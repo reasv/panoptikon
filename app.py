@@ -15,16 +15,6 @@ import tensorflow as tf
 
 DESCRIPTION = "# [KichangKim/DeepDanbooru](https://github.com/KichangKim/DeepDanbooru)"
 
-
-def load_sample_image_paths() -> list[pathlib.Path]:
-    image_dir = pathlib.Path("images")
-    if not image_dir.exists():
-        path = huggingface_hub.hf_hub_download("public-data/sample-images-TADNE", "images.tar.gz", repo_type="dataset")
-        with tarfile.open(path) as f:
-            f.extractall()
-    return sorted(image_dir.glob("*"))
-
-
 def load_model() -> tf.keras.Model:
     path = huggingface_hub.hf_hub_download("public-data/DeepDanbooru", "model-resnet_custom_v3.h5")
     model = tf.keras.models.load_model(path)
@@ -65,16 +55,12 @@ def predict(image: PIL.Image.Image, score_threshold: float) -> tuple[dict[str, f
     result_text = ", ".join(result_all.keys())
     return result_threshold, result_all, result_text
 
-
-image_paths = load_sample_image_paths()
-examples = [[path.as_posix(), 0.5] for path in image_paths]
-
 with gr.Blocks(css="style.css") as demo:
     gr.Markdown(DESCRIPTION)
     with gr.Row():
         with gr.Column():
             image = gr.Image(label="Input", type="pil")
-            score_threshold = gr.Slider(label="Score threshold", minimum=0, maximum=1, step=0.05, value=0.5)
+            score_threshold = gr.Slider(label="Score threshold", minimum=0, maximum=1, step=0.05, value=0.3)
             run_button = gr.Button("Run")
         with gr.Column():
             with gr.Tabs():
@@ -84,13 +70,6 @@ with gr.Blocks(css="style.css") as demo:
                     result_json = gr.JSON(label="JSON output", show_label=False)
                 with gr.Tab(label="Text"):
                     result_text = gr.Text(label="Text output", show_label=False, lines=5)
-    gr.Examples(
-        examples=examples,
-        inputs=[image, score_threshold],
-        outputs=[result, result_json, result_text],
-        fn=predict,
-        cache_examples=os.getenv("CACHE_EXAMPLES") == "1",
-    )
 
     run_button.click(
         fn=predict,
