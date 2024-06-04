@@ -105,28 +105,6 @@ def insert_or_update_file_data(conn, image_data, scan_time):
             INSERT INTO files (sha256, path, last_modified, last_seen, available)
             VALUES (?, ?, ?, ?, TRUE)
             ''', (sha256, path, last_modified, scan_time))
-    
-    conn.commit()
-
-
-def hard_update_items_available():
-    # This function is used to update the availability of files in the database
-    conn = get_database_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT path FROM files')
-    files = cursor.fetchall()
-    
-    for (path,) in files:
-        available = os.path.exists(path)
-        cursor.execute('''
-        UPDATE files
-        SET Available = ?
-        WHERE path = ?
-        ''', (available, path))
-    
-    conn.commit()
-    conn.close()
 
 def save_items_to_database(images_data, paths):
     initialize_database()
@@ -140,16 +118,14 @@ def save_items_to_database(images_data, paths):
             # Start a transaction
             with conn:
                 cursor = conn.cursor()
+                cursor.execute('BEGIN')
 
                 # Insert a scan entry for each parent folder path
                 for path in paths:
                     cursor.execute('''
                     INSERT INTO file_scans (time, path)
                     VALUES (?, ?)
-                    ''', (scan_time, path))
-                
-                # Commit the transaction if all inserts succeed
-                conn.commit()
+                    ''', (scan_time, path))                
                 successful_insert = True
 
         except sqlite3.IntegrityError:
@@ -162,6 +138,8 @@ def save_items_to_database(images_data, paths):
     
     mark_unavailable_files(conn, scan_time, paths)
 
+    # Only commit if the entire transaction is successful
+    conn.commit()
     conn.close()
 
 def mark_unavailable_files(conn, scan_time, paths):
@@ -176,8 +154,6 @@ def mark_unavailable_files(conn, scan_time, paths):
         WHERE last_seen != ?
         AND path LIKE ?
         ''', (scan_time, path + '%'))
-    
-    conn.commit()
 
 def get_file_by_path(conn, path):
     cursor = conn.cursor()
@@ -200,3 +176,22 @@ def get_file_by_path(conn, path):
         file_dict = None
 
     return file_dict
+
+def hard_update_items_available():
+    # This function is used to update the availability of files in the database
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT path FROM files')
+    files = cursor.fetchall()
+    
+    for (path,) in files:
+        available = os.path.exists(path)
+        cursor.execute('''
+        UPDATE files
+        SET Available = ?
+        WHERE path = ?
+        ''', (available, path))
+    
+    conn.commit()
+    conn.close()
