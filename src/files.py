@@ -4,16 +4,13 @@ from collections import defaultdict
 from datetime import datetime
 import mimetypes
 
-from .db import get_file_by_path
+from .db import get_file_by_path, initialize_database, get_database_connection
 
-def get_image_files(starting_points):
-    # List of supported image file extensions
-    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
-
+def get_files_by_extension(starting_points, extensions):
     for starting_point in starting_points:
         for root, _, files in os.walk(starting_point):
             for file in files:
-                if any(file.lower().endswith(ext) for ext in image_extensions):
+                if any(file.lower().endswith(ext) for ext in extensions):
                     yield os.path.join(root, file)
 
 def calculate_hashes(file_path):
@@ -35,19 +32,19 @@ def get_mime_type(file_path):
     mime_type, _ = mimetypes.guess_type(file_path)
     return mime_type
 
-def find_images_and_hashes(starting_points):
+def scan_files(starting_points, allowed_extensions):
     result = defaultdict(lambda: {
         'sha256': '',
         'MD5': '',
         'mime_type': '',
         'paths': []
     })
-
-    for file_path in get_image_files(starting_points):
+    conn = get_database_connection()
+    for file_path in get_files_by_extension(starting_points, allowed_extensions):
         mime_type = get_mime_type(file_path)
         last_modified = get_last_modified_time(file_path)
         # Check if the file is already in the database
-        if file_data := get_file_by_path(file_path):
+        if file_data := get_file_by_path(conn, file_path):
             # Check if the file has been modified since the last scan
             if file_data["last_modified"] == last_modified:
                 # Reuse the existing hash and mime type
@@ -64,7 +61,7 @@ def find_images_and_hashes(starting_points):
             'path': file_path,
             'last_modified': last_modified
         })
-
+    conn.close()
     return dict(result)
 
 def load_paths_from_file(file_path):
@@ -72,8 +69,7 @@ def load_paths_from_file(file_path):
         paths = [line.strip() for line in f if line.strip()]
     return paths
 
-if __name__ == '__main__':
-    file_path = 'paths.txt'
-    starting_points = load_paths_from_file(file_path)
-    hashes_info = find_images_and_hashes(starting_points)
-    print(hashes_info)
+def scan_images(starting_points):
+    # List of supported image file extensions
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+    return scan_files(starting_points, image_extensions)

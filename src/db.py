@@ -177,8 +177,7 @@ def mark_unavailable_files(conn, scan_time, paths):
     
     conn.commit()
 
-def get_file_by_path(path):
-    conn = get_database_connection()
+def get_file_by_path(conn, path):
     cursor = conn.cursor()
 
     cursor.execute('''
@@ -198,6 +197,5 @@ def get_file_by_path(path):
     else:
         file_dict = None
 
-    conn.close()
     return file_dict
 
