@@ -4,6 +4,8 @@ from collections import defaultdict
 from datetime import datetime
 import mimetypes
 
+from .db import get_file_by_path
+
 def get_image_files(starting_points):
     # List of supported image file extensions
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
@@ -42,9 +44,17 @@ def find_images_and_hashes(starting_points):
     })
 
     for file_path in get_image_files(starting_points):
-        md5, sha256 = calculate_hashes(file_path)
-        last_modified = get_last_modified_time(file_path)
         mime_type = get_mime_type(file_path)
+        last_modified = get_last_modified_time(file_path)
+        # Check if the file is already in the database
+        if file_data := get_file_by_path(file_path):
+            # Check if the file has been modified since the last scan
+            if file_data["last_modified"] == last_modified:
+                # Reuse the existing hash and mime type
+                md5 = file_data["md5"]
+                sha256 = file_data["item"]
+            else:
+                md5, sha256 = calculate_hashes(file_path)
 
         if not result[sha256]['paths']:
             result[sha256]['sha256'] = sha256

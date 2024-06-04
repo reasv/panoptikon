@@ -1,7 +1,6 @@
 import os
 import sqlite3
 from datetime import datetime
-from files import find_images_and_hashes, load_paths_from_file
 import time
 
 def get_database_connection():
@@ -9,7 +8,8 @@ def get_database_connection():
     conn = sqlite3.connect(db_file)
     return conn
 
-def initialize_database(conn):
+def initialize_database():
+    conn = get_database_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -59,6 +59,7 @@ def initialize_database(conn):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_path ON file_scans(path)')
 
     conn.commit()
+    conn.close()
 
 def insert_or_update_file_data(conn, image_data, scan_time):
     cursor = conn.cursor()
@@ -126,8 +127,8 @@ def update_items_available():
     conn.close()
 
 def save_items_to_database(images_data, paths):
+    initialize_database()
     conn = get_database_connection()
-    initialize_database(conn)
 
     successful_insert = False
     while not successful_insert:
@@ -176,8 +177,27 @@ def mark_unavailable_files(conn, scan_time, paths):
     
     conn.commit()
 
-if __name__ == '__main__':
-    file_path = 'paths.txt'
-    starting_points = load_paths_from_file(file_path)
-    hashes_info = find_images_and_hashes(starting_points)
-    save_items_to_database(hashes_info, starting_points)
+def get_file_by_path(path):
+    conn = get_database_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT files.*, items.md5
+    FROM files
+    JOIN items ON files.item = items.sha256
+    WHERE files.path = ?
+    ''', (path,))
+    
+    file_record = cursor.fetchone()
+
+    if file_record:
+        # Get column names from the cursor description
+        column_names = [desc[0] for desc in cursor.description]
+        # Construct a dictionary using column names and file record
+        file_dict = dict(zip(column_names, file_record))
+    else:
+        file_dict = None
+
+    conn.close()
+    return file_dict
+
