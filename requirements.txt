@@ -1,0 +1,4 @@
+git+https://github.com/KichangKim/DeepDanbooru@v3-20200915-sgd-e30#egg=deepdanbooru
+gradio==4.29.0
+pillow==10.2.0
+tensorflow==2.16.1
