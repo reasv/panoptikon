@@ -200,4 +200,3 @@ def get_file_by_path(conn, path):
         file_dict = None
 
     return file_dict
-
