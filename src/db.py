@@ -17,6 +17,7 @@ def initialize_database():
         sha256 TEXT PRIMARY KEY,
         md5 TEXT,
         type TEXT,
+        size INTEGER,          -- Size of the file in bytes
         time_added TEXT,         -- Using TEXT to store ISO-8601 formatted datetime
         time_last_seen TEXT      -- Using TEXT to store ISO-8601 formatted datetime
     )
@@ -25,12 +26,12 @@ def initialize_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item TEXT,
+        sha256 TEXT,
         path TEXT UNIQUE,        -- Ensuring path is unique
         last_modified TEXT,      -- Using TEXT to store ISO-8601 formatted datetime
         last_seen TEXT,          -- Using TEXT to store ISO-8601 formatted datetime
         available BOOLEAN,       -- BOOLEAN to indicate if the path is available
-        FOREIGN KEY(item) REFERENCES items(sha256)
+        FOREIGN KEY(sha256) REFERENCES items(sha256)
     )
     ''')
 
@@ -49,7 +50,7 @@ def initialize_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_type ON items(type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_time_added ON items(time_added)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_time_last_seen ON items(time_last_seen)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_item ON files(item)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_modified ON files(last_modified)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_available ON files(available)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)')  # Explicit index on path
@@ -67,19 +68,20 @@ def insert_or_update_file_data(conn, image_data, scan_time):
     md5 = image_data['MD5']
     mime_type = image_data['mime_type']
     paths = image_data['paths']
-    
+    file_size = image_data['size']
+
     cursor.execute('''
-    INSERT INTO items (sha256, md5, type, time_added, time_last_seen)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO items (sha256, md5, type, size, time_added, time_last_seen)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(sha256) DO UPDATE SET time_last_seen=excluded.time_last_seen
-    ''', (sha256, md5, mime_type, scan_time, scan_time))
+    ''', (sha256, md5, mime_type, file_size, scan_time, scan_time))
     
     for path_data in paths:
         path = path_data['path']
         last_modified = path_data['last_modified']
         
         # Check if the path already exists
-        cursor.execute('SELECT item FROM files WHERE path = ?', (path,))
+        cursor.execute('SELECT sha256 FROM files WHERE path = ?', (path,))
         existing_path = cursor.fetchone()
         
         if existing_path:
@@ -94,20 +96,20 @@ def insert_or_update_file_data(conn, image_data, scan_time):
                 # Path exists with a different sha256, delete the old entry and insert new
                 cursor.execute('DELETE FROM files WHERE path = ?', (path,))
                 cursor.execute('''
-                INSERT INTO files (item, path, last_modified, last_seen, available)
+                INSERT INTO files (sha256, path, last_modified, last_seen, available)
                 VALUES (?, ?, ?, ?, TRUE)
                 ''', (sha256, path, last_modified, scan_time))
         else:
             # Path does not exist, insert new
             cursor.execute('''
-            INSERT INTO files (item, path, last_modified, last_seen, available)
+            INSERT INTO files (sha256, path, last_modified, last_seen, available)
             VALUES (?, ?, ?, ?, TRUE)
             ''', (sha256, path, last_modified, scan_time))
     
     conn.commit()
 
 
-def update_items_available():
+def hard_update_items_available():
     # This function is used to update the availability of files in the database
     conn = get_database_connection()
     cursor = conn.cursor()
@@ -181,9 +183,9 @@ def get_file_by_path(conn, path):
     cursor = conn.cursor()
 
     cursor.execute('''
-    SELECT files.*, items.md5
+    SELECT files.*, items.md5, items.size
     FROM files
-    JOIN items ON files.item = items.sha256
+    JOIN items ON files.sha256 = items.sha256
     WHERE files.path = ?
     ''', (path,))
     

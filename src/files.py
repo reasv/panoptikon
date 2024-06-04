@@ -28,35 +28,44 @@ def get_last_modified_time(file_path):
     mtime = os.path.getmtime(file_path)
     return datetime.fromtimestamp(mtime).isoformat()
 
+def get_file_size(file_path):
+    return os.path.getsize(file_path)
+
 def get_mime_type(file_path):
     mime_type, _ = mimetypes.guess_type(file_path)
     return mime_type
 
 def scan_files(starting_points, allowed_extensions):
+    initialize_database()
     result = defaultdict(lambda: {
         'sha256': '',
         'MD5': '',
         'mime_type': '',
+        'size': 0,
         'paths': []
     })
     conn = get_database_connection()
     for file_path in get_files_by_extension(starting_points, allowed_extensions):
         mime_type = get_mime_type(file_path)
+        file_size = get_file_size(file_path)
         last_modified = get_last_modified_time(file_path)
+        md5, sha256 = None, None
         # Check if the file is already in the database
         if file_data := get_file_by_path(conn, file_path):
             # Check if the file has been modified since the last scan
-            if file_data["last_modified"] == last_modified:
+            if file_data["last_modified"] == last_modified and file_data["size"] == file_size:
                 # Reuse the existing hash and mime type
                 md5 = file_data["md5"]
-                sha256 = file_data["item"]
-            else:
-                md5, sha256 = calculate_hashes(file_path)
+                sha256 = file_data["sha256"]
+
+        if not sha256:
+            md5, sha256 = calculate_hashes(file_path)
 
         if not result[sha256]['paths']:
             result[sha256]['sha256'] = sha256
             result[sha256]['MD5'] = md5
             result[sha256]['mime_type'] = mime_type
+            result[sha256]['size'] = file_size
         result[sha256]['paths'].append({
             'path': file_path,
             'last_modified': last_modified
