@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime
-from .files import find_images_and_hashes, load_paths_from_file
+from files import find_images_and_hashes, load_paths_from_file
 import time
 
 def get_database_connection():
