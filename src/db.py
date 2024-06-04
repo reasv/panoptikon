@@ -125,7 +125,7 @@ def save_items_to_database(images_data, paths):
                     cursor.execute('''
                     INSERT INTO file_scans (time, path)
                     VALUES (?, ?)
-                    ''', (scan_time, path))                
+                    ''', (scan_time, path))
                 successful_insert = True
 
         except sqlite3.IntegrityError:
