@@ -1,0 +1,14 @@
+.gradio-container {
+    max-width: 100% !important
+}
+.centered-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.centered-content > * {
+    width: 50%;
+}
+.grid-wrap {
+    max-height: 75vh !important
+}

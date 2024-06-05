@@ -31,5 +31,16 @@ def show_in_fm(path):
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to open path '{path}' in file explorer: {e}")
 
-# Example usage:
-# show_in_file_explorer('/path/to/your/file.txt')
+def open_file(image_path):
+    if os.path.exists(image_path):
+        os.startfile(image_path, cwd=os.path.dirname(image_path))
+        return f"Attempting to open: {image_path}"
+    else:
+        return "File does not exist"
+    
+def open_in_explorer(image_path):
+    if os.path.exists(image_path):
+        show_in_fm(image_path)
+        return f"Attempting to open: {image_path}"
+    else:
+        return "File does not exist"

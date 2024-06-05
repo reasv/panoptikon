@@ -350,10 +350,12 @@ def get_items_by_tag_name(conn, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(conn, tags, min_confidence=0.5, limit=10000):
+def find_items_by_tags(conn, tags, min_confidence=0.5, page_size=1000, page=1):
     cursor = conn.cursor()
-    if limit == 0:
-        limit = 1000000
+    if page_size < 1:
+        page_size = 1000000
+
+    offset = (page - 1) * page_size
     query = '''
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
@@ -364,16 +366,16 @@ def find_items_by_tags(conn, tags, min_confidence=0.5, limit=10000):
     GROUP BY items.sha256
     HAVING COUNT(DISTINCT tags.name) = ?
     ORDER BY last_modified DESC
-    LIMIT ?
+    LIMIT ? OFFSET ?
     '''.format(','.join(['?']*len(tags)))
-    cursor.execute(query, tags + [min_confidence, len(tags), limit])
+    cursor.execute(query, tags + [min_confidence, len(tags), page_size, offset])
     items = cursor.fetchall()
     return items
 
-def find_paths_by_tags(tags, min_confidence=0.5, limit=10000):
+def find_paths_by_tags(tags, min_confidence=0.5, page_size=1000, page=1):
     conn = get_database_connection()
     results = []
-    for item in find_items_by_tags(conn, tags, min_confidence, limit):
+    for item in find_items_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page):
         if os.path.exists(item[7]):
             results.append({
                 'sha256': item[0],
