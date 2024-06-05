@@ -66,7 +66,17 @@ def initialize_database():
         start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
         end_time TEXT,               -- Using TEXT to store ISO-8601 formatted datetime
         setter TEXT NOT NULL,
-        UNIQUE(start_time)       -- Unique constraint on time and path
+        UNIQUE(start_time)       -- Unique constraint on time
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time_added TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        path TEXT NOT NULL,
+        included BOOLEAN NOT NULL,       -- BOOLEAN to indicate if folder is included or specifically excluded
+        UNIQUE(path)  -- Unique constraint on path
     )
     ''')
     
@@ -94,6 +104,9 @@ def initialize_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_start_time ON tag_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_end_time ON tag_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_setter ON tag_scans(setter)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_time_added ON folders(time_added)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(path)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_included ON folders(included)')
 
     conn.commit()
     conn.close()
@@ -154,7 +167,6 @@ def insert_or_update_file_data(conn, image_data, scan_time):
             ''', (sha256, path, last_modified, scan_time))
 
 def save_items_to_database(images_data, paths):
-    initialize_database()
     conn = get_database_connection()
 
     successful_insert = False
