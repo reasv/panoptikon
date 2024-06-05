@@ -35,11 +35,15 @@ def update_gallery(tags, columns):
     images = process_tags(tags)
     return gr.update(value=images, columns=columns)
 
-def on_select(evt: gr.SelectData):  # SelectData is a subclass of EventData
+def on_select(evt: gr.SelectData):
     pathstr = json.loads(evt.value['caption'])['path']
     return pathstr, pathstr
 
-def on_select_tags(evt: gr.SelectData):  # SelectData is a subclass of EventData
+def on_select_label(evt: gr.SelectData):
+    print(evt.value)
+    return evt.value
+
+def on_select_tags(evt: gr.SelectData): 
     sha256 = json.loads(evt.value['caption'])['sha256']
     tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(sha256)}
     text = ", ".join(tags.keys())
@@ -93,7 +97,7 @@ with gr.Blocks(css=css, fill_height=True) as demo:
     )
     image_output.select(on_select, None, [image_path_output, image_preview])
     image_output.select(on_select_tags, None, [tag_list, tag_text])
-
+    tag_list.select(on_select_label, None, [tag_input])
     open_file_button.click(
         fn=open_file,
         inputs=image_path_output,
