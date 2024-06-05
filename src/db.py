@@ -321,6 +321,18 @@ def get_all_tags_for_item(conn, sha256):
     tags = cursor.fetchall()
     return tags
 
+def get_all_tags_for_item_name_confidence(sha256):
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT name, confidence
+    FROM tags
+    WHERE item = ?
+    ''', (sha256,))
+    tags = cursor.fetchall()
+    conn.close()
+    return tags
+
 def get_tag_names_list(conn):
     cursor = conn.cursor()
     cursor.execute('SELECT DISTINCT name FROM tags')
