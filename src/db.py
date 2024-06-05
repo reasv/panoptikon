@@ -2,6 +2,7 @@ import os
 import sqlite3
 from datetime import datetime
 import time
+from typing import Tuple
 
 def get_database_connection():
     db_file = os.getenv('DB_FILE', 'sqlite.db')
@@ -286,3 +287,81 @@ def find_working_paths(conn, excluded_tag_setter=None):
                     working_paths[sha256] = path
                     break
     return working_paths
+
+def get_working_path_by_sha256(conn, sha256: str) -> Tuple[str, str] | None:
+    cursor = conn.cursor()
+    # First, try to find a path with available = 1
+    cursor.execute('SELECT path, last_modified FROM files WHERE sha256 = ? AND available = 1', (sha256,))
+    paths = cursor.fetchall()
+    
+    found = False
+    for path_tuple in paths:
+        path = path_tuple[0]
+        if os.path.exists(path):
+            return path, path_tuple[1]
+    
+    # If no available paths are found, try other paths
+    if not found:
+        cursor.execute('SELECT path, last_modified FROM files WHERE sha256 = ?', (sha256,))
+        paths = cursor.fetchall()
+        
+        for path_tuple in paths:
+            path = path_tuple[0]
+            if os.path.exists(path):
+                return path, path_tuple[1]
+    return None
+
+def get_all_tags_for_item(conn, sha256):
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT namespace, name, value, confidence, setter, time, last_set
+    FROM tags
+    WHERE item = ?
+    ''', (sha256,))
+    tags = cursor.fetchall()
+    return tags
+
+def get_tag_names_list(conn):
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT name FROM tags')
+    tag_names = cursor.fetchall()
+    return [tag[0] for tag in tag_names]
+
+def get_items_by_tag_name(conn, tag_name):
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen
+    FROM items
+    JOIN tags ON items.sha256 = tags.item
+    WHERE tags.name = ?
+    ''', (tag_name,))
+    items = cursor.fetchall()
+    return items
+
+def find_items_by_tags(conn, tags):
+    cursor = conn.cursor()
+    query = '''
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen
+    FROM items
+    JOIN tags ON items.sha256 = tags.item
+    WHERE tags.name IN ({})
+    GROUP BY items.sha256
+    HAVING COUNT(DISTINCT tags.name) = ?
+    '''.format(','.join(['?']*len(tags)))
+    cursor.execute(query, tags + [len(tags)])
+    items = cursor.fetchall()
+    return items
+
+def find_paths_by_tags(tags):
+    conn = get_database_connection()
+    results = []
+    for item in find_items_by_tags(conn, tags):
+        if result := get_working_path_by_sha256(conn, item[0]):
+            results.append({
+                'sha256': item[0],
+                'type': item[2],
+                'path': result[0],
+                'last_modified': result[1]
+            })
+    conn.close()
+    return results
