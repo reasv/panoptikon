@@ -350,25 +350,38 @@ def get_items_by_tag_name(conn, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(conn, tags):
+def find_items_by_tags(conn, tags, min_confidence=0.5, limit=10000):
     cursor = conn.cursor()
+    if limit == 0:
+        limit = 1000000
     query = '''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
+    MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN tags ON items.sha256 = tags.item
-    WHERE tags.name IN ({})
+    JOIN files ON items.sha256 = files.sha256
+    WHERE tags.name IN ({}) AND tags.confidence >= ?
     GROUP BY items.sha256
     HAVING COUNT(DISTINCT tags.name) = ?
+    ORDER BY last_modified DESC
+    LIMIT ?
     '''.format(','.join(['?']*len(tags)))
-    cursor.execute(query, tags + [len(tags)])
+    cursor.execute(query, tags + [min_confidence, len(tags), limit])
     items = cursor.fetchall()
     return items
 
-def find_paths_by_tags(tags):
+def find_paths_by_tags(tags, min_confidence=0.5, limit=10000):
     conn = get_database_connection()
     results = []
-    for item in find_items_by_tags(conn, tags):
-        if result := get_working_path_by_sha256(conn, item[0]):
+    for item in find_items_by_tags(conn, tags, min_confidence, limit):
+        if os.path.exists(item[7]):
+            results.append({
+                'sha256': item[0],
+                'type': item[2],
+                'last_modified': item[6],
+                'path': item[7]
+            })
+        elif result := get_working_path_by_sha256(conn, item[0]):
             results.append({
                 'sha256': item[0],
                 'type': item[2],
