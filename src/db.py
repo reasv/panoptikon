@@ -15,33 +15,57 @@ def initialize_database():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS items (
         sha256 TEXT PRIMARY KEY,
-        md5 TEXT,
+        md5 TEXT NOT NULL,
         type TEXT,
         size INTEGER,          -- Size of the file in bytes
-        time_added TEXT,         -- Using TEXT to store ISO-8601 formatted datetime
-        time_last_seen TEXT      -- Using TEXT to store ISO-8601 formatted datetime
+        time_added TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
+        time_last_seen TEXT NOT NULL      -- Using TEXT to store ISO-8601 formatted datetime
     )
     ''')
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sha256 TEXT,
-        path TEXT UNIQUE,        -- Ensuring path is unique
-        last_modified TEXT,      -- Using TEXT to store ISO-8601 formatted datetime
-        last_seen TEXT,          -- Using TEXT to store ISO-8601 formatted datetime
-        available BOOLEAN,       -- BOOLEAN to indicate if the path is available
+        sha256 TEXT NOT NULL,
+        path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
+        last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
+        last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
+        available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
         FOREIGN KEY(sha256) REFERENCES items(sha256)
     )
     ''')
 
-    # New table for file scans
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS file_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        time TEXT,               -- Using TEXT to store ISO-8601 formatted datetime
-        path TEXT,
+        time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        path TEXT NOT NULL,
         UNIQUE(time, path)       -- Unique constraint on time and path
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tags (
+        namespace TEXT NOT NULL,
+        name TEXT NOT NULL,
+        value TEXT,
+        confidence REAL DEFAULT 1.0,
+        item TEXT NOT NULL,
+        setter TEXT NOT NULL,
+        time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        last_set TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
+        PRIMARY KEY(namespace, name, item, setter),
+        FOREIGN KEY(item) REFERENCES items(sha256)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tag_scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT,               -- Using TEXT to store ISO-8601 formatted datetime
+        setter TEXT NOT NULL,
+        UNIQUE(start_time)       -- Unique constraint on time and path
     )
     ''')
     
@@ -58,9 +82,31 @@ def initialize_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_time ON file_scans(time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_path ON file_scans(path)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_namespace ON tags(namespace)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_value ON tags(value)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_confidence ON tags(confidence)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_item ON tags(item)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setter ON tags(setter)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_time ON tags(time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_last_set ON tags(last_set)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_start_time ON tag_scans(start_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_end_time ON tag_scans(end_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_setter ON tag_scans(setter)')
 
     conn.commit()
     conn.close()
+
+def insert_tag(conn, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
+    time = scan_time
+    last_set = scan_time
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO tags (namespace, name, value, confidence, item, setter, time, last_set)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence, last_set=excluded.last_set
+    ''', (namespace, name, value, confidence, item, setter, time, last_set))
+
 
 def insert_or_update_file_data(conn, image_data, scan_time):
     cursor = conn.cursor()
@@ -116,17 +162,16 @@ def save_items_to_database(images_data, paths):
             scan_time = datetime.now().isoformat()
 
             # Start a transaction
-            with conn:
-                cursor = conn.cursor()
-                cursor.execute('BEGIN')
+            cursor = conn.cursor()
+            cursor.execute('BEGIN')
 
-                # Insert a scan entry for each parent folder path
-                for path in paths:
-                    cursor.execute('''
-                    INSERT INTO file_scans (time, path)
-                    VALUES (?, ?)
-                    ''', (scan_time, path))
-                successful_insert = True
+            # Insert a scan entry for each parent folder path
+            for path in paths:
+                cursor.execute('''
+                INSERT INTO file_scans (time, path)
+                VALUES (?, ?)
+                ''', (scan_time, path))
+            successful_insert = True
 
         except sqlite3.IntegrityError:
             # Rollback the transaction on failure and wait before retrying
@@ -195,3 +240,49 @@ def hard_update_items_available():
     
     conn.commit()
     conn.close()
+
+
+def find_working_paths(conn, excluded_tag_setter=None):
+    cursor = conn.cursor()
+    if excluded_tag_setter:
+        # Get all unique sha256 hashes excluding those with a tag set by the given author
+        cursor.execute('''
+        SELECT DISTINCT files.sha256
+        FROM files
+        LEFT JOIN tags ON files.sha256 = tags.item AND tags.setter = ?
+        WHERE tags.item IS NULL
+        ''', (excluded_tag_setter,))
+        sha256_hashes = cursor.fetchall()
+    else:
+        # Get all unique sha256 hashes
+        cursor.execute('SELECT DISTINCT sha256 FROM files')
+        sha256_hashes = cursor.fetchall()
+
+    working_paths = {}
+
+    for sha256_tuple in sha256_hashes:
+        sha256 = sha256_tuple[0]
+        
+        # First, try to find a path with available = 1
+        cursor.execute('SELECT path FROM files WHERE sha256 = ? AND available = 1', (sha256,))
+        paths = cursor.fetchall()
+        
+        found = False
+        for path_tuple in paths:
+            path = path_tuple[0]
+            if os.path.exists(path):
+                working_paths[sha256] = path
+                found = True
+                break
+        
+        # If no available paths are found, try other paths
+        if not found:
+            cursor.execute('SELECT path FROM files WHERE sha256 = ?', (sha256,))
+            paths = cursor.fetchall()
+            
+            for path_tuple in paths:
+                path = path_tuple[0]
+                if os.path.exists(path):
+                    working_paths[sha256] = path
+                    break
+    return working_paths
