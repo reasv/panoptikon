@@ -9,6 +9,7 @@ from src import find_paths_by_tags, get_all_tags_for_item_name_confidence
 from src.utils import open_file, open_in_explorer
 from src.ui_scan import create_scan_UI
 from src.ui_toptags import create_toptags_UI
+from src.ui_test_model import create_dd_UI
 
 def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1):
     tags = tags_str.split()
@@ -65,6 +66,8 @@ def create_UI():
                 create_scan_UI()
             with gr.TabItem(label="Tag Frequency"):
                 create_toptags_UI()
+            with gr.TabItem(label="Tagging Model"):
+                create_dd_UI()
 
         submit_button.click(
             fn=search_by_tags,
