@@ -39,7 +39,7 @@ def execute_folder_scan(
         + include_audio * get_audio_extensions()
     )
     hashes_info = scan_files(starting_points, excluded_folders, extensions)
-    save_items_to_database(hashes_info, starting_points)
+    save_items_to_database(conn, hashes_info, starting_points)
     if commit:
         conn.commit()
     return True, "Scan completed successfully"

@@ -127,7 +127,7 @@ def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
     sha256 = image_data['sha256']
     md5 = image_data['MD5']
     mime_type = image_data['mime_type']
-    paths = image_data['paths']
+    paths: Dict[str, str] = image_data['paths']
     file_size = image_data['size']
 
     cursor.execute('''
@@ -136,10 +136,7 @@ def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
     ON CONFLICT(sha256) DO UPDATE SET time_last_seen=excluded.time_last_seen
     ''', (sha256, md5, mime_type, file_size, scan_time, scan_time))
     
-    for path_data in paths:
-        path = path_data['path']
-        last_modified = path_data['last_modified']
-        
+    for path, last_modified in paths.items():
         # Check if the path already exists
         cursor.execute('SELECT sha256 FROM files WHERE path = ?', (path,))
         existing_path = cursor.fetchone()
@@ -173,7 +170,6 @@ def save_items_to_database(conn: sqlite3.Connection, files_data: Dict[str, Dict[
 
             # Start a transaction
             cursor = conn.cursor()
-            cursor.execute('BEGIN')
 
             # Insert a scan entry for each parent folder path
             for path in paths:
