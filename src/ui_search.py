@@ -5,9 +5,6 @@ import json
 
 from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
-from src.ui_scan import create_scan_UI
-from src.ui_toptags import create_toptags_UI
-from src.ui_test_model import create_dd_UI
 
 def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1):
     tags = tags_str.split()
@@ -29,19 +26,6 @@ def on_select_tag(evt: gr.SelectData):
     conn.close()
     text = ", ".join(tags.keys())
     return tags, text
-
-def create_root_UI():
-    with gr.Blocks(css="static/style.css", fill_height=True) as ui:
-        with gr.Tabs():
-            with gr.TabItem(label="Tag Search"):
-                create_search_UI()
-            with gr.TabItem(label="File Scan & Tagging"):
-                create_scan_UI()
-            with gr.TabItem(label="Tag Frequency"):
-                create_toptags_UI()
-            with gr.TabItem(label="Tagging Model"):
-                create_dd_UI()
-    ui.launch()
 
 def create_search_UI():
     with gr.Column(elem_classes="centered-content", scale=0):
