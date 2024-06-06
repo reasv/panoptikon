@@ -166,9 +166,7 @@ def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
             VALUES (?, ?, ?, ?, TRUE)
             ''', (sha256, path, last_modified, scan_time))
 
-def save_items_to_database(files_data: Dict[str, Dict[str, str]], paths: List[str]):
-    conn = get_database_connection()
-
+def save_items_to_database(conn: sqlite3.Connection, files_data: Dict[str, Dict[str, str]], paths: List[str]):
     while True:
         try:
             scan_time = datetime.now().isoformat()
@@ -197,7 +195,6 @@ def save_items_to_database(files_data: Dict[str, Dict[str, str]], paths: List[st
 
     # Only commit if the entire transaction is successful
     conn.commit()
-    conn.close()
 
 def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, paths: List[str]):
     cursor = conn.cursor()
@@ -421,7 +418,7 @@ def remove_folder_from_database(conn: sqlite3.Connection, folder_path: str):
     cursor = conn.cursor()
     cursor.execute('DELETE FROM folders WHERE path = ?', (folder_path,))
 
-def get_folders_from_database(conn: sqlite3.Connection, included=True):
+def get_folders_from_database(conn: sqlite3.Connection, included=True) -> List[str]:
     cursor = conn.cursor()
     cursor.execute('SELECT path FROM folders WHERE included = ?', (included,))
     folders = cursor.fetchall()
