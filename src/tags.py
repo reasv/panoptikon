@@ -11,7 +11,7 @@ import huggingface_hub
 import numpy as np
 import PIL.Image
 import tensorflow as tf
-from src.db import insert_tag, find_working_paths
+from src.db import insert_tag, find_working_paths_without_tags
 
 def get_threshold_from_env() -> float:
     threshold = os.getenv("SCORE_THRESHOLD")
@@ -55,8 +55,7 @@ def predict(image: PIL.Image.Image, score_threshold: float, model: tf.keras.Mode
     return result_threshold, result_all, result_text
 
 def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
-    model = load_model()
-    labels = load_labels()
+    model, labels = None, None
     threshold = get_threshold_from_env()
 
     scan_time = datetime.now().isoformat()
@@ -66,11 +65,14 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
     VALUES (?, ?)
     ''', (scan_time, setter))
 
-    for sha256, path in find_working_paths(conn, setter).items():
+    for sha256, path in find_working_paths_without_tags(conn, setter).items():
         image = PIL.Image.open(path)
         if image.mode != 'RGB':
             image = image.convert('RGB')
         try:
+            if model is None:
+                model = load_model()
+                labels = load_labels()
             result_threshold, _result_all, _result_text = predict(image, threshold, model, labels)
         except Exception as e:
             print(f"Error processing {path}")

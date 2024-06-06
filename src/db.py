@@ -229,7 +229,7 @@ def hard_update_items_available(conn: sqlite3.Connection):
         ''', (available, path))
 
 
-def find_working_paths(conn: sqlite3.Connection, excluded_tag_setter=None):
+def find_working_paths_without_tags(conn: sqlite3.Connection, excluded_tag_setter=None):
     cursor = conn.cursor()
     if excluded_tag_setter:
         # Get all unique sha256 hashes excluding those with a tag set by the given author
