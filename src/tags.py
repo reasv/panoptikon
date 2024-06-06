@@ -11,7 +11,7 @@ import huggingface_hub
 import numpy as np
 import PIL.Image
 import tensorflow as tf
-from .db import insert_tag, find_working_paths, get_database_connection, initialize_database
+from src.db import insert_tag, find_working_paths
 
 def get_threshold_from_env() -> float:
     threshold = os.getenv("SCORE_THRESHOLD")

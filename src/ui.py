@@ -5,7 +5,7 @@ from __future__ import annotations
 import gradio as gr
 import json
 
-from src import find_paths_by_tags, get_all_tags_for_item_name_confidence
+from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
 from src.ui_scan import create_scan_UI
 from src.ui_toptags import create_toptags_UI
@@ -13,7 +13,9 @@ from src.ui_test_model import create_dd_UI
 
 def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1):
     tags = tags_str.split()
-    results = find_paths_by_tags(tags, page_size=results_per_page, min_confidence=min_tag_confidence, page=page)  
+    conn = get_database_connection()
+    results = find_paths_by_tags(conn, tags, page_size=results_per_page, min_confidence=min_tag_confidence, page=page)  
+    conn.close()
     # Create a list of image paths to be displayed
     images = [(result['path'], json.dumps(result)) for result in results]
     return gr.update(value=images, columns=columns), str(len(images))
@@ -24,7 +26,9 @@ def on_select_image(evt: gr.SelectData):
 
 def on_select_tag(evt: gr.SelectData): 
     sha256 = json.loads(evt.value['caption'])['sha256']
-    tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(sha256)}
+    conn = get_database_connection()
+    tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
+    conn.close()
     text = ", ".join(tags.keys())
     return tags, text
 

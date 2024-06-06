@@ -31,7 +31,7 @@ def execute_folder_scan(
         + include_video * get_video_extensions()
         + include_audio * get_audio_extensions()
     )
-    hashes_info = scan_files(starting_points, excluded_folders, extensions)
+    hashes_info = scan_files(conn, starting_points, excluded_folders, extensions)
     save_items_to_database(conn, hashes_info, starting_points)
     return True, "Scan completed successfully"
 
@@ -46,8 +46,8 @@ def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tupl
 
 def remove_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
     cursor = conn.cursor()
-
-    cursor.execute('DELETE FROM folders WHERE path = ? AND included = 0', (folder,))
+    for folder in paths:
+        cursor.execute('DELETE FROM folders WHERE path = ? AND included = 0', (folder,))
     return True, "Folders removed successfully"
 
 def remove_included_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:

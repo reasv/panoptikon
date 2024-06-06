@@ -10,8 +10,7 @@ def get_database_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(db_file)
     return conn
 
-def initialize_database():
-    conn = get_database_connection()
+def initialize_database(conn: sqlite3.Connection):
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -108,9 +107,6 @@ def initialize_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_time_added ON folders(time_added)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(path)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_included ON folders(included)')
-
-    conn.commit()
-    conn.close()
 
 def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
     time = scan_time
@@ -311,8 +307,7 @@ def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     tags = cursor.fetchall()
     return tags
 
-def get_all_tags_for_item_name_confidence(sha256):
-    conn = get_database_connection()
+def get_all_tags_for_item_name_confidence(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
     SELECT name, confidence
@@ -320,7 +315,6 @@ def get_all_tags_for_item_name_confidence(sha256):
     WHERE item = ?
     ''', (sha256,))
     tags = cursor.fetchall()
-    conn.close()
     return tags
 
 def get_tag_names_list(conn):
@@ -362,8 +356,7 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
     items = cursor.fetchall()
     return items
 
-def find_paths_by_tags(tags, min_confidence=0.5, page_size=1000, page=1):
-    conn = get_database_connection()
+def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1):
     results = []
     for item in find_items_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page):
         if os.path.exists(item[7]):
@@ -380,7 +373,6 @@ def find_paths_by_tags(tags, min_confidence=0.5, page_size=1000, page=1):
                 'path': result[0],
                 'last_modified': result[1]
             })
-    conn.close()
     return results
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):

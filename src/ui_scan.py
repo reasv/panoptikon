@@ -54,12 +54,20 @@ def update_folders(included_folders_text: str, excluded_folders_text: str):
 
 def rescan_folders():
     conn = get_database_connection()
-    execute_folder_scan(conn, commit=True)
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    execute_folder_scan(conn)
+    conn.commit()
     conn.close()
     return "Rescanned all folders"
 
 def regenerate_tags():
-    scan_and_predict_tags()
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    scan_and_predict_tags(conn)
+    conn.commit()
+    conn.close()
     return "Generated tags for all files with missing tags"
 
 def create_scan_UI():

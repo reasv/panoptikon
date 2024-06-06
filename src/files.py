@@ -4,8 +4,9 @@ from collections import defaultdict
 from datetime import datetime
 import mimetypes
 from typing import List
+import sqlite3
 
-from .db import get_file_by_path, get_database_connection
+from src.db import get_file_by_path
 from src.utils import normalize_path
 
 def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
@@ -26,6 +27,7 @@ def get_files_by_extension(starting_points: List[str], excluded_paths: List[str]
                     yield os.path.join(root, file)
 
 def scan_files(
+        conn: sqlite3.Connection,
         starting_points: List[str],
         excluded_paths: List[str],
         allowed_extensions: List[str]
@@ -38,7 +40,6 @@ def scan_files(
         'size': 0,
         'paths': dict()
     })
-    conn = get_database_connection()
     for file_path in get_files_by_extension(starting_points, excluded_paths, allowed_extensions):
         mime_type = get_mime_type(file_path)
         file_size = get_file_size(file_path)
@@ -62,7 +63,6 @@ def scan_files(
             result[sha256]['mime_type'] = mime_type
             result[sha256]['size'] = file_size
         result[sha256]['paths'][file_path] = last_modified
-    conn.close()
     return dict(result)
 
 def get_image_extensions():
