@@ -1,4 +1,4 @@
-from src.ui import create_root_UI
+from src.ui.root import create_root_UI
 from src.db import initialize_database, get_database_connection
 
 def launch_app():
