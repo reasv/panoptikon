@@ -56,7 +56,7 @@ def initialize_database():
         time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
         last_set TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
         PRIMARY KEY(namespace, name, item, setter),
-        FOREIGN KEY(item) REFERENCES items(sha256)
+        FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
     )
     ''')
 
@@ -192,9 +192,6 @@ def save_items_to_database(conn: sqlite3.Connection, files_data: Dict[str, Dict[
         insert_or_update_file_data(conn, image_data, scan_time)
     
     mark_unavailable_files(conn, scan_time, paths)
-
-    # Only commit if the entire transaction is successful
-    conn.commit()
 
 def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, paths: List[str]):
     cursor = conn.cursor()
@@ -423,3 +420,59 @@ def get_folders_from_database(conn: sqlite3.Connection, included=True) -> List[s
     cursor.execute('SELECT path FROM folders WHERE included = ?', (included,))
     folders = cursor.fetchall()
     return [folder[0] for folder in folders]
+
+def delete_files_under_excluded_folders(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM files
+    WHERE path IN (
+        SELECT files.path
+        FROM files
+        JOIN folders ON files.path LIKE folders.path || '%'
+        WHERE folders.included = 0
+    )
+    ''')
+
+def delete_items_without_files(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM items
+    WHERE sha256 NOT IN (
+        SELECT sha256
+        FROM files
+    )
+    ''')
+
+def delete_files_not_under_included_folders(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM files
+    WHERE path NOT IN (
+        SELECT files.path
+        FROM files
+        JOIN folders ON files.path LIKE folders.path || '%'
+        WHERE folders.included = 1
+    )
+    ''')
+
+def get_most_common_tags(conn: sqlite3.Connection, limit=10):
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT namespace, name, COUNT(*) as count
+    FROM tags
+    GROUP BY namespace, name
+    ORDER BY count DESC
+    LIMIT ?
+    ''', (limit,))
+    tags = cursor.fetchall()
+    return tags
+
+def get_most_common_tags_frequency(conn: sqlite3.Connection, limit=10):
+    tags = get_most_common_tags(conn, limit)
+    # Get the total count of items that have tags
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(DISTINCT item) FROM tags')
+    total_count = cursor.fetchone()[0]
+    # Calculate the frequency
+    tags = [(tag[0], tag[1], tag[2], tag[2]/total_count) for tag in tags]
+    return tags
