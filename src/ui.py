@@ -34,7 +34,7 @@ def create_root_UI():
     with gr.Blocks(css="static/style.css", fill_height=True) as ui:
         with gr.Tabs():
             with gr.TabItem(label="Tag Search"):
-                create_UI()
+                create_search_UI()
             with gr.TabItem(label="File Scan & Tagging"):
                 create_scan_UI()
             with gr.TabItem(label="Tag Frequency"):
@@ -43,7 +43,7 @@ def create_root_UI():
                 create_dd_UI()
     ui.launch()
 
-def create_UI():
+def create_search_UI():
     with gr.Column(elem_classes="centered-content", scale=0):
         with gr.Row():
             tag_input = gr.Textbox(label="Enter tags separated by spaces")
