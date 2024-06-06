@@ -2,9 +2,9 @@ import os
 import sqlite3
 from datetime import datetime
 import time
-from typing import Tuple
+from typing import Dict, List, Tuple
 
-def get_database_connection():
+def get_database_connection() -> sqlite3.Connection:
     db_file = os.getenv('DB_FILE', 'sqlite.db')
     conn = sqlite3.connect(db_file)
     return conn
@@ -111,7 +111,7 @@ def initialize_database():
     conn.commit()
     conn.close()
 
-def insert_tag(conn, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
+def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
     time = scan_time
     last_set = scan_time
     cursor = conn.cursor()
@@ -122,7 +122,7 @@ def insert_tag(conn, scan_time, namespace, name, item, setter, confidence = 1.0,
     ''', (namespace, name, value, confidence, item, setter, time, last_set))
 
 
-def insert_or_update_file_data(conn, image_data, scan_time):
+def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
     cursor = conn.cursor()
     sha256 = image_data['sha256']
     md5 = image_data['MD5']
@@ -166,11 +166,10 @@ def insert_or_update_file_data(conn, image_data, scan_time):
             VALUES (?, ?, ?, ?, TRUE)
             ''', (sha256, path, last_modified, scan_time))
 
-def save_items_to_database(images_data, paths):
+def save_items_to_database(files_data: Dict[str, Dict[str, str]], paths: List[str]):
     conn = get_database_connection()
 
-    successful_insert = False
-    while not successful_insert:
+    while True:
         try:
             scan_time = datetime.now().isoformat()
 
@@ -184,14 +183,14 @@ def save_items_to_database(images_data, paths):
                 INSERT INTO file_scans (time, path)
                 VALUES (?, ?)
                 ''', (scan_time, path))
-            successful_insert = True
+            break
 
         except sqlite3.IntegrityError:
             # Rollback the transaction on failure and wait before retrying
             conn.rollback()
             time.sleep(1)
 
-    for sha256, image_data in images_data.items():
+    for _, image_data in files_data.items():
         insert_or_update_file_data(conn, image_data, scan_time)
     
     mark_unavailable_files(conn, scan_time, paths)
@@ -200,7 +199,7 @@ def save_items_to_database(images_data, paths):
     conn.commit()
     conn.close()
 
-def mark_unavailable_files(conn, scan_time, paths):
+def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, paths: List[str]):
     cursor = conn.cursor()
     
     # Mark files as unavailable if they haven't been seen in the current scan
@@ -213,7 +212,7 @@ def mark_unavailable_files(conn, scan_time, paths):
         AND path LIKE ?
         ''', (scan_time, path + '%'))
 
-def get_file_by_path(conn, path):
+def get_file_by_path(conn: sqlite3.Connection, path: str):
     cursor = conn.cursor()
 
     cursor.execute('''
@@ -255,7 +254,7 @@ def hard_update_items_available():
     conn.close()
 
 
-def find_working_paths(conn, excluded_tag_setter=None):
+def find_working_paths(conn: sqlite3.Connection, excluded_tag_setter=None):
     cursor = conn.cursor()
     if excluded_tag_setter:
         # Get all unique sha256 hashes excluding those with a tag set by the given author
@@ -300,7 +299,7 @@ def find_working_paths(conn, excluded_tag_setter=None):
                     break
     return working_paths
 
-def get_working_path_by_sha256(conn, sha256: str) -> Tuple[str, str] | None:
+def get_working_path_by_sha256(conn: sqlite3.Connection, sha256: str) -> Tuple[str, str] | None:
     cursor = conn.cursor()
     # First, try to find a path with available = 1
     cursor.execute('SELECT path, last_modified FROM files WHERE sha256 = ? AND available = 1', (sha256,))
@@ -323,7 +322,7 @@ def get_working_path_by_sha256(conn, sha256: str) -> Tuple[str, str] | None:
                 return path, path_tuple[1]
     return None
 
-def get_all_tags_for_item(conn, sha256):
+def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
     SELECT namespace, name, value, confidence, setter, time, last_set
@@ -351,7 +350,7 @@ def get_tag_names_list(conn):
     tag_names = cursor.fetchall()
     return [tag[0] for tag in tag_names]
 
-def get_items_by_tag_name(conn, tag_name):
+def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     cursor = conn.cursor()
     cursor.execute('''
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen
@@ -362,7 +361,7 @@ def get_items_by_tag_name(conn, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(conn, tags, min_confidence=0.5, page_size=1000, page=1):
+def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1):
     cursor = conn.cursor()
     if page_size < 1:
         page_size = 1000000
@@ -404,3 +403,26 @@ def find_paths_by_tags(tags, min_confidence=0.5, page_size=1000, page=1):
             })
     conn.close()
     return results
+
+def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
+    cursor = conn.cursor()
+    # Check if the folder already exists and has the same included status
+    cursor.execute('SELECT included FROM folders WHERE path = ?', (folder_path,))
+    existing_folder = cursor.fetchone()
+    if existing_folder and existing_folder[0] == included:
+        return
+
+    cursor.execute('''
+    INSERT INTO folders (time_added, path, included)
+    VALUES (?, ?, ?)
+    ''', (time, folder_path, included))
+
+def remove_folder_from_database(conn: sqlite3.Connection, folder_path: str):
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM folders WHERE path = ?', (folder_path,))
+
+def get_folders_from_database(conn: sqlite3.Connection, included=True):
+    cursor = conn.cursor()
+    cursor.execute('SELECT path FROM folders WHERE included = ?', (included,))
+    folders = cursor.fetchall()
+    return [folder[0] for folder in folders]
