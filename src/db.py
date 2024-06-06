@@ -334,31 +334,68 @@ def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1):
+def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None) -> Tuple[List[Tuple], int]:
     cursor = conn.cursor()
     if page_size < 1:
         page_size = 1000000
 
     offset = (page - 1) * page_size
+
+    # Add condition for include_path if provided
+    path_condition = ""
+    if include_path:
+        path_condition = " AND files.path LIKE ? || '%'"
+
+    # First query to get the total count of items matching the criteria
+    count_query = '''
+    SELECT COUNT(*)
+    FROM (
+        SELECT items.sha256
+        FROM items
+        JOIN tags ON items.sha256 = tags.item
+        JOIN files ON items.sha256 = files.sha256
+        WHERE tags.name IN ({}) AND tags.confidence >= ? {}
+        GROUP BY items.sha256
+        HAVING COUNT(DISTINCT tags.name) = ?
+    )
+    '''.format(','.join(['?']*len(tags)), path_condition)
+
+    count_params = tags + [min_confidence]
+    if include_path:
+        count_params.append(include_path)
+    count_params.append(len(tags))
+
+    cursor.execute(count_query, count_params)
+    total_count: int = cursor.fetchone()[0]
+
+    # Second query to get the items with pagination
     query = '''
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN tags ON items.sha256 = tags.item
     JOIN files ON items.sha256 = files.sha256
-    WHERE tags.name IN ({}) AND tags.confidence >= ?
+    WHERE tags.name IN ({}) AND tags.confidence >= ? {}
     GROUP BY items.sha256
     HAVING COUNT(DISTINCT tags.name) = ?
     ORDER BY last_modified DESC
     LIMIT ? OFFSET ?
-    '''.format(','.join(['?']*len(tags)))
-    cursor.execute(query, tags + [min_confidence, len(tags), page_size, offset])
-    items = cursor.fetchall()
-    return items
+    '''.format(','.join(['?']*len(tags)), path_condition)
 
-def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1):
+    query_params = tags + [min_confidence]
+    if include_path:
+        query_params.append(include_path)
+    query_params.extend([len(tags), page_size, offset])
+
+    cursor.execute(query, query_params)
+    items = cursor.fetchall()
+
+    return items, total_count
+
+def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None):
     results = []
-    for item in find_items_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page):
+    items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path)
+    for item in items:
         if os.path.exists(item[7]):
             results.append({
                 'sha256': item[0],
@@ -373,7 +410,7 @@ def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
                 'path': result[0],
                 'last_modified': result[1]
             })
-    return results
+    return results, total_count
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()

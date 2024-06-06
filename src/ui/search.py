@@ -6,14 +6,15 @@ import json
 from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
 
-def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1):
+def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1, include_path: str = None):
     tags = tags_str.split()
     conn = get_database_connection()
-    results = find_paths_by_tags(conn, tags, page_size=results_per_page, min_confidence=min_tag_confidence, page=page)  
+    results, total_results = find_paths_by_tags(conn, tags, page_size=results_per_page, min_confidence=min_tag_confidence, page=page, include_path=include_path)  
     conn.close()
     # Create a list of image paths to be displayed
     images = [(result['path'], json.dumps(result)) for result in results]
-    return gr.update(value=images, columns=columns), str(len(images))
+    print(f"Found {total_results} images")
+    return gr.update(value=images, columns=columns), total_results
 
 def on_select_image(evt: gr.SelectData):
     pathstr = json.loads(evt.value['caption'])['path']
@@ -36,12 +37,12 @@ def create_search_UI():
             tag_input = gr.Textbox(label="Enter tags separated by spaces")
             min_confidence = gr.Slider(minimum=0.1, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags")
         with gr.Row():
-            max_results = gr.Slider(minimum=0, maximum=500, value=5, step=5, label="Limit number of results (0 for maximum)")
+            max_results = gr.Slider(minimum=0, maximum=500, value=10, step=5, label="Limit number of results (0 for maximum)")
             columns_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Number of columns")
         with gr.Row():
             with gr.Column():
                 submit_button = gr.Button("Find Images")
-                number_of_results = gr.Text(value="0", label="Results Displayed", interactive=False)
+                number_of_results = gr.Number(value=0, label="Total Results", interactive=False)
             with gr.Column():
                 image_path_output = gr.Text(value="", label="Last Selected Image Path", interactive=False, visible=False)
                 with gr.Row():
