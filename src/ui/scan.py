@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import gradio as gr
+
 from src.folders import add_folders, remove_folders, execute_folder_scan
 from src.db import get_folders_from_database, get_database_connection
 from src.tags import scan_and_predict_tags

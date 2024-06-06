@@ -1,8 +1,8 @@
 import os
 import sqlite3
 from datetime import datetime
-import time
 from typing import Dict, List, Tuple
+
 from src.utils import normalize_path
 
 def get_database_connection() -> sqlite3.Connection:

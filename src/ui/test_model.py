@@ -1,11 +1,7 @@
-#!/usr/bin/env python
-
 from __future__ import annotations
 
-import deepdanbooru as dd
 import gradio as gr
 import PIL.Image
-import tensorflow as tf
 
 from src.tags import predict, load_labels, load_model
 

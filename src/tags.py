@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from __future__ import annotations
 
 import os
@@ -11,6 +9,7 @@ import huggingface_hub
 import numpy as np
 import PIL.Image
 import tensorflow as tf
+
 from src.db import insert_tag, find_working_paths_without_tags
 
 def get_threshold_from_env() -> float:
