@@ -22,7 +22,7 @@ def on_select_image(evt: gr.SelectData):
     pathstr = json.loads(evt.value['caption'])['path']
     return gr.update(visible=True, value=pathstr), pathstr, gr.update(visible=True), gr.update(visible=True)
 
-def on_select_tag(evt: gr.SelectData): 
+def on_select_tag(evt: gr.SelectData):
     sha256 = json.loads(evt.value['caption'])['sha256']
     conn = get_database_connection()
     tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
