@@ -5,10 +5,8 @@ from __future__ import annotations
 import os
 from datetime import datetime
 import sqlite3
-import time
 
 import deepdanbooru as dd
-import gradio as gr
 import huggingface_hub
 import numpy as np
 import PIL.Image
@@ -56,29 +54,17 @@ def predict(image: PIL.Image.Image, score_threshold: float, model: tf.keras.Mode
     result_text = ", ".join(result_all.keys())
     return result_threshold, result_all, result_text
 
-def scan_and_predict_tags(setter="deepdanbooru"):
+def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
     model = load_model()
     labels = load_labels()
     threshold = get_threshold_from_env()
-    conn = get_database_connection()
 
-    successful_insert = False
-    while not successful_insert:
-        try:
-            scan_time = datetime.now().isoformat()
-            # Start a transaction
-            cursor = conn.cursor()
-            cursor.execute('BEGIN')
-            cursor.execute('''
-            INSERT INTO tag_scans (start_time, setter)
-            VALUES (?, ?)
-            ''', (scan_time, setter))
-            successful_insert = True
-
-        except sqlite3.IntegrityError:
-            # Rollback the transaction on failure and wait before retrying
-            conn.rollback()
-            time.sleep(1)
+    scan_time = datetime.now().isoformat()
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO tag_scans (start_time, setter)
+    VALUES (?, ?)
+    ''', (scan_time, setter))
 
     for sha256, path in find_working_paths(conn, setter).items():
         image = PIL.Image.open(path)
@@ -109,5 +95,3 @@ def scan_and_predict_tags(setter="deepdanbooru"):
         SET end_time = ?
         WHERE start_time = ? AND setter = ?
     ''', (scan_end_time, scan_time, setter))
-    conn.commit()
-    conn.close()

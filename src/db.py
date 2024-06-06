@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime
 import time
 from typing import Dict, List, Tuple
+from src.utils import normalize_path
 
 def get_database_connection() -> sqlite3.Connection:
     db_file = os.getenv('DB_FILE', 'sqlite.db')
@@ -164,25 +165,17 @@ def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
             ''', (sha256, path, last_modified, scan_time))
 
 def save_items_to_database(conn: sqlite3.Connection, files_data: Dict[str, Dict[str, str]], paths: List[str]):
-    while True:
-        try:
-            scan_time = datetime.now().isoformat()
+    scan_time = datetime.now().isoformat()
 
-            # Start a transaction
-            cursor = conn.cursor()
+    # Start a transaction
+    cursor = conn.cursor()
 
-            # Insert a scan entry for each parent folder path
-            for path in paths:
-                cursor.execute('''
-                INSERT INTO file_scans (time, path)
-                VALUES (?, ?)
-                ''', (scan_time, path))
-            break
-
-        except sqlite3.IntegrityError:
-            # Rollback the transaction on failure and wait before retrying
-            conn.rollback()
-            time.sleep(1)
+    # Insert a scan entry for each parent folder path
+    for path in paths:
+        cursor.execute('''
+        INSERT INTO file_scans (time, path)
+        VALUES (?, ?)
+        ''', (scan_time, path))
 
     for _, image_data in files_data.items():
         insert_or_update_file_data(conn, image_data, scan_time)
@@ -224,9 +217,8 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
 
     return file_dict
 
-def hard_update_items_available():
+def hard_update_items_available(conn: sqlite3.Connection):
     # This function is used to update the availability of files in the database
-    conn = get_database_connection()
     cursor = conn.cursor()
     
     cursor.execute('SELECT path FROM files')
@@ -239,9 +231,6 @@ def hard_update_items_available():
         SET Available = ?
         WHERE path = ?
         ''', (available, path))
-    
-    conn.commit()
-    conn.close()
 
 
 def find_working_paths(conn: sqlite3.Connection, excluded_tag_setter=None):
@@ -396,6 +385,7 @@ def find_paths_by_tags(tags, min_confidence=0.5, page_size=1000, page=1):
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()
+    folder_path = normalize_path(folder_path)
     # Check if the folder already exists and has the same included status
     cursor.execute('SELECT included FROM folders WHERE path = ?', (folder_path,))
     existing_folder = cursor.fetchone()

@@ -44,3 +44,15 @@ def open_in_explorer(image_path):
         return f"Attempting to open: {image_path}"
     else:
         return "File does not exist"
+
+def ensure_trailing_slash(path: str) -> str:
+    """
+    Ensure the path ends with a trailing slash appropriate for the OS.
+    """
+    return os.path.join(path, '')
+
+def normalize_path(path: str) -> str:
+    """
+    Normalize the path to be in our preferred format.
+    """
+    return ensure_trailing_slash(os.path.abspath(path.strip()))

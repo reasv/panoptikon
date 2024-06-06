@@ -6,14 +6,21 @@ import mimetypes
 from typing import List
 
 from .db import get_file_by_path, get_database_connection
+from src.utils import normalize_path
 
 def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
-    excluded_paths = [os.path.abspath(excluded_path) for excluded_path in excluded_paths]
-    starting_points = [os.path.abspath(starting_point) for starting_point in starting_points]
+    excluded_paths = [normalize_path(excluded_path) for excluded_path in excluded_paths]
+    starting_points = [normalize_path(starting_point) for starting_point in starting_points]
     for starting_point in starting_points:
         for root, dirs, files in os.walk(starting_point):
-            # Skip directories that are in the excluded paths
-            dirs[:] = [d for d in dirs if os.path.abspath(os.path.join(root, d)) not in excluded_paths]
+            # Normalize root path with trailing slash
+            root_with_slash = normalize_path(root)
+            
+            # Filter directories: exclude if they start with any excluded path
+            dirs[:] = [
+                d for d in dirs 
+                if not any(root_with_slash.startswith(excluded) for excluded in excluded_paths)
+            ]
             for file in files:
                 if any(file.lower().endswith(ext) for ext in extensions):
                     yield os.path.join(root, file)
@@ -46,6 +53,7 @@ def scan_files(
                 sha256 = file_data["sha256"]
 
         if not sha256:
+            print(f"Calculating hashes for {file_path}")
             md5, sha256 = calculate_hashes(file_path)
 
         if result[sha256]['size'] == 0:
