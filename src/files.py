@@ -3,15 +3,22 @@ import hashlib
 from collections import defaultdict
 from datetime import datetime
 import mimetypes
+from typing import List
 
 from .db import get_file_by_path, initialize_database, get_database_connection
 
-def get_files_by_extension(starting_points, extensions):
+def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
+    excluded_paths = [os.path.abspath(excluded_path) for excluded_path in excluded_paths]
+    
     for starting_point in starting_points:
-        for root, _, files in os.walk(starting_point):
+        for root, dirs, files in os.walk(starting_point):
+            # Skip directories that are in the excluded paths
+            dirs[:] = [d for d in dirs if os.path.abspath(os.path.join(root, d)) not in excluded_paths]
+
             for file in files:
                 if any(file.lower().endswith(ext) for ext in extensions):
                     yield os.path.join(root, file)
+
 
 def calculate_hashes(file_path):
     hash_md5 = hashlib.md5()
