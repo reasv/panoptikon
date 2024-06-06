@@ -27,6 +27,9 @@ def on_select_tag(evt: gr.SelectData):
     text = ", ".join(tags.keys())
     return tags, text
 
+def on_tag_click(evt: gr.SelectData):
+    return evt.value
+
 def create_search_UI():
     with gr.Column(elem_classes="centered-content", scale=0):
         with gr.Row():
@@ -68,12 +71,13 @@ def create_search_UI():
 
     image_output.select(on_select_image, None, [image_path_output, image_preview, open_file_button, open_file_explorer])
     image_output.select(on_select_tag, None, [tag_list, tag_text])
-    tag_list.select(lambda evt: evt.value, None, [tag_input])
+    tag_list.select(on_tag_click, None, [tag_input])
 
     open_file_button.click(
         fn=open_file,
         inputs=image_path_output,
     )
+    
     open_file_explorer.click(
         fn=open_in_explorer,
         inputs=image_path_output,
