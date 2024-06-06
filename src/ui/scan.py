@@ -20,10 +20,8 @@ def get_excluded_folders():
     return "\n".join(folders)
 
 def update_folders(included_folders_text: str, excluded_folders_text: str):
-    print(included_folders_text, excluded_folders_text)
     new_included_folders = [normalize_path(p) for p in included_folders_text.strip().split("\n")] if len(included_folders_text.strip()) > 0 else []
     new_excluded_folders = [normalize_path(p) for p in excluded_folders_text.strip().split("\n")] if len(excluded_folders_text.strip()) > 0 else []
-    print(new_included_folders, new_excluded_folders)
     conn = get_database_connection()
     current_included_folders = get_folders_from_database(conn, included=True)
     current_excluded_folders = get_folders_from_database(conn, included=False)
