@@ -8,6 +8,7 @@ import json
 from src import find_paths_by_tags, get_all_tags_for_item_name_confidence
 from src.utils import open_file, open_in_explorer
 from src.ui_scan import create_scan_UI
+from src.ui_toptags import create_toptags_UI
 
 def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, page: int = 1):
     tags = tags_str.split()
@@ -62,6 +63,8 @@ def create_UI():
                                         tag_text = gr.Textbox(label="Tags", interactive=False, lines=5)
             with gr.TabItem(label="File Scan & Tagging"):
                 create_scan_UI()
+            with gr.TabItem(label="Tag Frequency"):
+                create_toptags_UI()
 
         submit_button.click(
             fn=search_by_tags,
