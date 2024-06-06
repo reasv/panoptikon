@@ -60,7 +60,6 @@ def scan_and_predict_tags(setter="deepdanbooru"):
     model = load_model()
     labels = load_labels()
     threshold = get_threshold_from_env()
-    initialize_database()
     conn = get_database_connection()
 
     successful_insert = False

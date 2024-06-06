@@ -5,9 +5,6 @@ from src.db import add_folder_to_database, get_folders_from_database, add_folder
 from src.files import scan_files, get_image_extensions, get_video_extensions, get_audio_extensions
 
 def add_new_included_folders_and_scan(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    cursor = conn.cursor()
-    # Start a transaction
-    cursor.execute('BEGIN')
     add_time = datetime.now().isoformat()
     try:
         for folder in paths:
@@ -28,6 +25,9 @@ def execute_folder_scan(
         commit = False
     ) -> Tuple[bool, str]:
 
+    cursor = conn.cursor()
+    if commit:
+        cursor.execute('BEGIN')
     if included_folders is None:
         included_folders = get_folders_from_database(conn, included=True)
 
@@ -45,8 +45,6 @@ def execute_folder_scan(
     return True, "Scan completed successfully"
 
 def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    cursor = conn.cursor()
-    cursor.execute('BEGIN')
     try:
         for folder in paths:
             add_folder_to_database(conn, datetime.now().isoformat(), folder, included=False)
@@ -60,7 +58,6 @@ def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tupl
 
 def remove_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
     cursor = conn.cursor()
-    cursor.execute('BEGIN')
     try:
         for folder in paths:
             cursor.execute('DELETE FROM folders WHERE path = ? AND included = 0', (folder,))
@@ -71,7 +68,6 @@ def remove_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple
 
 def remove_included_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
     cursor = conn.cursor()
-    cursor.execute('BEGIN')
     try:
         for folder in paths:
             cursor.execute('DELETE FROM folders WHERE path = ? AND included = 1', (folder,))
@@ -88,7 +84,9 @@ def remove_included_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple
 def add_folders(conn: sqlite3.Connection, included: List[str] = [], excluded: List[str] = []) -> Tuple[bool, str]:
     if len(included) == 0 and len(excluded) == 0:
         return False, "No folders provided"
-    
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+
     if len(excluded) > 0:
         success, message = add_new_excluded_folders(conn, excluded)
         if not success:
@@ -104,6 +102,9 @@ def add_folders(conn: sqlite3.Connection, included: List[str] = [], excluded: Li
 def remove_folders(conn: sqlite3.Connection, included: List[str] = [], excluded: List[str] = []) -> Tuple[bool, str]:
     if len(included) == 0 and len(excluded) == 0:
         return False, "No folders provided"
+    
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
     
     if len(excluded) > 0:
         success, message = remove_excluded_folders(conn, excluded)
