@@ -19,3 +19,8 @@
     background: #1565c0;
     border-radius: 100vh;
 }
+
+#bighistoryPreview img {
+    max-height: 80vh !important;
+    object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
+}
