@@ -61,7 +61,6 @@ def on_tag_click(evt: gr.SelectData):
 def get_folder_list():
     conn = get_database_connection()
     folders = get_folders_from_database(conn)
-    print(folders)
     conn.close()
     return folders
 
