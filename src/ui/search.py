@@ -98,7 +98,7 @@ def create_search_UI(select_history: gr.State = None):
                 with gr.Column(scale=1):
                     file_list = gr.Dataset(label="Results", type="values", samples_per_page=12, samples=[], components=["image", "textbox"], scale=1)
                 with gr.Column(scale=2):
-                    image_preview = gr.Image(elem_id="largeSearchPreview", value="./static/404.png", label="Selected Image")
+                    image_preview = gr.Image(elem_id="largeSearchPreview", value=None, label="Selected Image")
                 with gr.Column(scale=1):
                     with gr.Tabs():
                         with gr.Tab(label="Tags"):
