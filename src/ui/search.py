@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import List
 
 import gradio as gr
 import json
@@ -19,7 +20,10 @@ def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, resul
     # Create a list of image paths to be displayed
     images = [(result['path'], json.dumps(result)) for result in results]
     print(f"Found {total_results} images")
-    return gr.update(value=images, columns=columns), total_results, gr.update(value=page, maximum=int(total_results/results_per_page))
+    # Calculate the total number of pages, we need to round up
+    total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
+    
+    return gr.update(value=images, columns=columns), total_results, gr.update(value=page, maximum=int(total_pages))
 
 def search_by_tags_next_page(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     return search_by_tags(tags_str, columns, min_tag_confidence, results_per_page, include_path, page+1)
@@ -27,17 +31,20 @@ def search_by_tags_next_page(tags_str: str, columns: int, min_tag_confidence: fl
 def search_by_tags_previous_page(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     return search_by_tags(tags_str, columns, min_tag_confidence, results_per_page, include_path, page-1)
 
-def on_select_image(evt: gr.SelectData):
-    pathstr = json.loads(evt.value['caption'])['path']
-    return gr.update(visible=True, value=pathstr), pathstr, gr.update(visible=True), gr.update(visible=True)
+def on_select_image(evt: gr.SelectData, select_history: List[str]):
+    image_data = json.loads(evt.value['caption'])
+    select_history.append(image_data)
+    # Get the path of the image
+    pathstr = image_data['path']
 
-def on_select_tag(evt: gr.SelectData):
-    sha256 = json.loads(evt.value['caption'])['sha256']
+    # Get the tags for the image
+    sha256 = image_data['sha256']
     conn = get_database_connection()
     tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
     conn.close()
+    # Tags in the format "tag1, tag2, tag3"
     text = ", ".join(tags.keys())
-    return tags, text
+    return gr.update(visible=True, value=pathstr), pathstr, gr.update(visible=True), gr.update(visible=True), tags, text, select_history
 
 def on_tag_click(evt: gr.SelectData):
     return evt.value
@@ -54,7 +61,7 @@ def input_folder(evt):
 def change_page(evt):
     return evt
 
-def create_search_UI():
+def create_search_UI(select_history: gr.State = None):
     with gr.Column(elem_classes="centered-content", scale=0):
         with gr.Row():
             tag_input = gr.Textbox(label="Enter tags separated by spaces", value='rating:safe', scale=3)
@@ -116,8 +123,15 @@ def create_search_UI():
         outputs=[image_output, number_of_results, current_page]
     )
 
-    image_output.select(on_select_image, None, [image_path_output, image_preview, open_file_button, open_file_explorer])
-    image_output.select(on_select_tag, None, [tag_list, tag_text])
+    image_output.select(
+        fn=on_select_image,
+        inputs=[select_history],
+        outputs=[
+            image_path_output, image_preview, open_file_button, open_file_explorer,
+            tag_list, tag_text, select_history
+        ]
+    )
+
     tag_list.select(on_tag_click, None, [tag_input])
 
     open_file_button.click(
