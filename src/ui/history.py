@@ -7,7 +7,8 @@ import gradio as gr
 def get_history_paths(select_history: gr.State):
     print(f"History length is {len(select_history)}")
     # Should be in reverse order
-    return [item['path'] for item in select_history[::-1]]
+    reverse = [item['path'] for item in select_history[::-1]]
+    return reverse
 
 def set_columns(columns: int):
     return gr.update(columns=columns)
