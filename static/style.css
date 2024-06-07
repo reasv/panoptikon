@@ -26,8 +26,8 @@
 }
 
 #largeSearchPreview img {
-    max-height: 80vh !important;
-    min-height: 80vh !important;
+    max-height: 77vh !important;
+    min-height: 77vh !important;
     object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
 }
 

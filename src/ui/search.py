@@ -53,7 +53,7 @@ def process_image_selection(image_data: dict, select_history: List[str]):
     conn.close()
     # Tags in the format "tag1, tag2, tag3"
     text = ", ".join(tags.keys())
-    return gr.update(visible=True, value=pathstr), pathstr, gr.update(visible=True), gr.update(visible=True), tags, text, select_history
+    return gr.update(value=pathstr), pathstr, gr.update(interactive=True), gr.update(interactive=True), tags, text, select_history
 
 def on_tag_click(evt: gr.SelectData):
     return evt.value
@@ -78,20 +78,18 @@ def create_search_UI(select_history: gr.State = None):
             submit_button = gr.Button("Search", scale=1)
             number_of_results = gr.Number(value=0, label="Total Results", interactive=False)
         with gr.Row():
-            max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=5, label="Results per page (0 for max)")
-            columns_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Number of columns")
+            max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=1)
+            selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=1)
         with gr.Row():
-            with gr.Column():
-                selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)
-            with gr.Column():
-                with gr.Row():
-                    image_path_output = gr.Text(value="", label="Last Selected Image Path", interactive=False, visible=False)
-                    with gr.Column():
-                        open_file_button = gr.Button("Open File", visible=False)
-                        open_file_explorer = gr.Button("Show in File Manager", visible=False)
+            with gr.Row():
+                image_path_output = gr.Text(value="", label="Last Selected Image", interactive=False)
+                with gr.Column():
+                    open_file_button = gr.Button("Open File", interactive=False)
+                    open_file_explorer = gr.Button("Show in File Manager", interactive=False)
 
     with gr.Tabs():
         with gr.TabItem(label="Gallery"):
+            columns_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Number of columns")
             image_output = gr.Gallery(label="Results", scale=2)
         with gr.TabItem(label="List"):
             with gr.Row():
@@ -102,9 +100,10 @@ def create_search_UI(select_history: gr.State = None):
                 with gr.Column(scale=1):
                     with gr.Tabs():
                         with gr.Tab(label="Tags"):
-                            tag_list = gr.Label(label="Tags", show_label=False)
-                        with gr.Tab(label="Tags list"):
                             tag_text = gr.Textbox(label="Tags", interactive=False, lines=5)
+                        with gr.Tab(label="Tags Confidence"):
+                            tag_list = gr.Label(label="Tags", show_label=False)
+                        
         with gr.Row(elem_id="pagination"):
                 previous_page = gr.Button("Previous Page", scale=1)
                 current_page = gr.Slider(value=1, label="Current Page", maximum=1, minimum=1, step=1, scale=2)
