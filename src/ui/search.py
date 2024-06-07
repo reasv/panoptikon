@@ -22,8 +22,8 @@ def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, resul
     print(f"Found {total_results} images")
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
-    
-    return gr.update(value=images, columns=columns), total_results, gr.update(value=page, maximum=int(total_pages))
+    item_list  = [[item['path'], item['path'], item["sha256"]] for item in results]
+    return gr.update(value=images, columns=columns), total_results, gr.update(value=page, maximum=int(total_pages)), gr.update(samples=item_list)
 
 def search_by_tags_next_page(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     return search_by_tags(tags_str, columns, min_tag_confidence, results_per_page, include_path, page+1)
@@ -33,6 +33,15 @@ def search_by_tags_previous_page(tags_str: str, columns: int, min_tag_confidence
 
 def on_select_image(evt: gr.SelectData, select_history: List[str]):
     image_data = json.loads(evt.value['caption'])
+    return process_image_selection(image_data, select_history)
+
+def on_select_image_list(dataset_data, select_history: List[str]):
+    sha256 = dataset_data[2]
+    pathstr = dataset_data[1]
+    image_data = {'path': pathstr, 'sha256': sha256}
+    return process_image_selection(image_data, select_history)
+
+def process_image_selection(image_data: dict, select_history: List[str]):
     select_history.append(image_data)
     # Get the path of the image
     pathstr = image_data['path']
@@ -88,10 +97,12 @@ def create_search_UI(select_history: gr.State = None):
                 previous_page = gr.Button("Previous Page", scale=1)
                 current_page = gr.Slider(value=1, label="Current Page", maximum=1, minimum=1, step=1, scale=2)
                 next_page = gr.Button("Next Page", scale=1)
-        with gr.TabItem(label="Selected Image"):
+        with gr.TabItem(label="List"):
             with gr.Row():
+                with gr.Column(scale=1):
+                    file_list = gr.Dataset(label="Results", type="values", samples_per_page=15, samples=[], components=["image", "textbox"], scale=1)
                 with gr.Column(scale=2):
-                    image_preview = gr.Image(value="./static/404.png", label="Selected Image")
+                    image_preview = gr.Image(elem_id="largeSearchPreview", value="./static/404.png", label="Selected Image")
                 with gr.Column(scale=1):
                     with gr.Tabs():
                         with gr.Tab(label="Tags"):
@@ -102,30 +113,39 @@ def create_search_UI(select_history: gr.State = None):
     submit_button.click(
         fn=search_by_tags,
         inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder], 
-        outputs=[image_output, number_of_results, current_page]
+        outputs=[image_output, number_of_results, current_page, file_list]
     )
 
     current_page.release(
         fn=search_by_tags,
         inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page]
+        outputs=[image_output, number_of_results, current_page, file_list]
     )
 
     previous_page.click(
         fn=search_by_tags_previous_page,
         inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page]
+        outputs=[image_output, number_of_results, current_page, file_list]
     )
 
     next_page.click(
         fn=search_by_tags_next_page,
         inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page]
+        outputs=[image_output, number_of_results, current_page, file_list]
     )
 
     image_output.select(
         fn=on_select_image,
         inputs=[select_history],
+        outputs=[
+            image_path_output, image_preview, open_file_button, open_file_explorer,
+            tag_list, tag_text, select_history
+        ]
+    )
+
+    file_list.click(
+        fn=on_select_image_list,
+        inputs=[file_list, select_history],
         outputs=[
             image_path_output, image_preview, open_file_button, open_file_explorer,
             tag_list, tag_text, select_history

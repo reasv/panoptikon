@@ -24,3 +24,8 @@
     max-height: 80vh !important;
     object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
 }
+
+#largeSearchPreview img {
+    max-height: 80vh !important;
+    object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
+}
