@@ -93,10 +93,6 @@ def create_search_UI(select_history: gr.State = None):
     with gr.Tabs():
         with gr.TabItem(label="Gallery"):
             image_output = gr.Gallery(label="Results", scale=2)
-            with gr.Row():
-                previous_page = gr.Button("Previous Page", scale=1)
-                current_page = gr.Slider(value=1, label="Current Page", maximum=1, minimum=1, step=1, scale=2)
-                next_page = gr.Button("Next Page", scale=1)
         with gr.TabItem(label="List"):
             with gr.Row():
                 with gr.Column(scale=1):
@@ -109,6 +105,10 @@ def create_search_UI(select_history: gr.State = None):
                             tag_list = gr.Label(label="Tags", show_label=False)
                         with gr.Tab(label="Tags list"):
                             tag_text = gr.Textbox(label="Tags", interactive=False, lines=5)
+        with gr.Row(elem_id="pagination"):
+                previous_page = gr.Button("Previous Page", scale=1)
+                current_page = gr.Slider(value=1, label="Current Page", maximum=1, minimum=1, step=1, scale=2)
+                next_page = gr.Button("Next Page", scale=1)
 
     submit_button.click(
         fn=search_by_tags,
