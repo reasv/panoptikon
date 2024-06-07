@@ -6,8 +6,16 @@
     flex-direction: column;
     align-items: center;
 }
+/* Center the content */
 .centered-content > * {
-    width: 50%;
+    width: 70%;
+}
+
+/* Use full width on smaller devices */
+@media (max-width: 768px) {
+    .centered-content > * {
+        width: 100%;
+    }
 }
 .grid-wrap {
     max-height: 75vh !important
