@@ -17,7 +17,6 @@ def on_tag_click(evt: gr.SelectData):
     return evt.value
 
 # We define a dataclass to use as return value for image_list which contains all the components we want to expose
-
 @dataclass
 class ImageList:
     file_list: gr.Dataset
