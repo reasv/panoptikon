@@ -28,16 +28,16 @@ class GalleryView:
 
 def create_gallery_view(enable_bookmark: bool = True, extra_actions: List[str] = []):
     with gr.Row():
-        columns_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Number of columns")
+        columns_slider = gr.Slider(minimum=1, maximum=15, value=5, step=1, label="Number of columns")
         selected_image_path = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
         selected_image_sha256 = gr.Textbox(value="", label="Last Selected Image SHA256", show_copy_button=True, interactive=False, visible=False) # Hidden
         open_file_button = gr.Button("Open File", interactive=False)
-        open_file_explorer = gr.Button("Show in File Manager", interactive=False)
+        open_file_explorer = gr.Button("Show in Explorer", interactive=False)
         bookmark = gr.Button("Bookmark", interactive=False, visible=enable_bookmark)
         extra: List[gr.Button] = []
         for action in extra_actions:
             extra.append(gr.Button(action, interactive=False))
-        image_output = gr.Gallery(label="Results", scale=2)
+    image_output = gr.Gallery(label="Results", columns=5, scale=2)
 
     def on_selected_image_path_change(path: str):
         nonlocal extra_actions

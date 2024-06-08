@@ -5,9 +5,10 @@ import gradio as gr
 import json
 
 from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection, get_folders_from_database
-from src.utils import open_file, open_in_explorer
+from src.ui.components.gallery_view import create_gallery_view
+from src.ui.components.list_view import create_image_list
 
-def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
+def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     if page < 1: page = 1
 
     include_path = include_path.strip() if include_path is not None else None
@@ -23,23 +24,27 @@ def search_by_tags(tags_str: str, columns: int, min_tag_confidence: float, resul
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
     item_list  = [[item['path'], item['path'], item["sha256"]] for item in results]
-    return gr.update(value=images, columns=columns), total_results, gr.update(value=page, maximum=int(total_pages)), gr.update(samples=item_list)
+    return images, total_results, gr.update(value=page, maximum=int(total_pages)), gr.update(samples=item_list)
 
-def search_by_tags_next_page(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
-    return search_by_tags(tags_str, columns, min_tag_confidence, results_per_page, include_path, page+1)
+def search_by_tags_next_page(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
+    return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, page+1)
 
-def search_by_tags_previous_page(tags_str: str, columns: int, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
-    return search_by_tags(tags_str, columns, min_tag_confidence, results_per_page, include_path, page-1)
+def search_by_tags_previous_page(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
+    return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, page-1)
 
-def on_select_image(evt: gr.SelectData, select_history: List[str]):
+def on_gallery_select_image(evt: gr.SelectData, select_history: List[str]):
     image_data = json.loads(evt.value['caption'])
-    return process_image_selection(image_data, select_history)
+    path = image_data['path']
+    sha256 = image_data['sha256']
+    select_history.append(image_data)
+    return select_history, path, sha256
 
-def on_select_image_list(dataset_data, select_history: List[str]):
+def on_list_select_image(dataset_data, select_history: List[str]):
     sha256 = dataset_data[2]
     pathstr = dataset_data[1]
     image_data = {'path': pathstr, 'sha256': sha256}
-    return process_image_selection(image_data, select_history)
+    select_history.append(image_data)
+    return select_history
 
 def process_image_selection(image_data: dict, select_history: List[str]):
     select_history.append(image_data)
@@ -83,36 +88,14 @@ def create_search_UI(select_history: gr.State = None):
                     with gr.Group():
                         with gr.Row():
                             tag_input = gr.Textbox(label="Enter tags separated by spaces", value='rating:safe', show_copy_button=True, scale=3)
-                            min_confidence = gr.Slider(minimum=0.1, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags", scale=2)
+                            min_confidence = gr.Slider(minimum=0.05, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags", scale=2)
                             max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
         with gr.Tabs():
             with gr.TabItem(label="Gallery"):
-                with gr.Row():
-                    columns_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="Number of columns")
-                    image_path_output = gr.Text(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
-                    with gr.Column():
-                        open_file_button = gr.Button("Open File", interactive=False)
-                        open_file_explorer = gr.Button("Show in File Manager", interactive=False)
-                image_output = gr.Gallery(label="Results", scale=2)
+                gallery_view = create_gallery_view()
             with gr.TabItem(label="List"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
-
-                    with gr.Column(scale=2):
-                        image_preview = gr.Image(elem_id="largeSearchPreview", value=None, label="Selected Image")
-                    with gr.Column(scale=1):
-                        with gr.Tabs():
-                            with gr.Tab(label="Tags"):
-                                tag_text = gr.Textbox(label="Tags", show_copy_button=True, interactive=False, lines=5)
-                            with gr.Tab(label="Tags Confidence"):
-                                tag_list = gr.Label(label="Tags", show_label=False)
-                        image_path_output_list = gr.Text(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
-                        with gr.Row():
-                            open_file_button_list = gr.Button("Open File", interactive=False, scale=3)
-                            open_file_explorer_list = gr.Button("Show in Explorer", interactive=False, scale=3)
-                            bookmark_list = gr.Button("Bookmark", interactive=False, scale=3)
+                list_view = create_image_list(tag_input=tag_input)
 
             with gr.Row(elem_id="pagination"):
                 previous_page = gr.Button("Previous Page", scale=1)
@@ -126,54 +109,36 @@ def create_search_UI(select_history: gr.State = None):
 
     submit_button.click(
         fn=search_by_tags,
-        inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder], 
-        outputs=[image_output, number_of_results, current_page, file_list]
+        inputs=[tag_input, min_confidence, max_results_per_page, selected_folder], 
+        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
     )
 
     current_page.release(
         fn=search_by_tags,
-        inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page, file_list]
+        inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
+        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
     )
 
     previous_page.click(
         fn=search_by_tags_previous_page,
-        inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page, file_list]
+        inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
+        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
     )
 
     next_page.click(
         fn=search_by_tags_next_page,
-        inputs=[tag_input, columns_slider, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[image_output, number_of_results, current_page, file_list]
+        inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
+        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
     )
 
-    image_output.select(
-        fn=on_select_image,
+    gallery_view.image_output.select(
+        fn=on_gallery_select_image,
         inputs=[select_history],
-        outputs=[
-            image_path_output, image_preview, open_file_button, open_file_explorer,
-            tag_list, tag_text, select_history
-        ]
+        outputs=[select_history, list_view.selected_image_path, list_view.selected_image_sha256]
     )
 
-    file_list.click(
-        fn=on_select_image_list,
-        inputs=[file_list, select_history],
-        outputs=[
-            image_path_output_list, image_preview, open_file_button_list, open_file_explorer_list,
-            tag_list, tag_text, select_history
-        ]
-    )
-
-    tag_list.select(on_tag_click, None, [tag_input])
-
-    open_file_button.click(
-        fn=open_file,
-        inputs=image_path_output,
-    )
-    
-    open_file_explorer.click(
-        fn=open_in_explorer,
-        inputs=image_path_output,
+    list_view.file_list.click(
+        fn=on_list_select_image,
+        inputs=[list_view.file_list, select_history],
+        outputs=[select_history]
     )
