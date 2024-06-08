@@ -79,6 +79,17 @@ def initialize_database(conn: sqlite3.Connection):
         UNIQUE(path)  -- Unique constraint on path
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS bookmarks (
+        namespace TEXT NOT NULL, -- Namespace for the bookmark
+        sha256 TEXT NOT NULL, -- SHA256 of the item
+        time_added TEXT NOT NULL, -- Using TEXT to store ISO-8601 formatted datetime
+        metadata TEXT, -- JSON string to store additional metadata
+        FOREIGN KEY(sha256) REFERENCES items(sha256) ON DELETE CASCADE,
+        PRIMARY KEY(namespace, sha256)
+    )
+    ''')
     
     # Create indexes
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_md5 ON items(md5)')
@@ -107,6 +118,9 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_time_added ON folders(time_added)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_path ON folders(path)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_folders_included ON folders(included)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_time_added ON bookmarks(time_added)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_sha256 ON bookmarks(sha256)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_metadata ON bookmarks(metadata)')
 
 def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
     time = scan_time
@@ -394,7 +408,10 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
 
 def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None):
     results = []
-    items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path)
+    if len(tags) == 0:
+        items, total_count = find_items_without_tags(conn, page_size, page, include_path)
+    else:
+        items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path)
     for item in items:
         if os.path.exists(item[7]):
             results.append({
@@ -411,6 +428,57 @@ def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
                 'last_modified': result[1]
             })
     return results, total_count
+
+def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, include_path=None) -> Tuple[List[Tuple], int]:
+    cursor = conn.cursor()
+    if page_size < 1:
+        page_size = 1000000
+
+    offset = (page - 1) * page_size
+
+    # Add condition for include_path if provided
+    path_condition = ""
+    if include_path:
+        path_condition = "AND files.path LIKE ? || '%'"
+
+    # First query to get the total count of items matching the criteria
+    count_query = '''
+    SELECT COUNT(*)
+    FROM (
+        SELECT items.sha256
+        FROM items
+        JOIN files ON items.sha256 = files.sha256 {}
+        GROUP BY items.sha256
+    )
+    '''.format(path_condition)
+
+    count_params = []
+    if include_path:
+        count_params.append(include_path)
+
+    cursor.execute(count_query, count_params)
+    total_count: int = cursor.fetchone()[0]
+
+    # Second query to get the items with pagination
+    query = '''
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
+    MAX(files.last_modified) as last_modified, MIN(files.path) as path
+    FROM items
+    JOIN files ON items.sha256 = files.sha256 {}
+    GROUP BY items.sha256
+    ORDER BY last_modified DESC
+    LIMIT ? OFFSET ?
+    '''.format(path_condition)
+
+    query_params = []
+    if include_path:
+        query_params.append(include_path)
+    query_params.extend([page_size, offset])
+
+    cursor.execute(query, query_params)
+    items = cursor.fetchall()
+
+    return items, total_count
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()
@@ -491,3 +559,46 @@ def get_most_common_tags_frequency(conn: sqlite3.Connection, limit=10):
     # Calculate the frequency
     tags = [(tag[0], tag[1], tag[2], tag[2]/total_count) for tag in tags]
     return tags
+
+def update_bookmarks(conn: sqlite3.Connection, items_sha256: List[str], namespace: str='default'):
+    cursor = conn.cursor()
+    # Add all items as bookmarks, if they don't already exist, in a single query
+    cursor.executemany('''
+    INSERT INTO bookmarks (namespace, sha256, time_added)
+    VALUES (?, ?, ?)
+    ON CONFLICT(sha256) DO NOTHING
+    ''', [(namespace, sha256, datetime.now().isoformat()) for sha256 in items_sha256])
+
+    # Remove all items that are not in the list
+    cursor.execute('''
+    DELETE FROM bookmarks
+    WHERE sha256 NOT IN ({}) AND namespace = ?
+    '''.format(','.join(['?']*len(items_sha256)), items_sha256, namespace))
+
+def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default') -> List[Tuple[str, str]]:
+    cursor = conn.cursor()
+    # Fetch bookmarks with their paths, prioritizing available files
+    cursor.execute('''
+        SELECT bookmarks.sha256, 
+               COALESCE(available_files.path, any_files.path) as path
+        FROM bookmarks
+        LEFT JOIN files AS available_files 
+               ON bookmarks.sha256 = available_files.sha256 
+               AND available_files.available = 1
+        LEFT JOIN files AS any_files 
+               ON bookmarks.sha256 = any_files.sha256
+        WHERE bookmarks.namespace = ?
+        GROUP BY bookmarks.sha256
+        ORDER BY bookmarks.time_added ASC
+    ''', (namespace,))
+    
+    bookmarks = cursor.fetchall()
+    bookmark_tuples: List[Tuple[str, str]] = [(bookmark[0], bookmark[1]) for bookmark in bookmarks]
+    
+    # Check if the paths are available, if not, try to find a working path
+    for i, bookmark in enumerate(bookmark_tuples):
+        if not os.path.exists(bookmark[1]):
+            if result := get_working_path_by_sha256(conn, bookmark[0]):
+                bookmark_tuples[i] = (bookmark[0], result[0])
+    
+    return bookmark_tuples

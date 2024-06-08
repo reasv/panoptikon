@@ -89,7 +89,6 @@ def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[st
             outputs=[bookmark]
         )
 
-
     return GalleryView(
         columns_slider=columns_slider,
         selected_image_path=selected_image_path,
