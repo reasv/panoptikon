@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from src.db import get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
+from src.ui.components.utils import add_bookmark
 
 def on_select_image(dataset_data):
     sha256 = dataset_data[2]
@@ -39,7 +40,7 @@ class ImageList:
     bookmark: gr.Button
     extra: List[gr.Button]
 
-def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
+def create_image_list(bookmarks_state: gr.State = None, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
     with gr.Row():
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
@@ -56,7 +57,7 @@ def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_i
             with gr.Row():
                 btn_open_file = gr.Button("Open File", interactive=False, scale=3)
                 btn_open_file_explorer = gr.Button("Show in Explorer", interactive=False, scale=3)
-                bookmark = gr.Button("Bookmark", interactive=False, scale=3, visible=enable_bookmark)
+                bookmark = gr.Button("Bookmark", interactive=False, scale=3, visible=bookmarks_state != None)
                 extra: List[gr.Button] = []
                 for action in extra_actions:
                     extra.append(gr.Button(action, interactive=False, scale=3))
@@ -100,6 +101,12 @@ def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_i
     btn_open_file_explorer.click(
         fn=open_in_explorer,
         inputs=selected_image_path,
+    )
+
+    bookmark.click(
+        fn=add_bookmark,
+        inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
+        outputs=[bookmarks_state]
     )
 
     return ImageList(

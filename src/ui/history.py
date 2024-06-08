@@ -25,7 +25,7 @@ def erase_history_fn(select_history: List[str], keep_last_n: int):
 def on_gallery_select_image(selected_image_path: str, selected_image_sha256: str):
     return selected_image_path, selected_image_sha256
 
-def create_history_UI(select_history: gr.State):
+def create_history_UI(select_history: gr.State, bookmarks_state: gr.State):
     with gr.TabItem(label="History") as history_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():

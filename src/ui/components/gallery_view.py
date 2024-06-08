@@ -6,6 +6,7 @@ import gradio as gr
 import json
 
 from src.utils import open_file, open_in_explorer
+from src.ui.bookmarks import add_bookmark
 
 def on_select_image(evt: gr.SelectData):
     image_data = json.loads(evt.value['caption'])
@@ -26,14 +27,14 @@ class GalleryView:
     extra: List[gr.Button]
     image_output: gr.Gallery
 
-def create_gallery_view(enable_bookmark: bool = True, extra_actions: List[str] = []):
+def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[str] = []):
     with gr.Row():
         columns_slider = gr.Slider(minimum=1, maximum=15, value=5, step=1, label="Number of columns")
         selected_image_path = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
         selected_image_sha256 = gr.Textbox(value="", label="Last Selected Image SHA256", show_copy_button=True, interactive=False, visible=False) # Hidden
         open_file_button = gr.Button("Open File", interactive=False)
         open_file_explorer = gr.Button("Show in Explorer", interactive=False)
-        bookmark = gr.Button("Bookmark", interactive=False, visible=enable_bookmark)
+        bookmark = gr.Button("Bookmark", interactive=False, visible=bookmarks_state != None)
         extra: List[gr.Button] = []
         for action in extra_actions:
             extra.append(gr.Button(action, interactive=False))
@@ -75,6 +76,12 @@ def create_gallery_view(enable_bookmark: bool = True, extra_actions: List[str] =
     open_file_explorer.click(
         fn=open_in_explorer,
         inputs=selected_image_path,
+    )
+
+    bookmark.click(
+        fn=add_bookmark,
+        inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
+        outputs=[bookmarks_state]
     )
 
     return GalleryView(

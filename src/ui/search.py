@@ -7,6 +7,7 @@ import json
 from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection, get_folders_from_database
 from src.ui.components.gallery_view import create_gallery_view
 from src.ui.components.list_view import create_image_list
+from src.ui.components.history_dict import HistoryDict
 
 def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     if page < 1: page = 1
@@ -46,23 +47,6 @@ def on_list_select_image(dataset_data, select_history: List[str]):
     select_history.append(image_data)
     return select_history
 
-def process_image_selection(image_data: dict, select_history: List[str]):
-    select_history.append(image_data)
-    # Get the path of the image
-    pathstr = image_data['path']
-
-    # Get the tags for the image
-    sha256 = image_data['sha256']
-    conn = get_database_connection()
-    tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
-    conn.close()
-    # Tags in the format "tag1, tag2, tag3"
-    text = ", ".join(tags.keys())
-    return gr.update(value=pathstr), pathstr, gr.update(interactive=True), gr.update(interactive=True), tags, text, select_history
-
-def on_tag_click(evt: gr.SelectData):
-    return evt.value
-
 def get_folder_list():
     conn = get_database_connection()
     folders = get_folders_from_database(conn)
@@ -72,13 +56,7 @@ def get_folder_list():
 def on_tab_load():
     return gr.update(choices=get_folder_list())
 
-def input_folder(evt):
-    return evt
-
-def change_page(evt):
-    return evt
-
-def create_search_UI(select_history: gr.State = None):
+def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State = None):
     with gr.TabItem(label="Tag Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -93,9 +71,9 @@ def create_search_UI(select_history: gr.State = None):
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
         with gr.Tabs():
             with gr.TabItem(label="Gallery"):
-                gallery_view = create_gallery_view()
+                gallery_view = create_gallery_view(bookmarks_state=bookmarks_state)
             with gr.TabItem(label="List"):
-                list_view = create_image_list(tag_input=tag_input)
+                list_view = create_image_list(bookmarks_state=bookmarks_state, tag_input=tag_input)
 
             with gr.Row(elem_classes="pagination-controls"):
                 previous_page = gr.Button("Previous Page", scale=1)
