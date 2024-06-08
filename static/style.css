@@ -18,7 +18,7 @@
     }
 }
 .grid-wrap {
-    max-height: 75vh !important
+    max-height: 70vh !important
 }
 
 #duplicate-button {
@@ -30,15 +30,38 @@
 
 #bighistoryPreview img {
     max-height: 80vh !important;
-    object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
+    object-fit: contain; /* To ensure the image maintains its aspect ratio */
+}
+/* On displays under 4K, max-height should be 72vh */
+
+@media only screen and (max-width: 1970px) {
+    #largeSearchPreview img {
+        max-height: 60vh !important;
+        min-height: 60vh !important;
+        object-fit: contain; /* To ensure the image maintains its aspect ratio */
+    }
 }
 
-#largeSearchPreview img {
-    max-height: 77vh !important;
-    min-height: 77vh !important;
-    object-fit: contain; /* Optional: To ensure the image maintains its aspect ratio */
+@media only screen and (max-height: 1590px) and (min-height: 1256px) and (min-width: 1970px) {
+    #largeSearchPreview img {
+        max-height: 74vh !important;
+        min-height: 74vh !important;
+        object-fit: contain; /* To ensure the image maintains its aspect ratio */
+    }
+}
+
+@media only screen and (min-height: 1590px) {
+    #largeSearchPreview img {
+        max-height: 77vh !important;
+        min-height: 77vh !important;
+        object-fit: contain; /* To ensure the image maintains its aspect ratio */
+    }
 }
 
 #pagination {
     margin-top: 1rem;
+}
+
+footer {
+    display: none !important;
 }
