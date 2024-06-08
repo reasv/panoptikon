@@ -33,10 +33,10 @@ def create_history_UI(select_history: gr.State, bookmarks_state: gr.State):
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
         with gr.Tabs():
             with gr.TabItem(label="Gallery"):
-                history_gallery = create_gallery_view()
+                history_gallery = create_gallery_view(bookmarks_state=bookmarks_state)
 
             with gr.TabItem(label="List"):
-                history_list = create_image_list()
+                history_list = create_image_list(bookmarks_state=bookmarks_state)
 
     history_tab.select(
         fn=get_history_paths,

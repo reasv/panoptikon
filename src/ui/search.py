@@ -4,10 +4,9 @@ from typing import List
 import gradio as gr
 import json
 
-from src.db import find_paths_by_tags, get_all_tags_for_item_name_confidence, get_database_connection, get_folders_from_database
+from src.db import find_paths_by_tags, get_database_connection, get_folders_from_database
 from src.ui.components.gallery_view import create_gallery_view
 from src.ui.components.list_view import create_image_list
-from src.ui.components.history_dict import HistoryDict
 
 def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     if page < 1: page = 1
