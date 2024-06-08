@@ -102,12 +102,12 @@ def create_image_list(bookmarks_state: gr.State = None, extra_actions: List[str]
         fn=open_in_explorer,
         inputs=selected_image_path,
     )
-
-    bookmark.click(
-        fn=add_bookmark,
-        inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
-        outputs=[bookmarks_state]
-    )
+    if bookmarks_state != None:
+        bookmark.click(
+            fn=add_bookmark,
+            inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
+            outputs=[bookmarks_state]
+        )
 
     return ImageList(
         file_list=file_list,

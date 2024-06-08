@@ -43,10 +43,10 @@ def create_bookmarks_UI(bookmarks_state: gr.State):
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
         with gr.Tabs():
             with gr.TabItem(label="Gallery"):
-                bookmarks_gallery = create_gallery_view(extra_actions=["Remove"], enable_bookmark=False)
+                bookmarks_gallery = create_gallery_view(extra_actions=["Remove"])
 
             with gr.TabItem(label="List"):
-                bookmarks_list = create_image_list(extra_actions=["Remove"], enable_bookmark=False)
+                bookmarks_list = create_image_list(extra_actions=["Remove"])
 
     bookmarks_tab.select(
         fn=get_bookmarks_paths,
