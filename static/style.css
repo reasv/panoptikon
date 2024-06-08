@@ -17,25 +17,13 @@
         width: 100%;
     }
 }
-.grid-wrap {
+
+.gallery-view .grid-wrap {
     max-height: 70vh !important
 }
 
-#duplicate-button {
-    margin: auto;
-    color: #fff;
-    background: #1565c0;
-    border-radius: 100vh;
-}
-
-#bighistoryPreview img {
-    max-height: 80vh !important;
-    object-fit: contain; /* To ensure the image maintains its aspect ratio */
-}
-/* On displays under 4K, max-height should be 72vh */
-
 @media only screen and (max-width: 1970px) {
-    #largeSearchPreview img {
+    .listViewImagePreview img {
         max-height: 60vh !important;
         min-height: 60vh !important;
         object-fit: contain; /* To ensure the image maintains its aspect ratio */
@@ -43,7 +31,7 @@
 }
 
 @media only screen and (max-height: 1590px) and (min-height: 1256px) and (min-width: 1970px) {
-    #largeSearchPreview img {
+    .listViewImagePreview img {
         max-height: 74vh !important;
         min-height: 74vh !important;
         object-fit: contain; /* To ensure the image maintains its aspect ratio */
@@ -51,14 +39,14 @@
 }
 
 @media only screen and (min-height: 1590px) {
-    #largeSearchPreview img {
+    .listViewImagePreview img {
         max-height: 77vh !important;
         min-height: 77vh !important;
         object-fit: contain; /* To ensure the image maintains its aspect ratio */
     }
 }
 
-#pagination {
+.pagination-controls {
     margin-top: 1rem;
 }
 

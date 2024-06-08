@@ -97,7 +97,7 @@ def create_search_UI(select_history: gr.State = None):
             with gr.TabItem(label="List"):
                 list_view = create_image_list(tag_input=tag_input)
 
-            with gr.Row(elem_id="pagination"):
+            with gr.Row(elem_classes="pagination-controls"):
                 previous_page = gr.Button("Previous Page", scale=1)
                 current_page = gr.Slider(value=1, label="Current Page", maximum=1, minimum=1, step=1, scale=2)
                 next_page = gr.Button("Next Page", scale=1)

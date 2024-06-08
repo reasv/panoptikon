@@ -44,7 +44,7 @@ def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_i
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
         with gr.Column(scale=2):
-            image_preview = gr.Image(elem_id="largeSearchPreview", value=None, label="Selected Image")
+            image_preview = gr.Image(elem_classes=["listViewImagePreview"], value=None, label="Selected Image")
         with gr.Column(scale=1):
             with gr.Tabs():
                 with gr.Tab(label="Tags"):

@@ -37,7 +37,7 @@ def create_gallery_view(enable_bookmark: bool = True, extra_actions: List[str] =
         extra: List[gr.Button] = []
         for action in extra_actions:
             extra.append(gr.Button(action, interactive=False))
-    image_output = gr.Gallery(label="Results", columns=5, scale=2)
+    image_output = gr.Gallery(label="Results", elem_classes=["gallery-view"], columns=5, scale=2)
 
     def on_selected_image_path_change(path: str):
         nonlocal extra_actions
