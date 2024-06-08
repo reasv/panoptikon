@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import gradio as gr
 
 from src.ui.scan import create_scan_UI
@@ -20,4 +22,4 @@ def create_root_UI():
             create_history_UI(select_history)
             with gr.TabItem(label="Tagging Model"):
                 create_dd_UI()
-    ui.launch()
+    ui.launch(share=(os.getenv("GRADIO_SHARE", False) == "true"), server_name=os.getenv("GRADIO_HOSTNAME", None), server_port=os.getenv("GRADIO_PORT", None))
