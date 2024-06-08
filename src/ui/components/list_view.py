@@ -102,11 +102,12 @@ def create_image_list(bookmarks_state: gr.State = None, extra_actions: List[str]
         fn=open_in_explorer,
         inputs=selected_image_path,
     )
+
     if bookmarks_state != None:
         bookmark.click(
             fn=toggle_bookmark,
-            inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
-            outputs=[bookmarks_state, bookmark]
+            inputs=[bookmarks_state, selected_image_sha256, bookmark],
+            outputs=[bookmark]
         )
         selected_image_sha256.change(
             fn=on_selected_image_get_bookmark_state,

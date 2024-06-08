@@ -595,15 +595,6 @@ def remove_bookmark(conn: sqlite3.Connection, sha256: str, namespace: str='defau
     WHERE sha256 = ? AND namespace = ?
     ''', (sha256, namespace))
 
-def toggle_bookmark_db(conn: sqlite3.Connection, sha256: str, namespace: str='default', metadata: str=None):
-    cursor = conn.cursor()
-    # Use ON CONFLICT to toggle the bookmark
-    cursor.execute('''
-    INSERT INTO bookmarks (namespace, sha256, time_added, metadata)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(sha256) DO DELETE
-    ''', (namespace, sha256, datetime.now().isoformat(), metadata))
-
 def get_bookmark_metadata(conn: sqlite3.Connection, sha256: str, namespace: str='default'):
     cursor = conn.cursor()
     cursor.execute('''
@@ -613,7 +604,7 @@ def get_bookmark_metadata(conn: sqlite3.Connection, sha256: str, namespace: str=
     ''', (sha256, namespace))
     metadata = cursor.fetchone()
     
-    return True, metadata[0] if metadata else False, None
+    return (True, metadata[0]) if metadata else (False, None)
 
 def delete_bookmarks_exclude_last_n(conn: sqlite3.Connection, n: int, namespace: str = 'default'):
     cursor = conn.cursor()
@@ -643,7 +634,7 @@ def get_all_bookmark_namespaces(conn: sqlite3.Connection) -> List[str]:
     namespaces = cursor.fetchall()
     return [namespace[0] for namespace in namespaces]
 
-def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_size=1000, page=1,) -> List[Tuple[str, str]]:
+def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_size=1000, page=1,) -> Tuple[List[Tuple[str, str]], int]:
     if page_size < 1:
         page_size = 1000000
     offset = (page - 1) * page_size
