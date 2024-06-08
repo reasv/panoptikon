@@ -39,7 +39,7 @@ class ImageList:
     bookmark: gr.Button
     extra: List[gr.Button]
 
-def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_input: gr.Textbox = None, ):
+def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
     with gr.Row():
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
