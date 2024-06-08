@@ -6,7 +6,7 @@ import gradio as gr
 import json
 
 from src.utils import open_file, open_in_explorer
-from src.ui.components.utils import add_bookmark
+from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
 
 def on_select_image(evt: gr.SelectData):
     image_data = json.loads(evt.value['caption'])
@@ -79,10 +79,16 @@ def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[st
     )
     if bookmarks_state != None:
         bookmark.click(
-            fn=add_bookmark,
+            fn=toggle_bookmark,
             inputs=[bookmarks_state, selected_image_sha256, selected_image_path],
-            outputs=[bookmarks_state]
+            outputs=[bookmarks_state, bookmark]
         )
+        selected_image_sha256.change(
+            fn=on_selected_image_get_bookmark_state,
+            inputs=[bookmarks_state, selected_image_sha256],
+            outputs=[bookmark]
+        )
+
 
     return GalleryView(
         columns_slider=columns_slider,
