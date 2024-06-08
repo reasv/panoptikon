@@ -20,7 +20,7 @@ def erase_history_fn(select_history: List[str], keep_last_n: int):
         select_history = []
     print("History erased")
     gallery_update, list_update = get_history_paths(select_history)
-    return select_history, gallery_update, list_update
+    return select_history, gallery_update, list_update, None, None, None, None
 
 def on_gallery_select_image(selected_image_path: str, selected_image_sha256: str):
     return selected_image_path, selected_image_sha256
@@ -47,7 +47,11 @@ def create_history_UI(select_history: gr.State, bookmarks_state: gr.State):
     erase_history.click(
         fn=erase_history_fn,
         inputs=[select_history, keep_last_n],
-        outputs=[select_history, history_gallery.image_output, history_list.file_list]
+        outputs=[
+            select_history, history_gallery.image_output, history_list.file_list,
+            history_list.selected_image_path, history_list.selected_image_sha256,
+            history_gallery.selected_image_path, history_gallery.selected_image_sha256
+        ]
     )
 
     history_gallery.selected_image_path.change(
