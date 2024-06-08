@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List
+import json
 
 import gradio as gr
 
@@ -21,3 +22,17 @@ def on_selected_image_get_bookmark_state(bookmarks_state: HistoryDict, sha256: s
     is_bookmarked = sha256 in bookmarks_state
     # If the image is bookmarked, we want to show the "Remove Bookmark" button
     return gr.update(value="Remove Bookmark" if is_bookmarked else "Bookmark")
+
+def save_bookmarks(bookmarks: HistoryDict):
+    bookmarks = HistoryDict(bookmarks)
+    # Turn the HistoryDict into a list of tuples
+    bookmarks_list = list(bookmarks.items())
+    json.dump({"bookmarks": bookmarks_list}, open("bookmarks.json", "w"))
+
+def load_bookmarks():
+    try:
+        bookmarks_store = json.load(open("bookmarks.json"))
+        bookmarks = HistoryDict(bookmarks_store["bookmarks"])
+    except FileNotFoundError:
+        bookmarks = HistoryDict()
+    return bookmarks

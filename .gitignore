@@ -168,3 +168,5 @@ images/
 paths.txt
 
 *.db
+
+bookmarks.json
