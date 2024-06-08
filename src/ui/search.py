@@ -69,10 +69,10 @@ def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State 
                             max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
         with gr.Tabs():
-            with gr.TabItem(label="Gallery"):
-                gallery_view = create_gallery_view(bookmarks_state=bookmarks_state)
-            with gr.TabItem(label="List"):
-                list_view = create_image_list(bookmarks_state=bookmarks_state, tag_input=tag_input)
+            with gr.TabItem(label="Gallery") as gallery_tab:
+                gallery_view = create_gallery_view(parent_tab=gallery_tab, bookmarks_state=bookmarks_state)
+            with gr.TabItem(label="List") as list_tab:
+                list_view = create_image_list(parent_tab=list_tab, bookmarks_state=bookmarks_state, tag_input=tag_input)
 
             with gr.Row(elem_classes="pagination-controls"):
                 previous_page = gr.Button("Previous Page", scale=1)

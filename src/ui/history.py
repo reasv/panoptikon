@@ -32,11 +32,11 @@ def create_history_UI(select_history: gr.State, bookmarks_state: gr.State):
                 erase_history = gr.Button("Erase History")
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
         with gr.Tabs():
-            with gr.TabItem(label="Gallery"):
-                history_gallery = create_gallery_view(bookmarks_state=bookmarks_state)
+            with gr.TabItem(label="Gallery") as gallery_tab:
+                history_gallery = create_gallery_view(parent_tab=gallery_tab, bookmarks_state=bookmarks_state)
 
-            with gr.TabItem(label="List"):
-                history_list = create_image_list(bookmarks_state=bookmarks_state)
+            with gr.TabItem(label="List") as list_tab:
+                history_list = create_image_list(parent_tab=list_tab, bookmarks_state=bookmarks_state)
 
     history_tab.select(
         fn=get_history_paths,

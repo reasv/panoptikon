@@ -40,7 +40,7 @@ class ImageList:
     bookmark: gr.Button
     extra: List[gr.Button]
 
-def create_image_list(bookmarks_state: gr.State = None, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
+def create_image_list(parent_tab: gr.TabItem = None, bookmarks_state: gr.State = None, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
     with gr.Row():
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
@@ -112,6 +112,11 @@ def create_image_list(bookmarks_state: gr.State = None, extra_actions: List[str]
             outputs=[bookmark]
         )
         selected_image_sha256.change(
+            fn=on_selected_image_get_bookmark_state,
+            inputs=[bookmarks_state, selected_image_sha256],
+            outputs=[bookmark]
+        )
+        parent_tab.select(
             fn=on_selected_image_get_bookmark_state,
             inputs=[bookmarks_state, selected_image_sha256],
             outputs=[bookmark]

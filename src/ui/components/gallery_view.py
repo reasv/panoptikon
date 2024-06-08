@@ -27,7 +27,7 @@ class GalleryView:
     extra: List[gr.Button]
     image_output: gr.Gallery
 
-def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[str] = []):
+def create_gallery_view(parent_tab: gr.TabItem = None, bookmarks_state: gr.State = None, extra_actions: List[str] = []):
     with gr.Row():
         columns_slider = gr.Slider(minimum=1, maximum=15, value=5, step=1, label="Number of columns")
         selected_image_path = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
@@ -85,6 +85,11 @@ def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[st
             outputs=[bookmark]
         )
         selected_image_sha256.change(
+            fn=on_selected_image_get_bookmark_state,
+            inputs=[bookmarks_state, selected_image_sha256],
+            outputs=[bookmark]
+        )
+        parent_tab.select(
             fn=on_selected_image_get_bookmark_state,
             inputs=[bookmarks_state, selected_image_sha256],
             outputs=[bookmark]
