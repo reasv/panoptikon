@@ -42,12 +42,13 @@ def create_gallery_view(bookmarks_state: gr.State = None, extra_actions: List[st
 
     def on_selected_image_path_change(path: str):
         nonlocal extra_actions
+        interactive = True
         if path.strip() == "":
-            return gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False)
-        updates = gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True)
+            interactive = False
+        updates = gr.update(interactive=interactive), gr.update(interactive=interactive), gr.update(interactive=interactive)
         # Add updates to the tuple for extra actions
         for _ in extra_actions:
-            updates += (gr.update(interactive=True),)
+            updates += (gr.update(interactive=interactive),)
         return updates
 
     image_output.select(
