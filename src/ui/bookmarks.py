@@ -5,7 +5,6 @@ import json
 import gradio as gr
 from src.ui.components.list_view import create_image_list
 from src.ui.components.gallery_view import create_gallery_view
-from src.ui.components.history_dict import HistoryDict
 from src.ui.components.utils import delete_bookmarks_except_last_n, get_all_bookmarks_in_folder, delete_bookmark
 
 def get_bookmarks_paths(bookmarks_namespace: str):

@@ -10,7 +10,6 @@ from src.ui.test_model import create_dd_UI
 from src.ui.search import create_search_UI
 from src.ui.history import create_history_UI
 from src.ui.bookmarks import create_bookmarks_UI
-from src.ui.components.history_dict import HistoryDict
 
 def create_root_UI():
     with gr.Blocks(css="static/style.css", fill_height=True) as ui:
