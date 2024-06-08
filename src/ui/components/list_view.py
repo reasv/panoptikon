@@ -4,31 +4,43 @@ from typing import List
 import gradio as gr
 from dataclasses import dataclass
 
+from src.db import get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
-from src.ui.components.utils import process_image_selection
 
-def on_select_image_list(dataset_data, select_history: List[str]):
+def on_select_image(dataset_data, select_history: List[str]):
     sha256 = dataset_data[2]
     pathstr = dataset_data[1]
     image_data = {'path': pathstr, 'sha256': sha256}
-    return process_image_selection(image_data, select_history)
+    return pathstr, sha256, pathstr
 
 def on_tag_click(evt: gr.SelectData):
     return evt.value
 
-# We define a dataclass to use as return value for image_list which contains all the components we want to expose
+def on_select_image_sha256_change(sha256: str):
+    if sha256.strip() == "":
+        return {}, ""
+    conn = get_database_connection()
+    tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
+    conn.close()
+    # Tags in the format "tag1, tag2, tag3"
+    text = ", ".join(tags.keys())
+    return tags, text
+
+# We define a dataclass to use as return value for create_image_list which contains all the components we want to expose
 @dataclass
 class ImageList:
     file_list: gr.Dataset
     image_preview: gr.Image
     tag_text: gr.Textbox
     tag_list: gr.Label
-    image_path_output: gr.Textbox
+    selected_image_path: gr.Textbox
+    selected_image_sha256: gr.Textbox
     btn_open_file: gr.Button
     btn_open_file_explorer: gr.Button
     bookmark: gr.Button
+    extra: List[gr.Button]
 
-def image_list(tag_input: gr.Textbox = None):
+def create_image_list(enable_bookmark=True, extra_actions: List[str] = [], tag_input: gr.Textbox = None, ):
     with gr.Row():
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
@@ -40,32 +52,55 @@ def image_list(tag_input: gr.Textbox = None):
                     tag_text = gr.Textbox(label="Tags", show_copy_button=True, interactive=False, lines=5)
                 with gr.Tab(label="Tags Confidence"):
                     tag_list = gr.Label(label="Tags", show_label=False)
-            image_path_output = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
+            selected_image_path = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
+            selected_image_sha256 = gr.Textbox(value="", label="Last Selected Image SHA256", show_copy_button=True, interactive=False, visible=False) # Hidden
             with gr.Row():
                 btn_open_file = gr.Button("Open File", interactive=False, scale=3)
                 btn_open_file_explorer = gr.Button("Show in Explorer", interactive=False, scale=3)
-                bookmark = gr.Button("Bookmark", interactive=False, scale=3)
+                bookmark = gr.Button("Bookmark", interactive=False, scale=3, visible=enable_bookmark)
+                extra: List[gr.Button] = []
+                for action in extra_actions:
+                    extra.append(gr.Button(action, interactive=False, scale=3))
 
-    # file_list.click(
-    #     fn=on_select_image_list,
-    #     inputs=[file_list, select_history],
-    #     outputs=[
-    #         image_path_output, image_preview, btn_open_file, btn_open_file_explorer,
-    #         tag_list, tag_text, select_history
-    #     ]
-    # )
+    def on_selected_image_path_change(path: str):
+        nonlocal extra_actions
+        if path.strip() == "":
+            return gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False)
+        updates = path, gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True)
+        # Add updates to the tuple for extra actions
+        for _ in extra_actions:
+            updates += (gr.update(interactive=True),)
+        return updates
+
+    file_list.click(
+        fn=on_select_image,
+        inputs=[file_list],
+        outputs=[selected_image_path, selected_image_sha256]
+    )
+
+    selected_image_path.change(
+        fn=on_selected_image_path_change,
+        inputs=[selected_image_path],
+        outputs=[image_preview, btn_open_file, btn_open_file_explorer, bookmark, *extra]
+    )
+
+    selected_image_sha256.change(
+        fn=on_select_image_sha256_change,
+        inputs=[selected_image_sha256],
+        outputs=[tag_list, tag_text]
+    )
 
     if tag_input:
         tag_list.select(on_tag_click, None, [tag_input])
 
     btn_open_file.click(
         fn=open_file,
-        inputs=image_path_output,
+        inputs=selected_image_path,
     )
-    
+
     btn_open_file_explorer.click(
         fn=open_in_explorer,
-        inputs=image_path_output,
+        inputs=selected_image_path,
     )
 
     return ImageList(
@@ -73,8 +108,10 @@ def image_list(tag_input: gr.Textbox = None):
         image_preview=image_preview,
         tag_text=tag_text,
         tag_list=tag_list,
-        image_path_output=image_path_output,
+        selected_image_path=selected_image_path,
+        selected_image_sha256=selected_image_sha256,
         btn_open_file=btn_open_file,
         btn_open_file_explorer=btn_open_file_explorer,
-        bookmark=bookmark
+        bookmark=bookmark,
+        extra=extra
     )

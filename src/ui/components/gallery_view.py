@@ -58,7 +58,7 @@ def create_gallery_view(enable_bookmark: bool = True, extra_actions: List[str] =
     selected_image_path.change(
         fn=on_selected_image_path_change,
         inputs=[selected_image_path],
-        outputs=([open_file_button, open_file_explorer, bookmark] + extra)
+        outputs=[open_file_button, open_file_explorer, bookmark, *extra]
     )
 
     columns_slider.release(
