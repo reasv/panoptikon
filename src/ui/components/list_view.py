@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from src.db import get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
 
-def on_select_image(dataset_data, select_history: List[str]):
+def on_select_image(dataset_data):
     sha256 = dataset_data[2]
     pathstr = dataset_data[1]
-    image_data = {'path': pathstr, 'sha256': sha256}
     return pathstr, sha256, pathstr
 
 def on_tag_click(evt: gr.SelectData):
