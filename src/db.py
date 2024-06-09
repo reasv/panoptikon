@@ -5,10 +5,10 @@ from typing import Dict, List, Tuple
 
 from src.utils import normalize_path
 
-def get_database_connection() -> sqlite3.Connection:
+def get_database_connection(force_readonly=False) -> sqlite3.Connection:
     # Check if we are in read-only mode
     db_file = os.getenv('DB_FILE', 'sqlite.db')
-    if os.environ.get('READONLY', 'false').lower() == 'true':
+    if force_readonly or os.environ.get('READONLY', 'false').lower() == 'true':
         # Use a read-only connection
         conn = sqlite3.connect(f'file:{db_file}?mode=ro', uri=True)
     else:

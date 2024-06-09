@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Gallery</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/packery/2.1.2/packery.pkgd.min.css">
+    <style>
+        .grid {
+            width: 100%;
+        }
+        .grid-item {
+            width: 200px;
+            margin: 10px;
+        }
+        .grid-item img {
+            width: 100%;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="grid">
+        {% for sha256, path in bookmarks %}
+            <div class="grid-item">
+                <img src="{{ url_for('serve_image', filename=path) }}" alt="Image">
+            </div>
+        {% endfor %}
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/packery/2.1.2/packery.pkgd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/draggabilly/2.3.0/draggabilly.pkgd.min.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            var grid = document.querySelector('.grid');
+            var pckry = new Packery(grid, {
+                itemSelector: '.grid-item',
+                gutter: 10
+            });
+
+            // make all grid-items draggable
+            var draggableElems = grid.querySelectorAll('.grid-item');
+            draggableElems.forEach(function(itemElem) {
+                var draggie = new Draggabilly(itemElem);
+                pckry.bindDraggabillyEvents(draggie);
+            });
+        });
+    </script>
+</body>
+</html>
