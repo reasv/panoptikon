@@ -6,28 +6,109 @@
     <title>Image Gallery</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/packery/2.1.2/packery.pkgd.min.css">
     <style>
+        /* Black site background */
+        body {
+            background-color: #000;
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
         .grid {
             width: 100%;
         }
         .grid-item {
-            width: 200px;
-            margin: 10px;
+            margin: 5px;
         }
         .grid-item img {
             width: 100%;
             display: block;
+        }
+        .small {
+            width: 300px;
+        }
+        .medium {
+            width: 500px;
+        }
+        .large {
+            width: 700px;
+        }
+        .large-2 {
+            width: 800px;
+        }
+        .large-3 {
+            width: 1000px;
+        }
+        .large-4 {
+            width: 1200px;
+        }
+        .close-btn, .enlarge-btn, .reduce-btn {
+            position: absolute;
+            background-color: rgba(0, 0, 0, 0.5);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            font-size: 16px;
+            cursor: pointer;
+            display: none;
+            justify-content: center;
+            align-items: center;
+        }
+        .close-btn {
+            top: 5px;
+            right: 5px;
+        }
+        .enlarge-btn {
+            bottom: 5px;
+            right: 5px;
+        }
+        .reduce-btn {
+            bottom: 5px;
+            left: 5px;
+        }
+        .grid-item:hover .close-btn, .grid-item:hover .enlarge-btn, .grid-item:hover .reduce-btn {
+            display: flex;
+        }
+
+        .control-buttons {
+            position: fixed;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+        }
+        .control-buttons button {
+            background-color: rgba(0, 0, 0, 0.5);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            font-size: 24px;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
         }
     </style>
 </head>
 <body>
     <div class="grid">
         {% for sha256, path in bookmarks %}
-            <div class="grid-item">
+            <div class="grid-item medium">
+                <button class="close-btn" onclick="removeImage(event)">×</button>
+                <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
+                <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
                 <img src="{{ url_for('serve_image', filename=path) }}" alt="Image">
             </div>
         {% endfor %}
     </div>
-
+    <div class="control-buttons">
+        <button onclick="changeAllSizes('enlarge')">+</button>
+        <button onclick="changeAllSizes('reduce')">-</button>
+    </div>
+    
     <script src="https://cdnjs.cloudflare.com/ajax/libs/packery/2.1.2/packery.pkgd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/draggabilly/2.3.0/draggabilly.pkgd.min.js"></script>
     <script>
@@ -35,7 +116,7 @@
             var grid = document.querySelector('.grid');
             var pckry = new Packery(grid, {
                 itemSelector: '.grid-item',
-                gutter: 10
+                gutter: 5
             });
 
             // make all grid-items draggable
@@ -44,7 +125,72 @@
                 var draggie = new Draggabilly(itemElem);
                 pckry.bindDraggabillyEvents(draggie);
             });
+            
         });
+        function removeImage(event) {
+                var gridItem = event.target.closest('.grid-item');
+                var grid = document.querySelector('.grid');
+                grid.removeChild(gridItem);
+                var pckry = Packery.data(grid);
+                pckry.remove(gridItem);
+                pckry.layout();
+        }
+        function changeSizeClosest(event, action) {
+            changeSize(event.target.closest('.grid-item'), action);
+        }
+        function changeSize(gridItem, action) {
+            var currentClass = gridItem.classList.contains('small') ? 'small' :
+                               gridItem.classList.contains('medium') ? 'medium' :
+                               'large';
+
+            if (action === 'enlarge') {
+                if (currentClass === 'small') {
+                    gridItem.classList.remove('small');
+                    gridItem.classList.add('medium');
+                } else if (currentClass === 'medium') {
+                    gridItem.classList.remove('medium');
+                    gridItem.classList.add('large');
+                } else if (currentClass === 'large') {
+                    gridItem.classList.remove('large');
+                    gridItem.classList.add('large-2');
+                } else if (currentClass === 'large-2') {
+                    gridItem.classList.remove('large-2');
+                    gridItem.classList.add('large-3');
+                } else if (currentClass === 'large-3') {
+                    gridItem.classList.remove('large-3');
+                    gridItem.classList.add('large-4');
+                }
+            } else if (action === 'reduce') {
+                if (currentClass === 'large') {
+                    gridItem.classList.remove('large');
+                    gridItem.classList.add('medium');
+                } else if (currentClass === 'medium') {
+                    gridItem.classList.remove('medium');
+                    gridItem.classList.add('small');
+                } else if (currentClass === 'large-2') {
+                    gridItem.classList.remove('large-2');
+                    gridItem.classList.add('large');
+                } else if (currentClass === 'large-3') {
+                    gridItem.classList.remove('large-3');
+                    gridItem.classList.add('large-2');
+                } else if (currentClass === 'large-4') {
+                    gridItem.classList.remove('large-4');
+                    gridItem.classList.add('large-3');
+                }
+            }
+
+            var pckry = Packery.data(document.querySelector('.grid'));
+            pckry.layout();
+        }
+        function changeAllSizes(action) {
+            var gridItems = document.querySelectorAll('.grid-item');
+            gridItems.forEach(function(gridItem) {
+                changeSize(gridItem, action);
+            });
+
+            var pckry = Packery.data(document.querySelector('.grid'));
+            pckry.layout();
+        }
     </script>
 </body>
 </html>
