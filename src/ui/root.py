@@ -14,12 +14,12 @@ from src.ui.bookmarks import create_bookmarks_UI
 def create_root_UI():
     with gr.Blocks(css="static/style.css", fill_height=True) as ui:
         select_history = gr.State(value=[])
-        bookmarks_folder = gr.State(value="default")
+        bookmarks_namespace = gr.State(value="default")
 
         with gr.Tabs():
-            create_search_UI(select_history, bookmarks_folder)
-            create_bookmarks_UI(bookmarks_folder)
-            create_history_UI(select_history, bookmarks_folder)
+            create_search_UI(select_history, bookmarks_namespace=bookmarks_namespace)
+            create_bookmarks_UI(bookmarks_namespace=bookmarks_namespace)
+            create_history_UI(select_history, bookmarks_namespace=bookmarks_namespace)
             with gr.TabItem(label="Tag Frequency"):
                 create_toptags_UI()
             with gr.TabItem(label="File Scan & Tagging"):

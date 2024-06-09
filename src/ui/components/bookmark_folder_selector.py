@@ -7,11 +7,14 @@ import gradio as gr
 from src.ui.components.utils import get_all_bookmark_folders
 
 def on_bookmark_folder_change(bookmarks_namespace: str):
+    print(f"Bookmark namespace changed to {bookmarks_namespace}")
     return bookmarks_namespace
 
 def on_input(namespace_chosen: str, bookmarks_namespace: str):
+    print(f"Previous namespace {bookmarks_namespace}")
     print(f"Input namespace {namespace_chosen}")
     new_value = namespace_chosen if len(namespace_chosen.strip()) > 0 else bookmarks_namespace
+    print(f"New namespace {new_value}")
     return new_value, new_value
 
 def on_tab_load():
@@ -22,7 +25,7 @@ class BookmarkFolderChooser:
     bookmark_folder_choice: gr.Dropdown
 
 def create_bookmark_folder_chooser(parent_tab: gr.TabItem=None, bookmarks_namespace: gr.State = None):
-    bookmark_folder_choice = gr.Dropdown(choices=get_all_bookmark_folders(), allow_custom_value=True, visible=bookmarks_namespace != None, label="Bookmark group name")
+    bookmark_folder_choice = gr.Dropdown(choices=get_all_bookmark_folders(), value="default", allow_custom_value=True, visible=bookmarks_namespace != None, label="Bookmark group name", scale=1)
 
     parent_tab.select(
         fn=on_tab_load,
@@ -31,7 +34,8 @@ def create_bookmark_folder_chooser(parent_tab: gr.TabItem=None, bookmarks_namesp
 
     bookmarks_namespace.change(
         fn=on_bookmark_folder_change,
-        inputs=[bookmark_folder_choice]
+        inputs=[bookmarks_namespace],
+        outputs=[bookmark_folder_choice]
     )
 
     bookmark_folder_choice.input(

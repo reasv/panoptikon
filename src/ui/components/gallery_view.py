@@ -7,6 +7,7 @@ import json
 
 from src.utils import open_file, open_in_explorer
 from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
+from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
 
 def on_select_image(evt: gr.SelectData):
     image_data = json.loads(evt.value['caption'])
@@ -27,14 +28,16 @@ class GalleryView:
     extra: List[gr.Button]
     image_output: gr.Gallery
 
-def create_gallery_view(parent_tab: gr.TabItem = None, bookmarks_state: gr.State = None, extra_actions: List[str] = []):
+def create_gallery_view(parent_tab: gr.TabItem = None, bookmarks_namespace: gr.State = None, extra_actions: List[str] = []):
     with gr.Row():
         columns_slider = gr.Slider(minimum=1, maximum=15, value=5, step=1, label="Number of columns")
         selected_image_path = gr.Textbox(value="", label="Last Selected Image", show_copy_button=True, interactive=False)
         selected_image_sha256 = gr.Textbox(value="", label="Last Selected Image SHA256", show_copy_button=True, interactive=False, visible=False) # Hidden
         open_file_button = gr.Button("Open File", interactive=False)
         open_file_explorer = gr.Button("Show in Explorer", interactive=False)
-        bookmark = gr.Button("Bookmark", interactive=False, visible=bookmarks_state != None)
+        if bookmarks_namespace != None:
+            create_bookmark_folder_chooser(parent_tab=parent_tab, bookmarks_namespace=bookmarks_namespace)
+        bookmark = gr.Button("Bookmark", interactive=False, visible=bookmarks_namespace != None)
         extra: List[gr.Button] = []
         for action in extra_actions:
             extra.append(gr.Button(action, interactive=False))
@@ -78,22 +81,28 @@ def create_gallery_view(parent_tab: gr.TabItem = None, bookmarks_state: gr.State
         fn=open_in_explorer,
         inputs=selected_image_path,
     )
-    if bookmarks_state != None:
+    if bookmarks_namespace != None:
         bookmark.click(
             fn=toggle_bookmark,
-            inputs=[bookmarks_state, selected_image_sha256, bookmark],
+            inputs=[bookmarks_namespace, selected_image_sha256, bookmark],
             outputs=[bookmark]
         )
         selected_image_sha256.change(
             fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_state, selected_image_sha256],
+            inputs=[bookmarks_namespace, selected_image_sha256],
+            outputs=[bookmark]
+        )
+        bookmarks_namespace.change(
+            fn=on_selected_image_get_bookmark_state,
+            inputs=[bookmarks_namespace, selected_image_sha256],
             outputs=[bookmark]
         )
         parent_tab.select(
             fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_state, selected_image_sha256],
+            inputs=[bookmarks_namespace, selected_image_sha256],
             outputs=[bookmark]
         )
+
 
     return GalleryView(
         columns_slider=columns_slider,

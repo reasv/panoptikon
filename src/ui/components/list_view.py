@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from src.db import get_all_tags_for_item_name_confidence, get_database_connection
 from src.utils import open_file, open_in_explorer
 from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
+from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
 
 def on_select_image(dataset_data):
     sha256 = dataset_data[2]
@@ -22,8 +23,8 @@ def on_select_image_sha256_change(sha256: str):
     conn = get_database_connection()
     tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
     conn.close()
-    # Tags in the format "tag1, tag2, tag3"
-    text = ", ".join(tags.keys())
+    # Tags in the format "tag1 tag2 tag3"
+    text = " ".join(tags.keys())
     return tags, text
 
 # We define a dataclass to use as return value for create_image_list which contains all the components we want to expose
@@ -40,7 +41,7 @@ class ImageList:
     bookmark: gr.Button
     extra: List[gr.Button]
 
-def create_image_list(parent_tab: gr.TabItem = None, bookmarks_state: gr.State = None, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
+def create_image_list(parent_tab: gr.TabItem = None, bookmarks_namespace: gr.State = None, extra_actions: List[str] = [], tag_input: gr.Textbox = None):
     with gr.Row():
         with gr.Column(scale=1):
             file_list = gr.Dataset(label="Results", type="values", samples_per_page=10, samples=[], components=["image", "textbox"], scale=1)
@@ -57,7 +58,11 @@ def create_image_list(parent_tab: gr.TabItem = None, bookmarks_state: gr.State =
             with gr.Row():
                 btn_open_file = gr.Button("Open File", interactive=False, scale=3)
                 btn_open_file_explorer = gr.Button("Show in Explorer", interactive=False, scale=3)
-                bookmark = gr.Button("Bookmark", interactive=False, scale=3, visible=bookmarks_state != None)
+            with gr.Row():
+                if bookmarks_namespace != None:
+                    create_bookmark_folder_chooser(parent_tab=parent_tab, bookmarks_namespace=bookmarks_namespace)
+                bookmark = gr.Button("Bookmark", interactive=False, scale=1, visible=bookmarks_namespace != None)
+            with gr.Row():
                 extra: List[gr.Button] = []
                 for action in extra_actions:
                     extra.append(gr.Button(action, interactive=False, scale=3))
@@ -105,20 +110,25 @@ def create_image_list(parent_tab: gr.TabItem = None, bookmarks_state: gr.State =
         inputs=selected_image_path,
     )
 
-    if bookmarks_state != None:
+    if bookmarks_namespace != None:
         bookmark.click(
             fn=toggle_bookmark,
-            inputs=[bookmarks_state, selected_image_sha256, bookmark],
+            inputs=[bookmarks_namespace, selected_image_sha256, bookmark],
             outputs=[bookmark]
         )
         selected_image_sha256.change(
             fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_state, selected_image_sha256],
+            inputs=[bookmarks_namespace, selected_image_sha256],
+            outputs=[bookmark]
+        )
+        bookmarks_namespace.change(
+            fn=on_selected_image_get_bookmark_state,
+            inputs=[bookmarks_namespace, selected_image_sha256],
             outputs=[bookmark]
         )
         parent_tab.select(
             fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_state, selected_image_sha256],
+            inputs=[bookmarks_namespace, selected_image_sha256],
             outputs=[bookmark]
         )
 

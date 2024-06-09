@@ -18,13 +18,13 @@ def get_bookmarks_paths(bookmarks_namespace: str):
 def erase_bookmarks_fn(bookmarks_namespace: str, keep_last_n: int):
     delete_bookmarks_except_last_n(bookmarks_namespace, keep_last_n)
     print("Bookmarks erased")
-    gallery_update, list_update = get_bookmarks_paths(bookmarks_namespace)
+    gallery_update, list_update, _, _, _, _ = get_bookmarks_paths(bookmarks_namespace)
     return gallery_update, list_update, None, None, None, None
 
 def delete_bookmark_fn(bookmarks_namespace: str, selected_image_sha256: str):
     delete_bookmark(bookmarks_namespace=bookmarks_namespace, sha256=selected_image_sha256)
     print("Bookmark deleted")
-    gallery_update, list_update = get_bookmarks_paths(bookmarks_namespace)
+    gallery_update, list_update, _, _, _, _ = get_bookmarks_paths(bookmarks_namespace)
     return gallery_update, list_update, None, None, None, None
 
 def on_gallery_select_image(selected_image_path: str, selected_image_sha256: str):

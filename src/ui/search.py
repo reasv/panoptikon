@@ -55,7 +55,7 @@ def get_folder_list():
 def on_tab_load():
     return gr.update(choices=get_folder_list())
 
-def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State = None):
+def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.State = None):
     with gr.TabItem(label="Tag Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -70,9 +70,9 @@ def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State 
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
         with gr.Tabs():
             with gr.TabItem(label="Gallery") as gallery_tab:
-                gallery_view = create_gallery_view(parent_tab=gallery_tab, bookmarks_state=bookmarks_state)
+                gallery_view = create_gallery_view(parent_tab=gallery_tab, bookmarks_namespace=bookmarks_namespace)
             with gr.TabItem(label="List") as list_tab:
-                list_view = create_image_list(parent_tab=list_tab, bookmarks_state=bookmarks_state, tag_input=tag_input)
+                list_view = create_image_list(parent_tab=list_tab, bookmarks_namespace=bookmarks_namespace, tag_input=tag_input)
 
             with gr.Row(elem_classes="pagination-controls"):
                 previous_page = gr.Button("Previous Page", scale=1)
