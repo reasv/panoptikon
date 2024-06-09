@@ -24,7 +24,7 @@ def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: i
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
     item_list  = [[item['path'], item['path'], item["sha256"]] for item in results]
-    return images, total_results, gr.update(value=page, maximum=int(total_pages)), gr.update(samples=item_list)
+    return images, total_results, gr.update(value=page, maximum=int(total_pages)), gr.update(samples=item_list), None, None, None, None
 
 def search_by_tags_next_page(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, page+1)
@@ -64,7 +64,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State 
                 with gr.Column(scale=10):
                     with gr.Group():
                         with gr.Row():
-                            tag_input = gr.Textbox(label="Enter tags separated by spaces", value='rating:safe', show_copy_button=True, scale=3)
+                            tag_input = gr.Textbox(label="Enter tags separated by spaces", value='', show_copy_button=True, scale=3)
                             min_confidence = gr.Slider(minimum=0.05, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags", scale=2)
                             max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
@@ -87,25 +87,49 @@ def create_search_UI(select_history: gr.State = None, bookmarks_state: gr.State 
     submit_button.click(
         fn=search_by_tags,
         inputs=[tag_input, min_confidence, max_results_per_page, selected_folder], 
-        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
+        outputs=[
+            gallery_view.image_output, number_of_results,
+            current_page, list_view.file_list,
+            list_view.selected_image_path, list_view.selected_image_sha256,
+            gallery_view.selected_image_path, gallery_view.selected_image_sha256
+        ]
     )
 
     current_page.release(
         fn=search_by_tags,
         inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
+        outputs=[
+            gallery_view.image_output, number_of_results,
+            current_page, list_view.file_list,
+            list_view.selected_image_path, list_view.selected_image_sha256,
+            gallery_view.selected_image_path, gallery_view.selected_image_sha256
+        ]
     )
 
     previous_page.click(
         fn=search_by_tags_previous_page,
         inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
+        outputs=[
+            gallery_view.image_output,
+            number_of_results,
+            current_page,
+            list_view.file_list,
+            list_view.selected_image_path, list_view.selected_image_sha256,
+            gallery_view.selected_image_path, gallery_view.selected_image_sha256
+        ]
     )
 
     next_page.click(
         fn=search_by_tags_next_page,
         inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page], 
-        outputs=[gallery_view.image_output, number_of_results, current_page, list_view.file_list]
+        outputs=[
+            gallery_view.image_output,
+            number_of_results,
+            current_page,
+            list_view.file_list,
+            list_view.selected_image_path, list_view.selected_image_sha256,
+            gallery_view.selected_image_path, gallery_view.selected_image_sha256
+        ]
     )
 
     gallery_view.image_output.select(
