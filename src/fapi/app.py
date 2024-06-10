@@ -1,6 +1,6 @@
 import os
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection, get_bookmarks
@@ -23,6 +23,4 @@ async def display_bookmarks(request: Request, bookmarks_namespace: str):
 @app.get("/image/{filename:path}")
 async def serve_image(filename: str):
     directory = os.path.dirname(filename)
-    if not os.path.exists(os.path.join(directory, os.path.basename(filename))):
-        raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(os.path.join(directory, os.path.basename(filename)))
