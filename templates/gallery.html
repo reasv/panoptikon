@@ -139,43 +139,39 @@
             changeSize(event.target.closest('.grid-item'), action);
         }
         function changeSize(gridItem, action) {
-            var currentClass = gridItem.classList.contains('small') ? 'small' :
-                               gridItem.classList.contains('medium') ? 'medium' :
-                               'large';
-
             if (action === 'enlarge') {
-                if (currentClass === 'small') {
+                if (gridItem.classList.contains('small')) {
                     gridItem.classList.remove('small');
                     gridItem.classList.add('medium');
-                } else if (currentClass === 'medium') {
+                } else if (gridItem.classList.contains('medium')) {
                     gridItem.classList.remove('medium');
                     gridItem.classList.add('large');
-                } else if (currentClass === 'large') {
+                } else if (gridItem.classList.contains('large')) {
                     gridItem.classList.remove('large');
                     gridItem.classList.add('large-2');
-                } else if (currentClass === 'large-2') {
+                } else if (gridItem.classList.contains('large-2')) {
                     gridItem.classList.remove('large-2');
                     gridItem.classList.add('large-3');
-                } else if (currentClass === 'large-3') {
+                } else if (gridItem.classList.contains('large-3')) {
                     gridItem.classList.remove('large-3');
                     gridItem.classList.add('large-4');
                 }
             } else if (action === 'reduce') {
-                if (currentClass === 'large') {
-                    gridItem.classList.remove('large');
-                    gridItem.classList.add('medium');
-                } else if (currentClass === 'medium') {
-                    gridItem.classList.remove('medium');
-                    gridItem.classList.add('small');
-                } else if (currentClass === 'large-2') {
-                    gridItem.classList.remove('large-2');
-                    gridItem.classList.add('large');
-                } else if (currentClass === 'large-3') {
-                    gridItem.classList.remove('large-3');
-                    gridItem.classList.add('large-2');
-                } else if (currentClass === 'large-4') {
+                if (gridItem.classList.contains('large-4')) {
                     gridItem.classList.remove('large-4');
                     gridItem.classList.add('large-3');
+                } else if (gridItem.classList.contains('large-3')) {
+                    gridItem.classList.remove('large-3');
+                    gridItem.classList.add('large-2');
+                } else if (gridItem.classList.contains('large-2')) {
+                    gridItem.classList.remove('large-2');
+                    gridItem.classList.add('large');
+                } else if (gridItem.classList.contains('large')) {
+                    gridItem.classList.remove('large');
+                    gridItem.classList.add('medium');
+                } else if (gridItem.classList.contains('medium')) {
+                    gridItem.classList.remove('medium');
+                    gridItem.classList.add('small');
                 }
             }
 
