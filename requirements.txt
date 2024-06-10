@@ -2,4 +2,3 @@ git+https://github.com/KichangKim/DeepDanbooru@v3-20200915-sgd-e30#egg=deepdanbo
 gradio==4.36.0
 pillow==10.2.0
 tensorflow==2.16.1
-Flask==3.0.3
