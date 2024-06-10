@@ -1,10 +1,12 @@
 from __future__ import annotations
+from typing import List
 
 import gradio as gr
 
 from src.db import add_bookmark, remove_bookmark, delete_bookmarks_exclude_last_n, get_database_connection, get_all_bookmark_namespaces, get_bookmark_metadata, get_bookmarks
 
-def toggle_bookmark(bookmarks_namespace: str, selected_image_sha256: str, button_name: str):
+def toggle_bookmark(bookmarks_namespace: str, selected_files: List[dict], button_name: str):
+    selected_image_sha256 = selected_files[0]['sha256']
     conn = get_database_connection()
     if button_name == "Bookmark":
         add_bookmark(conn, namespace=bookmarks_namespace, sha256=selected_image_sha256)
@@ -16,7 +18,8 @@ def toggle_bookmark(bookmarks_namespace: str, selected_image_sha256: str, button
     conn.close()
     return on_selected_image_get_bookmark_state(bookmarks_namespace=bookmarks_namespace, sha256=selected_image_sha256)
 
-def on_selected_image_get_bookmark_state(bookmarks_namespace: str, sha256: str):
+def on_selected_image_get_bookmark_state(bookmarks_namespace: str, selected_files: List[dict]):
+    sha256 = selected_files[0]['sha256']
     conn = get_database_connection()
     is_bookmarked, _ = get_bookmark_metadata(conn, namespace=bookmarks_namespace, sha256=sha256)
     conn.commit()
