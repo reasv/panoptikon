@@ -14,16 +14,66 @@ def on_change_columns_slider(columns_slider: int):
 def on_files_change(files: List[dict]):
     image_list = [(file['path'], file['path']) for file in files]
     print(f"Received {len(image_list)} images")
-    return image_list, []
+    return (gr.update(value=image_list), [files[0]]) if len(image_list) > 0 else ([], [])
 
-def on_select_image(evt: gr.SelectData, files: List[dict], selected_files: List[dict]):
+def on_select_image(
+        evt: gr.SelectData,
+        files: List[dict],
+        selected_files: List[dict]
+    ):
+    print(f"Selected image index: {evt.index} in gallery")
     image_index: int = evt.index
+
+    # Check if index is valid
+    if image_index < 0 or image_index >= len(files):
+        # Don't update selected_files if index is invalid
+        return selected_files
+
     image = files[image_index]
     if len(selected_files) > 0:
         selected_files[0] = image
     else:
         selected_files.append(image)
     return selected_files
+
+def on_selected_image_change_extra_actions(extra_actions: List[str]):
+    def on_selected_image_path_change(selected_files: List[dict], files: List[dict], selected_image_path: str):
+        nonlocal extra_actions
+
+        if len(selected_files) == 0:
+            interactive = False
+            selected_file_index = 0
+            path = ""
+        else:
+            interactive = True
+            selected_file = selected_files[0]
+            path: str = selected_file['path']
+            selected_file_index = files.index(selected_file)
+            if path.strip() == "":
+                interactive = False
+        gallery_update = gr.update(selected_index=selected_file_index) if len(files) > 0 else gr.update(value=[])
+
+        # Do not update if the path is the same
+        if path == selected_image_path:
+            gallery_update = gr.update()
+            path = gr.update()
+
+        # Do not update gallery if no files are selected
+        if len(selected_files) == 0:
+            gallery_update = gr.update()
+
+        updates = (
+            path,
+            gallery_update,
+            gr.update(interactive=interactive),
+            gr.update(interactive=interactive),
+            gr.update(interactive=interactive)
+        )
+        # Add updates to the tuple for extra actions
+        for _ in extra_actions:
+            updates += (gr.update(interactive=interactive),)
+        return updates
+    return on_selected_image_path_change
 
 # We define a dataclass to use as return value for create_gallery_view which contains all the components we want to expose
 @dataclass
@@ -56,39 +106,29 @@ def create_gallery_view(
             extra.append(gr.Button(action, interactive=False))
     image_output = gr.Gallery(label="Results", elem_classes=["gallery-view"], columns=5, scale=2)
 
-    def on_selected_image_path_change(path: str):
-        nonlocal extra_actions
-        interactive = True
-        if path.strip() == "":
-            interactive = False
-        updates = gr.update(interactive=interactive), gr.update(interactive=interactive), gr.update(interactive=interactive)
-        # Add updates to the tuple for extra actions
-        for _ in extra_actions:
-            updates += (gr.update(interactive=interactive),)
-        return updates
-
     files.change(
         fn=on_files_change,
         inputs=[files],
         outputs=[image_output, selected_files]
     )
 
+    selected_files.change(
+        fn=on_selected_image_change_extra_actions(extra_actions),
+        inputs=[selected_files, files, selected_image_path],
+        outputs=[
+            selected_image_path,
+            image_output,
+            open_file_button,
+            open_file_explorer,
+            bookmark,
+            *extra
+        ]
+    )
+
     image_output.select(
         fn=on_select_image,
         inputs=[files, selected_files],
         outputs=[selected_files]
-    )
-
-    selected_files.change(
-        fn=lambda files: files[0]['path'],
-        inputs=[selected_files],
-        outputs=[selected_image_path]
-    )
-
-    selected_image_path.change(
-        fn=on_selected_image_path_change,
-        inputs=[selected_image_path],
-        outputs=[open_file_button, open_file_explorer, bookmark, *extra]
     )
 
     columns_slider.release(

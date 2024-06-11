@@ -6,6 +6,8 @@ import gradio as gr
 from src.db import add_bookmark, remove_bookmark, delete_bookmarks_exclude_last_n, get_database_connection, get_all_bookmark_namespaces, get_bookmark_metadata, get_bookmarks
 
 def toggle_bookmark(bookmarks_namespace: str, selected_files: List[dict], button_name: str):
+    if len(selected_files) == 0:
+        return gr.update(value="Bookmark")
     selected_image_sha256 = selected_files[0]['sha256']
     conn = get_database_connection()
     if button_name == "Bookmark":
@@ -16,9 +18,11 @@ def toggle_bookmark(bookmarks_namespace: str, selected_files: List[dict], button
         print(f"Removed bookmark")
     conn.commit()
     conn.close()
-    return on_selected_image_get_bookmark_state(bookmarks_namespace=bookmarks_namespace, sha256=selected_image_sha256)
+    return on_selected_image_get_bookmark_state(bookmarks_namespace=bookmarks_namespace, selected_files=selected_files)
 
 def on_selected_image_get_bookmark_state(bookmarks_namespace: str, selected_files: List[dict]):
+    if len(selected_files) == 0:
+        return gr.update(value="Bookmark")
     sha256 = selected_files[0]['sha256']
     conn = get_database_connection()
     is_bookmarked, _ = get_bookmark_metadata(conn, namespace=bookmarks_namespace, sha256=sha256)

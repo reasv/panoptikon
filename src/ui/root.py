@@ -29,8 +29,4 @@ def create_root_UI():
             #     create_scan_UI()
             # with gr.TabItem(label="Tagging Model"):
             #     create_dd_UI()
-    conn = get_database_connection()
-    folders = get_folders_from_database(conn, included=True)
-    conn.close()
-    gr.set_static_paths(folders)
     return ui

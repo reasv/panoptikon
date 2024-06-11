@@ -34,13 +34,13 @@ def create_multiview(select_history: gr.State = None, bookmarks_namespace: gr.St
                 parent_tab=gallery_tab,
                 bookmarks_namespace=bookmarks_namespace
             )
-        # with gr.TabItem(label="List") as list_tab:
-        #     list_view = create_image_list(
-        #         selected_files=selected_files,
-        #         files=files,
-        #         parent_tab=list_tab,
-        #         bookmarks_namespace=bookmarks_namespace
-        #     )
+        with gr.TabItem(label="List") as list_tab:
+            list_view = create_image_list(
+                selected_files=selected_files,
+                files=files,
+                parent_tab=list_tab,
+                bookmarks_namespace=bookmarks_namespace
+            )
 
     # Reset selected files when the list of files changes
     files.change(
@@ -58,6 +58,6 @@ def create_multiview(select_history: gr.State = None, bookmarks_namespace: gr.St
     return Multiview(
         selected_files=selected_files,
         gallery_view=gallery_view,
-        list_view=None,
+        list_view=list_view,
         files=files
     )
