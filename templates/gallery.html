@@ -173,12 +173,18 @@
             width: 100%;
             padding: 10px;
         }
+
         .thumbnail-list img {
-            height: 10vh; /* Adjust the size of thumbnails as needed */
-            margin-right: 10px;
+            height: 10vh;
             border-radius: 5px;
             transition: transform 0.3s;
             cursor: pointer;
+        }
+
+        .thumbnail-wrapper {
+            position: relative;
+            display: inline-block;
+            margin-right: 10px;
         }
 
         .thumbnail-list img:hover {
@@ -201,6 +207,9 @@
             border: 5px solid white;
             box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
             border-radius: 10px;
+        }
+        .in-grid .close-btn {
+            display: flex;
         }
     </style>
     <style>
@@ -292,7 +301,10 @@
     <div class="drawer" id="drawer">
         <div class="thumbnail-list" id="thumbnailList">
             {% for sha256, path in files %}
-                <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
+                <div id="thumbnail-{{sha256}}" class="thumbnail-wrapper in-grid">
+                    <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
+                    <button class="close-btn" onclick="removeImageByHash('{{sha256}}')">×</button>
+                </div>
             {% endfor %}
         </div>
     </div>
@@ -320,7 +332,7 @@
 
             restoreLayout();
             
-            $grid.on( 'dragItemPositioned', saveLayout );
+            $grid.on('dragItemPositioned', saveLayout );
         });
 
         function removeImage(event) {
@@ -328,7 +340,19 @@
             $grid.packery('remove', gridItem);
             // Remove the item from the DOM
             gridItem.remove();
+            sha256 = gridItem.getAttribute('data-item-id');
+            $("#thumbnail-" + sha256).removeClass('in-grid');
             layoutChangeHook();
+        }
+
+        function removeImageByHash(sha256) {
+            var gridItem = document.getElementById(`gallery-${sha256}`);
+            $grid.packery('remove', gridItem);
+            // Remove the item from the DOM
+            gridItem.remove();
+            layoutChangeHook();
+            // Remove the in-grid class from the thumbnail wrapper
+            $("#thumbnail-" + sha256).removeClass('in-grid');
         }
 
         function changeSizeClosest(event, action) {
@@ -480,12 +504,17 @@
                 item.classes.forEach(function(cls) {
                     $elem.addClass(cls);
                 });
+                // Add in-grid class to the thumbnail wrapper
+                sha256 = $elem.attr('data-item-id');
+                $("#thumbnail-" + sha256).addClass('in-grid');
                 existingIDs.add(item.id);
             });
             // Eliminate any grid-item that were not found in the saved sizes
             $('.grid-item').each(function(index, elem) {
                 var $elem = $(elem);
                 if (!existingIDs.has($elem.attr('id'))) {
+                    sha256 = $elem.attr('data-item-id');
+                    $("#thumbnail-" + sha256).removeClass('in-grid');
                     $elem.remove();
                 }
             });
@@ -549,37 +578,40 @@
             thumbnailList.addEventListener('click', function (event) {
                 if (event.target.tagName === 'IMG') {
                     const sha256 = event.target.getAttribute('data-item-id');
-                    // Check if the image is already in the grid
-                    if (document.getElementById(`gallery-${sha256}`)) {
-                        return;
-                    }
                     const src = event.target.src;
-                    const gridItem = document.createElement('div');
-                    gridItem.id = `gallery-${sha256}`;
-                    gridItem.setAttribute('data-item-id', sha256);
-                    gridItem.className = 'grid-item grid-item-size-25';
-                    gridItem.innerHTML = `
-                        <button class="close-btn" onclick="removeImage(event)">×</button>
-                        <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
-                        <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
-                        <div class="size-button-container">
-                            ${percentages.map(percentage => `
-                                <button class="btn-size-${percentage}" onclick="changeSizeClosestTo(event, ${percentage})">${percentage}%</button>
-                            `).join('')}
-                        </div>
-                        <img src="${src}" alt="Image">
-                    `;
-                    gridContainer.appendChild(gridItem);
-                    imagesLoaded(gridContainer, function() {
-                        $grid.packery('appended', gridItem);
-                        layoutChangeHook();
-                    });
-                    // Apply in-grid class to the thumbnail
-                    event.target.classList.add('in-grid');
+                    createGalleryItem(sha256, src);
                 }
             });
         });
 
+        function createGalleryItem(sha256, src) {
+            // Check if the image is already in the grid
+            if (document.getElementById(`gallery-${sha256}`)) {
+                return;
+            }
+            const gridItem = document.createElement('div');
+            gridItem.id = `gallery-${sha256}`;
+            gridItem.setAttribute('data-item-id', sha256);
+            gridItem.className = 'grid-item grid-item-size-25';
+            gridItem.innerHTML = `
+                <button class="close-btn" onclick="removeImage(event)">×</button>
+                <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
+                <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
+                <div class="size-button-container">
+                    ${percentages.map(percentage => `
+                        <button class="btn-size-${percentage}" onclick="changeSizeClosestTo(event, ${percentage})">${percentage}%</button>
+                    `).join('')}
+                </div>
+                <img src="${src}" alt="Image">
+            `;
+            gridContainer.appendChild(gridItem);
+            imagesLoaded(gridContainer, function() {
+                $grid.packery('appended', gridItem);
+                layoutChangeHook();
+            });
+            // Apply in-grid class to the thumbnail wrapper
+            $("#thumbnail-" + sha256).addClass('in-grid');
+        }
     </script>
 </body>
 </html>
