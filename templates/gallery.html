@@ -98,6 +98,9 @@
         .control-buttons-drawer-open {
             bottom: 15.5vh;
         }
+        .control-buttons-drawer-open.control-buttons-drawer-open-large {
+            bottom: 30.5vh;
+        }
         .control-buttons button {
             background-color: rgba(0, 0, 0, 0.5);
             color: white;
@@ -158,13 +161,16 @@
             bottom: 0;
             left: 0;
             right: 0;
-            height: 15vh; /* Adjust the height as needed */
+            height: 15vh;
             background-color: #333;
             overflow: hidden;
             display: flex;
             align-items: center;
             justify-content: center;
             box-shadow: 0 -2px 10px rgba(0,0,0,0.5);
+        }
+        .drawer-large {
+            height: 30vh;
         }
 
         .thumbnail-list {
@@ -179,6 +185,9 @@
             border-radius: 5px;
             transition: transform 0.3s;
             cursor: pointer;
+        }
+        .drawer-large .thumbnail-list img {
+            height: 25vh;
         }
 
         .thumbnail-wrapper {
@@ -329,6 +338,7 @@
         {% endfor %}
     </div>
     <div class="control-buttons control-buttons-drawer-open">
+        <button class="drawer-size-toggle" onclick="toggleDrawerSize()">^+</button>
         <button onclick="toggleDrawer()">^</button>
         <button onclick="changeAllSizes('enlarge')">+</button>
         <button onclick="changeAllSizes('reduce')">-</button>
@@ -604,6 +614,12 @@
         function toggleDrawer() {
             $('#drawer').toggle();
             $('.control-buttons').toggleClass('control-buttons-drawer-open');
+            $('.drawer-size-toggle').toggle();
+        }
+
+        function toggleDrawerSize() {
+            $('#drawer').toggleClass('drawer-large');
+            $('.control-buttons').toggleClass('control-buttons-drawer-open-large');
         }
 
         document.addEventListener('DOMContentLoaded', function () {
