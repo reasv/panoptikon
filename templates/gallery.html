@@ -169,12 +169,55 @@
     <script src="//unpkg.com/imagesloaded@5/imagesloaded.pkgd.js"></script>
     <script src="//unpkg.com/packery@2.1.2/dist/packery.pkgd.js"></script>
     <script src="//unpkg.com/draggabilly@2/dist/draggabilly.pkgd.js"></script>
+    <script>
+        // get JSON-friendly data for items positions
+        Packery.prototype.getShiftPositions = function( attrName ) {
+        attrName = attrName || 'id';
+        var _this = this;
+        return this.items.map( function( item ) {
+            return {
+                attr: item.element.getAttribute( attrName ),
+                x: item.rect.x / _this.packer.width
+            }
+        });
+        };
+
+        Packery.prototype.initShiftLayout = function( positions, attr ) {
+        if ( !positions ) {
+            // if no initial positions, run packery layout
+            this.layout();
+            return;
+        }
+        // parse string to JSON
+        if ( typeof positions == 'string' ) {
+            try {
+            positions = JSON.parse( positions );
+            } catch( error ) {
+            console.error( 'JSON parse error: ' + error );
+            this.layout();
+            return;
+            }
+        }
+
+        attr = attr || 'id'; // default to id attribute
+        this._resetLayout();
+        // set item order and horizontal position from saved positions
+        this.items = positions.map( function( itemPosition ) {
+            var selector = '[' + attr + '="' + itemPosition.attr  + '"]'
+            var itemElem = this.element.querySelector( selector );
+            var item = this.getItem( itemElem );
+            item.rect.x = itemPosition.x * this.packer.width;
+            return item;
+        }, this );
+        this.shiftLayout();
+        };
+    </script>
 </head>
 <body>
     <div id="grid-container" class="grid">
         <div class="grid-sizer sizer-size-25"></div>
         {% for sha256, path in files %}
-            <div class="grid-item grid-item-size-25">
+            <div id="gallery-{{sha256}}" data-item-id="{{sha256}}" class="grid-item grid-item-size-25">
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
                 <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
@@ -190,6 +233,7 @@
     <div class="control-buttons">
         <button onclick="changeAllSizes('enlarge')">+</button>
         <button onclick="changeAllSizes('reduce')">-</button>
+        <button onclick="resetLayout()">X</button>
     </div>
     <script>
         var $grid;
@@ -201,14 +245,20 @@
                 itemSelector: '.grid-item',
                 // columnWidth helps with drop positioning
                 columnWidth: '.grid-sizer',
-                percentPosition: true
+                percentPosition: true,
+                initLayout: false
             });
+
 
             $grid.find('.grid-item').each( function( i, gridItem ) {
                 var draggie = new Draggabilly( gridItem );
                 // bind drag events to Packery
                 $grid.packery( 'bindDraggabillyEvents', draggie );
             });
+
+            restoreLayout();
+            
+            $grid.on( 'dragItemPositioned', saveLayout );
         });
 
         function removeImage(event) {
@@ -242,8 +292,7 @@
                 }
             }
             if (layout) {
-                updateGridSizer();
-                $grid.packery('layout');
+                layoutChangeHook();
             }
         }
 
@@ -253,8 +302,7 @@
             let size = percentages.indexOf(percentage);
             gridItem.classList.remove(currentSizeClass);
             gridItem.classList.add(sizeClasses[size]);
-            updateGridSizer();
-            $grid.packery('layout');
+            layoutChangeHook();
         }
 
         function changeSizeClosestTo(event, percentage) {
@@ -265,8 +313,7 @@
             $('.grid-item').each(function(i, gridItem) {
                 changeSize(gridItem, action, false);
             });
-            updateGridSizer();
-            $grid.packery('layout');
+            layoutChangeHook();
         }
 
         function getSizeIndex(gridItem) {
@@ -316,6 +363,64 @@
             
             const largestItemPercentage = percentages[largestSizeIndex];
             $('.grid-sizer').addClass(`sizer-size-${newGridSizerPercentage}`);
+        }
+
+        function layoutChangeHook() {
+            updateGridSizer();
+            $grid.packery('layout');
+            saveLayout();
+        }
+        function saveLayout() {
+            var itemElems = $('.grid-item');
+            var positions = [];
+
+            itemElems.each(function(index, elem) {
+                var $elem = $(elem);
+                var id = $elem.attr('id');
+                var classes = $elem.attr('class').split(/\s+/);
+
+                positions.push({
+                    id: id,
+                    classes: classes
+                });
+            });
+
+            var path = window.location.pathname;
+            localStorage.setItem('packerySizes-' + path, JSON.stringify(positions));
+            var positions = $grid.packery( 'getShiftPositions', 'data-item-id' );
+            localStorage.setItem( 'dragPositions-' + path, JSON.stringify( positions ) );
+            console.log('Layout saved');
+        }
+
+        function restoreLayout() {
+            var path = window.location.pathname;
+            var savedSizes = JSON.parse(localStorage.getItem('packerySizes-' + path));
+
+            if (!savedSizes) {
+                console.log('No saved sizes found');
+                $grid.packery('layout');
+                return;
+            }
+
+            savedSizes.forEach(function(item) {
+                var $elem = $('#' + item.id);
+
+                // Restore classes
+                $elem.attr('class', ''); // Clear existing classes
+                item.classes.forEach(function(cls) {
+                    $elem.addClass(cls);
+                });
+            });
+            updateGridSizer();
+            var initPositions = localStorage.getItem( 'dragPositions-' + path );
+            $grid.packery( 'initShiftLayout', initPositions, 'data-item-id' );
+            $grid.packery('layout');
+        }
+
+        function resetLayout() {
+            localStorage.removeItem('packerySizes-' + window.location.pathname);
+            localStorage.removeItem('dragPositions-' + window.location.pathname);
+            location.reload();
         }
     </script>
 </body>
