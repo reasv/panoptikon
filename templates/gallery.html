@@ -211,6 +211,42 @@
         .in-grid .close-btn {
             display: flex;
         }
+
+        /* New Item Size buttons */
+        .new-item-size-button-container {
+            position: absolute;
+            bottom: 5px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 5px;
+            visibility: hidden;
+            opacity: 0;
+            transition: visibility 0s, opacity 0.3s ease-in-out;
+        }
+
+        .drawer:hover .new-item-size-button-container {
+            visibility: visible;
+            opacity: 1;
+        }
+
+        .new-item-size-button-container button {
+            background-color: rgba(255, 255, 255, 0.8);
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            padding: 2px 5px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .new-item-size-button-container button:hover {
+            background-color: rgba(255, 255, 255, 1);
+        }
+        .new-item-size-button-container .btn-size-selected {
+                opacity: 1;
+                background-color: rgba(255, 255, 255, 1);
+                font-size: 18px;
+        }
     </style>
     <style>
          {% for percentage in percentages %}
@@ -309,6 +345,17 @@
                     <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
                     <button class="close-btn" onclick="removeImageByHash('{{sha256}}')">×</button>
                 </div>
+            {% endfor %}
+        </div>
+        <div class="new-item-size-button-container">
+            {% for percentage in percentages %}
+                <button class="
+                btn-size-{{percentage}}
+                {% if percentage == 20 %}
+                btn-size-selected
+                {% endif %}
+                "
+                onclick="changeNewItemSize(event, parseInt('{{ percentage }}'))">{{ percentage }}%</button>
             {% endfor %}
         </div>
     </div>
@@ -600,6 +647,8 @@
             });
         });
 
+        let defaultNewItemSize = 20;
+
         function createGalleryItem(sha256, src, layout = true) {
             // Check if the image is already in the grid
             if (document.getElementById(`gallery-${sha256}`)) {
@@ -608,7 +657,7 @@
             const gridItem = document.createElement('div');
             gridItem.id = `gallery-${sha256}`;
             gridItem.setAttribute('data-item-id', sha256);
-            gridItem.className = 'grid-item grid-item-size-20';
+            gridItem.className = `grid-item grid-item-size-${defaultNewItemSize}`;
             gridItem.innerHTML = `
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
@@ -633,6 +682,13 @@
             // Apply in-grid class to the thumbnail wrapper
             $("#thumbnail-" + sha256).addClass('in-grid');
             return gridItem;
+        }
+
+        function changeNewItemSize(event, percentage) {
+            // Remove class btn-size-selected from all buttons
+            $('.new-item-size-button-container button').removeClass('btn-size-selected');
+            $(`.new-item-size-button-container .btn-size-${percentage}`).addClass('btn-size-selected');
+            defaultNewItemSize = percentage;
         }
     </script>
 </body>
