@@ -278,7 +278,7 @@
 <body>
     <div id="grid-container" class="grid">
         <div class="grid-sizer sizer-size-25"></div>
-        {% for sha256, path in files %}
+        {% for sha256, path in files[:limit] %}
             <div id="gallery-{{sha256}}" data-item-id="{{sha256}}" class="grid-item grid-item-size-25">
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
@@ -301,7 +301,11 @@
     <div class="drawer" id="drawer">
         <div class="thumbnail-list" id="thumbnailList">
             {% for sha256, path in files %}
-                <div id="thumbnail-{{sha256}}" class="thumbnail-wrapper in-grid">
+                <div id="thumbnail-{{sha256}}" class="thumbnail-wrapper 
+                {% if loop.index0 < limit %}
+                in-grid
+                {% endif %}
+                ">
                     <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
                     <button class="close-btn" onclick="removeImageByHash('{{sha256}}')">×</button>
                 </div>
@@ -496,8 +500,19 @@
                 var $elem = $('#' + item.id);
                 // If the element is not found, add it to the missing IDs set
                 if ($elem.length === 0) {
-                    missingIDs.add(item.id);
-                    return;
+                    sha256 = item.id.split('-')[1];
+                    // Check if the thumbnail exists
+                    if ($("#thumbnail-" + sha256).length == 0) {
+                        missingIDs.add(item.id);
+                        return;
+                    }
+                    // Create the gallery item, but don't layout the grid yet
+                    const gridItem = createGalleryItem(sha256, $("#thumbnail-" + sha256 + " img").attr('src'), false);
+                    $grid.packery('addItems', gridItem);
+                    var draggie = new Draggabilly( gridItem );
+                    // bind drag events to Packery
+                    $grid.packery( 'bindDraggabillyEvents', draggie );
+                    console.log(`Added missing item ${sha256} ${$("#thumbnail-" + sha256 + " img").attr('src')}`);
                 }
                 // Restore classes
                 $elem.attr('class', ''); // Clear existing classes
@@ -528,7 +543,7 @@
                     return !missingIDs.has( 'gallery-'+item.attr );
                 });
             }
-            $grid.packery( 'initShiftLayout', initPositions, 'data-item-id' );
+            $grid.packery('initShiftLayout', initPositions, 'data-item-id' );
             $grid.packery('layout');
         }
 
@@ -584,7 +599,7 @@
             });
         });
 
-        function createGalleryItem(sha256, src) {
+        function createGalleryItem(sha256, src, layout = true) {
             // Check if the image is already in the grid
             if (document.getElementById(`gallery-${sha256}`)) {
                 return;
@@ -605,12 +620,18 @@
                 <img src="${src}" alt="Image">
             `;
             gridContainer.appendChild(gridItem);
-            imagesLoaded(gridContainer, function() {
-                $grid.packery('appended', gridItem);
-                layoutChangeHook();
-            });
+            if (layout) {
+                imagesLoaded(gridContainer, function() {
+                    $grid.packery('appended', gridItem);
+                    var draggie = new Draggabilly( gridItem );
+                    // bind drag events to Packery
+                    $grid.packery( 'bindDraggabillyEvents', draggie );
+                    layoutChangeHook();
+                });
+            }
             // Apply in-grid class to the thumbnail wrapper
             $("#thumbnail-" + sha256).addClass('in-grid');
+            return gridItem;
         }
     </script>
 </body>
