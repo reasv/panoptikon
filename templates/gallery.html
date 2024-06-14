@@ -95,6 +95,9 @@
             display: flex;
             gap: 10px;
         }
+        .control-buttons-drawer-open {
+            bottom: 15.5vh;
+        }
         .control-buttons button {
             background-color: rgba(0, 0, 0, 0.5);
             color: white;
@@ -148,6 +151,56 @@
 
         .size-button-container button:hover {
             background-color: rgba(255, 255, 255, 1);
+        }
+        /* Drawer */
+        .drawer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 15vh; /* Adjust the height as needed */
+            background-color: #333;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.5);
+        }
+
+        .thumbnail-list {
+            display: flex;
+            overflow-x: auto;
+            width: 100%;
+            padding: 10px;
+        }
+        .thumbnail-list img {
+            height: 10vh; /* Adjust the size of thumbnails as needed */
+            margin-right: 10px;
+            border-radius: 5px;
+            transition: transform 0.3s;
+            cursor: pointer;
+        }
+
+        .thumbnail-list img:hover {
+            transform: scale(1.1);
+        }
+        /* Hover image container */
+        .hover-image-container {
+            position: fixed;
+            bottom: 50%;
+            right: 50%;
+            transform: translate(50%, 40%);
+            display: none;
+            z-index: 1000;
+            pointer-events: none;
+        }
+
+        .hover-image-container img {
+            max-width: 80%;
+            max-height: 80vh; /* Adjust the max height to consider the drawer height */
+            border: 5px solid white;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            border-radius: 10px;
         }
     </style>
     <style>
@@ -230,11 +283,20 @@
             </div>
         {% endfor %}
     </div>
-    <div class="control-buttons">
+    <div class="control-buttons control-buttons-drawer-open">
+        <button onclick="toggleDrawer()">^</button>
         <button onclick="changeAllSizes('enlarge')">+</button>
         <button onclick="changeAllSizes('reduce')">-</button>
         <button onclick="resetLayout()">X</button>
     </div>
+    <div class="drawer" id="drawer">
+        <div class="thumbnail-list" id="thumbnailList">
+            {% for sha256, path in files %}
+                <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
+            {% endfor %}
+        </div>
+    </div>
+    <div id="hoverImageContainer" class="hover-image-container"></div>
     <script>
         var $grid;
         // Get the grid container
@@ -446,6 +508,78 @@
             localStorage.removeItem('dragPositions-' + window.location.pathname);
             location.reload();
         }
+
+        function toggleDrawer() {
+            $('#drawer').toggle();
+            $('.control-buttons').toggleClass('control-buttons-drawer-open');
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            const drawer = document.getElementById('drawer');
+            const thumbnailList = document.getElementById('thumbnailList');
+            const hoverImageContainer = document.getElementById('hoverImageContainer');
+
+            drawer.addEventListener('wheel', function (event) {
+                if (event.deltaY > 0) {
+                    thumbnailList.scrollLeft += 100; // Scroll right
+                } else {
+                    thumbnailList.scrollLeft -= 100; // Scroll left
+                }
+                event.preventDefault();
+            });
+
+            thumbnailList.addEventListener('mouseover', function (event) {
+                if (event.target.tagName === 'IMG') {
+                    const src = event.target.src;
+                    const hoverImage = document.createElement('img');
+                    hoverImage.src = src;
+                    hoverImageContainer.innerHTML = '';
+                    hoverImageContainer.appendChild(hoverImage);
+                    hoverImageContainer.style.display = 'block';
+                }
+            });
+
+            thumbnailList.addEventListener('mouseout', function (event) {
+                if (event.target.tagName === 'IMG') {
+                    hoverImageContainer.style.display = 'none';
+                }
+            });
+            
+            // Click on a thumbnail to add it to the grid
+            thumbnailList.addEventListener('click', function (event) {
+                if (event.target.tagName === 'IMG') {
+                    const sha256 = event.target.getAttribute('data-item-id');
+                    // Check if the image is already in the grid
+                    if (document.getElementById(`gallery-${sha256}`)) {
+                        return;
+                    }
+                    const src = event.target.src;
+                    const gridItem = document.createElement('div');
+                    gridItem.id = `gallery-${sha256}`;
+                    gridItem.setAttribute('data-item-id', sha256);
+                    gridItem.className = 'grid-item grid-item-size-25';
+                    gridItem.innerHTML = `
+                        <button class="close-btn" onclick="removeImage(event)">×</button>
+                        <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
+                        <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
+                        <div class="size-button-container">
+                            ${percentages.map(percentage => `
+                                <button class="btn-size-${percentage}" onclick="changeSizeClosestTo(event, ${percentage})">${percentage}%</button>
+                            `).join('')}
+                        </div>
+                        <img src="${src}" alt="Image">
+                    `;
+                    gridContainer.appendChild(gridItem);
+                    imagesLoaded(gridContainer, function() {
+                        $grid.packery('appended', gridItem);
+                        layoutChangeHook();
+                    });
+                    // Apply in-grid class to the thumbnail
+                    event.target.classList.add('in-grid');
+                }
+            });
+        });
+
     </script>
 </body>
 </html>
