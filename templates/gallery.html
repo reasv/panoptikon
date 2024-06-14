@@ -264,6 +264,8 @@
         function removeImage(event) {
             var gridItem = event.target.closest('.grid-item');
             $grid.packery('remove', gridItem);
+            // Remove the item from the DOM
+            gridItem.remove();
             layoutChangeHook();
         }
 
