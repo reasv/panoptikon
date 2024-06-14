@@ -513,6 +513,7 @@
                     // bind drag events to Packery
                     $grid.packery( 'bindDraggabillyEvents', draggie );
                     console.log(`Added missing item ${sha256} ${$("#thumbnail-" + sha256 + " img").attr('src')}`);
+                    $elem = $('#' + item.id);
                 }
                 // Restore classes
                 $elem.attr('class', ''); // Clear existing classes
