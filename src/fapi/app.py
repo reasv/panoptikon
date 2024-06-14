@@ -34,7 +34,20 @@ async def display_bookmarks(request: Request, bookmarks_namespace: str):
 @app.get("/browse/{foldername:path}/", response_class=HTMLResponse)
 async def browse_folder(request: Request, foldername: str):
     files_dicts = []
+    # Whether or not to include subdirectories
+    include_subdirs = request.query_params.get("subdirs", "false") == "true"
+    # Convert foldername to have the correct slashes for the current OS
+    foldername = os.path.join(os.path.normpath(foldername), "")
     for file_path in get_files_by_extension([foldername], [], get_image_extensions()):
+        # Skip files that are not directly in the current directory
+        dirname = os.path.join(os.path.dirname(file_path), "")
+        if (
+            not include_subdirs 
+            and dirname != foldername
+        ):  
+            print(f"Skipping {dirname} because it is not in {foldername}")
+            continue
+
         # Calculate sha256 hash of the file path instead of the file content for speed
         # Since we are browsing a single directory tree, this should be unique
         sha256 = hashlib.sha256(file_path.encode()).hexdigest()
