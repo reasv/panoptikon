@@ -277,9 +277,9 @@
 </head>
 <body>
     <div id="grid-container" class="grid">
-        <div class="grid-sizer sizer-size-25"></div>
+        <div class="grid-sizer sizer-size-20"></div>
         {% for sha256, path in files[:limit] %}
-            <div id="gallery-{{sha256}}" data-item-id="{{sha256}}" class="grid-item grid-item-size-25">
+            <div id="gallery-{{sha256}}" data-item-id="{{sha256}}" class="grid-item grid-item-size-20">
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
                 <button class="reduce-btn" onclick="changeSizeClosest(event, 'reduce')">-</button>
@@ -414,7 +414,7 @@
             if (currentSizeClass) {
                 currentSizeClass = currentSizeClass[0];
             } else {
-                currentSizeClass = 'grid-item-size-25';
+                currentSizeClass = 'grid-item-size-20';
             }
             return sizeClasses.indexOf(currentSizeClass);
         }
@@ -608,7 +608,7 @@
             const gridItem = document.createElement('div');
             gridItem.id = `gallery-${sha256}`;
             gridItem.setAttribute('data-item-id', sha256);
-            gridItem.className = 'grid-item grid-item-size-25';
+            gridItem.className = 'grid-item grid-item-size-20';
             gridItem.innerHTML = `
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>
