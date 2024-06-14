@@ -1,7 +1,7 @@
 import os
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection, get_bookmarks
 
@@ -32,3 +32,9 @@ async def display_bookmarks(request: Request, bookmarks_namespace: str):
 async def serve_image(filename: str):
     directory = os.path.dirname(filename)
     return FileResponse(os.path.join(directory, os.path.basename(filename)))
+
+
+# Redirect / to /gradio
+@app.get("/")
+async def redirect_to_gradio():
+    return RedirectResponse(url="/gradio/")
