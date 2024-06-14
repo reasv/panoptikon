@@ -263,7 +263,8 @@
 
         function removeImage(event) {
             var gridItem = event.target.closest('.grid-item');
-            $grid.packery('remove', gridItem).packery('layout');
+            $grid.packery('remove', gridItem);
+            layoutChangeHook();
         }
 
         function changeSizeClosest(event, action) {
@@ -401,18 +402,39 @@
                 $grid.packery('layout');
                 return;
             }
-
+            const existingIDs = new Set();
+            const missingIDs = new Set();
             savedSizes.forEach(function(item) {
                 var $elem = $('#' + item.id);
-
+                // If the element is not found, add it to the missing IDs set
+                if ($elem.length === 0) {
+                    missingIDs.add(item.id);
+                    return;
+                }
                 // Restore classes
                 $elem.attr('class', ''); // Clear existing classes
                 item.classes.forEach(function(cls) {
                     $elem.addClass(cls);
                 });
+                existingIDs.add(item.id);
+            });
+            // Eliminate any grid-item that were not found in the saved sizes
+            $('.grid-item').each(function(index, elem) {
+                var $elem = $(elem);
+                if (!existingIDs.has($elem.attr('id'))) {
+                    $elem.remove();
+                }
             });
             updateGridSizer();
+            // Restore drag positions
             var initPositions = localStorage.getItem( 'dragPositions-' + path );
+            if ( initPositions ) {
+                initPositions = JSON.parse( initPositions );
+                initPositions = initPositions.filter( function( item ) {
+                    // filter out items that are not in the grid
+                    return !missingIDs.has( 'gallery-'+item.attr );
+                });
+            }
             $grid.packery( 'initShiftLayout', initPositions, 'data-item-id' );
             $grid.packery('layout');
         }
