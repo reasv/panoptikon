@@ -1,9 +1,11 @@
 import os
+import hashlib
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection, get_bookmarks
+from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -24,6 +26,46 @@ async def display_bookmarks(request: Request, bookmarks_namespace: str):
         "request": request,
         "files": files,
         "namespace": bookmarks_namespace,
+        "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
+        "limit": show
+    })
+
+
+@app.get("/browse/{foldername:path}/", response_class=HTMLResponse)
+async def browse_folder(request: Request, foldername: str):
+    files_dicts = []
+    for file_path in get_files_by_extension([foldername], [], get_image_extensions()):
+        # Calculate sha256 hash of the file path instead of the file content for speed
+        # Since we are browsing a single directory tree, this should be unique
+        sha256 = hashlib.sha256(file_path.encode()).hexdigest()
+        files_dicts.append(
+            {
+                'sha256': sha256,
+                'path': file_path,
+                'last_modified': get_last_modified_time(file_path)
+            }
+        )
+    # Extract sort parameter from query string
+    sort = request.query_params.get("sort", "last_modified")
+    if sort == "last_modified":
+        # Sort files by last modified time
+        # Desc sort by default to show the latest files first
+        reverse = request.query_params.get("desc", "true") == "true"
+        files_dicts.sort(key=lambda x: x['last_modified'], reverse=reverse)
+    elif sort == "path":
+        # Sort files by path
+        # asc sort by default to show the latest files first
+        reverse = request.query_params.get("desc", "false") == "true"
+        files_dicts.sort(key=lambda x: x['path'], reverse=reverse)
+
+    print(len(files_dicts))
+
+    files = [(file['sha256'], file['path']) for file in files_dicts]
+    # Extract "show" parameter from query string
+    show = int(request.query_params.get("show", 4))
+    return templates.TemplateResponse("gallery.html", {
+        "request": request,
+        "files": files,
         "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
         "limit": show
     })
