@@ -35,6 +35,9 @@ def get_folder_list():
 def on_tab_load():
     return gr.update(choices=get_folder_list())
 
+def on_tag_select(selectData: gr.SelectData):
+    return selectData.value
+
 def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.State = None):
     with gr.TabItem(label="Tag Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
@@ -99,4 +102,9 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
             number_of_results,
             current_page,
         ]
+    )
+
+    multi_view.list_view.tag_list.select(
+        fn=on_tag_select,
+        outputs=[tag_input]
     )
