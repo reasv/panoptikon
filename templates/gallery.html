@@ -202,17 +202,16 @@
         /* Hover image container */
         .hover-image-container {
             position: fixed;
-            bottom: 50%;
-            right: 50%;
-            transform: translate(50%, 40%);
+            right: 50vw;
+            transform: translate(50%);
             display: none;
             z-index: 1000;
             pointer-events: none;
         }
 
         .hover-image-container img {
-            max-width: 80%;
-            max-height: 80vh; /* Adjust the max height to consider the drawer height */
+            max-width: 80vw;
+            max-height: 80vh;
             border: 5px solid white;
             box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
             border-radius: 10px;
@@ -641,7 +640,12 @@
                     const src = event.target.src;
                     const hoverImage = document.createElement('img');
                     hoverImage.src = src;
+                    const drawerHeight = drawer.clientHeight;
+                    hoverImage.style.maxHeight = `calc(100vh - ${drawerHeight}px - 20px)`; // Subtract drawer height and a small margin
                     hoverImageContainer.innerHTML = '';
+                    hoverImage.style.maxHeight = `calc(100vh - ${drawerHeight}px - 100px)`; // Subtract drawer height and a small margin
+                    console.log(drawerHeight);
+                    hoverImageContainer.style.bottom = `calc(${drawerHeight}px + 75px)`;
                     hoverImageContainer.appendChild(hoverImage);
                     hoverImageContainer.style.display = 'block';
                 }
