@@ -173,7 +173,7 @@
 <body>
     <div id="grid-container" class="grid">
         <div class="grid-sizer sizer-size-25"></div>
-        {% for sha256, path in bookmarks %}
+        {% for sha256, path in files %}
             <div class="grid-item grid-item-size-25">
                 <button class="close-btn" onclick="removeImage(event)">×</button>
                 <button class="enlarge-btn" onclick="changeSizeClosest(event, 'enlarge')">+</button>

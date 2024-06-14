@@ -16,11 +16,11 @@ def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000,
 
 @app.get("/bookmarks/{bookmarks_namespace}/", response_class=HTMLResponse)
 async def display_bookmarks(request: Request, bookmarks_namespace: str):
-    bookmarks, total = get_all_bookmarks_in_folder(bookmarks_namespace)
+    files, total = get_all_bookmarks_in_folder(bookmarks_namespace)
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,
-        "bookmarks": bookmarks,
+        "files": files,
         "namespace": bookmarks_namespace,
         "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100]
     })
