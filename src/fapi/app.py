@@ -33,7 +33,6 @@ async def serve_image(filename: str):
     directory = os.path.dirname(filename)
     return FileResponse(os.path.join(directory, os.path.basename(filename)))
 
-
 # Redirect / to /gradio
 @app.get("/")
 async def redirect_to_gradio():

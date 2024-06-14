@@ -48,7 +48,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
                             min_confidence = gr.Slider(minimum=0.05, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags", scale=2)
                             max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)         
-        
+
         multi_view = create_multiview(select_history=select_history, bookmarks_namespace=bookmarks_namespace)
 
         with gr.Row(elem_classes="pagination-controls"):

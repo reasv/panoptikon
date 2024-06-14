@@ -8,7 +8,7 @@ from src.ui.scan import create_scan_UI
 from src.ui.toptags import create_toptags_UI
 from src.ui.test_model import create_dd_UI
 from src.ui.search import create_search_UI
-# from src.ui.history import create_history_UI
+from src.ui.history import create_history_UI
 from src.ui.bookmarks import create_bookmarks_UI
 
 def create_root_UI():
@@ -19,7 +19,7 @@ def create_root_UI():
         with gr.Tabs():
             create_search_UI(select_history, bookmarks_namespace=bookmarks_namespace)
             create_bookmarks_UI(bookmarks_namespace=bookmarks_namespace)
-            # create_history_UI(select_history, bookmarks_namespace=bookmarks_namespace)
+            create_history_UI(select_history, bookmarks_namespace=bookmarks_namespace)
             with gr.TabItem(label="Tag Frequency"):
                 create_toptags_UI()
             with gr.TabItem(label="File Scan & Tagging"):
