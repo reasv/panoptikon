@@ -130,10 +130,14 @@ async def browse_folder(request: Request, foldername: str):
         "limit": show
     })
 
-@app.get("/image/{filename:path}")
+@app.get("/file/{filename:path}")
 async def serve_image(filename: str):
     directory = os.path.dirname(filename)
-    return FileResponse(os.path.join(directory, os.path.basename(filename)))
+    # Cache the file for 30 minutes
+    return FileResponse(
+        os.path.join(directory, os.path.basename(filename)),
+        headers={"Cache-Control": "max-age=1800"}
+    )
 
 # Redirect / to /gradio
 @app.get("/")
