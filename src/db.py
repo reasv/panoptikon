@@ -353,7 +353,17 @@ def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None) -> Tuple[List[Tuple], int]:
+def find_items_by_tags(
+        conn: sqlite3.Connection,
+        tags,
+        min_confidence=0.5,
+        page_size=1000,
+        page=1,
+        include_path=None,
+        order_by="last_modified",
+        order=None
+    ) -> Tuple[List[Tuple], int]:
+
     cursor = conn.cursor()
     if page_size < 1:
         page_size = 1000000
@@ -387,6 +397,17 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
     cursor.execute(count_query, count_params)
     total_count: int = cursor.fetchone()[0]
 
+    if order_by == "path":
+        order_by_clause = "path"
+        if order == None:
+            order = "asc"
+    else:
+        order_by_clause = "last_modified"
+        if order == None:
+            order = "desc"
+    
+    order_clause = "DESC" if order == "desc" else "ASC"
+
     # Second query to get the items with pagination
     query = '''
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
@@ -397,9 +418,9 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
     WHERE tags.name IN ({}) AND tags.confidence >= ? {}
     GROUP BY items.sha256
     HAVING COUNT(DISTINCT tags.name) = ?
-    ORDER BY last_modified DESC
+    ORDER BY {} {}
     LIMIT ? OFFSET ?
-    '''.format(','.join(['?']*len(tags)), path_condition)
+    '''.format(','.join(['?']*len(tags)), path_condition, order_by_clause, order_clause)
 
     query_params = tags + [min_confidence]
     if include_path:
@@ -411,12 +432,12 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
 
     return items, total_count
 
-def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None) -> Tuple[List[dict], int]:
+def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None, order_by="last_modified", order=None) -> Tuple[List[dict], int]:
     results: List[dict] = []
     if len(tags) == 0:
-        items, total_count = find_items_without_tags(conn, page_size, page, include_path)
+        items, total_count = find_items_without_tags(conn, page_size, page, include_path, order_by=order_by, order=order)
     else:
-        items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path)
+        items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path, order_by, order)
     for item in items:
         if os.path.exists(item[7]):
             results.append({
@@ -434,7 +455,7 @@ def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
             })
     return results, total_count
 
-def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, include_path=None) -> Tuple[List[Tuple], int]:
+def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, include_path=None, order_by="last_modified", order=None) -> Tuple[List[Tuple], int]:
     cursor = conn.cursor()
     if page_size < 1:
         page_size = 1000000
@@ -464,16 +485,27 @@ def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, in
     cursor.execute(count_query, count_params)
     total_count: int = cursor.fetchone()[0]
 
+    if order_by == "path":
+        order_by_clause = "path"
+        if order == None:
+            order = "asc"
+    else:
+        order_by_clause = "last_modified"
+        if order == None:
+            order = "desc"
+    
+    order_clause = "DESC" if order == "desc" else "ASC"
+
     # Second query to get the items with pagination
-    query = '''
+    query = f'''
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
-    JOIN files ON items.sha256 = files.sha256 {}
+    JOIN files ON items.sha256 = files.sha256 {path_condition}
     GROUP BY items.sha256
-    ORDER BY last_modified DESC
+    ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
-    '''.format(path_condition)
+    '''
 
     query_params = []
     if include_path:

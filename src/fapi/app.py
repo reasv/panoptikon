@@ -84,10 +84,21 @@ def get_all_items_with_tags(
         min_confidence: float,
         page_size: int = 1000,
         page: int = 1,
-        include_path: str=None
+        include_path: str=None,
+        order_by: str = "last_modified",
+        order = None
     ):
     conn = get_database_connection(force_readonly=True)
-    items, total_items = find_paths_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page, include_path=include_path)
+    items, total_items = find_paths_by_tags(
+        conn,
+        tags,
+        min_confidence=min_confidence,
+        page_size=page_size,
+        page=page,
+        include_path=include_path,
+        order_by=order_by,
+        order=order
+    )
     conn.close()
     return items, total_items
 
@@ -100,9 +111,19 @@ async def search_by_tags_html(
         include_path: Optional[str] = Query(None),
         page_size: int = Query(100, ge=1),
         page: int = Query(1, ge=1),
+        order_by: str = Query("last_modified"),
+        order = Query(None)
     ):
     tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
-    files_dicts, total = get_all_items_with_tags(tags_list, min_confidence, page_size=page_size, page=page, include_path=include_path)
+    files_dicts, total = get_all_items_with_tags(
+            tags_list,
+            min_confidence,
+            page_size=page_size,
+            page=page,
+            include_path=include_path,
+            order_by=order_by,
+            order=order
+        )
     files = [(file['sha256'], file['path']) for file in files_dicts]
     print(tags, tags_list)
     print(total)
@@ -120,9 +141,19 @@ async def search_by_tags_json(
         include_path: Optional[str] = Query(None),
         page_size: int = Query(100, ge=1),
         page: int = Query(1, ge=1),
+        order_by: str = Query("last_modified"),
+        order = Query(None)
     ):
     tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
-    files, total = get_all_items_with_tags(tags_list, min_confidence, page_size, page, include_path)
+    files, total = get_all_items_with_tags(
+        tags_list,
+        min_confidence,
+        page_size,
+        page,
+        include_path,
+        order_by,
+        order
+    )
     print(total)
     return JSONResponse({
         "files": files,
