@@ -401,7 +401,7 @@
             });
 
             restoreLayout();
-            
+            addPreviousNextPageButtons();
             $grid.on('dragItemPositioned', saveLayout );
         });
 
@@ -540,12 +540,12 @@
                 // Get the img element
                 var img = $elem.find('img')[0];
                 // Get the data-item-id attribute
-                var dataItemId = img.getAttribute('data-item-id');
+                var dataItemId = $elem.attr('data-item-id');
                 // Get the src attribute
                 var dataSrc = img.getAttribute('src');
                 settings.push({
                     id: id,
-                    classes: classes
+                    classes: classes,
                     dataItemId: dataItemId,
                     dataSrc: dataSrc
                 });
@@ -746,6 +746,97 @@
             // Apply in-grid class to the thumbnail wrapper
             $("#thumbnail-" + sha256).addClass('in-grid');
             return gridItem;
+        }
+
+        function refreshItemList(override_params = {}) {
+            let api = "{{ url_for('search_by_tags_json') }}";
+            // Use the same query parameters as the current page
+            const searchParams = new URLSearchParams(window.location.search);
+            for (const [key, value] of searchParams) {
+                if (override_params[key] === undefined) {
+                    api += `&${key}=${value}`;
+                    continue
+                }
+                if (override_params[key] === null) {
+                    continue
+                }
+                api += `&${key}=${override_params[key]}`;
+            }
+            fetch(api)
+                .then(response => response.json())
+                .then(data => {
+                    removeAllThumbnailItems();
+                    for (const file of data.files) {
+                        const sha256 = file["sha256"];
+                        const path = file["path"];
+                        createThumbnailItem(sha256, path);
+                    }
+                });
+        }
+
+        function addPreviousNextPageButtons() {
+            const searchParams = new URLSearchParams(window.location.search);
+            // Check if there is a page parameter
+            if (!searchParams.has('page')) {
+                console.log('No page parameter found');
+                return;
+            }
+            console.log('Page parameter found');
+            const page = parseInt(searchParams.get('page'));
+            // Add to control buttons
+            const controlButtons = document.querySelector('.control-buttons');
+            const previousButton = document.createElement('button');
+            if (page > 1) {
+                previousButton.textContent = `←${page-1}`;
+                previousButton.onclick = () => loadNextPageItems(true);
+                controlButtons.insertBefore(previousButton, controlButtons.firstChild);
+            }
+            // Also add refresh button
+            const refreshButton = document.createElement('button');
+            refreshButton.textContent = '↻';
+            refreshButton.onclick = () => refreshItemList();
+            controlButtons.appendChild(refreshButton);
+            // Add next button
+            const nextButton = document.createElement('button');
+            nextButton.textContent = `${page+1}→`;
+            nextButton.onclick = () => loadNextPageItems();
+            controlButtons.appendChild(nextButton);
+        }
+
+        function loadNextPageItems(previous = false) {
+            const searchParams = new URLSearchParams(window.location.search);
+            let page;
+            if (previous) {
+                page = parseInt(searchParams.get('page')) - 1;
+            } else {
+                page = parseInt(searchParams.get('page')) + 1;
+            }
+            page = Math.max(1, page);
+            searchParams.set('page', page);
+            window.location.search = searchParams.toString();
+            refreshItemList({page: page});
+        }
+
+        function createThumbnailItem(sha256, src) {
+            const thumbnailList = document.getElementById('thumbnailList');
+            const thumbnailWrapper = document.createElement('div');
+            thumbnailWrapper.id = `thumbnail-${sha256}`;
+            thumbnailWrapper.className = 'thumbnail-wrapper';
+            thumbnailWrapper.innerHTML = `
+                <img class="lazy" data-src="${src}" data-item-id="${sha256}" alt="${src}">
+                <button class="close-btn" onclick="removeImageByHash('${sha256}')">×</button>
+            `;
+            thumbnailList.appendChild(thumbnailWrapper);
+        }
+
+        function removeThumbnailItem(sha256) {
+            const thumbnailWrapper = document.getElementById(`thumbnail-${sha256}`);
+            thumbnailWrapper.remove();
+        }
+
+        function removeAllThumbnailItems() {
+            const thumbnailList = document.getElementById('thumbnailList');
+            thumbnailList.innerHTML = '';
         }
 
         function changeNewItemSize(event, percentage) {
