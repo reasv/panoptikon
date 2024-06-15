@@ -750,8 +750,14 @@
             return gridItem;
         }
 
+        function checkCurrentPageType() {
+            const bookmarks_path = "/bookmarks";
+            return window.location.pathname.startsWith(bookmarks_path) ? 'bookmarks' : 'search';
+        }
+
         function refreshItemList(override_params = {}) {
-            let api = "{{ url_for('search_by_tags_json') }}";
+            const api = '/api' + window.location.pathname
+
             // Use the same query parameters as the current page
             const searchParams = new URLSearchParams(window.location.search);
             for (const [key, value] of searchParams) {
@@ -807,6 +813,14 @@
             // Check if there is a page parameter
             if (!searchParams.has('page')) {
                 console.log('No page parameter found');
+                const pageType = checkCurrentPageType();
+                if (pageType === 'bookmarks') {
+                    // No need to add page buttons for bookmarks
+                    const controlButtons = document.querySelector('.control-buttons');
+                    const refreshButton = makeRefreshButton();
+                    controlButtons.appendChild(refreshButton);
+                    return;
+                }
                 return;
             }
             console.log('Page parameter found');
@@ -822,9 +836,7 @@
             // Hide the previous button if the page is 1
             previousButton.disabled = page === 1;
             // Also add refresh button
-            const refreshButton = document.createElement('button');
-            refreshButton.textContent = '↻';
-            refreshButton.onclick = () => refreshItemList();
+            const refreshButton = makeRefreshButton();
             controlButtons.appendChild(refreshButton);
             // Add next button
             const nextButton = document.createElement('button');
@@ -832,6 +844,13 @@
             nextButton.onclick = () => loadNextPageItems();
             nextButton.className = 'next-page-button';
             controlButtons.appendChild(nextButton);
+        }
+
+        function makeRefreshButton() {
+            const refreshButton = document.createElement('button');
+            refreshButton.textContent = '↻';
+            refreshButton.onclick = () => refreshItemList();
+            return refreshButton;
         }
 
         function loadNextPageItems(previous = false) {

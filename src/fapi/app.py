@@ -18,7 +18,7 @@ def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000,
     return bookmarks, total_bookmarks
 
 @app.get("/bookmarks/{bookmarks_namespace}/", response_class=HTMLResponse)
-async def display_bookmarks(request: Request, bookmarks_namespace: str):
+async def get_bookmarks_page(request: Request, bookmarks_namespace: str):
     # Extract "show" parameter from query string
     show = int(request.query_params.get("show", 0))
     page_size = int(request.query_params.get("page_size", 1000))
@@ -31,6 +31,16 @@ async def display_bookmarks(request: Request, bookmarks_namespace: str):
         "namespace": bookmarks_namespace,
         "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
         "limit": show
+    })
+
+@app.get("/api/bookmarks/{bookmarks_namespace}/", response_class=JSONResponse)
+async def get_bookmarks_json(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
+    files, total = get_all_bookmarks_in_folder(bookmarks_namespace, page_size=page_size, page=page)
+    files_dict = [{"sha256": sha256, "path": path} for sha256, path in files]
+    print(total)
+    return JSONResponse({
+        "files": files_dict,
+        "total": total,
     })
 
 def get_all_items_with_tags(tags: list, min_confidence: float, page_size: int = 1000, page: int = 1, include_path: str=None):
@@ -74,10 +84,7 @@ async def search_by_tags_json(
     print(total)
     return JSONResponse({
         "files": files,
-        "tags": tags,
         "total": total,
-        "page_size": page_size,
-        "page": page
     })
 
 @app.get("/browse/{foldername:path}/", response_class=HTMLResponse)
