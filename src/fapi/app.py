@@ -11,19 +11,43 @@ from src.files import get_files_by_extension, get_image_extensions, get_last_mod
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
+def get_all_bookmarks_in_folder(
+        bookmarks_namespace: str,
+        page_size: int = 1000,
+        page: int = 1,
+        order_by: str = "time_added",
+        order = None
+    ):
     conn = get_database_connection(force_readonly=True)
-    bookmarks, total_bookmarks = get_bookmarks(conn, namespace=bookmarks_namespace, page_size=page_size, page=page)
+    bookmarks, total_bookmarks = get_bookmarks(
+        conn,
+        namespace=bookmarks_namespace,
+        page_size=page_size,
+        page=page,
+        order_by=order_by,
+        order=order
+    )
     conn.close()
     return bookmarks, total_bookmarks
 
 @app.get("/bookmarks/{bookmarks_namespace}/", response_class=HTMLResponse)
-async def get_bookmarks_page(request: Request, bookmarks_namespace: str):
+async def get_bookmarks_page(
+        request: Request,
+        bookmarks_namespace: str,
+        show: int = 0,
+        page_size: int = 1000,
+        page: int = 1,
+        order_by: str = "time_added",
+        order=None
+    ):
     # Extract "show" parameter from query string
-    show = int(request.query_params.get("show", 0))
-    page_size = int(request.query_params.get("page_size", 1000))
-    page = int(request.query_params.get("page", 1))
-    files, total = get_all_bookmarks_in_folder(bookmarks_namespace, page_size=page_size, page=page)
+    files, total = get_all_bookmarks_in_folder(
+        bookmarks_namespace,
+        page_size=page_size,
+        page=page,
+        order_by=order_by,
+        order=order
+    )
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,
@@ -34,8 +58,20 @@ async def get_bookmarks_page(request: Request, bookmarks_namespace: str):
     })
 
 @app.get("/api/bookmarks/{bookmarks_namespace}/", response_class=JSONResponse)
-async def get_bookmarks_json(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
-    files, total = get_all_bookmarks_in_folder(bookmarks_namespace, page_size=page_size, page=page)
+async def get_bookmarks_json(
+        bookmarks_namespace: str,
+        page_size: int = 1000,
+        page: int = 1,
+        order_by: str = "time_added",
+        order=None
+    ):
+    files, total = get_all_bookmarks_in_folder(
+        bookmarks_namespace,
+        page_size=page_size,
+        page=page,
+        order_by=order_by,
+        order=order
+    )
     files_dict = [{"sha256": sha256, "path": path} for sha256, path in files]
     print(total)
     return JSONResponse({
@@ -43,7 +79,13 @@ async def get_bookmarks_json(bookmarks_namespace: str, page_size: int = 1000, pa
         "total": total,
     })
 
-def get_all_items_with_tags(tags: list, min_confidence: float, page_size: int = 1000, page: int = 1, include_path: str=None):
+def get_all_items_with_tags(
+        tags: list,
+        min_confidence: float,
+        page_size: int = 1000,
+        page: int = 1,
+        include_path: str=None
+    ):
     conn = get_database_connection(force_readonly=True)
     items, total_items = find_paths_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page, include_path=include_path)
     conn.close()

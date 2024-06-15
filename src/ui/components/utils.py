@@ -37,9 +37,9 @@ def get_all_bookmark_folders():
     conn.close()
     return bookmark_folders
 
-def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
+def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000, page: int = 1, order_by: str = "time_added", order = None):
     conn = get_database_connection()
-    bookmarks, total_bookmarks = get_bookmarks(conn, namespace=bookmarks_namespace, page_size=page_size, page=page)
+    bookmarks, total_bookmarks = get_bookmarks(conn, namespace=bookmarks_namespace, page_size=page_size, page=page, order_by=order_by, order=order)
     conn.close()
     return bookmarks, total_bookmarks
 

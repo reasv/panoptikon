@@ -634,7 +634,7 @@ def get_all_bookmark_namespaces(conn: sqlite3.Connection) -> List[str]:
     namespaces = cursor.fetchall()
     return [namespace[0] for namespace in namespaces]
 
-def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_size=1000, page=1,) -> Tuple[List[Tuple[str, str]], int]:
+def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_size=1000, page=1, order_by="time_added", order=None) -> Tuple[List[Tuple[str, str]], int]:
     if page_size < 1:
         page_size = 1000000
     offset = (page - 1) * page_size
@@ -648,8 +648,23 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
         WHERE bookmarks.namespace = ?
     ''', (namespace,))
     total_results = cursor.fetchone()[0]
+    # Can order by time_added, path, or last_modified
 
-    cursor.execute('''
+    if order_by == "path":
+        order_by_clause = "path"
+        if order == None:
+            order = "asc"
+    elif order_by == "last_modified":
+        order_by_clause = "MAX(any_files.last_modified)"
+        if order == None:
+            order = "desc"
+    else:
+        order_by_clause = "bookmarks.time_added"
+        if order == None:
+            order = "desc"
+    
+    order_clause = "DESC" if order == "desc" else "ASC"
+    cursor.execute(f'''
         SELECT bookmarks.sha256, 
                COALESCE(available_files.path, any_files.path) as path
         FROM bookmarks
@@ -660,7 +675,8 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
                ON bookmarks.sha256 = any_files.sha256
         WHERE bookmarks.namespace = ?
         GROUP BY bookmarks.sha256
-        ORDER BY bookmarks.time_added DESC
+        ORDER BY {order_by_clause}
+        {order_clause}
         LIMIT ? OFFSET ?
     ''', (namespace, page_size, offset))
     
