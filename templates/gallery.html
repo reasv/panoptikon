@@ -531,21 +531,27 @@
         }
         function saveLayout() {
             var itemElems = $('.grid-item');
-            var positions = [];
+            var settings = [];
 
             itemElems.each(function(index, elem) {
                 var $elem = $(elem);
                 var id = $elem.attr('id');
                 var classes = $elem.attr('class').split(/\s+/);
-
-                positions.push({
+                // Get the img element
+                var img = $elem.find('img')[0];
+                // Get the data-item-id attribute
+                var dataItemId = img.getAttribute('data-item-id');
+                // Get the src attribute
+                var dataSrc = img.getAttribute('src');
+                settings.push({
                     id: id,
                     classes: classes
+                    dataItemId: dataItemId,
+                    dataSrc: dataSrc
                 });
             });
 
-            var path = window.location.pathname;
-            localStorage.setItem(getLocalStoragePath('packerySizes'), JSON.stringify(positions));
+            localStorage.setItem(getLocalStoragePath('packerySizes'), JSON.stringify(settings));
             var positions = $grid.packery( 'getShiftPositions', 'data-item-id' );
             localStorage.setItem(getLocalStoragePath('dragPositions'), JSON.stringify( positions ) );
             console.log('Layout saved');
@@ -563,33 +569,29 @@
         }
 
         function restoreLayout() {
-            var path = window.location.pathname;
-            var savedSizes = JSON.parse(localStorage.getItem(getLocalStoragePath('packerySizes')));            
+            var savedSettings = JSON.parse(localStorage.getItem(getLocalStoragePath('packerySizes')));            
 
-            if (!savedSizes) {
+            if (!savedSettings) {
                 console.log('No saved sizes found');
                 $grid.packery('layout');
                 return;
             }
             const existingIDs = new Set();
+            // TODO remove this
             const missingIDs = new Set();
-            savedSizes.forEach(function(item) {
+            savedSettings.forEach(function(item) {
                 var $elem = $('#' + item.id);
-                // If the element is not found, add it to the missing IDs set
+                // If the element is not found, create it
                 if ($elem.length === 0) {
-                    sha256 = item.id.split('-')[1];
-                    // Check if the thumbnail exists
-                    if ($("#thumbnail-" + sha256).length == 0) {
-                        missingIDs.add(item.id);
-                        return;
-                    }
+                    sha256 = item.dataItemId;
+                    src = item.dataSrc;
                     // Create the gallery item, but don't layout the grid yet
-                    const gridItem = createGalleryItem(sha256, $("#thumbnail-" + sha256 + " img").attr('data-src'), false);
+                    const gridItem = createGalleryItem(sha256, src, false);
                     $grid.packery('addItems', gridItem);
-                    var draggie = new Draggabilly( gridItem );
+                    var draggie = new Draggabilly(gridItem);
                     // bind drag events to Packery
-                    $grid.packery( 'bindDraggabillyEvents', draggie );
-                    console.log(`Added missing item ${sha256} ${$("#thumbnail-" + sha256 + " img").attr('data-src')}`);
+                    $grid.packery('bindDraggabillyEvents', draggie );
+                    console.log(`Added missing item ${sha256} ${src}`);
                     $elem = $('#' + item.id);
                 }
                 // Restore classes
