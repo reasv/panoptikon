@@ -186,6 +186,16 @@
             transition: transform 0.3s;
             cursor: pointer;
         }
+
+        /* Lazy loading placeholder */
+        .thumbnail-wrapper img.lazy {
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .thumbnail-wrapper img.lazy-loaded {
+            opacity: 1;
+        }
         .drawer-large .thumbnail-list img {
             height: 25vh;
         }
@@ -351,7 +361,7 @@
                 in-grid
                 {% endif %}
                 ">
-                    <img data-item-id="{{sha256}}" src="{{ url_for('serve_image', filename=path) }}" alt="{{path}}">
+                    <img class="lazy" data-src="{{ url_for('serve_image', filename=path) }}" data-item-id="{{sha256}}" alt="{{path}}">
                     <button class="close-btn" onclick="removeImageByHash('{{sha256}}')">×</button>
                 </div>
             {% endfor %}
@@ -535,15 +545,26 @@
             });
 
             var path = window.location.pathname;
-            localStorage.setItem('packerySizes-' + path, JSON.stringify(positions));
+            localStorage.setItem(getLocalStoragePath('packerySizes'), JSON.stringify(positions));
             var positions = $grid.packery( 'getShiftPositions', 'data-item-id' );
-            localStorage.setItem( 'dragPositions-' + path, JSON.stringify( positions ) );
+            localStorage.setItem(getLocalStoragePath('dragPositions'), JSON.stringify( positions ) );
             console.log('Layout saved');
+        }
+
+        function getLocalStoragePath(type) {
+            var path = window.location.pathname;
+            if (new URLSearchParams(window.location.search).has('set')) {
+                // Get value of set
+                var set = `set-${new URLSearchParams(window.location.search).get('set')}-`;
+            } else {
+                var set = '';
+            }
+            return `${set}${type}-${path}`;
         }
 
         function restoreLayout() {
             var path = window.location.pathname;
-            var savedSizes = JSON.parse(localStorage.getItem('packerySizes-' + path));
+            var savedSizes = JSON.parse(localStorage.getItem(getLocalStoragePath('packerySizes')));            
 
             if (!savedSizes) {
                 console.log('No saved sizes found');
@@ -563,12 +584,12 @@
                         return;
                     }
                     // Create the gallery item, but don't layout the grid yet
-                    const gridItem = createGalleryItem(sha256, $("#thumbnail-" + sha256 + " img").attr('src'), false);
+                    const gridItem = createGalleryItem(sha256, $("#thumbnail-" + sha256 + " img").attr('data-src'), false);
                     $grid.packery('addItems', gridItem);
                     var draggie = new Draggabilly( gridItem );
                     // bind drag events to Packery
                     $grid.packery( 'bindDraggabillyEvents', draggie );
-                    console.log(`Added missing item ${sha256} ${$("#thumbnail-" + sha256 + " img").attr('src')}`);
+                    console.log(`Added missing item ${sha256} ${$("#thumbnail-" + sha256 + " img").attr('data-src')}`);
                     $elem = $('#' + item.id);
                 }
                 // Restore classes
@@ -592,7 +613,7 @@
             });
             updateGridSizer();
             // Restore drag positions
-            var initPositions = localStorage.getItem( 'dragPositions-' + path );
+            var initPositions = localStorage.getItem(getLocalStoragePath('dragPositions'))
             if ( initPositions ) {
                 initPositions = JSON.parse( initPositions );
                 initPositions = initPositions.filter( function( item ) {
@@ -605,8 +626,8 @@
         }
 
         function resetLayout() {
-            localStorage.removeItem('packerySizes-' + window.location.pathname);
-            localStorage.removeItem('dragPositions-' + window.location.pathname);
+            localStorage.removeItem(getLocalStoragePath('packerySizes'));
+            localStorage.removeItem(getLocalStoragePath('dragPositions'));
             location.reload();
         }
 
@@ -661,10 +682,31 @@
             thumbnailList.addEventListener('click', function (event) {
                 if (event.target.tagName === 'IMG') {
                     const sha256 = event.target.getAttribute('data-item-id');
-                    const src = event.target.src;
+                    const src = event.target.getAttribute('data-src');
                     createGalleryItem(sha256, src);
                 }
             });
+
+            // Lazy loading implementation
+            let lazyImages = [].slice.call(document.querySelectorAll('img.lazy'));
+
+            if ('IntersectionObserver' in window) {
+                let lazyImageObserver = new IntersectionObserver(function (entries, observer) {
+                    entries.forEach(function (entry) {
+                        if (entry.isIntersecting) {
+                            let lazyImage = entry.target;
+                            lazyImage.src = lazyImage.dataset.src;
+                            lazyImage.classList.remove('lazy');
+                            lazyImage.classList.add('lazy-loaded');
+                            lazyImageObserver.unobserve(lazyImage);
+                        }
+                    });
+                });
+
+                lazyImages.forEach(function (lazyImage) {
+                    lazyImageObserver.observe(lazyImage);
+                });
+            }
         });
 
         let defaultNewItemSize = 20;
