@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List
 import json
+from urllib.parse import quote
 
 import gradio as gr
 from src.ui.components.utils import delete_bookmarks_except_last_n, get_all_bookmarks_in_folder, delete_bookmark
@@ -26,6 +27,14 @@ def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[dict]):
     print("Bookmark deleted")
     bookmarks = get_bookmarks_paths(bookmarks_namespace)
     return bookmarks
+
+def build_bookmark_query(bookmarks_namespace: str, page_size: int = 10, page: int = 1):
+    if not include_path: include_path = ""
+
+    if include_path.strip() != "":
+        # URL encode the path
+        include_path = quote(include_path)
+    return f"/bookmarks/{bookmarks_namespace}&page_size={page_size}&page={page}"
 
 def create_bookmarks_UI(bookmarks_namespace: gr.State):
     with gr.TabItem(label="Bookmarks") as bookmarks_tab:

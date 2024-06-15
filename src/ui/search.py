@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import gradio as gr
+import urllib.parse
 
 from src.db import find_paths_by_tags, get_database_connection, get_folders_from_database
 from src.ui.components.multi_view import create_multiview
+
+def build_query(tags: list, min_tag_confidence: float, include_path: str = None, page_size: int = 10, page: int = 1):
+    if not include_path: include_path = ""
+
+    if include_path.strip() != "":
+        # URL encode the path
+        include_path = urllib.parse.quote(include_path)
+    return f"/search/tags?tags={','.join(tags)}&min_confidence={min_tag_confidence}&include_path={include_path}&page_size={page_size}&page={page}"
 
 def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     if page < 1: page = 1
@@ -18,7 +27,7 @@ def search_by_tags(tags_str: str, min_tag_confidence: float, results_per_page: i
     print(f"Found {total_results} images")
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
-    return results, total_results, gr.update(value=page, maximum=int(total_pages))
+    return results, total_results, gr.update(value=page, maximum=int(total_pages)), f"[View Results in Gallery]({build_query(tags, min_tag_confidence, include_path, results_per_page, page)})"
 
 def search_by_tags_next_page(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1):
     return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, page+1)
@@ -42,6 +51,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
     with gr.TabItem(label="Tag Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
+                link = gr.Markdown('[View Results in Gallery](/search/tags)')
                 number_of_results = gr.Number(value=0, show_label=True, label="Results", interactive=False, scale=0)
                 submit_button = gr.Button("Search", scale=0)
                 with gr.Column(scale=10):
@@ -71,6 +81,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
             multi_view.files,
             number_of_results,
             current_page,
+            link
         ]
     )
 
@@ -81,6 +92,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
             multi_view.files,
             number_of_results,
             current_page,
+            link
         ]
     )
 
@@ -90,7 +102,8 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
         outputs=[
             multi_view.files,
             number_of_results,
-            current_page
+            current_page,
+            link
         ]
     )
 
@@ -101,6 +114,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
             multi_view.files,
             number_of_results,
             current_page,
+            link
         ]
     )
 

@@ -4,7 +4,7 @@ import hashlib
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from src.db import get_database_connection, get_bookmarks
+from src.db import get_database_connection, get_bookmarks, find_paths_by_tags
 from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time
 
 app = FastAPI()
@@ -19,13 +19,45 @@ def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000,
 @app.get("/bookmarks/{bookmarks_namespace}/", response_class=HTMLResponse)
 async def display_bookmarks(request: Request, bookmarks_namespace: str):
     # Extract "show" parameter from query string
-    show = int(request.query_params.get("show", 4))
+    show = int(request.query_params.get("show", 0))
     files, total = get_all_bookmarks_in_folder(bookmarks_namespace)
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,
         "files": files,
         "namespace": bookmarks_namespace,
+        "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
+        "limit": show
+    })
+
+def get_all_items_with_tags(tags: list, min_confidence: float, page_size: int = 1000, page: int = 1, include_path: str=None):
+    conn = get_database_connection(force_readonly=True)
+    items, total_items = find_paths_by_tags(conn, tags, min_confidence=min_confidence, page_size=page_size, page=page, include_path=include_path)
+    conn.close()
+    return items, total_items
+
+@app.get("/search/tags", response_class=HTMLResponse)
+async def search_by_tags(request: Request):
+    #Extract tags from query string
+    tags = [tag.strip() for tag in request.query_params.get("tags", "").split(",") if tag.strip() != ""]
+    #Extract min_confidence from query string
+    min_confidence = float(request.query_params.get("min_confidence", 0.25))
+    # Extract "show" parameter from query string
+    show = int(request.query_params.get("show", 0))
+    # Extract "include_path" parameter from query string
+    include_path = request.query_params.get("include_path", None)
+    # Extract "page_size" parameter from query string
+    page_size = int(request.query_params.get("page_size", 100))
+    # Extract "page" parameter from query string
+    page = int(request.query_params.get("page", 1))
+    print(f"Searching for tags: {tags}, min_confidence: {min_confidence}, include_path: {include_path}, page_size: {page_size}, page: {page}")
+    files_dicts, total = get_all_items_with_tags(tags, min_confidence, page_size=page_size, page=page, include_path=include_path)
+    files = [(file['sha256'], file['path']) for file in files_dicts]
+    print(total)
+    return templates.TemplateResponse("gallery.html", {
+        "request": request,
+        "files": files,
+        "tags": tags,
         "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
         "limit": show
     })
@@ -75,7 +107,7 @@ async def browse_folder(request: Request, foldername: str):
 
     files = [(file['sha256'], file['path']) for file in files_dicts]
     # Extract "show" parameter from query string
-    show = int(request.query_params.get("show", 4))
+    show = int(request.query_params.get("show", 0))
     return templates.TemplateResponse("gallery.html", {
         "request": request,
         "files": files,

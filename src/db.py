@@ -411,8 +411,8 @@ def find_items_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
 
     return items, total_count
 
-def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None):
-    results = []
+def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None) -> Tuple[List[dict], int]:
+    results: List[dict] = []
     if len(tags) == 0:
         items, total_count = find_items_without_tags(conn, page_size, page, include_path)
     else:
