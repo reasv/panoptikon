@@ -1,8 +1,9 @@
 import os
 import hashlib
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection, get_bookmarks, find_paths_by_tags
 from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time
@@ -37,31 +38,45 @@ def get_all_items_with_tags(tags: list, min_confidence: float, page_size: int = 
     return items, total_items
 
 @app.get("/search/tags", response_class=HTMLResponse)
-async def search_by_tags(request: Request):
-    #Extract tags from query string
-    tags = [tag.strip() for tag in request.query_params.get("tags", "").split(",") if tag.strip() != ""]
-    #Extract min_confidence from query string
-    min_confidence = float(request.query_params.get("min_confidence", 0.25))
-    # Extract "show" parameter from query string
-    show = int(request.query_params.get("show", 0))
-    # Extract "include_path" parameter from query string
-    include_path = request.query_params.get("include_path", None)
-    # Extract "page_size" parameter from query string
-    page_size = int(request.query_params.get("page_size", 100))
-    # Extract "page" parameter from query string
-    page = int(request.query_params.get("page", 1))
-    print(f"Searching for tags: {tags}, min_confidence: {min_confidence}, include_path: {include_path}, page_size: {page_size}, page: {page}")
-    files_dicts, total = get_all_items_with_tags(tags, min_confidence, page_size=page_size, page=page, include_path=include_path)
+async def search_by_tags_html(
+        request: Request,
+        tags: str = Query("", alias="tags"),
+        min_confidence: float = Query(0.25, ge=0.0),
+        show: int = Query(0, ge=0),
+        include_path: Optional[str] = Query(None),
+        page_size: int = Query(100, ge=1),
+        page: int = Query(1, ge=1),
+    ):
+    tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
+    files_dicts, total = get_all_items_with_tags(tags_list, min_confidence, page_size=page_size, page=page, include_path=include_path)
     files = [(file['sha256'], file['path']) for file in files_dicts]
+    print(tags, tags_list)
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,
         "files": files,
-        "tags": tags,
         "percentages": [5, 10, 20, 25, 33, 40, 50, 60, 66, 80, 100],
         "limit": show
     })
 
+@app.get("/api/search/tags", response_class=JSONResponse)
+async def search_by_tags_json(
+        tags: str = Query("", alias="tags"),
+        min_confidence: float = Query(0.25, ge=0.0),
+        include_path: Optional[str] = Query(None),
+        page_size: int = Query(100, ge=1),
+        page: int = Query(1, ge=1),
+    ):
+    tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
+    files, total = get_all_items_with_tags(tags_list, min_confidence, page_size, page, include_path)
+    print(total)
+    return JSONResponse({
+        "files": files,
+        "tags": tags,
+        "total": total,
+        "page_size": page_size,
+        "page": page
+    })
 
 @app.get("/browse/{foldername:path}/", response_class=HTMLResponse)
 async def browse_folder(request: Request, foldername: str):
