@@ -21,7 +21,9 @@ def get_all_bookmarks_in_folder(bookmarks_namespace: str, page_size: int = 1000,
 async def display_bookmarks(request: Request, bookmarks_namespace: str):
     # Extract "show" parameter from query string
     show = int(request.query_params.get("show", 0))
-    files, total = get_all_bookmarks_in_folder(bookmarks_namespace)
+    page_size = int(request.query_params.get("page_size", 1000))
+    page = int(request.query_params.get("page", 1))
+    files, total = get_all_bookmarks_in_folder(bookmarks_namespace, page_size=page_size, page=page)
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,

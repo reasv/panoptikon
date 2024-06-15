@@ -28,22 +28,21 @@ def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[dict]):
     bookmarks = get_bookmarks_paths(bookmarks_namespace)
     return bookmarks
 
-def build_bookmark_query(bookmarks_namespace: str, page_size: int = 10, page: int = 1):
-    if not include_path: include_path = ""
+def build_bookmark_query(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
+    return f"/bookmarks/{bookmarks_namespace}"
 
-    if include_path.strip() != "":
-        # URL encode the path
-        include_path = quote(include_path)
-    return f"/bookmarks/{bookmarks_namespace}&page_size={page_size}&page={page}"
+def bookmark_query_text(bookmarks_namespace: str, page_size: int = 1000, page: int = 1):
+    return f"[View Bookmark folder in Gallery]({build_bookmark_query(bookmarks_namespace, page_size=page_size, page=page)})"
 
 def create_bookmarks_UI(bookmarks_namespace: gr.State):
     with gr.TabItem(label="Bookmarks") as bookmarks_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
+                link = gr.Markdown(bookmark_query_text("default"))
                 create_bookmark_folder_chooser(parent_tab=bookmarks_tab, bookmarks_namespace=bookmarks_namespace)
                 erase_bookmarks = gr.Button("Erase bookmarks")
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
-        
+
         multi_view = create_multiview(bookmarks_namespace=bookmarks_namespace, extra_actions=["Remove"])
 
     bookmarks_tab.select(
@@ -58,6 +57,13 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
         outputs=[
             multi_view.files
         ]
+    )
+
+    # Update link to gallery view
+    bookmarks_namespace.change(
+        fn=bookmark_query_text,
+        inputs=[bookmarks_namespace],
+        outputs=[link]
     )
 
     erase_bookmarks.click(
