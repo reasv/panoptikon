@@ -688,10 +688,12 @@
                     createGalleryItem(sha256, src);
                 }
             });
-
-            // Lazy loading implementation
             let lazyImages = [].slice.call(document.querySelectorAll('img.lazy'));
+            applyLazyImageObserver(lazyImages);
+        });
 
+        function applyLazyImageObserver(lazyImages) {
+            // Lazy loading implementation
             if ('IntersectionObserver' in window) {
                 let lazyImageObserver = new IntersectionObserver(function (entries, observer) {
                     entries.forEach(function (entry) {
@@ -709,7 +711,7 @@
                     lazyImageObserver.observe(lazyImage);
                 });
             }
-        });
+        }
 
         let defaultNewItemSize = 20;
 
@@ -754,24 +756,50 @@
             const searchParams = new URLSearchParams(window.location.search);
             for (const [key, value] of searchParams) {
                 if (override_params[key] === undefined) {
-                    api += `&${key}=${value}`;
                     continue
                 }
                 if (override_params[key] === null) {
+                    searchParams.delete(key);
                     continue
                 }
-                api += `&${key}=${override_params[key]}`;
+                searchParams.set(key, override_params[key]);
             }
-            fetch(api)
+            console.log();
+            fetch(api+'?'+searchParams.toString())
                 .then(response => response.json())
                 .then(data => {
                     removeAllThumbnailItems();
+                    let elements = []
                     for (const file of data.files) {
                         const sha256 = file["sha256"];
                         const path = file["path"];
-                        createThumbnailItem(sha256, path);
+                        const url = "{{ url_for('serve_image', filename='') }}" + path;
+                        createThumbnailItem(sha256, url);
+                        elements.push(document.querySelector(`#thumbnail-${sha256} img.lazy`));
                     }
+                    applyLazyImageObserver(elements);
                 });
+            if (override_params['page']) {
+                // Update the page parameter in the URL
+                const page = override_params['page'];
+                searchParams.set('page', page);
+                window.history.pushState({}, '', `${window.location.pathname}?${searchParams.toString()}`);
+                updatePageButtonLabels();
+            }
+        }
+
+        function updatePageButtonLabels() {
+            const searchParams = new URLSearchParams(window.location.search);
+            const page = parseInt(searchParams.get('page'));
+            const previousButton = document.querySelector('.previous-page-button');
+            const nextButton = document.querySelector('.next-page-button');
+            if (previousButton) {
+                previousButton.textContent = `←${page-1}`;
+                previousButton.disabled = page === 1;
+            }
+            if (nextButton) {
+                nextButton.textContent = `${page+1}→`;
+            }
         }
 
         function addPreviousNextPageButtons() {
@@ -786,11 +814,13 @@
             // Add to control buttons
             const controlButtons = document.querySelector('.control-buttons');
             const previousButton = document.createElement('button');
-            if (page > 1) {
-                previousButton.textContent = `←${page-1}`;
-                previousButton.onclick = () => loadNextPageItems(true);
-                controlButtons.insertBefore(previousButton, controlButtons.firstChild);
-            }
+            
+            previousButton.textContent = `←${page-1}`;
+            previousButton.onclick = () => loadNextPageItems(true);
+            previousButton.className = 'previous-page-button';
+            controlButtons.insertBefore(previousButton, controlButtons.firstChild);
+            // Hide the previous button if the page is 1
+            previousButton.disabled = page === 1;
             // Also add refresh button
             const refreshButton = document.createElement('button');
             refreshButton.textContent = '↻';
@@ -800,6 +830,7 @@
             const nextButton = document.createElement('button');
             nextButton.textContent = `${page+1}→`;
             nextButton.onclick = () => loadNextPageItems();
+            nextButton.className = 'next-page-button';
             controlButtons.appendChild(nextButton);
         }
 
@@ -813,7 +844,6 @@
             }
             page = Math.max(1, page);
             searchParams.set('page', page);
-            window.location.search = searchParams.toString();
             refreshItemList({page: page});
         }
 
