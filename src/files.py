@@ -11,6 +11,9 @@ from src.types import FileScanData
 from src.utils import normalize_path
 
 def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
+    """
+    Get all files with the given extensions in the given starting points and their entire directory trees, excluding the given excluded paths.
+    """
     excluded_paths = [normalize_path(excluded_path) for excluded_path in excluded_paths]
     starting_points = [normalize_path(starting_point) for starting_point in starting_points]
     for starting_point in starting_points:

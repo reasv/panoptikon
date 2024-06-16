@@ -15,15 +15,6 @@ from src.db import (
 )
 from src.files import scan_files, deduplicate_paths
 
-def add_new_included_folders_and_scan(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    add_time = datetime.now().isoformat()
-
-    for folder in paths:
-        add_folder_to_database(conn, add_time, folder, included=True)
-
-    execute_folder_scan(conn, paths)
-    return True, "Folders added and scanned successfully"
-
 def execute_folder_scan(
         conn: sqlite3.Connection,
         included_folders: None | List[str] = None,
@@ -31,9 +22,18 @@ def execute_folder_scan(
         include_video = False,
         include_audio = False,
     ) -> list[int]:
-
+    """
+    Execute a scan of the files in the given `included_folders`, or all folders marked as `included` within the db, and update the database with the results.
+    Marks files that were not found in the scan but are present in the db as `unavailable`.
+    Will never scan folders not marked as `included` in the database.
+    """
+    all_included_folders = get_folders_from_database(conn, included=True)
     if included_folders is None:
-        included_folders = get_folders_from_database(conn, included=True)
+        included_folders = all_included_folders
+
+    # Ensure that all included_folders are also marked as included in the database
+    included_folders = [folder for folder in included_folders if folder in all_included_folders]
+
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
@@ -94,6 +94,15 @@ def execute_folder_scan(
         ))
 
     return scan_ids
+
+def add_new_included_folders_and_scan(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
+    add_time = datetime.now().isoformat()
+
+    for folder in paths:
+        add_folder_to_database(conn, add_time, folder, included=True)
+
+    execute_folder_scan(conn, paths)
+    return True, "Folders added and scanned successfully"
 
 def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
 
