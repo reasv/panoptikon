@@ -197,6 +197,9 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
     return item_inserted, file_updated, file_deleted, file_inserted
 
 def add_file_scan(conn: sqlite3.Connection, scan_time: str, end_time: str, path: str, new_items: int, unchanged_files: int, new_files: int, modified_files: int, marked_unavailable: int, errors: int, total_available: int):
+    """
+    Logs a file scan into the database
+    """
     cursor = conn.cursor()
     insert_result = cursor.execute('''
     INSERT INTO file_scans (start_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors)
