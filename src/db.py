@@ -593,7 +593,7 @@ def delete_folders_not_in_list(conn: sqlite3.Connection, folder_paths: List[str]
     DELETE FROM folders
     WHERE included = ?
     AND path NOT IN ({})
-    '''.format(','.join(['?']*len(folder_paths)), folder_paths, included))
+    '''.format(','.join(['?']*len(folder_paths))), [included] + folder_paths)
     return result.rowcount
 
 def remove_folder_from_database(conn: sqlite3.Connection, folder_path: str):
