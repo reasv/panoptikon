@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import sqlite3
 from datetime import datetime
 from typing import List, Tuple
@@ -9,11 +10,13 @@ from src.db import (
     add_folder_to_database,
     get_folders_from_database,
     add_folder_to_database,
+    delete_folders_not_in_list,
     delete_files_under_excluded_folders,
     delete_items_without_files,
     delete_files_not_under_included_folders
 )
 from src.files import scan_files, deduplicate_paths
+from src.utils import normalize_path
 
 def execute_folder_scan(
         conn: sqlite3.Connection,
@@ -95,66 +98,58 @@ def execute_folder_scan(
 
     return scan_ids
 
-def add_new_included_folders_and_scan(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    add_time = datetime.now().isoformat()
+@dataclass
+class UpdateFoldersResult:
+    included_deleted: int
+    excluded_deleted: int
+    included_added: List[str]
+    excluded_added: List[str]
+    excluded_folder_files_deleted: int
+    orphan_files_deleted: int
+    orphan_items_deleted: int
+    scan_ids: List[int]
 
-    for folder in paths:
-        add_folder_to_database(conn, add_time, folder, included=True)
-
-    execute_folder_scan(conn, paths)
-    return True, "Folders added and scanned successfully"
-
-def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-
-    for folder in paths:
-        add_folder_to_database(conn, datetime.now().isoformat(), folder, included=False)
+def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], excluded_folders: List[str]):
+    """
+    Update the database with the new `included_folders` and `excluded_folders` lists.
+    Any folders that are in the database but not in the new lists will be DELETED.
+    Any files under the `excluded_folders` will be DELETED.
+    Any files not under the `included_folders` will be DELETED.
+    Any orphaned items without files will be DELETED.
+    Bookmarks on orhpaned items will be DELETED.
+    """
+    new_included_folders = [normalize_path(p) for p in included_folders if len(p.strip()) > 0]
+    new_excluded_folders = [normalize_path(p) for p in excluded_folders if len(p.strip()) > 0]
     
-    delete_files_under_excluded_folders(conn)
-    delete_items_without_files(conn)
-    return True, "Folders added successfully"
+    included_deleted = delete_folders_not_in_list(conn, new_included_folders, included=True)
+    excluded_deleted = delete_folders_not_in_list(conn, new_excluded_folders, included=False)
 
-def remove_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    cursor = conn.cursor()
-    for folder in paths:
-        cursor.execute('DELETE FROM folders WHERE path = ? AND included = 0', (folder,))
-    return True, "Folders removed successfully"
+    scan_time = datetime.now().isoformat()
+    included_added = []
+    for folder in new_included_folders:
+        added = add_folder_to_database(conn, scan_time, folder, included=True)
+        if added:
+            included_added.append(folder)
+    
+    excluded_added = []
+    for folder in new_excluded_folders:
+        added = add_folder_to_database(conn, scan_time, folder, included=False)
+        if added:
+            excluded_added.append(folder)
 
-def remove_included_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
-    cursor = conn.cursor()
-    for folder in paths:
-        cursor.execute('DELETE FROM folders WHERE path = ? AND included = 1', (folder,))
-    delete_files_not_under_included_folders(conn)
-    delete_items_without_files(conn)
-    return True, "Folders removed successfully"
+    scan_ids = execute_folder_scan(conn)
 
-# Public functions
+    excluded_folder_files_deleted = delete_files_under_excluded_folders(conn)
+    orphan_files_deleted = delete_files_not_under_included_folders(conn)
+    orphan_items_deleted = delete_items_without_files(conn)
 
-def add_folders(conn: sqlite3.Connection, included: List[str] = [], excluded: List[str] = []) -> Tuple[bool, str]:
-    if len(included) == 0 and len(excluded) == 0:
-        return False, "No folders provided"
-
-    if len(excluded) > 0:
-        success, message = add_new_excluded_folders(conn, excluded)
-        if not success:
-            return False, message
-        
-    if len(included) > 0:
-        success, message = add_new_included_folders_and_scan(conn, included)
-        if not success:
-            return False, message
-    return True, "Folders added successfully"
-
-def remove_folders(conn: sqlite3.Connection, included: List[str] = [], excluded: List[str] = []) -> Tuple[bool, str]:
-    if len(included) == 0 and len(excluded) == 0:
-        return False, "No folders provided"
-        
-    if len(excluded) > 0:
-        success, message = remove_excluded_folders(conn, excluded)
-        if not success:
-            return False, message
-        
-    if len(included) > 0:
-        success, message = remove_included_folders(conn, included)
-        if not success:
-            return False, message
-    return True, "Folders removed successfully"
+    return UpdateFoldersResult(
+        included_deleted=included_deleted,
+        excluded_deleted=excluded_deleted,
+        included_added=included_added,
+        excluded_added=excluded_added,
+        excluded_folder_files_deleted=excluded_folder_files_deleted,
+        orphan_files_deleted=orphan_files_deleted,
+        orphan_items_deleted=orphan_items_deleted,
+        scan_ids=scan_ids
+    )
