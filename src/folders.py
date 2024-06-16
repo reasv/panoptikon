@@ -42,12 +42,13 @@ def execute_folder_scan(
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
 
+    print(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
         new_items, unchanged_files, new_files, modified_files, errors = 0, 0, 0, 0, 0
         for file_data in scan_files(
             conn,
-            starting_points=folder,
+            starting_points=[folder],
             excluded_paths=excluded_folders,
             include_images=include_images,
             include_video=include_video,
@@ -88,7 +89,7 @@ def execute_folder_scan(
                 conn,
                 scan_time=scan_time,
                 end_time=end_time,
-                folder=folder,
+                path=folder,
                 new_items=new_items,
                 unchanged_files=unchanged_files,
                 new_files=new_files,
