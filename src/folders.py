@@ -40,7 +40,7 @@ def execute_folder_scan(
 
     scan_ids = []
     for folder in starting_points:
-        new_items, unchanged_files, new_files, modified_files = 0, 0, 0, 0
+        new_items, unchanged_files, new_files, modified_files, errors = 0, 0, 0, 0, 0
         for file_data in scan_files(
             folder,
             excluded_folders,
@@ -48,6 +48,10 @@ def execute_folder_scan(
             include_video,
             include_audio
         ):
+            if file_data is None:
+                errors += 1
+                continue
+            # Update the file data in the database
             (
                 item_inserted, 
                 file_updated,
@@ -71,7 +75,7 @@ def execute_folder_scan(
                 # File was not in the database and has been inserted
                 new_files += 1
         # Mark files that were not found in the scan but are present in the db as `unavailable`
-        marked_unavailable = mark_unavailable_files(conn, scan_time=scan_time, path=folder)
+        marked_unavailable, total_available = mark_unavailable_files(conn, scan_time=scan_time, path=folder)
 
         end_time = datetime.now().isoformat()
         scan_ids.append(
@@ -84,7 +88,9 @@ def execute_folder_scan(
                 unchanged_files=unchanged_files,
                 new_files=new_files,
                 modified_files=modified_files,
-                marked_unavailable=marked_unavailable
+                marked_unavailable=marked_unavailable,
+                errors=errors,
+                total_available=total_available
         ))
 
     return scan_ids

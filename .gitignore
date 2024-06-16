@@ -170,3 +170,5 @@ paths.txt
 *.db
 
 bookmarks.json
+
+migration.py

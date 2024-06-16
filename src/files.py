@@ -50,8 +50,11 @@ def scan_files(
             allowed_extensions
         ):
         mime_type = get_mime_type(file_path)
-        file_size = get_file_size(file_path)
-        last_modified = get_last_modified_time(file_path)
+        try: 
+            last_modified, file_size = get_last_modified_time_and_size(file_path)
+        except Exception as e:
+            yield None
+
         md5, sha256 = None, None
         file_modified = True # Assume the file has been modified
 
@@ -68,7 +71,11 @@ def scan_files(
 
         if not sha256:
             print(f"Calculating hashes for {file_path}")
-            md5, sha256 = calculate_hashes(file_path)
+            try:
+                md5, sha256 = calculate_hashes(file_path)
+            except Exception as e:
+                print(f"Error calculating hashes for {file_path}: {e}")
+                yield None
 
         yield FileScanData(
             sha256=sha256,
@@ -96,26 +103,57 @@ def calculate_hashes(file_path: str):
     """
     hash_md5 = hashlib.md5()
     hash_sha256 = hashlib.sha256()
+    try:
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+                hash_sha256.update(chunk)
+        return hash_md5.hexdigest(), hash_sha256.hexdigest()
+    except FileNotFoundError:
+        print(f"Error: The file '{file_path}' does not exist.")
+    except PermissionError:
+        print(f"Error: You do not have permission to access the file '{file_path}'.")
+    except IsADirectoryError:
+        print(f"Error: The path '{file_path}' is a directory, not a file.")
+    except NotADirectoryError:
+        print(f"Error: A component of the path '{file_path}' is not a directory.")
+    except OSError as e:
+        print(f"Error: An OS error occurred while accessing the file '{file_path}': {e}")
+    raise Exception("Error calculating hashes")
+    
 
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-            hash_sha256.update(chunk)
-
-    return hash_md5.hexdigest(), hash_sha256.hexdigest()
-
-def get_last_modified_time(file_path: str):
+def get_os_stat(path: str):
     """
-    Get the last modified time of the file at the given path.
+    Get the os.stat() information for the file at the given path.
     """
-    mtime = os.path.getmtime(file_path)
-    return datetime.fromtimestamp(mtime).isoformat()
+    try:
+        info = os.stat(path)
+        return info
+    except FileNotFoundError:
+        print(f"Error: The path '{path}' does not exist.")
+    except PermissionError:
+        print(f"Error: You do not have permission to access the path '{path}'.")
+    except NotADirectoryError:
+        print(f"Error: A component of the path '{path}' is not a directory.")
+    except OSError as e:
+        print(f"Error: An OS error occurred while accessing the path '{path}': {e}")
+
+    raise Exception("Error getting os.stat() information")
+
+def get_last_modified_time_and_size(file_path: str):
+    """
+    Get the last modified time and the size of the file at the given path.
+    """
+    stat = get_os_stat(file_path)
+    mtime = stat.st_mtime
+    size = stat.st_size
+    return datetime.fromtimestamp(mtime).isoformat(), size
 
 def get_file_size(file_path: str):
     """
     Get the size of the file at the given path.
     """
-    return os.path.getsize(file_path)
+    return get_last_modified_time_and_size(file_path)[1]
 
 def get_mime_type(file_path: str):
     """

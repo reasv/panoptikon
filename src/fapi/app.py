@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection, get_bookmarks, find_paths_by_tags
-from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time
+from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time_and_size
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -184,7 +184,7 @@ async def browse_folder(request: Request, foldername: str):
             {
                 'sha256': sha256,
                 'path': file_path,
-                'last_modified': get_last_modified_time(file_path)
+                'last_modified': get_last_modified_time_and_size(file_path)[0]
             }
         )
     # Extract sort parameter from query string

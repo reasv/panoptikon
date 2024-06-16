@@ -49,11 +49,13 @@ def initialize_database(conn: sqlite3.Connection):
         start_time TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
         end_time TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
         path TEXT NOT NULL,
+        total_available INTEGER NOT NULL,
         new_items INTEGER NOT NULL,
         unchanged_files INTEGER NOT NULL,
         new_files INTEGER NOT NULL,
         modified_files INTEGER NOT NULL,
         marked_unavailable INTEGER NOT NULL,
+        errors INTEGER NOT NULL,
         UNIQUE(start_time, path)       -- Unique constraint on time and path
     )
     ''')
@@ -194,12 +196,12 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
 
     return item_inserted, file_updated, file_deleted, file_inserted
 
-def add_file_scan(conn: sqlite3.Connection, scan_time: str, end_time: str, path: str, new_items: int, unchanged_files: int, new_files: int, modified_files: int, marked_unavailable: int):
+def add_file_scan(conn: sqlite3.Connection, scan_time: str, end_time: str, path: str, new_items: int, unchanged_files: int, new_files: int, modified_files: int, marked_unavailable: int, errors: int, total_available: int):
     cursor = conn.cursor()
     insert_result = cursor.execute('''
-    INSERT INTO file_scans (start_time, end_time, path, new_items, unchanged_files, new_files, modified_files, marked_unavailable)
+    INSERT INTO file_scans (start_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (scan_time, end_time, path, new_items, unchanged_files, new_files, modified_files, marked_unavailable))
+    ''', (scan_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors))
     # Return the row id of the inserted record
     return insert_result.lastrowid
 
@@ -209,11 +211,13 @@ class FileScanRecord:
     start_time: str
     end_time: str
     path: str
+    total_available: int
     new_items: int
     unchanged_files: int
     new_files: int
     modified_files: int
     marked_unavailable: int
+    errors: int
 
 def get_file_scan_by_id(conn: sqlite3.Connection, scan_id: int) -> FileScanRecord | None:
     cursor = conn.cursor()
@@ -240,8 +244,16 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
         WHERE last_seen != ?
         AND path LIKE ?
     ''', (scan_time, path + '%'))
+    # Count available files
+    result_available = cursor.execute('''
+        SELECT COUNT(*)
+        FROM files
+        WHERE available = TRUE
+        AND path LIKE ?
+    ''', (path + '%',))
+    available_files: int = result_available.fetchone()[0]
     # Return the number of rows affected
-    return result.rowcount
+    return result.rowcount, available_files
         
 
 def get_file_by_path(conn: sqlite3.Connection, path: str):
