@@ -26,8 +26,7 @@ def initialize_database(conn: sqlite3.Connection):
         md5 TEXT NOT NULL,
         type TEXT,
         size INTEGER,          -- Size of the file in bytes
-        time_added TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
-        time_last_seen TEXT NOT NULL      -- Using TEXT to store ISO-8601 formatted datetime
+        time_added TEXT NOT NULL         -- Using TEXT to store ISO-8601 formatted datetime
     )
     ''')
     
@@ -110,7 +109,6 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_md5 ON items(md5)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_type ON items(type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_time_added ON items(time_added)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_time_last_seen ON items(time_last_seen)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_modified ON files(last_modified)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_available ON files(available)')
@@ -161,12 +159,12 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
     file_modified = file_data.modified
 
     item_insert_result = cursor.execute('''
-    INSERT INTO items (sha256, md5, type, size, time_added, time_last_seen)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(sha256) DO UPDATE SET time_last_seen=excluded.time_last_seen
-    ''', (sha256, md5, mime_type, file_size, scan_time, scan_time))
+    INSERT INTO items (sha256, md5, type, size, time_added)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(sha256) DO NOTHING
+    ''', (sha256, md5, mime_type, file_size, scan_time))
 
-    # We need to check if the item was inserted or updated
+    # We need to check if the item was inserted
     item_inserted = item_insert_result.rowcount > 0
     
     file_updated = False
@@ -401,7 +399,7 @@ def get_tag_names_list(conn):
 def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
     FROM items
     JOIN tags ON items.sha256 = tags.item
     WHERE tags.name = ?
@@ -466,7 +464,7 @@ def find_items_by_tags(
 
     # Second query to get the items with pagination
     query = '''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN tags ON items.sha256 = tags.item
@@ -554,7 +552,7 @@ def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, in
 
     # Second query to get the items with pagination
     query = f'''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added, items.time_last_seen,
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN files ON items.sha256 = files.sha256 {path_condition}
