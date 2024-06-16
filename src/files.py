@@ -80,7 +80,7 @@ def scan_files(
                 md5, sha256 = calculate_hashes(file_path)
                 if file_data:
                     if file_data["sha256"] == sha256:
-                        print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size}")
+                        print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size} bytes. Previous mtime: {file_data['last_modified']}, current mtime: {last_modified}.")
             except Exception as e:
                 print(f"Error calculating hashes for {file_path}: {e}")
                 yield None

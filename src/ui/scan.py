@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 
 import gradio as gr
 
@@ -17,6 +18,9 @@ def get_excluded_folders():
     folders = get_folders_from_database(conn, included=False)
     conn.close()
     return "\n".join(folders)
+
+def parse_iso_date(date: str):
+    return datetime.fromisoformat(date).strftime("%Y-%m-%d %H:%M:%S")
 
 def update_folders(included_folders_text: str, excluded_folders_text: str, delete_unavailable_files: bool = True):
     new_included_folders = [p for p in included_folders_text.strip().split("\n")] if len(included_folders_text.strip()) > 0 else []
@@ -54,11 +58,9 @@ def update_folders(included_folders_text: str, excluded_folders_text: str, delet
     
     current_included_folders = get_folders_from_database(conn, included=True)
     current_excluded_folders = get_folders_from_database(conn, included=False)
-    file_scans = get_all_file_scans(conn)
-
     conn.close()
 
-    return f"{update_result_text}\nScanned and generated tags for all files that didn't have them.", "\n".join(current_included_folders), "\n".join(current_excluded_folders)
+    return f"{update_result_text}\nScanned and generated tags for all files that didn't have them.", "\n".join(current_included_folders), "\n".join(current_excluded_folders), fetch_scan_history()
 
 def rescan_folders(delete_unavailable_files: bool = True):
     conn = get_database_connection()
@@ -67,18 +69,18 @@ def rescan_folders(delete_unavailable_files: bool = True):
     ids, files_deleted, items_deleted = rescan_all_folders(conn, delete_unavailable=delete_unavailable_files)
     conn.commit()
     conn.close()
-    return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items."
+    return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.", fetch_scan_history()
 
 def regenerate_tags():
     conn = get_database_connection()
     cursor = conn.cursor()
     cursor.execute('BEGIN')
-    scan_and_predict_tags(conn)
+    scan_and_generate_tags(conn)
     conn.commit()
     conn.close()
-    return "Generated tags for all files with missing tags"
+    return "Generated tags for all files with missing tags", fetch_scan_history()
 
-def scan_and_predict_tags(delete_unavailable_files=True):
+def scan_and_generate_tags(delete_unavailable_files=True):
     return rescan_folders(delete_unavailable_files) + regenerate_tags()
 
 def fetch_scan_history():
@@ -86,7 +88,9 @@ def fetch_scan_history():
     file_scans = get_all_file_scans(conn)
     conn.close()
     # Convert the file scans to a list of tuples
-    file_scans = [(f.id, f.start_time, f.end_time, f.path, f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files) for f in file_scans]
+    file_scans = [(f.id, parse_iso_date(f.start_time), parse_iso_date(f.end_time), 
+                   f.path, 
+                   f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files) for f in file_scans]
     return file_scans
 
 def create_scan_UI():
@@ -126,7 +130,8 @@ def create_scan_UI():
                     type="index",
                     samples_per_page=25,
                     samples=[],
-                    components=["textbox", "textbox"],
+                    headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
+                    components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
                     scale=1
                 )
 
@@ -138,26 +143,26 @@ def create_scan_UI():
         update_button.click(
             fn=update_folders,
             inputs=[included_directory_list, excluded_directory_list, delete_unavailable_files],
-            outputs=[results, included_directory_list, excluded_directory_list,],
+            outputs=[results, included_directory_list, excluded_directory_list, scan_history],
             api_name="update_folder_lists",
         )
 
         scan_button.click(
             fn=rescan_folders,
             inputs=[delete_unavailable_files],
-            outputs=[results],
+            outputs=[results, scan_history],
             api_name="rescan_folders",
         )
 
         regenerate_tags_button.click(
             fn=regenerate_tags,
-            outputs=[results],
+            outputs=[results, scan_history],
             api_name="regenerate_tags",
         )
 
         regenerate_and_scan.click(
-            fn=scan_and_predict_tags,
+            fn=scan_and_generate_tags,
             inputs=[delete_unavailable_files],
-            outputs=[results],
-            api_name="scan_and_predict_tags",
+            outputs=[results, scan_history],
+            api_name="scan_and_generate_tags",
         )
