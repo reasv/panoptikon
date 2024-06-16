@@ -65,7 +65,7 @@ def scan_files(
         # Check if the file is already in the database
         if file_data := get_file_by_path(conn, file_path):
             # Check if the file has been modified since the last scan
-            if file_data["last_modified"] == last_modified and file_data["size"] == file_size:
+            if file_data["last_modified"] == last_modified:
                 # Reuse the existing hash and mime type
                 md5: str = file_data["md5"]
                 sha256: str = file_data["sha256"]
@@ -78,6 +78,9 @@ def scan_files(
             print(f"Calculating hashes for {file_path}")
             try:
                 md5, sha256 = calculate_hashes(file_path)
+                if file_data:
+                    if file_data["sha256"] == sha256:
+                        print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size}")
             except Exception as e:
                 print(f"Error calculating hashes for {file_path}: {e}")
                 yield None
