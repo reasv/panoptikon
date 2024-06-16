@@ -14,6 +14,7 @@ def get_files_by_extension(starting_points: List[str], excluded_paths: List[str]
     """
     Get all files with the given extensions in the given starting points and their entire directory trees, excluding the given excluded paths.
     """
+    print(f"Scanning for files with extensions {extensions} in {starting_points} excluding {excluded_paths}")
     excluded_paths = [normalize_path(excluded_path) for excluded_path in excluded_paths]
     starting_points = [normalize_path(starting_point) for starting_point in starting_points]
     for starting_point in starting_points:
@@ -48,9 +49,9 @@ def scan_files(
         + include_audio * get_audio_extensions()
     )
     for file_path in get_files_by_extension(
-            starting_points,
-            excluded_paths,
-            allowed_extensions
+            starting_points=starting_points,
+            excluded_paths=excluded_paths,
+            extensions=allowed_extensions
         ):
         mime_type = get_mime_type(file_path)
         try: 
@@ -88,7 +89,7 @@ def scan_files(
             size=file_size,
             path=file_path,
             path_in_db=bool(file_data),
-            file_modified=file_modified
+            modified=file_modified
         )
 
 def get_image_extensions():
@@ -179,7 +180,7 @@ def deduplicate_paths(paths: List[str]):
     deduplicated_paths = []
     for path in normalized_paths:
         # Check if path is a subpath of the last added path
-        if not deduplicated_paths or not path.startswith(deduplicate_paths[-1]):
+        if not deduplicated_paths or not path.startswith(deduplicated_paths[-1]):
             deduplicated_paths.append(path)
     return deduplicated_paths
     
