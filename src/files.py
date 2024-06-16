@@ -69,6 +69,7 @@ def scan_files(
                 # Reuse the existing hash and mime type
                 md5: str = file_data["md5"]
                 sha256: str = file_data["sha256"]
+                file_modified = False
             else:
                 # File has been modified since the last scan
                 file_modified = True
