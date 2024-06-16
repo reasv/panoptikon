@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 import os
 import sqlite3
 from datetime import datetime
 from typing import Dict, List, Tuple
 
 from src.utils import normalize_path
+from src.types import FileScanData
 
 def get_database_connection(force_readonly=False) -> sqlite3.Connection:
     # Check if we are in read-only mode
@@ -44,9 +46,15 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS file_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        start_time TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
         path TEXT NOT NULL,
-        UNIQUE(time, path)       -- Unique constraint on time and path
+        new_items INTEGER NOT NULL,
+        unchanged_files INTEGER NOT NULL,
+        new_files INTEGER NOT NULL,
+        modified_files INTEGER NOT NULL,
+        marked_unavailable INTEGER NOT NULL,
+        UNIQUE(start_time, path)       -- Unique constraint on time and path
     )
     ''')
 
@@ -107,7 +115,8 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)')  # Explicit index on path
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_time ON file_scans(time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_start_time ON file_scans(start_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_end_time ON file_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_path ON file_scans(path)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_namespace ON tags(namespace)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)')
@@ -138,77 +147,102 @@ def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, sette
     ''', (namespace, name, value, confidence, item, setter, time, last_set))
 
 
-def insert_or_update_file_data(conn: sqlite3.Connection, image_data, scan_time):
+def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileScanData):
     cursor = conn.cursor()
-    sha256 = image_data['sha256']
-    md5 = image_data['MD5']
-    mime_type = image_data['mime_type']
-    paths: Dict[str, str] = image_data['paths']
-    file_size = image_data['size']
+    sha256 = file_data.sha256
+    md5 = file_data.md5
+    mime_type = file_data.mime_type
+    file_size = file_data.size
+    path = file_data.path
+    last_modified = file_data.last_modified
+    path_in_db = file_data.path_in_db
+    file_modified = file_data.modified
 
-    cursor.execute('''
+    item_insert_result = cursor.execute('''
     INSERT INTO items (sha256, md5, type, size, time_added, time_last_seen)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(sha256) DO UPDATE SET time_last_seen=excluded.time_last_seen
     ''', (sha256, md5, mime_type, file_size, scan_time, scan_time))
+
+    # We need to check if the item was inserted or updated
+    item_inserted = item_insert_result.rowcount > 0
     
-    for path, last_modified in paths.items():
-        # Check if the path already exists
-        cursor.execute('SELECT sha256 FROM files WHERE path = ?', (path,))
-        existing_path = cursor.fetchone()
-        
-        if existing_path:
-            if existing_path[0] == sha256:
-                # Path exists with the same sha256, update last_modified, last_seen, and available
-                cursor.execute('''
-                UPDATE files
-                SET last_modified = ?, last_seen = ?, available = TRUE
-                WHERE path = ?
-                ''', (last_modified, scan_time, path))
-            else:
-                # Path exists with a different sha256, delete the old entry and insert new
-                cursor.execute('DELETE FROM files WHERE path = ?', (path,))
-                cursor.execute('''
-                INSERT INTO files (sha256, path, last_modified, last_seen, available)
-                VALUES (?, ?, ?, ?, TRUE)
-                ''', (sha256, path, last_modified, scan_time))
-        else:
-            # Path does not exist, insert new
-            cursor.execute('''
-            INSERT INTO files (sha256, path, last_modified, last_seen, available)
-            VALUES (?, ?, ?, ?, TRUE)
-            ''', (sha256, path, last_modified, scan_time))
-
-def save_items_to_database(conn: sqlite3.Connection, files_data: Dict[str, Dict[str, str]], paths: List[str]):
-    scan_time = datetime.now().isoformat()
-
-    # Start a transaction
-    cursor = conn.cursor()
-
-    # Insert a scan entry for each parent folder path
-    for path in paths:
-        cursor.execute('''
-        INSERT INTO file_scans (time, path)
-        VALUES (?, ?)
+    file_updated = False
+    if path_in_db and not file_modified:
+        # Path exists and has not changed, update last_seen and available
+        file_update_result = cursor.execute('''
+        UPDATE files
+        SET last_seen = ?, available = TRUE
+        WHERE path = ?
         ''', (scan_time, path))
 
-    for _, image_data in files_data.items():
-        insert_or_update_file_data(conn, image_data, scan_time)
-    
-    mark_unavailable_files(conn, scan_time, paths)
+        file_updated = file_update_result.rowcount > 0
 
-def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, paths: List[str]):
+    file_deleted = False
+    file_inserted = False
+    if not path_in_db or file_modified:
+        # If the path already exists, delete the old entry
+        file_delete_result = cursor.execute('DELETE FROM files WHERE path = ?', (path,))
+        file_deleted = file_delete_result.rowcount > 0
+
+        # Path does not exist or has been modified, insert new
+        file_insert_result = cursor.execute('''
+        INSERT INTO files (sha256, path, last_modified, last_seen, available)
+        VALUES (?, ?, ?, ?, TRUE)
+        ''', (sha256, path, last_modified, scan_time))
+        file_inserted = file_insert_result.rowcount > 0
+
+    return item_inserted, file_updated, file_deleted, file_inserted
+
+def add_file_scan(conn: sqlite3.Connection, scan_time: str, end_time: str, path: str, new_items: int, unchanged_files: int, new_files: int, modified_files: int, marked_unavailable: int):
+    cursor = conn.cursor()
+    insert_result = cursor.execute('''
+    INSERT INTO file_scans (start_time, end_time, path, new_items, unchanged_files, new_files, modified_files, marked_unavailable)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (scan_time, end_time, path, new_items, unchanged_files, new_files, modified_files, marked_unavailable))
+    # Return the row id of the inserted record
+    return insert_result.lastrowid
+
+@dataclass
+class FileScanRecord:
+    id: int
+    start_time: str
+    end_time: str
+    path: str
+    new_items: int
+    unchanged_files: int
+    new_files: int
+    modified_files: int
+    marked_unavailable: int
+
+def get_file_scan_by_id(conn: sqlite3.Connection, scan_id: int) -> FileScanRecord | None:
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT *
+    FROM file_scans
+    WHERE id = ?
+    ''', (scan_id,))
+    scan_record = cursor.fetchone()
+    if scan_record:
+        return FileScanRecord(*scan_record)
+    return None
+
+def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
+    """
+    Mark files as unavailable if their path is a subpath of `path` and they were not seen during the scan at `scan_time`
+    """
     cursor = conn.cursor()
     
-    # Mark files as unavailable if they haven't been seen in the current scan
-    # and their path starts with one of the paths provided
-    for path in paths:
-        cursor.execute('''
+    # If a file has not been seen in scan that happened at scan_time, mark it as unavailable
+    result = cursor.execute('''
         UPDATE files
         SET available = FALSE
         WHERE last_seen != ?
         AND path LIKE ?
-        ''', (scan_time, path + '%'))
+    ''', (scan_time, path + '%'))
+    # Return the number of rows affected
+    return result.rowcount
+        
 
 def get_file_by_path(conn: sqlite3.Connection, path: str):
     cursor = conn.cursor()
@@ -722,3 +756,10 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
                 bookmark_tuples[i] = (bookmark[0], result[0])
     
     return bookmark_tuples, total_results
+
+def delete_unavailable_files(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM files
+    WHERE available = 0
+    ''')

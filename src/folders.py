@@ -2,8 +2,18 @@ import sqlite3
 from datetime import datetime
 from typing import List, Tuple
 
-from src.db import add_folder_to_database, get_folders_from_database, add_folder_to_database, save_items_to_database, delete_files_under_excluded_folders, delete_items_without_files, delete_files_not_under_included_folders
-from src.files import scan_files, get_image_extensions, get_video_extensions, get_audio_extensions
+from src.db import (
+    update_file_data,
+    add_file_scan,
+    mark_unavailable_files,
+    add_folder_to_database,
+    get_folders_from_database,
+    add_folder_to_database,
+    delete_files_under_excluded_folders,
+    delete_items_without_files,
+    delete_files_not_under_included_folders
+)
+from src.files import scan_files, deduplicate_paths
 
 def add_new_included_folders_and_scan(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
     add_time = datetime.now().isoformat()
@@ -20,21 +30,64 @@ def execute_folder_scan(
         include_images = True,
         include_video = False,
         include_audio = False,
-    ) -> Tuple[bool, str]:
+    ) -> list[int]:
 
     if included_folders is None:
         included_folders = get_folders_from_database(conn, included=True)
-
     excluded_folders = get_folders_from_database(conn, included=False)
-    starting_points = included_folders
-    extensions = (
-        include_images * get_image_extensions()
-        + include_video * get_video_extensions()
-        + include_audio * get_audio_extensions()
-    )
-    hashes_info = scan_files(conn, starting_points, excluded_folders, extensions)
-    save_items_to_database(conn, hashes_info, starting_points)
-    return True, "Scan completed successfully"
+    starting_points = deduplicate_paths(included_folders)
+    scan_time = datetime.now().isoformat()
+
+    scan_ids = []
+    for folder in starting_points:
+        new_items, unchanged_files, new_files, modified_files = 0, 0, 0, 0
+        for file_data in scan_files(
+            folder,
+            excluded_folders,
+            include_images,
+            include_video,
+            include_audio
+        ):
+            (
+                item_inserted, 
+                file_updated,
+                file_deleted,
+                file_inserted
+            ) = update_file_data(
+                conn,
+                scan_time=scan_time,
+                file_data=file_data
+            )
+            if item_inserted:
+                new_items += 1
+            if file_updated:
+                # File was already in the database and has NOT been modified on disk
+                unchanged_files += 1
+            elif file_deleted:
+                # File was in the database but has changed on disk,
+                # therefore it was deleted and reinserted as a new file
+                modified_files += 1
+            elif file_inserted:
+                # File was not in the database and has been inserted
+                new_files += 1
+        # Mark files that were not found in the scan but are present in the db as `unavailable`
+        marked_unavailable = mark_unavailable_files(conn, scan_time=scan_time, path=folder)
+
+        end_time = datetime.now().isoformat()
+        scan_ids.append(
+            add_file_scan(
+                conn,
+                scan_time=scan_time,
+                end_time=end_time,
+                folder=folder,
+                new_items=new_items,
+                unchanged_files=unchanged_files,
+                new_files=new_files,
+                modified_files=modified_files,
+                marked_unavailable=marked_unavailable
+        ))
+
+    return scan_ids
 
 def add_new_excluded_folders(conn: sqlite3.Connection, paths: list[str]) -> Tuple[bool, str]:
 
