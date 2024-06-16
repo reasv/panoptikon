@@ -65,10 +65,10 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
     ''', (scan_time, setter))
 
     for sha256, path in find_working_paths_without_tags(conn, setter).items():
-        image = PIL.Image.open(path)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
         try:
+            image = PIL.Image.open(path)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
             if model is None:
                 model = load_model()
                 labels = load_labels()
