@@ -203,7 +203,7 @@ def add_file_scan(conn: sqlite3.Connection, scan_time: str, end_time: str, path:
     cursor = conn.cursor()
     insert_result = cursor.execute('''
     INSERT INTO file_scans (start_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (scan_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors))
     # Return the row id of the inserted record
     return insert_result.lastrowid
