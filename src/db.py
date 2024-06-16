@@ -576,16 +576,25 @@ def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, in
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()
     folder_path = normalize_path(folder_path)
-    # Check if the folder already exists and has the same included status
-    cursor.execute('SELECT included FROM folders WHERE path = ?', (folder_path,))
-    existing_folder = cursor.fetchone()
-    if existing_folder and existing_folder[0] == included:
-        return
-
+    # Attempt to insert the folder
     cursor.execute('''
-    INSERT INTO folders (time_added, path, included)
-    VALUES (?, ?, ?)
+        INSERT OR IGNORE INTO folders (time_added, path, included)
+        VALUES (?, ?, ?)
     ''', (time, folder_path, included))
+    
+    if cursor.rowcount == 0: 
+        return False
+    else:
+        return True
+    
+def delete_folders_not_in_list(conn: sqlite3.Connection, folder_paths: List[str], included=True):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    DELETE FROM folders
+    WHERE included = ?
+    AND path NOT IN ({})
+    '''.format(','.join(['?']*len(folder_paths)), folder_paths, included))
+    return result.rowcount
 
 def remove_folder_from_database(conn: sqlite3.Connection, folder_path: str):
     cursor = conn.cursor()
@@ -599,37 +608,49 @@ def get_folders_from_database(conn: sqlite3.Connection, included=True) -> List[s
 
 def delete_files_under_excluded_folders(conn: sqlite3.Connection):
     cursor = conn.cursor()
-    cursor.execute('''
+    result = cursor.execute('''
     DELETE FROM files
-    WHERE path IN (
-        SELECT files.path
-        FROM files
-        JOIN folders ON files.path LIKE folders.path || '%'
+    WHERE EXISTS (
+        SELECT 1
+        FROM folders
         WHERE folders.included = 0
-    )
+        AND files.path LIKE folders.path || '%'
+    );
     ''')
-
-def delete_items_without_files(conn: sqlite3.Connection):
-    cursor = conn.cursor()
-    cursor.execute('''
-    DELETE FROM items
-    WHERE sha256 NOT IN (
-        SELECT sha256
-        FROM files
-    )
-    ''')
+    return result.rowcount
 
 def delete_files_not_under_included_folders(conn: sqlite3.Connection):
     cursor = conn.cursor()
-    cursor.execute('''
+    result = cursor.execute('''
     DELETE FROM files
-    WHERE path NOT IN (
-        SELECT files.path
-        FROM files
-        JOIN folders ON files.path LIKE folders.path || '%'
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM folders
         WHERE folders.included = 1
+        AND files.path LIKE folders.path || '%'
+    );
+    ''')
+    return result.rowcount
+
+def delete_unavailable_files(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    DELETE FROM files
+    WHERE available = 0
+    ''')
+    return result.rowcount
+
+def delete_items_without_files(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    DELETE FROM items
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM files
+        WHERE files.sha256 = items.sha256
     )
     ''')
+    return result.rowcount
 
 def get_most_common_tags(conn: sqlite3.Connection, limit=10):
     cursor = conn.cursor()
@@ -778,10 +799,3 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
                 bookmark_tuples[i] = (bookmark[0], result[0])
     
     return bookmark_tuples, total_results
-
-def delete_unavailable_files(conn: sqlite3.Connection):
-    cursor = conn.cursor()
-    cursor.execute('''
-    DELETE FROM files
-    WHERE available = 0
-    ''')
