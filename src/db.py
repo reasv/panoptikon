@@ -476,7 +476,7 @@ def find_items_by_tags(
 
     # Second query to get the items with pagination
     query = '''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN tags ON items.sha256 = tags.item
@@ -505,12 +505,12 @@ def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
     else:
         items, total_count = find_items_by_tags(conn, tags, min_confidence, page_size, page, include_path, order_by, order)
     for item in items:
-        if os.path.exists(item[7]):
+        if os.path.exists(item[6]):
             results.append({
                 'sha256': item[0],
                 'type': item[2],
-                'last_modified': item[6],
-                'path': item[7]
+                'last_modified': item[5],
+                'path': item[6]
             })
         elif result := get_working_path_by_sha256(conn, item[0]):
             results.append({
@@ -564,7 +564,7 @@ def find_items_without_tags(conn: sqlite3.Connection, page_size=1000, page=1, in
 
     # Second query to get the items with pagination
     query = f'''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
     JOIN files ON items.sha256 = files.sha256 {path_condition}
@@ -804,6 +804,9 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
     
     # Check if the paths are available, if not, try to find a working path
     for i, bookmark in enumerate(bookmark_tuples):
+        if bookmark[1] is None:
+            print(f"Bookmark path is None: {bookmark}")
+            continue
         if not os.path.exists(bookmark[1]):
             if result := get_working_path_by_sha256(conn, bookmark[0]):
                 bookmark_tuples[i] = (bookmark[0], result[0])
