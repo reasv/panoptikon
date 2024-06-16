@@ -234,6 +234,13 @@ def get_file_scan_by_id(conn: sqlite3.Connection, scan_id: int) -> FileScanRecor
         return FileScanRecord(*scan_record)
     return None
 
+def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
+    cursor = conn.cursor()
+    # Order by start_time in descending order
+    cursor.execute('SELECT * FROM file_scans ORDER BY start_time DESC')
+    scan_records = cursor.fetchall()
+    return [FileScanRecord(*scan_record) for scan_record in scan_records]
+
 def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
     """
     Mark files as unavailable if their path is a subpath of `path` and they were not seen during the scan at `scan_time`
