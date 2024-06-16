@@ -46,11 +46,12 @@ def execute_folder_scan(
     for folder in starting_points:
         new_items, unchanged_files, new_files, modified_files, errors = 0, 0, 0, 0, 0
         for file_data in scan_files(
-            folder,
-            excluded_folders,
-            include_images,
-            include_video,
-            include_audio
+            conn,
+            starting_points=folder,
+            excluded_paths=excluded_folders,
+            include_images=include_images,
+            include_video=include_video,
+            include_audio=include_audio
         ):
             if file_data is None:
                 errors += 1
@@ -140,7 +141,7 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
         if added:
             excluded_added.append(folder)
 
-    scan_ids = execute_folder_scan(conn, included_added)
+    scan_ids = execute_folder_scan(conn, included_folders=included_added)
 
     if delete_unavailable:
         unavailable_files_deleted = delete_unavailable_files(conn)
