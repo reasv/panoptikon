@@ -244,14 +244,25 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
     Mark files as unavailable if their path is a subpath of `path` and they were not seen during the scan at `scan_time`
     """
     cursor = conn.cursor()
-    
+
+    # Count files to be marked as unavailable
+    precount_result = cursor.execute('''
+    SELECT COUNT(*)
+    FROM files
+    WHERE last_seen != ?
+    AND path LIKE ?
+    ''', (scan_time, path + '%'))
+
+    marked_unavailable = precount_result.fetchone()[0]
+
     # If a file has not been seen in scan that happened at scan_time, mark it as unavailable
-    result = cursor.execute('''
+    cursor.execute('''
         UPDATE files
         SET available = FALSE
         WHERE last_seen != ?
         AND path LIKE ?
     ''', (scan_time, path + '%'))
+
     # Count available files
     result_available = cursor.execute('''
         SELECT COUNT(*)
@@ -260,8 +271,9 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
         AND path LIKE ?
     ''', (path + '%',))
     available_files: int = result_available.fetchone()[0]
-    # Return the number of rows affected
-    return result.rowcount, available_files
+
+    
+    return marked_unavailable, available_files
         
 
 def get_file_by_path(conn: sqlite3.Connection, path: str):

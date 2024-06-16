@@ -82,7 +82,7 @@ def execute_folder_scan(
                 new_files += 1
         # Mark files that were not found in the scan but are present in the db as `unavailable`
         marked_unavailable, total_available = mark_unavailable_files(conn, scan_time=scan_time, path=folder)
-
+        print(f"Scan of {folder} complete. New items: {new_items}, Unchanged files: {unchanged_files}, New files: {new_files}, Modified files: {modified_files}, Marked unavailable: {marked_unavailable}, Errors: {errors}, Total available: {total_available}")
         end_time = datetime.now().isoformat()
         scan_ids.append(
             add_file_scan(
