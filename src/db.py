@@ -78,8 +78,17 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS tag_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        end_time TEXT,               -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
         setter TEXT NOT NULL,
+        threshold REAL NOT NULL,
+        image_files INTEGER NOT NULL,
+        video_files INTEGER NOT NULL,
+        other_files INTEGER NOT NULL DEFAULT 0,
+        video_frames INTEGER NOT NULL,
+        total_frames INTEGER NOT NULL,
+        errors INTEGER NOT NULL,
+        timeouts INTEGER NOT NULL,
+        total_remaining INTEGER NOT NULL,
         UNIQUE(start_time)       -- Unique constraint on time
     )
     ''')
@@ -313,6 +322,48 @@ def hard_update_items_available(conn: sqlite3.Connection):
         WHERE path = ?
         ''', (available, path))
 
+def add_tag_scan(
+        conn: sqlite3.Connection,
+        scan_time: str,
+        end_time: str,
+        setter: str,
+        threshold: float,
+        image_files: int,
+        video_files: int,
+        other_files: int,
+        video_frames: int,
+        total_frames: int,
+        errors: int,
+        timeouts: int,
+        total_remaining: int
+    ):
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO tag_scans (start_time, end_time, setter, threshold, image_files, video_files, other_files, video_frames, total_frames, errors, timeouts, total_remaining)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (scan_time, end_time, setter, threshold, image_files, video_files, other_files, video_frames, total_frames, errors, timeouts, total_remaining))
+
+@dataclass
+class TagScanRecord:
+    id: int
+    start_time: str
+    end_time: str
+    setter: str
+    threshold: float
+    image_files: int
+    video_files: int
+    other_files: int
+    video_frames: int
+    total_frames: int
+    errors: int
+    timeouts: int
+    total_remaining: int
+
+def get_all_tag_scans(conn: sqlite3.Connection) -> List[TagScanRecord]:
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM tag_scans ORDER BY start_time DESC')
+    scan_records = cursor.fetchall()
+    return [TagScanRecord(*scan_record) for scan_record in scan_records]
 
 def find_working_paths_without_tags(conn: sqlite3.Connection, excluded_tag_setter=None):
     cursor = conn.cursor()

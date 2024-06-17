@@ -4,7 +4,7 @@ from datetime import datetime
 import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
-from src.db import get_folders_from_database, get_database_connection, get_all_file_scans
+from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans
 from src.tags import scan_and_predict_tags
 
 def get_folders():
@@ -46,21 +46,12 @@ def update_folders(included_folders_text: str, excluded_folders_text: str, delet
         conn.rollback()
         conn.close()
         return f"Error: {e}", included_folders_text, excluded_folders_text
-
-    cursor.execute('BEGIN')
-    try: 
-        scan_and_predict_tags(conn)
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        return f"Error: {e}", included_folders_text, excluded_folders_text
     
     current_included_folders = get_folders_from_database(conn, included=True)
     current_excluded_folders = get_folders_from_database(conn, included=False)
     conn.close()
 
-    return f"{update_result_text}\nScanned and generated tags for all files that didn't have them.", "\n".join(current_included_folders), "\n".join(current_excluded_folders), fetch_scan_history()
+    return f"{update_result_text}", "\n".join(current_included_folders), "\n".join(current_excluded_folders), fetch_scan_history(), fetch_tagging_history()
 
 def rescan_folders(delete_unavailable_files: bool = True):
     conn = get_database_connection()
@@ -69,19 +60,26 @@ def rescan_folders(delete_unavailable_files: bool = True):
     ids, files_deleted, items_deleted = rescan_all_folders(conn, delete_unavailable=delete_unavailable_files)
     conn.commit()
     conn.close()
-    return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.", fetch_scan_history()
+    return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.", fetch_scan_history(), fetch_tagging_history()
 
 def regenerate_tags():
     conn = get_database_connection()
     cursor = conn.cursor()
     cursor.execute('BEGIN')
-    scan_and_predict_tags(conn)
+    images, videos, failed, timed_out = scan_and_predict_tags(conn)
     conn.commit()
     conn.close()
-    return "Generated tags for all files with missing tags", fetch_scan_history()
-
-def scan_and_generate_tags(delete_unavailable_files=True):
-    return rescan_folders(delete_unavailable_files) + regenerate_tags()
+    failed_str = "\n".join(failed)
+    timed_out_str = "\n".join(timed_out)
+    return f"""Tag Generation completed.
+                Successfully processed {images} images and {videos} videos.
+                {len(failed)} files failed to process due to errors.
+                {len(timed_out)} files took too long to process and timed out.
+                Failed files:
+                {failed_str}
+                Timed out files:
+                {timed_out_str}
+            """, fetch_scan_history(), fetch_tagging_history()
 
 def fetch_scan_history():
     conn = get_database_connection()
@@ -92,6 +90,31 @@ def fetch_scan_history():
                    f.path, 
                    f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files) for f in file_scans]
     return file_scans
+
+def fetch_tagging_history():
+    conn = get_database_connection()
+    tag_scans = get_all_tag_scans(conn)
+    conn.close()
+    # Convert the tag scans to a list of tuples
+    tag_scans = [(
+        t.id,
+        parse_iso_date(t.start_time),
+        parse_iso_date(t.end_time),
+        t.setter,
+        t.threshold,
+        t.image_files,
+        t.video_files,
+        t.other_files,
+        t.video_frames,
+        t.total_frames,
+        t.errors,
+        t.timeouts,
+        t.total_remaining
+        ) for t in tag_scans]
+    return tag_scans
+
+def fetch_all_history():
+    return fetch_scan_history(), fetch_tagging_history()
 
 def create_scan_UI():
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
@@ -109,7 +132,6 @@ def create_scan_UI():
             with gr.Row():
                 with gr.Column():
                     regenerate_tags_button = gr.Button("Generate Tags for files with no tags")
-                    regenerate_and_scan = gr.Button("Scan All and Generate Missing Tags")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -125,44 +147,51 @@ def create_scan_UI():
                 results = gr.Textbox(label="Scan Report", interactive=False, lines=8, value="")
 
             with gr.Row():
-                scan_history = gr.Dataset(
-                    label="File Scan History",
-                    type="index",
-                    samples_per_page=25,
-                    samples=[],
-                    headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
-                    components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
-                    scale=1
-                )
+                with gr.Tabs():
+                    with gr.TabItem(label="Scan History"):
+                        scan_history = gr.Dataset(
+                            label="File Scan History",
+                            type="index",
+                            samples_per_page=25,
+                            samples=[],
+                            headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
+                            components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
+                            scale=1
+                        )
+                    with gr.TabItem(label="Tagging History"):
+                        tagging_history = gr.Dataset(
+                            label="Tagging History",
+                            type="index",
+                            samples_per_page=25,
+                            samples=[],
+                            headers=["ID", "Start Time", "End Time", "Tag Model", "Threshold", "Image Files", "Video Files", "Other Files", "Video Frames", "Total Frames", "Errors", "Timeouts", "Remaining Untagged"],
+                            components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number", "number", "number"],
+                            scale=1
+                        )
+                
 
         scan_tab.select(
-            fn=fetch_scan_history,
-            outputs=[scan_history],
-            api_name="fetch_scan_history",
+            fn=fetch_all_history,
+            outputs=[scan_history, tagging_history],
+            api_name="fetch_history",
         )
+
         update_button.click(
             fn=update_folders,
             inputs=[included_directory_list, excluded_directory_list, delete_unavailable_files],
-            outputs=[results, included_directory_list, excluded_directory_list, scan_history],
+            outputs=[results, included_directory_list, excluded_directory_list, scan_history, tagging_history],
             api_name="update_folder_lists",
         )
 
         scan_button.click(
             fn=rescan_folders,
             inputs=[delete_unavailable_files],
-            outputs=[results, scan_history],
+            outputs=[results, scan_history, tagging_history],
             api_name="rescan_folders",
         )
 
         regenerate_tags_button.click(
             fn=regenerate_tags,
-            outputs=[results, scan_history],
+            outputs=[results, scan_history, tagging_history],
             api_name="regenerate_tags",
-        )
-
-        regenerate_and_scan.click(
-            fn=scan_and_generate_tags,
-            inputs=[delete_unavailable_files],
-            outputs=[results, scan_history],
-            api_name="scan_and_generate_tags",
         )
