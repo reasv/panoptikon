@@ -10,6 +10,8 @@ from src.db import get_file_by_path
 from src.types import FileScanData
 from src.utils import normalize_path
 
+mimetypes.add_type('image/webp', '.webp')
+
 def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
     """
     Get all files with the given extensions in the given starting points and their entire directory trees, excluding the given excluded paths.
@@ -171,7 +173,7 @@ def get_mime_type(file_path: str):
     """
     Get the MIME type of the file at the given path.
     """
-    mime_type, _ = mimetypes.guess_type(file_path)
+    mime_type, _ = mimetypes.guess_type(file_path, strict=False)
     return mime_type
 
 def deduplicate_paths(paths: List[str]):
