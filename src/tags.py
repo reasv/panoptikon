@@ -49,7 +49,7 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
         try:
             mime_type = get_mime_type(path)
             if mime_type.startswith("video"):
-                result_threshold, video_frames = process_video_dd(sha256, path, model=model, labels=labels, keyframe_threshold=0.8, num_frames=5, tag_threshold=score_threshold)
+                result_threshold, video_frames = process_video_dd(sha256, path, model=model, labels=labels, keyframe_threshold=None, num_frames=4, tag_threshold=score_threshold)
                 if result_threshold is None:
                     continue
             else:
