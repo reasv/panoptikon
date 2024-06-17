@@ -31,12 +31,16 @@ def get_files_by_extension(starting_points: List[str], excluded_paths: List[str]
                 if any(file.lower().endswith(ext) for ext in extensions):
                     yield os.path.join(root, file)
 
+# Convert ISO string to epoch time number
+def parse_iso_date(date: str) -> int:
+    return int(datetime.fromisoformat(date).timestamp())
+
 def scan_files(
         conn: sqlite3.Connection,
         starting_points: List[str],
         excluded_paths: List[str],
         include_images = True,
-        include_video = False,
+        include_video = True,
         include_audio = False,
         allowed_extensions: List[str] = [],
     ):
@@ -65,7 +69,7 @@ def scan_files(
         # Check if the file is already in the database
         if file_data := get_file_by_path(conn, file_path):
             # Check if the file has been modified since the last scan
-            if file_data["last_modified"] == last_modified:
+            if parse_iso_date(file_data["last_modified"]) == int(os.stat(file_path).st_mtime):
                 # Reuse the existing hash and mime type
                 md5: str = file_data["md5"]
                 sha256: str = file_data["sha256"]
@@ -78,9 +82,9 @@ def scan_files(
             print(f"Calculating hashes for {file_path}")
             try:
                 md5, sha256 = calculate_hashes(file_path)
-                if file_data:
-                    if file_data["sha256"] == sha256:
-                        print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size} bytes. Previous mtime: {file_data['last_modified']}, current mtime: {last_modified}.")
+                # if file_data:
+                #     if file_data["sha256"] == sha256:
+                        # print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size} bytes. Previous mtime: {file_data['last_modified']}, current mtime: {last_modified}.")
             except Exception as e:
                 print(f"Error calculating hashes for {file_path}: {e}")
                 yield None
