@@ -2,6 +2,9 @@ import os
 import subprocess
 import platform
 
+from PIL import Image
+import math
+
 def show_in_fm(path):
     """
     Open the given path in the file explorer and select the file, works on Windows, macOS, and Linux.
@@ -56,3 +59,41 @@ def normalize_path(path: str) -> str:
     Normalize the path to be in our preferred format.
     """
     return ensure_trailing_slash(os.path.abspath(path.strip()))
+
+def create_image_grid(image_list) -> Image.Image:
+    """
+    Create a grid of images from a list of PIL.Image.Image objects, automatically
+    determining the grid size to form a square or slightly rectangular shape if needed.
+    
+    Args:
+    - image_list (list of PIL.Image.Image): List of images to include in the grid.
+    
+    Returns:
+    - PIL.Image.Image: The resulting grid image.
+    """
+    if not image_list:
+        raise ValueError("The image_list is empty.")
+    
+    # Number of images
+    num_images = len(image_list)
+    
+    # Determine the grid size
+    grid_size = math.ceil(math.sqrt(num_images))
+    
+    # Get the size of each image (assuming all images are the same size)
+    img_width, img_height = image_list[0].size
+    
+    # Calculate the size of the output image
+    grid_width = grid_size * img_width
+    grid_height = grid_size * img_height
+    
+    # Create a new blank image with the calculated size
+    grid_image = Image.new('RGB', (grid_width, grid_height))
+    
+    # Paste each image into the grid
+    for index, img in enumerate(image_list):
+        row = index // grid_size
+        col = index % grid_size
+        grid_image.paste(img, (col * img_width, row * img_height))
+    
+    return grid_image

@@ -172,4 +172,5 @@ paths.txt
 bookmarks.json
 
 migration.py
+videotest.py
 thumbs/
