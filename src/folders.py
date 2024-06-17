@@ -23,7 +23,7 @@ def execute_folder_scan(
         conn: sqlite3.Connection,
         included_folders: None | List[str] = None,
         include_images = True,
-        include_video = False,
+        include_video = True,
         include_audio = False,
     ) -> list[int]:
     """
