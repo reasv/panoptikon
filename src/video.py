@@ -6,6 +6,8 @@ import numpy as np
 from PIL.Image import Image
 import PIL.Image
 
+from src.utils import create_image_grid
+
 def extract_frames(video_path, num_frames=10):
     """
     Extract a specified number of evenly spaced frames from a video.
@@ -114,6 +116,8 @@ def saveImages(basePath, images: List[Image]):
     for i in range(len(images)):
         imagePath = os.path.join(basePath, f"{i}" + ".jpg")
         images[i].save(imagePath)
+
+    create_image_grid(images).save(os.path.join(basePath, "grid.jpg"))
 
 def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = None, thumbnail_save_path=None):
     """
