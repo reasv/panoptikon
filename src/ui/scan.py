@@ -75,7 +75,7 @@ def regenerate_tags():
     conn = get_database_connection()
     cursor = conn.cursor()
     cursor.execute('BEGIN')
-    scan_and_generate_tags(conn)
+    scan_and_predict_tags(conn)
     conn.commit()
     conn.close()
     return "Generated tags for all files with missing tags", fetch_scan_history()
