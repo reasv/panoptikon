@@ -11,7 +11,7 @@ import PIL.Image
 
 from src.db import insert_tag, find_working_paths_without_tags, add_tag_scan
 from src.files import get_mime_type
-from src.deepdanbooru import load_model, load_labels, predict
+from src.deepdanbooru import load_model, load_labels, predict, predict_batch
 from src.video import video_to_frames, combine_results
 from src.utils import create_image_grid
 
@@ -35,9 +35,9 @@ def process_video_dd(sha256: str, video_path: str, model, labels, keyframe_thres
         print(f"Error processing video {video_path}: {e}")
         return None, None
     results = []
-    for frame in frames:
-        result_threshold, _result_all, _result_text = predict(frame, model, labels, score_threshold=tag_threshold)
+    for result_threshold, _result_all, _result_text in predict_batch(frames, model, labels, score_threshold=tag_threshold):
         results.append((result_threshold))
+
     combined_result = combine_results(results)
     return combined_result, frames
 
@@ -67,9 +67,10 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
     timeouts = []
     videos, images, total_video_frames, total_processed_frames = 0, 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        for sha256, path in find_working_paths_without_tags(conn, setter).items():
+        paths_without_tags = find_working_paths_without_tags(conn, setter)
+        for sha256, path in paths_without_tags.items():
             mime_type = get_mime_type(path)
-            print(f"Processing {path} ({mime_type})")
+            print(f"Processing {path} ({mime_type}) (timeout {timeout})")
             future = executor.submit(process_single_file, sha256, mime_type, path, model, labels, tag_threshold=score_threshold)
             try:
                 result_threshold, frames = future.result(timeout=timeout)
@@ -88,6 +89,7 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
             if result_threshold is None:
                 failed_paths.append(path)
                 continue
+            print(f"Adding {len(result_threshold.keys())} tags for {path}...")
             for tag, confidence in result_threshold.items():
                 insert_tag(
                     conn,
@@ -99,6 +101,8 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
                     setter=setter,
                     value=None
                 )
+            print(f"Added tags for {path}")
+
     print(f"Processed {images} images and {videos} videos totalling {total_processed_frames} frames ({total_video_frames} video frames)")
     scan_end_time = datetime.now().isoformat()
     remaining_paths = find_working_paths_without_tags(conn, setter)
