@@ -130,9 +130,15 @@ def create_wd_tagger_UI():
                         general_res,
                     ]
                 )
-
+    def run_predict(image, model_repo, general_thresh, general_mcut_enabled, character_thresh, character_mcut_enabled):
+        return predictor.predict(
+            image,
+            model_repo,
+            general_thresh if not general_mcut_enabled else None,
+            character_thresh if not character_mcut_enabled else None,
+        )
     submit.click(
-        predictor.predict,
+        fn=run_predict,
         inputs=[
             image,
             model_repo,
@@ -141,5 +147,5 @@ def create_wd_tagger_UI():
             character_thresh,
             character_mcut_enabled,
         ],
-        outputs=[sorted_general_strings, rating, character_res, general_res],
+        outputs=[rating, character_res, general_res, sorted_general_strings],
     )

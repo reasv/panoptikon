@@ -147,10 +147,8 @@ class Predictor:
         self,
         image,
         model_repo,
-        general_thresh,
-        general_mcut_enabled,
-        character_thresh,
-        character_mcut_enabled,
+        general_thresh: float = None,
+        character_thresh: float = None,
     ):
         self.load_model(model_repo)
 
@@ -169,7 +167,8 @@ class Predictor:
         # Then we have general tags: pick any where prediction confidence > threshold
         general_names = [labels[i] for i in self.general_indexes]
 
-        if general_mcut_enabled:
+        if not general_thresh:
+            # Use MCut thresholding
             general_probs = np.array([x[1] for x in general_names])
             general_thresh = mcut_threshold(general_probs)
 
@@ -179,10 +178,11 @@ class Predictor:
         # Everything else is characters: pick any where prediction confidence > threshold
         character_names = [labels[i] for i in self.character_indexes]
 
-        if character_mcut_enabled:
+        if not character_thresh:
+            # Use MCut thresholding
             character_probs = np.array([x[1] for x in character_names])
             character_thresh = mcut_threshold(character_probs)
-            character_thresh = max(0.15, character_thresh)
+            character_thresh = max(0.05, character_thresh)
 
         character_res = [x for x in character_names if x[1] > character_thresh]
         character_res = dict(character_res)
@@ -192,9 +192,10 @@ class Predictor:
             key=lambda x: x[1],
             reverse=True,
         )
+        
         sorted_general_strings = [x[0] for x in sorted_general_strings]
         sorted_general_strings = (
             ", ".join(sorted_general_strings).replace("(", "\(").replace(")", "\)")
         )
 
-        return sorted_general_strings, rating, character_res, general_res
+        return rating, character_res, general_res, sorted_general_strings
