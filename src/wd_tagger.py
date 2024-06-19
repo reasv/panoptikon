@@ -5,15 +5,16 @@ import onnxruntime as rt
 import pandas as pd
 from PIL import Image
 
-TITLE = "WaifuDiffusion Tagger"
-DESCRIPTION = """
-Demo for the WaifuDiffusion tagger models
-"""
-
 # Dataset v3 series of models:
 SWINV2_MODEL_DSV3_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
 CONV_MODEL_DSV3_REPO = "SmilingWolf/wd-convnext-tagger-v3"
 VIT_MODEL_DSV3_REPO = "SmilingWolf/wd-vit-tagger-v3"
+
+V3_MODELS = [
+    SWINV2_MODEL_DSV3_REPO,
+    CONV_MODEL_DSV3_REPO,
+    VIT_MODEL_DSV3_REPO,
+]
 
 # Dataset v2 series of models:
 MOAT_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-moat-tagger-v2"
@@ -61,7 +62,6 @@ def load_labels(dataframe) -> list[str]:
     character_indexes = list(np.where(dataframe["category"] == 4)[0])
     return tag_names, rating_indexes, general_indexes, character_indexes
 
-
 def mcut_threshold(probs):
     """
     Maximum Cut Thresholding (MCut)
@@ -74,7 +74,6 @@ def mcut_threshold(probs):
     t = difs.argmax()
     thresh = (sorted_probs[t] + sorted_probs[t + 1]) / 2
     return thresh
-
 
 class Predictor:
     def __init__(self):
@@ -199,104 +198,3 @@ class Predictor:
         )
 
         return sorted_general_strings, rating, character_res, general_res
-
-
-def create_wd_tagger_UI():
-    score_slider_step = 0.05
-    score_character_threshold = 0.25
-    score_general_threshold = 0.25
-
-    predictor = Predictor()
-
-    dropdown_list = [
-        SWINV2_MODEL_DSV3_REPO,
-        CONV_MODEL_DSV3_REPO,
-        VIT_MODEL_DSV3_REPO,
-        MOAT_MODEL_DSV2_REPO,
-        SWIN_MODEL_DSV2_REPO,
-        CONV_MODEL_DSV2_REPO,
-        CONV2_MODEL_DSV2_REPO,
-        VIT_MODEL_DSV2_REPO,
-    ]
-
-    with gr.Column():
-        gr.Markdown(
-            value=f"<h1 style='text-align: center; margin-bottom: 1rem'>{TITLE}</h1>"
-        )
-        gr.Markdown(value=DESCRIPTION)
-        with gr.Row():
-            with gr.Column(variant="panel"):
-                image = gr.Image(type="pil", image_mode="RGBA", label="Input")
-                model_repo = gr.Dropdown(
-                    dropdown_list,
-                    value=SWINV2_MODEL_DSV3_REPO,
-                    label="Model",
-                )
-                with gr.Row():
-                    general_thresh = gr.Slider(
-                        0,
-                        1,
-                        step=score_slider_step,
-                        value=score_general_threshold,
-                        label="General Tags Threshold",
-                        scale=3,
-                    )
-                    general_mcut_enabled = gr.Checkbox(
-                        value=False,
-                        label="Use MCut threshold",
-                        scale=1,
-                    )
-                with gr.Row():
-                    character_thresh = gr.Slider(
-                        0,
-                        1,
-                        step=score_slider_step,
-                        value=score_character_threshold,
-                        label="Character Tags Threshold",
-                        scale=3,
-                    )
-                    character_mcut_enabled = gr.Checkbox(
-                        value=False,
-                        label="Use MCut threshold",
-                        scale=1,
-                    )
-                with gr.Row():
-                    clear = gr.ClearButton(
-                        components=[
-                            image,
-                            model_repo,
-                            general_thresh,
-                            general_mcut_enabled,
-                            character_thresh,
-                            character_mcut_enabled,
-                        ],
-                        variant="secondary",
-                        size="lg",
-                    )
-                    submit = gr.Button(value="Submit", variant="primary", size="lg")
-            with gr.Column(variant="panel"):
-                sorted_general_strings = gr.Textbox(label="Output (string)")
-                rating = gr.Label(label="Rating")
-                character_res = gr.Label(label="Output (characters)")
-                general_res = gr.Label(label="Output (tags)")
-                clear.add(
-                    [
-                        sorted_general_strings,
-                        rating,
-                        character_res,
-                        general_res,
-                    ]
-                )
-
-    submit.click(
-        predictor.predict,
-        inputs=[
-            image,
-            model_repo,
-            general_thresh,
-            general_mcut_enabled,
-            character_thresh,
-            character_mcut_enabled,
-        ],
-        outputs=[sorted_general_strings, rating, character_res, general_res],
-    )

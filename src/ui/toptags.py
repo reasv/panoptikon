@@ -14,7 +14,8 @@ def get_labels():
     return labels
 
 def create_toptags_UI():
-    with gr.Column(elem_classes="centered-content", scale=0):
-        top_tags = gr.Label(value=get_labels, label="Percentages are calculated on items that have tags")
-        refresh_button = gr.Button("Refresh")
-        refresh_button.click(fn=get_labels, outputs=top_tags)
+    with gr.TabItem(label="Tag Frequency"):
+        with gr.Column(elem_classes="centered-content", scale=0):
+            top_tags = gr.Label(value=get_labels, label="Percentages are calculated on items that have tags")
+            refresh_button = gr.Button("Refresh")
+            refresh_button.click(fn=get_labels, outputs=top_tags)
