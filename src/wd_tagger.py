@@ -1,4 +1,3 @@
-import gradio as gr
 import huggingface_hub
 import numpy as np
 import onnxruntime as rt
@@ -76,7 +75,8 @@ def mcut_threshold(probs):
     return thresh
 
 class Predictor:
-    def __init__(self):
+    def __init__(self, model_repo=None):
+        self.default_model_repo = model_repo
         self.model_target_size = None
         self.last_loaded_repo = None
 
@@ -112,9 +112,11 @@ class Predictor:
         self.last_loaded_repo = model_repo
         self.model = model
 
-    def prepare_image(self, image):
-        target_size = self.model_target_size
+    def prepare_image(self, image: Image.Image):
+        if image.mode != 'RGBA':
+            image = image.convert('RGBA')
 
+        target_size = self.model_target_size
         canvas = Image.new("RGBA", image.size, (255, 255, 255))
         canvas.alpha_composite(image)
         image = canvas.convert("RGB")
@@ -146,10 +148,12 @@ class Predictor:
     def predict(
         self,
         image,
-        model_repo,
+        model_repo: str = None,
         general_thresh: float = None,
         character_thresh: float = None,
     ):
+        if model_repo is None:
+            model_repo = self.default_model_repo
         self.load_model(model_repo)
 
         image = self.prepare_image(image)
@@ -187,15 +191,4 @@ class Predictor:
         character_res = [x for x in character_names if x[1] > character_thresh]
         character_res = dict(character_res)
 
-        sorted_general_strings = sorted(
-            general_res.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        
-        sorted_general_strings = [x[0] for x in sorted_general_strings]
-        sorted_general_strings = (
-            ", ".join(sorted_general_strings).replace("(", "\(").replace(")", "\)")
-        )
-
-        return rating, character_res, general_res, sorted_general_strings
+        return rating, character_res, general_res

@@ -95,19 +95,6 @@ def extract_keyframes(video_path, threshold=0.8) -> List[Image]:
     cap.release()
     return keyframes
 
-def combine_results(results: List[dict[str, float]]) -> dict[str, float]:
-    """
-    Combine multiple results into a single result by picking the highest confidence score for each tag.
-    :param results: List of results to combine
-    :return: Combined result as a dictionary of tags and scores
-    """
-    combined_result = dict()
-    for result in results:
-        for tag, score in result.items():
-            if tag not in combined_result or score > combined_result[tag]:
-                combined_result[tag] = score
-    return combined_result
-
 def saveImages(basePath, images: List[Image]):
     # Normalize the path
     basePath = os.path.normpath(basePath)

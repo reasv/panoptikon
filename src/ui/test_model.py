@@ -131,12 +131,24 @@ def create_wd_tagger_UI():
                     ]
                 )
     def run_predict(image, model_repo, general_thresh, general_mcut_enabled, character_thresh, character_mcut_enabled):
-        return predictor.predict(
+        rating, character_res, general_res = predictor.predict(
             image,
             model_repo,
             general_thresh if not general_mcut_enabled else None,
             character_thresh if not character_mcut_enabled else None,
         )
+        sorted_general_strings = sorted(
+            general_res.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        sorted_general_strings = [x[0] for x in sorted_general_strings]
+        sorted_general_strings = (
+            ", ".join(sorted_general_strings).replace("(", "\(").replace(")", "\)")
+        )
+        return rating, character_res, general_res, sorted_general_strings
+
     submit.click(
         fn=run_predict,
         inputs=[
