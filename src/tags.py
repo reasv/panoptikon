@@ -9,8 +9,7 @@ import sqlite3
 import PIL.IcnsImagePlugin
 import PIL.Image
 
-from src.db import insert_tag, find_working_paths_without_tags, add_tag_scan
-from src.files import get_mime_type
+from src.db import insert_tag, get_items_missing_tags, add_tag_scan
 from src.deepdanbooru import load_model, load_labels, predict, predict_batch
 from src.video import video_to_frames, combine_results
 from src.utils import create_image_grid
@@ -67,45 +66,51 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter="deepdanbooru"):
     timeouts = []
     videos, images, total_video_frames, total_processed_frames = 0, 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        paths_without_tags = find_working_paths_without_tags(conn, setter)
-        for sha256, path in paths_without_tags.items():
-            mime_type = get_mime_type(path)
-            print(f"Processing {path} ({mime_type}) (timeout {timeout})")
-            future = executor.submit(process_single_file, sha256, mime_type, path, model, labels, tag_threshold=score_threshold)
+        for item in get_items_missing_tags(conn, setter):
+            print(f"Processing {item.path} ({item.type}) (timeout {timeout})")
+            future = executor.submit(
+                    process_single_file,
+                    item.sha256,
+                    item.type,
+                    item.path,
+                    model,
+                    labels,
+                    tag_threshold=score_threshold
+                )
             try:
                 result_threshold, frames = future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                print(f"Timeout processing {path}")
-                timeouts.append(path)
+                print(f"Timeout processing {item.path}")
+                timeouts.append(item.path)
                 continue
             total_processed_frames += frames
 
-            if mime_type.startswith("video"):
+            if item.type.startswith("video"):
                 videos += 1
                 total_video_frames += frames
             else:
                 images += 1
 
             if result_threshold is None:
-                failed_paths.append(path)
+                failed_paths.append(item.path)
                 continue
-            print(f"Adding {len(result_threshold.keys())} tags for {path}...")
+            print(f"Adding {len(result_threshold.keys())} tags for {item.path}...")
             for tag, confidence in result_threshold.items():
                 insert_tag(
                     conn,
                     scan_time=scan_time,
                     namespace="danbooru",
                     name=tag,
-                    item=sha256,
+                    item=item.sha256,
                     confidence=confidence,
                     setter=setter,
                     value=None
                 )
-            print(f"Added tags for {path}")
+            print(f"Added tags for {item.path}")
 
     print(f"Processed {images} images and {videos} videos totalling {total_processed_frames} frames ({total_video_frames} video frames)")
     scan_end_time = datetime.now().isoformat()
-    remaining_paths = find_working_paths_without_tags(conn, setter)
+    remaining_paths = len(list(get_items_missing_tags(conn, setter)))
 
     add_tag_scan(
         conn,

@@ -155,7 +155,6 @@ def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, sette
     ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence, last_set=excluded.last_set
     ''', (namespace, name, value, confidence, item, setter, time, last_set))
 
-
 def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileScanData):
     cursor = conn.cursor()
     sha256 = file_data.sha256
@@ -365,72 +364,79 @@ def get_all_tag_scans(conn: sqlite3.Connection) -> List[TagScanRecord]:
     scan_records = cursor.fetchall()
     return [TagScanRecord(*scan_record) for scan_record in scan_records]
 
-def find_working_paths_without_tags(conn: sqlite3.Connection, excluded_tag_setter=None):
+@dataclass
+class ItemWithPath:
+    sha256: str
+    md5: str
+    type: str
+    size: int
+    time_added: str
+    path: str
+
+def get_items_missing_tags(conn: sqlite3.Connection, tag_setter=None):
+    """
+    Get all items that do not have any tags set by the given tag setter
+    If tag_setter is None, get all items that do not have any tags set by any tag setter
+    """
     cursor = conn.cursor()
-    if excluded_tag_setter:
-        # Get all unique sha256 hashes excluding those with a tag set by the given author
-        cursor.execute('''
-        SELECT DISTINCT files.sha256
-        FROM files
-        LEFT JOIN tags ON files.sha256 = tags.item AND tags.setter = ?
-        WHERE tags.item IS NULL
-        ''', (excluded_tag_setter,))
-        sha256_hashes = cursor.fetchall()
-    else:
-        # Get all unique sha256 hashes
-        cursor.execute('SELECT DISTINCT sha256 FROM files')
-        sha256_hashes = cursor.fetchall()
+    tag_setter_clause = "AND tags.setter = ?" if tag_setter else ""
+    cursor.execute(f'''
+    SELECT 
+        items.sha256,
+        items.md5,
+        items.type,
+        items.size,
+        items.time_added,
+        (
+            SELECT files.path
+            FROM files 
+            WHERE files.sha256 = items.sha256 
+            ORDER BY files.available DESC
+            LIMIT 1
+        ) as path
+    FROM items
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM tags
+        WHERE tags.item = items.sha256 {tag_setter_clause}
+    )
+    ''', (tag_setter,) if tag_setter else ())
 
-    working_paths = {}
+    # Yield each item
+    while row := cursor.fetchone():
+        item = ItemWithPath(*row)
+        if os.path.exists(item.path):
+            yield item
+        else:
+            # If the path does not exist, try to find a working path
+            if file := get_existing_file_for_sha256(conn, item.sha256):
+                item.path = file.path
+                yield item
+            else:
+                # If no working path is found, skip this item
+                continue
 
-    for sha256_tuple in sha256_hashes:
-        sha256 = sha256_tuple[0]
-        
-        # First, try to find a path with available = 1
-        cursor.execute('SELECT path FROM files WHERE sha256 = ? AND available = 1', (sha256,))
-        paths = cursor.fetchall()
-        
-        found = False
-        for path_tuple in paths:
-            path = path_tuple[0]
-            if os.path.exists(path):
-                working_paths[sha256] = path
-                found = True
-                break
-        
-        # If no available paths are found, try other paths
-        if not found:
-            cursor.execute('SELECT path FROM files WHERE sha256 = ?', (sha256,))
-            paths = cursor.fetchall()
-            
-            for path_tuple in paths:
-                path = path_tuple[0]
-                if os.path.exists(path):
-                    working_paths[sha256] = path
-                    break
-    return working_paths
+@dataclass
+class FileRecord:
+    sha256: str
+    path: str
+    last_modified: str
 
-def get_working_path_by_sha256(conn: sqlite3.Connection, sha256: str) -> Tuple[str, str] | None:
+def get_existing_file_for_sha256(conn: sqlite3.Connection, sha256: str) -> FileRecord | None:
     cursor = conn.cursor()
-    # First, try to find a path with available = 1
-    cursor.execute('SELECT path, last_modified FROM files WHERE sha256 = ? AND available = 1', (sha256,))
-    paths = cursor.fetchall()
-    
-    found = False
-    for path_tuple in paths:
-        path = path_tuple[0]
+
+    cursor.execute('''
+    SELECT path, last_modified
+    FROM files
+    WHERE sha256 = ?
+    ORDER BY available DESC
+    ''', (sha256,))
+
+    while row := cursor.fetchone():
+        path, last_modified = row
         if os.path.exists(path):
-            return path, path_tuple[1]
+            return FileRecord(sha256, path, last_modified)
     
-    # If no available paths are found, try other paths
-    if not found:
-        cursor.execute('SELECT path, last_modified FROM files WHERE sha256 = ?', (sha256,))
-        paths = cursor.fetchall()
-        
-        for path_tuple in paths:
-            path = path_tuple[0]
-            if os.path.exists(path):
-                return path, path_tuple[1]
     return None
 
 def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
@@ -563,12 +569,12 @@ def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_
                 'last_modified': item[5],
                 'path': item[6]
             })
-        elif result := get_working_path_by_sha256(conn, item[0]):
+        elif file := get_existing_file_for_sha256(conn, item[0]):
             results.append({
                 'sha256': item[0],
                 'type': item[2],
-                'path': result[0],
-                'last_modified': result[1]
+                'path': file.path,
+                'last_modified': file.last_modified
             })
     return results, total_count
 
@@ -859,7 +865,7 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
             print(f"Bookmark path is None: {bookmark}")
             continue
         if not os.path.exists(bookmark[1]):
-            if result := get_working_path_by_sha256(conn, bookmark[0]):
-                bookmark_tuples[i] = (bookmark[0], result[0])
+            if file := get_existing_file_for_sha256(conn, bookmark[0]):
+                bookmark_tuples[i] = (bookmark[0], file.path)
     
     return bookmark_tuples, total_results
