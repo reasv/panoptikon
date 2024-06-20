@@ -727,6 +727,18 @@ def delete_items_without_files(conn: sqlite3.Connection):
     ''')
     return result.rowcount
 
+def delete_tags_without_items(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    DELETE FROM tags
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM items
+        WHERE items.sha256 = tags.item
+    )
+    ''')
+    return result.rowcount
+
 def get_most_common_tags(conn: sqlite3.Connection, limit=10):
     cursor = conn.cursor()
     cursor.execute('''
