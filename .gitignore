@@ -169,8 +169,6 @@ paths.txt
 
 *.db
 
-bookmarks.json
-
-migration.py
 videotest.py
 thumbs/
+temp_frames/
