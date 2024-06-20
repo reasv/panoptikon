@@ -6,14 +6,14 @@ import gradio as gr
 
 from src.db import FileSearchResult
 from src.utils import open_file, open_in_explorer
-from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
+from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state, get_thumbnail
 from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
 
 def on_change_columns_slider(columns_slider: int):
     return gr.update(columns=columns_slider)
 
 def on_files_change(files: List[FileSearchResult]):
-    image_list = [(file.path, file.path) for file in files]
+    image_list = [(get_thumbnail(file, True), file.path) for file in files]
     print(f"Received {len(image_list)} images")
     return (gr.update(value=image_list), [files[0]]) if len(image_list) > 0 else ([], [])
 

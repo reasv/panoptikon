@@ -68,6 +68,7 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
         frames = video_to_frames(path, keyframe_threshold=None, num_frames=4)
         if not frames:
             raise Exception("No frames found")
+        os.makedirs("./thumbs", exist_ok=True)
         frames[0].save(f"./thumbs/{sha256}-0.jpg")
         create_image_grid(frames).save(f"./thumbs/{sha256}-grid.jpg")
         character_res, general_res = aggregate_results([tag_predictor.predict(frame, general_thresh=tag_threshold, character_thresh=None) for frame in frames])

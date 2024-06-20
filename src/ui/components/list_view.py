@@ -6,11 +6,11 @@ from dataclasses import dataclass
 
 from src.db import get_all_tags_for_item_name_confidence, get_database_connection, FileSearchResult
 from src.utils import open_file, open_in_explorer
-from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
+from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state, get_thumbnail
 from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
 
 def on_files_change(files: List[FileSearchResult]):
-    image_list = [[file.path, file.path] for file in files]
+    image_list = [[get_thumbnail(file, False), file.path] for file in files]
     print(f"Received {len(image_list)} images")
     return gr.update(samples=image_list), ([] if len(image_list) == 0 else [files[0]])
 
@@ -33,6 +33,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
             interactive = True
             sha256 = selected_file.sha256
             path = selected_file.path
+            thumbnail = get_thumbnail(selected_file, True)
             if path != selected_image_path:
                 conn = get_database_connection()
                 tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
@@ -45,7 +46,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                     path = None
 
                 updates = (
-                    tags, text, path, path,
+                    tags, text, path, thumbnail,
                     gr.update(interactive=interactive),
                     gr.update(interactive=interactive),
                     gr.update(interactive=interactive)
