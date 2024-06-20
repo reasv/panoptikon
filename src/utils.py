@@ -1,6 +1,8 @@
 import os
 import subprocess
 import platform
+import mimetypes
+mimetypes.add_type('image/webp', '.webp')
 
 from PIL import Image
 import math
@@ -59,6 +61,13 @@ def normalize_path(path: str) -> str:
     Normalize the path to be in our preferred format.
     """
     return ensure_trailing_slash(os.path.abspath(path.strip()))
+
+def get_mime_type(file_path: str):
+    """
+    Get the MIME type of the file at the given path.
+    """
+    mime_type, _ = mimetypes.guess_type(file_path, strict=False)
+    return mime_type
 
 def create_image_grid(image_list) -> Image.Image:
     """

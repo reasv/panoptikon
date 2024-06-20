@@ -3,7 +3,7 @@ from __future__ import annotations
 import gradio as gr
 import urllib.parse
 
-from src.db import find_paths_by_tags, get_database_connection, get_folders_from_database
+from src.db import get_database_connection, get_folders_from_database, search_files
 from src.ui.components.multi_view import create_multiview
 
 def build_query(tags: list, min_tag_confidence: float, include_path: str = None, page_size: int = 10, page: int = 1, order_by: str = "last_modified", order = None):
@@ -33,16 +33,24 @@ def search_by_tags(
 
     tags = tags_str.split()
     conn = get_database_connection()
-    results, total_results = find_paths_by_tags(
+
+    results, total_results = zip(*list(search_files(
         conn,
         tags,
-        page_size=results_per_page,
+        negative_tags=[],
+        tag_namespace="danbooru",
         min_confidence=min_tag_confidence,
-        page=page,
-        include_path=include_path,
+        setters=None,
+        all_setters_required = False,
+        item_type = None,
+        include_path_prefix = include_path,
         order_by=order_by,
-        order=order
-        )  
+        order=order,
+        page=page,
+        page_size=results_per_page,
+        check_path_exists = True
+    )))
+    total_results = total_results[0]
     conn.close()
     print(f"Found {total_results} images")
     # Calculate the total number of pages, we need to round up

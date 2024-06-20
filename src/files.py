@@ -2,15 +2,12 @@ from dataclasses import dataclass
 import os
 import hashlib
 from datetime import datetime
-import mimetypes
 from typing import List
 import sqlite3
 
 from src.db import get_file_by_path
 from src.types import FileScanData
-from src.utils import normalize_path
-
-mimetypes.add_type('image/webp', '.webp')
+from src.utils import normalize_path, get_mime_type
 
 def get_files_by_extension(starting_points: List[str], excluded_paths: List[str], extensions: List[str]):
     """
@@ -168,13 +165,6 @@ def get_file_size(file_path: str):
     Get the size of the file at the given path.
     """
     return get_last_modified_time_and_size(file_path)[1]
-
-def get_mime_type(file_path: str):
-    """
-    Get the MIME type of the file at the given path.
-    """
-    mime_type, _ = mimetypes.guess_type(file_path, strict=False)
-    return mime_type
 
 def deduplicate_paths(paths: List[str]):
     """

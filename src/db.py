@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from src.utils import normalize_path
+from src.utils import normalize_path, get_mime_type
 from src.types import FileScanData
 
 def get_database_connection(force_readonly=False) -> sqlite3.Connection:
@@ -477,16 +477,13 @@ def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     return items
 
 @dataclass
-class ItemResult:
-    sha256: str
-    md5: str
-    type: str
-    size: int
-    time_added: str
-    last_modified: str
+class FileSearchResult:
     path: str
+    sha256: str
+    last_modified: str
+    type: str
 
-def search_items(
+def search_files(
         conn: sqlite3.Connection,
         tags: List[str],
         negative_tags: List[str] | None = None,
@@ -500,6 +497,7 @@ def search_items(
         order: str | None = None,
         page_size: int | None = 1000,
         page: int = 1,
+        check_path_exists: bool = False
     ):
     negative_tags = negative_tags or []
     tags = tags or []
@@ -508,17 +506,17 @@ def search_items(
     offset = (page - 1) * page_size
 
     # The item mimetype should start with the given item_type
-    item_type_condition = f" {' WHERE' if not negative_tags and not tags else ' AND'} items.type LIKE ? || '%'" if item_type else ""
-    # The path needs to *start* with the given path prefix
-    path_condition = " AND files.path LIKE ? || '%'" if include_path_prefix else ""
-    
+    item_type_condition = f"""
+        JOIN items ON files.sha256 = items.sha256
+        AND items.type LIKE ? || '%'
+    """ if item_type else ""
     # The setter should match the given setter
     tag_setters_condition = f" AND tags.setter IN ({','.join(['?']*len(setters))})" if setters else ""
     # The namespace needs to *start* with the given namespace
     tag_namespace_condition = " AND tags.namespace LIKE ? || '%'" if tag_namespace else ""
     # Negative tags should not be associated with the item
     negative_tags_condition = f"""
-        WHERE items.sha256 NOT IN (
+        WHERE files.sha256 NOT IN (
             SELECT item
             FROM tags
             WHERE name IN ({','.join(['?']*len(negative_tags))})
@@ -527,54 +525,55 @@ def search_items(
             {tag_namespace_condition}
         )
     """ if negative_tags else ""
+    # The path needs to *start* with the given path prefix
+    path_condition = f" {' WHERE' if not negative_tags else ' AND'} files.path LIKE ? || '%'" if include_path_prefix else ""
 
     having_clause = "HAVING COUNT(DISTINCT tags.name) = ?" if not all_setters_required else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
     # First query to get the total count of items matching the criteria
     count_query = f"""
     SELECT COUNT(*)
     FROM (
-        SELECT items.sha256
-        FROM items
-        JOIN tags ON items.sha256 = tags.item
-        {item_type_condition}
+        SELECT files.path
+        FROM files
+        JOIN tags ON tags.item = files.sha256
         AND tags.name IN ({','.join(['?']*len(tags))})
         AND tags.confidence >= ?
         {tag_setters_condition}
         {tag_namespace_condition}
-        JOIN files ON items.sha256 = files.sha256
-        AND files.available = 1
-        {path_condition}
+
+        {item_type_condition}
+
         {negative_tags_condition}
-        GROUP BY items.sha256
+        {path_condition}
+        GROUP BY files.path
         {having_clause}
     )
     """ if tags else f"""
 
     SELECT COUNT(*)
     FROM (
-        SELECT items.sha256
-        FROM items        
-        JOIN files ON items.sha256 = files.sha256
-        AND files.available = 1
-        {path_condition}
-        {negative_tags_condition}
+        SELECT files.path
+        FROM files
         {item_type_condition}
-        GROUP BY items.sha256
+        {negative_tags_condition}
+        {path_condition}
     )
     """
-    print(count_query)
     count_params: List[str] = [
-        (item_type if tags else None),
         *((*tags,
         min_confidence,
         *setters,
         tag_namespace,) if tags else ()),
+        item_type,
+        *((*negative_tags,
+           min_confidence,
+           *setters,
+           tag_namespace,) if negative_tags else ()),
         include_path_prefix,
-        *negative_tags,
-        *((min_confidence, *setters, tag_namespace,) if negative_tags else ()),
-        (item_type if not tags else None),
-        ( # Having clause count not required if no tags
+        (   
+            # Number of tags to match, or number of tag-setter pairs to match if we require all setters to be present for all tags
             (len(tags) if not all_setters_required else len(tags) * len(setters))
+            # HAVING clause is not needed if no positive tags are provided
             if tags else None
         )
     ]
@@ -599,40 +598,32 @@ def search_items(
 
     # Second query to get the items with pagination
     query = f"""
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added,
-    MAX(files.last_modified) as last_modified, MIN(files.path) as path
-    FROM items
-    JOIN tags ON items.sha256 = tags.item 
-    {item_type_condition}
+    SELECT files.path, files.sha256, files.last_modified
+    FROM files
+    JOIN tags ON tags.item = files.sha256
     AND tags.name IN ({','.join(['?']*len(tags))})
     AND tags.confidence >= ?
     {tag_setters_condition}
     {tag_namespace_condition}
-    JOIN files ON items.sha256 = files.sha256
-    AND files.available = 1
-    {path_condition}
+
+    {item_type_condition}
+
     {negative_tags_condition}
-    GROUP BY items.sha256
+    {path_condition}
+    GROUP BY files.path
     {having_clause}
     ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
 
     """ if tags else f"""
-
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added,
-    MAX(files.last_modified) as last_modified, MIN(files.path) as path
-    FROM items
-    JOIN files ON items.sha256 = files.sha256
-    AND files.available = 1
-    {path_condition}
-    {negative_tags_condition}
+    SELECT files.path, files.sha256, files.last_modified
+    FROM files
     {item_type_condition}
-    GROUP BY items.sha256
+    {negative_tags_condition}
+    {path_condition}
     ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
     """
-
-    print(query)
     query_params: List[str] = [
         *count_params,
         page_size,
@@ -641,7 +632,10 @@ def search_items(
 
     cursor.execute(query, query_params)
     while row := cursor.fetchone():
-        yield ItemResult(*row), total_count
+        file = FileSearchResult(*row, get_mime_type(row[0]))
+        if check_path_exists and not os.path.exists(file.path):
+            continue
+        yield file, total_count
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()

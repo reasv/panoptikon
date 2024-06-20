@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from src.db import get_database_connection, get_bookmarks, find_paths_by_tags
+from src.db import get_database_connection, get_bookmarks, search_files
 from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time_and_size
 
 app = FastAPI()
@@ -89,18 +89,24 @@ def get_all_items_with_tags(
         order = None
     ):
     conn = get_database_connection(force_readonly=True)
-    items, total_items = find_paths_by_tags(
+    results, total_results = zip(*list(search_files(
         conn,
         tags,
+        negative_tags=[],
+        tag_namespace="danbooru",
         min_confidence=min_confidence,
-        page_size=page_size,
-        page=page,
-        include_path=include_path,
+        setters=None,
+        all_setters_required = False,
+        item_type = None,
+        include_path_prefix = include_path,
         order_by=order_by,
-        order=order
-    )
+        order=order,
+        page=page,
+        page_size=page_size,
+        check_path_exists = True
+    )))
     conn.close()
-    return items, total_items
+    return results, total_results[0]
 
 @app.get("/search/tags", response_class=HTMLResponse)
 async def search_by_tags_html(
