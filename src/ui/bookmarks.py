@@ -41,6 +41,7 @@ def bookmark_query_text(bookmarks_namespace: str, page_size: int = 1000, page: i
     return f"[View Bookmark folder in Gallery]({build_bookmark_query(bookmarks_namespace, page_size=page_size, page=page, order_by=order_by, order=order)})"
 
 def create_bookmarks_UI(bookmarks_namespace: gr.State):
+    secondary_namespace = gr.State("default")
     with gr.TabItem(label="Bookmarks") as bookmarks_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -52,7 +53,7 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
                 erase_bookmarks = gr.Button("Erase bookmarks")
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
 
-        multi_view = create_multiview(bookmarks_namespace=None, extra_actions=["Remove"])
+        multi_view = create_multiview(bookmarks_namespace=secondary_namespace, extra_actions=["Remove From Current Group"])
 
     bookmarks_tab.select(
         fn=get_bookmarks_paths,
