@@ -52,7 +52,7 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
                 erase_bookmarks = gr.Button("Erase bookmarks")
                 keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
 
-        multi_view = create_multiview(bookmarks_namespace=bookmarks_namespace, extra_actions=["Remove"])
+        multi_view = create_multiview(bookmarks_namespace=None, extra_actions=["Remove"])
 
     bookmarks_tab.select(
         fn=get_bookmarks_paths,
