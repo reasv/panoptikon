@@ -476,52 +476,89 @@ def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
     items = cursor.fetchall()
     return items
 
-def find_items_by_tags(
+def search_items(
         conn: sqlite3.Connection,
-        tags,
-        min_confidence=0.5,
-        page_size=1000,
-        page=1,
-        include_path=None,
-        order_by="last_modified",
-        order=None
-    ) -> Tuple[List[Tuple], int]:
-
-    cursor = conn.cursor()
-    if page_size < 1:
-        page_size = 1000000
-
+        tags: List[str],
+        negative_tags: List[str] | None = None,
+        tag_namespace: str | None = None,
+        min_confidence: float | None = 0.5,
+        setters: List[str] | None = None,
+        all_setters_required: bool = False,
+        item_type: str | None = None,
+        include_path_prefix: str | None = None,
+        order_by: str | None = "last_modified",
+        order: str | None = None,
+        page_size: int | None = 1000,
+        page: int = 1,
+    ):
+    negative_tags = negative_tags or []
+    tags = tags or []
+    setters = setters or []
+    page_size = page_size or 1000000 # Mostly for debugging purposes
     offset = (page - 1) * page_size
 
-    # Add condition for include_path if provided
-    path_condition = ""
-    if include_path:
-        path_condition = " AND files.path LIKE ? || '%'"
+    # The item mimetype should start with the given item_type
+    item_type_condition = " AND items.type LIKE ? || '%'" if item_type else ""
+    # The path needs to *start* with the given path prefix
+    path_condition = " AND files.path LIKE ? || '%'" if include_path_prefix else ""
+    
+    # The setter should match the given setter
+    tag_setters_condition = f" AND tags.setter IN ({','.join(['?']*len(setters))})" if setters else ""
+    # The namespace needs to *start* with the given namespace
+    tag_namespace_condition = " AND tags.namespace LIKE ? || '%'" if tag_namespace else ""
+    # Negative tags should not be associated with the item
+    negative_tags_condition = f"""
+        WHERE items.sha256 NOT IN (
+            SELECT item
+            FROM tags
+            WHERE name IN ({','.join(['?']*len(negative_tags))})
+            AND confidence >= ?
+            {tag_setters_condition}
+            {tag_namespace_condition}
+        )
+    """ if negative_tags else ""
 
+    having_clause = "HAVING COUNT(DISTINCT tags.name) = ?" if not all_setters_required else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
     # First query to get the total count of items matching the criteria
-    count_query = '''
+    count_query = f"""
     SELECT COUNT(*)
     FROM (
         SELECT items.sha256
         FROM items
         JOIN tags ON items.sha256 = tags.item
+        {item_type_condition}
+        AND tags.name IN ({','.join(['?']*len(tags))})
+        AND tags.confidence >= ?
+        {tag_setters_condition}
+        {tag_namespace_condition}
         JOIN files ON items.sha256 = files.sha256
-        WHERE tags.name IN ({}) AND tags.confidence >= ? {}
+        {path_condition}
+        {negative_tags_condition}
         GROUP BY items.sha256
-        HAVING COUNT(DISTINCT tags.name) = ?
+        {having_clause}
     )
-    '''.format(','.join(['?']*len(tags)), path_condition)
-
-    count_params = tags + [min_confidence]
-    if include_path:
-        count_params.append(include_path)
-    count_params.append(len(tags))
-
+    """
+    count_params: List[str] = [
+        item_type,
+        *tags,
+        min_confidence,
+        *setters,
+        tag_namespace,
+        include_path_prefix,
+        *negative_tags,
+        *((min_confidence, *setters, tag_namespace,) if negative_tags else ()),
+        (len(tags) if not all_setters_required else len(tags) * len(setters))
+    ]
+    # Remove None values from the count_params
+    count_params = [param for param in count_params if param is not None]
+    
+    cursor = conn.cursor()
     cursor.execute(count_query, count_params)
     total_count: int = cursor.fetchone()[0]
 
     if order_by == "path":
         order_by_clause = "path"
+        # Default order differs for path and last_modified
         if order == None:
             order = "asc"
     else:
@@ -532,28 +569,44 @@ def find_items_by_tags(
     order_clause = "DESC" if order == "desc" else "ASC"
 
     # Second query to get the items with pagination
-    query = '''
+    query = f"""
     SELECT items.sha256, items.md5, items.type, items.size, items.time_added,
     MAX(files.last_modified) as last_modified, MIN(files.path) as path
     FROM items
-    JOIN tags ON items.sha256 = tags.item
+    JOIN tags ON items.sha256 = tags.item 
+    {item_type_condition}
+    AND tags.name IN ({','.join(['?']*len(tags))})
+    AND tags.confidence >= ?
+    {tag_setters_condition}
+    {tag_namespace_condition}
     JOIN files ON items.sha256 = files.sha256
-    WHERE tags.name IN ({}) AND tags.confidence >= ? {}
+    {path_condition}
+    {negative_tags_condition}
     GROUP BY items.sha256
-    HAVING COUNT(DISTINCT tags.name) = ?
-    ORDER BY {} {}
+    {having_clause}
+    ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
-    '''.format(','.join(['?']*len(tags)), path_condition, order_by_clause, order_clause)
-
-    query_params = tags + [min_confidence]
-    if include_path:
-        query_params.append(include_path)
-    query_params.extend([len(tags), page_size, offset])
+    """
+    print(query)
+    query_params: List[str] = [
+        item_type,
+        *negative_tags,
+        *((min_confidence, *setters, tag_namespace,) if negative_tags else ()),
+        *tags,
+        min_confidence,
+        *setters,
+        tag_namespace,
+        include_path_prefix,
+        (len(tags) if not all_setters_required else len(tags) * len(setters)),
+        page_size,
+        offset
+    ]
+    # Remove None values from the query_params
+    query_params = [param for param in query_params if param is not None]
 
     cursor.execute(query, query_params)
-    items = cursor.fetchall()
-
-    return items, total_count
+    while row := cursor.fetchone():
+        yield row, total_count
 
 def find_paths_by_tags(conn: sqlite3.Connection, tags, min_confidence=0.5, page_size=1000, page=1, include_path=None, order_by="last_modified", order=None) -> Tuple[List[dict], int]:
     results: List[dict] = []
