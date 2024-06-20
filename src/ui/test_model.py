@@ -3,15 +3,15 @@ from __future__ import annotations
 import gradio as gr
 import PIL.Image
 
-from src.deepdanbooru import predict, load_labels, load_model
+# from src.deepdanbooru import predict, load_labels, load_model
 from src.wd_tagger import Predictor, V3_MODELS
 
 def create_model_demo():
     with gr.TabItem(label="Tagging Models"):
-        with gr.Tabs():
-            with gr.Tab(label="DeepDanbooru"):
-                create_dd_UI()
-            with gr.Tab(label="WD Taggers"):
+        # with gr.Tabs():
+        #     with gr.Tab(label="DeepDanbooru"):
+        #         create_dd_UI()
+        #     with gr.Tab(label="WD Taggers"):
                 create_wd_tagger_UI()
 
 def create_dd_UI():
