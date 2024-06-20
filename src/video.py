@@ -1,5 +1,7 @@
 from typing import List
 import os
+import subprocess
+from io import BytesIO
 
 import cv2
 import numpy as np
@@ -106,6 +108,83 @@ def saveImages(basePath, images: List[Image]):
 
     create_image_grid(images).save(os.path.join(basePath, "grid.jpg"))
 
+def extract_keyframes_ffmpeg(path: str, num_frames: int):
+    # Create a temporary directory to store extracted frames
+    temp_dir = "temp_frames"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Build ffmpeg command to extract keyframes
+    command = [
+        'ffmpeg',
+        '-i', path,
+        '-vf', 'select=eq(pict_type\\,I)',
+        '-vsync', 'vfr',
+        '-frame_pts', 'true',
+        f'{temp_dir}/frame_%04d.png'
+    ]
+    
+    # Execute ffmpeg command and suppress output
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Get list of extracted frames
+    extracted_frames = sorted(os.listdir(temp_dir))
+    
+    # Limit to num_frames
+    if num_frames < len(extracted_frames):
+        extracted_frames = extracted_frames[:num_frames]
+    
+    # Load frames into PIL images and clean up immediately
+    frames = []
+    for frame_file in extracted_frames:
+        frame_path = os.path.join(temp_dir, frame_file)
+        with open(frame_path, 'rb') as f:
+            frame_image = PIL.Image.open(BytesIO(f.read()))
+            frames.append(frame_image)
+        os.remove(frame_path)  # Remove the frame after reading
+    
+    return frames
+
+def extract_frames_ffmpeg(path: str, num_frames: int):
+    # Create a temporary directory to store extracted frames
+    temp_dir = "temp_frames"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Get the duration of the video in seconds
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    duration = float(result.stdout)
+    
+    # Calculate interval between frames
+    interval = duration / num_frames
+    
+    # Build ffmpeg command to extract frames at regular intervals
+    command = [
+        'ffmpeg',
+        '-i', path,
+        '-vf', f'fps=1/{interval}',
+        '-vsync', 'vfr',
+        f'{temp_dir}/frame_%04d.png'
+    ]
+    
+    # Execute ffmpeg command and suppress output
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Get list of extracted frames
+    extracted_frames = sorted(os.listdir(temp_dir))[:num_frames]
+    
+    # Load frames into PIL images and clean up immediately
+    frames = []
+    for frame_file in extracted_frames:
+        frame_path = os.path.join(temp_dir, frame_file)
+        with open(frame_path, 'rb') as f:
+            frame_image = PIL.Image.open(BytesIO(f.read()))
+            frames.append(frame_image)
+        os.remove(frame_path)  # Remove the frame after reading
+    
+    return frames
+
 def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = None, thumbnail_save_path=None):
     """
     Extract keyframes from a video and save them as images.
@@ -120,7 +199,7 @@ def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = N
         # Extract frames from the video
         if not num_frames:
             num_frames = 1
-        keyframes = extract_frames(video_path, num_frames=num_frames)
+        keyframes = extract_keyframes_ffmpeg(video_path, num_frames=num_frames)
 
     if num_frames and len(keyframes) > num_frames:
         # Select representative frames

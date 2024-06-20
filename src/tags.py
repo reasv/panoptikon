@@ -63,24 +63,24 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
     """
     Process a single file and predict tags for it. Returns a TaggingResult object, or None if an error occurred.
     """
-    # try:
-    if mime_type.startswith("video"):
-        frames = video_to_frames(path, keyframe_threshold=None, num_frames=4)
-        if not frames:
-            raise Exception("No frames found")
-        os.makedirs("./thumbs", exist_ok=True)
-        frames[0].save(f"./thumbs/{sha256}-0.jpg")
-        create_image_grid(frames).save(f"./thumbs/{sha256}-grid.jpg")
-        character_res, general_res = aggregate_results([tag_predictor.predict(frame, general_thresh=tag_threshold, character_thresh=None) for frame in frames])
-        n_frames = len(frames)
-    else:
-        image = PIL.Image.open(path)
-        character_res, general_res = translate_tags_result(*tag_predictor.predict(image, general_thresh=tag_threshold, character_thresh=None))
-        n_frames = 1
-    return TaggingResult(sha256, path, mime_type, n_frames, character_res, general_res)
-    # except Exception as e:
-    #     print(f"Error processing {path} with error {e}")
-    #     return None
+    try:
+        if mime_type.startswith("video"):
+            frames = video_to_frames(path, keyframe_threshold=None, num_frames=4)
+            if not frames:
+                raise Exception("No frames found")
+            os.makedirs("./thumbs", exist_ok=True)
+            frames[0].save(f"./thumbs/{sha256}-0.jpg")
+            create_image_grid(frames).save(f"./thumbs/{sha256}-grid.jpg")
+            character_res, general_res = aggregate_results([tag_predictor.predict(frame, general_thresh=tag_threshold, character_thresh=None) for frame in frames])
+            n_frames = len(frames)
+        else:
+            image = PIL.Image.open(path)
+            character_res, general_res = translate_tags_result(*tag_predictor.predict(image, general_thresh=tag_threshold, character_thresh=None))
+            n_frames = 1
+        return TaggingResult(sha256, path, mime_type, n_frames, character_res, general_res)
+    except Exception as e:
+        print(f"Error processing {path} with error {e}")
+        return None
 
 def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
     """
