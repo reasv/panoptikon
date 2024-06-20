@@ -4,6 +4,7 @@ from typing import List
 
 import gradio as gr
 
+from src.db import FileSearchResult
 from src.utils import open_file, open_in_explorer
 from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
 from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
@@ -11,15 +12,15 @@ from src.ui.components.bookmark_folder_selector import create_bookmark_folder_ch
 def on_change_columns_slider(columns_slider: int):
     return gr.update(columns=columns_slider)
 
-def on_files_change(files: List[dict]):
-    image_list = [(file['path'], file['path']) for file in files]
+def on_files_change(files: List[FileSearchResult]):
+    image_list = [(file.path, file.path) for file in files]
     print(f"Received {len(image_list)} images")
     return (gr.update(value=image_list), [files[0]]) if len(image_list) > 0 else ([], [])
 
 def on_select_image(
         evt: gr.SelectData,
-        files: List[dict],
-        selected_files: List[dict]
+        files: List[FileSearchResult],
+        selected_files: List[FileSearchResult]
     ):
     print(f"Selected image index: {evt.index} in gallery")
     image_index: int = evt.index
@@ -37,7 +38,7 @@ def on_select_image(
     return selected_files
 
 def on_selected_image_change_extra_actions(extra_actions: List[str]):
-    def on_selected_image_path_change(selected_files: List[dict], files: List[dict], selected_image_path: str):
+    def on_selected_image_path_change(selected_files: List[FileSearchResult], files: List[FileSearchResult], selected_image_path: str):
         nonlocal extra_actions
 
         if len(selected_files) == 0:
@@ -47,7 +48,7 @@ def on_selected_image_change_extra_actions(extra_actions: List[str]):
         else:
             interactive = True
             selected_file = selected_files[0]
-            path: str = selected_file['path']
+            path: str = selected_file.path
             selected_file_index = files.index(selected_file)
             if path.strip() == "":
                 interactive = False

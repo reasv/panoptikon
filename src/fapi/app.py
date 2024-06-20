@@ -1,12 +1,13 @@
 import os
 import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from src.db import get_database_connection, get_bookmarks, search_files
+from src.db import get_database_connection, get_bookmarks, search_files, FileSearchResult
 from src.files import get_files_by_extension, get_image_extensions, get_last_modified_time_and_size
+from fastapi.encoders import jsonable_encoder
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -41,13 +42,14 @@ async def get_bookmarks_page(
         order=None
     ):
     # Extract "show" parameter from query string
-    files, total = get_all_bookmarks_in_folder(
+    files_result, total = get_all_bookmarks_in_folder(
         bookmarks_namespace,
         page_size=page_size,
         page=page,
         order_by=order_by,
         order=order
     )
+    files = [(file.sha256, file.path) for file in files_result]
     print(total)
     return templates.TemplateResponse("gallery.html", {
         "request": request,
@@ -72,10 +74,8 @@ async def get_bookmarks_json(
         order_by=order_by,
         order=order
     )
-    files_dict = [{"sha256": sha256, "path": path} for sha256, path in files]
-    print(total)
     return JSONResponse({
-        "files": files_dict,
+        "files": jsonable_encoder(files),
         "total": total,
     })
 
@@ -87,7 +87,7 @@ def get_all_items_with_tags(
         include_path: str=None,
         order_by: str = "last_modified",
         order = None
-    ):
+    ) -> Tuple[List[FileSearchResult], int]:
     conn = get_database_connection(force_readonly=True)
     results, total_results = zip(*list(search_files(
         conn,
@@ -130,7 +130,7 @@ async def search_by_tags_html(
             order_by=order_by,
             order=order
         )
-    files = [(file['sha256'], file['path']) for file in files_dicts]
+    files = [(file.sha256, file.path) for file in files_dicts]
     print(tags, tags_list)
     print(total)
     return templates.TemplateResponse("gallery.html", {
@@ -162,7 +162,7 @@ async def search_by_tags_json(
     )
     print(total)
     return JSONResponse({
-        "files": files,
+        "files": jsonable_encoder(files),
         "total": total,
     })
 

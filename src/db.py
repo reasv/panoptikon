@@ -501,6 +501,11 @@ def search_files(
     ):
     negative_tags = negative_tags or []
     tags = tags or []
+    tags = [tag.lower().strip() for tag in tags if tag.strip() != ""]
+    negative_tags = [tag.lower().strip() for tag in negative_tags if tag.strip() != ""]
+    tag_namespace = tag_namespace or None
+    item_type = item_type or None
+    include_path_prefix = include_path_prefix or None
     setters = setters or []
     page_size = page_size or 1000000 # Mostly for debugging purposes
     offset = (page - 1) * page_size
@@ -581,7 +586,13 @@ def search_files(
     count_params = [param for param in count_params if param is not None]
     
     cursor = conn.cursor()
-    cursor.execute(count_query, count_params)
+    try:
+        cursor.execute(count_query, count_params)
+    except Exception as e:
+        print(item_type, include_path_prefix)
+        print(count_query)
+        print(count_params)
+        raise e
     total_count: int = cursor.fetchone()[0]
 
     if order_by == "path":
@@ -807,7 +818,15 @@ def get_all_bookmark_namespaces(conn: sqlite3.Connection) -> List[str]:
     namespaces = cursor.fetchall()
     return [namespace[0] for namespace in namespaces]
 
-def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_size=1000, page=1, order_by="time_added", order=None) -> Tuple[List[Tuple[str, str]], int]:
+def get_bookmarks(
+        conn: sqlite3.Connection,
+        namespace: str = 'default',
+        page_size=1000,
+        page=1,
+        order_by="time_added",
+        order=None
+    ) -> Tuple[List[FileSearchResult], int]:
+
     if page_size < 1:
         page_size = 1000000
     offset = (page - 1) * page_size
@@ -817,7 +836,8 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
     cursor.execute('''
         SELECT COUNT(DISTINCT bookmarks.sha256)
         FROM bookmarks
-        LEFT JOIN files ON bookmarks.sha256 = files.sha256
+        JOIN files
+        ON bookmarks.sha256 = files.sha256
         WHERE bookmarks.namespace = ?
     ''', (namespace,))
     total_results = cursor.fetchone()[0]
@@ -838,13 +858,15 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
     
     order_clause = "DESC" if order == "desc" else "ASC"
     cursor.execute(f'''
-        SELECT bookmarks.sha256, 
-               COALESCE(available_files.path, any_files.path) as path
+        SELECT 
+        COALESCE(available_files.path, any_files.path) as path,
+        bookmarks.sha256,
+        COALESCE(MAX(available_files.last_modified), MAX(any_files.last_modified)) as last_modified
         FROM bookmarks
         LEFT JOIN files AS available_files 
                ON bookmarks.sha256 = available_files.sha256 
                AND available_files.available = 1
-        LEFT JOIN files AS any_files 
+        JOIN files AS any_files 
                ON bookmarks.sha256 = any_files.sha256
         WHERE bookmarks.namespace = ?
         GROUP BY bookmarks.sha256
@@ -853,16 +875,15 @@ def get_bookmarks(conn: sqlite3.Connection, namespace: str = 'default', page_siz
         LIMIT ? OFFSET ?
     ''', (namespace, page_size, offset))
     
-    bookmarks = cursor.fetchall()
-    bookmark_tuples: List[Tuple[str, str]] = [(bookmark[0], bookmark[1]) for bookmark in bookmarks]
-    
-    # Check if the paths are available, if not, try to find a working path
-    for i, bookmark in enumerate(bookmark_tuples):
-        if bookmark[1] is None:
-            print(f"Bookmark path is None: {bookmark}")
+    bookmarks: List[FileSearchResult] = []
+    for row in cursor.fetchall():
+        item = FileSearchResult(*row, get_mime_type(row[0]))
+        if not os.path.exists(item.path):
+            if file := get_existing_file_for_sha256(conn, item.sha256):
+                item.path = file.path
+                bookmarks.append(item)
+            # If the path does not exist and no working path is found, skip this item
             continue
-        if not os.path.exists(bookmark[1]):
-            if file := get_existing_file_for_sha256(conn, bookmark[0]):
-                bookmark_tuples[i] = (bookmark[0], file.path)
+        bookmarks.append(item)
     
-    return bookmark_tuples, total_results
+    return bookmarks, total_results

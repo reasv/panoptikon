@@ -4,18 +4,18 @@ from typing import List
 import gradio as gr
 from dataclasses import dataclass
 
-from src.db import get_all_tags_for_item_name_confidence, get_database_connection
+from src.db import get_all_tags_for_item_name_confidence, get_database_connection, FileSearchResult
 from src.utils import open_file, open_in_explorer
 from src.ui.components.utils import toggle_bookmark, on_selected_image_get_bookmark_state
 from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser
 
-def on_files_change(files: List[dict]):
-    image_list = [[file['path'], file['path']] for file in files]
+def on_files_change(files: List[FileSearchResult]):
+    image_list = [[file.path, file.path] for file in files]
     print(f"Received {len(image_list)} images")
     return gr.update(samples=image_list), ([] if len(image_list) == 0 else [files[0]])
 
 def on_selected_files_change_extra_actions(extra_actions: List[str]):
-    def on_selected_files_change(selected_files: List[str], selected_image_path: str):
+    def on_selected_files_change(selected_files: List[FileSearchResult], selected_image_path: str):
         nonlocal extra_actions
         if len(selected_files) == 0:
             interactive = False
@@ -31,8 +31,8 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
         else:
             selected_file = selected_files[0]
             interactive = True
-            sha256 = selected_file['sha256']
-            path = selected_file['path']
+            sha256 = selected_file.sha256
+            path = selected_file.path
             if path != selected_image_path:
                 conn = get_database_connection()
                 tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
@@ -62,7 +62,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
         return updates
     return on_selected_files_change
 
-def on_select_image(evt: int, files: List[dict], selected_files: List[dict]):
+def on_select_image(evt: int, files: List[FileSearchResult], selected_files: List[FileSearchResult]):
     print(f"Selected image index: {evt} in file list")
     image_index: int = evt
     image = files[image_index]

@@ -7,13 +7,14 @@ import gradio as gr
 from src.ui.components.utils import delete_bookmarks_except_last_n, get_all_bookmarks_in_folder, delete_bookmark
 from src.ui.components.bookmark_folder_selector import create_bookmark_folder_chooser # type: ignore
 from src.ui.components.multi_view import create_multiview
+from src.db import FileSearchResult
 
 def get_bookmarks_paths(bookmarks_namespace: str, order_by: str = "time_added", order: str = None):
     if order == "default":
         order = None
     bookmarks, total_bookmarks = get_all_bookmarks_in_folder(bookmarks_namespace, order_by=order_by, order=order)
     print(f"Bookmarks fetched from {bookmarks_namespace} folder. Total: {total_bookmarks}, Displayed: {len(bookmarks)}")
-    return [{ "path": path, "sha256": sha256 } for sha256, path in bookmarks]
+    return bookmarks
 
 def erase_bookmarks_fn(bookmarks_namespace: str, keep_last_n: int, order_by: str = "time_added", order: str = None):
     delete_bookmarks_except_last_n(bookmarks_namespace, keep_last_n)
@@ -21,11 +22,11 @@ def erase_bookmarks_fn(bookmarks_namespace: str, keep_last_n: int, order_by: str
     bookmarks = get_bookmarks_paths(bookmarks_namespace, order_by=order_by, order=order)
     return bookmarks
 
-def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[dict], order_by: str = "time_added", order: str = None):
+def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[FileSearchResult], order_by: str = "time_added", order: str = None):
     if len(selected_files) == 0:
         print("No bookmark selected")
         return
-    delete_bookmark(bookmarks_namespace=bookmarks_namespace, sha256=selected_files[0]["sha256"])
+    delete_bookmark(bookmarks_namespace=bookmarks_namespace, sha256=selected_files[0].sha256)
     print("Bookmark deleted")
     bookmarks = get_bookmarks_paths(bookmarks_namespace, order_by=order_by, order=order)
     return bookmarks

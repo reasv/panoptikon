@@ -6,11 +6,12 @@ import gradio as gr
 
 from src.ui.components.gallery_view import create_gallery_view, GalleryView
 from src.ui.components.list_view import create_image_list, ImageList
+from src.db import FileSearchResult
 
 def on_files_change():
     return []
 
-def on_selected_files_change(selected_files: List[str], selection_history: List[str]):
+def on_selected_files_change(selected_files: List[FileSearchResult], selection_history: List[FileSearchResult]):
     if len(selected_files) > 0:
         selection_history.append(selected_files[0])
     return selection_history
