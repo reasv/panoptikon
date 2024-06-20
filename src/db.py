@@ -19,7 +19,7 @@ def get_database_connection(force_readonly=False) -> sqlite3.Connection:
 
 def initialize_database(conn: sqlite3.Connection):
     cursor = conn.cursor()
-    
+    cursor.execute('PRAGMA foreign_keys = ON')
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS items (
         sha256 TEXT PRIMARY KEY,
