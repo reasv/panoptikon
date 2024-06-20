@@ -11,7 +11,7 @@ import PIL.Image
 from src.db import insert_tag, get_items_missing_tags, add_tag_scan
 from src.wd_tagger import Predictor, V3_MODELS
 from src.video import video_to_frames
-from src.utils import create_image_grid
+from src.utils import create_image_grid, write_text_on_image
 
 def get_threshold_from_env() -> float:
     threshold = os.getenv("SCORE_THRESHOLD")
@@ -69,8 +69,11 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
             if not frames:
                 raise Exception("No frames found")
             os.makedirs("./thumbs", exist_ok=True)
+            grid = create_image_grid(frames)
+            write_text_on_image(grid, mime_type)
+            grid.save(f"./thumbs/{sha256}-grid.jpg")
+            write_text_on_image(frames[0], mime_type)
             frames[0].save(f"./thumbs/{sha256}-0.jpg")
-            create_image_grid(frames).save(f"./thumbs/{sha256}-grid.jpg")
             character_res, general_res = aggregate_results([tag_predictor.predict(frame, general_thresh=tag_threshold, character_thresh=None) for frame in frames])
             n_frames = len(frames)
         else:

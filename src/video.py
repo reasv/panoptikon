@@ -129,17 +129,14 @@ def extract_keyframes_ffmpeg(path: str, num_frames: int):
     # Get list of extracted frames
     extracted_frames = sorted(os.listdir(temp_dir))
     
-    # Limit to num_frames
-    if num_frames < len(extracted_frames):
-        extracted_frames = extracted_frames[:num_frames]
-    
     # Load frames into PIL images and clean up immediately
     frames = []
     for frame_file in extracted_frames:
         frame_path = os.path.join(temp_dir, frame_file)
         with open(frame_path, 'rb') as f:
-            frame_image = PIL.Image.open(BytesIO(f.read()))
-            frames.append(frame_image)
+            if len(frames) < num_frames:
+                frame_image = PIL.Image.open(BytesIO(f.read()))
+                frames.append(frame_image)
         os.remove(frame_path)  # Remove the frame after reading
     
     return frames
@@ -172,43 +169,45 @@ def extract_frames_ffmpeg(path: str, num_frames: int):
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # Get list of extracted frames
-    extracted_frames = sorted(os.listdir(temp_dir))[:num_frames]
+    extracted_frames = sorted(os.listdir(temp_dir))
     
     # Load frames into PIL images and clean up immediately
     frames = []
     for frame_file in extracted_frames:
         frame_path = os.path.join(temp_dir, frame_file)
         with open(frame_path, 'rb') as f:
-            frame_image = PIL.Image.open(BytesIO(f.read()))
-            frames.append(frame_image)
+            if len(frames) < num_frames:
+                frame_image = PIL.Image.open(BytesIO(f.read()))
+                frames.append(frame_image)
         os.remove(frame_path)  # Remove the frame after reading
     
     return frames
 
-def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = None, thumbnail_save_path=None):
+def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = None, thumbnail_save_path=None) -> List[Image]:
     """
     Extract keyframes from a video and save them as images.
     :param video_path: Path to the video file
     :param keyframe_threshold: Threshold for keyframe extraction
     :param num_frames: Number of frames to extract (default: None, extract all keyframes)
     """
-    if keyframe_threshold:
-        # Extract keyframes from the video
-        keyframes = extract_keyframes(video_path, threshold=keyframe_threshold)
-    else:
-        # Extract frames from the video
-        if not num_frames:
-            num_frames = 1
-        keyframes = extract_keyframes_ffmpeg(video_path, num_frames=num_frames)
+    keyframes = extract_frames_ffmpeg(video_path, num_frames=num_frames)
+    # if keyframe_threshold:
+    #     # Extract keyframes from the video
+    #     keyframes = extract_keyframes(video_path, threshold=keyframe_threshold)
+    # else:
+    #     # Extract frames from the video
+    #     if not num_frames:
+    #         num_frames = 1
+    #     
 
-    if num_frames and len(keyframes) > num_frames:
-        # Select representative frames
-        keyframes: List[Image] = select_representative_frames(keyframes, max_frames=num_frames)
+    # if num_frames and len(keyframes) > num_frames:
+    #     # Select representative frames
+    #     keyframes: List[Image] = select_representative_frames(keyframes, max_frames=num_frames)
 
-    if num_frames and len(keyframes) < num_frames:
-        additional_samples = extract_frames(video_path, num_frames=num_frames-len(keyframes))
-        keyframes.extend(additional_samples)
-    # Save the keyframes as images
-    if thumbnail_save_path:
-        saveImages(thumbnail_save_path, images=keyframes)
+    # if num_frames and len(keyframes) < num_frames:
+    #     additional_samples = extract_frames(video_path, num_frames=num_frames-len(keyframes))
+    #     keyframes.extend(additional_samples)
+    # # Save the keyframes as images
+    # if thumbnail_save_path:
+    #     saveImages(thumbnail_save_path, images=keyframes)
     return keyframes

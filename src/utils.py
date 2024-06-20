@@ -4,7 +4,8 @@ import platform
 import mimetypes
 mimetypes.add_type('image/webp', '.webp')
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+
 import math
 
 def show_in_fm(path):
@@ -68,6 +69,25 @@ def get_mime_type(file_path: str):
     """
     mime_type, _ = mimetypes.guess_type(file_path, strict=False)
     return mime_type
+
+def write_text_on_image(image: Image.Image, text: str):
+    draw = ImageDraw.Draw(image)
+    font_size = 20  # Adjust as needed
+    font = ImageFont.load_default(size=font_size)
+
+    # Text position
+    x = 10
+    y = image.height - font_size - 10
+    
+    # Draw outline
+    outline_range = 1
+    for dx in range(-outline_range, outline_range + 1):
+        for dy in range(-outline_range, outline_range + 1):
+            if dx != 0 or dy != 0:
+                draw.text((x + dx, y + dy), text, font=font, fill="black")
+    
+    # Draw text
+    draw.text((x, y), text, font=font, fill="white")
 
 def create_image_grid(image_list) -> Image.Image:
     """
