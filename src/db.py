@@ -68,7 +68,6 @@ def initialize_database(conn: sqlite3.Connection):
         item TEXT NOT NULL,
         setter TEXT NOT NULL,
         time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        last_set TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
         PRIMARY KEY(namespace, name, item, setter),
         FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
     )
@@ -146,7 +145,6 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_item ON tags(item)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setter ON tags(setter)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_time ON tags(time)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_last_set ON tags(last_set)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_start_time ON tag_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_end_time ON tag_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_setter ON tag_scans(setter)')
@@ -165,15 +163,14 @@ def initialize_database(conn: sqlite3.Connection):
 
 def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
     time = scan_time
-    last_set = scan_time
     # Round confidence to 3 decimal places
     confidence = round(confidence, 3)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO tags (namespace, name, value, confidence, item, setter, time, last_set)
+    INSERT INTO tags (namespace, name, value, confidence, item, setter, time)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence, last_set=excluded.last_set
-    ''', (namespace, name, value, confidence, item, setter, time, last_set))
+    ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
+    ''', (namespace, name, value, confidence, item, setter, time))
 
 def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileScanData):
     cursor = conn.cursor()
@@ -554,7 +551,7 @@ def get_existing_file_for_sha256(conn: sqlite3.Connection, sha256: str) -> FileR
 def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT namespace, name, value, confidence, setter, time, last_set
+    SELECT namespace, name, value, confidence, setter, time
     FROM tags
     WHERE item = ?
     ''', (sha256,))
