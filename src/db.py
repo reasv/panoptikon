@@ -925,12 +925,12 @@ def get_most_common_tags(conn: sqlite3.Connection, limit=10):
 
 def get_most_common_tags_frequency(conn: sqlite3.Connection, limit=10):
     tags = get_most_common_tags(conn, limit)
-    # Get the total count of items that have tags
+    # Get the total number of item_setter pairs
     cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(DISTINCT item) FROM tags')
-    total_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(DISTINCT item || '-' || setter) AS distinct_count FROM item_tag_scans;")
+    total_items_setters = cursor.fetchone()[0]
     # Calculate the frequency
-    tags = [(tag[0], tag[1], tag[2], tag[2]/total_count) for tag in tags]
+    tags = [(tag[0], tag[1], tag[2], tag[2]/(total_items_setters)) for tag in tags]
     return tags
 
 def update_bookmarks(conn: sqlite3.Connection, items_sha256: List[str], namespace: str='default'):
