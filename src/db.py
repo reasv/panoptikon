@@ -380,38 +380,61 @@ def get_items_missing_tags(conn: sqlite3.Connection, tag_setter=None):
     """
     cursor = conn.cursor()
     tag_setter_clause = "AND tags.setter = ?" if tag_setter else ""
-    cursor.execute(f'''
-    SELECT 
-        items.sha256,
-        items.md5,
-        items.type,
-        items.size,
-        items.time_added,
-        (
-            SELECT files.path
-            FROM files 
-            WHERE files.sha256 = items.sha256 
-            ORDER BY files.available DESC
-            LIMIT 1
-        ) as path
-    FROM items
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM tags
-        WHERE tags.item = items.sha256 {tag_setter_clause}
-    )
-    ''', (tag_setter,) if tag_setter else ())
+    missing_tags_subquery = f'''
+    WITH ItemsWithoutTags AS (
+        SELECT 
+            items.sha256,
+            items.md5,
+            items.type,
+            items.size,
+            items.time_added
+        FROM items
+        LEFT JOIN tags
+        ON items.sha256 = tags.item
+        {tag_setter_clause}
+        WHERE tags.item IS NULL
+    )'''
+
+    query = f'''
+    {missing_tags_subquery}
+    SELECT
+        iwt.sha256,
+        iwt.md5,
+        iwt.type,
+        iwt.size,
+        iwt.time_added,
+        COALESCE(available_files.path, any_files.path) as path,
+    FROM ItemsWithoutTags AS iwt
+    LEFT JOIN files AS available_files
+    ON iwt.sha256 = files.sha256
+    AND files.available = 1
+    JOIN files AS any_files
+    ON iwt.sha256 = any_files.sha256;
+    '''
+    count_query = f'''
+    {missing_tags_subquery}
+    SELECT COUNT(*)
+    FROM ItemsWithoutTags
+    JOIN files
+    ON ItemsWithoutTags.sha256 = files.sha256;
+    '''
+    cursor.execute(count_query, (tag_setter,) if tag_setter else ())
+    total_count: int = cursor.fetchone()[0]
+
+    cursor.execute(query, (tag_setter,) if tag_setter else ())
 
     # Yield each item
+    remaining_count = total_count
     while row := cursor.fetchone():
+        remaining_count -= 1
         item = ItemWithPath(*row)
         if os.path.exists(item.path):
-            yield item
+            yield item, remaining_count, total_count
         else:
             # If the path does not exist, try to find a working path
             if file := get_existing_file_for_sha256(conn, item.sha256):
                 item.path = file.path
-                yield item
+                yield item, remaining_count, total_count
             else:
                 # If no working path is found, skip this item
                 continue
@@ -642,11 +665,14 @@ def search_files(
     ]
 
     cursor.execute(query, query_params)
+    results_count = cursor.rowcount
     while row := cursor.fetchone():
         file = FileSearchResult(*row, get_mime_type(row[0]))
         if check_path_exists and not os.path.exists(file.path):
             continue
         yield file, total_count
+    if results_count == 0:
+        return []
 
 def add_folder_to_database(conn: sqlite3.Connection, time: str, folder_path: str, included=True):
     cursor = conn.cursor()

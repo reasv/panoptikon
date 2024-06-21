@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import List
 import os
 from datetime import datetime
+
 import sqlite3
 
 import PIL.IcnsImagePlugin
@@ -85,6 +86,18 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
         print(f"Error processing {path} with error {e}")
         return None
 
+def estimate_eta(scan_start_time: str, items_processed: int, remaining_items: int):
+    """
+    Estimate the time remaining for the scan to complete based on the number of items processed and the total number of items.
+    """
+    time_elapsed = datetime.now() - datetime.fromisoformat(scan_start_time)
+    items_per_second = items_processed / time_elapsed.total_seconds()
+    remaining_time = remaining_items / (items_per_second or 1)
+    # Format the remaining time as a string in the format HHhMMmSSs eg 1h23m45s
+    remaining_time_str = str(datetime.fromtimestamp(remaining_time)).split(" ")[1]
+    remaining_time_str = remaining_time_str.replace(":", "h", 1).replace(":", "m", 1) + "s"
+    return remaining_time_str
+
 def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
     """
     Scan and predict tags for all items in the database that are missing tags from the given tagging ML model.
@@ -95,8 +108,10 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
     print(f"Using score threshold {score_threshold}")
     failed_paths = []
     videos, images, total_video_frames, total_processed_frames = 0, 0, 0, 0
-    for item in get_items_missing_tags(conn, setter):
-        print(f"Processing {item.path} ({item.type})")
+    counter = 0
+    for item, remaining_items, total_items in get_items_missing_tags(conn, setter):
+        counter += 1
+        print(f"{setter}: ({counter}/{total_items}) (ETA: {estimate_eta(scan_time, counter, remaining_items)}) Processing ({item.type}) {item.path}")
         tag_result = process_single_file(
                 item.sha256,
                 item.type,

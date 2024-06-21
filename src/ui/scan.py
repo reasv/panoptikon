@@ -1,11 +1,13 @@
 from __future__ import annotations
 from datetime import datetime
+from typing import List
 
 import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans
 from src.tags import scan_and_predict_tags
+from src.wd_tagger import V3_MODELS
 
 def get_folders():
     conn = get_database_connection()
@@ -62,24 +64,30 @@ def rescan_folders(delete_unavailable_files: bool = True):
     conn.close()
     return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.", fetch_scan_history(), fetch_tagging_history()
 
-def regenerate_tags():
+def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
+    print(f"Regenerating tags for models: {tag_models}")
     conn = get_database_connection()
-    cursor = conn.cursor()
-    cursor.execute('BEGIN')
-    images, videos, failed, timed_out = scan_and_predict_tags(conn)
-    conn.commit()
+    full_report = ""
+    for model in tag_models:
+        cursor = conn.cursor()
+        cursor.execute('BEGIN')
+        images, videos, failed, timed_out = scan_and_predict_tags(conn, setter=model)
+        conn.commit()
+        failed_str = "\n".join(failed)
+        timed_out_str = "\n".join(timed_out)
+        report_str = f"""
+        Tag Generation completed for model {model}.
+        Successfully processed {images} images and {videos} videos.
+        {len(failed)} files failed to process due to errors.
+        {len(timed_out)} files took too long to process and timed out.
+        Failed files:
+        {failed_str}
+        Timed out files:
+        {timed_out_str}
+        """
+        full_report += report_str
     conn.close()
-    failed_str = "\n".join(failed)
-    timed_out_str = "\n".join(timed_out)
-    return f"""Tag Generation completed.
-                Successfully processed {images} images and {videos} videos.
-                {len(failed)} files failed to process due to errors.
-                {len(timed_out)} files took too long to process and timed out.
-                Failed files:
-                {failed_str}
-                Timed out files:
-                {timed_out_str}
-            """, fetch_scan_history(), fetch_tagging_history()
+    return full_report, fetch_scan_history(), fetch_tagging_history()
 
 def fetch_scan_history():
     conn = get_database_connection()
@@ -131,7 +139,8 @@ def create_scan_UI():
                     delete_unavailable_files = gr.Checkbox(label="Remove files from the database if they are no longer found on the filesystem", value=True, interactive=True)
             with gr.Row():
                 with gr.Column():
-                    regenerate_tags_button = gr.Button("Generate Tags for files with no tags")
+                    model_choice = gr.Dropdown(label="Tagging Model(s) to Use", multiselect=True, choices=V3_MODELS, value=[V3_MODELS[0]])
+                    regenerate_tags_button = gr.Button("Generate Tags for Files Missing Tags")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -192,6 +201,7 @@ def create_scan_UI():
 
         regenerate_tags_button.click(
             fn=regenerate_tags,
+            inputs=[model_choice],
             outputs=[results, scan_history, tagging_history],
             api_name="regenerate_tags",
         )
