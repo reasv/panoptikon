@@ -169,7 +169,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
                 submit_button = gr.Button("Search", scale=0)
                 with gr.Column(scale=10):
                     with gr.Tabs():
-                        with gr.Tab(label="Search"):
+                        with gr.Tab(label="Options"):
                             with gr.Group():
                                 with gr.Row():
                                     tag_input = gr.Textbox(label="Enter tags separated by commas", value='', show_copy_button=True, scale=3)
@@ -182,8 +182,8 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
                                 with gr.Row():
                                     order = gr.Radio(choices=["asc", "desc", "default"], label="Order", value="default", scale=2)
                                     tag_setters = gr.Dropdown(label="Only search tags set by model(s)", multiselect=True, choices=V3_MODELS, value=[], scale=2)
-                                    all_setters_required = gr.Checkbox(label="Require ALL selected models to have set each tag", scale=2)
-                                    item_type = gr.Dropdown(label="Item MimeType Prefix", choices=["image/", "video/"], allow_custom_value=True, multiselect=False, value=None, scale=2)
+                                    all_setters_required = gr.Checkbox(label="Require ALL selected models to have set each tag", scale=1)
+                                    item_type = gr.Dropdown(label="Item MimeType Prefix", choices=["image/", "video/", "image/png", "image/jpeg", "video/mp4"], allow_custom_value=True, multiselect=False, value=None, scale=2)
                                     namespace_prefix = gr.Dropdown(
                                         label="Tag Namespace Prefix",
                                         choices=["danbooru:", "danbooru:character", "danbooru:general"],

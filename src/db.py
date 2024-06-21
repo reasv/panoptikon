@@ -164,7 +164,7 @@ def insert_tag(conn: sqlite3.Connection, namespace, name, item, setter, confiden
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO tags (namespace, name, value, confidence, item, setter)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
     ''', (namespace, name, value, confidence, item, setter))
 

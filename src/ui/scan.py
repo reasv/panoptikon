@@ -5,7 +5,7 @@ from typing import List
 import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
-from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter
+from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
 from src.tags import scan_and_predict_tags
 from src.wd_tagger import V3_MODELS
 
@@ -43,6 +43,7 @@ def update_folders(included_folders_text: str, excluded_folders_text: str, delet
         Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed.
         """
         conn.commit()
+        vacuum_database(conn)
     except Exception as e:
         # Rollback the transaction on error
         conn.rollback()
@@ -61,6 +62,7 @@ def rescan_folders(delete_unavailable_files: bool = True):
     cursor.execute('BEGIN')
     ids, files_deleted, items_deleted = rescan_all_folders(conn, delete_unavailable=delete_unavailable_files)
     conn.commit()
+    vacuum_database(conn)
     conn.close()
     return f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.", fetch_scan_history(), fetch_tagging_history()
 
@@ -73,6 +75,7 @@ def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
         cursor.execute('BEGIN')
         images, videos, failed, timed_out = scan_and_predict_tags(conn, setter=model)
         conn.commit()
+        vacuum_database(conn)
         failed_str = "\n".join(failed)
         timed_out_str = "\n".join(timed_out)
         report_str = f"""
@@ -98,6 +101,7 @@ def delete_tags(tag_models: List[str] = []):
         tags_removed, items_tags_removed = delete_tags_from_setter(conn, model)
         message += f"Removed {tags_removed} tags from {items_tags_removed} items tagged by model {model}.\n"
     conn.commit()
+    vacuum_database(conn)
     conn.close()
     return message, fetch_scan_history(), fetch_tagging_history()
 
