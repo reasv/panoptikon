@@ -1,6 +1,7 @@
 import os
 import subprocess
 import platform
+from datetime import datetime
 import mimetypes
 mimetypes.add_type('image/webp', '.webp')
 
@@ -126,3 +127,23 @@ def create_image_grid(image_list) -> Image.Image:
         grid_image.paste(img, (col * img_width, row * img_height))
     
     return grid_image
+
+def seconds_to_hms(seconds):
+    # Format the time as a string in the format HHhMMmSSs eg 1h23m45s
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining_seconds = round(seconds % 60, 1)
+    if hours == 0 and minutes == 0:
+        return f"{remaining_seconds}s"
+    if hours == 0:
+        return f"{minutes}m{remaining_seconds}s"
+    return f"{hours}h{minutes}m{remaining_seconds}s"
+
+def estimate_eta(scan_start_time: str, items_processed: int, remaining_items: int):
+    """
+    Estimate the time remaining for the scan to complete based on the number of items processed and the total number of items.
+    """
+    time_elapsed = datetime.now() - datetime.fromisoformat(scan_start_time)
+    items_per_second = items_processed / time_elapsed.total_seconds()
+    remaining_time = remaining_items / (items_per_second or 1)
+    return seconds_to_hms(remaining_time)

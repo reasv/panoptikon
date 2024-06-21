@@ -5,7 +5,7 @@ from typing import List
 import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
-from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans
+from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter
 from src.tags import scan_and_predict_tags
 from src.wd_tagger import V3_MODELS
 
@@ -89,6 +89,18 @@ def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
     conn.close()
     return full_report, fetch_scan_history(), fetch_tagging_history()
 
+def delete_tags(tag_models: List[str] = []):
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    message = ""
+    for model in tag_models:
+        tags_removed, items_tags_removed = delete_tags_from_setter(conn, model)
+        message += f"Removed {tags_removed} tags from {items_tags_removed} items tagged by model {model}.\n"
+    conn.commit()
+    conn.close()
+    return message, fetch_scan_history(), fetch_tagging_history()
+
 def fetch_scan_history():
     conn = get_database_connection()
     file_scans = get_all_file_scans(conn)
@@ -140,7 +152,9 @@ def create_scan_UI():
             with gr.Row():
                 with gr.Column():
                     model_choice = gr.Dropdown(label="Tagging Model(s) to Use", multiselect=True, choices=V3_MODELS, value=[V3_MODELS[0]])
-                    regenerate_tags_button = gr.Button("Generate Tags for Files Missing Tags")
+                    with gr.Row():
+                        regenerate_tags_button = gr.Button("Generate Tags for Files Missing Tags")
+                        delete_tags_button = gr.Button("Delete ALL Tags set by selected Model(s)")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -149,8 +163,10 @@ def create_scan_UI():
                         The 'Update Directory Lists and Scan New Entries' button will update the directory lists, scan newly included directories, and generate tags for files that don't have them.
                         
                         The 'Rescan all Directories' button will rescan all directories. But it will not update the directory lists or generate tags.
-                        
-                        The 'Scan All and Generate missing Tags' button will rescan all directories, update the directory lists, and generate tags for files that don't have them.
+
+                        The 'Generate Tags for Files Missing Tags' button will generate tags for all items that don't have tags set by the selected model(s).
+
+                        The 'Delete ALL Tags set by selected Model(s)' button will delete all tags set by the selected model(s) for all items from the database.                        
                         """)
             with gr.Row():
                 results = gr.Textbox(label="Scan Report", interactive=False, lines=8, value="")
@@ -204,4 +220,11 @@ def create_scan_UI():
             inputs=[model_choice],
             outputs=[results, scan_history, tagging_history],
             api_name="regenerate_tags",
+        )
+
+        delete_tags_button.click(
+            fn=delete_tags,
+            inputs=[model_choice],
+            outputs=[results, scan_history, tagging_history],
+            api_name="delete_tags",
         )

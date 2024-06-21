@@ -113,7 +113,19 @@ def initialize_database(conn: sqlite3.Connection):
         PRIMARY KEY(namespace, sha256)
     )
     ''')
-    
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS item_tag_scans (
+        item TEXT NOT NULL,
+        setter TEXT NOT NULL,
+        last_scan TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        tags_set INTEGER NOT NULL,
+        tags_removed INTEGER NOT NULL,
+        UNIQUE(item, setter)                   -- Unique constraint on item and setter
+        FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
+    )
+    ''')
+
     # Create indexes
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_md5 ON items(md5)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_type ON items(type)')
@@ -144,10 +156,18 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_time_added ON bookmarks(time_added)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_sha256 ON bookmarks(sha256)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_metadata ON bookmarks(metadata)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookmarks_namespace ON bookmarks(namespace)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_item ON item_tag_scans(item)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_setter ON item_tag_scans(setter)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_last_scan ON item_tag_scans(last_scan)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_set ON item_tag_scans(tags_set)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_removed ON item_tag_scans(tags_removed)')
 
 def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
     time = scan_time
     last_set = scan_time
+    # Round confidence to 3 decimal places
+    confidence = round(confidence, 3)
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO tags (namespace, name, value, confidence, item, setter, time, last_set)
@@ -364,6 +384,53 @@ def get_all_tag_scans(conn: sqlite3.Connection) -> List[TagScanRecord]:
     scan_records = cursor.fetchall()
     return [TagScanRecord(*scan_record) for scan_record in scan_records]
 
+def add_item_tag_scan(conn: sqlite3.Connection, item: str, setter: str, last_scan: str, tags_set: int, tags_removed: int):
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO item_tag_scans (item, setter, last_scan, tags_set, tags_removed)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(item, setter) DO UPDATE SET last_scan=excluded.last_scan, tags_set=excluded.tags_set, tags_removed=excluded.tags_removed
+    ''', (item, setter, last_scan, tags_set, tags_removed))
+
+def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
+    """
+    Get all items that have not been scanned by the given tag setter.
+    More efficient than get_items_missing_tags as it does not require a join with the tags table.
+    It also avoids joining with the files table to get the path, instead getting paths one by one.
+    """
+    clauses = f"""
+    FROM items
+    LEFT JOIN item_tag_scans
+    ON items.sha256 = item_tag_scans.item
+    AND item_tag_scans.setter = ?
+    WHERE item_tag_scans.item IS NULL
+    """
+
+    count_query = f'''
+    SELECT COUNT(*)
+    {clauses}
+    '''
+    cursor = conn.cursor()
+
+    cursor.execute(count_query, (setter,))
+    total_count = cursor.fetchone()[0]
+
+    cursor.execute(f'''
+    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
+    {clauses}
+    ''', (setter,))
+
+    remaining_count: int = total_count
+    while row := cursor.fetchone():
+        item = ItemWithPath(*row, "")
+        remaining_count -= 1
+        if file := get_existing_file_for_sha256(conn, item.sha256):
+            item.path = file.path
+            yield item, remaining_count, total_count
+        else:
+            # If no working path is found, skip this item
+            continue
+
 @dataclass
 class ItemWithPath:
     sha256: str
@@ -372,6 +439,23 @@ class ItemWithPath:
     size: int
     time_added: str
     path: str
+
+def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    DELETE FROM tags
+    WHERE setter = ?
+    ''', (setter,))
+
+    tags_removed = result.rowcount
+
+    result_items = cursor.execute('''
+    DELETE FROM item_tag_scans
+    WHERE setter = ?
+    ''', (setter,))
+
+    items_tags_removed = result_items.rowcount
+    return tags_removed, items_tags_removed
 
 def get_items_missing_tags(conn: sqlite3.Connection, tag_setter=None):
     """
@@ -395,39 +479,44 @@ def get_items_missing_tags(conn: sqlite3.Connection, tag_setter=None):
         WHERE tags.item IS NULL
     )'''
 
+    # cursor.execute(f'''
+    # {missing_tags_subquery}
+    # SELECT COUNT(*)
+    # FROM ItemsWithoutTags
+    # ''', (tag_setter,) if tag_setter else ())
+
+    # total_count = cursor.fetchone()[0]
+    # print(f"Count reached: {total_count}")
+
     query = f'''
     {missing_tags_subquery}
     SELECT
+        COUNT(*),
         iwt.sha256,
         iwt.md5,
         iwt.type,
         iwt.size,
         iwt.time_added,
-        COALESCE(available_files.path, any_files.path) as path,
+        COALESCE(available_files.path, any_files.path) as path
     FROM ItemsWithoutTags AS iwt
     LEFT JOIN files AS available_files
-    ON iwt.sha256 = files.sha256
-    AND files.available = 1
+    ON iwt.sha256 = available_files.sha256
+    AND available_files.available = 1
     JOIN files AS any_files
     ON iwt.sha256 = any_files.sha256;
     '''
-    count_query = f'''
-    {missing_tags_subquery}
-    SELECT COUNT(*)
-    FROM ItemsWithoutTags
-    JOIN files
-    ON ItemsWithoutTags.sha256 = files.sha256;
-    '''
-    cursor.execute(count_query, (tag_setter,) if tag_setter else ())
-    total_count: int = cursor.fetchone()[0]
-
     cursor.execute(query, (tag_setter,) if tag_setter else ())
 
     # Yield each item
-    remaining_count = total_count
+    remaining_count = -1
+    total_count = 0
     while row := cursor.fetchone():
-        remaining_count -= 1
-        item = ItemWithPath(*row)
+        total_count = row[0]
+        if remaining_count == -1:
+            remaining_count = total_count
+        else:
+            remaining_count -= 1
+        item = ItemWithPath(*row[1:])
         if os.path.exists(item.path):
             yield item, remaining_count, total_count
         else:
