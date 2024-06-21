@@ -9,7 +9,7 @@ def get_labels(setters = None, confidence_threshold=None):
         confidence_threshold = None
     conn = get_database_connection()
     tags_character = get_most_common_tags_frequency(conn, namespace="danbooru:character", setters=setters, confidence_threshold=confidence_threshold, limit=25)
-    tags_general = get_most_common_tags_frequency(conn, namespace="danbooru:general", setters=setters,confidence_threshold=confidence_threshold, limit=100)
+    tags_general = get_most_common_tags_frequency(conn, namespace="danbooru:general", setters=setters, confidence_threshold=confidence_threshold, limit=100)
     conn.close()
     if len(tags_general) == 0 or len(tags_character) == 0:
         return {"None": 1}
