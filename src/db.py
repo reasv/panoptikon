@@ -824,29 +824,92 @@ def delete_unavailable_files(conn: sqlite3.Connection):
     ''')
     return result.rowcount
 
-def delete_items_without_files(conn: sqlite3.Connection):
+def delete_items_without_files(conn: sqlite3.Connection, batch_size: int = 10000):
     cursor = conn.cursor()
-    result = cursor.execute('''
-    DELETE FROM items
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM files
-        WHERE files.sha256 = items.sha256
-    )
-    ''')
-    return result.rowcount
+    total_deleted = 0
 
-def delete_tags_without_items(conn: sqlite3.Connection):
+    while True:
+        # Perform the deletion in batches
+        cursor.execute('''
+        DELETE FROM items
+        WHERE rowid IN (
+            SELECT items.rowid
+            FROM items
+            LEFT JOIN files ON files.sha256 = items.sha256
+            WHERE files.sha256 IS NULL
+            LIMIT ?
+        )
+        ''', (batch_size,))
+        
+        # Check the number of rows affected in this batch
+        deleted_rows = cursor.rowcount
+        total_deleted += deleted_rows
+        
+        # If no rows were deleted, we are done
+        if deleted_rows == 0:
+            break
+    
+    return total_deleted
+
+def delete_tags_without_items(conn: sqlite3.Connection, batch_size: int = 10000):
     cursor = conn.cursor()
-    result = cursor.execute('''
-    DELETE FROM tags
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM items
-        WHERE items.sha256 = tags.item
-    )
-    ''')
-    return result.rowcount
+    total_deleted = 0
+    while True:
+        # Perform the deletion in batches
+        cursor.execute('''
+        DELETE FROM tags
+        WHERE rowid IN (
+            SELECT tags.rowid
+            FROM tags
+            LEFT JOIN items ON items.sha256 = tags.item
+            WHERE items.sha256 IS NULL
+            LIMIT ?
+        )
+        ''', (batch_size,))
+        
+        # Check the number of rows affected in this batch
+        deleted_rows = cursor.rowcount
+        total_deleted += deleted_rows
+        
+        # If no rows were deleted, we are done
+        if deleted_rows == 0:
+            break
+    
+    return total_deleted
+
+def delete_item_tag_scans_without_items(conn: sqlite3.Connection, batch_size: int = 10000):
+    cursor = conn.cursor()
+    total_deleted = 0
+
+    while True:
+        # Perform the deletion in batches
+        cursor.execute('''
+        DELETE FROM item_tag_scans
+        WHERE rowid IN (
+            SELECT item_tag_scans.rowid
+            FROM item_tag_scans
+            LEFT JOIN items ON items.sha256 = item_tag_scans.item
+            WHERE items.sha256 IS NULL
+            LIMIT ?
+        )
+        ''', (batch_size,))
+        
+        # Check the number of rows affected in this batch
+        deleted_rows = cursor.rowcount
+        total_deleted += deleted_rows
+        
+        # If no rows were deleted, we are done
+        if deleted_rows == 0:
+            break
+    
+    return total_deleted
+
+def vacuum_database(conn: sqlite3.Connection):
+    """
+    Run VACUUM and ANALYZE on the database to optimize it
+    """
+    conn.execute('VACUUM')
+    conn.execute('ANALYZE')
 
 def get_most_common_tags(conn: sqlite3.Connection, limit=10):
     cursor = conn.cursor()

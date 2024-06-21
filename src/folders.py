@@ -15,7 +15,9 @@ from src.db import (
     delete_items_without_files,
     delete_files_not_under_included_folders,
     delete_unavailable_files,
-    delete_tags_without_items
+    delete_tags_without_items,
+    delete_item_tag_scans_without_items,
+    vacuum_database
 )
 from src.files import scan_files, deduplicate_paths
 from src.utils import normalize_path
@@ -154,6 +156,8 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     orphan_items_deleted = delete_items_without_files(conn)
     delete_tags_without_items(conn)
+    delete_item_tag_scans_without_items(conn)
+    vacuum_database(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,
@@ -178,6 +182,9 @@ def rescan_all_folders(conn: sqlite3.Connection, delete_unavailable: bool = True
     if delete_unavailable:
         unavailable_files_deleted = delete_unavailable_files(conn)
         orphan_items_deleted = delete_items_without_files(conn)
+        delete_tags_without_items(conn)
+        delete_item_tag_scans_without_items(conn)
+        vacuum_database(conn)
     else:
         unavailable_files_deleted = 0
         orphan_items_deleted = 0
