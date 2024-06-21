@@ -67,7 +67,6 @@ def initialize_database(conn: sqlite3.Connection):
         confidence REAL DEFAULT 1.0,
         item TEXT NOT NULL,
         setter TEXT NOT NULL,
-        time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
         PRIMARY KEY(namespace, name, item, setter),
         FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
     )
@@ -144,7 +143,6 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_confidence ON tags(confidence)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_item ON tags(item)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setter ON tags(setter)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_time ON tags(time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_start_time ON tag_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_end_time ON tag_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_setter ON tag_scans(setter)')
@@ -161,16 +159,15 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_set ON item_tag_scans(tags_set)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_removed ON item_tag_scans(tags_removed)')
 
-def insert_tag(conn: sqlite3.Connection, scan_time, namespace, name, item, setter, confidence = 1.0, value = None):
-    time = scan_time
+def insert_tag(conn: sqlite3.Connection, namespace, name, item, setter, confidence = 1.0, value = None):
     # Round confidence to 3 decimal places
     confidence = round(confidence, 3)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO tags (namespace, name, value, confidence, item, setter, time)
+    INSERT INTO tags (namespace, name, value, confidence, item, setter)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
-    ''', (namespace, name, value, confidence, item, setter, time))
+    ''', (namespace, name, value, confidence, item, setter))
 
 def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileScanData):
     cursor = conn.cursor()
@@ -551,7 +548,7 @@ def get_existing_file_for_sha256(conn: sqlite3.Connection, sha256: str) -> FileR
 def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT namespace, name, value, confidence, setter, time
+    SELECT namespace, name, value, confidence, setter
     FROM tags
     WHERE item = ?
     ''', (sha256,))

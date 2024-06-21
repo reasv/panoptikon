@@ -128,7 +128,6 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
         for namespace, tag, confidence in tags:
             insert_tag(
                 conn,
-                scan_time=scan_time,
                 namespace=namespace,
                 name=tag,
                 item=item.sha256,
