@@ -162,14 +162,7 @@ cython_debug/
 #.idea/
 
 venv/
-
-images/
-
-paths.txt
-
-*.db
-
-videotest.py
 thumbs/
 temp_frames/
-cc/
+scripts/
+db/
