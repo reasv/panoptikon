@@ -15,7 +15,8 @@ def build_query(tags: list, min_tag_confidence: float, include_path: str = None,
     order_query = ""
     if order is not None:
         order_query = f"&order={order}"
-    return f"/search/tags?tags={','.join(tags)}&min_confidence={min_tag_confidence}&include_path={include_path}&page_size={page_size}&page={page}&order_by={order_by}{order_query}"
+    tag_str = urllib.parse.quote(','.join(tags))
+    return f"/search/tags?tags={tag_str}&min_confidence={min_tag_confidence}&include_path={include_path}&page_size={page_size}&page={page}&order_by={order_by}{order_query}"
 
 def search_by_tags(
         tags_str: str,
@@ -31,9 +32,9 @@ def search_by_tags(
     include_path = include_path.strip() if include_path is not None else None
     if include_path == "": include_path = None
 
-    tags = tags_str.split()
+    tags = [tag.strip() for tag in tags_str.split(',') if tag.strip() != ""]
     conn = get_database_connection()
-
+    print(f"Searching for tags: {tags} with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order}")
     results, total_results = zip(*list(search_files(
         conn,
         tags,
@@ -56,6 +57,9 @@ def search_by_tags(
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (1 if total_results % results_per_page > 0 else 0)
     return results, total_results, gr.update(value=page, maximum=int(total_pages)), f"[View Results in Gallery]({build_query(tags, min_tag_confidence, include_path, results_per_page, page, order_by, order)})"
+
+def search_by_tags_search_button(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1, order_by: str = "last_modified", order = None):
+    return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, 1, order_by, order)
 
 def search_by_tags_next_page(tags_str: str, min_tag_confidence: float, results_per_page: int, include_path: str = None, page: int = 1, order_by: str = "last_modified", order = None):
     return search_by_tags(tags_str, min_tag_confidence, results_per_page, include_path, page+1, order_by, order)
@@ -85,7 +89,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
                 with gr.Column(scale=10):
                     with gr.Group():
                         with gr.Row():
-                            tag_input = gr.Textbox(label="Enter tags separated by spaces", value='', show_copy_button=True, scale=3)
+                            tag_input = gr.Textbox(label="Enter tags separated by commas", value='', show_copy_button=True, scale=3)
                             min_confidence = gr.Slider(minimum=0.05, maximum=1, value=0.25, step=0.05, label="Min. Confidence Level for Tags", scale=2)
                             max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
                             selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)
@@ -104,7 +108,7 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
     )
 
     submit_button.click(
-        fn=search_by_tags,
+        fn=search_by_tags_search_button,
         inputs=[tag_input, min_confidence, max_results_per_page, selected_folder, current_page, order_by], 
         outputs=[
             multi_view.files,

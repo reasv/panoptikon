@@ -39,7 +39,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                 tags = { t[0]: t[1] for t in get_all_tags_for_item_name_confidence(conn, sha256)}
                 conn.close()
                 # Tags in the format "tag1 tag2 tag3"
-                text = " ".join(tags.keys())
+                text = ", ".join(tags.keys())
 
                 if path.strip() == "":
                     interactive = False
