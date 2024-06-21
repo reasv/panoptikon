@@ -938,7 +938,7 @@ def get_most_common_tags(conn: sqlite3.Connection, namespace=None, setters: List
     return tags
 
 def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], limit=10):
-    tags = get_most_common_tags(conn, namespace=namespace, limit=limit)
+    tags = get_most_common_tags(conn, namespace=namespace, setters=setters, limit=limit)
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
     setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
