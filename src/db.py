@@ -32,7 +32,6 @@ def initialize_database(conn: sqlite3.Connection):
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
         sha256 TEXT NOT NULL,
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
