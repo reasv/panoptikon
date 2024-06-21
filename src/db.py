@@ -910,35 +910,41 @@ def vacuum_database(conn: sqlite3.Connection):
     conn.execute('VACUUM')
     conn.execute('ANALYZE')
 
-def get_most_common_tags(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], limit=10):
+def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None, setters: List[str] = [], confidence_threshold: float | None = None, limit=10):
     cursor = conn.cursor()
     namespace_clause = "WHERE namespace LIKE ? || '%'" if namespace else ""
     setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
     if namespace and setters:
         setters_clause = f"AND setter IN ({','.join(['?']*len(setters))})"
 
+    confidence_clause = f"WHERE confidence >= ?" if confidence_threshold else ""
+    if confidence_threshold and (namespace or setters):
+        confidence_clause = f"AND confidence >= ?"
+
     query_args = [arg for arg in [
         namespace,
         *setters,
+        confidence_threshold,
         limit
     ] if arg is not None]
+
     query = f'''
     SELECT namespace, name, COUNT(*) as count
     FROM tags
     {namespace_clause}
     {setters_clause}
+    {confidence_clause}
     GROUP BY namespace, name
     ORDER BY count DESC
     LIMIT ?
     '''
-    print(query)
     cursor.execute(query, query_args)
 
     tags = cursor.fetchall()
     return tags
 
-def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], limit=10):
-    tags = get_most_common_tags(conn, namespace=namespace, setters=setters, limit=limit)
+def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], confidence_threshold=None, limit=10):
+    tags = get_most_common_tags(conn, namespace=namespace, setters=setters, confidence_threshold=confidence_threshold, limit=limit)
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
     setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
