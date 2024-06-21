@@ -5,14 +5,15 @@ from src.db import get_most_common_tags_frequency, get_database_connection
 
 def get_labels():
     conn = get_database_connection()
-    tags = get_most_common_tags_frequency(conn, limit=100)
+    tags_character = get_most_common_tags_frequency(conn, namespace="danbooru:character", limit=25)
+    tags_general = get_most_common_tags_frequency(conn, namespace="danbooru:general", limit=100)
     conn.close()
-    if len(tags) == 0:
+    if len(tags_general) == 0 or len(tags_character) == 0:
         return {"None": 1}
 
-    labels_character = {tag[1]: tag[3] for tag in tags if tag[0] == "danbooru:character"}
-    labels_general = {tag[1]: tag[3] for tag in tags if tag[0] != "danbooru:character"}
-    labels_rating = {tag[1]: tag[3] for tag in tags if tag[1].startswith("rating:")}
+    labels_character = {tag[1]: tag[3] for tag in tags_character}
+    labels_general = {tag[1]: tag[3] for tag in tags_general if not tag[1].startswith("rating:")}
+    labels_rating = {tag[1]: tag[3] for tag in tags_general if tag[1].startswith("rating:")}
     return labels_rating, labels_character, labels_general
 
 def create_toptags_UI():

@@ -910,23 +910,43 @@ def vacuum_database(conn: sqlite3.Connection):
     conn.execute('VACUUM')
     conn.execute('ANALYZE')
 
-def get_most_common_tags(conn: sqlite3.Connection, limit=10):
+def get_most_common_tags(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], limit=10):
     cursor = conn.cursor()
-    cursor.execute('''
+    namespace_clause = "WHERE namespace LIKE ? || '%'" if namespace else ""
+    setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
+    if namespace and setters:
+        setters_clause = f"AND setter IN ({','.join(['?']*len(setters))})"
+
+    query_args = [arg for arg in [
+        namespace,
+        *setters,
+        limit
+    ] if arg is not None]
+    query = f'''
     SELECT namespace, name, COUNT(*) as count
     FROM tags
+    {namespace_clause}
+    {setters_clause}
     GROUP BY namespace, name
     ORDER BY count DESC
     LIMIT ?
-    ''', (limit,))
+    '''
+    print(query)
+    cursor.execute(query, query_args)
+
     tags = cursor.fetchall()
     return tags
 
-def get_most_common_tags_frequency(conn: sqlite3.Connection, limit=10):
-    tags = get_most_common_tags(conn, limit)
+def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], limit=10):
+    tags = get_most_common_tags(conn, namespace=namespace, limit=limit)
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(DISTINCT item || '-' || setter) AS distinct_count FROM item_tag_scans;")
+    setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
+    cursor.execute(f"""
+                   SELECT COUNT(DISTINCT item || '-' || setter) AS distinct_count
+                   FROM item_tag_scans
+                   {setters_clause}
+                """, setters if setters else ())
     total_items_setters = cursor.fetchone()[0]
     # Calculate the frequency
     tags = [(tag[0], tag[1], tag[2], tag[2]/(total_items_setters)) for tag in tags]
