@@ -33,11 +33,13 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS files (
         sha256 TEXT NOT NULL,
+        item INTEGER NOT NULL,
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
         FOREIGN KEY(sha256) REFERENCES items(sha256)
+        FOREIGN KEY(item) REFERENCES items(rowid)
     )
     ''')
 
@@ -133,6 +135,8 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)')  # Explicit index on path
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)')
+    if is_column_in_table(conn, 'files', 'item'):
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_item ON files(item)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_start_time ON file_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_end_time ON file_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_path ON file_scans(path)')
@@ -187,6 +191,9 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
 
     # We need to check if the item was inserted
     item_inserted = item_insert_result.rowcount > 0
+
+    # Get the rowid of the inserted item, if it was inserted
+    item_rowid = cursor.lastrowid if item_inserted else None
     
     file_updated = False
     if path_in_db and not file_modified:
@@ -206,11 +213,15 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
         file_delete_result = cursor.execute('DELETE FROM files WHERE path = ?', (path,))
         file_deleted = file_delete_result.rowcount > 0
 
+        if not item_rowid:
+            # If the item was not inserted, get the rowid from the database
+            item_rowid: int = cursor.execute('SELECT rowid FROM items WHERE sha256 = ?', (sha256,)).fetchone()[0]
+
         # Path does not exist or has been modified, insert new
         file_insert_result = cursor.execute('''
-        INSERT INTO files (sha256, path, last_modified, last_seen, available)
-        VALUES (?, ?, ?, ?, TRUE)
-        ''', (sha256, path, last_modified, scan_time))
+        INSERT INTO files (sha256, item, path, last_modified, last_seen, available)
+        VALUES (?, ?, ?, ?, ?, TRUE)
+        ''', (sha256, item_rowid, path, last_modified, scan_time))
         file_inserted = file_insert_result.rowcount > 0
 
     return item_inserted, file_updated, file_deleted, file_inserted
@@ -259,6 +270,12 @@ def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
     cursor.execute('SELECT * FROM file_scans ORDER BY start_time DESC')
     scan_records = cursor.fetchall()
     return [FileScanRecord(*scan_record) for scan_record in scan_records]
+
+def is_column_in_table(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cursor = conn.cursor()
+    cursor.execute(f'PRAGMA table_info({table})')
+    columns = cursor.fetchall()
+    return any(column[1] == column for column in columns)
 
 def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
     """
