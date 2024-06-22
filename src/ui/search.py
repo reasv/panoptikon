@@ -49,7 +49,6 @@ def search_by_tags(
         remaining = []
         subtype = []
         for tag in tag_list:
-            print(tag)
             if tag.startswith(prefix):
                 subtype.append(tag[1:])
             else:
