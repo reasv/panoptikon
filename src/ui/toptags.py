@@ -10,13 +10,14 @@ def get_labels(setters = None, confidence_threshold=None):
     conn = get_database_connection()
     tags_character = get_most_common_tags_frequency(conn, namespace="danbooru:character", setters=setters, confidence_threshold=confidence_threshold, limit=25)
     tags_general = get_most_common_tags_frequency(conn, namespace="danbooru:general", setters=setters, confidence_threshold=confidence_threshold, limit=100)
+    tags_rating = get_most_common_tags_frequency(conn, namespace="danbooru:rating", setters=setters, confidence_threshold=confidence_threshold, limit=5)
     conn.close()
     if len(tags_general) == 0 or len(tags_character) == 0:
         return {"None": 1}, {"None": 1}, {"None": 1}
 
     labels_character = {tag[1]: tag[3] for tag in tags_character}
-    labels_general = {tag[1]: tag[3] for tag in tags_general if not tag[1].startswith("rating:")}
-    labels_rating = {tag[1]: tag[3] for tag in tags_general if tag[1].startswith("rating:")}
+    labels_general = {tag[1]: tag[3] for tag in tags_general}
+    labels_rating = {tag[1]: tag[3] for tag in tags_rating}
     return labels_rating, labels_character, labels_general
 
 def create_toptags_UI():
