@@ -662,7 +662,9 @@ def build_search_query(
 def search_files(
         conn: sqlite3.Connection,
         tags: List[str],
+        tags_match_any: List[str] = None,
         negative_tags: List[str] | None = None,
+        negative_tags_match_all: List[str] = None,
         tag_namespace: str | None = None,
         min_confidence: float | None = 0.5,
         setters: List[str] | None = None,
@@ -674,13 +676,18 @@ def search_files(
         page_size: int | None = 1000,
         page: int = 1,
         check_path_exists: bool = False,
-        any_positive_tags_match: bool = False
     ):
     # Normalize/clean the inputs
-    negative_tags = negative_tags or []
-    tags = tags or []
-    tags = [tag.lower().strip() for tag in tags if tag.strip() != ""]
-    negative_tags = [tag.lower().strip() for tag in negative_tags if tag.strip() != ""]
+    def clean_tag_list(tag_list: List[str] | None) -> List[str]:
+        if not tag_list:
+            return []
+        return [tag.lower().strip() for tag in tag_list if tag.strip() != ""]
+
+    tags_match_any = clean_tag_list(tags_match_any)
+    negative_tags_match_all = clean_tag_list(negative_tags_match_all)
+    tags = clean_tag_list(tags)
+    negative_tags = clean_tag_list(negative_tags)
+
     tag_namespace = tag_namespace or None
     item_type = item_type or None
     include_path_prefix = include_path_prefix or None
@@ -689,21 +696,87 @@ def search_files(
 
     page_size = page_size or 1000000 # Mostly for debugging purposes
     offset = (page - 1) * page_size
+    if not tags_match_any:
+        # Basic case where we need to match all positive tags and none of the negative tags
+        main_query, params = build_search_query(
+            tags=tags,
+            negative_tags=negative_tags,
+            tag_namespace=tag_namespace,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=all_setters_required,
+            item_type=item_type,
+            include_path_prefix=include_path_prefix,
+            any_positive_tags_match=False
+        )
+    elif tags_match_any and not tags:
+        # If "match any" tags are provided, but no positive tags are provided
+        # We need to build a query to match on *any* of them being present
+        main_query, params = build_search_query(
+            tags=tags_match_any,
+            negative_tags=negative_tags,
+            tag_namespace=tag_namespace,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=False,
+            item_type=item_type,
+            include_path_prefix=include_path_prefix,
+            any_positive_tags_match=True
+        )
 
-    main_query, params = build_search_query(
-        tags=tags,
-        negative_tags=negative_tags,
-        tag_namespace=tag_namespace,
-        min_confidence=min_confidence,
-        setters=setters,
-        all_setters_required=all_setters_required,
-        item_type=item_type,
-        include_path_prefix=include_path_prefix,
-        any_positive_tags_match=any_positive_tags_match
-    )
+    if tags_match_any and tags:
+        # If tags "match any" are provided along with match all regular positive tags
+        # We need to build a separate query to match on *any* of them being present
+        # And then intersect the results with the main query
+        tags_query, tags_params = build_search_query(
+            tags=tags_match_any,
+            negative_tags=None,
+            tag_namespace=tag_namespace,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=False,
+            item_type=item_type,
+            include_path_prefix=include_path_prefix,
+            any_positive_tags_match=True
+        )
 
-    print(main_query)
+        # Append the tags query to the main query
+        main_query = f"""
+        {main_query}
+        INTERSECT
+        {tags_query}
+        """
+        params += tags_params
+
+    if negative_tags_match_all:
+        # If negative tags "match all" are provided
+        # We need to build a separate query to match on *all* of them being present
+        # And then exclude the results from the main query
+        negative_tags_query, negative_tags_params = build_search_query(
+            tags=negative_tags_match_all,
+            negative_tags=None,
+            tag_namespace=tag_namespace,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=all_setters_required,
+            item_type=item_type,
+            include_path_prefix=include_path_prefix,
+            any_positive_tags_match=False
+        )
+
+        # Append the negative tags query to the main query
+        main_query = f"""
+        SELECT files.path, files.sha256, files.last_modified
+        FROM (
+            {main_query}
+        )
+        EXCEPT
+        {negative_tags_query}
+        """
+        params += negative_tags_params
     
+    print(main_query)
+
     # First query to get the total count of items matching the criteria
     count_query = f"""
     SELECT COUNT(*)
