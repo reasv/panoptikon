@@ -196,7 +196,7 @@ def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, c
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO tags_items (item, tag, confidence)
-    VALUES (?, ?, ?, ?)
+    VALUES (?, ?, ? )
     ON CONFLICT(item, tag) DO UPDATE SET confidence=excluded.confidence
     ''', (item_rowid, tag_rowid, confidence))
 
