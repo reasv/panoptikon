@@ -124,7 +124,7 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
             ] + [
             ("danbooru:general", tag, confidence) for tag, confidence in tag_result.general_tags.items() if not tag.startswith("rating:")
             ] + [
-            ("danbooru:rating", tag, confidence) for tag, confidence in tag_result.character_tags.items() if tag.startswith("rating:")
+            ("danbooru:rating", tag, confidence) for tag, confidence in tag_result.general_tags.items() if tag.startswith("rating:")
             ]
         for namespace, tag, confidence in tags:
             tag_rowid = create_tag_setter(conn, namespace=namespace, name=tag, setter=setter)
