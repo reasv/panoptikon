@@ -73,7 +73,6 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS tags_items (
         item INTEGER NOT NULL,
         tag INTEGER NOT NULL,
-        value TEXT,
         confidence REAL DEFAULT 1.0,
         UNIQUE(item, tag),
         FOREIGN KEY(item) REFERENCES items(rowid) ON DELETE CASCADE
@@ -166,11 +165,9 @@ def initialize_database(conn: sqlite3.Connection):
     # Create indexes for tags_items
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_item ON tags_items(item)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag ON tags_items(tag)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_value ON tags_items(value)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_confidence ON tags_items(confidence)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_item_tag ON tags_items(item, tag)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag_item ON tags_items(tag, item)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag_value ON tags_items(tag, value)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_namespace ON tags_setters(namespace)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_name ON tags_setters(name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_setter ON tags_setters(setter)')
@@ -193,15 +190,15 @@ def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):
         rowid: int = cursor.execute('SELECT rowid FROM tags_setters WHERE namespace = ? AND name = ? AND setter = ?', (namespace, name, setter)).fetchone()[0]
     return rowid
 
-def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, confidence = 1.0, value = None):
+def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, confidence = 1.0):
     # Round confidence to 3 decimal places
     confidence = round(confidence, 3)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO tags_items (item, tag, value, confidence)
+    INSERT INTO tags_items (item, tag, confidence)
     VALUES (?, ?, ?, ?)
-    ON CONFLICT(item, tag) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
-    ''', (item_rowid, tag_rowid, value, confidence))
+    ON CONFLICT(item, tag) DO UPDATE SET confidence=excluded.confidence
+    ''', (item_rowid, tag_rowid, confidence))
 
 def get_item_rowid(conn: sqlite3.Connection, sha256: str):
     cursor = conn.cursor()
@@ -543,7 +540,7 @@ def get_existing_file_for_sha256(conn: sqlite3.Connection, sha256: str) -> FileR
 def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT tags.namespace, tags.name, tags_items.value, tags_items.confidence, tags.setter
+    SELECT tags.namespace, tags.name, tags_items.confidence, tags.setter
     FROM items
     JOIN tags_items ON items.rowid = tags_items.item
     AND items.sha256 = ?
@@ -554,7 +551,7 @@ def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
 
 def get_all_tags_for_item_name_confidence(conn: sqlite3.Connection, sha256):
     tags = get_all_tags_for_item(conn, sha256)
-    return [(row[1], row[3]) for row in tags]
+    return [(row[1], row[2]) for row in tags]
 
 def get_tag_names_list(conn: sqlite3.Connection):
     cursor = conn.cursor()

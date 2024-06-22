@@ -134,7 +134,6 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
                 item_rowid=item_rowid,
                 tag_rowid=tag_rowid,
                 confidence=confidence,
-                value=None
             )
         add_item_tag_scan(conn, item=item.sha256, setter=setter, last_scan=scan_time, tags_set=len(tags), tags_removed=0)
 
