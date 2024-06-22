@@ -653,7 +653,7 @@ def build_search_query(
                 # Number of tags to match, or number of tag-setter pairs to match if we require all setters to be present for all tags
                 (len(tags) if not all_setters_required else len(tags) * len(setters))
                 # HAVING clause is not needed if no positive tags are provided
-                if tags else None
+                if tags and not any_positive_tags_match else None
             )
     ] if param is not None]
 
@@ -687,6 +687,12 @@ def search_files(
     negative_tags_match_all = clean_tag_list(negative_tags_match_all)
     tags = clean_tag_list(tags)
     negative_tags = clean_tag_list(negative_tags)
+    if len(tags_match_any) == 1:
+        # If only one tag is provided for "match any", we can just use it as a regular tag
+        tags.append(tags_match_any[0])
+    if len(negative_tags_match_all) == 1:
+        # If only one tag is provided for negative "match all", we can just use it as a regular negative tag
+        negative_tags.append(negative_tags_match_all[0])
 
     tag_namespace = tag_namespace or None
     item_type = item_type or None
@@ -696,20 +702,8 @@ def search_files(
 
     page_size = page_size or 1000000 # Mostly for debugging purposes
     offset = (page - 1) * page_size
-    if not tags_match_any:
-        # Basic case where we need to match all positive tags and none of the negative tags
-        main_query, params = build_search_query(
-            tags=tags,
-            negative_tags=negative_tags,
-            tag_namespace=tag_namespace,
-            min_confidence=min_confidence,
-            setters=setters,
-            all_setters_required=all_setters_required,
-            item_type=item_type,
-            include_path_prefix=include_path_prefix,
-            any_positive_tags_match=False
-        )
-    elif tags_match_any and not tags:
+
+    if tags_match_any and not tags:
         # If "match any" tags are provided, but no positive tags are provided
         # We need to build a query to match on *any* of them being present
         main_query, params = build_search_query(
@@ -722,6 +716,19 @@ def search_files(
             item_type=item_type,
             include_path_prefix=include_path_prefix,
             any_positive_tags_match=True
+        )
+    else:
+        # Basic case where we need to match all positive tags and none of the negative tags
+        main_query, params = build_search_query(
+            tags=tags,
+            negative_tags=negative_tags,
+            tag_namespace=tag_namespace,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=all_setters_required,
+            item_type=item_type,
+            include_path_prefix=include_path_prefix,
+            any_positive_tags_match=False
         )
 
     if tags_match_any and tags:
