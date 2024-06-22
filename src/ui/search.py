@@ -56,11 +56,9 @@ def search_by_tags(
                 remaining.append(tag)
         return remaining, subtype
 
-    print("matching")
     tags, negative_tags = extract_tags_subtype(tags, "-")
     tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
     tags, tags_match_any = extract_tags_subtype(tags, "*")
-    print("matched")
     conn = get_database_connection()
     print(f"Searching for tags: {tags} (negative tags: {negative_tags}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
     start = time()
