@@ -662,7 +662,10 @@ def build_search_query(
 def print_search_query(query_str: str, params: List[str | float | int]):
     # Quote strings in params
     quoted_params = [f"'{param}'" if isinstance(param, str) else param for param in params]
-    print(query_str.replace('?', '{}').format(*quoted_params))
+    formatted_query = query_str.replace('?', '{}').format(*quoted_params)
+    # Remove empty lines
+    formatted_query = '\n'.join([line for line in formatted_query.split('\n') if line.strip() != ''])
+    print(formatted_query)
 
 def search_files(
         conn: sqlite3.Connection,
@@ -681,6 +684,7 @@ def search_files(
         page_size: int | None = 1000,
         page: int = 1,
         check_path_exists: bool = False,
+        return_total_count: bool = True
     ):
     # Normalize/clean the inputs
     def clean_tag_list(tag_list: List[str] | None) -> List[str]:
@@ -803,15 +807,18 @@ def search_files(
     )
     """
     # Debugging
-    # print_search_query(count_query, params)
+    print_search_query(count_query, params)
     cursor = conn.cursor()
-    try:
-        cursor.execute(count_query, params)
-    except Exception as e:
-        # Debugging
-        print_search_query(count_query, params)
-        raise e
-    total_count: int = cursor.fetchone()[0]
+    if return_total_count:
+        try:
+            cursor.execute(count_query, params)
+        except Exception as e:
+            # Debugging
+            print_search_query(count_query, params)
+            raise e
+        total_count: int = cursor.fetchone()[0]
+    else:
+        total_count = 0
 
     if order_by == "path":
         order_by_clause = "path"
