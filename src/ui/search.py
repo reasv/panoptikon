@@ -59,7 +59,7 @@ def search_by_tags(
     tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
     tags, tags_match_any = extract_tags_subtype(tags, "*")
     conn = get_database_connection()
-    print(f"Searching for tags: {tags} (negative tags: {negative_tags}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
+    print(f"Searching for tags: {tags} match any: {tags_match_any} (negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
     start = time()
     res_list = list(search_files(
         conn,
