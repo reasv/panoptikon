@@ -43,10 +43,22 @@ def search_by_tags(
 
     include_path = include_path.strip() if include_path is not None else None
     if include_path == "": include_path = None
-
     tags = [tag.strip() for tag in tags_str.split(',') if tag.strip() != ""]
-    negative_tags = [tag[1:] for tag in tags if tag.startswith("-")]
-    tags = [tag for tag in tags if not tag.startswith("-")]
+
+    def extract_tags_subtype(tag_list: list[str], prefix: str = "-"):
+        remaining = []
+        subtype = []
+        for tag in tag_list:
+            if tag.startswith(prefix):
+                subtype.append(tag[1:])
+            else:
+                tags.append(tag)
+        return remaining, subtype
+    
+    tags, negative_tags = extract_tags_subtype(tags, "-")
+    tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
+    tags, tags_match_any = extract_tags_subtype(tags, "*")
+
     conn = get_database_connection()
     print(f"Searching for tags: {tags} (negative tags: {negative_tags}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
     start = time()
@@ -54,6 +66,8 @@ def search_by_tags(
         conn,
         tags,
         negative_tags=negative_tags,
+        negative_tags_match_all=negative_tags_match_all,
+        tags_match_any=tags_match_any,
         tag_namespace=namespace_prefix,
         min_confidence=min_tag_confidence,
         setters=tag_setters,
