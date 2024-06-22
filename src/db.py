@@ -807,7 +807,7 @@ def search_files(
     )
     """
     # Debugging
-    print_search_query(count_query, params)
+    # print_search_query(count_query, params)
     cursor = conn.cursor()
     if return_total_count:
         try:

@@ -19,6 +19,8 @@ def build_query(tags: list, min_tag_confidence: float, include_path: str = None,
     if order is not None:
         order_query = f"&order={order}"
     tag_str = urllib.parse.quote(','.join(tags))
+    if not min_tag_confidence: min_tag_confidence = 0.0
+    if not include_path: include_path = ""
     return f"/search/tags?tags={tag_str}&min_confidence={min_tag_confidence}&include_path={include_path}&page_size={page_size}&page={page}&order_by={order_by}{order_query}"
 
 def search_by_tags(
