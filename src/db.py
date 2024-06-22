@@ -772,14 +772,22 @@ def search_files(
         )
 
         # Append the negative tags query to the main query
-        main_query = f"""
-        SELECT files.path, files.sha256, files.last_modified
-        FROM (
+        if tags_match_any and tags:
+            # If we already have an INTERSECT query, we need to use it as a subquery
+            main_query = f"""
+            SELECT *
+            FROM (
+                {main_query}
+            )
+            EXCEPT
+            {negative_tags_query}
+            """
+        else:
+            main_query = f"""
             {main_query}
-        )
-        EXCEPT
-        {negative_tags_query}
-        """
+            EXCEPT
+            {negative_tags_query}
+            """
         params += negative_tags_params
     
     print(main_query)
@@ -795,7 +803,6 @@ def search_files(
     try:
         cursor.execute(count_query, params)
     except Exception as e:
-        print(item_type, include_path_prefix)
         print(count_query)
         print(params)
         raise e
