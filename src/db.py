@@ -566,8 +566,7 @@ class FileSearchResult:
     last_modified: str
     type: str
 
-def search_files(
-        conn: sqlite3.Connection,
+def build_search_query(
         tags: List[str],
         negative_tags: List[str] | None = None,
         tag_namespace: str | None = None,
@@ -576,24 +575,11 @@ def search_files(
         all_setters_required: bool = False,
         item_type: str | None = None,
         include_path_prefix: str | None = None,
-        order_by: str | None = "last_modified",
-        order: str | None = None,
-        page_size: int | None = 1000,
-        page: int = 1,
-        check_path_exists: bool = False,
         any_tags_match: bool = False
-    ):
-    negative_tags = negative_tags or []
-    tags = tags or []
-    tags = [tag.lower().strip() for tag in tags if tag.strip() != ""]
-    negative_tags = [tag.lower().strip() for tag in negative_tags if tag.strip() != ""]
-    tag_namespace = tag_namespace or None
-    item_type = item_type or None
-    include_path_prefix = include_path_prefix or None
-    min_confidence = min_confidence or None
-    setters = setters or []
-    page_size = page_size or 1000000 # Mostly for debugging purposes
-    offset = (page - 1) * page_size
+    ) -> Tuple[str, List[str]]:
+    """
+    Build a query to search for files based on the given tags, negative tags, and other conditions.
+    """
 
     # The item mimetype should start with the given item_type
     item_type_condition = f"""
@@ -670,6 +656,52 @@ def search_files(
                 if tags else None
             )
     ] if param is not None]
+
+    return main_query, params
+
+def search_files(
+        conn: sqlite3.Connection,
+        tags: List[str],
+        negative_tags: List[str] | None = None,
+        tag_namespace: str | None = None,
+        min_confidence: float | None = 0.5,
+        setters: List[str] | None = None,
+        all_setters_required: bool = False,
+        item_type: str | None = None,
+        include_path_prefix: str | None = None,
+        order_by: str | None = "last_modified",
+        order: str | None = None,
+        page_size: int | None = 1000,
+        page: int = 1,
+        check_path_exists: bool = False,
+        any_tags_match: bool = False
+    ):
+    # Normalize/clean the inputs
+    negative_tags = negative_tags or []
+    tags = tags or []
+    tags = [tag.lower().strip() for tag in tags if tag.strip() != ""]
+    negative_tags = [tag.lower().strip() for tag in negative_tags if tag.strip() != ""]
+    tag_namespace = tag_namespace or None
+    item_type = item_type or None
+    include_path_prefix = include_path_prefix or None
+    min_confidence = min_confidence or None
+    setters = setters or []
+
+    page_size = page_size or 1000000 # Mostly for debugging purposes
+    offset = (page - 1) * page_size
+
+    main_query, params = build_search_query(
+        tags=tags,
+        negative_tags=negative_tags,
+        tag_namespace=tag_namespace,
+        min_confidence=min_confidence,
+        setters=setters,
+        all_setters_required=all_setters_required,
+        item_type=item_type,
+        include_path_prefix=include_path_prefix,
+        any_tags_match=any_tags_match
+    )
+    
     # First query to get the total count of items matching the criteria
     count_query = f"""
     SELECT COUNT(*)
