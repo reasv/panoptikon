@@ -33,7 +33,7 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS files (
         sha256 TEXT NOT NULL,
-        item INTEGER NOT NULL,
+        item INTEGER NOT NULL,            -- Foreign key to items table
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
@@ -61,15 +61,23 @@ def initialize_database(conn: sqlite3.Connection):
     ''')
 
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS tags (
+    CREATE TABLE IF NOT EXISTS tags_setters (
         namespace TEXT NOT NULL,
         name TEXT NOT NULL,
+        setter TEXT NOT NULL,
+        PRIMARY KEY(namespace, name, setter)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tags_items (
+        item INTEGER NOT NULL,
+        tag INTEGER NOT NULL,
         value TEXT,
         confidence REAL DEFAULT 1.0,
-        item TEXT NOT NULL,
-        setter TEXT NOT NULL,
-        PRIMARY KEY(namespace, name, item, setter),
-        FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
+        UNIQUE(item, tag),
+        FOREIGN KEY(item) REFERENCES items(rowid) ON DELETE CASCADE
+        FOREIGN KEY(tag) REFERENCES tags_setters(rowid) ON DELETE CASCADE
     )
     ''')
 
@@ -140,12 +148,6 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_start_time ON file_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_end_time ON file_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_scans_path ON file_scans(path)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_namespace ON tags(namespace)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_value ON tags(value)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_confidence ON tags(confidence)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_item ON tags(item)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setter ON tags(setter)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_start_time ON tag_scans(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_end_time ON tag_scans(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_scans_setter ON tag_scans(setter)')
@@ -161,16 +163,53 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_last_scan ON item_tag_scans(last_scan)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_set ON item_tag_scans(tags_set)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_item_tag_scans_tags_removed ON item_tag_scans(tags_removed)')
+    # Create indexes for tags_items
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_item ON tags_items(item)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag ON tags_items(tag)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_value ON tags_items(value)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_confidence ON tags_items(confidence)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_item_tag ON tags_items(item, tag)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag_item ON tags_items(tag, item)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_items_tag_value ON tags_items(tag, value)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_namespace ON tags_setters(namespace)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_name ON tags_setters(name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_setter ON tags_setters(setter)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_namespace_name ON tags_setters(namespace, name)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_namespace_setter ON tags_setters(namespace, setter)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_setters_name_setter ON tags_setters(name, setter)')
 
-def insert_tag(conn: sqlite3.Connection, namespace, name, item, setter, confidence = 1.0, value = None):
+def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):
+    cursor = conn.cursor()
+    result = cursor.execute('''
+    INSERT INTO tags_setters (namespace, name, setter)
+    VALUES (?, ?, ?)
+    ON CONFLICT(namespace, name, setter) DO NOTHING
+    ''', (namespace, name, setter))
+
+    tag_setter_inserted = result.rowcount > 0
+    if tag_setter_inserted:
+        rowid: int = cursor.lastrowid
+    else:
+        rowid: int = cursor.execute('SELECT rowid FROM tags_setters WHERE namespace = ? AND name = ? AND setter = ?', (namespace, name, setter)).fetchone()[0]
+    return rowid
+
+def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, confidence = 1.0, value = None):
     # Round confidence to 3 decimal places
     confidence = round(confidence, 3)
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT INTO tags (namespace, name, value, confidence, item, setter)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(namespace, name, item, setter) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
-    ''', (namespace, name, value, confidence, item, setter))
+    INSERT INTO tags_items (item, tag, value, confidence)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(item, tag) DO UPDATE SET value=excluded.value, confidence=excluded.confidence
+    ''', (item_rowid, tag_rowid, value, confidence))
+
+def get_item_rowid(conn: sqlite3.Connection, sha256: str):
+    cursor = conn.cursor()
+    cursor.execute('SELECT rowid FROM items WHERE sha256 = ?', (sha256,))
+    rowid = cursor.fetchone()
+    if rowid:
+        return rowid[0]
+    return None
 
 def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileScanData):
     cursor = conn.cursor()
@@ -452,8 +491,19 @@ class ItemWithPath:
 
 def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
     cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM tags_items
+    WHERE rowid IN (
+        SELECT tags_items.rowid
+        FROM tags_items
+        JOIN tags_setters as tags
+        ON tags_items.tag = tags.rowid
+        AND tags.setter = ?
+    )
+    ''', (setter,))
+
     result = cursor.execute('''
-    DELETE FROM tags
+    DELETE FROM tags_setters
     WHERE setter = ?
     ''', (setter,))
 
@@ -466,77 +516,6 @@ def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
 
     items_tags_removed = result_items.rowcount
     return tags_removed, items_tags_removed
-
-def get_items_missing_tags(conn: sqlite3.Connection, tag_setter=None):
-    """
-    Get all items that do not have any tags set by the given tag setter
-    If tag_setter is None, get all items that do not have any tags set by any tag setter
-    """
-    cursor = conn.cursor()
-    tag_setter_clause = "AND tags.setter = ?" if tag_setter else ""
-    missing_tags_subquery = f'''
-    WITH ItemsWithoutTags AS (
-        SELECT 
-            items.sha256,
-            items.md5,
-            items.type,
-            items.size,
-            items.time_added
-        FROM items
-        LEFT JOIN tags
-        ON items.sha256 = tags.item
-        {tag_setter_clause}
-        WHERE tags.item IS NULL
-    )'''
-
-    # cursor.execute(f'''
-    # {missing_tags_subquery}
-    # SELECT COUNT(*)
-    # FROM ItemsWithoutTags
-    # ''', (tag_setter,) if tag_setter else ())
-
-    # total_count = cursor.fetchone()[0]
-    # print(f"Count reached: {total_count}")
-
-    query = f'''
-    {missing_tags_subquery}
-    SELECT
-        COUNT(*),
-        iwt.sha256,
-        iwt.md5,
-        iwt.type,
-        iwt.size,
-        iwt.time_added,
-        COALESCE(available_files.path, any_files.path) as path
-    FROM ItemsWithoutTags AS iwt
-    LEFT JOIN files AS available_files
-    ON iwt.sha256 = available_files.sha256
-    AND available_files.available = 1
-    JOIN files AS any_files
-    ON iwt.sha256 = any_files.sha256;
-    '''
-    cursor.execute(query, (tag_setter,) if tag_setter else ())
-
-    # Yield each item
-    remaining_count = -1
-    total_count = 0
-    while row := cursor.fetchone():
-        total_count = row[0]
-        if remaining_count == -1:
-            remaining_count = total_count
-        else:
-            remaining_count -= 1
-        item = ItemWithPath(*row[1:])
-        if os.path.exists(item.path):
-            yield item, remaining_count, total_count
-        else:
-            # If the path does not exist, try to find a working path
-            if file := get_existing_file_for_sha256(conn, item.sha256):
-                item.path = file.path
-                yield item, remaining_count, total_count
-            else:
-                # If no working path is found, skip this item
-                continue
 
 @dataclass
 class FileRecord:
@@ -564,39 +543,24 @@ def get_existing_file_for_sha256(conn: sqlite3.Connection, sha256: str) -> FileR
 def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT namespace, name, value, confidence, setter
-    FROM tags
-    WHERE item = ?
+    SELECT tags.namespace, tags.name, tags_items.value, tags_items.confidence, tags.setter
+    FROM items
+    JOIN tags_items ON items.rowid = tags_items.item
+    AND items.sha256 = ?
+    JOIN tags_setters as tags ON tags_items.tag = tags.rowid
     ''', (sha256,))
     tags = cursor.fetchall()
     return tags
 
 def get_all_tags_for_item_name_confidence(conn: sqlite3.Connection, sha256):
-    cursor = conn.cursor()
-    cursor.execute('''
-    SELECT name, confidence
-    FROM tags
-    WHERE item = ?
-    ''', (sha256,))
-    tags = cursor.fetchall()
-    return tags
+    tags = get_all_tags_for_item(conn, sha256)
+    return [(row[1], row[3]) for row in tags]
 
-def get_tag_names_list(conn):
+def get_tag_names_list(conn: sqlite3.Connection):
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT name FROM tags')
+    cursor.execute('SELECT DISTINCT name FROM tags_setters')
     tag_names = cursor.fetchall()
     return [tag[0] for tag in tag_names]
-
-def get_items_by_tag_name(conn: sqlite3.Connection, tag_name):
-    cursor = conn.cursor()
-    cursor.execute('''
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
-    FROM items
-    JOIN tags ON items.sha256 = tags.item
-    WHERE tags.name = ?
-    ''', (tag_name,))
-    items = cursor.fetchall()
-    return items
 
 @dataclass
 class FileSearchResult:
@@ -634,7 +598,7 @@ def search_files(
 
     # The item mimetype should start with the given item_type
     item_type_condition = f"""
-        JOIN items ON files.sha256 = items.sha256
+        JOIN items ON files.item = items.rowid
         AND items.type LIKE ? || '%'
     """ if item_type else ""
     # The setter should match the given setter
@@ -643,77 +607,80 @@ def search_files(
     tag_namespace_condition = " AND tags.namespace LIKE ? || '%'" if tag_namespace else ""
     # Negative tags should not be associated with the item
     negative_tags_condition = f"""
-        WHERE files.sha256 NOT IN (
-            SELECT item
-            FROM tags
-            WHERE name IN ({','.join(['?']*len(negative_tags))})
-            AND confidence >= ?
+        WHERE files.item NOT IN (
+            SELECT tags_items.item
+            FROM tags_setters as tags
+            JOIN tags_items ON tags.rowid = tags_items.tag
+            AND tags.name IN ({','.join(['?']*len(negative_tags))})
             {tag_setters_condition}
             {tag_namespace_condition}
+            AND tags_items.confidence >= ?
         )
     """ if negative_tags else ""
     # The path needs to *start* with the given path prefix
-    path_condition = f" {' WHERE' if not negative_tags else ' AND'} files.path LIKE ? || '%'" if include_path_prefix else ""
+    path_condition = f" AND files.path LIKE ? || '%'" if include_path_prefix else ""
+    # If tags are not provided, and no negative tags are provided, this needs to start a WHERE clause
+    if include_path_prefix and not tags and not negative_tags:
+        path_condition = f" WHERE files.path LIKE ? || '%'"
 
     having_clause = "HAVING COUNT(DISTINCT tags.name) = ?" if not all_setters_required else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
+
+    main_query = f"""
+        SELECT files.path, files.sha256, files.last_modified
+        FROM tags_setters as tags
+        JOIN tags_items ON tags.rowid = tags_items.tag
+        AND tags.name IN ({','.join(['?']*len(tags))})
+        AND tags_items.confidence >= ?
+        {tag_setters_condition}
+        {tag_namespace_condition}
+        JOIN files ON tags_items.item = files.item
+        {path_condition}
+        {item_type_condition}
+        {negative_tags_condition}
+        GROUP BY files.path
+        {having_clause}
+    """ if tags else f"""
+        SELECT files.path, files.sha256, files.last_modified
+        FROM files
+        {item_type_condition}
+        {negative_tags_condition}
+        {path_condition}
+    """
+    params: List[str] = [
+        param for param in [
+            *((*tags,
+            min_confidence,
+            *setters,
+            tag_namespace,) if tags else ()),
+            (include_path_prefix if tags else None),
+            item_type,
+            *((*negative_tags,
+            *setters,
+            tag_namespace,
+            min_confidence
+            ) if negative_tags else ()),
+            (include_path_prefix if not tags else None),
+            (   
+                # Number of tags to match, or number of tag-setter pairs to match if we require all setters to be present for all tags
+                (len(tags) if not all_setters_required else len(tags) * len(setters))
+                # HAVING clause is not needed if no positive tags are provided
+                if tags else None
+            )
+    ] if param is not None]
     # First query to get the total count of items matching the criteria
     count_query = f"""
     SELECT COUNT(*)
     FROM (
-        SELECT files.path
-        FROM files
-        JOIN tags ON tags.item = files.sha256
-        AND tags.name IN ({','.join(['?']*len(tags))})
-        AND tags.confidence >= ?
-        {tag_setters_condition}
-        {tag_namespace_condition}
-
-        {item_type_condition}
-
-        {negative_tags_condition}
-        {path_condition}
-        GROUP BY files.path
-        {having_clause}
-    )
-    """ if tags else f"""
-
-    SELECT COUNT(*)
-    FROM (
-        SELECT files.path
-        FROM files
-        {item_type_condition}
-        {negative_tags_condition}
-        {path_condition}
+        {main_query}
     )
     """
-    count_params: List[str] = [
-        *((*tags,
-        min_confidence,
-        *setters,
-        tag_namespace,) if tags else ()),
-        item_type,
-        *((*negative_tags,
-           min_confidence,
-           *setters,
-           tag_namespace,) if negative_tags else ()),
-        include_path_prefix,
-        (   
-            # Number of tags to match, or number of tag-setter pairs to match if we require all setters to be present for all tags
-            (len(tags) if not all_setters_required else len(tags) * len(setters))
-            # HAVING clause is not needed if no positive tags are provided
-            if tags else None
-        )
-    ]
-    # Remove None values from the count_params
-    count_params = [param for param in count_params if param is not None]
-    
     cursor = conn.cursor()
     try:
-        cursor.execute(count_query, count_params)
+        cursor.execute(count_query, params)
     except Exception as e:
         print(item_type, include_path_prefix)
         print(count_query)
-        print(count_params)
+        print(params)
         raise e
     total_count: int = cursor.fetchone()[0]
 
@@ -731,34 +698,12 @@ def search_files(
 
     # Second query to get the items with pagination
     query = f"""
-    SELECT files.path, files.sha256, files.last_modified
-    FROM files
-    JOIN tags ON tags.item = files.sha256
-    AND tags.name IN ({','.join(['?']*len(tags))})
-    AND tags.confidence >= ?
-    {tag_setters_condition}
-    {tag_namespace_condition}
-
-    {item_type_condition}
-
-    {negative_tags_condition}
-    {path_condition}
-    GROUP BY files.path
-    {having_clause}
-    ORDER BY {order_by_clause} {order_clause}
-    LIMIT ? OFFSET ?
-
-    """ if tags else f"""
-    SELECT files.path, files.sha256, files.last_modified
-    FROM files
-    {item_type_condition}
-    {negative_tags_condition}
-    {path_condition}
+    {main_query}
     ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
     """
     query_params: List[str] = [
-        *count_params,
+        *params,
         page_size,
         offset
     ]
@@ -766,6 +711,7 @@ def search_files(
     cursor.execute(query, query_params)
     results_count = cursor.rowcount
     while row := cursor.fetchone():
+        print(row)
         file = FileSearchResult(*row, get_mime_type(row[0]))
         if check_path_exists and not os.path.exists(file.path):
             continue
@@ -873,12 +819,12 @@ def delete_tags_without_items(conn: sqlite3.Connection, batch_size: int = 10000)
     while True:
         # Perform the deletion in batches
         cursor.execute('''
-        DELETE FROM tags
+        DELETE FROM tags_items
         WHERE rowid IN (
-            SELECT tags.rowid
-            FROM tags
-            LEFT JOIN items ON items.sha256 = tags.item
-            WHERE items.sha256 IS NULL
+            SELECT tags_items.rowid
+            FROM tags_items
+            LEFT JOIN items ON items.rowid = tags_items.item
+            WHERE items.rowid IS NULL
             LIMIT ?
         )
         ''', (batch_size,))
@@ -929,14 +875,9 @@ def vacuum_database(conn: sqlite3.Connection):
 
 def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None, setters: List[str] = [], confidence_threshold: float | None = None, limit=10):
     cursor = conn.cursor()
-    namespace_clause = "WHERE namespace LIKE ? || '%'" if namespace else ""
-    setters_clause = f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
-    if namespace and setters:
-        setters_clause = f"AND setter IN ({','.join(['?']*len(setters))})"
-
-    confidence_clause = f"WHERE confidence >= ?" if confidence_threshold else ""
-    if confidence_threshold and (namespace or setters):
-        confidence_clause = f"AND confidence >= ?"
+    namespace_clause = "AND tags.namespace LIKE ? || '%'" if namespace else ""
+    setters_clause = f"AND tags.setter IN ({','.join(['?']*len(setters))})" if setters else ""
+    confidence_clause = f"AND tags_items.confidence >= ?" if confidence_threshold else ""
 
     query_args = [arg for arg in [
         namespace,
@@ -947,7 +888,8 @@ def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None,
 
     query = f'''
     SELECT namespace, name, COUNT(*) as count
-    FROM tags
+    FROM tags_setters as tags
+    JOIN tags_items ON tags.rowid = tags_items.tag
     {namespace_clause}
     {setters_clause}
     {confidence_clause}

@@ -12,7 +12,7 @@ def get_labels(setters = None, confidence_threshold=None):
     tags_general = get_most_common_tags_frequency(conn, namespace="danbooru:general", setters=setters, confidence_threshold=confidence_threshold, limit=100)
     conn.close()
     if len(tags_general) == 0 or len(tags_character) == 0:
-        return {"None": 1}
+        return {"None": 1}, {"None": 1}, {"None": 1}
 
     labels_character = {tag[1]: tag[3] for tag in tags_character}
     labels_general = {tag[1]: tag[3] for tag in tags_general if not tag[1].startswith("rating:")}

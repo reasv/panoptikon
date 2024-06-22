@@ -10,7 +10,7 @@ from src.utils import estimate_eta
 import PIL.IcnsImagePlugin
 import PIL.Image
 
-from src.db import insert_tag, add_tag_scan, add_item_tag_scan, get_items_missing_tag_scan
+from src.db import add_tag_scan, add_item_tag_scan, get_items_missing_tag_scan, create_tag_setter, insert_tag_item, get_item_rowid
 from src.wd_tagger import Predictor, V3_MODELS
 from src.video import video_to_frames
 from src.utils import create_image_grid, write_text_on_image
@@ -126,13 +126,13 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
             ("danbooru:general", tag, confidence) for tag, confidence in tag_result.general_tags.items()
             ]
         for namespace, tag, confidence in tags:
-            insert_tag(
+            tag_rowid = create_tag_setter(conn, namespace=namespace, name=tag, setter=setter)
+            item_rowid = get_item_rowid(conn, item.sha256)
+            insert_tag_item(
                 conn,
-                namespace=namespace,
-                name=tag,
-                item=item.sha256,
+                item_rowid=item_rowid,
+                tag_rowid=tag_rowid,
                 confidence=confidence,
-                setter=setter,
                 value=None
             )
         add_item_tag_scan(conn, item=item.sha256, setter=setter, last_scan=scan_time, tags_set=len(tags), tags_removed=0)
