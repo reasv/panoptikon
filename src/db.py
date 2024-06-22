@@ -575,7 +575,7 @@ def build_search_query(
         all_setters_required: bool = False,
         item_type: str | None = None,
         include_path_prefix: str | None = None,
-        any_tags_match: bool = False
+        any_positive_tags_match: bool = False,
     ) -> Tuple[str, List[str]]:
     """
     Build a query to search for files based on the given tags, negative tags, and other conditions.
@@ -627,7 +627,7 @@ def build_search_query(
         {item_type_condition}
         {negative_tags_condition}
         GROUP BY files.path
-        {having_clause if not any_tags_match else ""}
+        {having_clause if not any_positive_tags_match else ""}
     """ if tags else f"""
         SELECT files.path, files.sha256, files.last_modified
         FROM files
@@ -674,7 +674,7 @@ def search_files(
         page_size: int | None = 1000,
         page: int = 1,
         check_path_exists: bool = False,
-        any_tags_match: bool = False
+        any_positive_tags_match: bool = False
     ):
     # Normalize/clean the inputs
     negative_tags = negative_tags or []
@@ -699,8 +699,10 @@ def search_files(
         all_setters_required=all_setters_required,
         item_type=item_type,
         include_path_prefix=include_path_prefix,
-        any_tags_match=any_tags_match
+        any_positive_tags_match=any_positive_tags_match
     )
+
+    print(main_query)
     
     # First query to get the total count of items matching the criteria
     count_query = f"""
