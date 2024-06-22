@@ -48,7 +48,7 @@ def search_by_tags(
     negative_tags = [tag[1:] for tag in tags if tag.startswith("-")]
     tags = [tag for tag in tags if not tag.startswith("-")]
     conn = get_database_connection()
-    print(f"Searching for tags: {tags} with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
+    print(f"Searching for tags: {tags} (negative tags: {negative_tags}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}")
     start = time()
     res_list = list(search_files(
         conn,
