@@ -659,6 +659,11 @@ def build_search_query(
 
     return main_query, params
 
+def print_search_query(query_str: str, params: List[str | float | int]):
+    # Quote strings in params
+    quoted_params = [f"'{param}'" if isinstance(param, str) else param for param in params]
+    print(query_str.replace('?', '{}').format(*quoted_params))
+
 def search_files(
         conn: sqlite3.Connection,
         tags: List[str],
@@ -789,8 +794,6 @@ def search_files(
             {negative_tags_query}
             """
         params += negative_tags_params
-    
-    print(main_query)
 
     # First query to get the total count of items matching the criteria
     count_query = f"""
@@ -799,12 +802,14 @@ def search_files(
         {main_query}
     )
     """
+    # Debugging
+    # print_search_query(count_query, params)
     cursor = conn.cursor()
     try:
         cursor.execute(count_query, params)
     except Exception as e:
-        print(count_query)
-        print(params)
+        # Debugging
+        print_search_query(count_query, params)
         raise e
     total_count: int = cursor.fetchone()[0]
 
@@ -835,7 +840,6 @@ def search_files(
     cursor.execute(query, query_params)
     results_count = cursor.rowcount
     while row := cursor.fetchone():
-        print(row)
         file = FileSearchResult(*row, get_mime_type(row[0]))
         if check_path_exists and not os.path.exists(file.path):
             continue
