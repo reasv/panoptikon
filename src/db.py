@@ -592,6 +592,7 @@ def search_files(
     tag_namespace = tag_namespace or None
     item_type = item_type or None
     include_path_prefix = include_path_prefix or None
+    min_confidence = min_confidence or None
     setters = setters or []
     page_size = page_size or 1000000 # Mostly for debugging purposes
     offset = (page - 1) * page_size
@@ -605,6 +606,10 @@ def search_files(
     tag_setters_condition = f" AND tags.setter IN ({','.join(['?']*len(setters))})" if setters else ""
     # The namespace needs to *start* with the given namespace
     tag_namespace_condition = " AND tags.namespace LIKE ? || '%'" if tag_namespace else ""
+
+    # The confidence should be greater than or equal to the given confidence
+    min_confidence_condition = f"AND tags_items.confidence >= ?" if min_confidence else ""
+
     # Negative tags should not be associated with the item
     negative_tags_condition = f"""
         WHERE files.item NOT IN (
@@ -614,7 +619,7 @@ def search_files(
             AND tags.name IN ({','.join(['?']*len(negative_tags))})
             {tag_setters_condition}
             {tag_namespace_condition}
-            AND tags_items.confidence >= ?
+            {min_confidence_condition}
         )
     """ if negative_tags else ""
     # The path needs to *start* with the given path prefix
@@ -630,7 +635,7 @@ def search_files(
         FROM tags_setters as tags
         JOIN tags_items ON tags.rowid = tags_items.tag
         AND tags.name IN ({','.join(['?']*len(tags))})
-        AND tags_items.confidence >= ?
+        {min_confidence_condition}
         {tag_setters_condition}
         {tag_namespace_condition}
         JOIN files ON tags_items.item = files.item
