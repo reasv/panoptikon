@@ -583,7 +583,8 @@ def search_files(
         order: str | None = None,
         page_size: int | None = 1000,
         page: int = 1,
-        check_path_exists: bool = False
+        check_path_exists: bool = False,
+        any_tags_match: bool = False
     ):
     negative_tags = negative_tags or []
     tags = tags or []
@@ -643,7 +644,7 @@ def search_files(
         {item_type_condition}
         {negative_tags_condition}
         GROUP BY files.path
-        {having_clause}
+        {having_clause if not any_tags_match else ""}
     """ if tags else f"""
         SELECT files.path, files.sha256, files.last_modified
         FROM files
