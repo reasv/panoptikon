@@ -132,7 +132,7 @@ def seconds_to_hms(seconds):
     # Format the time as a string in the format HHhMMmSSs eg 1h23m45s
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
-    remaining_seconds = round(seconds % 60, 1)
+    remaining_seconds = int(round(seconds % 60, 0))
     if hours == 0 and minutes == 0:
         return f"{remaining_seconds}s"
     if hours == 0:
