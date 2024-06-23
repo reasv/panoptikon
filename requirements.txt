@@ -4,3 +4,4 @@ onnxruntime>=1.12.0
 imageio[ffmpeg]>=0.5.1
 paddleocr>=2.7.5
 paddlepaddle-gpu>=2.6.1
+open_clip_torch>=2.24

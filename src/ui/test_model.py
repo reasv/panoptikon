@@ -6,6 +6,7 @@ import PIL.Image
 # from src.deepdanbooru import predict, load_labels, load_model
 from src.wd_tagger import Predictor, V3_MODELS
 from src.ui.paddleocr import create_paddleocr_UI
+from src.ui.clip import create_CLIP_ui
 
 def create_model_demo():
     with gr.TabItem(label="Models"):
@@ -14,6 +15,8 @@ def create_model_demo():
                 create_wd_tagger_UI()
             with gr.Tab(label="PaddleOCR"):
                 create_paddleocr_UI()
+            with gr.Tab(label="CLIP Semantic Search"):
+                create_CLIP_ui()
 
 def create_wd_tagger_UI():
     TITLE = "WaifuDiffusion Tagger"
