@@ -1,6 +1,7 @@
 from typing import List
 import hashlib
-
+from PIL import Image
+import numpy as np
 import gradio as gr
 
 from src.ui.components.multi_view import create_multiview
@@ -32,11 +33,20 @@ def create_CLIP_ui():
     with gr.Column():
         gr.Markdown(DESCRIPTION)
         with gr.Row():
-            folder_path = gr.Textbox(label="Folder Path")
-            generate_embeddings = gr.Button("Generate Embeddings")
-            delete_embeddings_button = gr.Button("Unload Model/Embeddings")
-            text_query = gr.Textbox(label="Text Query", value="a cat", interactive=True)
-            search = gr.Button("Search", interactive=False)
+            with gr.Column():
+                with gr.Row():
+                    folder_path = gr.Textbox(label="Folder Path")
+                    generate_embeddings = gr.Button("Generate Embeddings")
+                    delete_embeddings_button = gr.Button("Unload Model/Embeddings")
+            with gr.Column():
+                with gr.Row():
+                    with gr.Tabs():
+                        with gr.Tab(label="Text Query"):
+                            text_query = gr.Textbox(label="Text Query", value="a cat", interactive=True)
+                            search = gr.Button("Search", interactive=False)
+                        with gr.Tab(label="Image Query"):
+                            image_query = gr.Image(label="Reverse Image Search", interactive=True)
+                            search_image = gr.Button("Search Image", interactive=False)
         with gr.Row():
             multiview = create_multiview()
 
@@ -47,9 +57,9 @@ def create_CLIP_ui():
         embeddings = clip.get_image_embeddings(image_paths)
         # Create a dictionary of image sha256 to embeddings
         embeddings = {file.sha256: embedding for file, embedding in zip(files, embeddings)}
-        return files, gr.update(interactive=True)
+        return files, gr.update(interactive=True), gr.update(interactive=True)
 
-    def search_images(folder_path: str, text_query: str, current_files: List[FileSearchResult]):
+    def search_with_text(folder_path: str, text_query: str, current_files: List[FileSearchResult]):
         nonlocal clip, embeddings
         if text_query == "":
             return get_images(folder_path)
@@ -59,20 +69,29 @@ def create_CLIP_ui():
         ranked_images = [images_dict[hash] for hash in clip.rank_images_by_similarity(embeddings, text_embedding)]
         return ranked_images
     
+    def search_with_image(folder_path: str, image: Image.Image, current_files: List[FileSearchResult]):
+        nonlocal clip, embeddings
+        if image is None:
+            return get_images(folder_path)
+        image_embedding = clip.get_image_embeddings([Image.fromarray(np.array(image))])[0]
+        images_dict = {file.sha256: file for file in current_files}
+        ranked_images = [images_dict[hash] for hash in clip.rank_images_by_similarity(embeddings, image_embedding)]
+        return ranked_images
+    
     def delete_embeddings():
         nonlocal clip, embeddings
         clip.unload_model()
         embeddings = {}
-        return [], gr.update(interactive=False),
+        return [], gr.update(interactive=False), gr.update(interactive=False)
 
     generate_embeddings.click(
         fn=embed_images,
         inputs=[folder_path],
-        outputs=[multiview.files, search]
+        outputs=[multiview.files, search, search_image]
     )
 
     search.click(
-        fn=search_images,
+        fn=search_with_text,
         inputs=[folder_path, text_query, multiview.files],
         outputs=[multiview.files]
     )
@@ -80,5 +99,11 @@ def create_CLIP_ui():
     delete_embeddings_button.click(
         fn=delete_embeddings,
         inputs=[],
-        outputs=[multiview.files, search]
+        outputs=[multiview.files, search, search_image]
+    )
+
+    search_image.click(
+        fn=search_with_image,
+        inputs=[folder_path, image_query, multiview.files],
+        outputs=[multiview.files]
     )

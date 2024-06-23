@@ -26,7 +26,11 @@ class CLIPEmbedder:
 
         for i in range(0, len(image_paths), self.batch_size):
             batch_paths = image_paths[i:i + self.batch_size]
-            batch_images = [self.preprocess(Image.open(image_path)).unsqueeze(0) for image_path in batch_paths] # type: ignore
+            # Check if they're all PIL images rather than paths
+            if all(isinstance(image_path, Image.Image) for image_path in batch_paths):
+                batch_images = [self.preprocess(image_path).unsqueeze(0) for image_path in batch_paths] # type: ignore
+            else:
+                batch_images = [self.preprocess(Image.open(image_path)).unsqueeze(0) for image_path in batch_paths] # type: ignore
             batch_images = torch.cat(batch_images).to(self.device)
 
             with torch.no_grad(), torch.cuda.amp.autocast():
