@@ -72,7 +72,7 @@ if __name__ == '__main__':
     duration_last_page_no_results = []
     n_results = []
     page_size = 100
-    use_total_count = False
+    use_total_count = True
     for i in range(1000):
         random.seed(i)
         start_time = time()
