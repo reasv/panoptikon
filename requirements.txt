@@ -2,3 +2,5 @@ gradio==4.36.0
 pillow==10.2.0
 onnxruntime>=1.12.0
 imageio[ffmpeg]>=0.5.1
+paddleocr>=2.7.5
+paddlepaddle-gpu>=2.6.1
