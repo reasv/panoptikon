@@ -24,19 +24,28 @@ def on_tab_load():
 class BookmarkFolderChooser:
     bookmark_folder_choice: gr.Dropdown
 
-def create_bookmark_folder_chooser(parent_tab: gr.TabItem=None, bookmarks_namespace: gr.State = None):
-    bookmark_folder_choice = gr.Dropdown(choices=get_all_bookmark_folders(), value="default", allow_custom_value=True, visible=bookmarks_namespace != None, label="Bookmark group name", scale=1)
-
-    parent_tab.select(
-        fn=on_tab_load,
-        outputs=[bookmark_folder_choice]
+def create_bookmark_folder_chooser(parent_tab: gr.TabItem | None = None, bookmarks_namespace: gr.State | None = None):
+    bookmark_folder_choice = gr.Dropdown(
+        choices=[(c,c) for c in get_all_bookmark_folders()],
+        value="default",
+        allow_custom_value=True,
+        visible=bookmarks_namespace != None,
+        label="Bookmark group name",
+        scale=1
     )
 
-    bookmarks_namespace.change(
-        fn=on_bookmark_folder_change,
-        inputs=[bookmarks_namespace],
-        outputs=[bookmark_folder_choice]
-    )
+    if parent_tab is not None:
+        parent_tab.select(
+            fn=on_tab_load,
+            outputs=[bookmark_folder_choice]
+        )
+
+    if bookmarks_namespace is not None:
+        bookmarks_namespace.change(
+            fn=on_bookmark_folder_change,
+            inputs=[bookmarks_namespace],
+            outputs=[bookmark_folder_choice]
+        )
 
     bookmark_folder_choice.input(
         fn=on_input,

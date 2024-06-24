@@ -62,7 +62,9 @@ def scan_files(
         except Exception as e:
             yield None
 
-        md5, sha256 = None, None
+        md5: str | None = None
+        sha256: str | None = None
+
         file_modified = True # Assume the file has been modified
 
         # Check if the file is already in the database
@@ -70,14 +72,14 @@ def scan_files(
             # Check if the file has been modified since the last scan
             if parse_iso_date(file_data["last_modified"]) == int(os.stat(file_path).st_mtime):
                 # Reuse the existing hash and mime type
-                md5: str = file_data["md5"]
-                sha256: str = file_data["sha256"]
+                md5 = file_data["md5"]
+                sha256 = file_data["sha256"]
                 file_modified = False
             else:
                 # File has been modified since the last scan
                 file_modified = True
 
-        if not sha256:
+        if sha256 is None or md5 is None:
             print(f"Calculating hashes for {file_path}")
             try:
                 md5, sha256 = calculate_hashes(file_path)
@@ -89,9 +91,9 @@ def scan_files(
                 yield None
 
         yield FileScanData(
-            sha256=sha256,
-            md5=md5,
-            mime_type=mime_type,
+            sha256=sha256, # type: ignore
+            md5=md5, # type: ignore
+            mime_type=mime_type, # type: ignore
             last_modified=last_modified,
             size=file_size,
             path=file_path,

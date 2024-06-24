@@ -3,36 +3,10 @@ import os
 import subprocess
 from io import BytesIO
 
-import cv2
-import numpy as np
 from PIL.Image import Image
 import PIL.Image
 
 from src.utils import create_image_grid
-
-def extract_frames(video_path, num_frames=10):
-    """
-    Extract a specified number of evenly spaced frames from a video.
-    :param video_path: Path to the video file
-    :param num_frames: Number of frames to extract
-    :return: List of extracted frames as PIL Images
-    """
-    frames = []
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_indices = np.linspace(0, total_frames - 1, num=num_frames, dtype=int)
-    
-    for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        success, image = cap.read()
-        if success:
-            # Convert the frame to RGB and then to a PIL Image
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            pil_image = PIL.Image.fromarray(image)
-            frames.append(pil_image)
-    
-    cap.release()
-    return frames
 
 def select_representative_frames(frames, max_frames):
     """
@@ -62,40 +36,6 @@ def select_representative_frames(frames, max_frames):
     selected_frames = [frames[i] for i in indices]
     
     return selected_frames
-
-def extract_keyframes(video_path, threshold=0.8) -> List[Image]:
-    """
-    Extract keyframes from a video based on color histogram differences.
-    :param video_path: Path to the video file
-    :param threshold: Threshold for histogram difference to consider a frame as keyframe
-    :return: List of extracted keyframes as PIL Images
-    """
-    keyframes: List[Image] = []
-    cap = cv2.VideoCapture(video_path)
-    ret, prev_frame = cap.read()
-    if not ret:
-        return keyframes
-
-    prev_hist = cv2.calcHist([prev_frame], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-    prev_hist = cv2.normalize(prev_hist, prev_hist).flatten()
-    keyframes.append(PIL.Image.fromarray(cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB)))
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        hist = cv2.calcHist([frame], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        
-        hist_diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
-        
-        if hist_diff < threshold:
-            keyframes.append(PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            prev_hist = hist
-    
-    cap.release()
-    return keyframes
 
 def saveImages(basePath, images: List[Image]):
     # Normalize the path
@@ -183,31 +123,14 @@ def extract_frames_ffmpeg(path: str, num_frames: int):
     
     return frames
 
-def video_to_frames(video_path: str, keyframe_threshold=0.8, num_frames: int = None, thumbnail_save_path=None) -> List[Image]:
+def video_to_frames(video_path: str, num_frames: int | None = None) -> List[Image]:
     """
     Extract keyframes from a video and save them as images.
     :param video_path: Path to the video file
     :param keyframe_threshold: Threshold for keyframe extraction
     :param num_frames: Number of frames to extract (default: None, extract all keyframes)
     """
+    if num_frames is None:
+        num_frames = 4
     keyframes = extract_frames_ffmpeg(video_path, num_frames=num_frames)
-    # if keyframe_threshold:
-    #     # Extract keyframes from the video
-    #     keyframes = extract_keyframes(video_path, threshold=keyframe_threshold)
-    # else:
-    #     # Extract frames from the video
-    #     if not num_frames:
-    #         num_frames = 1
-    #     
-
-    # if num_frames and len(keyframes) > num_frames:
-    #     # Select representative frames
-    #     keyframes: List[Image] = select_representative_frames(keyframes, max_frames=num_frames)
-
-    # if num_frames and len(keyframes) < num_frames:
-    #     additional_samples = extract_frames(video_path, num_frames=num_frames-len(keyframes))
-    #     keyframes.extend(additional_samples)
-    # # Save the keyframes as images
-    # if thumbnail_save_path:
-    #     saveImages(thumbnail_save_path, images=keyframes)
     return keyframes

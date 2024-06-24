@@ -40,7 +40,7 @@ def create_wd_tagger_UI():
             with gr.Column(variant="panel"):
                 image = gr.Image(type="pil", image_mode="RGBA", label="Input")
                 model_repo = gr.Dropdown(
-                    dropdown_list,
+                    choices=[(c,c) for c in dropdown_list],
                     value=V3_MODELS[0],
                     label="Model",
                 )
@@ -114,7 +114,7 @@ def create_wd_tagger_UI():
 
         sorted_general_strings = [x[0] for x in sorted_general_strings]
         sorted_general_strings = (
-            ", ".join(sorted_general_strings).replace("(", "\(").replace(")", "\)")
+            ", ".join(sorted_general_strings).replace("(", r"\(").replace(")", r"\)")
         )
         return rating, character_res, general_res, sorted_general_strings
 

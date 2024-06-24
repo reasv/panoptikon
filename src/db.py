@@ -184,7 +184,7 @@ def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):
     ''', (namespace, name, setter))
 
     tag_setter_inserted = result.rowcount > 0
-    if tag_setter_inserted:
+    if tag_setter_inserted and cursor.lastrowid is not None:
         rowid: int = cursor.lastrowid
     else:
         rowid: int = cursor.execute('SELECT rowid FROM tags_setters WHERE namespace = ? AND name = ? AND setter = ?', (namespace, name, setter)).fetchone()[0]
@@ -200,7 +200,7 @@ def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, c
     ON CONFLICT(item, tag) DO UPDATE SET confidence=excluded.confidence
     ''', (item_rowid, tag_rowid, confidence))
 
-def get_item_rowid(conn: sqlite3.Connection, sha256: str):
+def get_item_rowid(conn: sqlite3.Connection, sha256: str) -> int | None:
     cursor = conn.cursor()
     cursor.execute('SELECT rowid FROM items WHERE sha256 = ?', (sha256,))
     rowid = cursor.fetchone()
@@ -229,7 +229,7 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
     item_inserted = item_insert_result.rowcount > 0
 
     # Get the rowid of the inserted item, if it was inserted
-    item_rowid = cursor.lastrowid if item_inserted else None
+    item_rowid: int | None = cursor.lastrowid if item_inserted else None
     
     file_updated = False
     if path_in_db and not file_modified:
@@ -251,7 +251,7 @@ def update_file_data(conn: sqlite3.Connection, scan_time: str, file_data: FileSc
 
         if not item_rowid:
             # If the item was not inserted, get the rowid from the database
-            item_rowid: int = cursor.execute('SELECT rowid FROM items WHERE sha256 = ?', (sha256,)).fetchone()[0]
+            item_rowid = cursor.execute('SELECT rowid FROM items WHERE sha256 = ?', (sha256,)).fetchone()[0]
 
         # Path does not exist or has been modified, insert new
         file_insert_result = cursor.execute('''
@@ -468,7 +468,7 @@ def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
 
     remaining_count: int = total_count
     while row := cursor.fetchone():
-        item = ItemWithPath(*row, "")
+        item = ItemWithPath(*row, "") # type: ignore
         remaining_count -= 1
         if file := get_existing_file_for_sha256(conn, item.sha256):
             item.path = file.path
@@ -571,12 +571,12 @@ def build_search_query(
         negative_tags: List[str] | None = None,
         tag_namespace: str | None = None,
         min_confidence: float | None = 0.5,
-        setters: List[str] | None = None,
+        setters: List[str] = [],
         all_setters_required: bool = False,
         item_type: str | None = None,
         include_path_prefix: str | None = None,
         any_positive_tags_match: bool = False,
-    ) -> Tuple[str, List[str]]:
+    ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags, negative tags, and other conditions.
     """
@@ -635,7 +635,7 @@ def build_search_query(
         {negative_tags_condition}
         {path_condition}
     """
-    params: List[str] = [
+    params: List[str | int | float] = [
         param for param in [
             *((*tags,
             min_confidence,
@@ -670,9 +670,9 @@ def print_search_query(query_str: str, params: List[str | float | int]):
 def search_files(
         conn: sqlite3.Connection,
         tags: List[str],
-        tags_match_any: List[str] = None,
+        tags_match_any: List[str] | None = None,
         negative_tags: List[str] | None = None,
-        negative_tags_match_all: List[str] = None,
+        negative_tags_match_all: List[str] | None = None,
         tag_namespace: str | None = None,
         min_confidence: float | None = 0.5,
         setters: List[str] | None = None,
@@ -838,7 +838,7 @@ def search_files(
     ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
     """
-    query_params: List[str] = [
+    query_params: List[str | int | float] = [
         *params,
         page_size,
         offset
@@ -847,7 +847,7 @@ def search_files(
     cursor.execute(query, query_params)
     results_count = cursor.rowcount
     while row := cursor.fetchone():
-        file = FileSearchResult(*row, get_mime_type(row[0]))
+        file = FileSearchResult(*row, get_mime_type(row[0])) # type: ignore
         if check_path_exists and not os.path.exists(file.path):
             continue
         yield file, total_count
@@ -1008,12 +1008,12 @@ def vacuum_database(conn: sqlite3.Connection):
     conn.execute('VACUUM')
     conn.execute('ANALYZE')
 
-def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None, setters: List[str] = [], confidence_threshold: float | None = None, limit=10):
+def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None, setters: List[str] | None = [], confidence_threshold: float | None = None, limit=10):
     cursor = conn.cursor()
     namespace_clause = "AND tags.namespace LIKE ? || '%'" if namespace else ""
     setters_clause = f"AND tags.setter IN ({','.join(['?']*len(setters))})" if setters else ""
     confidence_clause = f"AND tags_items.confidence >= ?" if confidence_threshold else ""
-
+    setters = setters or []
     query_args = [arg for arg in [
         namespace,
         *setters,
@@ -1037,7 +1037,7 @@ def get_most_common_tags(conn: sqlite3.Connection, namespace: str | None = None,
     tags = cursor.fetchall()
     return tags
 
-def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] = [], confidence_threshold=None, limit=10):
+def get_most_common_tags_frequency(conn: sqlite3.Connection, namespace=None, setters: List[str] | None = [], confidence_threshold=None, limit=10):
     tags = get_most_common_tags(conn, namespace=namespace, setters=setters, confidence_threshold=confidence_threshold, limit=limit)
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
@@ -1067,7 +1067,7 @@ def update_bookmarks(conn: sqlite3.Connection, items_sha256: List[str], namespac
     WHERE sha256 NOT IN ({}) AND namespace = ?
     '''.format(','.join(['?']*len(items_sha256)), items_sha256, namespace))
 
-def add_bookmark(conn: sqlite3.Connection, sha256: str, namespace: str='default', metadata: str=None):
+def add_bookmark(conn: sqlite3.Connection, sha256: str, namespace: str='default', metadata: str | None = None):
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO bookmarks (namespace, sha256, time_added, metadata)
@@ -1180,7 +1180,7 @@ def get_bookmarks(
     
     bookmarks: List[FileSearchResult] = []
     for row in cursor.fetchall():
-        item = FileSearchResult(*row, get_mime_type(row[0]))
+        item = FileSearchResult(*row, get_mime_type(row[0])) # type: ignore
         if not os.path.exists(item.path):
             if file := get_existing_file_for_sha256(conn, item.sha256):
                 item.path = file.path

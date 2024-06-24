@@ -67,7 +67,7 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
     """
     try:
         if mime_type.startswith("video"):
-            frames = video_to_frames(path, keyframe_threshold=None, num_frames=4)
+            frames = video_to_frames(path, num_frames=4)
             if not frames:
                 raise Exception("No frames found")
             os.makedirs("./thumbs", exist_ok=True)
@@ -129,6 +129,7 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
         for namespace, tag, confidence in tags:
             tag_rowid = create_tag_setter(conn, namespace=namespace, name=tag, setter=setter)
             item_rowid = get_item_rowid(conn, item.sha256)
+            assert item_rowid is not None
             insert_tag_item(
                 conn,
                 item_rowid=item_rowid,

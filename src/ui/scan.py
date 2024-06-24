@@ -155,7 +155,7 @@ def create_scan_UI():
                     delete_unavailable_files = gr.Checkbox(label="Remove files from the database if they are no longer found on the filesystem", value=True, interactive=True)
             with gr.Row():
                 with gr.Column():
-                    model_choice = gr.Dropdown(label="Tagging Model(s) to Use", multiselect=True, choices=V3_MODELS, value=[V3_MODELS[0]])
+                    model_choice = gr.Dropdown(label="Tagging Model(s) to Use", multiselect=True, value=[V3_MODELS[0]], choices=[(model, model) for model in V3_MODELS])
                     with gr.Row():
                         regenerate_tags_button = gr.Button("Generate Tags for Files Missing Tags")
                         delete_tags_button = gr.Button("Delete ALL Tags set by selected Model(s)")

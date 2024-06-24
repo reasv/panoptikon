@@ -27,7 +27,7 @@ def create_toptags_UI():
                 with gr.Column():
                     top_tags_rating = gr.Label(label="Rating tags")
                     top_tags_characters = gr.Label(label="Character tags")
-                    include_from_models = gr.Dropdown(label="Only include tags from model(s)", value=[], multiselect=True, choices=V3_MODELS)
+                    include_from_models = gr.Dropdown(label="Only include tags from model(s)", value=[], multiselect=True, choices=[(c,c) for c in V3_MODELS])
                     confidence_threshold = gr.Slider(label="Confidence threshold", minimum=0.05, maximum=1, step=0.01, value=0.1)
                     refresh_button = gr.Button("Update")
                 top_tags_general = gr.Label(label="General tags")

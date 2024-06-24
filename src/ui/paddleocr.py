@@ -1,5 +1,5 @@
 import gradio as gr
-from paddleocr import PaddleOCR, draw_ocr
+from paddleocr import PaddleOCR, draw_ocr # type: ignore
 from PIL import Image
 import numpy as np
 

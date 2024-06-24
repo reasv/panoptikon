@@ -9,20 +9,20 @@ from src.ui.components.bookmark_folder_selector import create_bookmark_folder_ch
 from src.ui.components.multi_view import create_multiview
 from src.db import FileSearchResult
 
-def get_bookmarks_paths(bookmarks_namespace: str, order_by: str = "time_added", order: str = None):
+def get_bookmarks_paths(bookmarks_namespace: str, order_by: str = "time_added", order: str | None = None):
     if order == "default":
         order = None
     bookmarks, total_bookmarks = get_all_bookmarks_in_folder(bookmarks_namespace, order_by=order_by, order=order)
     print(f"Bookmarks fetched from {bookmarks_namespace} folder. Total: {total_bookmarks}, Displayed: {len(bookmarks)}")
     return bookmarks
 
-def erase_bookmarks_fn(bookmarks_namespace: str, keep_last_n: int, order_by: str = "time_added", order: str = None):
+def erase_bookmarks_fn(bookmarks_namespace: str, keep_last_n: int, order_by: str = "time_added", order: str | None = None):
     delete_bookmarks_except_last_n(bookmarks_namespace, keep_last_n)
     print("Bookmarks erased")
     bookmarks = get_bookmarks_paths(bookmarks_namespace, order_by=order_by, order=order)
     return bookmarks
 
-def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[FileSearchResult], order_by: str = "time_added", order: str = None):
+def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[FileSearchResult], order_by: str = "time_added", order: str | None = None):
     if len(selected_files) == 0:
         print("No bookmark selected")
         return
@@ -31,11 +31,11 @@ def delete_bookmark_fn(bookmarks_namespace: str, selected_files: List[FileSearch
     bookmarks = get_bookmarks_paths(bookmarks_namespace, order_by=order_by, order=order)
     return bookmarks
 
-def build_bookmark_query(bookmarks_namespace: str, page_size: int = 1000, page: int = 1, order_by: str = "time_added", order: str = None):
+def build_bookmark_query(bookmarks_namespace: str, page_size: int = 1000, page: int = 1, order_by: str = "time_added", order: str | None = None):
     order_str = f"&order={order}" if order else ""
     return f"/bookmarks/{bookmarks_namespace}?order_by={order_by}{order_str}"
 
-def bookmark_query_text(bookmarks_namespace: str, page_size: int = 1000, page: int = 1, order_by: str = "time_added", order: str = None):
+def bookmark_query_text(bookmarks_namespace: str, page_size: int = 1000, page: int = 1, order_by: str = "time_added", order: str | None = None):
     if order == "default":
         order = None
     return f"[View Bookmark folder in Gallery]({build_bookmark_query(bookmarks_namespace, page_size=page_size, page=page, order_by=order_by, order=order)})"

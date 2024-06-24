@@ -9,7 +9,7 @@ from src.ui.components.multi_view import create_multiview
 from src.wd_tagger import V3_MODELS
 from src.tags import get_threshold_from_env
 
-def build_query(tags: list, min_tag_confidence: float, include_path: str = None, page_size: int = 10, page: int = 1, order_by: str = "last_modified", order = None):
+def build_query(tags: list, min_tag_confidence: float | None, include_path: str | None = None, page_size: int = 10, page: int = 1, order_by: str = "last_modified", order = None):
     if not include_path: include_path = ""
 
     if include_path.strip() != "":
@@ -27,7 +27,7 @@ def search_by_tags(
         tags_str: str,
         min_tag_confidence: float | None,
         results_per_page: int,
-        include_path: str = None,
+        include_path: str | None = None,
         page: int = 1,
         order_by: str = "last_modified",
         order = None,
@@ -40,7 +40,7 @@ def search_by_tags(
     if order not in ["asc", "desc", None]: order = None
 
     minimum_confidence_threshold = get_threshold_from_env()
-    if min_tag_confidence <= minimum_confidence_threshold:
+    if not min_tag_confidence or min_tag_confidence <= minimum_confidence_threshold:
         min_tag_confidence = None
 
     include_path = include_path.strip() if include_path is not None else None
@@ -95,7 +95,7 @@ def search_by_tags_search_button(
         tags_str: str,
         min_tag_confidence: float,
         results_per_page: int,
-        include_path: str = None,
+        include_path: str | None = None,
         page: int = 1,
         order_by: str = "last_modified",
         order = None,
@@ -122,7 +122,7 @@ def search_by_tags_next_page(
         tags_str: str,
         min_tag_confidence: float,
         results_per_page: int,
-        include_path: str = None,
+        include_path: str | None = None,
         page: int = 1,
         order_by: str = "last_modified",
         order = None,
@@ -149,7 +149,7 @@ def search_by_tags_previous_page(
         tags_str: str,
         min_tag_confidence: float,
         results_per_page: int,
-        include_path: str = None,
+        include_path: str | None = None,
         page: int = 1,
         order_by: str = "last_modified",
         order = None,
@@ -184,7 +184,7 @@ def on_tab_load():
 def on_tag_select(selectData: gr.SelectData):
     return selectData.value
 
-def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.State = None):
+def create_search_UI(select_history: gr.State | None = None, bookmarks_namespace: gr.State | None = None):
     with gr.TabItem(label="Tag Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -199,13 +199,13 @@ def create_search_UI(select_history: gr.State = None, bookmarks_namespace: gr.St
                                     tag_input = gr.Textbox(label="Enter tags separated by commas", value='', show_copy_button=True, scale=3)
                                     min_confidence = gr.Slider(minimum=0.05, maximum=1, value=get_threshold_from_env(), step=0.05, label="Min. Confidence Level for Tags", scale=2)
                                     max_results_per_page = gr.Slider(minimum=0, maximum=500, value=10, step=1, label="Results per page (0 for max)", scale=2)
-                                    selected_folder = gr.Dropdown(label="Limit search to items under path", choices=get_folder_list(), allow_custom_value=True, scale=2)
+                                    selected_folder = gr.Dropdown(label="Limit search to items under path", choices=[(folder, folder) for folder in get_folder_list()], allow_custom_value=True, scale=2)
                                     order_by = gr.Radio(choices=["path", "last_modified"], label="Order by", value="last_modified", scale=2)
                         with gr.Tab(label="Advanced Options"):
                             with gr.Group():
                                 with gr.Row():
                                     order = gr.Radio(choices=["asc", "desc", "default"], label="Order", value="default", scale=2)
-                                    tag_setters = gr.Dropdown(label="Only search tags set by model(s)", multiselect=True, choices=V3_MODELS, value=[], scale=2)
+                                    tag_setters = gr.Dropdown(label="Only search tags set by model(s)", multiselect=True, choices=[(m, m) for m in V3_MODELS], value=[], scale=2)
                                     all_setters_required = gr.Checkbox(label="Require ALL selected models to have set each tag", scale=1)
                                     item_type = gr.Dropdown(label="Item MimeType Prefix", choices=["image/", "video/", "image/png", "image/jpeg", "video/mp4"], allow_custom_value=True, multiselect=False, value=None, scale=2)
                                     namespace_prefix = gr.Dropdown(

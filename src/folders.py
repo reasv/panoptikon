@@ -128,8 +128,8 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
     new_included_folders = [normalize_path(p) for p in included_folders if len(p.strip()) > 0]
     new_excluded_folders = [normalize_path(p) for p in excluded_folders if len(p.strip()) > 0]
     
-    included_deleted = delete_folders_not_in_list(conn, new_included_folders, included=True)
-    excluded_deleted = delete_folders_not_in_list(conn, new_excluded_folders, included=False)
+    included_deleted = delete_folders_not_in_list(conn=conn, folder_paths=new_included_folders, included=True)
+    excluded_deleted = delete_folders_not_in_list(conn=conn, folder_paths=new_excluded_folders, included=False)
 
     scan_time = datetime.now().isoformat()
     included_added = []

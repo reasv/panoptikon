@@ -84,7 +84,7 @@ def get_all_items_with_tags(
         min_confidence: float,
         page_size: int = 1000,
         page: int = 1,
-        include_path: str=None,
+        include_path: str | None = None,
         order_by: str = "last_modified",
         order = None
     ) -> Tuple[List[FileSearchResult], int]:

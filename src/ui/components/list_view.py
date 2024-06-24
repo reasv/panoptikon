@@ -89,8 +89,8 @@ class ImageList:
 def create_image_list(
         selected_files: gr.State,
         files: gr.State,
-        parent_tab: gr.TabItem = None,
-        bookmarks_namespace: gr.State = None,
+        parent_tab: gr.TabItem | None = None,
+        bookmarks_namespace: gr.State | None = None,
         extra_actions: List[str] = [],
     ):
     with gr.Row():
@@ -183,11 +183,12 @@ def create_image_list(
             inputs=[bookmarks_namespace, selected_files],
             outputs=[bookmark]
         )
-        parent_tab.select(
-            fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_namespace, selected_files],
-            outputs=[bookmark]
-        )
+        if parent_tab is not None:
+            parent_tab.select(
+                fn=on_selected_image_get_bookmark_state,
+                inputs=[bookmarks_namespace, selected_files],
+                outputs=[bookmark]
+            )
 
     return ImageList(
         file_list=file_list,

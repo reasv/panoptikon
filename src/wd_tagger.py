@@ -1,3 +1,4 @@
+from typing import List
 import huggingface_hub
 import numpy as np
 import onnxruntime as rt
@@ -49,7 +50,7 @@ kaomojis = [
     "||_||",
 ]
 
-def load_labels(dataframe) -> list[str]:
+def load_labels(dataframe) -> List[List[str]]:
     name_series = dataframe["name"]
     name_series = name_series.map(
         lambda x: x.replace("_", " ") if x not in kaomojis else x
@@ -59,7 +60,7 @@ def load_labels(dataframe) -> list[str]:
     rating_indexes = list(np.where(dataframe["category"] == 9)[0])
     general_indexes = list(np.where(dataframe["category"] == 0)[0])
     character_indexes = list(np.where(dataframe["category"] == 4)[0])
-    return tag_names, rating_indexes, general_indexes, character_indexes
+    return [tag_names, rating_indexes, general_indexes, character_indexes]
 
 def mcut_threshold(probs):
     """
@@ -148,9 +149,9 @@ class Predictor:
     def predict(
         self,
         image,
-        model_repo: str = None,
-        general_thresh: float = None,
-        character_thresh: float = None,
+        model_repo: str | None = None,
+        general_thresh: float | None = None,
+        character_thresh: float | None = None,
     ):
         if model_repo is None:
             model_repo = self.default_model_repo
@@ -185,7 +186,7 @@ class Predictor:
         if not character_thresh:
             # Use MCut thresholding
             character_probs = np.array([x[1] for x in character_names])
-            character_thresh = mcut_threshold(character_probs)
+            character_thresh: float = mcut_threshold(character_probs)
             character_thresh = max(0.05, character_thresh)
 
         character_res = [x for x in character_names if x[1] > character_thresh]

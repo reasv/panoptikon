@@ -23,7 +23,10 @@ def on_select_image(
         selected_files: List[FileSearchResult]
     ):
     print(f"Selected image index: {evt.index} in gallery")
-    image_index: int = evt.index
+    if isinstance(evt.index, int):
+        image_index = evt.index
+    else:
+        image_index = int(evt.index[0])
 
     # Check if index is valid
     if image_index < 0 or image_index >= len(files):
@@ -48,7 +51,7 @@ def on_selected_image_change_extra_actions(extra_actions: List[str]):
         else:
             interactive = True
             selected_file = selected_files[0]
-            path: str = selected_file.path
+            path = selected_file.path
             selected_file_index = files.index(selected_file)
             if path.strip() == "":
                 interactive = False
@@ -90,8 +93,8 @@ class GalleryView:
 def create_gallery_view(
         selected_files: gr.State,
         files: gr.State,
-        parent_tab: gr.TabItem = None,
-        bookmarks_namespace: gr.State = None,
+        parent_tab: gr.TabItem | None = None,
+        bookmarks_namespace: gr.State | None = None,
         extra_actions: List[str] = []
     ):
     with gr.Row():
@@ -163,11 +166,12 @@ def create_gallery_view(
             inputs=[bookmarks_namespace, selected_files],
             outputs=[bookmark]
         )
-        parent_tab.select(
-            fn=on_selected_image_get_bookmark_state,
-            inputs=[bookmarks_namespace, selected_files],
-            outputs=[bookmark]
-        )
+        if parent_tab != None:
+            parent_tab.select(
+                fn=on_selected_image_get_bookmark_state,
+                inputs=[bookmarks_namespace, selected_files],
+                outputs=[bookmark]
+            )
 
     return GalleryView(
         columns_slider=columns_slider,

@@ -23,7 +23,7 @@ class Multiview:
     gallery_view: GalleryView
     list_view: ImageList
 
-def create_multiview(select_history: gr.State = None, bookmarks_namespace: gr.State = None, extra_actions: List[str] = []):
+def create_multiview(select_history: gr.State | None = None, bookmarks_namespace: gr.State | None = None, extra_actions: List[str] = []):
     selected_files = gr.State([])
     files = gr.State([])
 
