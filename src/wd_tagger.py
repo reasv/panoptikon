@@ -62,7 +62,7 @@ def load_labels(dataframe) -> List[List[str]]:
     character_indexes = list(np.where(dataframe["category"] == 4)[0])
     return [tag_names, rating_indexes, general_indexes, character_indexes]
 
-def mcut_threshold(probs):
+def mcut_threshold(probs: np.ndarray) -> float:
     """
     Maximum Cut Thresholding (MCut)
     Largeron, C., Moulin, C., & Gery, M. (2012). MCut: A Thresholding Strategy
@@ -186,7 +186,7 @@ class Predictor:
         if not character_thresh:
             # Use MCut thresholding
             character_probs = np.array([x[1] for x in character_names])
-            character_thresh: float = mcut_threshold(character_probs)
+            character_thresh = mcut_threshold(character_probs)
             character_thresh = max(0.05, character_thresh)
 
         character_res = [x for x in character_names if x[1] > character_thresh]
