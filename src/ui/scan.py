@@ -8,8 +8,7 @@ from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
 from src.tags import scan_and_predict_tags
 from src.wd_tagger import V3_MODELS
-from src.embeds import scan_and_embed
-from src.chromadb import get_chromadb_client
+from src.image_embeddings import scan_and_embed, get_chromadb_client
 
 def get_folders():
     conn = get_database_connection()

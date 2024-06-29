@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import List
-import json
 from urllib.parse import quote
 
 import gradio as gr

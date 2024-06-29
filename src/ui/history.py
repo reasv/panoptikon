@@ -24,7 +24,13 @@ def create_history_UI(select_history: gr.State, bookmarks_namespace: gr.State):
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
                 erase_history = gr.Button("Erase History")
-                keep_last_n = gr.Slider(minimum=0, maximum=100, value=0, step=1, label="Keep last N items on erase")
+                keep_last_n = gr.Slider(
+                    minimum=0,
+                    maximum=100,
+                    value=0,
+                    step=1,
+                    label="Keep last N items on erase"
+                )
         
         multi_view = create_multiview(bookmarks_namespace=bookmarks_namespace)
 

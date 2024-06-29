@@ -1,22 +1,22 @@
+import os
+import sqlite3
+from datetime import datetime
 from typing import List, Sequence, Union, cast
-import torch
+
 from PIL import Image as PILImage
+import torch
 import open_clip
 import numpy as np
-from numpy.typing import NDArray
-from chromadb.types import Vector
-from chromadb.api.types import is_image, is_document, EmbeddingFunction
-from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
+import chromadb
+import chromadb.api
+from chromadb.api.types import is_image, is_document, EmbeddingFunction, Image, Images, Document, Documents, Embeddings, Embedding
+from chromadb.api import BaseAPI
 
-ImageDType = Union[np.uint, np.int_, np.float_]
-Image = NDArray[ImageDType]
-Images = List[Image]
-
-Document = str
-Documents = List[Document]
-
-Embedding = Vector
-Embeddings = List[Embedding]
+from src.db import get_existing_file_for_sha256, FileSearchResult
+from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
+from src.files import get_mime_type
+from src.utils import estimate_eta, make_video_thumbnails
+from src.video import video_to_frames
 
 class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
     def __init__(
@@ -122,3 +122,141 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
             elif is_document(item):
                 embeddings.append(self.get_text_embeddings([cast(Document, item)])[0].squeeze().tolist())
         return embeddings
+
+def get_chromadb_client() -> chromadb.api.BaseAPI:
+    sqlite_db_file = os.getenv('DB_FILE', './db/sqlite.db')
+    cdb_file = f"{sqlite_db_file}.chromadb"
+    return chromadb.PersistentClient(path=cdb_file)
+
+def search_item_image_embeddings(
+        conn: sqlite3.Connection,
+        cdb: chromadb.api.BaseAPI,
+        embedder: CLIPEmbedder,
+        image_query: np.ndarray | None = None,
+        text_query: str | None = None,
+        limit: int = 10,
+        model = "ViT-H-14-378-quickgelu",
+        checkpoint = "dfn5b",
+    ):
+    setter = f"{model}_ckpt_{checkpoint}"
+    collection_name = f"image_embeddings.{setter}"
+
+    try:
+        collection = cdb.get_collection(
+            name=collection_name,
+            embedding_function=embedder,
+        )
+    except ValueError:
+        return [], []
+    
+    results = collection.query(
+        query_texts=text_query,
+        query_images=image_query,
+        n_results=limit
+    )
+    metadatas = results['metadatas']
+    if not metadatas:
+        return [], []
+    metadatas = metadatas[0] # Only one query
+
+    scores = results['distances']
+    if not scores:
+        return [], []
+    scores = scores[0] # Only one query
+    
+    searchResults = []
+    resultScores = []
+    for metadata, distance in zip(metadatas, scores):
+        sha256 = metadata['item']
+        if not isinstance(sha256, str):
+            continue
+        file = get_existing_file_for_sha256(conn, sha256=sha256)
+        if file is None:
+            continue
+        searchResults.append(FileSearchResult(
+            path=file.path,
+            sha256=file.sha256,
+            last_modified=file.last_modified,
+            type=get_mime_type(file.path) or "unknown",
+        ))
+        resultScores.append(distance)
+
+    return searchResults, resultScores
+
+def scan_and_embed(
+        conn: sqlite3.Connection,
+        cdb: BaseAPI,
+        model="ViT-H-14-378-quickgelu",
+        checkpoint="dfn5b",
+    ):
+    """
+    Scan and embed all items in the database that are missing embeddings from the given embedding model.
+    """
+    scan_time = datetime.now().isoformat()
+    embedder = CLIPEmbedder(
+        model_name=model,
+        pretrained=checkpoint,
+    )
+    embedder.load_model()
+    setter = f"{model}_ckpt_{checkpoint}"
+    collection_name = f"image_embeddings.{setter}"
+    try:
+        collection = cdb.get_collection(
+            name=collection_name,
+            embedding_function=embedder,
+        )
+    except ValueError:
+        collection = cdb.create_collection(
+            name=collection_name,
+            embedding_function=embedder,
+        )
+    failed_paths = []
+    videos, images, total_video_frames, total_processed_frames, items = 0, 0, 0, 0, 0
+    for item, remaining, total_items in get_items_missing_tag_scan(conn, setter=setter):
+        items += 1
+        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Processing ({item.type}) {item.path}")
+        try:
+            if item.type.startswith("image"):
+                image_array = np.array(PILImage.open(item.path))
+                collection.add(
+                    ids=[item.sha256],
+                    images=[image_array],
+                    metadatas=[{"item": item.sha256}]
+                )
+                images += 1
+            if item.type.startswith("video"):
+                frames = video_to_frames(item.path, num_frames=4)
+                collection.add(
+                        ids=[f"{item.sha256}-{i}" for i, f in enumerate(frames)],
+                        images=[np.array(frame) for frame in frames],
+                        metadatas=([{"item": item.sha256} for _ in frames])
+                )
+                make_video_thumbnails(frames, item.sha256, item.type)
+                videos += 1
+                total_video_frames += len(frames)
+            add_item_tag_scan(conn, item.sha256, setter, scan_time)
+        except Exception as e:
+            print(f"Failed to embed {item.path}: {e}")
+            failed_paths.append(item.path)
+
+    # Record the scan in the database log
+    scan_end_time = datetime.now().isoformat()
+    # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
+    remaining_paths = next(get_items_missing_tag_scan(conn, setter), [0, 0, 0])[2]
+    add_tag_scan(
+        conn,
+        scan_time,
+        scan_end_time,
+        setter=setter,
+        threshold=0,
+        image_files=images,
+        video_files=videos,
+        other_files=0,
+        video_frames=total_video_frames,
+        total_frames=total_processed_frames,
+        errors=len(failed_paths),
+        timeouts=0,
+        total_remaining=remaining_paths
+    )
+
+    return images, videos, failed_paths, []

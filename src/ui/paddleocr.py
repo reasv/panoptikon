@@ -5,7 +5,8 @@ import numpy as np
 
 def create_paddleocr_UI():
     DESCRIPTION = """
-    PaddleOCR is an OCR tool based on PaddlePaddle. It is easy to use and provides a variety of text detection and recognition models.
+    PaddleOCR is an OCR tool based on PaddlePaddle.
+    It is easy to use and provides a variety of text detection and recognition models.
     """
     with gr.Column():
         gr.Markdown(
