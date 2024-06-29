@@ -127,7 +127,6 @@ def video_to_frames(video_path: str, num_frames: int | None = None) -> List[Imag
     """
     Extract keyframes from a video and save them as images.
     :param video_path: Path to the video file
-    :param keyframe_threshold: Threshold for keyframe extraction
     :param num_frames: Number of frames to extract (default: None, extract all keyframes)
     """
     if num_frames is None:
