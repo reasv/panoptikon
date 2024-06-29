@@ -8,7 +8,7 @@ from chromadb.api import BaseAPI
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.utils import estimate_eta, make_video_thumbnails
 from src.video import video_to_frames
-from src.clip import CLIPEmbedder
+from src.image_embeddings import CLIPEmbedder
 
 def scan_and_embed(
         conn: sqlite3.Connection,

@@ -5,7 +5,7 @@ import gradio as gr
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
 from src.chromadb import search_item_image_embeddings, get_chromadb_client
-from src.clip import CLIPEmbedder
+from src.image_embeddings import CLIPEmbedder
 
 def create_semantic_search_UI(select_history: gr.State | None = None, bookmarks_namespace: gr.State | None = None):
     with gr.TabItem(label="Semantic Search") as search_tab:

@@ -11,7 +11,7 @@ import chromadb.api
 
 from src.db import get_existing_file_for_sha256, FileSearchResult
 from src.files import get_mime_type
-from src.clip import CLIPEmbedder
+from src.image_embeddings import CLIPEmbedder
 
 def get_chromadb_client() -> chromadb.api.BaseAPI:
     sqlite_db_file = os.getenv('DB_FILE', './db/sqlite.db')
