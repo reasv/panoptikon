@@ -21,7 +21,6 @@ from src.db import (
 from src.files import scan_files, deduplicate_paths
 from src.utils import normalize_path
 
-
 def execute_folder_scan(
     conn: sqlite3.Connection,
     included_folders: None | List[str] = None,
