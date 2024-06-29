@@ -430,7 +430,7 @@ def get_all_tag_scans(conn: sqlite3.Connection) -> List[TagScanRecord]:
     scan_records = cursor.fetchall()
     return [TagScanRecord(*scan_record) for scan_record in scan_records]
 
-def add_item_tag_scan(conn: sqlite3.Connection, item: str, setter: str, last_scan: str, tags_set: int, tags_removed: int):
+def add_item_tag_scan(conn: sqlite3.Connection, item: str, setter: str, last_scan: str, tags_set: int = 0, tags_removed: int = 0):
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO item_tag_scans (item, setter, last_scan, tags_set, tags_removed)
