@@ -9,6 +9,7 @@ from src.db import get_folders_from_database, get_database_connection, get_all_f
 from src.tags import scan_and_predict_tags
 from src.wd_tagger import V3_MODELS
 from src.image_embeddings import scan_and_embed, get_chromadb_client
+from src.ocr import scan_extract_text
 
 def get_folders():
     conn = get_database_connection()
@@ -116,6 +117,29 @@ def generate_embeds():
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()
 
+def run_ocr():
+    conn = get_database_connection()
+    cdb = get_chromadb_client()
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    images, videos, failed, timed_out = scan_extract_text(conn, cdb)
+    conn.commit()
+    vacuum_database(conn)
+    failed_str = "\n".join(failed)
+    timed_out_str = "\n".join(timed_out)
+    report_str = f"""
+    OCR Extraction completed.
+    Successfully processed {images} images and {videos} videos.
+    {len(failed)} files failed to process due to errors.
+    {len(timed_out)} files took too long to process and timed out.
+    Failed files:
+    {failed_str}
+    Timed out files:
+    {timed_out_str}
+    """
+    conn.close()
+    return report_str, fetch_scan_history(), fetch_tagging_history()
+
 def delete_tags(tag_models: List[str] = []):
     conn = get_database_connection()
     cursor = conn.cursor()
@@ -185,6 +209,8 @@ def create_scan_UI():
                         delete_tags_button = gr.Button("Delete ALL Tags set by selected Model(s)")
                     with gr.Row():
                         generate_embeds_button = gr.Button("Generate Embeddings for Items Missing Embeddings")
+                    with gr.Row():
+                        extract_text_ocr = gr.Button("Use OCR to Extract Text from Images and Videos")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -263,4 +289,10 @@ def create_scan_UI():
             fn=generate_embeds,
             outputs=[results, scan_history, tagging_history],
             api_name="generate_embeds",
+        )
+
+        extract_text_ocr.click(
+            fn=run_ocr,
+            outputs=[results, scan_history, tagging_history],
+            api_name="run_ocr",
         )
