@@ -3,7 +3,6 @@ from datetime import datetime
 
 from PIL import Image
 import numpy as np
-import torch
 from chromadb.api import BaseAPI
 
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
@@ -25,6 +24,7 @@ def scan_and_embed(
         model_name=model,
         pretrained=checkpoint,
     )
+    embedder.load_model()
     setter = f"{model}_ckpt_{checkpoint}"
     collection_name = f"image_embeddings.{setter}"
     try:

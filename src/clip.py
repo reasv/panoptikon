@@ -6,6 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 from chromadb.types import Vector
 from chromadb.api.types import is_image, is_document, EmbeddingFunction
+from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
 
 ImageDType = Union[np.uint, np.int_, np.float_]
 Image = NDArray[ImageDType]
@@ -34,6 +35,9 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
             )
             self.model.eval().to(self.device)
             self.tokenizer = open_clip.get_tokenizer(self.model_name)
+    
+    def load_model(self):
+        self._load_model()
 
     def get_image_embeddings(self, image_paths: List[str | PILImage.Image | np.ndarray]):
         self._load_model()
@@ -103,7 +107,7 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
         embeddings: Embeddings = []
         for item in input:
             if is_image(item):
-                embeddings.append(self.get_image_embeddings([cast(Image, item)]))
+                embeddings.append(self.get_image_embeddings([cast(Image, item)])[0].squeeze().tolist())
             elif is_document(item):
-                embeddings.append(self.get_text_embeddings([cast(Document, item)]))
+                embeddings.append(self.get_text_embeddings([cast(Document, item)])[0].squeeze().tolist())
         return embeddings
