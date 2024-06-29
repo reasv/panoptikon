@@ -221,7 +221,11 @@ def scan_and_embed(
                 collection.add(
                     ids=[item.sha256],
                     images=[image_array],
-                    metadatas=[{"item": item.sha256}]
+                    metadatas=[{
+                        "item": item.sha256,
+                        "type": item.type,
+                        "general_type": item.type.split("/")[0],   
+                    }]
                 )
                 images += 1
             if item.type.startswith("video"):
@@ -229,7 +233,11 @@ def scan_and_embed(
                 collection.add(
                         ids=[f"{item.sha256}-{i}" for i, f in enumerate(frames)],
                         images=[np.array(frame) for frame in frames],
-                        metadatas=([{"item": item.sha256} for _ in frames])
+                        metadatas=([{
+                            "item": item.sha256,
+                            "type": item.type,
+                            "general_type": item.type.split("/")[0],
+                        } for _ in frames])
                 )
                 make_video_thumbnails(frames, item.sha256, item.type)
                 videos += 1
