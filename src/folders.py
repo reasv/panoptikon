@@ -21,13 +21,14 @@ from src.db import (
 from src.files import scan_files, deduplicate_paths
 from src.utils import normalize_path
 
+
 def execute_folder_scan(
-        conn: sqlite3.Connection,
-        included_folders: None | List[str] = None,
-        include_images = True,
-        include_video = True,
-        include_audio = False,
-    ) -> list[int]:
+    conn: sqlite3.Connection,
+    included_folders: None | List[str] = None,
+    include_images=True,
+    include_video=True,
+    include_audio=False,
+) -> list[int]:
     """
     Execute a scan of the files in the given `included_folders`, or all folders marked as `included` within the db, and update the database with the results.
     Marks files that were not found in the scan but are present in the db as `unavailable`.
@@ -38,7 +39,9 @@ def execute_folder_scan(
         included_folders = all_included_folders
 
     # Ensure that all included_folders are also marked as included in the database
-    included_folders = [folder for folder in included_folders if folder in all_included_folders]
+    included_folders = [
+        folder for folder in included_folders if folder in all_included_folders
+    ]
 
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
@@ -54,21 +57,14 @@ def execute_folder_scan(
             excluded_paths=excluded_folders,
             include_images=include_images,
             include_video=include_video,
-            include_audio=include_audio
+            include_audio=include_audio,
         ):
             if file_data is None:
                 errors += 1
                 continue
             # Update the file data in the database
-            (
-                item_inserted, 
-                file_updated,
-                file_deleted,
-                file_inserted
-            ) = update_file_data(
-                conn,
-                scan_time=scan_time,
-                file_data=file_data
+            (item_inserted, file_updated, file_deleted, file_inserted) = (
+                update_file_data(conn, scan_time=scan_time, file_data=file_data)
             )
             if item_inserted:
                 new_items += 1
@@ -83,8 +79,12 @@ def execute_folder_scan(
                 # File was not in the database and has been inserted
                 new_files += 1
         # Mark files that were not found in the scan but are present in the db as `unavailable`
-        marked_unavailable, total_available = mark_unavailable_files(conn, scan_time=scan_time, path=folder)
-        print(f"Scan of {folder} complete. New items: {new_items}, Unchanged files: {unchanged_files}, New files: {new_files}, Modified files: {modified_files}, Marked unavailable: {marked_unavailable}, Errors: {errors}, Total available: {total_available}")
+        marked_unavailable, total_available = mark_unavailable_files(
+            conn, scan_time=scan_time, path=folder
+        )
+        print(
+            f"Scan of {folder} complete. New items: {new_items}, Unchanged files: {unchanged_files}, New files: {new_files}, Modified files: {modified_files}, Marked unavailable: {marked_unavailable}, Errors: {errors}, Total available: {total_available}"
+        )
         end_time = datetime.now().isoformat()
         scan_ids.append(
             add_file_scan(
@@ -98,10 +98,12 @@ def execute_folder_scan(
                 modified_files=modified_files,
                 marked_unavailable=marked_unavailable,
                 errors=errors,
-                total_available=total_available
-        ))
+                total_available=total_available,
+            )
+        )
 
     return scan_ids
+
 
 # Public API
 @dataclass
@@ -116,7 +118,13 @@ class UpdateFoldersResult:
     orphan_items_deleted: int
     scan_ids: List[int]
 
-def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], excluded_folders: List[str], delete_unavailable: bool = True):
+
+def update_folder_lists(
+    conn: sqlite3.Connection,
+    included_folders: List[str],
+    excluded_folders: List[str],
+    delete_unavailable: bool = True,
+):
     """
     Update the database with the new `included_folders` and `excluded_folders` lists.
     Any folders that are in the database but not in the new lists will be DELETED.
@@ -125,11 +133,19 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
     Any orphaned items without files will be DELETED.
     Bookmarks on orhpaned items will be DELETED.
     """
-    new_included_folders = [normalize_path(p) for p in included_folders if len(p.strip()) > 0]
-    new_excluded_folders = [normalize_path(p) for p in excluded_folders if len(p.strip()) > 0]
-    
-    included_deleted = delete_folders_not_in_list(conn=conn, folder_paths=new_included_folders, included=True)
-    excluded_deleted = delete_folders_not_in_list(conn=conn, folder_paths=new_excluded_folders, included=False)
+    new_included_folders = [
+        normalize_path(p) for p in included_folders if len(p.strip()) > 0
+    ]
+    new_excluded_folders = [
+        normalize_path(p) for p in excluded_folders if len(p.strip()) > 0
+    ]
+
+    included_deleted = delete_folders_not_in_list(
+        conn=conn, folder_paths=new_included_folders, included=True
+    )
+    excluded_deleted = delete_folders_not_in_list(
+        conn=conn, folder_paths=new_excluded_folders, included=False
+    )
 
     scan_time = datetime.now().isoformat()
     included_added = []
@@ -137,7 +153,7 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
         added = add_folder_to_database(conn, scan_time, folder, included=True)
         if added:
             included_added.append(folder)
-    
+
     excluded_added = []
     for folder in new_excluded_folders:
         added = add_folder_to_database(conn, scan_time, folder, included=False)
@@ -166,8 +182,9 @@ def update_folder_lists(conn: sqlite3.Connection, included_folders: List[str], e
         unavailable_files_deleted=unavailable_files_deleted,
         orphan_files_deleted=orphan_files_deleted,
         orphan_items_deleted=orphan_items_deleted,
-        scan_ids=scan_ids
+        scan_ids=scan_ids,
     )
+
 
 def rescan_all_folders(conn: sqlite3.Connection, delete_unavailable: bool = True):
     """
@@ -185,5 +202,5 @@ def rescan_all_folders(conn: sqlite3.Connection, delete_unavailable: bool = True
     else:
         unavailable_files_deleted = 0
         orphan_items_deleted = 0
-    
+
     return scan_ids, unavailable_files_deleted, orphan_items_deleted
