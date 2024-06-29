@@ -8,6 +8,8 @@ from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
 from src.tags import scan_and_predict_tags
 from src.wd_tagger import V3_MODELS
+from src.embeds import scan_and_embed
+from src.chromadb import get_chromadb_client
 
 def get_folders():
     conn = get_database_connection()
@@ -92,6 +94,29 @@ def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
     conn.close()
     return full_report, fetch_scan_history(), fetch_tagging_history()
 
+def generate_embeds():
+    conn = get_database_connection()
+    cdb = get_chromadb_client()
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    images, videos, failed, timed_out = scan_and_embed(conn, cdb)
+    conn.commit()
+    vacuum_database(conn)
+    failed_str = "\n".join(failed)
+    timed_out_str = "\n".join(timed_out)
+    report_str = f"""
+    Embeddings generation completed.
+    Successfully processed {images} images and {videos} videos.
+    {len(failed)} files failed to process due to errors.
+    {len(timed_out)} files took too long to process and timed out.
+    Failed files:
+    {failed_str}
+    Timed out files:
+    {timed_out_str}
+    """
+    conn.close()
+    return report_str, fetch_scan_history(), fetch_tagging_history()
+
 def delete_tags(tag_models: List[str] = []):
     conn = get_database_connection()
     cursor = conn.cursor()
@@ -159,6 +184,8 @@ def create_scan_UI():
                     with gr.Row():
                         regenerate_tags_button = gr.Button("Generate Tags for Files Missing Tags")
                         delete_tags_button = gr.Button("Delete ALL Tags set by selected Model(s)")
+                    with gr.Row():
+                        generate_embeds_button = gr.Button("Generate Embeddings for Items Missing Embeddings")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -231,4 +258,10 @@ def create_scan_UI():
             inputs=[model_choice],
             outputs=[results, scan_history, tagging_history],
             api_name="delete_tags",
+        )
+
+        generate_embeds_button.click(
+            fn=generate_embeds,
+            outputs=[results, scan_history, tagging_history],
+            api_name="generate_embeds",
         )

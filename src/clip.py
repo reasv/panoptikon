@@ -1,8 +1,23 @@
+from typing import List, Union, cast
 import torch
-from PIL import Image
+from PIL import Image as PILImage
 import open_clip
+import numpy as np
+from numpy.typing import NDArray
+from chromadb.types import Vector
+from chromadb.api.types import is_image, is_document, EmbeddingFunction
 
-class CLIPEmbedder:
+ImageDType = Union[np.uint, np.int_, np.float_]
+Image = NDArray[ImageDType]
+Images = List[Image]
+
+Document = str
+Documents = List[Document]
+
+Embedding = Vector
+Embeddings = List[Embedding]
+
+class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
     def __init__(self, model_name='ViT-H-14-378-quickgelu', pretrained='dfn5b', batch_size=8):
         self.model_name = model_name
         self.pretrained = pretrained
@@ -20,17 +35,21 @@ class CLIPEmbedder:
             self.model.eval().to(self.device)
             self.tokenizer = open_clip.get_tokenizer(self.model_name)
 
-    def get_image_embeddings(self, image_paths):
+    def get_image_embeddings(self, image_paths: List[str | PILImage.Image | np.ndarray]):
         self._load_model()
         embeddings = []
 
         for i in range(0, len(image_paths), self.batch_size):
             batch_paths = image_paths[i:i + self.batch_size]
             # Check if they're all PIL images rather than paths
-            if all(isinstance(image_path, Image.Image) for image_path in batch_paths):
+            if all(isinstance(image_path, PILImage.Image) for image_path in batch_paths):
                 batch_images = [self.preprocess(image_path).unsqueeze(0) for image_path in batch_paths] # type: ignore
+            # Check if they're ndarrays
+            elif all(isinstance(image_path, np.ndarray) for image_path in batch_paths):
+                batch_images = [self.preprocess(PILImage.fromarray(image_array)).unsqueeze(0) for image_array in batch_paths] # type: ignore
+            # Otherwise, assume they're all paths
             else:
-                batch_images = [self.preprocess(Image.open(image_path)).unsqueeze(0) for image_path in batch_paths] # type: ignore
+                batch_images = [self.preprocess(PILImage.open(image_path)).unsqueeze(0) for image_path in batch_paths] # type: ignore
             batch_images = torch.cat(batch_images).to(self.device)
 
             with torch.no_grad(), torch.cuda.amp.autocast():
@@ -41,7 +60,7 @@ class CLIPEmbedder:
 
         return embeddings
 
-    def get_text_embeddings(self, texts):
+    def get_text_embeddings(self, texts: List[str]):
         self._load_model()
         embeddings = []
 
@@ -79,3 +98,12 @@ class CLIPEmbedder:
         sorted_hashes = [image_hashes[i] for i in sorted_indices]
 
         return sorted_hashes
+    
+    def __call__(self, input: Union[Documents, Images]) -> Embeddings:
+        embeddings: Embeddings = []
+        for item in input:
+            if is_image(item):
+                embeddings.append(self.get_image_embeddings([cast(Image, item)]))
+            elif is_document(item):
+                embeddings.append(self.get_text_embeddings([cast(Document, item)]))
+        return embeddings

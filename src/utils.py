@@ -147,3 +147,17 @@ def estimate_eta(scan_start_time: str, items_processed: int, remaining_items: in
     items_per_second = items_processed / time_elapsed.total_seconds()
     remaining_time = remaining_items / (items_per_second or 1)
     return seconds_to_hms(remaining_time)
+
+def make_video_thumbnails(frames: list[Image.Image], sha256: str, mime_type: str):
+    """
+    Create thumbnails for a video file.
+    :param frames: List of frames to create thumbnails from.
+    :param sha256: SHA256 hash of the video file.
+    :param mime_type: MIME type of the video file.
+    """
+    os.makedirs("./thumbs", exist_ok=True)
+    grid = create_image_grid(frames)
+    write_text_on_image(grid, mime_type)
+    grid.save(f"./thumbs/{sha256}-grid.jpg")
+    write_text_on_image(frames[0], mime_type)
+    frames[0].save(f"./thumbs/{sha256}-0.jpg")
