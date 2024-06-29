@@ -1,4 +1,4 @@
-from typing import List, Union, cast
+from typing import List, Sequence, Union, cast
 import torch
 from PIL import Image as PILImage
 import open_clip
@@ -19,14 +19,22 @@ Embedding = Vector
 Embeddings = List[Embedding]
 
 class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
-    def __init__(self, model_name='ViT-H-14-378-quickgelu', pretrained='dfn5b', batch_size=8):
+    def __init__(
+            self,
+            model_name='ViT-H-14-378-quickgelu',
+            pretrained='dfn5b',
+            batch_size=8
+        ):
         self.model_name = model_name
         self.pretrained = pretrained
         self.batch_size = batch_size
         self.model = None
         self.tokenizer = None
         self.preprocess = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() 
+            else "cpu"
+        )
 
     def _load_model(self):
         if self.model is None:
@@ -39,21 +47,24 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
     def load_model(self):
         self._load_model()
 
-    def get_image_embeddings(self, image_paths: List[str | PILImage.Image | np.ndarray]):
+    def get_image_embeddings(
+            self,
+            images: Sequence[str | PILImage.Image | np.ndarray]
+        ):
         self._load_model()
         embeddings = []
 
-        for i in range(0, len(image_paths), self.batch_size):
-            batch_paths = image_paths[i:i + self.batch_size]
+        for i in range(0, len(images), self.batch_size):
+            image_batch = images[i:i + self.batch_size]
             # Check if they're all PIL images rather than paths
-            if all(isinstance(image_path, PILImage.Image) for image_path in batch_paths):
-                batch_images = [self.preprocess(image_path).unsqueeze(0) for image_path in batch_paths] # type: ignore
+            if all(isinstance(image, PILImage.Image) for image in image_batch):
+                batch_images = [self.preprocess(image).unsqueeze(0) for image in image_batch] # type: ignore
             # Check if they're ndarrays
-            elif all(isinstance(image_path, np.ndarray) for image_path in batch_paths):
-                batch_images = [self.preprocess(PILImage.fromarray(image_array)).unsqueeze(0) for image_array in batch_paths] # type: ignore
+            elif all(isinstance(image, np.ndarray) for image in image_batch):
+                batch_images = [self.preprocess(PILImage.fromarray(image_array)).unsqueeze(0) for image_array in image_batch] # type: ignore
             # Otherwise, assume they're all paths
             else:
-                batch_images = [self.preprocess(PILImage.open(image_path)).unsqueeze(0) for image_path in batch_paths] # type: ignore
+                batch_images = [self.preprocess(PILImage.open(image)).unsqueeze(0) for image in image_batch] # type: ignore
             batch_images = torch.cat(batch_images).to(self.device)
 
             with torch.no_grad(), torch.cuda.amp.autocast():
