@@ -21,16 +21,13 @@ def get_chromadb_client() -> chromadb.api.BaseAPI:
 def search_item_image_embeddings(
         conn: sqlite3.Connection,
         cdb: chromadb.api.BaseAPI,
-        image_query: np.ndarray | None,
-        text_query: str | None,
+        embedder: CLIPEmbedder,
+        image_query: np.ndarray | None = None,
+        text_query: str | None = None,
         limit: int = 10,
         model = "ViT-H-14-378-quickgelu",
         checkpoint = "dfn5b",
     ):
-    embedder = CLIPEmbedder(
-        model_name=model,
-        pretrained=checkpoint,
-    )
     setter = f"{model}_ckpt_{checkpoint}"
     collection_name = f"image_embeddings.{setter}"
 
