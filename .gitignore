@@ -167,3 +167,4 @@ temp_frames/
 scripts/
 db/
 .vscode/
+jax_cache/

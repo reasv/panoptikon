@@ -6,3 +6,6 @@ paddleocr>=2.7.5
 paddlepaddle-gpu>=2.6.1
 open_clip_torch>=2.24
 chromadb>=0.5.3
+jax>=0.4.30
+git+https://github.com/sanchit-gandhi/whisper-jax.git
+yt_dlp>=2024.5.27
