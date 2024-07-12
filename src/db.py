@@ -676,7 +676,7 @@ def search_files(
         tag_namespace: str | None = None,
         min_confidence: float | None = 0.5,
         setters: List[str] | None = None,
-        all_setters_required: bool = False,
+        all_setters_required: bool | None = False,
         item_type: str | None = None,
         include_path_prefix: str | None = None,
         order_by: str | None = "last_modified",
@@ -696,6 +696,7 @@ def search_files(
     negative_tags_match_all = clean_tag_list(negative_tags_match_all)
     tags = clean_tag_list(tags)
     negative_tags = clean_tag_list(negative_tags)
+    all_setters_required = all_setters_required or False
     if len(tags_match_any) == 1:
         # If only one tag is provided for "match any", we can just use it as a regular tag
         tags.append(tags_match_any[0])
