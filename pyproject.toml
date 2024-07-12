@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "panoptikon"
+version = "0.1.0"
+description = "AI-based media indexing, tagging, and semantic search engine for local files"
+authors = ["reasv"]
+license = "AGPL"
+readme = "README.md"
+packages = [
+    { include = "panoptikon", from="src" },
+    { include = "panoptikon.*", from="src" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+gradio = "^4.37.2"
+pillow = "^10.4.0"
+onnxruntime = "^1.18.1"
+imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
+paddleocr = "^2.8.0"
+paddlepaddle-gpu = "^2.6.1"
+open-clip-torch = "^2.26.1"
+chromadb = "^0.5.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
