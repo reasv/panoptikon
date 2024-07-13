@@ -1,9 +1,17 @@
-from typing import List
+from dataclasses import dataclass
+from typing import Any
+
 import huggingface_hub
 import numpy as np
-import onnxruntime as rt
 import pandas as pd
 from PIL import Image
+import timm
+from timm.data import create_transform, resolve_data_config
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from src.utils import pil_ensure_rgb, pil_pad_square
 
 # Dataset v3 series of models:
 SWINV2_MODEL_DSV3_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
@@ -24,7 +32,6 @@ CONV2_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-convnextv2-tagger-v2"
 VIT_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-vit-tagger-v2"
 
 # Files to download from the repos
-MODEL_FILENAME = "model.onnx"
 LABEL_FILENAME = "selected_tags.csv"
 
 # https://github.com/toriato/stable-diffusion-webui-wd14-tagger/blob/a9eacb1eff904552d3012babfa28b57e1d3e295c/tagger/ui.py#L368
@@ -50,17 +57,34 @@ kaomojis = [
     "||_||",
 ]
 
-def load_labels(dataframe) -> List[List[str]]:
-    name_series = dataframe["name"]
-    name_series = name_series.map(
-        lambda x: x.replace("_", " ") if x not in kaomojis else x
-    )
-    tag_names = name_series.tolist()
+@dataclass
+class LabelData:
+    names: list[str]
+    rating: list[np.int64]
+    general: list[np.int64]
+    character: list[np.int64]
 
+def load_labels(model_repo: str):
+    csv_path = huggingface_hub.hf_hub_download(
+        model_repo,
+        LABEL_FILENAME,
+    )
+    dataframe = pd.read_csv(csv_path)
+    name_series = dataframe["name"]
+    # name_series = name_series.map(
+    #     lambda x: x.replace("_", " ") if x not in kaomojis else x
+    # )
+    tag_names = name_series.tolist()
     rating_indexes = list(np.where(dataframe["category"] == 9)[0])
     general_indexes = list(np.where(dataframe["category"] == 0)[0])
     character_indexes = list(np.where(dataframe["category"] == 4)[0])
-    return [tag_names, rating_indexes, general_indexes, character_indexes]
+    tag_data = LabelData(
+        names=tag_names,
+        rating=rating_indexes,
+        general=general_indexes,
+        character=character_indexes,
+    )
+    return tag_data
 
 def mcut_threshold(probs: np.ndarray) -> float:
     """
@@ -76,75 +100,42 @@ def mcut_threshold(probs: np.ndarray) -> float:
     return thresh
 
 class Predictor:
+    labels: LabelData | None = None
+    transform: Any | None = None
+    default_model_repo: str | None = None
+    last_loaded_repo: str | None = None
+    torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     def __init__(self, model_repo=None):
         self.default_model_repo = model_repo
-        self.model_target_size = None
         self.last_loaded_repo = None
-
-    def download_model(self, model_repo):
-        csv_path = huggingface_hub.hf_hub_download(
-            model_repo,
-            LABEL_FILENAME,
-        )
-        model_path = huggingface_hub.hf_hub_download(
-            model_repo,
-            MODEL_FILENAME,
-        )
-        return csv_path, model_path
+        self.torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def load_model(self, model_repo):
         if model_repo == self.last_loaded_repo:
             return
+        self.labels = load_labels(model_repo)
 
-        csv_path, model_path = self.download_model(model_repo)
-
-        tags_df = pd.read_csv(csv_path)
-        sep_tags = load_labels(tags_df)
-
-        self.tag_names = sep_tags[0]
-        self.rating_indexes = sep_tags[1]
-        self.general_indexes = sep_tags[2]
-        self.character_indexes = sep_tags[3]
-
-        model = rt.InferenceSession(model_path)
-        _, height, width, _ = model.get_inputs()[0].shape
-        self.model_target_size = height
+        model: nn.Module = timm.create_model("hf-hub:" + model_repo).eval()
+        state_dict = timm.models.load_state_dict_from_hf(model_repo)
+        model.load_state_dict(state_dict)
+        self.transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
 
         self.last_loaded_repo = model_repo
         self.model = model
 
     def prepare_image(self, image: Image.Image):
-        if image.mode != 'RGBA':
-            image = image.convert('RGBA')
-
-        target_size = self.model_target_size
-        canvas = Image.new("RGBA", image.size, (255, 255, 255))
-        canvas.alpha_composite(image)
-        image = canvas.convert("RGB")
-
-        # Pad image to square
-        image_shape = image.size
-        max_dim = max(image_shape)
-        pad_left = (max_dim - image_shape[0]) // 2
-        pad_top = (max_dim - image_shape[1]) // 2
-
-        padded_image = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
-        padded_image.paste(image, (pad_left, pad_top))
-
-        # Resize
-        if max_dim != target_size:
-            padded_image = padded_image.resize(
-                (target_size, target_size),
-                Image.BICUBIC,
-            )
-
-        # Convert to numpy array
-        image_array = np.asarray(padded_image, dtype=np.float32)
-
-        # Convert PIL-native RGB to BGR
-        image_array = image_array[:, :, ::-1]
-
-        return np.expand_dims(image_array, axis=0)
+        # ensure image is RGB
+        image = pil_ensure_rgb(image)
+        # pad to square with white background
+        image = pil_pad_square(image)
+        # run the model's input transform to convert to tensor and rescale
+        if self.transform is None:
+            raise ValueError("Model not loaded")
+        inputs: Tensor = self.transform(image).unsqueeze(0)
+        # NCHW image RGB to BGR
+        inputs = inputs[:, [2, 1, 0]]
+        return inputs
 
     def predict(
         self,
@@ -157,39 +148,60 @@ class Predictor:
             model_repo = self.default_model_repo
         self.load_model(model_repo)
 
-        image = self.prepare_image(image)
+        image_input = self.prepare_image(image)
 
-        input_name = self.model.get_inputs()[0].name
-        label_name = self.model.get_outputs()[0].name
-        preds = self.model.run([label_name], {input_name: image})[0]
+        with torch.inference_mode():
+            # move model to GPU, if available
+            if self.torch_device.type != "cpu":
+                model = self.model.to(self.torch_device)
+                inputs = image_input.to(self.torch_device)
+            # run the model
+            outputs = model.forward(inputs)
+            # apply the final activation function (timm doesn't support doing this internally)
+            outputs = F.sigmoid(outputs)
+            # move inputs, outputs, and model back to to cpu if we were on GPU
+            if self.torch_device.type != "cpu":
+                inputs = inputs.to("cpu")
+                outputs = outputs.to("cpu")
+                model = model.to("cpu")
 
-        labels = list(zip(self.tag_names, preds[0].astype(float)))
+        probs = outputs.squeeze(0)
+        return self.get_tags(probs, general_thresh, character_thresh)
+    
+    def get_tags(
+        self,
+        probs: Tensor,
+        general_thresh: float | None,
+        character_thresh: float | None,
+    ):
+        if self.labels is None:
+            raise ValueError("Labels not loaded")
 
-        # First 4 labels are actually ratings: pick one with argmax
-        ratings_names = [labels[i] for i in self.rating_indexes]
-        rating = dict(ratings_names)
+        # Convert indices+probs to labels
+        labels = list(zip(self.labels.names, probs.numpy()))
 
-        # Then we have general tags: pick any where prediction confidence > threshold
-        general_names = [labels[i] for i in self.general_indexes]
+        # First 4 labels_data are actually ratings
+        rating_labels = dict([labels[i] for i in self.labels.rating])
+
+        # General labels, pick any where prediction confidence > threshold
+        general_labels_all = [labels[i] for i in self.labels.general]
 
         if not general_thresh:
             # Use MCut thresholding
-            general_probs = np.array([x[1] for x in general_names])
+            general_probs = np.array([x[1] for x in general_labels_all])
             general_thresh = mcut_threshold(general_probs)
+        
+        general_labels = dict([x for x in general_labels_all if x[1] > general_thresh])
 
-        general_res = [x for x in general_names if x[1] > general_thresh]
-        general_res = dict(general_res)
-
-        # Everything else is characters: pick any where prediction confidence > threshold
-        character_names = [labels[i] for i in self.character_indexes]
+        character_labels_all = [labels[i] for i in self.labels.character]
 
         if not character_thresh:
             # Use MCut thresholding
-            character_probs = np.array([x[1] for x in character_names])
+            character_probs = np.array([x[1] for x in character_labels_all])
             character_thresh = mcut_threshold(character_probs)
             character_thresh = max(0.05, character_thresh)
+        
+        # Character labels, pick any where prediction confidence > threshold
+        character_labels = dict([x for x in character_labels_all if x[1] > character_thresh])
 
-        character_res = [x for x in character_names if x[1] > character_thresh]
-        character_res = dict(character_res)
-
-        return rating, character_res, general_res
+        return rating_labels, character_labels, general_labels
