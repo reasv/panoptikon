@@ -1,28 +1,63 @@
 import sqlite3
 from datetime import datetime
+from typing import Any, Generator, List, Sequence
 
 from PIL import Image as PILImage
 import numpy as np
-from chromadb.api import BaseAPI
-from paddleocr import PaddleOCR
+from chromadb.api import ClientAPI
 
-from src.db import get_existing_file_for_sha256, FileSearchResult
+from doctr.models import ocr_predictor
+from doctr.io.html import read_html
+from doctr.io.pdf import read_pdf
+
+from src.db import ItemWithPath, get_existing_file_for_sha256, FileSearchResult
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.files import get_mime_type
-from src.utils import estimate_eta, make_video_thumbnails
+from src.utils import estimate_eta, make_video_thumbnails, pil_ensure_rgb
 from src.video import video_to_frames
+
+def batch_items_generator(items_generator: Generator[tuple[ItemWithPath, int, Any], Any, None], batch_size: int):
+    batch: List[ItemWithPath] = []
+    last_remaining = 0
+    total_items = 0
+    for item, remaining, total_items in items_generator:
+        last_remaining = remaining
+        total_items = total_items
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch, last_remaining, total_items
+            batch = []
+    if batch:
+        yield batch, last_remaining, total_items
+
+def batch_items_consumer(batch: List[ItemWithPath], process_batch_func, items_to_batch_items_func):
+    work_units = []
+    batch_index_to_work_units: dict[int, List[int]] = {}
+    for batch_index, item in enumerate(batch):
+        batch_index_to_work_units[batch_index] = []
+        item_wus = items_to_batch_items_func(item)
+        for wu in item_wus:
+            # The index of the work unit we are adding
+            wu_index = len(work_units)
+            work_units.append(wu)
+            batch_index_to_work_units[batch_index].append(wu_index)
+    processed_batch_items = process_batch_func(work_units)
+    # Yield the batch and the processed items matching the work units to the batch item
+    for batch_index, wu_indices in batch_index_to_work_units.items():
+        yield batch[batch_index], [processed_batch_items[i] for i in wu_indices]
 
 def scan_extract_text(
         conn: sqlite3.Connection,
-        cdb: BaseAPI,
+        cdb: ClientAPI,
         language="en",
-        model="paddleocr",
+        detection_model='db_resnet50',
+        recognition_model='crnn_mobilenet_v3_small',
     ):
     """
     Scan all items in the database that have not had text extracted yet.
     """
     scan_time = datetime.now().isoformat()
-    setter = f"{model}-{language}"
+    setter = f"{detection_model}-{recognition_model}"
     collection_name = f"text_embeddings"
     try:
         collection = cdb.get_collection(
@@ -32,61 +67,69 @@ def scan_extract_text(
         collection = cdb.create_collection(
             name=collection_name,
         )
-    ocr = PaddleOCR(use_angle_cls=True, lang=language, use_gpu=False)
-    failed_paths = []
+
+    doctr_model = ocr_predictor(det_arch=detection_model, reco_arch=recognition_model, pretrained=True).cuda().half()
     videos, images, total_video_frames, total_processed_frames, items = 0, 0, 0, 0, 0
-    for item, remaining, total_items in get_items_missing_tag_scan(conn, setter=setter):
-        items += 1
-        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Processing ({item.type}) {item.path}")
+    def process_batch(batch: Sequence[np.ndarray]) -> List[str]:
+        nonlocal total_processed_frames
+        total_processed_frames += len(batch)
+        result = doctr_model([image for image in batch])
+        files_texts: List[str] = []
+        for page in result.pages:
+            file_text = ""
+            for block in page.blocks:
+                for line in block.lines:
+                    for word in line.words:
+                        file_text += word.value + " "
+                    file_text += "\n"
+                file_text += "\n"
+            files_texts.append(file_text)
+        return files_texts
+
+    failed_paths: List[str] = []
+    def item_to_batch_items(item: ItemWithPath) -> List[np.ndarray]:
+        nonlocal failed_paths
         try:
             if item.type.startswith("image"):
-                image_array = np.array(PILImage.open(item.path))
-                ocr_result = ocr.ocr(image_array)[0]
-                text = "\n".join([line[1][0] for line in ocr_result])
-                collection.add(
+                return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
+            if item.type.startswith("video"):
+                frames = video_to_frames(item.path, num_frames=4)
+                make_video_thumbnails(frames, item.sha256, item.type)
+                return [np.array(pil_ensure_rgb(frame)) for frame in frames]
+            if item.type.startswith("application/pdf"):
+                return read_pdf(item.path)
+            if item.type.startswith("text/html"):
+                return read_pdf(read_html(item.path))
+        except Exception as e:
+            print(f"Failed to read {item.path}: {e}")
+            failed_paths.append(item.path)
+        return []
+
+    for batch, remaining, total_items in batch_items_generator(get_items_missing_tag_scan(conn, setter=setter), batch_size=64):
+        for item, ocr_results in batch_items_consumer(batch, process_batch, item_to_batch_items):
+            items += 1
+            merged_text = "\n".join(list(set(ocr_results)))
+            collection.add(
                     ids=[f"{item.sha256}-{setter}"],
-                    documents=[text],
+                    documents=[merged_text],
                     metadatas=[{
                         "item": item.sha256,
                         "source": "ocr",
-                        "model": model,
+                        "model": setter,
                         "setter": setter,
                         "language": language,
                         "type": item.type,
                         "general_type": item.type.split("/")[0],
                     }]
                 )
+            add_item_tag_scan(conn, item.sha256, setter, scan_time)
+            if item.type.startswith("image"):
                 images += 1
             if item.type.startswith("video"):
-                frames = video_to_frames(item.path, num_frames=4)
-                ocr_results = [ocr.ocr(np.array(frame))[0] for frame in frames]
-                texts = ["\n".join([line[1][0] for line in result]) for result in ocr_results]
-                # Deduplicate text
-                texts = list(set(texts))
-                # Get a single text for the video
-                full_text = "\n".join(texts)
-                collection.add(
-                        ids=[f"{item.sha256}-{setter}"],
-                        documents=[full_text],
-                        metadatas=([
-                            {
-                                "item": item.sha256,
-                                "source": "ocr",
-                                "model": model,
-                                "setter": setter,
-                                "language": language,
-                                "type": item.type,
-                                "general_type": item.type.split("/")[0],
-                            }]
-                        )
-                )
-                make_video_thumbnails(frames, item.sha256, item.type)
                 videos += 1
-                total_video_frames += len(frames)
-            add_item_tag_scan(conn, item.sha256, setter, scan_time)
-        except Exception as e:
-            print(f"Failed to embed {item.path}: {e}")
-            failed_paths.append(item.path)
+                total_video_frames += len(ocr_results)
+
+        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Last item ({item.type}) {item.path}")
 
     # Record the scan in the database log
     scan_end_time = datetime.now().isoformat()
@@ -112,7 +155,7 @@ def scan_extract_text(
 
 def search_item_text(
         conn: sqlite3.Connection,
-        cdb: BaseAPI,
+        cdb: ClientAPI,
         text_query: str,
         semantic_search: bool = False,
         full_text_search: bool = False,
