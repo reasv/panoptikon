@@ -1,7 +1,7 @@
 import os
 import subprocess
 import platform
-from typing import Any, Callable, Generator, List, Sequence
+from typing import Any, Callable, Generator, List, Sequence, Tuple
 import math
 from datetime import datetime
 import mimetypes
@@ -206,6 +206,51 @@ def batch_items_generator(
     if batch:
         yield batch, last_remaining, total_items
 
+def batch_items(
+        items_generator: Generator[Tuple[ItemWithPath, int, int], Any, None],
+        batch_size: int,
+        process_batch_func,
+        item_extractor_func
+    ):
+    while True:
+        batch: List[Tuple[ItemWithPath, int, int]] = []
+        work_units = []
+        batch_index_to_work_units: dict[int, List[int]] = {}
+        for item, remaining, total_items in items_generator:
+            batch_index = len(batch)
+            batch.append((item, remaining, total_items))
+            batch_index_to_work_units[batch_index] = []
+            item_wus = item_extractor_func(item)
+            for wu in item_wus:
+                # The index of the work unit we are adding
+                wu_index = len(work_units)
+                work_units.append(wu)
+                batch_index_to_work_units[batch_index].append(wu_index)
+            if len(work_units) >= batch_size:
+                # Stop adding items to the batch, and process
+                break
+        if len(work_units) == 0:
+            # No more work to do
+            break
+        processed_batch_items = process_batch_func(work_units)
+        # Yield the batch and the processed items matching the work units to the batch item
+        for batch_index, wu_indices in batch_index_to_work_units.items():
+            item, remaining, total_items = batch[batch_index]
+            yield item, remaining, total_items, [processed_batch_items[i] for i in wu_indices]
+
+def minibatcher(input_list: Sequence, run_minibatch, batch_size: int):
+    result = [None] * len(input_list)  # Initialize a result list with None values
+    start = 0  # Starting index for each batch
+
+    while start < len(input_list):
+        end = min(start + batch_size, len(input_list))  # Calculate end index for the current batch
+        batch = input_list[start:end]  # Extract the current batch
+        batch_result = run_minibatch(batch)  # Process the batch
+        result[start:end] = batch_result  # Insert the batch result into the result list
+        start = end  # Move to the next batch
+
+    return result
+
 def batch_items_consumer(
         batch: List[ItemWithPath],
         process_batch_func,
@@ -225,6 +270,7 @@ def batch_items_consumer(
     # Yield the batch and the processed items matching the work units to the batch item
     for batch_index, wu_indices in batch_index_to_work_units.items():
         yield batch[batch_index], [processed_batch_items[i] for i in wu_indices]
+
 
 def create_item_image_extractor(error_callback: Callable[[ItemWithPath], None]) -> Callable[[ItemWithPath], List[np.ndarray]]:
     def item_image_extractor(item: ItemWithPath) -> List[np.ndarray]:

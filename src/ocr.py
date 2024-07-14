@@ -1,21 +1,17 @@
 import sqlite3
 from datetime import datetime
-from typing import Any, Generator, List, Sequence
+from typing import List, Sequence
 
-from PIL import Image as PILImage
 import numpy as np
 from chromadb.api import ClientAPI
 
 from doctr.models import ocr_predictor
-from doctr.io.html import read_html
-from doctr.io.pdf import read_pdf
 
-from src.db import ItemWithPath, get_existing_file_for_sha256, FileSearchResult
+from src.db import get_existing_file_for_sha256, FileSearchResult
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.files import get_mime_type
-from src.utils import estimate_eta, make_video_thumbnails, pil_ensure_rgb
-from src.utils import batch_items_generator, batch_items_consumer, create_item_image_extractor
-from src.video import video_to_frames
+from src.utils import estimate_eta
+from src.utils import create_item_image_extractor, batch_items
 
 def scan_extract_text(
         conn: sqlite3.Connection,
@@ -44,7 +40,7 @@ def scan_extract_text(
     def process_batch(batch: Sequence[np.ndarray]) -> List[str]:
         nonlocal total_processed_frames
         total_processed_frames += len(batch)
-        result = doctr_model([image for image in batch])
+        result = doctr_model(batch)
         files_texts: List[str] = []
         for page in result.pages:
             file_text = ""
@@ -61,31 +57,34 @@ def scan_extract_text(
 
     item_extractor = create_item_image_extractor(error_callback=lambda x: failed_paths.append(x.path))
 
-    for batch, remaining, total_items in batch_items_generator(get_items_missing_tag_scan(conn, setter=setter), batch_size=64):
-        for item, ocr_results in batch_items_consumer(batch, process_batch, item_extractor):
-            items += 1
-            merged_text = "\n".join(list(set(ocr_results)))
-            collection.add(
-                    ids=[f"{item.sha256}-{setter}"],
-                    documents=[merged_text],
-                    metadatas=[{
-                        "item": item.sha256,
-                        "source": "ocr",
-                        "model": setter,
-                        "setter": setter,
-                        "language": language,
-                        "type": item.type,
-                        "general_type": item.type.split("/")[0],
-                    }]
-                )
-            add_item_tag_scan(conn, item.sha256, setter, scan_time)
-            if item.type.startswith("image"):
-                images += 1
-            if item.type.startswith("video"):
-                videos += 1
-                total_video_frames += len(ocr_results)
-
-        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Last item ({item.type}) {item.path}")
+    for item, remaining, total_items, ocr_results in batch_items(
+            get_items_missing_tag_scan(conn, setter=setter),
+            64,
+            process_batch,
+            item_extractor
+        ):
+        items += 1
+        merged_text = "\n".join(list(set(ocr_results)))
+        collection.add(
+                ids=[f"{item.sha256}-{setter}"],
+                documents=[merged_text],
+                metadatas=[{
+                    "item": item.sha256,
+                    "source": "ocr",
+                    "model": setter,
+                    "setter": setter,
+                    "language": language,
+                    "type": item.type,
+                    "general_type": item.type.split("/")[0],
+                }]
+            )
+        add_item_tag_scan(conn, item.sha256, setter, scan_time)
+        if item.type.startswith("image"):
+            images += 1
+        if item.type.startswith("video"):
+            videos += 1
+            total_video_frames += len(ocr_results)
+        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Processing ({item.type}) {item.path}")
 
     # Record the scan in the database log
     scan_end_time = datetime.now().isoformat()
