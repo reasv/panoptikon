@@ -6,10 +6,10 @@ import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
-from src.tags import scan_and_predict_tags
+from src.tags import run_tag_extractor_job
 from src.wd_tagger import V3_MODELS
-from src.image_embeddings import scan_and_embed, get_chromadb_client
-from src.ocr import scan_extract_text
+from src.image_embeddings import run_image_embedding_extractor_job, get_chromadb_client
+from src.ocr import run_ocr_extractor_job
 
 def get_folders():
     conn = get_database_connection()
@@ -75,20 +75,17 @@ def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
     for model in tag_models:
         cursor = conn.cursor()
         cursor.execute('BEGIN')
-        images, videos, failed, timed_out = scan_and_predict_tags(conn, setter=model)
+        images, videos, failed = run_tag_extractor_job(conn, model=model)
         conn.commit()
         vacuum_database(conn)
         failed_str = "\n".join(failed)
-        timed_out_str = "\n".join(timed_out)
         report_str = f"""
         Tag Generation completed for model {model}.
         Successfully processed {images} images and {videos} videos.
         {len(failed)} files failed to process due to errors.
-        {len(timed_out)} files took too long to process and timed out.
         Failed files:
         {failed_str}
         Timed out files:
-        {timed_out_str}
         """
         full_report += report_str
     conn.close()
@@ -99,20 +96,17 @@ def generate_embeds():
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute('BEGIN')
-    images, videos, failed, timed_out = scan_and_embed(conn, cdb)
+    images, videos, failed = run_image_embedding_extractor_job(conn, cdb)
     conn.commit()
     vacuum_database(conn)
     failed_str = "\n".join(failed)
-    timed_out_str = "\n".join(timed_out)
     report_str = f"""
     Embeddings generation completed.
     Successfully processed {images} images and {videos} videos.
     {len(failed)} files failed to process due to errors.
-    {len(timed_out)} files took too long to process and timed out.
     Failed files:
     {failed_str}
     Timed out files:
-    {timed_out_str}
     """
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()
@@ -122,20 +116,17 @@ def run_ocr():
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute('BEGIN')
-    images, videos, failed, timed_out = scan_extract_text(conn, cdb)
+    images, videos, failed = run_ocr_extractor_job(conn, cdb)
     conn.commit()
     vacuum_database(conn)
     failed_str = "\n".join(failed)
-    timed_out_str = "\n".join(timed_out)
     report_str = f"""
     OCR Extraction completed.
     Successfully processed {images} images and {videos} videos.
     {len(failed)} files failed to process due to errors.
-    {len(timed_out)} files took too long to process and timed out.
     Failed files:
     {failed_str}
     Timed out files:
-    {timed_out_str}
     """
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()

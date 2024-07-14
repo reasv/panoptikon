@@ -14,10 +14,10 @@ from chromadb.api.types import is_image, is_document, EmbeddingFunction, Image, 
 from chromadb.api import ClientAPI
 
 from src.db import get_existing_file_for_sha256, FileSearchResult
-from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.files import get_mime_type
-from src.utils import estimate_eta, make_video_thumbnails
-from src.video import video_to_frames
+from src.types import ItemWithPath
+from src.utils import item_image_extractor_np
+from src.extractor_job import run_extractor_job
 
 class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
     def __init__(
@@ -53,7 +53,7 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
             images: Sequence[str | PILImage.Image | np.ndarray]
         ):
         self._load_model()
-        embeddings = []
+        embeddings: List[np.ndarray] = []
 
         for i in range(0, len(images), self.batch_size):
             image_batch = images[i:i + self.batch_size]
@@ -124,7 +124,7 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
                 embeddings.append(self.get_text_embeddings([cast(Document, item)])[0].squeeze().tolist())
         return embeddings
 
-def get_chromadb_client() -> chromadb.api.BaseAPI:
+def get_chromadb_client() -> chromadb.api.ClientAPI:
     sqlite_db_file = os.getenv('DB_FILE', './db/sqlite.db')
     cdb_file = f"{sqlite_db_file}.chromadb"
     return chromadb.PersistentClient(path=cdb_file)
@@ -184,16 +184,12 @@ def search_item_image_embeddings(
 
     return searchResults, resultScores
 
-def scan_and_embed(
+def run_image_embedding_extractor_job(
         conn: sqlite3.Connection,
         cdb: ClientAPI,
         model="ViT-H-14-378-quickgelu",
         checkpoint="dfn5b",
     ):
-    """
-    Scan and embed all items in the database that are missing embeddings from the given embedding model.
-    """
-    scan_time = datetime.now().isoformat()
     embedder = CLIPEmbedder(
         model_name=model,
         pretrained=checkpoint,
@@ -202,70 +198,29 @@ def scan_and_embed(
     setter = f"{model}_ckpt_{checkpoint}"
     collection_name = f"image_embeddings.{setter}"
     try:
-        collection = cdb.get_collection(
-            name=collection_name,
-            embedding_function=embedder,
-        )
+        collection = cdb.get_collection(name=collection_name)
     except ValueError:
-        collection = cdb.create_collection(
-            name=collection_name,
-            embedding_function=embedder,
+        collection = cdb.create_collection(name=collection_name)
+
+    def process_batch(batch: Sequence[np.ndarray]):
+        return embedder.get_image_embeddings(batch)
+    
+    def handle_item_result(_: sqlite3.Connection, __: str, item: ItemWithPath, embeddings: Sequence[np.ndarray]):
+        collection.add(
+            ids=[f"{item.sha256}-{i}" for i, _ in enumerate(embeddings)],
+            embeddings=list(embeddings),
+            images=item_image_extractor_np(item),
+            metadatas=([{
+                "item": item.sha256,
+                "type": item.type,
+                "general_type": item.type.split("/")[0],
+            } for _ in embeddings])
         )
-    failed_paths = []
-    videos, images, total_video_frames, total_processed_frames, items = 0, 0, 0, 0, 0
-    for item, remaining, total_items in get_items_missing_tag_scan(conn, setter=setter):
-        items += 1
-        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Processing ({item.type}) {item.path}")
-        try:
-            if item.type.startswith("image"):
-                image_array = np.array(PILImage.open(item.path))
-                collection.add(
-                    ids=[item.sha256],
-                    images=[image_array],
-                    metadatas=[{
-                        "item": item.sha256,
-                        "type": item.type,
-                        "general_type": item.type.split("/")[0],   
-                    }]
-                )
-                images += 1
-            if item.type.startswith("video"):
-                frames = video_to_frames(item.path, num_frames=4)
-                collection.add(
-                        ids=[f"{item.sha256}-{i}" for i, f in enumerate(frames)],
-                        images=[np.array(frame) for frame in frames],
-                        metadatas=([{
-                            "item": item.sha256,
-                            "type": item.type,
-                            "general_type": item.type.split("/")[0],
-                        } for _ in frames])
-                )
-                make_video_thumbnails(frames, item.sha256, item.type)
-                videos += 1
-                total_video_frames += len(frames)
-            add_item_tag_scan(conn, item.sha256, setter, scan_time)
-        except Exception as e:
-            print(f"Failed to embed {item.path}: {e}")
-            failed_paths.append(item.path)
-
-    # Record the scan in the database log
-    scan_end_time = datetime.now().isoformat()
-    # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
-    remaining_paths = next(get_items_missing_tag_scan(conn, setter), [0, 0, 0])[2]
-    add_tag_scan(
+    return run_extractor_job(
         conn,
-        scan_time,
-        scan_end_time,
-        setter=setter,
-        threshold=0,
-        image_files=images,
-        video_files=videos,
-        other_files=0,
-        video_frames=total_video_frames,
-        total_frames=total_processed_frames,
-        errors=len(failed_paths),
-        timeouts=0,
-        total_remaining=remaining_paths
+        setter,
+        item_image_extractor_np,
+        process_batch,
+        handle_item_result
     )
-
-    return images, videos, failed_paths, []
+    

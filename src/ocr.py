@@ -1,45 +1,43 @@
-import sqlite3
-from datetime import datetime
 from typing import List, Sequence
+import sqlite3
 
+import torch
 import numpy as np
 from chromadb.api import ClientAPI
-
 from doctr.models import ocr_predictor
 
 from src.db import get_existing_file_for_sha256, FileSearchResult
-from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.files import get_mime_type
-from src.utils import estimate_eta
-from src.utils import create_item_image_extractor, batch_items
+from src.types import ItemWithPath
+from src.utils import item_image_extractor_np
+from src.extractor_job import run_extractor_job
 
-def scan_extract_text(
+def run_ocr_extractor_job(
         conn: sqlite3.Connection,
         cdb: ClientAPI,
         language="en",
         detection_model='db_resnet50',
-        recognition_model='crnn_mobilenet_v3_small',
+        recognition_model='crnn_mobilenet_v3_small'
     ):
     """
-    Scan all items in the database that have not had text extracted yet.
+    Run a job that processes items in the database using the given batch inference function and item extractor.
     """
-    scan_time = datetime.now().isoformat()
-    setter = f"{detection_model}-{recognition_model}"
+    setter_name = f"{detection_model}-{recognition_model}"
     collection_name = f"text_embeddings"
     try:
-        collection = cdb.get_collection(
-            name=collection_name,
-        )
+        collection = cdb.get_collection(name=collection_name)
     except ValueError:
-        collection = cdb.create_collection(
-            name=collection_name,
-        )
+        collection = cdb.create_collection(name=collection_name)
+    
+    doctr_model = ocr_predictor(
+        det_arch=detection_model,
+        reco_arch=recognition_model,
+        pretrained=True
+    )
+    if torch.cuda.is_available():
+        doctr_model = doctr_model.cuda().half()
 
-    doctr_model = ocr_predictor(det_arch=detection_model, reco_arch=recognition_model, pretrained=True).cuda().half()
-    videos, images, total_video_frames, total_processed_frames, items = 0, 0, 0, 0, 0
     def process_batch(batch: Sequence[np.ndarray]) -> List[str]:
-        nonlocal total_processed_frames
-        total_processed_frames += len(batch)
         result = doctr_model(batch)
         files_texts: List[str] = []
         for page in result.pages:
@@ -52,61 +50,30 @@ def scan_extract_text(
                 file_text += "\n"
             files_texts.append(file_text)
         return files_texts
-
-    failed_paths: List[str] = []
-
-    item_extractor = create_item_image_extractor(error_callback=lambda x: failed_paths.append(x.path))
-
-    for item, remaining, total_items, ocr_results in batch_items(
-            get_items_missing_tag_scan(conn, setter=setter),
-            64,
-            process_batch,
-            item_extractor
-        ):
-        items += 1
-        merged_text = "\n".join(list(set(ocr_results)))
+    
+    def handle_item_result(_: sqlite3.Connection, setter: str, item: ItemWithPath, results: Sequence[str]):
+        merged_text = "\n".join(list(set(results)))
         collection.add(
-                ids=[f"{item.sha256}-{setter}"],
-                documents=[merged_text],
-                metadatas=[{
-                    "item": item.sha256,
-                    "source": "ocr",
-                    "model": setter,
-                    "setter": setter,
-                    "language": language,
-                    "type": item.type,
-                    "general_type": item.type.split("/")[0],
-                }]
-            )
-        add_item_tag_scan(conn, item.sha256, setter, scan_time)
-        if item.type.startswith("image"):
-            images += 1
-        if item.type.startswith("video"):
-            videos += 1
-            total_video_frames += len(ocr_results)
-        print(f"{setter}: ({items}/{total_items}) (ETA: {estimate_eta(scan_time, items, remaining)}) Processing ({item.type}) {item.path}")
-
-    # Record the scan in the database log
-    scan_end_time = datetime.now().isoformat()
-    # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
-    remaining_paths = next(get_items_missing_tag_scan(conn, setter), [0, 0, 0])[2]
-    add_tag_scan(
+            ids=[f"{item.sha256}-{setter}"],
+            documents=[merged_text],
+            metadatas=[{
+                "item": item.sha256,
+                "source": "ocr",
+                "model": setter,
+                "setter": setter,
+                "language": language,
+                "type": item.type,
+                "general_type": item.type.split("/")[0],
+            }]
+        )
+    
+    return run_extractor_job(
         conn,
-        scan_time,
-        scan_end_time,
-        setter=setter,
-        threshold=0,
-        image_files=images,
-        video_files=videos,
-        other_files=0,
-        video_frames=total_video_frames,
-        total_frames=total_processed_frames,
-        errors=len(failed_paths),
-        timeouts=0,
-        total_remaining=remaining_paths
+        setter_name,
+        item_image_extractor_np,
+        process_batch,
+        handle_item_result
     )
-
-    return images, videos, failed_paths, []
 
 def search_item_text(
         conn: sqlite3.Connection,
