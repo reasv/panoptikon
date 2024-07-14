@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Sequence, Tuple
 
 import huggingface_hub
 import numpy as np
@@ -136,10 +136,14 @@ class Predictor:
         # NCHW image RGB to BGR
         inputs = inputs[:, [2, 1, 0]]
         return inputs
+    
+    def prepare_images(self, images: Sequence[Image.Image]) -> Tensor:
+        batch = [self.prepare_image(image) for image in images]
+        return torch.cat(batch, dim=0)
 
     def predict(
         self,
-        image,
+        images: Sequence[Image.Image],
         model_repo: str | None = None,
         general_thresh: float | None = None,
         character_thresh: float | None = None,
@@ -148,13 +152,13 @@ class Predictor:
             model_repo = self.default_model_repo
         self.load_model(model_repo)
 
-        image_input = self.prepare_image(image)
+        image_inputs = self.prepare_images(images)
 
         with torch.inference_mode():
             # move model to GPU, if available
             if self.torch_device.type != "cpu":
                 model = self.model.to(self.torch_device)
-                inputs = image_input.to(self.torch_device)
+                inputs = image_inputs.to(self.torch_device)
             # run the model
             outputs = model.forward(inputs)
             # apply the final activation function (timm doesn't support doing this internally)
@@ -165,15 +169,20 @@ class Predictor:
                 outputs = outputs.to("cpu")
                 model = model.to("cpu")
 
-        probs = outputs.squeeze(0)
-        return self.get_tags(probs, general_thresh, character_thresh)
+        # Process each image's output individually
+        results: List[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]] = []
+        for i in range(outputs.size(0)):
+            probs = outputs[i]
+            tags = self.get_tags(probs, general_thresh, character_thresh)
+            results.append(tags)
+        return results
     
     def get_tags(
         self,
         probs: Tensor,
         general_thresh: float | None,
         character_thresh: float | None,
-    ):
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
         if self.labels is None:
             raise ValueError("Labels not loaded")
 

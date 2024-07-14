@@ -71,11 +71,11 @@ def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: P
             if not frames:
                 raise Exception("No frames found")
             make_video_thumbnails(frames, sha256, mime_type)
-            character_res, general_res = aggregate_results([tag_predictor.predict(frame, general_thresh=tag_threshold, character_thresh=None) for frame in frames])
+            character_res, general_res = aggregate_results([tag_predictor.predict([frame], general_thresh=tag_threshold, character_thresh=None)[0] for frame in frames])
             n_frames = len(frames)
         else:
             image = PIL.Image.open(path)
-            character_res, general_res = translate_tags_result(*tag_predictor.predict(image, general_thresh=tag_threshold, character_thresh=None))
+            character_res, general_res = translate_tags_result(*tag_predictor.predict([image], general_thresh=tag_threshold, character_thresh=None)[0])
             n_frames = 1
         return TaggingResult(sha256, path, mime_type, n_frames, character_res, general_res)
     except Exception as e:
