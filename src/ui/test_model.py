@@ -6,7 +6,7 @@ import PIL.Image
 from src.wd_tagger import Predictor, V3_MODELS
 from src.ui.paddleocr import create_paddleocr_UI
 from src.ui.clip import create_CLIP_ui
-from src.ui.whisper_jax import create_whisper_ui
+# from src.ui.whisper_jax import create_whisper_ui
 
 def create_model_demo():
     with gr.TabItem(label="Models"):
@@ -17,8 +17,8 @@ def create_model_demo():
                 create_paddleocr_UI()
             with gr.Tab(label="CLIP Semantic Search"):
                 create_CLIP_ui()
-            with gr.Tab(label="WhisperJAX") as tab:
-                create_whisper_ui(tab)
+            # with gr.Tab(label="WhisperJAX") as tab:
+            #     create_whisper_ui(tab)
 
 def create_wd_tagger_UI():
     TITLE = "WaifuDiffusion Tagger"

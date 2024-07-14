@@ -25,6 +25,7 @@ torchvision = {version = "^0.18.1+cu121", source = "pytorch_cuda"}
 torchaudio = {version = "^2.3.1+cu121", source = "pytorch_cuda"}
 python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
+python-dotenv = "^1.0.1"
 
 [[tool.poetry.source]]
 name = "pytorch_cuda"
