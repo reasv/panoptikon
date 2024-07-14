@@ -189,23 +189,6 @@ def pil_pad_square(image: Image.Image) -> Image.Image:
     canvas.paste(image, ((px - w) // 2, (px - h) // 2))
     return canvas
 
-def batch_items_generator(
-        items_generator: Generator[tuple[ItemWithPath, int, Any], Any, None],
-        batch_size: int
-    ):
-    batch: List[ItemWithPath] = []
-    last_remaining = 0
-    total_items = 0
-    for item, remaining, total_items in items_generator:
-        last_remaining = remaining
-        total_items = total_items
-        batch.append(item)
-        if len(batch) == batch_size:
-            yield batch, last_remaining, total_items
-            batch = []
-    if batch:
-        yield batch, last_remaining, total_items
-
 def batch_items(
         items_generator: Generator[Tuple[ItemWithPath, int, int], Any, None],
         batch_size: int,
@@ -250,27 +233,6 @@ def minibatcher(input_list: Sequence, run_minibatch, batch_size: int):
         start = end  # Move to the next batch
 
     return result
-
-def batch_items_consumer(
-        batch: List[ItemWithPath],
-        process_batch_func,
-        item_extractor_func
-    ):
-    work_units = []
-    batch_index_to_work_units: dict[int, List[int]] = {}
-    for batch_index, item in enumerate(batch):
-        batch_index_to_work_units[batch_index] = []
-        item_wus = item_extractor_func(item)
-        for wu in item_wus:
-            # The index of the work unit we are adding
-            wu_index = len(work_units)
-            work_units.append(wu)
-            batch_index_to_work_units[batch_index].append(wu_index)
-    processed_batch_items = process_batch_func(work_units)
-    # Yield the batch and the processed items matching the work units to the batch item
-    for batch_index, wu_indices in batch_index_to_work_units.items():
-        yield batch[batch_index], [processed_batch_items[i] for i in wu_indices]
-
 
 def create_item_image_extractor(error_callback: Callable[[ItemWithPath], None]) -> Callable[[ItemWithPath], List[np.ndarray]]:
     def item_image_extractor(item: ItemWithPath) -> List[np.ndarray]:
