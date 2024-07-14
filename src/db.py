@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 from src.utils import normalize_path, get_mime_type
-from src.types import FileScanData
+from src.types import FileScanData, ItemWithPath
 
 def get_database_connection(force_readonly=False) -> sqlite3.Connection:
     # Check if we are in read-only mode
@@ -476,15 +476,6 @@ def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
         else:
             # If no working path is found, skip this item
             continue
-
-@dataclass
-class ItemWithPath:
-    sha256: str
-    md5: str
-    type: str
-    size: int
-    time_added: str
-    path: str
 
 def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
     cursor = conn.cursor()

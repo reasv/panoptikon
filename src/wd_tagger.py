@@ -111,7 +111,13 @@ class Predictor:
         self.last_loaded_repo = None
         self.torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def load_model(self, model_repo):
+    def load_model(self, model_repo: str | None = None):
+        if model_repo is None:
+            model_repo = self.default_model_repo
+        
+        if model_repo is None:
+            raise ValueError("No model repo provided")
+
         if model_repo == self.last_loaded_repo:
             return
         self.labels = load_labels(model_repo)

@@ -4,13 +4,14 @@ from datetime import datetime
 from typing import List, Sequence, Union, cast
 
 from PIL import Image as PILImage
+from httpx import Client
 import torch
 import open_clip
 import numpy as np
 import chromadb
 import chromadb.api
 from chromadb.api.types import is_image, is_document, EmbeddingFunction, Image, Images, Document, Documents, Embeddings, Embedding
-from chromadb.api import BaseAPI
+from chromadb.api import ClientAPI
 
 from src.db import get_existing_file_for_sha256, FileSearchResult
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
@@ -130,7 +131,7 @@ def get_chromadb_client() -> chromadb.api.BaseAPI:
 
 def search_item_image_embeddings(
         conn: sqlite3.Connection,
-        cdb: chromadb.api.BaseAPI,
+        cdb: chromadb.api.ClientAPI,
         embedder: CLIPEmbedder,
         image_query: np.ndarray | None = None,
         text_query: str | None = None,
@@ -185,7 +186,7 @@ def search_item_image_embeddings(
 
 def scan_and_embed(
         conn: sqlite3.Connection,
-        cdb: BaseAPI,
+        cdb: ClientAPI,
         model="ViT-H-14-378-quickgelu",
         checkpoint="dfn5b",
     ):

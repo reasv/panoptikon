@@ -6,8 +6,6 @@ from io import BytesIO
 from PIL.Image import Image
 import PIL.Image
 
-from src.utils import create_image_grid
-
 def select_representative_frames(frames, max_frames):
     """
     Select a specified number of representative frames from a list.
@@ -37,16 +35,16 @@ def select_representative_frames(frames, max_frames):
     
     return selected_frames
 
-def saveImages(basePath, images: List[Image]):
-    # Normalize the path
-    basePath = os.path.normpath(basePath)
-    # Create the directory if it doesn't exist
-    os.makedirs(basePath, exist_ok=True)
-    for i in range(len(images)):
-        imagePath = os.path.join(basePath, f"{i}" + ".jpg")
-        images[i].save(imagePath)
+# def saveImages(basePath, images: List[Image]):
+#     # Normalize the path
+#     basePath = os.path.normpath(basePath)
+#     # Create the directory if it doesn't exist
+#     os.makedirs(basePath, exist_ok=True)
+#     for i in range(len(images)):
+#         imagePath = os.path.join(basePath, f"{i}" + ".jpg")
+#         images[i].save(imagePath)
 
-    create_image_grid(images).save(os.path.join(basePath, "grid.jpg"))
+#     create_image_grid(images).save(os.path.join(basePath, "grid.jpg"))
 
 def extract_keyframes_ffmpeg(path: str, num_frames: int):
     # Create a temporary directory to store extracted frames

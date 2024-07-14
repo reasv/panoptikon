@@ -1,13 +1,20 @@
 import os
 import subprocess
 import platform
+from typing import Any, Callable, Generator, List, Sequence
+import math
 from datetime import datetime
 import mimetypes
+
+from src.video import video_to_frames
 mimetypes.add_type('image/webp', '.webp')
-
 from PIL import Image, ImageDraw, ImageFont
+from PIL import Image as PILImage
+import numpy as np
+from doctr.io.html import read_html
+from doctr.io.pdf import read_pdf
 
-import math
+from src.types import ItemWithPath
 
 def show_in_fm(path):
     """
@@ -181,3 +188,78 @@ def pil_pad_square(image: Image.Image) -> Image.Image:
     canvas = Image.new("RGB", (px, px), (255, 255, 255))
     canvas.paste(image, ((px - w) // 2, (px - h) // 2))
     return canvas
+
+def batch_items_generator(
+        items_generator: Generator[tuple[ItemWithPath, int, Any], Any, None],
+        batch_size: int
+    ):
+    batch: List[ItemWithPath] = []
+    last_remaining = 0
+    total_items = 0
+    for item, remaining, total_items in items_generator:
+        last_remaining = remaining
+        total_items = total_items
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch, last_remaining, total_items
+            batch = []
+    if batch:
+        yield batch, last_remaining, total_items
+
+def batch_items_consumer(
+        batch: List[ItemWithPath],
+        process_batch_func,
+        item_extractor_func
+    ):
+    work_units = []
+    batch_index_to_work_units: dict[int, List[int]] = {}
+    for batch_index, item in enumerate(batch):
+        batch_index_to_work_units[batch_index] = []
+        item_wus = item_extractor_func(item)
+        for wu in item_wus:
+            # The index of the work unit we are adding
+            wu_index = len(work_units)
+            work_units.append(wu)
+            batch_index_to_work_units[batch_index].append(wu_index)
+    processed_batch_items = process_batch_func(work_units)
+    # Yield the batch and the processed items matching the work units to the batch item
+    for batch_index, wu_indices in batch_index_to_work_units.items():
+        yield batch[batch_index], [processed_batch_items[i] for i in wu_indices]
+
+def create_item_image_extractor(error_callback: Callable[[ItemWithPath], None]) -> Callable[[ItemWithPath], List[np.ndarray]]:
+    def item_image_extractor(item: ItemWithPath) -> List[np.ndarray]:
+        try:
+            if item.type.startswith("image"):
+                return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
+            if item.type.startswith("video"):
+                frames = video_to_frames(item.path, num_frames=4)
+                make_video_thumbnails(frames, item.sha256, item.type)
+                return [np.array(pil_ensure_rgb(frame)) for frame in frames]
+            if item.type.startswith("application/pdf"):
+                return read_pdf(item.path)
+            if item.type.startswith("text/html"):
+                return read_pdf(read_html(item.path))
+        except Exception as e:
+            print(f"Failed to read {item.path}: {e}")
+            error_callback(item)
+        return []
+    return item_image_extractor
+
+def create_item_image_extractor_pil(error_callback: Callable[[ItemWithPath], None]) -> Callable[[ItemWithPath], List[PILImage.Image]]:
+    def item_image_extractor(item: ItemWithPath) -> List[PILImage.Image]:
+        try:
+            if item.type.startswith("image"):
+                return [PILImage.open(item.path)]
+            if item.type.startswith("video"):
+                frames = video_to_frames(item.path, num_frames=4)
+                make_video_thumbnails(frames, item.sha256, item.type)
+                return frames
+            if item.type.startswith("application/pdf"):
+                return [PILImage.fromarray(page) for page in read_pdf(item.path)]
+            if item.type.startswith("text/html"):
+                return [PILImage.fromarray(page) for page in read_pdf(read_html(item.path))]
+        except Exception as e:
+            print(f"Failed to read {item.path}: {e}")
+            error_callback(item)
+        return []
+    return item_image_extractor

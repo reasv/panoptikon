@@ -14,37 +14,8 @@ from src.db import ItemWithPath, get_existing_file_for_sha256, FileSearchResult
 from src.db import get_items_missing_tag_scan, add_item_tag_scan, add_tag_scan
 from src.files import get_mime_type
 from src.utils import estimate_eta, make_video_thumbnails, pil_ensure_rgb
+from src.utils import batch_items_generator, batch_items_consumer, create_item_image_extractor
 from src.video import video_to_frames
-
-def batch_items_generator(items_generator: Generator[tuple[ItemWithPath, int, Any], Any, None], batch_size: int):
-    batch: List[ItemWithPath] = []
-    last_remaining = 0
-    total_items = 0
-    for item, remaining, total_items in items_generator:
-        last_remaining = remaining
-        total_items = total_items
-        batch.append(item)
-        if len(batch) == batch_size:
-            yield batch, last_remaining, total_items
-            batch = []
-    if batch:
-        yield batch, last_remaining, total_items
-
-def batch_items_consumer(batch: List[ItemWithPath], process_batch_func, items_to_batch_items_func):
-    work_units = []
-    batch_index_to_work_units: dict[int, List[int]] = {}
-    for batch_index, item in enumerate(batch):
-        batch_index_to_work_units[batch_index] = []
-        item_wus = items_to_batch_items_func(item)
-        for wu in item_wus:
-            # The index of the work unit we are adding
-            wu_index = len(work_units)
-            work_units.append(wu)
-            batch_index_to_work_units[batch_index].append(wu_index)
-    processed_batch_items = process_batch_func(work_units)
-    # Yield the batch and the processed items matching the work units to the batch item
-    for batch_index, wu_indices in batch_index_to_work_units.items():
-        yield batch[batch_index], [processed_batch_items[i] for i in wu_indices]
 
 def scan_extract_text(
         conn: sqlite3.Connection,
@@ -87,26 +58,11 @@ def scan_extract_text(
         return files_texts
 
     failed_paths: List[str] = []
-    def item_to_batch_items(item: ItemWithPath) -> List[np.ndarray]:
-        nonlocal failed_paths
-        try:
-            if item.type.startswith("image"):
-                return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
-            if item.type.startswith("video"):
-                frames = video_to_frames(item.path, num_frames=4)
-                make_video_thumbnails(frames, item.sha256, item.type)
-                return [np.array(pil_ensure_rgb(frame)) for frame in frames]
-            if item.type.startswith("application/pdf"):
-                return read_pdf(item.path)
-            if item.type.startswith("text/html"):
-                return read_pdf(read_html(item.path))
-        except Exception as e:
-            print(f"Failed to read {item.path}: {e}")
-            failed_paths.append(item.path)
-        return []
+
+    item_extractor = create_item_image_extractor(error_callback=lambda x: failed_paths.append(x.path))
 
     for batch, remaining, total_items in batch_items_generator(get_items_missing_tag_scan(conn, setter=setter), batch_size=64):
-        for item, ocr_results in batch_items_consumer(batch, process_batch, item_to_batch_items):
+        for item, ocr_results in batch_items_consumer(batch, process_batch, item_extractor):
             items += 1
             merged_text = "\n".join(list(set(ocr_results)))
             collection.add(

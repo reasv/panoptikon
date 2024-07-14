@@ -1,19 +1,18 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List
+from typing import List, Sequence
 import os
 from datetime import datetime
 import sqlite3
 
-from src.utils import estimate_eta
+from src.utils import create_item_image_extractor_pil, estimate_eta
 
 import PIL.IcnsImagePlugin
 import PIL.Image
 
 from src.db import add_tag_scan, add_item_tag_scan, get_items_missing_tag_scan, create_tag_setter, insert_tag_item, get_item_rowid
 from src.wd_tagger import Predictor, V3_MODELS
-from src.video import video_to_frames
-from src.utils import make_video_thumbnails
+from src.utils import batch_items_generator, batch_items_consumer
 
 def get_threshold_from_env() -> float:
     threshold = os.getenv("SCORE_THRESHOLD")
@@ -26,15 +25,6 @@ def get_timeout_from_env() -> int:
     if timeout is None:
         return 40
     return int(timeout)
-
-@dataclass
-class TaggingResult:
-    sha256: str
-    path: str
-    mime_type: str
-    frames: int
-    character_tags: dict[str, float]
-    general_tags: dict[str, float]
 
 def combine_results(results: List[dict[str, float]]) -> dict[str, float]:
     """
@@ -50,6 +40,8 @@ def combine_results(results: List[dict[str, float]]) -> dict[str, float]:
     return combined_result
 
 def aggregate_results(results: List[tuple[dict[str, float], dict[str, float], dict[str, float]]]):
+    if len(results) == 1:
+        return translate_tags_result(*results[0])
     # Combine all results into a single result for each category
     rating_res, character_res, general_res = zip(*results)
     return translate_tags_result(combine_results(list(rating_res)), combine_results(list(character_res)), combine_results(list(general_res)))
@@ -61,27 +53,6 @@ def translate_tags_result(rating_res: dict[str, float], character_res: dict[str,
     general_res[rating_tag] = rating_confidence
     return character_res, general_res
 
-def process_single_file(sha256: str, mime_type: str, path: str, tag_predictor: Predictor, tag_threshold=0.25):
-    """
-    Process a single file and predict tags for it. Returns a TaggingResult object, or None if an error occurred.
-    """
-    try:
-        if mime_type.startswith("video"):
-            frames = video_to_frames(path, num_frames=4)
-            if not frames:
-                raise Exception("No frames found")
-            make_video_thumbnails(frames, sha256, mime_type)
-            character_res, general_res = aggregate_results([tag_predictor.predict([frame], general_thresh=tag_threshold, character_thresh=None)[0] for frame in frames])
-            n_frames = len(frames)
-        else:
-            image = PIL.Image.open(path)
-            character_res, general_res = translate_tags_result(*tag_predictor.predict([image], general_thresh=tag_threshold, character_thresh=None)[0])
-            n_frames = 1
-        return TaggingResult(sha256, path, mime_type, n_frames, character_res, general_res)
-    except Exception as e:
-        print(f"Error processing {path} with error {e}")
-        return None
-
 def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
     """
     Scan and predict tags for all items in the database that are missing tags from the given tagging ML model.
@@ -91,48 +62,48 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
     score_threshold = get_threshold_from_env()
     print(f"Using score threshold {score_threshold}")
     failed_paths = []
-    videos, images, total_video_frames, total_processed_frames = 0, 0, 0, 0
+    videos, images, other, total_video_frames, total_processed_frames = 0, 0, 0, 0, 0
     counter = 0
-    for item, remaining, total_items in get_items_missing_tag_scan(conn, setter):
-        counter += 1
-        print(f"{setter}: ({counter}/{total_items}) (ETA: {estimate_eta(scan_time, counter, remaining)}) Processing ({item.type}) {item.path}")
-        tag_result = process_single_file(
-                item.sha256,
-                item.type,
-                item.path,
-                tag_predictor=tag_predictor,
-                tag_threshold=score_threshold
-            )
-        if tag_result is None:
-            failed_paths.append(item.path)
-            continue
+    item_extractor = create_item_image_extractor_pil(error_callback=lambda x: failed_paths.append(x.path))
 
-        total_processed_frames += tag_result.frames
+    def process_batch_inference(batch_images: Sequence[PIL.Image.Image]):
+        return tag_predictor.predict(batch_images, general_thresh=score_threshold, character_thresh=None)
 
-        if item.type.startswith("video"):
-            videos += 1
-            total_video_frames += tag_result.frames
-        else:
-            images += 1
-        tags = [
-            ("danbooru:character", tag, confidence) for tag, confidence in tag_result.character_tags.items()
+    for batch, remaining, total_items in batch_items_generator(get_items_missing_tag_scan(conn, setter), batch_size=64):
+        for item, results in batch_items_consumer(batch, process_batch_inference, item_extractor):
+            counter += 1
+            if len(results) == 0:
+                continue
+            character_res, general_res = aggregate_results(results)
+            total_processed_frames += len(results)
+            if item.type.startswith("video"):
+                videos += 1
+                total_video_frames += len(results)
+            elif item.type.startswith("image"):
+                images += 1
+            else:
+                other += 1
+            tags = [
+            ("danbooru:character", tag, confidence) for tag, confidence in character_res.items()
             ] + [
-            ("danbooru:general", tag, confidence) for tag, confidence in tag_result.general_tags.items() if not tag.startswith("rating:")
+            ("danbooru:general", tag, confidence) for tag, confidence in general_res.items() if not tag.startswith("rating:")
             ] + [
-            ("danbooru:rating", tag, confidence) for tag, confidence in tag_result.general_tags.items() if tag.startswith("rating:")
+            ("danbooru:rating", tag, confidence) for tag, confidence in general_res.items() if tag.startswith("rating:")
             ]
-        for namespace, tag, confidence in tags:
-            tag_rowid = create_tag_setter(conn, namespace=namespace, name=tag, setter=setter)
-            item_rowid = get_item_rowid(conn, item.sha256)
-            assert item_rowid is not None
-            insert_tag_item(
-                conn,
-                item_rowid=item_rowid,
-                tag_rowid=tag_rowid,
-                confidence=confidence,
-            )
-        add_item_tag_scan(conn, item=item.sha256, setter=setter, last_scan=scan_time, tags_set=len(tags), tags_removed=0)
-
+            for namespace, tag, confidence in tags:
+                tag_rowid = create_tag_setter(conn, namespace=namespace, name=tag, setter=setter)
+                item_rowid = get_item_rowid(conn, item.sha256)
+                assert item_rowid is not None
+                insert_tag_item(
+                    conn,
+                    item_rowid=item_rowid,
+                    tag_rowid=tag_rowid,
+                    confidence=confidence,
+                )
+            add_item_tag_scan(conn, item=item.sha256, setter=setter, last_scan=scan_time, tags_set=len(tags), tags_removed=0)
+        
+        print(f"{setter}: ({counter}/{total_items}) (ETA: {estimate_eta(scan_time, counter, remaining)}) Processing ({item.type}) {item.path}")    
+    
     print(f"Processed {images} images and {videos} videos totalling {total_processed_frames} frames ({total_video_frames} video frames)")
     
     # Record the scan in the database log
@@ -147,7 +118,7 @@ def scan_and_predict_tags(conn: sqlite3.Connection, setter=V3_MODELS[0]):
         threshold=score_threshold,
         image_files=images,
         video_files=videos,
-        other_files=0,
+        other_files=other,
         video_frames=total_video_frames,
         total_frames=total_processed_frames,
         errors=len(failed_paths),
