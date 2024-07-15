@@ -4,7 +4,7 @@ import gradio as gr
 import PIL.Image
 
 from src.data_extractors.wd_tagger import Predictor, V3_MODELS
-from src.ui.paddleocr import create_paddleocr_UI
+from src.ui.ocr_doctr import create_doctr_UI
 from src.ui.clip import create_CLIP_ui
 # from src.ui.whisper_jax import create_whisper_ui
 
@@ -13,8 +13,8 @@ def create_model_demo():
         with gr.Tabs():
             with gr.Tab(label="WD Taggers"):
                 create_wd_tagger_UI()
-            with gr.Tab(label="PaddleOCR"):
-                create_paddleocr_UI()
+            with gr.Tab(label="docTR OCR"):
+                create_doctr_UI()
             with gr.Tab(label="CLIP Semantic Search"):
                 create_CLIP_ui()
             # with gr.Tab(label="WhisperJAX") as tab:
