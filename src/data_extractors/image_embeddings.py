@@ -204,9 +204,10 @@ def run_image_embedding_extractor_job(
         return embedder.get_image_embeddings(batch)
     
     def handle_item_result(item: ItemWithPath, inputs: Sequence[np.ndarray],  embeddings: Sequence[np.ndarray]):
+        embeddings_list = [embedding.tolist() for embedding in embeddings]
         collection.add(
             ids=[f"{item.sha256}-{i}" for i, _ in enumerate(embeddings)],
-            embeddings=list(embeddings),
+            embeddings=embeddings_list,
             images=list(inputs),
             metadatas=([{
                 "item": item.sha256,
