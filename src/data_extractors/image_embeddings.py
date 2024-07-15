@@ -191,6 +191,7 @@ def run_image_embedding_extractor_job(
     embedder = CLIPEmbedder(
         model_name=model,
         pretrained=checkpoint,
+        batch_size=64
     )
     embedder.load_model()
     setter = f"{model}_ckpt_{checkpoint}"
