@@ -7,8 +7,8 @@ import PIL.Image
 from src.types import ItemWithPath
 from src.utils import item_image_extractor_pil
 from src.db import create_tag_setter, insert_tag_item, get_item_rowid
-from src.wd_tagger import Predictor, V3_MODELS
-from src.extractor_job import run_extractor_job
+from src.data_extractors.wd_tagger import Predictor, V3_MODELS
+from src.data_extractors.extractor_job import run_extractor_job
 
 def get_threshold_from_env() -> float:
     threshold = os.getenv("SCORE_THRESHOLD")

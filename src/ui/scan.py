@@ -6,10 +6,10 @@ import gradio as gr
 
 from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
-from src.tags import run_tag_extractor_job
-from src.wd_tagger import V3_MODELS
-from src.image_embeddings import run_image_embedding_extractor_job, get_chromadb_client
-from src.ocr import run_ocr_extractor_job
+from src.data_extractors.tags import run_tag_extractor_job
+from src.data_extractors.wd_tagger import V3_MODELS
+from src.data_extractors.image_embeddings import run_image_embedding_extractor_job, get_chromadb_client
+from src.data_extractors.ocr import run_ocr_extractor_job
 
 def get_folders():
     conn = get_database_connection()

@@ -10,7 +10,7 @@ from src.db import get_existing_file_for_sha256, FileSearchResult
 from src.files import get_mime_type
 from src.types import ItemWithPath
 from src.utils import item_image_extractor_np
-from src.extractor_job import run_extractor_job
+from src.data_extractors.extractor_job import run_extractor_job
 
 def run_ocr_extractor_job(
         conn: sqlite3.Connection,

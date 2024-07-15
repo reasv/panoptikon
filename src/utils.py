@@ -6,7 +6,7 @@ import math
 from datetime import datetime
 import mimetypes
 
-from src.video import video_to_frames
+from src.data_extractors.video import video_to_frames
 mimetypes.add_type('image/webp', '.webp')
 from PIL import Image, ImageDraw, ImageFont
 from PIL import Image as PILImage

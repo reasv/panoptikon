@@ -5,7 +5,7 @@ import numpy as np
 
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
-from src.image_embeddings import CLIPEmbedder, search_item_image_embeddings, get_chromadb_client
+from src.data_extractors.image_embeddings import CLIPEmbedder, search_item_image_embeddings, get_chromadb_client
 
 def create_semantic_search_UI(
         select_history: gr.State | None = None,

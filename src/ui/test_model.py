@@ -3,7 +3,7 @@ from __future__ import annotations
 import gradio as gr
 import PIL.Image
 
-from src.wd_tagger import Predictor, V3_MODELS
+from src.data_extractors.wd_tagger import Predictor, V3_MODELS
 from src.ui.paddleocr import create_paddleocr_UI
 from src.ui.clip import create_CLIP_ui
 # from src.ui.whisper_jax import create_whisper_ui

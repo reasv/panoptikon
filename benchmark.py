@@ -3,7 +3,7 @@ from time import time
 import random
 
 from src.db import get_database_connection, search_files, get_most_common_tags, get_folders_from_database
-from src.wd_tagger import V3_MODELS
+from src.data_extractors.wd_tagger import V3_MODELS
 
 def select_random_tags(tags_list: List[Tuple[str, int]], min_tags: int = 1, max_tags: int = 3) -> List[str]:
     # Calculate exponential weights for the number of tags

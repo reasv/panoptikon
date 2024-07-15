@@ -5,8 +5,8 @@ import numpy as np
 
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
-from src.ocr import search_item_text
-from src.image_embeddings import get_chromadb_client
+from src.data_extractors.ocr import search_item_text
+from src.data_extractors.image_embeddings import get_chromadb_client
 
 def create_semantic_text_search_UI(
         select_history: gr.State | None = None,

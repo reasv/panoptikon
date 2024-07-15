@@ -7,7 +7,7 @@ import gradio as gr
 from src.ui.components.multi_view import create_multiview
 from src.db import FileSearchResult
 from src.files import get_files_by_extension, get_last_modified_time_and_size, get_mime_type
-from src.image_embeddings import CLIPEmbedder
+from src.data_extractors.image_embeddings import CLIPEmbedder
 
 def get_images(folder_path: str):
     image_paths = list(get_files_by_extension([folder_path], [], ['.jpg', '.jpeg', '.png']))

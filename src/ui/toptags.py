@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gradio as gr
 from src.db import get_most_common_tags_frequency, get_database_connection
-from src.wd_tagger import V3_MODELS
+from src.data_extractors.wd_tagger import V3_MODELS
 
 def get_labels(setters = None, confidence_threshold=None):
     if confidence_threshold == 0.1:

@@ -6,8 +6,8 @@ from time import time
 
 from src.db import get_database_connection, get_folders_from_database, search_files
 from src.ui.components.multi_view import create_multiview
-from src.wd_tagger import V3_MODELS
-from src.tags import get_threshold_from_env
+from src.data_extractors.wd_tagger import V3_MODELS
+from src.data_extractors.tags import get_threshold_from_env
 
 def build_query(tags: list, min_tag_confidence: float | None, include_path: str | None = None, page_size: int = 10, page: int = 1, order_by: str = "last_modified", order = None):
     if not include_path: include_path = ""
