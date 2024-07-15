@@ -472,7 +472,7 @@ def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
         remaining_count -= 1
         if file := get_existing_file_for_sha256(conn, item.sha256):
             item.path = file.path
-            yield item, remaining_count, total_count
+            yield item, remaining_count
         else:
             # If no working path is found, skip this item
             continue

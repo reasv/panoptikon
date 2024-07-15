@@ -51,16 +51,16 @@ def run_ocr_extractor_job(
             files_texts.append(file_text)
         return files_texts
     
-    def handle_item_result(_: sqlite3.Connection, setter: str, item: ItemWithPath, results: Sequence[str]):
-        merged_text = "\n".join(list(set(results)))
+    def handle_item_result(item: ItemWithPath, inputs: Sequence[np.ndarray], outputs: Sequence[str]):
+        merged_text = "\n".join(list(set(outputs)))
         collection.add(
-            ids=[f"{item.sha256}-{setter}"],
+            ids=[f"{item.sha256}-{setter_name}"],
             documents=[merged_text],
             metadatas=[{
                 "item": item.sha256,
                 "source": "ocr",
-                "model": setter,
-                "setter": setter,
+                "model": setter_name,
+                "setter": setter_name,
                 "language": language,
                 "type": item.type,
                 "general_type": item.type.split("/")[0],
@@ -70,6 +70,7 @@ def run_ocr_extractor_job(
     return run_extractor_job(
         conn,
         setter_name,
+        64,
         item_image_extractor_np,
         process_batch,
         handle_item_result

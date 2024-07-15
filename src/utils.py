@@ -195,7 +195,7 @@ def item_image_extractor_np(item: ItemWithPath) -> List[np.ndarray]:
     if item.type.startswith("video"):
         frames = video_to_frames(item.path, num_frames=4)
         make_video_thumbnails(frames, item.sha256, item.type)
-        return [np.array(pil_ensure_rgb(frame)) for frame in frames]
+        return [np.array(pil_ensure_rgb(frame)) for frame in frames]    
     if item.type.startswith("application/pdf"):
         return read_pdf(item.path)
     if item.type.startswith("text/html"):

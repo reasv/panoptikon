@@ -80,10 +80,14 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: str = V3_MODELS[0]):
     def batch_inference_func(batch_images: Sequence[PIL.Image.Image]):
         return tag_predictor.predict(batch_images, general_thresh=score_threshold, character_thresh=None)
     
+    def handle_result(item: ItemWithPath, _: Sequence[PIL.Image.Image], outputs: Sequence[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]]):
+        handle_individual_result(conn, model, item, outputs)
+    
     return run_extractor_job(
         conn,
         model,
+        64,
         item_image_extractor_pil,
         batch_inference_func,
-        handle_individual_result
+        handle_result
     )

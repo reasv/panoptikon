@@ -1,10 +1,8 @@
 import os
 import sqlite3
-from datetime import datetime
 from typing import List, Sequence, Union, cast
 
 from PIL import Image as PILImage
-from httpx import Client
 import torch
 import open_clip
 import numpy as np
@@ -205,11 +203,11 @@ def run_image_embedding_extractor_job(
     def process_batch(batch: Sequence[np.ndarray]):
         return embedder.get_image_embeddings(batch)
     
-    def handle_item_result(_: sqlite3.Connection, __: str, item: ItemWithPath, embeddings: Sequence[np.ndarray]):
+    def handle_item_result(item: ItemWithPath, inputs: Sequence[np.ndarray],  embeddings: Sequence[np.ndarray]):
         collection.add(
             ids=[f"{item.sha256}-{i}" for i, _ in enumerate(embeddings)],
             embeddings=list(embeddings),
-            images=item_image_extractor_np(item),
+            images=list(inputs),
             metadatas=([{
                 "item": item.sha256,
                 "type": item.type,
@@ -219,6 +217,7 @@ def run_image_embedding_extractor_job(
     return run_extractor_job(
         conn,
         setter,
+        64,
         item_image_extractor_np,
         process_batch,
         handle_item_result
