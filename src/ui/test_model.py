@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gradio as gr
-import PIL.Image
 
 from src.data_extractors.wd_tagger import Predictor, V3_MODELS
 from src.ui.ocr_doctr import create_doctr_UI

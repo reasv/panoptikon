@@ -26,6 +26,12 @@ def get_excluded_folders():
 def parse_iso_date(date: str):
     return datetime.fromisoformat(date).strftime("%Y-%m-%d %H:%M:%S")
 
+def isodate_to_epoch(date: str):
+    return int(datetime.fromisoformat(date).timestamp())
+
+def isodate_minutes_diff(date1: str, date2: str):
+    return round(((datetime.fromisoformat(date1) - datetime.fromisoformat(date2)).total_seconds() / 60), 2)
+
 def update_folders(included_folders_text: str, excluded_folders_text: str, delete_unavailable_files: bool = True):
     new_included_folders = [p for p in included_folders_text.strip().split("\n")] if len(included_folders_text.strip()) > 0 else []
     new_excluded_folders = [p for p in excluded_folders_text.strip().split("\n")] if len(excluded_folders_text.strip()) > 0 else []
@@ -148,21 +154,32 @@ def fetch_scan_history():
     conn = get_database_connection()
     file_scans = get_all_file_scans(conn)
     conn.close()
-    # Convert the file scans to a list of tuples
-    file_scans = [[f.id, parse_iso_date(f.start_time), parse_iso_date(f.end_time), 
-                   f.path, 
-                   f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files] for f in file_scans]
+    file_scans = [[
+        f.id,
+        parse_iso_date(f.start_time),
+        parse_iso_date(f.end_time),
+        isodate_minutes_diff(f.end_time, f.start_time),
+        f.path,
+        f.total_available,
+        f.marked_unavailable,
+        f.errors,
+        f.new_items,
+        f.new_files,
+        f.unchanged_files,
+        f.modified_files
+    ] for f in file_scans]
+
     return gr.Dataset(samples=file_scans)
 
 def fetch_tagging_history():
     conn = get_database_connection()
     tag_scans = get_all_tag_scans(conn)
     conn.close()
-    # Convert the tag scans to a list of tuples
     tag_scans = [[
         t.id,
         parse_iso_date(t.start_time),
         parse_iso_date(t.end_time),
+        isodate_minutes_diff(t.end_time, t.start_time),
         t.setter,
         t.threshold,
         t.image_files,
@@ -186,8 +203,8 @@ def create_scan_dataset(samples = []):
         type="index",
         samples_per_page=25,
         samples=samples,
-        headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
-        components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
+        headers=["ID", "Start Time", "End Time", "Duration (m)", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
+        components=["number", "textbox", "textbox", "number", "textbox", "number", "number", "number", "number", "number", "number", "number"],
         scale=1
     )
     return scan_history
@@ -198,8 +215,8 @@ def create_job_dataset(samples = []):
         type="index",
         samples_per_page=25,
         samples=samples,
-        headers=["ID", "Start Time", "End Time", "Tag Model", "Threshold", "Image Files", "Video Files", "Other Files", "Video Frames", "Total Frames", "Errors", "Timeouts", "Remaining Untagged"],
-        components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number", "number", "number"],
+        headers=["ID", "Start Time", "End Time", "Duration (m)", "Tag Model", "Threshold", "Image Files", "Video Files", "Other Files", "Video Frames", "Total Frames", "Errors", "Timeouts", "Remaining Untagged"],
+        components=["number", "textbox", "textbox", "number", "textbox", "number", "number", "number", "number", "number", "number", "number", "number", "number"],
         scale=1
     )
     return tagging_history
