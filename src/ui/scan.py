@@ -4,6 +4,7 @@ from typing import List
 
 import gradio as gr
 
+from src.data_extractors.whisper import run_whisper_extractor_job
 from src.folders import update_folder_lists, rescan_all_folders
 from src.db import get_folders_from_database, get_database_connection, get_all_file_scans, get_all_tag_scans, delete_tags_from_setter, vacuum_database
 from src.data_extractors.tags import run_tag_extractor_job
@@ -134,6 +135,25 @@ def run_ocr():
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()
 
+def run_whisper():
+    conn = get_database_connection()
+    cdb = get_chromadb_client()
+    cursor = conn.cursor()
+    cursor.execute('BEGIN')
+    images, videos, failed = run_whisper_extractor_job(conn, cdb)
+    conn.commit()
+    vacuum_database(conn)
+    failed_str = "\n".join(failed)
+    report_str = f"""
+    Whisper Speech to Text Extraction completed.
+    Successfully processed {images} images and {videos} videos.
+    {len(failed)} files failed to process due to errors.
+    Failed files:
+    {failed_str}
+    """
+    conn.close()
+    return report_str, fetch_scan_history(), fetch_tagging_history()
+
 def delete_tags(tag_models: List[str] = []):
     conn = get_database_connection()
     cursor = conn.cursor()
@@ -241,6 +261,8 @@ def create_scan_UI():
                         generate_embeds_button = gr.Button("Generate Embeddings for Items Missing Embeddings")
                     with gr.Row():
                         extract_text_ocr = gr.Button("Use OCR to Extract Text from Images and Videos")
+                    with gr.Row():
+                        extract_whisper = gr.Button("Use Whisper STT to extract text from videos")
                 with gr.Column():
                     gr.Markdown("""
                         ## Notes
@@ -308,4 +330,10 @@ def create_scan_UI():
             fn=run_ocr,
             outputs=[results, scan_history, tagging_history],
             api_name="run_ocr",
+        )
+
+        extract_whisper.click(
+            fn=run_whisper,
+            outputs=[results, scan_history, tagging_history],
+            api_name="run_whisper",
         )
