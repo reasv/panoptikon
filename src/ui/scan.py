@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import Any, List
+from typing import List
 
 import gradio as gr
 
@@ -91,7 +91,6 @@ def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
         {len(failed)} files failed to process due to errors.
         Failed files:
         {failed_str}
-        Timed out files:
         """
         full_report += report_str
     conn.close()
@@ -112,7 +111,6 @@ def generate_embeds():
     {len(failed)} files failed to process due to errors.
     Failed files:
     {failed_str}
-    Timed out files:
     """
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()
@@ -132,7 +130,6 @@ def run_ocr():
     {len(failed)} files failed to process due to errors.
     Failed files:
     {failed_str}
-    Timed out files:
     """
     conn.close()
     return report_str, fetch_scan_history(), fetch_tagging_history()
