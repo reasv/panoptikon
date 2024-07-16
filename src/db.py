@@ -192,13 +192,13 @@ def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):
 
 def insert_tag_item(conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, confidence = 1.0):
     # Round confidence to 3 decimal places
-    confidence = round(confidence, 3)
+    confidence_float = round(float(confidence), 4)
     cursor = conn.cursor()
     cursor.execute('''
     INSERT INTO tags_items (item, tag, confidence)
     VALUES (?, ?, ? )
     ON CONFLICT(item, tag) DO UPDATE SET confidence=excluded.confidence
-    ''', (item_rowid, tag_rowid, confidence))
+    ''', (item_rowid, tag_rowid, confidence_float))
 
 def get_item_rowid(conn: sqlite3.Connection, sha256: str) -> int | None:
     cursor = conn.cursor()
