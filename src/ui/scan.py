@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import List
+from typing import Any, List
 
 import gradio as gr
 
@@ -149,17 +149,17 @@ def fetch_scan_history():
     file_scans = get_all_file_scans(conn)
     conn.close()
     # Convert the file scans to a list of tuples
-    file_scans = [(f.id, parse_iso_date(f.start_time), parse_iso_date(f.end_time), 
+    file_scans = [[f.id, parse_iso_date(f.start_time), parse_iso_date(f.end_time), 
                    f.path, 
-                   f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files) for f in file_scans]
-    return file_scans
+                   f.total_available, f.marked_unavailable, f.errors, f.new_items, f.new_files, f.unchanged_files, f.modified_files] for f in file_scans]
+    return gr.Dataset(samples=file_scans)
 
 def fetch_tagging_history():
     conn = get_database_connection()
     tag_scans = get_all_tag_scans(conn)
     conn.close()
     # Convert the tag scans to a list of tuples
-    tag_scans = [(
+    tag_scans = [[
         t.id,
         parse_iso_date(t.start_time),
         parse_iso_date(t.end_time),
@@ -173,11 +173,36 @@ def fetch_tagging_history():
         t.errors,
         t.timeouts,
         t.total_remaining
-        ) for t in tag_scans]
-    return tag_scans
+     ] for t in tag_scans]
+    return gr.Dataset(samples=tag_scans)
 
 def fetch_all_history():
     return fetch_scan_history(), fetch_tagging_history()
+
+def create_scan_dataset(samples = []):
+    print(samples)
+    scan_history = gr.Dataset(
+        label="File Scan History",
+        type="index",
+        samples_per_page=25,
+        samples=samples,
+        headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
+        components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
+        scale=1
+    )
+    return scan_history
+
+def create_job_dataset(samples = []):
+    tagging_history = gr.Dataset(
+        label="Tagging History",
+        type="index",
+        samples_per_page=25,
+        samples=samples,
+        headers=["ID", "Start Time", "End Time", "Tag Model", "Threshold", "Image Files", "Video Files", "Other Files", "Video Frames", "Total Frames", "Errors", "Timeouts", "Remaining Untagged"],
+        components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number", "number", "number"],
+        scale=1
+    )
+    return tagging_history
 
 def create_scan_UI():
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
@@ -221,26 +246,9 @@ def create_scan_UI():
             with gr.Row():
                 with gr.Tabs():
                     with gr.TabItem(label="Scan History"):
-                        scan_history = gr.Dataset(
-                            label="File Scan History",
-                            type="index",
-                            samples_per_page=25,
-                            samples=[],
-                            headers=["ID", "Start Time", "End Time", "Path", "Total Available", "Marked Unavailable", "Errors", "New Items", "New Files", "Unchanged Files", "Modified Files"],
-                            components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number"],
-                            scale=1
-                        )
+                        scan_history = create_scan_dataset()
                     with gr.TabItem(label="Tagging History"):
-                        tagging_history = gr.Dataset(
-                            label="Tagging History",
-                            type="index",
-                            samples_per_page=25,
-                            samples=[],
-                            headers=["ID", "Start Time", "End Time", "Tag Model", "Threshold", "Image Files", "Video Files", "Other Files", "Video Frames", "Total Frames", "Errors", "Timeouts", "Remaining Untagged"],
-                            components=["number", "textbox", "textbox", "textbox", "number", "number", "number", "number", "number", "number", "number", "number", "number"],
-                            scale=1
-                        )
-                
+                        tagging_history = create_job_dataset()
 
         scan_tab.select(
             fn=fetch_all_history,
