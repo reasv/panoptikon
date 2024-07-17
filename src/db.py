@@ -153,48 +153,57 @@ def initialize_database(conn: sqlite3.Connection):
     )
 
     # Create indexes
+    # Tuples are table name, followed by a list of columns
     indices = [
-        "idx_items_md5 ON items(md5)",
-        "idx_items_type ON items(type)",
-        "idx_items_time_added ON items(time_added)",
-        "idx_files_sha256 ON files(sha256)",
-        "idx_files_last_modified ON files(last_modified)",
-        "idx_files_available ON files(available)",
-        "idx_files_path ON files(path)",
-        "idx_files_last_seen ON files(last_seen)",
-        "idx_file_scans_start_time ON file_scans(start_time)",
-        "idx_file_end_time ON file_scans(end_time)",
-        "idx_file_scans_path ON file_scans(path)",
-        "idx_tag_scans_start_time ON tag_scans(start_time)",
-        "idx_tag_scans_end_time ON tag_scans(end_time)",
-        "idx_tag_scans_setter ON tag_scans(setter)",
-        "idx_folders_time_added ON folders(time_added)",
-        "idx_folders_path ON folders(path)",
-        "idx_folders_included ON folders(included)",
-        "idx_bookmarks_time_added ON bookmarks(time_added)",
-        "idx_bookmarks_sha256 ON bookmarks(sha256)",
-        "idx_bookmarks_metadata ON bookmarks(metadata)",
-        "idx_bookmarks_namespace ON bookmarks(namespace)",
-        "idx_item_tag_scans_item ON item_tag_scans(item)",
-        "idx_item_tag_scans_setter ON item_tag_scans(setter)",
-        "idx_item_tag_scans_last_scan ON item_tag_scans(last_scan)",
-        "idx_item_tag_scans_tags_set ON item_tag_scans(tags_set)",
-        "idx_item_tag_scans_tags_removed ON item_tag_scans(tags_removed)",
-        "idx_tags_items_item ON tags_items(item)",
-        "idx_tags_items_tag ON tags_items(tag)",
-        "idx_tags_items_confidence ON tags_items(confidence)",
-        "idx_tags_items_item_tag ON tags_items(item, tag)",
-        "idx_tags_items_tag_item ON tags_items(tag, item)",
-        "idx_tags_setters_namespace ON tags_setters(namespace)",
-        "idx_tags_setters_name ON tags_setters(name)",
-        "idx_tags_setters_setter ON tags_setters(setter)",
-        "idx_tags_setters_namespace_name ON tags_setters(namespace, name)",
-        "idx_tags_setters_namespace_setter ON tags_setters(namespace, setter)",
-        "idx_tags_setters_name_setter ON tags_setters(name, setter)",
+        ("items", ["md5"]),
+        ("items", ["type"]),
+        ("items", ["size"]),
+        ("items", ["time_added"]),
+        ("files", ["sha256"]),
+        ("files", ["last_modified"]),
+        ("files", ["available"]),
+        ("files", ["path"]),
+        ("files", ["last_seen"]),
+        ("file_scans", ["start_time"]),
+        ("file_scans", ["end_time"]),
+        ("file_scans", ["path"]),
+        ("tag_scans", ["start_time"]),
+        ("tag_scans", ["end_time"]),
+        ("tag_scans", ["setter"]),
+        ("folders", ["time_added"]),
+        ("folders", ["path"]),
+        ("folders", ["included"]),
+        ("bookmarks", ["time_added"]),
+        ("bookmarks", ["sha256"]),
+        ("bookmarks", ["metadata"]),
+        ("bookmarks", ["namespace"]),
+        ("item_tag_scans", ["item"]),
+        ("item_tag_scans", ["setter"]),
+        ("item_tag_scans", ["last_scan"]),
+        ("item_tag_scans", ["tags_set"]),
+        ("item_tag_scans", ["tags_removed"]),
+        ("tags_items", ["item"]),
+        ("tags_items", ["tag"]),
+        ("tags_items", ["confidence"]),
+        ("tags_items", ["item", "tag"]),
+        ("tags_items", ["tag", "item"]),
+        ("tags_setters", ["namespace"]),
+        ("tags_setters", ["name"]),
+        ("tags_setters", ["setter"]),
+        ("tags_setters", ["namespace", "name"]),
+        ("tags_setters", ["namespace", "setter"]),
+        ("tags_setters", ["name", "setter"]),
     ]
 
-    for index in indices:
-        cursor.execute(f"CREATE INDEX IF NOT EXISTS {index}")
+    for table, columns in indices:
+        columns_str = ", ".join(columns)
+        index_name = f"idx_{table}_{'_'.join(columns)}"
+        cursor.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS
+            {index_name} ON {table}({columns_str})
+            """
+        )
 
     if is_column_in_table(conn, "files", "item"):
         cursor.execute(
