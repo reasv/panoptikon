@@ -10,6 +10,7 @@ from src.data_extractors.extractor_job import run_extractor_job
 from src.data_extractors.wd_tagger import V3_MODELS, Predictor
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
 from src.types import ItemWithPath
+from src.ui.models import TaggerModel
 from src.utils import item_image_extractor_pil
 
 
@@ -106,13 +107,13 @@ def handle_individual_result(
         )
 
 
-def run_tag_extractor_job(conn: sqlite3.Connection, model: str = V3_MODELS[0]):
+def run_tag_extractor_job(conn: sqlite3.Connection, model: TaggerModel):
     """
     Run a job that processes items in the database using the given tagging model.
     """
     score_threshold = get_threshold_from_env()
     print(f"Using score threshold {score_threshold}")
-    tag_predictor = Predictor(model_repo=model)
+    tag_predictor = Predictor(model_repo=model.model_repo())
     tag_predictor.load_model()
 
     def batch_inference_func(batch_images: Sequence[PIL.Image.Image]):
@@ -127,12 +128,12 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: str = V3_MODELS[0]):
             Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]
         ],
     ):
-        handle_individual_result(conn, model, item, outputs)
+        handle_individual_result(conn, model.setter_id(), item, outputs)
 
     return run_extractor_job(
         conn,
-        model,
-        64,
+        model.setter_id(),
+        model.batch_size(),
         item_image_extractor_pil,
         batch_inference_func,
         handle_result,

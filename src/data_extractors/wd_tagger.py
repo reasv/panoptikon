@@ -110,7 +110,7 @@ class Predictor:
     last_loaded_repo: str | None = None
     torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __init__(self, model_repo=None):
+    def __init__(self, model_repo: str | None = None):
         self.default_model_repo = model_repo
         self.last_loaded_repo = None
         self.torch_device = torch.device(
