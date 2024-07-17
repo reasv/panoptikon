@@ -10,9 +10,9 @@ from chromadb.api.types import QueryResult
 from chromadb.types import Metadata
 from numpy import where
 
+from src.data_extractors.models import ModelOption
 from src.db import FileSearchResult, get_existing_file_for_sha256
 from src.types import ItemWithPath
-from src.ui.models import ModelOption
 
 
 def get_chromadb_client() -> ClientAPI:

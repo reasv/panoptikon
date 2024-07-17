@@ -9,11 +9,11 @@ from cv2 import add
 from doctr.models import ocr_predictor
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
 from src.db import FileSearchResult, get_existing_file_for_sha256
 from src.files import get_mime_type
 from src.types import ItemWithPath
-from src.ui.models import OCRModel
 from src.utils import item_image_extractor_np
 
 

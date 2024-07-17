@@ -7,10 +7,10 @@ from typing import Dict, List, Sequence, Tuple
 import PIL.Image
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.models import TaggerModel
 from src.data_extractors.wd_tagger import V3_MODELS, Predictor
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
 from src.types import ItemWithPath
-from src.ui.models import TaggerModel
 from src.utils import item_image_extractor_pil
 
 
