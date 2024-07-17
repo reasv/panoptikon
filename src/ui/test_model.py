@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import gradio as gr
 
-from src.data_extractors.wd_tagger import Predictor, V3_MODELS
-from src.ui.ocr_doctr import create_doctr_UI
+from src.data_extractors.wd_tagger import V3_MODELS, Predictor
 from src.ui.clip import create_CLIP_ui
+from src.ui.ocr_doctr import create_doctr_UI
+
 # from src.ui.whisper_jax import create_whisper_ui
+
 
 def create_model_demo():
     with gr.TabItem(label="Models"):
@@ -18,6 +20,7 @@ def create_model_demo():
                 create_CLIP_ui()
             # with gr.Tab(label="WhisperJAX") as tab:
             #     create_whisper_ui(tab)
+
 
 def create_wd_tagger_UI():
     TITLE = "WaifuDiffusion Tagger"
@@ -41,7 +44,7 @@ def create_wd_tagger_UI():
             with gr.Column(variant="panel"):
                 image = gr.Image(type="pil", image_mode="RGBA", label="Input")
                 model_repo = gr.Dropdown(
-                    choices=[(c,c) for c in dropdown_list],
+                    choices=[(c, c) for c in dropdown_list],
                     value=V3_MODELS[0],
                     label="Model",
                 )
@@ -86,7 +89,9 @@ def create_wd_tagger_UI():
                         variant="secondary",
                         size="lg",
                     )
-                    submit = gr.Button(value="Submit", variant="primary", size="lg")
+                    submit = gr.Button(
+                        value="Submit", variant="primary", size="lg"
+                    )
             with gr.Column(variant="panel"):
                 sorted_general_strings = gr.Textbox(label="Output (string)")
                 rating = gr.Label(label="Rating")
@@ -100,7 +105,15 @@ def create_wd_tagger_UI():
                         general_res,
                     ]
                 )
-    def run_predict(image, model_repo, general_thresh, general_mcut_enabled, character_thresh, character_mcut_enabled):
+
+    def run_predict(
+        image,
+        model_repo,
+        general_thresh,
+        general_mcut_enabled,
+        character_thresh,
+        character_mcut_enabled,
+    ):
         rating, character_res, general_res = predictor.predict(
             [image],
             model_repo,
@@ -115,7 +128,9 @@ def create_wd_tagger_UI():
 
         sorted_general_strings = [x[0] for x in sorted_general_strings]
         sorted_general_strings = (
-            ", ".join(sorted_general_strings).replace("(", r"\(").replace(")", r"\)")
+            ", ".join(sorted_general_strings)
+            .replace("(", r"\(")
+            .replace(")", r"\)")
         )
         return rating, character_res, general_res, sorted_general_strings
 

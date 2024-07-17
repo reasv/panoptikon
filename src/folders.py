@@ -1,25 +1,25 @@
-from dataclasses import dataclass
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple
 
 from src.db import (
-    update_file_data,
     add_file_scan,
-    mark_unavailable_files,
     add_folder_to_database,
-    get_folders_from_database,
-    add_folder_to_database,
-    delete_folders_not_in_list,
-    delete_files_under_excluded_folders,
-    delete_items_without_files,
     delete_files_not_under_included_folders,
-    delete_unavailable_files,
-    delete_tags_without_items,
+    delete_files_under_excluded_folders,
+    delete_folders_not_in_list,
     delete_item_tag_scans_without_items,
+    delete_items_without_files,
+    delete_tags_without_items,
+    delete_unavailable_files,
+    get_folders_from_database,
+    mark_unavailable_files,
+    update_file_data,
 )
-from src.files import scan_files, deduplicate_paths
+from src.files import deduplicate_paths, scan_files
 from src.utils import normalize_path
+
 
 def execute_folder_scan(
     conn: sqlite3.Connection,
@@ -49,7 +49,13 @@ def execute_folder_scan(
     print(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
-        new_items, unchanged_files, new_files, modified_files, errors = 0, 0, 0, 0, 0
+        new_items, unchanged_files, new_files, modified_files, errors = (
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
         for file_data in scan_files(
             conn,
             starting_points=[folder],
@@ -185,7 +191,9 @@ def update_folder_lists(
     )
 
 
-def rescan_all_folders(conn: sqlite3.Connection, delete_unavailable: bool = True):
+def rescan_all_folders(
+    conn: sqlite3.Connection, delete_unavailable: bool = True
+):
     """
     Rescan all included folders in the database and update the database with the results.
     Executes the related cleanup operations.

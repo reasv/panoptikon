@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class FileScanData:
     sha256: str
@@ -10,6 +11,7 @@ class FileScanData:
     path: str
     path_in_db: bool
     modified: bool
+
 
 @dataclass
 class ItemWithPath:

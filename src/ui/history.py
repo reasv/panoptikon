@@ -1,14 +1,17 @@
 from __future__ import annotations
+
 from typing import List
-import json
 
 import gradio as gr
+
 from src.ui.components.multi_view import create_multiview
+
 
 def get_history_paths(select_history: List[str]):
     print(f"History length is {len(select_history)}")
     # Should be in reverse order
     return select_history[::-1]
+
 
 def erase_history_fn(select_history: List[str], keep_last_n: int):
     if keep_last_n > 0:
@@ -18,6 +21,7 @@ def erase_history_fn(select_history: List[str], keep_last_n: int):
     print("History erased")
     history = get_history_paths(select_history)
     return select_history, history
+
 
 def create_history_UI(select_history: gr.State, bookmarks_namespace: gr.State):
     with gr.TabItem(label="History") as history_tab:
@@ -29,21 +33,19 @@ def create_history_UI(select_history: gr.State, bookmarks_namespace: gr.State):
                     maximum=100,
                     value=0,
                     step=1,
-                    label="Keep last N items on erase"
+                    label="Keep last N items on erase",
                 )
-        
+
         multi_view = create_multiview(bookmarks_namespace=bookmarks_namespace)
 
     history_tab.select(
         fn=get_history_paths,
         inputs=[select_history],
-        outputs=[multi_view.files]
+        outputs=[multi_view.files],
     )
 
     erase_history.click(
         fn=erase_history_fn,
         inputs=[select_history, keep_last_n],
-        outputs=[
-            select_history, multi_view.files
-        ]
+        outputs=[select_history, multi_view.files],
     )

@@ -1,13 +1,13 @@
-import gradio as gr
-from PIL import Image
-import numpy as np
 from typing import List, Sequence
 
-import torch
+import gradio as gr
 import numpy as np
+import torch
 from doctr.models import ocr_predictor
+from PIL import Image
 
 from src.utils import pil_ensure_rgb
+
 
 def create_doctr_UI():
     DESCRIPTION = """
@@ -32,11 +32,13 @@ def create_doctr_UI():
                         variant="secondary",
                         size="lg",
                     )
-                    submit = gr.Button(value="Submit", variant="primary", size="lg")
+                    submit = gr.Button(
+                        value="Submit", variant="primary", size="lg"
+                    )
             with gr.Column(variant="panel"):
                 text = gr.Textbox(label="Output")
                 clear.add([text])
-    
+
     def process_batch(model, batch: Sequence[np.ndarray]) -> List[str]:
         result = model(batch)
         files_texts: List[str] = []
@@ -54,9 +56,9 @@ def create_doctr_UI():
     def run_doctr(image: Image.Image, language):
         image_ndarray = np.array(pil_ensure_rgb(image))
         doctr_model = ocr_predictor(
-            det_arch='db_resnet50',
-            reco_arch='crnn_mobilenet_v3_small',
-            pretrained=True
+            det_arch="db_resnet50",
+            reco_arch="crnn_mobilenet_v3_small",
+            pretrained=True,
         )
         if torch.cuda.is_available():
             doctr_model = doctr_model.cuda().half()
