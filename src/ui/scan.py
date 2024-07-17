@@ -47,13 +47,9 @@ def isodate_to_epoch(date: str):
 
 
 def isodate_minutes_diff(date1: str, date2: str):
+    a, b = datetime.fromisoformat(date1), datetime.fromisoformat(date2)
     return round(
-        (
-            (
-                datetime.fromisoformat(date1) - datetime.fromisoformat(date2)
-            ).total_seconds()
-            / 60
-        ),
+        ((a - b).total_seconds() / 60),
         2,
     )
 
