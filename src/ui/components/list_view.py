@@ -5,11 +5,11 @@ from typing import List
 
 import gradio as gr
 
-from src.data_extractors.image_embeddings import get_chromadb_client
 from src.data_extractors.text_embeddings import (
     ExtractedText,
     retrieve_item_text,
 )
+from src.data_extractors.utils import get_chromadb_client
 from src.db import (
     FileSearchResult,
     get_all_tags_for_item_name_confidence,
