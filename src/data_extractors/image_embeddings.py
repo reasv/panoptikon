@@ -20,10 +20,10 @@ from chromadb.api.types import (
 from PIL import Image as PILImage
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.images import item_image_extractor_np
 from src.data_extractors.models import ImageEmbeddingModel
 from src.data_extractors.utils import query_result_to_file_search_result
 from src.types import ItemWithPath
-from src.utils import item_image_extractor_np
 
 
 class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):

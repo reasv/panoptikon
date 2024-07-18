@@ -3,7 +3,6 @@ from __future__ import annotations
 import gradio as gr
 
 import src.data_extractors.models as models
-from src.data_extractors.wd_tagger import Predictor
 
 
 def create_wd_tagger_UI():
@@ -15,7 +14,7 @@ def create_wd_tagger_UI():
     score_character_threshold = 0.25
     score_general_threshold = 0.25
 
-    predictor = Predictor()
+    predictor = None
 
     dropdown_list = models.TaggerModel.available_models()
 
@@ -98,6 +97,11 @@ def create_wd_tagger_UI():
         character_thresh,
         character_mcut_enabled,
     ):
+        from src.data_extractors.wd_tagger import Predictor
+
+        nonlocal predictor
+        if predictor is None:
+            predictor = Predictor()
         rating, character_res, general_res = predictor.predict(
             [image],
             model_repo,

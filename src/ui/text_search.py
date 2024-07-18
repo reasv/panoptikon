@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import gradio as gr
-import numpy as np
 
-from src.data_extractors.image_embeddings import get_chromadb_client
-from src.data_extractors.ocr import search_item_text
+from src.data_extractors.text_embeddings import search_item_text
+from src.data_extractors.utils import get_chromadb_client
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
 

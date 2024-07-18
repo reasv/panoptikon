@@ -1,5 +1,4 @@
 import sqlite3
-from ast import mod
 from typing import List, Sequence
 
 import numpy as np
@@ -9,12 +8,10 @@ from cv2 import add
 from doctr.models import ocr_predictor
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.images import item_image_extractor_np
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
-from src.db import FileSearchResult, get_existing_file_for_sha256
-from src.files import get_mime_type
 from src.types import ItemWithPath
-from src.utils import item_image_extractor_np
 
 
 def run_ocr_extractor_job(

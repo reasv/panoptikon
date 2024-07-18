@@ -5,7 +5,6 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
-from src.data_extractors.image_embeddings import CLIPEmbedder
 from src.db import FileSearchResult
 from src.files import (
     get_files_by_extension,
@@ -38,7 +37,7 @@ def create_CLIP_ui():
     Images will be returned in the order of their similarity to the text query inside a multiview.
     """
 
-    clip = CLIPEmbedder()
+    clip = None
     embeddings = {}
 
     with gr.Column():
@@ -74,6 +73,12 @@ def create_CLIP_ui():
     def embed_images(folder_path: str):
         nonlocal clip, embeddings
         files = get_images(folder_path)
+        if clip is None:
+            from src.data_extractors.image_embeddings import CLIPEmbedder
+
+            clip = CLIPEmbedder()
+            clip.load_model()
+
         image_paths = [file.path for file in files]
         embeddings = clip.get_image_embeddings(image_paths)
         # Create a dictionary of image sha256 to embeddings
@@ -88,6 +93,11 @@ def create_CLIP_ui():
         nonlocal clip, embeddings
         if text_query == "":
             return get_images(folder_path)
+        if clip is None:
+            from src.data_extractors.image_embeddings import CLIPEmbedder
+
+            clip = CLIPEmbedder()
+            clip.load_model()
         text_embeddings = clip.get_text_embeddings([text_query])
         text_embedding = text_embeddings[0]
         images_dict = {file.sha256: file for file in current_files}
@@ -101,12 +111,17 @@ def create_CLIP_ui():
 
     def search_with_image(
         folder_path: str,
-        image: Image.Image,
+        image: Image.Image | None,
         current_files: List[FileSearchResult],
     ):
         nonlocal clip, embeddings
         if image is None:
             return get_images(folder_path)
+        if clip is None:
+            from src.data_extractors.image_embeddings import CLIPEmbedder
+
+            clip = CLIPEmbedder()
+            clip.load_model()
         image_embedding = clip.get_image_embeddings(
             [Image.fromarray(np.array(image))]
         )[0]
@@ -121,7 +136,8 @@ def create_CLIP_ui():
 
     def delete_embeddings():
         nonlocal clip, embeddings
-        clip.unload_model()
+        if clip is not None:
+            clip.unload_model()
         embeddings = {}
         return [], gr.update(interactive=False), gr.update(interactive=False)
 

@@ -3,10 +3,6 @@ from __future__ import annotations
 import gradio as gr
 import numpy as np
 
-from src.data_extractors.image_embeddings import (
-    CLIPEmbedder,
-    search_item_image_embeddings,
-)
 from src.data_extractors.utils import get_chromadb_client
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
@@ -55,13 +51,21 @@ def create_semantic_search_UI(
             bookmarks_namespace=bookmarks_namespace,
         )
 
-    embedder = CLIPEmbedder(
-        model_name="ViT-H-14-378-quickgelu", pretrained="dfn5b"
-    )
+    embedder = None
 
     def items_semantic_search(
         search_text: str | None, search_image: np.ndarray | None, n_results: int
     ):
+        from src.data_extractors.image_embeddings import (
+            CLIPEmbedder,
+            search_item_image_embeddings,
+        )
+
+        nonlocal embedder
+        if embedder is None:
+            embedder = CLIPEmbedder(
+                model_name="ViT-H-14-378-quickgelu", pretrained="dfn5b"
+            )
         conn = get_database_connection()
         cdb = get_chromadb_client()
         files, scores = search_item_image_embeddings(
@@ -81,7 +85,8 @@ def create_semantic_search_UI(
         return items_semantic_search(search_text, None, n_results)
 
     def on_unload_model():
-        embedder.unload_model()
+        if embedder is not None:
+            embedder.unload_model()
         return gr.update(interactive=False)
 
     submit_button.click(

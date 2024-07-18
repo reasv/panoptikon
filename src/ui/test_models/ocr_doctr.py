@@ -3,7 +3,6 @@ from typing import List, Sequence
 import gradio as gr
 import numpy as np
 import torch
-from doctr.models import ocr_predictor
 from PIL import Image
 
 from src.utils import pil_ensure_rgb
@@ -13,6 +12,7 @@ def create_doctr_UI():
     DESCRIPTION = """
     Run OCR on an image using the Doctr library.
     """
+    doctr_model = None
     with gr.Column():
         gr.Markdown(
             value=f"<h1 style='text-align: center; margin-bottom: 1rem'>PaddleOCR</h1>"
@@ -54,14 +54,18 @@ def create_doctr_UI():
         return files_texts
 
     def run_doctr(image: Image.Image, language):
+        from doctr.models import ocr_predictor
+
         image_ndarray = np.array(pil_ensure_rgb(image))
-        doctr_model = ocr_predictor(
-            det_arch="db_resnet50",
-            reco_arch="crnn_mobilenet_v3_small",
-            pretrained=True,
-        )
-        if torch.cuda.is_available():
-            doctr_model = doctr_model.cuda().half()
+        nonlocal doctr_model
+        if doctr_model is None:
+            doctr_model = ocr_predictor(
+                det_arch="db_resnet50",
+                reco_arch="crnn_mobilenet_v3_small",
+                pretrained=True,
+            )
+            if torch.cuda.is_available():
+                doctr_model = doctr_model.cuda().half()
         text = process_batch(doctr_model, [image_ndarray])[0]
         return text
 

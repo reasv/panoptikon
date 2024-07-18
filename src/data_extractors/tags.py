@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
 import PIL.Image
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.images import item_image_extractor_pil
 from src.data_extractors.models import TaggerModel
 from src.data_extractors.utils import get_threshold_from_env
 from src.data_extractors.wd_tagger import Predictor
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
 from src.types import ItemWithPath
-from src.utils import item_image_extractor_pil
 
 
 def combine_results(results: List[dict[str, float]]) -> dict[str, float]:
