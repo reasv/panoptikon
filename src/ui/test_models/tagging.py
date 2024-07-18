@@ -16,7 +16,9 @@ def create_wd_tagger_UI():
 
     predictor = None
 
-    dropdown_list = models.TagsModel.available_models()
+    dropdown_list = [
+        repo for _, repo in models.TagsModel._available_models_mapping().items()
+    ]
 
     with gr.Column():
         gr.Markdown(
@@ -28,7 +30,7 @@ def create_wd_tagger_UI():
                 image = gr.Image(type="pil", image_mode="RGBA", label="Input")
                 model_repo = gr.Dropdown(
                     choices=[(name, name) for name in dropdown_list],
-                    value=models.TagsModel.default_model(),
+                    value=dropdown_list[0],
                     label="Model",
                 )
                 with gr.Row():
