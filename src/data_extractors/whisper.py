@@ -11,6 +11,8 @@ from whisperx.audio import SAMPLE_RATE
 from whisperx.types import TranscriptionResult
 
 from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.models import WhisperSTTModel
+from src.data_extractors.text_embeddings import add_item_text
 from src.types import ItemWithPath
 
 
@@ -108,26 +110,17 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
 
 
 def run_whisper_extractor_job(
-    conn: sqlite3.Connection,
-    cdb: ClientAPI,
-    batch_size=8,
-    whisper_model="base",
+    conn: sqlite3.Connection, cdb: ClientAPI, model_opts: WhisperSTTModel
 ):
     """
     Run a job that processes items in the database using the given batch inference function and item extractor.
     """
-    setter_name = f"{whisper_model}"
-    collection_name = f"text_embeddings"
-    try:
-        collection = cdb.get_collection(name=collection_name)
-    except ValueError:
-        collection = cdb.create_collection(name=collection_name)
 
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
 
-    whisper_model = whisperx.load_model(whisper_model, device=device)
+    whisper_model = whisperx.load_model(model_opts.model_name(), device=device)
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -142,7 +135,9 @@ def run_whisper_extractor_job(
         outputs: List[TranscriptionResult] = []
         for audio in batch:
             outputs.append(
-                whisper_model.transcribe(audio=audio, batch_size=batch_size)
+                whisper_model.transcribe(
+                    audio=audio, batch_size=model_opts.batch_size()
+                )
             )
         return outputs
 
@@ -157,22 +152,22 @@ def run_whisper_extractor_job(
         merged_text = "\n".join(
             [segment["text"] for segment in transcriptionResult["segments"]]
         )
-        collection.add(
-            ids=[f"{item.sha256}-{setter_name}"],
-            documents=[merged_text],
-            metadatas=[
-                {
-                    "item": item.sha256,
-                    "source": "stt",
-                    "model": setter_name,
-                    "setter": setter_name,
-                    "type": item.type,
-                    "language": transcriptionResult["language"],
-                    "general_type": item.type.split("/")[0],
-                }
-            ],
+
+        merged_text = merged_text.strip()
+
+        add_item_text(
+            cdb,
+            item,
+            model_opts,
+            transcriptionResult["language"],
+            merged_text,
         )
 
     return run_extractor_job(
-        conn, setter_name, 1, get_media_paths, process_batch, handle_item_result
+        conn,
+        model_opts.setter_id(),
+        1,
+        get_media_paths,
+        process_batch,
+        handle_item_result,
     )
