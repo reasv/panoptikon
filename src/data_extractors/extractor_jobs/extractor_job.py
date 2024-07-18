@@ -30,7 +30,8 @@ def run_extractor_job(
     output_handler: Callable[[ItemWithPath, Sequence[I], Sequence[R]], None],
 ):
     """
-    Run a job that processes items in the database using the given batch inference function and item extractor.
+    Run a job that processes items in the database
+    using the given batch inference function and item extractor.
     """
     scan_time = datetime.now().isoformat()
     failed_items: Dict[str, ItemWithPath] = {}
@@ -64,8 +65,10 @@ def run_extractor_job(
         processed_items += 1
         if failed_items.get(item.sha256) is not None:
             continue
+
         try:
-            output_handler(item, inputs, outputs)
+            if len(inputs) > 0:
+                output_handler(item, inputs, outputs)
             add_item_tag_scan(
                 conn,
                 item=item.sha256,
@@ -74,6 +77,8 @@ def run_extractor_job(
                 tags_set=0,
                 tags_removed=0,
             )
+            if len(inputs) == 0:
+                continue
         except Exception as e:
             print(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
@@ -84,12 +89,17 @@ def run_extractor_job(
             images += 1
         else:
             other += 1
+        total_items = remaining + processed_items
         print(
-            f"{setter_name}: ({processed_items}/{remaining+processed_items}) (ETA: {estimate_eta(scan_time, processed_items, remaining)}) Processed ({item.type}) {item.path}"
+            f"{setter_name}: ({processed_items}/{total_items}) "
+            + f"(ETA: {estimate_eta(scan_time, processed_items, remaining)}) "
+            + f"Processed ({item.type}) {item.path}"
         )
 
     print(
-        f"Processed {images} images and {videos} videos totalling {total_processed_units} frames"
+        f"Processed {processed_items} items:"
+        + f" {images} images and {videos} videos "
+        + f"totalling {total_processed_units} frames"
     )
 
     # Record the scan in the database log
@@ -126,7 +136,8 @@ def batch_items(
     process_batch_func: Callable[[Sequence[I]], Sequence[R]],
 ):
     """
-    Process items in batches using the given item extractor and batch processing functions.
+    Process items in batches using the given
+    item extractor and batch processing functions.
     """
     while True:
         batch: List[Tuple[ItemWithPath, int]] = []
