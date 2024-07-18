@@ -28,7 +28,8 @@ def add_item_text(
     language: str,
     text: str,
 ):
-    if len(text) == 0:
+    text = text.strip()
+    if len(text) < 3:
         return
     collection = get_text_collection(cdb)
     collection.upsert(
