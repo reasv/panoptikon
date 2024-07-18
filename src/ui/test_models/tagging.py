@@ -27,8 +27,10 @@ def create_wd_tagger_UI():
             with gr.Column(variant="panel"):
                 image = gr.Image(type="pil", image_mode="RGBA", label="Input")
                 model_repo = gr.Dropdown(
-                    choices=[(c, c) for c in dropdown_list],
-                    value=dropdown_list[0],
+                    choices=[
+                        (name, repo) for name, repo in dropdown_list.items()
+                    ],
+                    value=dropdown_list["wd-swinv2-tagger-v3"],
                     label="Model",
                 )
                 with gr.Row():

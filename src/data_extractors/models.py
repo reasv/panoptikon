@@ -1,5 +1,5 @@
 import sqlite3
-from typing import List
+from typing import Any, Dict, Tuple
 
 from chromadb.api import ClientAPI
 
@@ -14,9 +14,6 @@ class ModelOpts:
     def model_type(self) -> str:
         raise NotImplementedError
 
-    def model_name(self) -> str:
-        raise NotImplementedError
-
     def batch_size(self) -> int:
         raise NotImplementedError
 
@@ -24,7 +21,11 @@ class ModelOpts:
         raise NotImplementedError
 
     def setter_id(self) -> str:
-        return f"{self.model_type()}|{self.model_name()}"
+        raise NotImplementedError
+
+    @classmethod
+    def available_models(cls) -> Dict[str, Any]:
+        raise NotImplementedError
 
 
 class TaggerModel(ModelOpts):
@@ -33,15 +34,31 @@ class TaggerModel(ModelOpts):
 
     def __init__(self, batch_size: int = 64, model_repo: str | None = None):
         if model_repo is None:
-            model_repo = TaggerModel.available_models()[0]
-        assert (
-            model_repo in TaggerModel.available_models()
-        ), f"Invalid model repo {model_repo}"
+            model_repo = TaggerModel.available_models()["wd-swinv2-tagger-v3"]
+        assert model_repo in [
+            s for n, s in TaggerModel.available_models().items()
+        ], f"Invalid model repo {model_repo}"
         self._model_repo = model_repo
         self._batch_size = batch_size
 
+    def model_type(self) -> str:
+        return "tagger"
+
+    def setter_id(self) -> str:
+        return TaggerModel.model_to_setter_id(self.model_repo())
+
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        from src.data_extractors.extractor_jobs.tags import (
+            run_tag_extractor_job,
+        )
+
+        return run_tag_extractor_job(conn, self)
+
     @classmethod
-    def available_models(cls) -> List[str]:
+    def available_models(cls) -> Dict[str, str]:
         # Dataset v3 series of models:
         SWINV2_MODEL_DSV3_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
         CONV_MODEL_DSV3_REPO = "SmilingWolf/wd-convnext-tagger-v3"
@@ -59,29 +76,17 @@ class TaggerModel(ModelOpts):
         CONV_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
         CONV2_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-convnextv2-tagger-v2"
         VIT_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-vit-tagger-v2"
-        return V3_MODELS
+        return {name.split("/")[-1]: name for name in V3_MODELS}
 
-    def model_type(self) -> str:
-        return "tagger"
+    @classmethod
+    def model_to_setter_id(cls, model_repo: str) -> str:
+        # Reverse the available models dict
+        model_to_name = {v: k for k, v in cls.available_models().items()}
+        return model_to_name[model_repo]
 
-    def model_name(self) -> str:
-        return self._model_repo
-
-    def setter_id(self) -> str:
-        return super().setter_id()
-
-    def batch_size(self) -> int:
-        return self._batch_size
-
+    # Own methods
     def model_repo(self) -> str:
         return self._model_repo
-
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.tags import (
-            run_tag_extractor_job,
-        )
-
-        return run_tag_extractor_job(conn, self)
 
 
 class OCRModel(ModelOpts):
@@ -102,25 +107,50 @@ class OCRModel(ModelOpts):
     def model_type(self) -> str:
         return "ocr"
 
-    def model_name(self) -> str:
-        return f"{self._detection_model}|{self._recognition_model}"
-
     def setter_id(self) -> str:
-        return super().setter_id()
+        return OCRModel.model_to_setter_id(
+            self.detection_model(), self.recognition_model()
+        )
 
     def batch_size(self) -> int:
         return self._batch_size
+
+    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        from src.data_extractors.extractor_jobs.ocr import run_ocr_extractor_job
+
+        return run_ocr_extractor_job(conn, cdb, self)
+
+    @classmethod
+    def available_models(cls) -> Dict[str, Tuple[str, str]]:
+        return {
+            "db_resnet50|crnn_vgg16_bn": ("db_resnet50", "crnn_vgg16_bn"),
+            "db_resnet50|crnn_mobilenet_v3_small": (
+                "db_resnet50",
+                "crnn_mobilenet_v3_small",
+            ),
+            "db_resnet50|crnn_mobilenet_v3_large": (
+                "db_resnet50",
+                "crnn_mobilenet_v3_large",
+            ),
+            "db_resnet50|master": ("db_resnet50", "master"),
+            "db_resnet50|vitstr_small": ("db_resnet50", "vitstr_small"),
+            "db_resnet50|vitstr_base": ("db_resnet50", "vitstr_base"),
+            "db_resnet50|parseq": ("db_resnet50", "parseq"),
+        }
+
+    @classmethod
+    def model_to_setter_id(
+        cls, detection_model: str, recognition_model: str
+    ) -> str:
+        # Reverse the available models dict
+        model_to_name = {v: k for k, v in cls.available_models().items()}
+        return model_to_name[(detection_model, recognition_model)]
 
     def recognition_model(self) -> str:
         return self._recognition_model
 
     def detection_model(self) -> str:
         return self._detection_model
-
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.ocr import run_ocr_extractor_job
-
-        return run_ocr_extractor_job(conn, cdb, self)
 
 
 class ImageEmbeddingModel(ModelOpts):
@@ -142,15 +172,9 @@ class ImageEmbeddingModel(ModelOpts):
     def model_type(self) -> str:
         return "clip"
 
-    def model_name(self) -> str:
-        return f"{self._model_name}"
-
-    def model_checkpoint(self) -> str:
-        return f"{self._checkpoint}"
-
     def setter_id(self) -> str:
-        return (
-            f"{self.model_type()}|{self.model_name()}|{self.model_checkpoint()}"
+        return ImageEmbeddingModel.model_to_setter_id(
+            self.clip_model_name(), self.clip_model_checkpoint()
         )
 
     def batch_size(self) -> int:
@@ -163,23 +187,48 @@ class ImageEmbeddingModel(ModelOpts):
 
         return run_image_embedding_extractor_job(conn, cdb, self)
 
+    @classmethod
+    def available_models(cls) -> Dict[str, Tuple[str, str]]:
+        from src.data_extractors.ai.clip_model_list import CLIP_CHECKPOINTS
+
+        return {
+            f"{model_name}|{checkpoint}": (model_name, checkpoint)
+            for model_name, checkpoint in CLIP_CHECKPOINTS
+        }
+
+    @classmethod
+    def model_to_setter_id(cls, model_name: str, checkpoint: str) -> str:
+        # Reverse the available models dict
+        model_to_name = {v: k for k, v in cls.available_models().items()}
+        return model_to_name[(model_name, checkpoint)]
+
+    def clip_model_name(self) -> str:
+        return self._model_name
+
+    def clip_model_checkpoint(self) -> str:
+        return f"{self._checkpoint}"
+
 
 class WhisperSTTModel(ModelOpts):
-    _model_name: str
+    _model_repo: str
     _batch_size: int
 
-    def __init__(self, batch_size: int = 8, model_name="base"):
-        self._model_name = model_name
+    def __init__(self, batch_size: int = 8, model_repo: str | None = None):
+        if model_repo is None:
+            model_repo = WhisperSTTModel.available_models()["base"]
+
+        assert (
+            model_repo in WhisperSTTModel.available_models().values()
+        ), f"Invalid model repo {model_repo}"
+
+        self._model_repo = model_repo
         self._batch_size = batch_size
 
     def model_type(self) -> str:
         return "stt"
 
-    def model_name(self) -> str:
-        return self._model_name
-
     def setter_id(self) -> str:
-        return f"{self.model_type()}|{self.model_name()}"
+        return WhisperSTTModel.model_to_setter_id(self.model_repo())
 
     def batch_size(self) -> int:
         return self._batch_size
@@ -190,3 +239,34 @@ class WhisperSTTModel(ModelOpts):
         )
 
         return run_whisper_extractor_job(conn, cdb, self)
+
+    @classmethod
+    def available_models(cls) -> Dict[str, str]:
+        _MODELS = {
+            "tiny.en": "Systran/faster-whisper-tiny.en",
+            "tiny": "Systran/faster-whisper-tiny",
+            "base.en": "Systran/faster-whisper-base.en",
+            "base": "Systran/faster-whisper-base",
+            "small.en": "Systran/faster-whisper-small.en",
+            "small": "Systran/faster-whisper-small",
+            "medium.en": "Systran/faster-whisper-medium.en",
+            "medium": "Systran/faster-whisper-medium",
+            "large-v1": "Systran/faster-whisper-large-v1",
+            "large-v2": "Systran/faster-whisper-large-v2",
+            "large-v3": "Systran/faster-whisper-large-v3",
+            "large": "Systran/faster-whisper-large-v3",
+            "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
+            "distil-medium.en": "Systran/faster-distil-whisper-medium.en",
+            "distil-small.en": "Systran/faster-distil-whisper-small.en",
+            "distill-large-v3": "Systran/faster-distil-whisper-large-v3",
+        }
+        return _MODELS
+
+    @classmethod
+    def model_to_setter_id(cls, model_repo: str) -> str:
+        # Reverse the available models dict
+        model_to_name = {v: k for k, v in cls.available_models().items()}
+        return model_to_name[model_repo]
+
+    def model_repo(self) -> str:
+        return self._model_repo

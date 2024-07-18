@@ -297,8 +297,8 @@ def create_search_UI(
                                         label="Only search tags set by model(s)",
                                         multiselect=True,
                                         choices=[
-                                            (m, m)
-                                            for m in models.TaggerModel.available_models()
+                                            (n, r)
+                                            for n, r in models.TaggerModel.available_models().items()
                                         ],
                                         value=[],
                                         scale=2,

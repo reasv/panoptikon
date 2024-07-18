@@ -144,7 +144,9 @@ def run_model_job(model_opt: models.ModelOpts):
 
 
 def regenerate_tags(
-    tag_models: List[str] = [models.TaggerModel.available_models()[0]],
+    tag_models: List[str] = [
+        models.TaggerModel.available_models()["wd-swinv2-tagger-v3"]
+    ],
 ):
     print(f"Regenerating tags for models: {tag_models}")
     full_report = ""
@@ -356,10 +358,14 @@ def create_scan_UI():
                     model_choice = gr.Dropdown(
                         label="Tagging Model(s) to Use",
                         multiselect=True,
-                        value=[models.TaggerModel.available_models()[0]],
+                        value=[
+                            models.TaggerModel.available_models()[
+                                "wd-swinv2-tagger-v3"
+                            ]
+                        ],
                         choices=[
-                            (model, model)
-                            for model in models.TaggerModel.available_models()
+                            (name, repo)
+                            for name, repo in models.TaggerModel.available_models().items()
                         ],
                     )
                     with gr.Row():

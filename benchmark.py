@@ -58,6 +58,7 @@ def perform_search(
     print(f"Negative tags: {negative_tags}")
     print(f"Negative tags match all: {negative_tags_match_all}")
     print(f"Tags match any: {tags_match_any}")
+    all_setters = [s for n, s in models.TaggerModel.available_models().items()]
     res = list(
         search_files(
             conn,
@@ -68,8 +69,8 @@ def perform_search(
             tag_namespace=random.choice(["danbooru:", None, "dan"]),
             min_confidence=random.choice([None, 0.1, 0.2, 0.3]),
             setters=random.choices(
-                models.TaggerModel.available_models(),
-                k=random.randint(0, len(models.TaggerModel.available_models())),
+                all_setters,
+                k=random.randint(0, len(all_setters)),
             ),
             all_setters_required=random.choice([True, False, None]),
             item_type=random.choice(["image", "image/", "im", None]),

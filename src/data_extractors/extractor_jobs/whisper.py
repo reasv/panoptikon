@@ -25,7 +25,7 @@ def run_whisper_extractor_job(
     if torch.cuda.is_available():
         device = "cuda"
 
-    whisper_model = whisperx.load_model(model_opts.model_name(), device=device)
+    whisper_model = whisperx.load_model(model_opts.model_repo(), device=device)
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):

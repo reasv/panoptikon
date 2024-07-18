@@ -32,13 +32,12 @@ def add_item_text(
         return
     collection = get_text_collection(cdb)
     collection.upsert(
-        ids=[f"{item.sha256}-{model.setter_id()}"],
+        ids=[f"{item.sha256}-{model.model_type()}-{model.setter_id()}"],
         documents=[text],
         metadatas=[
             {
                 "item": item.sha256,
                 "source": model.model_type(),
-                "model": model.model_name(),
                 "setter": model.setter_id(),
                 "language": language,
                 "type": item.type,

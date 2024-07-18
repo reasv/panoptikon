@@ -16,8 +16,8 @@ def run_image_embedding_extractor_job(
     conn: sqlite3.Connection, cdb: ClientAPI, model_opt: ImageEmbeddingModel
 ):
     embedder = CLIPEmbedder(
-        model_name=model_opt.model_name(),
-        pretrained=model_opt.model_checkpoint(),
+        model_name=model_opt.clip_model_name(),
+        pretrained=model_opt.clip_model_checkpoint(),
         batch_size=model_opt.batch_size(),
     )
     embedder.load_model()
