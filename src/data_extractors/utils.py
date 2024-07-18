@@ -15,7 +15,6 @@ from src.db import FileSearchResult, get_existing_file_for_sha256
 class ExtractedText:
     item: str
     source: str
-    model: str
     setter: str
     language: str
     type: str
@@ -80,7 +79,6 @@ def process_result_single_query(result: QueryResult) -> List[ExtractedText]:
 def process_single_result(metadata: Metadata, document: str, score: float):
     assert isinstance(metadata["item"], str)
     assert isinstance(metadata["source"], str)
-    assert isinstance(metadata["model"], str)
     assert isinstance(metadata["setter"], str)
     assert isinstance(metadata["language"], str)
     assert isinstance(metadata["type"], str)
@@ -88,7 +86,6 @@ def process_single_result(metadata: Metadata, document: str, score: float):
     return ExtractedText(
         item=metadata["item"],
         source=metadata["source"],
-        model=metadata["model"],
         setter=metadata["setter"],
         language=metadata["language"],
         type=metadata["type"],

@@ -58,14 +58,18 @@ def create_semantic_text_search_UI(
     ):
         conn = get_database_connection()
         cdb = get_chromadb_client()
-        files, scores = search_item_text(
-            conn,
-            cdb,
-            text_query=search_text,
-            limit=n_results,
-            semantic_search=semantic_search,
-            full_text_search=full_text_search,
-        )
+        files = [
+            file
+            for file, score, in search_item_text(
+                conn,
+                cdb,
+                text_query=search_text,
+                limit=n_results,
+                semantic_search=semantic_search,
+                full_text_search=full_text_search,
+            )
+        ]
+
         return files
 
     submit_button.click(
