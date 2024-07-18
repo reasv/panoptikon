@@ -1,20 +1,48 @@
 import sqlite3
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from chromadb.api import ClientAPI
 
 
 class ModelOpts:
+    _batch_size: int
+
+    def __init__(
+        self, batch_size: int | None = 64, model_name: str | None = None
+    ):
+        self._batch_size = batch_size or self.default_batch_size()
+        if model_name is None:
+            model_name = self.default_model()
+        assert self.valid_model(model_name), f"Invalid model {model_name}"
+
+        self._init(model_name)
+
     def __str__(self):
         return self.setter_id()
 
     def __repr__(self):
         return self.setter_id()
 
-    def model_type(self) -> str:
-        raise NotImplementedError
-
     def batch_size(self) -> int:
+        return self._batch_size
+
+    @classmethod
+    def available_models(cls) -> List[str]:
+        return list(cls._available_models_mapping().keys())
+
+    @classmethod
+    def default_batch_size(cls) -> int:
+        return 64
+
+    @classmethod
+    def valid_model(cls, model_name: str) -> bool:
+        return model_name in cls.available_models()
+
+    @classmethod
+    def default_model(cls) -> str:
+        return cls.available_models()[0]
+
+    def model_type(self) -> str:
         raise NotImplementedError
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
@@ -24,31 +52,28 @@ class ModelOpts:
         raise NotImplementedError
 
     @classmethod
-    def available_models(cls) -> Dict[str, Any]:
+    def _available_models_mapping(cls) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def _init(self, model_name: str):
         raise NotImplementedError
 
 
-class TaggerModel(ModelOpts):
+class TagsModel(ModelOpts):
     _model_repo: str
-    _batch_size: int
 
-    def __init__(self, batch_size: int = 64, model_repo: str | None = None):
-        if model_repo is None:
-            model_repo = TaggerModel.available_models()["wd-swinv2-tagger-v3"]
-        assert model_repo in [
-            s for n, s in TaggerModel.available_models().items()
-        ], f"Invalid model repo {model_repo}"
-        self._model_repo = model_repo
-        self._batch_size = batch_size
+    def _init(self, model_name: str):
+        self._model_repo = TagsModel._available_models_mapping()[model_name]
 
     def model_type(self) -> str:
-        return "tagger"
+        return "tags"
 
     def setter_id(self) -> str:
-        return TaggerModel.model_to_setter_id(self.model_repo())
+        return TagsModel._model_to_setter_id(self.model_repo())
 
-    def batch_size(self) -> int:
-        return self._batch_size
+    @classmethod
+    def default_model(cls) -> str:
+        return "wd-swinv2-tagger-v3"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
         from src.data_extractors.extractor_jobs.tags import (
@@ -58,7 +83,7 @@ class TaggerModel(ModelOpts):
         return run_tag_extractor_job(conn, self)
 
     @classmethod
-    def available_models(cls) -> Dict[str, str]:
+    def _available_models_mapping(cls) -> Dict[str, str]:
         # Dataset v3 series of models:
         SWINV2_MODEL_DSV3_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
         CONV_MODEL_DSV3_REPO = "SmilingWolf/wd-convnext-tagger-v3"
@@ -79,9 +104,11 @@ class TaggerModel(ModelOpts):
         return {name.split("/")[-1]: name for name in V3_MODELS}
 
     @classmethod
-    def model_to_setter_id(cls, model_repo: str) -> str:
+    def _model_to_setter_id(cls, model_repo: str) -> str:
         # Reverse the available models dict
-        model_to_name = {v: k for k, v in cls.available_models().items()}
+        model_to_name = {
+            v: k for k, v in cls._available_models_mapping().items()
+        }
         return model_to_name[model_repo]
 
     # Own methods
@@ -92,28 +119,23 @@ class TaggerModel(ModelOpts):
 class OCRModel(ModelOpts):
     _detection_model: str
     _recognition_model: str
-    _batch_size: int
 
-    def __init__(
-        self,
-        batch_size: int = 64,
-        detection_model="db_resnet50",
-        recognition_model="crnn_mobilenet_v3_small",
-    ):
-        self._detection_model = detection_model
-        self._recognition_model = recognition_model
-        self._batch_size = batch_size
+    def _init(self, model_name: str):
+        self._detection_model, self._recognition_model = (
+            OCRModel._available_models_mapping()[model_name]
+        )
 
     def model_type(self) -> str:
         return "ocr"
 
     def setter_id(self) -> str:
-        return OCRModel.model_to_setter_id(
+        return OCRModel._model_to_setter_id(
             self.detection_model(), self.recognition_model()
         )
 
-    def batch_size(self) -> int:
-        return self._batch_size
+    @classmethod
+    def default_model(cls) -> str:
+        return "db_resnet50|crnn_mobilenet_v3_small"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
         from src.data_extractors.extractor_jobs.ocr import run_ocr_extractor_job
@@ -121,29 +143,29 @@ class OCRModel(ModelOpts):
         return run_ocr_extractor_job(conn, cdb, self)
 
     @classmethod
-    def available_models(cls) -> Dict[str, Tuple[str, str]]:
+    def _available_models_mapping(cls) -> Dict[str, Tuple[str, str]]:
+        options = [
+            ("db_resnet50", "crnn_vgg16_bn"),
+            ("db_resnet50", "crnn_mobilenet_v3_small"),
+            ("db_resnet50", "crnn_mobilenet_v3_large"),
+            ("db_resnet50", "master"),
+            ("db_resnet50", "vitstr_small"),
+            ("db_resnet50", "vitstr_base"),
+            ("db_resnet50", "parseq"),
+        ]
         return {
-            "db_resnet50|crnn_vgg16_bn": ("db_resnet50", "crnn_vgg16_bn"),
-            "db_resnet50|crnn_mobilenet_v3_small": (
-                "db_resnet50",
-                "crnn_mobilenet_v3_small",
-            ),
-            "db_resnet50|crnn_mobilenet_v3_large": (
-                "db_resnet50",
-                "crnn_mobilenet_v3_large",
-            ),
-            "db_resnet50|master": ("db_resnet50", "master"),
-            "db_resnet50|vitstr_small": ("db_resnet50", "vitstr_small"),
-            "db_resnet50|vitstr_base": ("db_resnet50", "vitstr_base"),
-            "db_resnet50|parseq": ("db_resnet50", "parseq"),
+            f"{detection}|{recognition}": (detection, recognition)
+            for detection, recognition in options
         }
 
     @classmethod
-    def model_to_setter_id(
+    def _model_to_setter_id(
         cls, detection_model: str, recognition_model: str
     ) -> str:
         # Reverse the available models dict
-        model_to_name = {v: k for k, v in cls.available_models().items()}
+        model_to_name = {
+            v: k for k, v in cls._available_models_mapping().items()
+        }
         return model_to_name[(detection_model, recognition_model)]
 
     def recognition_model(self) -> str:
@@ -156,29 +178,24 @@ class OCRModel(ModelOpts):
 class ImageEmbeddingModel(ModelOpts):
     _model_name: str
     _checkpoint: str
-    _batch_size: int
 
-    def __init__(
-        self,
-        batch_size: int = 64,
-        model_name="ViT-H-14-378-quickgelu",
-        pretrained="dfn5b",
-    ):
+    def _init(self, model_name: str):
 
-        self._model_name = model_name
-        self._checkpoint = pretrained
-        self._batch_size = batch_size
+        self._model_name, self._checkpoint = (
+            ImageEmbeddingModel._available_models_mapping()[model_name]
+        )
 
     def model_type(self) -> str:
         return "clip"
 
     def setter_id(self) -> str:
-        return ImageEmbeddingModel.model_to_setter_id(
+        return ImageEmbeddingModel._model_to_setter_id(
             self.clip_model_name(), self.clip_model_checkpoint()
         )
 
-    def batch_size(self) -> int:
-        return self._batch_size
+    @classmethod
+    def default_model(cls) -> str:
+        return "ViT-H-14-378-quickgelu|dfn5b"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
         from src.data_extractors.extractor_jobs.clip import (
@@ -188,7 +205,7 @@ class ImageEmbeddingModel(ModelOpts):
         return run_image_embedding_extractor_job(conn, cdb, self)
 
     @classmethod
-    def available_models(cls) -> Dict[str, Tuple[str, str]]:
+    def _available_models_mapping(cls) -> Dict[str, Tuple[str, str]]:
         from src.data_extractors.ai.clip_model_list import CLIP_CHECKPOINTS
 
         return {
@@ -197,41 +214,41 @@ class ImageEmbeddingModel(ModelOpts):
         }
 
     @classmethod
-    def model_to_setter_id(cls, model_name: str, checkpoint: str) -> str:
+    def _model_to_setter_id(cls, model_name: str, checkpoint: str) -> str:
         # Reverse the available models dict
-        model_to_name = {v: k for k, v in cls.available_models().items()}
+        model_to_name = {
+            v: k for k, v in cls._available_models_mapping().items()
+        }
         return model_to_name[(model_name, checkpoint)]
 
     def clip_model_name(self) -> str:
         return self._model_name
 
     def clip_model_checkpoint(self) -> str:
-        return f"{self._checkpoint}"
+        return self._checkpoint
 
 
 class WhisperSTTModel(ModelOpts):
     _model_repo: str
-    _batch_size: int
 
-    def __init__(self, batch_size: int = 8, model_repo: str | None = None):
-        if model_repo is None:
-            model_repo = WhisperSTTModel.available_models()["base"]
+    def _init(self, model_name: str):
+        self._model_repo = WhisperSTTModel._available_models_mapping()[
+            model_name
+        ]
 
-        assert (
-            model_repo in WhisperSTTModel.available_models().values()
-        ), f"Invalid model repo {model_repo}"
+    @classmethod
+    def default_batch_size(cls) -> int:
+        return 8
 
-        self._model_repo = model_repo
-        self._batch_size = batch_size
+    @classmethod
+    def default_model(cls) -> str:
+        return "distill-large-v3"
 
     def model_type(self) -> str:
         return "stt"
 
     def setter_id(self) -> str:
-        return WhisperSTTModel.model_to_setter_id(self.model_repo())
-
-    def batch_size(self) -> int:
-        return self._batch_size
+        return WhisperSTTModel._model_to_setter_id(self.model_repo())
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
         from src.data_extractors.extractor_jobs.whisper import (
@@ -241,7 +258,7 @@ class WhisperSTTModel(ModelOpts):
         return run_whisper_extractor_job(conn, cdb, self)
 
     @classmethod
-    def available_models(cls) -> Dict[str, str]:
+    def _available_models_mapping(cls) -> Dict[str, str]:
         _MODELS = {
             "tiny.en": "Systran/faster-whisper-tiny.en",
             "tiny": "Systran/faster-whisper-tiny",
@@ -263,9 +280,11 @@ class WhisperSTTModel(ModelOpts):
         return _MODELS
 
     @classmethod
-    def model_to_setter_id(cls, model_repo: str) -> str:
+    def _model_to_setter_id(cls, model_repo: str) -> str:
         # Reverse the available models dict
-        model_to_name = {v: k for k, v in cls.available_models().items()}
+        model_to_name = {
+            v: k for k, v in cls._available_models_mapping().items()
+        }
         return model_to_name[model_repo]
 
     def model_repo(self) -> str:

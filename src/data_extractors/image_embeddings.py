@@ -22,9 +22,8 @@ def search_item_image_embeddings(
     allowed_general_types: List[str] | None = None,
     limit: int = 10,
 ):
-    model_opt = ImageEmbeddingModel(
-        model_name=embedder.model_name,
-        pretrained=embedder.pretrained,
+    setter_id = ImageEmbeddingModel._model_to_setter_id(
+        embedder.model_name, embedder.pretrained
     )
     collection = get_image_embeddings_collection(cdb, embedder)
     where_query = []
@@ -40,7 +39,7 @@ def search_item_image_embeddings(
         where={
             "$and": (
                 [
-                    {"setter": model_opt.setter_id()},
+                    {"setter": setter_id},
                 ]
                 + [{"$or": where_query}]
                 if where_query

@@ -53,8 +53,8 @@ def create_toptags_UI():
                         value=[],
                         multiselect=True,
                         choices=[
-                            (name, repo)
-                            for name, repo in models.TaggerModel.available_models().items()
+                            (name, name)
+                            for name in models.TagsModel.available_models()
                         ],
                     )
                     confidence_threshold = gr.Slider(

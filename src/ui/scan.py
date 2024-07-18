@@ -144,14 +144,12 @@ def run_model_job(model_opt: models.ModelOpts):
 
 
 def regenerate_tags(
-    tag_models: List[str] = [
-        models.TaggerModel.available_models()["wd-swinv2-tagger-v3"]
-    ],
+    tag_models: List[str] = [models.TagsModel.default_model()],
 ):
     print(f"Regenerating tags for models: {tag_models}")
     full_report = ""
     for model in tag_models:
-        model_opt = models.TaggerModel(model_repo=model)
+        model_opt = models.TagsModel(model_name=model)
         report_str = run_model_job(model_opt)
         full_report += report_str
     return full_report, fetch_scan_history(), fetch_tagging_history()
@@ -359,13 +357,11 @@ def create_scan_UI():
                         label="Tagging Model(s) to Use",
                         multiselect=True,
                         value=[
-                            models.TaggerModel.available_models()[
-                                "wd-swinv2-tagger-v3"
-                            ]
+                            models.TagsModel.default_model(),
                         ],
                         choices=[
-                            (name, repo)
-                            for name, repo in models.TaggerModel.available_models().items()
+                            (name, name)
+                            for name in models.TagsModel.available_models()
                         ],
                     )
                     with gr.Row():

@@ -58,7 +58,7 @@ def perform_search(
     print(f"Negative tags: {negative_tags}")
     print(f"Negative tags match all: {negative_tags_match_all}")
     print(f"Tags match any: {tags_match_any}")
-    all_setters = [s for n, s in models.TaggerModel.available_models().items()]
+    all_setters = models.TagsModel.available_models()
     res = list(
         search_files(
             conn,

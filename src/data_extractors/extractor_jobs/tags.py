@@ -8,7 +8,7 @@ import PIL.Image
 from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extractor_jobs import run_extractor_job
-from src.data_extractors.models import TaggerModel
+from src.data_extractors.models import TagsModel
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
 from src.types import ItemWithPath
@@ -93,7 +93,7 @@ def handle_individual_result(
         )
 
 
-def run_tag_extractor_job(conn: sqlite3.Connection, model: TaggerModel):
+def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     """
     Run a job that processes items in the database using the given tagging model.
     """
