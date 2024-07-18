@@ -77,7 +77,9 @@ class TaggerModel(ModelOpts):
         return self._model_repo
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.tags import run_tag_extractor_job
+        from src.data_extractors.extractor_jobs.tags import (
+            run_tag_extractor_job,
+        )
 
         return run_tag_extractor_job(conn, self)
 
@@ -116,7 +118,7 @@ class OCRModel(ModelOpts):
         return self._detection_model
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.ocr import run_ocr_extractor_job
+        from src.data_extractors.extractor_jobs.ocr import run_ocr_extractor_job
 
         return run_ocr_extractor_job(conn, cdb, self)
 
@@ -155,7 +157,7 @@ class ImageEmbeddingModel(ModelOpts):
         return self._batch_size
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.image_embeddings import (
+        from src.data_extractors.extractor_jobs.clip import (
             run_image_embedding_extractor_job,
         )
 
@@ -183,6 +185,8 @@ class WhisperSTTModel(ModelOpts):
         return self._batch_size
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.whisper import run_whisper_extractor_job
+        from src.data_extractors.extractor_jobs.whisper import (
+            run_whisper_extractor_job,
+        )
 
         return run_whisper_extractor_job(conn, cdb, self)

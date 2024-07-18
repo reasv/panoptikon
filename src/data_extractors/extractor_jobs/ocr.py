@@ -7,7 +7,7 @@ from chromadb.api import ClientAPI
 from doctr.models import ocr_predictor
 
 from src.data_extractors.data_loaders.images import item_image_extractor_np
-from src.data_extractors.extractor_job import run_extractor_job
+from src.data_extractors.extractor_jobs import run_extractor_job
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
 from src.types import ItemWithPath
