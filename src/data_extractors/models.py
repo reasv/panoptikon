@@ -6,7 +6,7 @@ from chromadb.api import ClientAPI
 from src.data_extractors.wd_tagger import V3_MODELS
 
 
-class ModelOption:
+class ModelOpts:
     def __str__(self):
         return self.setter_id()
 
@@ -29,7 +29,7 @@ class ModelOption:
         return f"{self.model_type()}|{self.model_name()}"
 
 
-class TaggerModel(ModelOption):
+class TaggerModel(ModelOpts):
     _model_repo: str
     _batch_size: int
 
@@ -65,7 +65,7 @@ class TaggerModel(ModelOption):
         return run_tag_extractor_job(conn, self)
 
 
-class OCRModel(ModelOption):
+class OCRModel(ModelOpts):
     _detection_model: str
     _recognition_model: str
     _batch_size: int
@@ -104,7 +104,7 @@ class OCRModel(ModelOption):
         return run_ocr_extractor_job(conn, cdb, self)
 
 
-class ImageEmbeddingModel(ModelOption):
+class ImageEmbeddingModel(ModelOpts):
     _model_name: str
     _checkpoint: str
     _batch_size: int
@@ -145,7 +145,7 @@ class ImageEmbeddingModel(ModelOption):
         return run_image_embedding_extractor_job(conn, cdb, self)
 
 
-class WhisperSTTModel(ModelOption):
+class WhisperSTTModel(ModelOpts):
     _model_name: str
     _batch_size: int
 

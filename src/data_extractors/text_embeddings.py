@@ -3,7 +3,7 @@ from typing import List
 
 from chromadb.api import ClientAPI
 
-from src.data_extractors.models import ModelOption
+from src.data_extractors.models import ModelOpts
 from src.data_extractors.utils import (
     ExtractedText,
     process_result_single_query,
@@ -24,7 +24,7 @@ def get_text_collection(cdb: ClientAPI):
 def add_item_text(
     cdb: ClientAPI,
     item: ItemWithPath,
-    model: ModelOption,
+    model: ModelOpts,
     language: str,
     text: str,
 ):
