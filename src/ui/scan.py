@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List
+from typing import List, Type
 
 import gradio as gr
-from numpy import cdouble
 
+import run
 import src.data_extractors.models as models
 from src.data_extractors.utils import get_chromadb_client
 from src.db import (
@@ -141,6 +141,18 @@ def run_model_job(model_opt: models.ModelOpts):
     """
     conn.close()
     return report_str
+
+
+def delete_model_data(model_opt: models.ModelOpts):
+    print(f"Running data deletion job for model {model_opt}")
+    conn = get_database_connection()
+    cdb = get_chromadb_client()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN")
+    model_opt.delete_extracted_data(conn, cdb)
+    conn.commit()
+    vacuum_database(conn)
+    conn.close()
 
 
 def regenerate_tags(
@@ -320,6 +332,72 @@ def create_job_dataset(samples=[]):
         scale=1,
     )
     return tagging_history
+
+
+def extractor_job_UI(model_type: Type[models.ModelOpts]):
+    def run_job(batch: int, chosen_model: List[str]):
+        for model_name in chosen_model:
+            extractor_model = model_type(
+                batch_size=batch, model_name=model_name
+            )
+            run_model_job(extractor_model)
+
+    def delete_data(chosen_model: List[str]):
+        for model_name in chosen_model:
+            extractor_model = model_type(model_name=model_name)
+            delete_model_data(extractor_model)
+
+    with gr.TabItem(label=model_type.name()) as extractor_tab:
+        gr.Markdown(
+            f"""
+            ## {model_type.name()} Extraction Job
+            ### {model_type.description()}
+
+            This will run the {model_type.name()} extractor on the database.
+            The extractor will process all items in the database that have not been processed by the selected model yet.
+            Data will be extracted from the items and indexed in the database for search and retrieval.
+            """
+        )
+        with gr.Group():
+            model_choice = gr.Dropdown(
+                label="Model(s) to Use",
+                multiselect=True,
+                value=[
+                    model_type.default_model(),
+                ],
+                choices=[
+                    (name, name) for name in model_type.available_models()
+                ],
+            )
+            batch_size = gr.Slider(
+                label="Batch Size",
+                minimum=1,
+                maximum=128,
+                value=model_type.default_batch_size(),
+            )
+        with gr.Row():
+            run_button = gr.Button("Run Batch Job")
+            delete_button = gr.Button(
+                "Delete All Data Extracted by Selected Model(s)"
+            )
+
+    run_button.click(
+        fn=run_job,
+        inputs=[batch_size, model_choice],
+    )
+    delete_button.click(
+        fn=delete_data,
+        inputs=[model_choice],
+    )
+
+
+def create_extractor_UI():
+    with gr.Row():
+        with gr.Tabs():
+            extractor_job_UI(models.TagsModel)
+            extractor_job_UI(models.OCRModel)
+            extractor_job_UI(models.WhisperSTTModel)
+            extractor_job_UI(models.ImageEmbeddingModel)
 
 
 def create_scan_UI():

@@ -27,6 +27,14 @@ class ModelOpts:
         return self._batch_size
 
     @classmethod
+    def name(cls) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def description(cls) -> str:
+        raise NotImplementedError
+
+    @classmethod
     def available_models(cls) -> List[str]:
         return list(cls._available_models_mapping().keys())
 
@@ -58,6 +66,9 @@ class ModelOpts:
     def _init(self, model_name: str):
         raise NotImplementedError
 
+    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        raise NotImplementedError
+
 
 class TagsModel(ModelOpts):
     _model_repo: str
@@ -67,6 +78,14 @@ class TagsModel(ModelOpts):
 
     def model_type(self) -> str:
         return "tags"
+
+    @classmethod
+    def name(cls) -> str:
+        return "Tags"
+
+    @classmethod
+    def description(cls) -> str:
+        return "Generate danbooru-type tags for images and videos"
 
     def setter_id(self) -> str:
         return TagsModel._model_to_setter_id(self.model_repo())
@@ -128,6 +147,14 @@ class OCRModel(ModelOpts):
     def model_type(self) -> str:
         return "ocr"
 
+    @classmethod
+    def name(cls) -> str:
+        return "OCR"
+
+    @classmethod
+    def description(cls) -> str:
+        return "Extract text from images, videos, and documents through OCR"
+
     def setter_id(self) -> str:
         return OCRModel._model_to_setter_id(
             self.detection_model(), self.recognition_model()
@@ -188,6 +215,14 @@ class ImageEmbeddingModel(ModelOpts):
     def model_type(self) -> str:
         return "clip"
 
+    @classmethod
+    def name(cls) -> str:
+        return "CLIP Image Embeddings"
+
+    @classmethod
+    def description(cls) -> str:
+        return "Generate Image Embeddings using OpenAI's CLIP model for semantic image search"
+
     def setter_id(self) -> str:
         return ImageEmbeddingModel._model_to_setter_id(
             self.clip_model_name(), self.clip_model_checkpoint()
@@ -246,6 +281,14 @@ class WhisperSTTModel(ModelOpts):
 
     def model_type(self) -> str:
         return "stt"
+
+    @classmethod
+    def name(cls) -> str:
+        return "Whisper Speech-to-Text"
+
+    @classmethod
+    def description(cls) -> str:
+        return "Extract text from audio in audio and video files using OpenAI's Whisper model"
 
     def setter_id(self) -> str:
         return WhisperSTTModel._model_to_setter_id(self.model_repo())
