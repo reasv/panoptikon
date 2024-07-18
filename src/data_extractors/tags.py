@@ -8,24 +8,11 @@ import PIL.Image
 
 from src.data_extractors.extractor_job import run_extractor_job
 from src.data_extractors.models import TaggerModel
-from src.data_extractors.wd_tagger import V3_MODELS, Predictor
+from src.data_extractors.utils import get_threshold_from_env
+from src.data_extractors.wd_tagger import Predictor
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
 from src.types import ItemWithPath
 from src.utils import item_image_extractor_pil
-
-
-def get_threshold_from_env() -> float:
-    threshold = os.getenv("SCORE_THRESHOLD")
-    if threshold is None:
-        return 0.1
-    return float(threshold)
-
-
-def get_timeout_from_env() -> int:
-    timeout = os.getenv("TAGSCAN_TIMEOUT")
-    if timeout is None:
-        return 40
-    return int(timeout)
 
 
 def combine_results(results: List[dict[str, float]]) -> dict[str, float]:

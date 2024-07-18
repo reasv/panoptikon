@@ -5,8 +5,8 @@ from time import time
 
 import gradio as gr
 
-from src.data_extractors.tags import get_threshold_from_env
-from src.data_extractors.wd_tagger import V3_MODELS
+import src.data_extractors.models as models
+from src.data_extractors.utils import get_threshold_from_env
 from src.db import (
     get_database_connection,
     get_folders_from_database,
@@ -296,7 +296,10 @@ def create_search_UI(
                                     tag_setters = gr.Dropdown(
                                         label="Only search tags set by model(s)",
                                         multiselect=True,
-                                        choices=[(m, m) for m in V3_MODELS],
+                                        choices=[
+                                            (m, m)
+                                            for m in models.TaggerModel.available_models()
+                                        ],
                                         value=[],
                                         scale=2,
                                     )

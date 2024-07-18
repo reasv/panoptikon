@@ -4,15 +4,10 @@ from datetime import datetime
 from typing import List
 
 import gradio as gr
+from numpy import cdouble
 
-from src.data_extractors.image_embeddings import (
-    get_chromadb_client,
-    run_image_embedding_extractor_job,
-)
-from src.data_extractors.ocr import run_ocr_extractor_job
-from src.data_extractors.tags import run_tag_extractor_job
-from src.data_extractors.wd_tagger import V3_MODELS
-from src.data_extractors.whisper import run_whisper_extractor_job
+import src.data_extractors.models as models
+from src.data_extractors.utils import get_chromadb_client
 from src.db import (
     delete_tags_from_setter,
     get_all_file_scans,
@@ -127,86 +122,51 @@ def rescan_folders(delete_unavailable_files: bool = True):
     )
 
 
-def regenerate_tags(tag_models: List[str] = [V3_MODELS[0]]):
-    print(f"Regenerating tags for models: {tag_models}")
+def run_model_job(model_opt: models.ModelOpts):
+    print(f"Running job for model {model_opt}")
     conn = get_database_connection()
+    cdb = get_chromadb_client()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN")
+    images, videos, failed = model_opt.run_extractor(conn, cdb)
+    conn.commit()
+    vacuum_database(conn)
+    failed_str = "\n".join(failed)
+    report_str = f"""
+    Extraction completed for model {model_opt}.
+    Successfully processed {images} images and {videos} videos.
+    {len(failed)} files failed to process due to errors.
+    Failed files:
+    {failed_str}
+    """
+    conn.close()
+    return report_str
+
+
+def regenerate_tags(
+    tag_models: List[str] = [models.TaggerModel.available_models()[0]],
+):
+    print(f"Regenerating tags for models: {tag_models}")
     full_report = ""
     for model in tag_models:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN")
-        images, videos, failed = run_tag_extractor_job(conn, model=model)
-        conn.commit()
-        vacuum_database(conn)
-        failed_str = "\n".join(failed)
-        report_str = f"""
-        Tag Generation completed for model {model}.
-        Successfully processed {images} images and {videos} videos.
-        {len(failed)} files failed to process due to errors.
-        Failed files:
-        {failed_str}
-        """
+        model_opt = models.TaggerModel(model_repo=model)
+        report_str = run_model_job(model_opt)
         full_report += report_str
-    conn.close()
     return full_report, fetch_scan_history(), fetch_tagging_history()
 
 
 def generate_embeds():
-    conn = get_database_connection()
-    cdb = get_chromadb_client()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    images, videos, failed = run_image_embedding_extractor_job(conn, cdb)
-    conn.commit()
-    vacuum_database(conn)
-    failed_str = "\n".join(failed)
-    report_str = f"""
-    Embeddings generation completed.
-    Successfully processed {images} images and {videos} videos.
-    {len(failed)} files failed to process due to errors.
-    Failed files:
-    {failed_str}
-    """
-    conn.close()
+    report_str = run_model_job(models.ImageEmbeddingModel())
     return report_str, fetch_scan_history(), fetch_tagging_history()
 
 
 def run_ocr():
-    conn = get_database_connection()
-    cdb = get_chromadb_client()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    images, videos, failed = run_ocr_extractor_job(conn, cdb)
-    conn.commit()
-    vacuum_database(conn)
-    failed_str = "\n".join(failed)
-    report_str = f"""
-    OCR Extraction completed.
-    Successfully processed {images} images and {videos} videos.
-    {len(failed)} files failed to process due to errors.
-    Failed files:
-    {failed_str}
-    """
-    conn.close()
+    report_str = run_model_job(models.OCRModel())
     return report_str, fetch_scan_history(), fetch_tagging_history()
 
 
 def run_whisper():
-    conn = get_database_connection()
-    cdb = get_chromadb_client()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    images, videos, failed = run_whisper_extractor_job(conn, cdb)
-    conn.commit()
-    vacuum_database(conn)
-    failed_str = "\n".join(failed)
-    report_str = f"""
-    Whisper Speech to Text Extraction completed.
-    Successfully processed {images} images and {videos} videos.
-    {len(failed)} files failed to process due to errors.
-    Failed files:
-    {failed_str}
-    """
-    conn.close()
+    report_str = run_model_job(models.WhisperSTTModel())
     return report_str, fetch_scan_history(), fetch_tagging_history()
 
 
@@ -396,8 +356,11 @@ def create_scan_UI():
                     model_choice = gr.Dropdown(
                         label="Tagging Model(s) to Use",
                         multiselect=True,
-                        value=[V3_MODELS[0]],
-                        choices=[(model, model) for model in V3_MODELS],
+                        value=[models.TaggerModel.available_models()[0]],
+                        choices=[
+                            (model, model)
+                            for model in models.TaggerModel.available_models()
+                        ],
                     )
                     with gr.Row():
                         regenerate_tags_button = gr.Button(

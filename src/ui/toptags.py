@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gradio as gr
 
-from src.data_extractors.wd_tagger import V3_MODELS
+import src.data_extractors.models as models
 from src.db import get_database_connection, get_most_common_tags_frequency
 
 
@@ -52,7 +52,10 @@ def create_toptags_UI():
                         label="Only include tags from model(s)",
                         value=[],
                         multiselect=True,
-                        choices=[(c, c) for c in V3_MODELS],
+                        choices=[
+                            (c, c)
+                            for c in models.TaggerModel.available_models()
+                        ],
                     )
                     confidence_threshold = gr.Slider(
                         label="Confidence threshold",

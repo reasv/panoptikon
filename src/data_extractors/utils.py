@@ -102,3 +102,17 @@ def get_chromadb_client() -> ClientAPI:
     sqlite_db_file = os.getenv("DB_FILE", "./db/sqlite.db")
     cdb_file = f"{sqlite_db_file}.chromadb"
     return PersistentClient(path=cdb_file)
+
+
+def get_threshold_from_env() -> float:
+    threshold = os.getenv("SCORE_THRESHOLD")
+    if threshold is None:
+        return 0.1
+    return float(threshold)
+
+
+def get_timeout_from_env() -> int:
+    timeout = os.getenv("TAGSCAN_TIMEOUT")
+    if timeout is None:
+        return 40
+    return int(timeout)

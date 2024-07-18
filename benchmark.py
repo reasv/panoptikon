@@ -2,7 +2,7 @@ import random
 from time import time
 from typing import List, Tuple
 
-from src.data_extractors.wd_tagger import V3_MODELS
+import src.data_extractors.models as models
 from src.db import (
     get_database_connection,
     get_folders_from_database,
@@ -68,7 +68,8 @@ def perform_search(
             tag_namespace=random.choice(["danbooru:", None, "dan"]),
             min_confidence=random.choice([None, 0.1, 0.2, 0.3]),
             setters=random.choices(
-                V3_MODELS, k=random.randint(0, len(V3_MODELS))
+                models.TaggerModel.available_models(),
+                k=random.randint(0, len(models.TaggerModel.available_models())),
             ),
             all_setters_required=random.choice([True, False, None]),
             item_type=random.choice(["image", "image/", "im", None]),

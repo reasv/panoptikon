@@ -3,8 +3,6 @@ from typing import List
 
 from chromadb.api import ClientAPI
 
-from src.data_extractors.wd_tagger import V3_MODELS
-
 
 class ModelOpts:
     def __str__(self):
@@ -33,7 +31,9 @@ class TaggerModel(ModelOpts):
     _model_repo: str
     _batch_size: int
 
-    def __init__(self, batch_size: int = 64, model_repo: str = V3_MODELS[0]):
+    def __init__(self, batch_size: int = 64, model_repo: str | None = None):
+        if model_repo is None:
+            model_repo = TaggerModel.available_models()[0]
         assert (
             model_repo in TaggerModel.available_models()
         ), f"Invalid model repo {model_repo}"
@@ -42,6 +42,23 @@ class TaggerModel(ModelOpts):
 
     @classmethod
     def available_models(cls) -> List[str]:
+        # Dataset v3 series of models:
+        SWINV2_MODEL_DSV3_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
+        CONV_MODEL_DSV3_REPO = "SmilingWolf/wd-convnext-tagger-v3"
+        VIT_MODEL_DSV3_REPO = "SmilingWolf/wd-vit-tagger-v3"
+
+        V3_MODELS = [
+            SWINV2_MODEL_DSV3_REPO,
+            CONV_MODEL_DSV3_REPO,
+            VIT_MODEL_DSV3_REPO,
+        ]
+
+        # Dataset v2 series of models:
+        MOAT_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-moat-tagger-v2"
+        SWIN_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-swinv2-tagger-v2"
+        CONV_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
+        CONV2_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-convnextv2-tagger-v2"
+        VIT_MODEL_DSV2_REPO = "SmilingWolf/wd-v1-4-vit-tagger-v2"
         return V3_MODELS
 
     def model_type(self) -> str:

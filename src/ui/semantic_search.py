@@ -5,9 +5,9 @@ import numpy as np
 
 from src.data_extractors.image_embeddings import (
     CLIPEmbedder,
-    get_chromadb_client,
     search_item_image_embeddings,
 )
+from src.data_extractors.utils import get_chromadb_client
 from src.db import get_database_connection
 from src.ui.components.multi_view import create_multiview
 
