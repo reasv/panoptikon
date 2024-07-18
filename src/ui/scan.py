@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from calendar import c
-from datetime import datetime
-from typing import List, Type
-
 import gradio as gr
 
-import src.data_extractors.models as models
-from src.data_extractors.utils import get_chromadb_client
 from src.db import (
-    delete_tags_from_setter,
-    get_all_file_scans,
-    get_all_tag_scans,
     get_database_connection,
     get_folders_from_database,
     vacuum_database,
 )
 from src.folders import rescan_all_folders, update_folder_lists
+from src.ui.components.extractor_ui import create_extractor_UI
+from src.ui.components.scan_tables import (
+    create_job_dataset,
+    create_scan_dataset,
+    fetch_scan_history,
+    fetch_tagging_history,
+)
 
 
 def get_folders():
@@ -31,22 +29,6 @@ def get_excluded_folders():
     folders = get_folders_from_database(conn, included=False)
     conn.close()
     return "\n".join(folders)
-
-
-def parse_iso_date(date: str):
-    return datetime.fromisoformat(date).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def isodate_to_epoch(date: str):
-    return int(datetime.fromisoformat(date).timestamp())
-
-
-def isodate_minutes_diff(date1: str, date2: str):
-    a, b = datetime.fromisoformat(date1), datetime.fromisoformat(date2)
-    return round(
-        ((a - b).total_seconds() / 60),
-        2,
-    )
 
 
 def update_folders(
@@ -122,295 +104,8 @@ def rescan_folders(delete_unavailable_files: bool = True):
     )
 
 
-def run_model_job(model_opt: models.ModelOpts):
-    print(f"Running job for model {model_opt}")
-    conn = get_database_connection()
-    cdb = get_chromadb_client()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    images, videos, failed = model_opt.run_extractor(conn, cdb)
-    conn.commit()
-    vacuum_database(conn)
-    failed_str = "\n".join(failed)
-    report_str = f"""
-    Extraction completed for model {model_opt}.
-    Successfully processed {images} images and {videos} videos.
-    {len(failed)} files failed to process due to errors.
-    Failed files:
-    {failed_str}
-    """
-    conn.close()
-    return report_str
-
-
-def delete_model_data(model_opt: models.ModelOpts):
-    print(f"Running data deletion job for model {model_opt}")
-    conn = get_database_connection()
-    cdb = get_chromadb_client()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    report_str = model_opt.delete_extracted_data(conn, cdb)
-    conn.commit()
-    vacuum_database(conn)
-    conn.close()
-    return report_str
-
-
-def regenerate_tags(
-    tag_models: List[str] = [models.TagsModel.default_model()],
-):
-    print(f"Regenerating tags for models: {tag_models}")
-    full_report = ""
-    for model in tag_models:
-        model_opt = models.TagsModel(model_name=model)
-        report_str = run_model_job(model_opt)
-        full_report += report_str
-    return full_report, fetch_scan_history(), fetch_tagging_history()
-
-
-def generate_embeds():
-    report_str = run_model_job(models.ImageEmbeddingModel())
-    return report_str, fetch_scan_history(), fetch_tagging_history()
-
-
-def run_ocr():
-    report_str = run_model_job(models.OCRModel())
-    return report_str, fetch_scan_history(), fetch_tagging_history()
-
-
-def run_whisper():
-    report_str = run_model_job(models.WhisperSTTModel())
-    return report_str, fetch_scan_history(), fetch_tagging_history()
-
-
-def delete_tags(tag_models: List[str] = []):
-    conn = get_database_connection()
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    message = ""
-    for model in tag_models:
-        tags_removed, items_tags_removed = delete_tags_from_setter(conn, model)
-        message += f"Removed {tags_removed} tags from {items_tags_removed} items tagged by model {model}.\n"
-    conn.commit()
-    vacuum_database(conn)
-    conn.close()
-    return message, fetch_scan_history(), fetch_tagging_history()
-
-
-def fetch_scan_history():
-    conn = get_database_connection()
-    file_scans = get_all_file_scans(conn)
-    conn.close()
-    file_scans = [
-        [
-            f.id,
-            parse_iso_date(f.start_time),
-            parse_iso_date(f.end_time),
-            isodate_minutes_diff(f.end_time, f.start_time),
-            f.path,
-            f.total_available,
-            f.marked_unavailable,
-            f.errors,
-            f.new_items,
-            f.new_files,
-            f.unchanged_files,
-            f.modified_files,
-        ]
-        for f in file_scans
-    ]
-
-    return gr.Dataset(samples=file_scans)
-
-
-def fetch_tagging_history():
-    conn = get_database_connection()
-    tag_scans = get_all_tag_scans(conn)
-    conn.close()
-    tag_scans = [
-        [
-            t.id,
-            parse_iso_date(t.start_time),
-            parse_iso_date(t.end_time),
-            isodate_minutes_diff(t.end_time, t.start_time),
-            t.setter,
-            t.threshold,
-            t.image_files,
-            t.video_files,
-            t.other_files,
-            t.video_frames,
-            t.total_frames,
-            t.errors,
-            t.timeouts,
-            t.total_remaining,
-        ]
-        for t in tag_scans
-    ]
-    return gr.Dataset(samples=tag_scans)
-
-
 def fetch_all_history():
     return fetch_scan_history(), fetch_tagging_history()
-
-
-def create_scan_dataset(samples=[]):
-    print(samples)
-    scan_history = gr.Dataset(
-        label="File Scan History",
-        type="index",
-        samples_per_page=25,
-        samples=samples,
-        headers=[
-            "ID",
-            "Start Time",
-            "End Time",
-            "Duration (m)",
-            "Path",
-            "Total Available",
-            "Marked Unavailable",
-            "Errors",
-            "New Items",
-            "New Files",
-            "Unchanged Files",
-            "Modified Files",
-        ],
-        components=[
-            "number",
-            "textbox",
-            "textbox",
-            "number",
-            "textbox",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-        ],
-        scale=1,
-    )
-    return scan_history
-
-
-def create_job_dataset(samples=[]):
-    tagging_history = gr.Dataset(
-        label="Tagging History",
-        type="index",
-        samples_per_page=25,
-        samples=samples,
-        headers=[
-            "ID",
-            "Start Time",
-            "End Time",
-            "Duration (m)",
-            "Tag Model",
-            "Threshold",
-            "Image Files",
-            "Video Files",
-            "Other Files",
-            "Video Frames",
-            "Total Frames",
-            "Errors",
-            "Timeouts",
-            "Remaining Untagged",
-        ],
-        components=[
-            "number",
-            "textbox",
-            "textbox",
-            "number",
-            "textbox",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-        ],
-        scale=1,
-    )
-    return tagging_history
-
-
-def extractor_job_UI(
-    model_type: Type[models.ModelOpts],
-    report_state: gr.State,
-):
-    def run_job(batch: int, chosen_model: List[str]):
-        report_string = ""
-        for model_name in chosen_model:
-            extractor_model = model_type(
-                batch_size=batch, model_name=model_name
-            )
-            report_string += run_model_job(extractor_model)
-        return report_string
-
-    def delete_data(chosen_model: List[str]):
-        report_string = ""
-        for model_name in chosen_model:
-            extractor_model = model_type(model_name=model_name)
-            report_string += delete_model_data(extractor_model)
-        return report_string
-
-    with gr.TabItem(label=model_type.name()) as extractor_tab:
-        gr.Markdown(
-            f"""
-            ## {model_type.name()} Extraction Job
-            ### {model_type.description()}
-
-            This will run the {model_type.name()} extractor on the database.
-            The extractor will process all items in the database that have not been processed by the selected model yet.
-            Data will be extracted from the items and indexed in the database for search and retrieval.
-            """
-        )
-        with gr.Row():
-            with gr.Group():
-                model_choice = gr.Dropdown(
-                    label="Model(s) to Use",
-                    multiselect=True,
-                    value=[
-                        model_type.default_model(),
-                    ],
-                    choices=[
-                        (name, name) for name in model_type.available_models()
-                    ],
-                )
-                batch_size = gr.Slider(
-                    label="Batch Size",
-                    minimum=1,
-                    maximum=128,
-                    value=model_type.default_batch_size(),
-                )
-        with gr.Row():
-            run_button = gr.Button("Run Batch Job")
-            delete_button = gr.Button(
-                "Delete All Data Extracted by Selected Model(s)"
-            )
-
-    run_button.click(
-        fn=run_job,
-        inputs=[batch_size, model_choice],
-        outputs=[report_state],
-    )
-    delete_button.click(
-        fn=delete_data,
-        inputs=[model_choice],
-        outputs=[report_state],
-    )
-
-
-def create_extractor_UI(
-    report_state: gr.State,
-):
-    with gr.Row():
-        with gr.Tabs():
-            extractor_job_UI(models.TagsModel, report_state)
-            extractor_job_UI(models.OCRModel, report_state)
-            extractor_job_UI(models.WhisperSTTModel, report_state)
-            extractor_job_UI(models.ImageEmbeddingModel, report_state)
 
 
 def report_state_change(report_state: str):
@@ -513,35 +208,3 @@ def create_scan_UI():
             inputs=[report_state],
             outputs=[report_textbox, scan_history, tagging_history],
         )
-
-        # regenerate_tags_button.click(
-        #     fn=regenerate_tags,
-        #     inputs=[model_choice],
-        #     outputs=[results, scan_history, tagging_history],
-        #     api_name="regenerate_tags",
-        # )
-
-        # delete_tags_button.click(
-        #     fn=delete_tags,
-        #     inputs=[model_choice],
-        #     outputs=[results, scan_history, tagging_history],
-        #     api_name="delete_tags",
-        # )
-
-        # generate_embeds_button.click(
-        #     fn=generate_embeds,
-        #     outputs=[results, scan_history, tagging_history],
-        #     api_name="generate_embeds",
-        # )
-
-        # extract_text_ocr.click(
-        #     fn=run_ocr,
-        #     outputs=[results, scan_history, tagging_history],
-        #     api_name="run_ocr",
-        # )
-
-        # extract_whisper.click(
-        #     fn=run_whisper,
-        #     outputs=[results, scan_history, tagging_history],
-        #     api_name="run_whisper",
-        # )
