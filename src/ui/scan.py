@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from calendar import c
 from datetime import datetime
 from typing import List, Type
 
 import gradio as gr
 
-import run
 import src.data_extractors.models as models
 from src.data_extractors.utils import get_chromadb_client
 from src.db import (
@@ -149,10 +149,11 @@ def delete_model_data(model_opt: models.ModelOpts):
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute("BEGIN")
-    model_opt.delete_extracted_data(conn, cdb)
+    report_str = model_opt.delete_extracted_data(conn, cdb)
     conn.commit()
     vacuum_database(conn)
     conn.close()
+    return report_str
 
 
 def regenerate_tags(
@@ -334,18 +335,25 @@ def create_job_dataset(samples=[]):
     return tagging_history
 
 
-def extractor_job_UI(model_type: Type[models.ModelOpts]):
+def extractor_job_UI(
+    model_type: Type[models.ModelOpts],
+    report_state: gr.State,
+):
     def run_job(batch: int, chosen_model: List[str]):
+        report_string = ""
         for model_name in chosen_model:
             extractor_model = model_type(
                 batch_size=batch, model_name=model_name
             )
-            run_model_job(extractor_model)
+            report_string += run_model_job(extractor_model)
+        return report_string
 
     def delete_data(chosen_model: List[str]):
+        report_string = ""
         for model_name in chosen_model:
             extractor_model = model_type(model_name=model_name)
-            delete_model_data(extractor_model)
+            report_string += delete_model_data(extractor_model)
+        return report_string
 
     with gr.TabItem(label=model_type.name()) as extractor_tab:
         gr.Markdown(
@@ -358,23 +366,24 @@ def extractor_job_UI(model_type: Type[models.ModelOpts]):
             Data will be extracted from the items and indexed in the database for search and retrieval.
             """
         )
-        with gr.Group():
-            model_choice = gr.Dropdown(
-                label="Model(s) to Use",
-                multiselect=True,
-                value=[
-                    model_type.default_model(),
-                ],
-                choices=[
-                    (name, name) for name in model_type.available_models()
-                ],
-            )
-            batch_size = gr.Slider(
-                label="Batch Size",
-                minimum=1,
-                maximum=128,
-                value=model_type.default_batch_size(),
-            )
+        with gr.Row():
+            with gr.Group():
+                model_choice = gr.Dropdown(
+                    label="Model(s) to Use",
+                    multiselect=True,
+                    value=[
+                        model_type.default_model(),
+                    ],
+                    choices=[
+                        (name, name) for name in model_type.available_models()
+                    ],
+                )
+                batch_size = gr.Slider(
+                    label="Batch Size",
+                    minimum=1,
+                    maximum=128,
+                    value=model_type.default_batch_size(),
+                )
         with gr.Row():
             run_button = gr.Button("Run Batch Job")
             delete_button = gr.Button(
@@ -384,23 +393,32 @@ def extractor_job_UI(model_type: Type[models.ModelOpts]):
     run_button.click(
         fn=run_job,
         inputs=[batch_size, model_choice],
+        outputs=[report_state],
     )
     delete_button.click(
         fn=delete_data,
         inputs=[model_choice],
+        outputs=[report_state],
     )
 
 
-def create_extractor_UI():
+def create_extractor_UI(
+    report_state: gr.State,
+):
     with gr.Row():
         with gr.Tabs():
-            extractor_job_UI(models.TagsModel)
-            extractor_job_UI(models.OCRModel)
-            extractor_job_UI(models.WhisperSTTModel)
-            extractor_job_UI(models.ImageEmbeddingModel)
+            extractor_job_UI(models.TagsModel, report_state)
+            extractor_job_UI(models.OCRModel, report_state)
+            extractor_job_UI(models.WhisperSTTModel, report_state)
+            extractor_job_UI(models.ImageEmbeddingModel, report_state)
+
+
+def report_state_change(report_state: str):
+    return report_state, fetch_scan_history(), fetch_tagging_history()
 
 
 def create_scan_UI():
+    report_state = gr.State(value="")
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -419,48 +437,20 @@ def create_scan_UI():
             with gr.Row():
                 with gr.Column():
                     with gr.Row():
+                        delete_unavailable_files = gr.Checkbox(
+                            label="Remove files from the database if they are no longer found on the filesystem",
+                            value=True,
+                            interactive=True,
+                        )
+                    with gr.Row():
                         update_button = gr.Button(
                             "Update Directory Lists and Scan New Entries"
                         )
                         scan_button = gr.Button("Rescan all Directories")
                 with gr.Column():
-                    delete_unavailable_files = gr.Checkbox(
-                        label="Remove files from the database if they are no longer found on the filesystem",
-                        value=True,
-                        interactive=True,
-                    )
+                    pass
             with gr.Row():
-                with gr.Column():
-                    model_choice = gr.Dropdown(
-                        label="Tagging Model(s) to Use",
-                        multiselect=True,
-                        value=[
-                            models.TagsModel.default_model(),
-                        ],
-                        choices=[
-                            (name, name)
-                            for name in models.TagsModel.available_models()
-                        ],
-                    )
-                    with gr.Row():
-                        regenerate_tags_button = gr.Button(
-                            "Generate Tags for Files Missing Tags"
-                        )
-                        delete_tags_button = gr.Button(
-                            "Delete ALL Tags set by selected Model(s)"
-                        )
-                    with gr.Row():
-                        generate_embeds_button = gr.Button(
-                            "Generate Embeddings for Items Missing Embeddings"
-                        )
-                    with gr.Row():
-                        extract_text_ocr = gr.Button(
-                            "Use OCR to Extract Text from Images and Videos"
-                        )
-                    with gr.Row():
-                        extract_whisper = gr.Button(
-                            "Use Whisper STT to extract text from videos"
-                        )
+                create_extractor_UI(report_state)
                 with gr.Column():
                     gr.Markdown(
                         """
@@ -477,7 +467,7 @@ def create_scan_UI():
                         """
                     )
             with gr.Row():
-                results = gr.Textbox(
+                report_textbox = gr.Textbox(
                     label="Scan Report", interactive=False, lines=8, value=""
                 )
 
@@ -502,7 +492,7 @@ def create_scan_UI():
                 delete_unavailable_files,
             ],
             outputs=[
-                results,
+                report_textbox,
                 included_directory_list,
                 excluded_directory_list,
                 scan_history,
@@ -514,38 +504,44 @@ def create_scan_UI():
         scan_button.click(
             fn=rescan_folders,
             inputs=[delete_unavailable_files],
-            outputs=[results, scan_history, tagging_history],
+            outputs=[report_textbox, scan_history, tagging_history],
             api_name="rescan_folders",
         )
 
-        regenerate_tags_button.click(
-            fn=regenerate_tags,
-            inputs=[model_choice],
-            outputs=[results, scan_history, tagging_history],
-            api_name="regenerate_tags",
+        report_state.change(
+            fn=report_state_change,
+            inputs=[report_state],
+            outputs=[report_textbox, scan_history, tagging_history],
         )
 
-        delete_tags_button.click(
-            fn=delete_tags,
-            inputs=[model_choice],
-            outputs=[results, scan_history, tagging_history],
-            api_name="delete_tags",
-        )
+        # regenerate_tags_button.click(
+        #     fn=regenerate_tags,
+        #     inputs=[model_choice],
+        #     outputs=[results, scan_history, tagging_history],
+        #     api_name="regenerate_tags",
+        # )
 
-        generate_embeds_button.click(
-            fn=generate_embeds,
-            outputs=[results, scan_history, tagging_history],
-            api_name="generate_embeds",
-        )
+        # delete_tags_button.click(
+        #     fn=delete_tags,
+        #     inputs=[model_choice],
+        #     outputs=[results, scan_history, tagging_history],
+        #     api_name="delete_tags",
+        # )
 
-        extract_text_ocr.click(
-            fn=run_ocr,
-            outputs=[results, scan_history, tagging_history],
-            api_name="run_ocr",
-        )
+        # generate_embeds_button.click(
+        #     fn=generate_embeds,
+        #     outputs=[results, scan_history, tagging_history],
+        #     api_name="generate_embeds",
+        # )
 
-        extract_whisper.click(
-            fn=run_whisper,
-            outputs=[results, scan_history, tagging_history],
-            api_name="run_whisper",
-        )
+        # extract_text_ocr.click(
+        #     fn=run_ocr,
+        #     outputs=[results, scan_history, tagging_history],
+        #     api_name="run_ocr",
+        # )
+
+        # extract_whisper.click(
+        #     fn=run_whisper,
+        #     outputs=[results, scan_history, tagging_history],
+        #     api_name="run_whisper",
+        # )

@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Tuple
 
 from chromadb.api import ClientAPI
 
+from src.db import delete_tags_from_setter
+
 
 class ModelOpts:
     _batch_size: int
@@ -66,7 +68,9 @@ class ModelOpts:
     def _init(self, model_name: str):
         raise NotImplementedError
 
-    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def delete_extracted_data(
+        self, conn: sqlite3.Connection, cdb: ClientAPI
+    ) -> str:
         raise NotImplementedError
 
 
@@ -133,6 +137,12 @@ class TagsModel(ModelOpts):
     # Own methods
     def model_repo(self) -> str:
         return self._model_repo
+
+    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        tags_removed, items_tags_removed = delete_tags_from_setter(
+            conn, self.setter_id()
+        )
+        return f"Removed {tags_removed} tags from {items_tags_removed} items tagged by model {self.setter_id()}.\n"
 
 
 class OCRModel(ModelOpts):
