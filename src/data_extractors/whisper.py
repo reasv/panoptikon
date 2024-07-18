@@ -1,6 +1,4 @@
-import json
 import sqlite3
-import subprocess
 from typing import List, Sequence
 
 import numpy as np
@@ -9,7 +7,7 @@ import whisperx
 from chromadb.api import ClientAPI
 from whisperx.types import TranscriptionResult
 
-from src.data_extractors.audio import load_audio
+from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extractor_job import run_extractor_job
 from src.data_extractors.models import WhisperSTTModel
 from src.data_extractors.text_embeddings import add_item_text

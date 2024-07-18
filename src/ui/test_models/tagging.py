@@ -97,7 +97,7 @@ def create_wd_tagger_UI():
         character_thresh,
         character_mcut_enabled,
     ):
-        from src.data_extractors.wd_tagger import Predictor
+        from src.data_extractors.ai.wd_tagger import Predictor
 
         nonlocal predictor
         if predictor is None:

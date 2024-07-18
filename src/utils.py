@@ -5,7 +5,7 @@ import platform
 import subprocess
 from datetime import datetime
 
-from src.data_extractors.video import video_to_frames
+from src.data_extractors.data_loaders.video import video_to_frames
 
 mimetypes.add_type("image/webp", ".webp")
 from PIL import Image, ImageDraw, ImageFont

@@ -6,9 +6,9 @@ import chromadb.api
 import numpy as np
 from chromadb.api import ClientAPI
 
-from src.data_extractors.clip import CLIPEmbedder
+from src.data_extractors.ai.clip import CLIPEmbedder
+from src.data_extractors.data_loaders.images import item_image_extractor_np
 from src.data_extractors.extractor_job import run_extractor_job
-from src.data_extractors.images import item_image_extractor_np
 from src.data_extractors.models import ImageEmbeddingModel
 from src.data_extractors.utils import query_result_to_file_search_result
 from src.types import ItemWithPath
@@ -70,16 +70,45 @@ def get_image_embeddings_collection(
     return collection
 
 
+def add_item_image_embeddings(
+    cdb: ClientAPI,
+    model_opt: ImageEmbeddingModel,
+    item: ItemWithPath,
+    inputs: Sequence[np.ndarray],
+    embeddings: List[np.ndarray],
+):
+    collection = get_image_embeddings_collection(cdb)
+    embeddings_list = [embedding.tolist() for embedding in embeddings]
+    collection.add(
+        ids=[
+            f"{item.sha256}-{i}-{model_opt.setter_id()}"
+            for i, _ in enumerate(embeddings)
+        ],
+        embeddings=embeddings_list,
+        images=list(inputs),
+        metadatas=(
+            [
+                {
+                    "item": item.sha256,
+                    "setter": model_opt.setter_id(),
+                    "type": item.type,
+                    "general_type": item.type.split("/")[0],
+                }
+                for _ in embeddings
+            ]
+        ),
+    )
+
+
 def run_image_embedding_extractor_job(
     conn: sqlite3.Connection, cdb: ClientAPI, model_opt: ImageEmbeddingModel
 ):
     embedder = CLIPEmbedder(
         model_name=model_opt.model_name(),
         pretrained=model_opt.model_checkpoint(),
-        batch_size=64,
+        batch_size=model_opt.batch_size(),
     )
     embedder.load_model()
-    collection = get_image_embeddings_collection(cdb)
 
     def process_batch(batch: Sequence[np.ndarray]):
         return embedder.get_image_embeddings(batch)
@@ -90,26 +119,7 @@ def run_image_embedding_extractor_job(
         embeddings: Sequence[np.ndarray],
     ):
         embeddings_list = [embedding.tolist() for embedding in embeddings]
-        collection.add(
-            ids=[
-                f"{item.sha256}-{i}-{model_opt.setter_id()}"
-                for i, _ in enumerate(embeddings)
-            ],
-            embeddings=embeddings_list,
-            images=list(inputs),
-            metadatas=(
-                [
-                    {
-                        "item": item.sha256,
-                        "setter": model_opt.setter_id(),
-                        "model": model_opt.model_name(),
-                        "type": item.type,
-                        "general_type": item.type.split("/")[0],
-                    }
-                    for _ in embeddings
-                ]
-            ),
-        )
+        add_item_image_embeddings(cdb, model_opt, item, inputs, embeddings_list)
 
     return run_extractor_job(
         conn,

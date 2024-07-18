@@ -94,7 +94,7 @@ def create_CLIP_ui():
         if text_query == "":
             return get_images(folder_path)
         if clip is None:
-            from src.data_extractors.clip import CLIPEmbedder
+            from src.data_extractors.ai.clip import CLIPEmbedder
 
             clip = CLIPEmbedder()
             clip.load_model()

@@ -5,7 +5,7 @@ from doctr.io.html import read_html
 from doctr.io.pdf import read_pdf
 from PIL import Image as PILImage
 
-from src.data_extractors.video import video_to_frames
+from src.data_extractors.data_loaders.video import video_to_frames
 from src.types import ItemWithPath
 from src.utils import make_video_thumbnails, pil_ensure_rgb
 
