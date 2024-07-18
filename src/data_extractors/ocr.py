@@ -4,7 +4,6 @@ from typing import List, Sequence
 import numpy as np
 import torch
 from chromadb.api import ClientAPI
-from cv2 import add
 from doctr.models import ocr_predictor
 
 from src.data_extractors.extractor_job import run_extractor_job
