@@ -6,7 +6,7 @@ import torch
 from chromadb.api import ClientAPI
 from doctr.models import ocr_predictor
 
-from src.data_extractors.data_loaders.images import item_image_extractor_np
+from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extractor_jobs import run_extractor_job
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
@@ -58,7 +58,7 @@ def run_ocr_extractor_job(
         conn,
         model_opt.setter_id(),
         model_opt.batch_size(),
-        item_image_extractor_np,
+        item_image_loader_numpy,
         process_batch,
         handle_item_result,
     )

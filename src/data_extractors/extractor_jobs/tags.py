@@ -6,7 +6,7 @@ from typing import Dict, List, Sequence, Tuple
 import PIL.Image
 
 from src.data_extractors.ai.wd_tagger import Predictor
-from src.data_extractors.data_loaders.images import item_image_extractor_pil
+from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extractor_jobs import run_extractor_job
 from src.data_extractors.models import TaggerModel
 from src.data_extractors.utils import get_threshold_from_env
@@ -120,7 +120,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TaggerModel):
         conn,
         model.setter_id(),
         model.batch_size(),
-        item_image_extractor_pil,
+        item_image_loader_pillow,
         batch_inference_func,
         handle_result,
     )

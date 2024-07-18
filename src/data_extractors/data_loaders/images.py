@@ -10,7 +10,7 @@ from src.types import ItemWithPath
 from src.utils import make_video_thumbnails, pil_ensure_rgb
 
 
-def item_image_extractor_np(item: ItemWithPath) -> List[np.ndarray]:
+def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
     if item.type.startswith("image"):
         return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
     if item.type.startswith("video"):
@@ -24,7 +24,7 @@ def item_image_extractor_np(item: ItemWithPath) -> List[np.ndarray]:
     return []
 
 
-def item_image_extractor_pil(item: ItemWithPath) -> List[PILImage.Image]:
+def item_image_loader_pillow(item: ItemWithPath) -> List[PILImage.Image]:
     if item.type.startswith("image"):
         return [PILImage.open(item.path)]
     if item.type.startswith("video"):

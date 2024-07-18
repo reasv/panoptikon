@@ -7,7 +7,7 @@ import numpy as np
 from chromadb.api import ClientAPI
 
 from src.data_extractors.ai.clip import CLIPEmbedder
-from src.data_extractors.data_loaders.images import item_image_extractor_np
+from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extractor_jobs import run_extractor_job
 from src.data_extractors.models import ImageEmbeddingModel
 from src.data_extractors.utils import query_result_to_file_search_result
