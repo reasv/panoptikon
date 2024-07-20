@@ -127,6 +127,17 @@ def create_scan_UI():
             with gr.Row():
                 with gr.Column():
                     with gr.Row():
+                        gr.Markdown(
+                            """
+                        ## Notes
+                        The directory lists are newline-separated lists of directories to include or exclude. The directories must be absolute paths. The included directories will be scanned for files, and the excluded directories will have their files excluded/removed from the database.
+                        
+                        The 'Update Directory Lists and Scan New Entries' button will update the directory lists and only scan newly included directories.
+                        
+                        The 'Rescan all Directories' button will rescan all directories. But it will not apply changes to the directory lists or generate tags.                      
+                        """
+                        )
+                    with gr.Row():
                         delete_unavailable_files = gr.Checkbox(
                             label="Remove files from the database if they are no longer found on the filesystem",
                             value=True,
@@ -148,20 +159,7 @@ def create_scan_UI():
             with gr.Row():
                 create_extractor_UI()
                 with gr.Column():
-                    gr.Markdown(
-                        """
-                        ## Notes
-                        The directory lists are newline-separated lists of directories to include or exclude. The directories must be absolute paths. The included directories will be scanned for files, and the excluded directories will have their files excluded/removed from the database.
-                        
-                        The 'Update Directory Lists and Scan New Entries' button will update the directory lists, scan newly included directories, and generate tags for files that don't have them.
-                        
-                        The 'Rescan all Directories' button will rescan all directories. But it will not update the directory lists or generate tags.
-
-                        The 'Generate Tags for Files Missing Tags' button will generate tags for all items that don't have tags set by the selected model(s).
-
-                        The 'Delete ALL Tags set by selected Model(s)' button will delete all tags set by the selected model(s) for all items from the database.                        
-                        """
-                    )
+                    pass
 
             with gr.Row():
                 with gr.Tabs():
