@@ -2,7 +2,8 @@ import json
 import subprocess
 
 import numpy as np
-from whisperx.audio import SAMPLE_RATE
+
+SAMPLE_RATE = 16000
 
 
 def format_ffmpeg_error(error: str) -> str:
