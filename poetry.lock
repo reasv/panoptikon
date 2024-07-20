@@ -1231,13 +1231,13 @@ standard = ["fastapi", "uvicorn[standard] (>=0.15.0)"]
 
 [[package]]
 name = "faster-whisper"
-version = "1.0.1"
+version = "1.0.0"
 description = "Faster Whisper transcription with CTranslate2"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "faster-whisper-1.0.1.tar.gz", hash = "sha256:d20d3b4fdf2a8f9aa001fba486b9951a7c6716bf1796e10737a1d5582c0640f5"},
-    {file = "faster_whisper-1.0.1-py3-none-any.whl", hash = "sha256:7803bf7abcaae0376158d7b064ba927d44b6ce1fa9f6250d6d13038354d1d01a"},
+    {file = "faster-whisper-1.0.0.tar.gz", hash = "sha256:38db6fcfbd4ce1bf5027fbb4310ef8ed4d2f0b37674b1f2d833e172c352c89d7"},
+    {file = "faster_whisper-1.0.0-py3-none-any.whl", hash = "sha256:96f6f957abb594fa393179b49b7ba0e3241195fc39e07b252574b057f61f8d74"},
 ]
 
 [package.dependencies]
@@ -2426,13 +2426,13 @@ test = ["click (==8.1.7)", "cloudpickle (>=1.3,<3.0)", "coverage (==7.3.1)", "fa
 
 [[package]]
 name = "lightning-utilities"
-version = "0.11.3.post0"
+version = "0.11.5"
 description = "Lightning toolbox for across the our ecosystem."
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "lightning_utilities-0.11.3.post0-py3-none-any.whl", hash = "sha256:2aec1d067e5ab61a8978f879998850a97f9a3764ee54aade329552706b0d189b"},
-    {file = "lightning_utilities-0.11.3.post0.tar.gz", hash = "sha256:7485fad0e3c5607a6bde4507935689c553a2c91325de2127b4bb8171a601e236"},
+    {file = "lightning_utilities-0.11.5-py3-none-any.whl", hash = "sha256:ab2117cc926a9e3757919e25a0da574badb1c0f04fc931849235731b78016a8d"},
+    {file = "lightning_utilities-0.11.5.tar.gz", hash = "sha256:a96bee6d8b3df18b7c1a8dec83b2adb03dca6ca0ce3ae9fd355eb0922c4e5e07"},
 ]
 
 [package.dependencies]
@@ -7099,17 +7099,15 @@ files = [
 
 [[package]]
 name = "whisperx"
-version = "3.1.5"
+version = "3.1.1"
 description = "Time-Accurate Automatic Speech Recognition using Whisper."
 optional = false
 python-versions = ">=3.8"
-files = [
-    {file = "whisperx-3.1.5-py3-none-any.whl", hash = "sha256:f99e36c2cdeef3a4c8d0f6006c792f78e47368166625f5b237f67fe8ec973995"},
-    {file = "whisperx-3.1.5.tar.gz", hash = "sha256:84943b9d486ccd5c8e171fac54d6547b046fe79bb1ac034d79988917146892a1"},
-]
+files = []
+develop = false
 
 [package.dependencies]
-faster-whisper = "1.0.1"
+faster-whisper = "1.0.0"
 nltk = "*"
 pandas = "*"
 "pyannote.audio" = "3.1.1"
@@ -7120,6 +7118,12 @@ transformers = "*"
 
 [package.extras]
 dev = ["pytest"]
+
+[package.source]
+type = "git"
+url = "https://github.com/m-bain/whisperx.git"
+reference = "HEAD"
+resolved_reference = "58f00339af7dcc9705ef49d97a1f40764b7cf555"
 
 [[package]]
 name = "wrapt"
@@ -7394,4 +7398,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "e52353a4708c0958637973824c7af75900bdc5c2b747eb16be9ed297c7c4113d"
+content-hash = "338122b2d3854271ff2bdaba7e53cf88bd295c4cbe3c44aafce2a157c5c21bf1"
