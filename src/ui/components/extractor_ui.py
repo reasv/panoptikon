@@ -15,7 +15,6 @@ def run_model_job(model_opt: models.ModelOpts):
     cursor.execute("BEGIN")
     images, videos, failed = model_opt.run_extractor(conn, cdb)
     conn.commit()
-    vacuum_database(conn)
     failed_str = "\n".join(failed)
     report_str = f"""
     Extraction completed for model {model_opt}.
