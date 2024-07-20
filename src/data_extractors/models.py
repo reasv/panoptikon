@@ -283,7 +283,7 @@ class WhisperSTTModel(ModelOpts):
 
     @classmethod
     def default_batch_size(cls) -> int:
-        return 8
+        return 1
 
     @classmethod
     def default_model(cls) -> str:

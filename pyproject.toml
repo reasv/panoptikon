@@ -25,7 +25,7 @@ torchaudio = {version = "^2.3.1+cu121", source = "pytorch_cuda"}
 python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
 python-dotenv = "^1.0.1"
-whisperx = {git = "https://github.com/m-bain/whisperx.git"}
+faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
 
 [[tool.poetry.source]]
 name = "pytorch_cuda"

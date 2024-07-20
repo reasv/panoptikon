@@ -1,11 +1,12 @@
 import sqlite3
-from typing import List, Sequence
+from ast import mod
+from typing import Iterable, List, Sequence, Tuple
 
+import faster_whisper
 import numpy as np
 import torch
-import whisperx
 from chromadb.api import ClientAPI
-from whisperx.types import TranscriptionResult
+from faster_whisper.transcribe import Segment, TranscriptionInfo
 
 from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extractor_jobs import run_extractor_job
@@ -25,7 +26,13 @@ def run_whisper_extractor_job(
     if torch.cuda.is_available():
         device = "cuda"
 
-    whisper_model = whisperx.load_model(model_opts.model_repo(), device=device)
+    whisper_model = faster_whisper.WhisperModel(
+        model_opts.model_repo(), device=device, compute_type="float16"
+    )
+    if model_opts.batch_size() > 1:
+        whisper_model = faster_whisper.BatchedInferencePipeline(
+            model=whisper_model, batch_size=model_opts.batch_size()
+        )
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -36,27 +43,36 @@ def run_whisper_extractor_job(
             return [audio] if audio is not None else []
         return []
 
-    def process_batch(batch: Sequence[np.ndarray]) -> List[TranscriptionResult]:
-        outputs: List[TranscriptionResult] = []
+    def process_batch(batch: Sequence[np.ndarray]) -> List[
+        Tuple[
+            Iterable[Segment],
+            TranscriptionInfo,
+        ]
+    ]:
+        outputs: List[
+            Tuple[
+                Iterable[Segment],
+                TranscriptionInfo,
+            ]
+        ] = []
         for audio in batch:
-            outputs.append(
-                whisper_model.transcribe(
-                    audio=audio, batch_size=model_opts.batch_size()
-                )
-            )
+            outputs.append(whisper_model.transcribe(audio=audio))
         return outputs
 
     def handle_item_result(
         item: ItemWithPath,
         _: Sequence[np.ndarray],
-        outputs: Sequence[TranscriptionResult],
+        outputs: Sequence[
+            Tuple[
+                Iterable[Segment],
+                TranscriptionInfo,
+            ]
+        ],
     ):
         if len(outputs) == 0:
             return
-        transcriptionResult = outputs[0]  # Only one output per item
-        merged_text = "\n".join(
-            [segment["text"] for segment in transcriptionResult["segments"]]
-        )
+        segments, info = outputs[0]  # Only one output per item
+        merged_text = "\n".join([segment.text for segment in segments])
 
         merged_text = merged_text.strip()
 
@@ -64,7 +80,7 @@ def run_whisper_extractor_job(
             cdb,
             item,
             model_opts,
-            transcriptionResult["language"],
+            info.language,
             merged_text,
         )
 
