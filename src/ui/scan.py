@@ -113,7 +113,6 @@ def report_state_change(report_state: str):
 
 
 def create_scan_UI():
-    report_state = gr.State(value="")
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -143,9 +142,15 @@ def create_scan_UI():
                         )
                         scan_button = gr.Button("Rescan all Directories")
                 with gr.Column():
-                    pass
+                    with gr.Row():
+                        report_textbox = gr.Textbox(
+                            label="Scan Report",
+                            interactive=False,
+                            lines=8,
+                            value="",
+                        )
             with gr.Row():
-                create_extractor_UI(report_state)
+                create_extractor_UI()
                 with gr.Column():
                     gr.Markdown(
                         """
@@ -161,16 +166,14 @@ def create_scan_UI():
                         The 'Delete ALL Tags set by selected Model(s)' button will delete all tags set by the selected model(s) for all items from the database.                        
                         """
                     )
-            with gr.Row():
-                report_textbox = gr.Textbox(
-                    label="Scan Report", interactive=False, lines=8, value=""
-                )
 
             with gr.Row():
                 with gr.Tabs():
                     with gr.TabItem(label="Scan History"):
                         scan_history = create_scan_dataset()
-                    with gr.TabItem(label="Tagging History"):
+                    with gr.TabItem(
+                        label="Data Extraction History"
+                    ) as extractor_tab:
                         tagging_history = create_job_dataset()
 
         scan_tab.select(
@@ -203,8 +206,8 @@ def create_scan_UI():
             api_name="rescan_folders",
         )
 
-        report_state.change(
-            fn=report_state_change,
-            inputs=[report_state],
-            outputs=[report_textbox, scan_history, tagging_history],
+        extractor_tab.select(
+            fn=fetch_all_history,
+            outputs=[scan_history, tagging_history],
+            api_name="fetch_history",
         )

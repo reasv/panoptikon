@@ -71,7 +71,6 @@ def delete_model_data(model_opt: models.ModelOpts):
 
 def extractor_job_UI(
     model_type: Type[models.ModelOpts],
-    report_state: gr.State,
 ):
     def run_job(batch: int, chosen_model: List[str]):
         report_string = ""
@@ -141,12 +140,10 @@ def extractor_job_UI(
     )
 
 
-def create_extractor_UI(
-    report_state: gr.State,
-):
+def create_extractor_UI():
     with gr.Row():
         with gr.Tabs():
-            extractor_job_UI(models.TagsModel, report_state)
-            extractor_job_UI(models.OCRModel, report_state)
-            extractor_job_UI(models.WhisperSTTModel, report_state)
-            extractor_job_UI(models.ImageEmbeddingModel, report_state)
+            extractor_job_UI(models.TagsModel)
+            extractor_job_UI(models.OCRModel)
+            extractor_job_UI(models.WhisperSTTModel)
+            extractor_job_UI(models.ImageEmbeddingModel)
