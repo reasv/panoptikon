@@ -115,13 +115,13 @@ def create_scan_UI():
                 included_directory_list = gr.Textbox(
                     label="Include Directories",
                     value=get_folders,
-                    lines=20,
+                    lines=15,
                     interactive=True,
                 )
                 excluded_directory_list = gr.Textbox(
                     label="Exclude Directories",
                     value=get_excluded_folders,
-                    lines=20,
+                    lines=15,
                     interactive=True,
                 )
             with gr.Row():
