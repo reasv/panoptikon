@@ -1,3 +1,4 @@
+import datetime
 from typing import List, Type
 
 import gradio as gr
@@ -7,22 +8,50 @@ from src.data_extractors.utils import get_chromadb_client
 from src.db import get_database_connection, vacuum_database
 
 
-def run_model_job(model_opt: models.ModelOpts):
+def shorten_path(path: str, max_length=75) -> str:
+    return ("..." + path[-max_length:]) if len(path) > max_length else path
+
+
+def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
     print(f"Running job for model {model_opt}")
     conn = get_database_connection()
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute("BEGIN")
-    images, videos, failed = model_opt.run_extractor(conn, cdb)
+    failed, images, videos, other, units = [], 0, 0, 0, 0
+    start_time = datetime.datetime.now()
+    for progress in model_opt.run_extractor(conn, cdb):
+        if type(progress) == models.ExtractorJobProgress:
+            # Job is in progress
+            progress_tracker(
+                (progress.processed_items, progress.total_items),
+                desc=(
+                    f"ETA: {progress.eta_string} | "
+                    + f"Last Item: {shorten_path(progress.item.path)}"
+                ),
+                unit="files",
+            )
+        elif type(progress) == models.ExtractorJobReport:
+            # Job is complete
+            images = progress.images
+            videos = progress.videos
+            failed = progress.failed_paths
+            other = progress.other
+            units = progress.units
+
+    end_time = datetime.datetime.now()
+    total_time = end_time - start_time
+    total_time_pretty = str(total_time).split(".")[0]
     conn.commit()
     failed_str = "\n".join(failed)
     report_str = f"""
-    Extraction completed for model {model_opt}.
-    Successfully processed {images} images and {videos} videos.
+    Extraction completed for model {model_opt} in {total_time_pretty}.
+    Successfully processed {images} images and {videos} videos, and {other} other file types.
+    The model processed a total of {units} individual pieces of data.
     {len(failed)} files failed to process due to errors.
-    Failed files:
-    {failed_str}
     """
+    if len(failed) > 0:
+        report_str += f"\nFailed files:\n{failed_str}"
     conn.close()
     return report_str
 
@@ -71,8 +100,9 @@ def extractor_job_UI(
             Data will be extracted from the items and indexed in the database for search and retrieval.
             """
         )
-        with gr.Row():
-            with gr.Group():
+
+        with gr.Group():
+            with gr.Row():
                 model_choice = gr.Dropdown(
                     label="Model(s) to Use",
                     multiselect=True,
@@ -94,16 +124,20 @@ def extractor_job_UI(
             delete_button = gr.Button(
                 "Delete All Data Extracted by Selected Model(s)"
             )
+        with gr.Row():
+            report_box = gr.Textbox(
+                label="Job Report", value="", lines=5, interactive=False
+            )
 
     run_button.click(
         fn=run_job,
         inputs=[batch_size, model_choice],
-        outputs=[report_state],
+        outputs=[report_box],
     )
     delete_button.click(
         fn=delete_data,
         inputs=[model_choice],
-        outputs=[report_state],
+        outputs=[report_box],
     )
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
+from tracemalloc import start
 from typing import (
     Any,
     Callable,
@@ -13,9 +15,33 @@ from typing import (
     TypeVar,
 )
 
+from matplotlib import units
+
 from src.db import add_item_tag_scan, add_tag_scan, get_items_missing_tag_scan
 from src.types import ItemWithPath
 from src.utils import estimate_eta
+
+
+@dataclass
+class ExtractorJobProgress:
+    start_time: datetime
+    processed_items: int
+    total_items: int
+    eta_string: str
+    item: ItemWithPath
+
+
+@dataclass
+class ExtractorJobReport:
+    start_time: datetime
+    end_time: datetime
+    images: int
+    videos: int
+    other: int
+    total: int
+    units: int
+    failed_paths: List[str]
+
 
 R = TypeVar("R")
 I = TypeVar("I")
@@ -34,6 +60,7 @@ def run_extractor_job(
     using the given batch inference function and item extractor.
     """
     scan_time = datetime.now().isoformat()
+    start_time = datetime.now()
     failed_items: Dict[str, ItemWithPath] = {}
     processed_items, videos, images, other, total_processed_units = (
         0,
@@ -90,10 +117,14 @@ def run_extractor_job(
         else:
             other += 1
         total_items = remaining + processed_items
+        eta_str = estimate_eta(scan_time, processed_items, remaining)
         print(
             f"{setter_name}: ({processed_items}/{total_items}) "
-            + f"(ETA: {estimate_eta(scan_time, processed_items, remaining)}) "
+            + f"(ETA: {eta_str}) "
             + f"Processed ({item.type}) {item.path}"
+        )
+        yield ExtractorJobProgress(
+            start_time, processed_items, total_items, eta_str, item
         )
 
     print(
@@ -126,7 +157,16 @@ def run_extractor_job(
     print("Added scan to database")
 
     failed_paths = [item.path for item in failed_items.values()]
-    return images, videos, failed_paths
+    yield ExtractorJobReport(
+        start_time=start_time,
+        end_time=datetime.now(),
+        images=images,
+        videos=videos,
+        other=other,
+        total=processed_items,
+        units=total_processed_units,
+        failed_paths=failed_paths,
+    )
 
 
 def batch_items(

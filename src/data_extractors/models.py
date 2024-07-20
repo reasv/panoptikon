@@ -1,8 +1,12 @@
 import sqlite3
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Generator, List, Tuple
 
 from chromadb.api import ClientAPI
 
+from src.data_extractors.extractor_jobs.extractor_job import (
+    ExtractorJobProgress,
+    ExtractorJobReport,
+)
 from src.db import delete_tags_from_setter
 
 
@@ -55,7 +59,9 @@ class ModelOpts:
     def model_type(self) -> str:
         raise NotImplementedError
 
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def run_extractor(
+        self, conn: sqlite3.Connection, cdb: ClientAPI
+    ) -> Generator[ExtractorJobProgress | ExtractorJobReport, Any, None]:
         raise NotImplementedError
 
     def setter_id(self) -> str:
