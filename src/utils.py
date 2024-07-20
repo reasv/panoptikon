@@ -207,7 +207,7 @@ def pil_pad_square(image: Image.Image) -> Image.Image:
     return canvas
 
 
-def parse_iso_date(date: str):
+def pretty_print_isodate(date: str):
     return datetime.fromisoformat(date).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -215,9 +215,15 @@ def isodate_to_epoch(date: str):
     return int(datetime.fromisoformat(date).timestamp())
 
 
-def isodate_minutes_diff(date1: str, date2: str):
+def isodate_minutes_diff(date1: str, date2: str) -> str:
     a, b = datetime.fromisoformat(date1), datetime.fromisoformat(date2)
-    return round(
-        ((a - b).total_seconds() / 60),
-        2,
-    )
+    total_seconds = abs((a - b).total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{int(hours)}h{int(minutes)}m"
+    elif minutes > 0:
+        return f"{int(minutes)}m{int(seconds)}s"
+    else:
+        return f"{int(seconds)}s"

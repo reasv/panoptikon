@@ -6,7 +6,7 @@ from src.db import (
     get_database_connection,
 )
 from src.files import parse_iso_date
-from src.utils import isodate_minutes_diff
+from src.utils import isodate_minutes_diff, pretty_print_isodate
 
 
 def create_scan_dataset(samples=[]):
@@ -19,7 +19,7 @@ def create_scan_dataset(samples=[]):
             "ID",
             "Start Time",
             "End Time",
-            "Duration (m)",
+            "Duration",
             "Path",
             "Total Available",
             "Marked Unavailable",
@@ -33,7 +33,7 @@ def create_scan_dataset(samples=[]):
             "number",
             "textbox",
             "textbox",
-            "number",
+            "textbox",
             "textbox",
             "number",
             "number",
@@ -58,7 +58,7 @@ def create_job_dataset(samples=[]):
             "ID",
             "Start Time",
             "End Time",
-            "Duration (m)",
+            "Duration",
             "Tag Model",
             "Threshold",
             "Image Files",
@@ -74,7 +74,7 @@ def create_job_dataset(samples=[]):
             "number",
             "textbox",
             "textbox",
-            "number",
+            "textbox",
             "textbox",
             "number",
             "number",
@@ -98,8 +98,8 @@ def fetch_scan_history():
     file_scans = [
         [
             f.id,
-            parse_iso_date(f.start_time),
-            parse_iso_date(f.end_time),
+            pretty_print_isodate(f.start_time),
+            pretty_print_isodate(f.end_time),
             isodate_minutes_diff(f.end_time, f.start_time),
             f.path,
             f.total_available,
@@ -123,8 +123,8 @@ def fetch_tagging_history():
     tag_scans = [
         [
             t.id,
-            parse_iso_date(t.start_time),
-            parse_iso_date(t.end_time),
+            pretty_print_isodate(t.start_time),
+            pretty_print_isodate(t.end_time),
             isodate_minutes_diff(t.end_time, t.start_time),
             t.setter,
             t.threshold,
