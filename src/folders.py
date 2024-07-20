@@ -9,8 +9,8 @@ from src.db import (
     delete_files_not_under_included_folders,
     delete_files_under_excluded_folders,
     delete_folders_not_in_list,
-    delete_item_tag_scans_without_items,
     delete_items_without_files,
+    delete_log_items_without_item,
     delete_tags_without_items,
     delete_unavailable_files,
     get_folders_from_database,
@@ -176,7 +176,7 @@ def update_folder_lists(
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     orphan_items_deleted = delete_items_without_files(conn)
     delete_tags_without_items(conn)
-    delete_item_tag_scans_without_items(conn)
+    delete_log_items_without_item(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,
@@ -205,7 +205,7 @@ def rescan_all_folders(
         unavailable_files_deleted = delete_unavailable_files(conn)
         orphan_items_deleted = delete_items_without_files(conn)
         delete_tags_without_items(conn)
-        delete_item_tag_scans_without_items(conn)
+        delete_log_items_without_item(conn)
     else:
         unavailable_files_deleted = 0
         orphan_items_deleted = 0

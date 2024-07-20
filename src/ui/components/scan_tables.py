@@ -1,8 +1,8 @@
 import gradio as gr
 
 from src.db import (
+    get_all_data_extraction_logs,
     get_all_file_scans,
-    get_all_tag_scans,
     get_database_connection,
 )
 from src.utils import isodate_minutes_diff, pretty_print_isodate
@@ -117,7 +117,7 @@ def fetch_scan_history():
 
 def fetch_tagging_history():
     conn = get_database_connection()
-    tag_scans = get_all_tag_scans(conn)
+    tag_scans = get_all_data_extraction_logs(conn)
     conn.close()
     tag_scans = [
         [

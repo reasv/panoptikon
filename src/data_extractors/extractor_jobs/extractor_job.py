@@ -17,7 +17,11 @@ from typing import (
 
 from matplotlib import units
 
-from src.db import add_item_tag_scan, add_tag_scan, get_items_missing_tag_scan
+from src.db import (
+    add_item_to_log,
+    add_tag_scan,
+    get_items_missing_data_extraction,
+)
 from src.types import ItemWithPath
 from src.utils import estimate_eta
 
@@ -84,7 +88,7 @@ def run_extractor_job(
             return []
 
     for item, remaining, inputs, outputs in batch_items(
-        get_items_missing_tag_scan(conn, setter_name),
+        get_items_missing_data_extraction(conn, setter_name),
         batch_size,
         transform_input_handle_error,
         run_batch_inference_with_counter,
@@ -96,7 +100,7 @@ def run_extractor_job(
         try:
             if len(inputs) > 0:
                 output_handler(item, inputs, outputs)
-            add_item_tag_scan(
+            add_item_to_log(
                 conn,
                 item=item.sha256,
                 setter=setter_name,
@@ -137,7 +141,10 @@ def run_extractor_job(
     scan_end_time = datetime.now().isoformat()
     # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
     remaining_paths = (
-        next(get_items_missing_tag_scan(conn, setter_name), [None, -1])[1] + 1
+        next(get_items_missing_data_extraction(conn, setter_name), [None, -1])[
+            1
+        ]
+        + 1
     )
     add_tag_scan(
         conn,

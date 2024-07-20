@@ -16,12 +16,13 @@ def get_database_connection(force_readonly=False) -> sqlite3.Connection:
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
     else:
         conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def initialize_database(conn: sqlite3.Connection):
     cursor = conn.cursor()
-    cursor.execute("PRAGMA foreign_keys = ON")
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS items (
@@ -94,21 +95,20 @@ def initialize_database(conn: sqlite3.Connection):
 
     cursor.execute(
         """
-    CREATE TABLE IF NOT EXISTS tag_scans (
+    CREATE TABLE IF NOT EXISTS data_extraction_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        end_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT DEFAULT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        type TEXT NOT NULL,
         setter TEXT NOT NULL,
-        threshold REAL NOT NULL,
-        image_files INTEGER NOT NULL,
-        video_files INTEGER NOT NULL,
+        threshold REAL DEFAULT NULL,
+        image_files INTEGER NOT NULL DEFAULT 0,
+        video_files INTEGER NOT NULL DEFAULT 0,
         other_files INTEGER NOT NULL DEFAULT 0,
-        video_frames INTEGER NOT NULL,
-        total_frames INTEGER NOT NULL,
-        errors INTEGER NOT NULL,
-        timeouts INTEGER NOT NULL,
-        total_remaining INTEGER NOT NULL,
-        UNIQUE(start_time)       -- Unique constraint on time
+        total_segments INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        total_remaining INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(start_time, type, setter)       -- Unique constraint on start_time, type and setter
     )
     """
     )
@@ -140,14 +140,12 @@ def initialize_database(conn: sqlite3.Connection):
 
     cursor.execute(
         """
-    CREATE TABLE IF NOT EXISTS item_tag_scans (
-        item TEXT NOT NULL,
-        setter TEXT NOT NULL,
-        last_scan TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        tags_set INTEGER NOT NULL,
-        tags_removed INTEGER NOT NULL,
-        UNIQUE(item, setter)                   -- Unique constraint on item and setter
-        FOREIGN KEY(item) REFERENCES items(sha256) ON DELETE CASCADE
+    CREATE TABLE IF NOT EXISTS extraction_log_items (
+        item INTEGER NOT NULL,
+        log_id INTEGER NOT NULL,
+        UNIQUE(item, log_id), -- Unique constraint on item and log_id
+        FOREIGN KEY(item) REFERENCES items(rowid) ON DELETE CASCADE
+        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
     )
     """
     )
@@ -167,9 +165,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("file_scans", ["start_time"]),
         ("file_scans", ["end_time"]),
         ("file_scans", ["path"]),
-        ("tag_scans", ["start_time"]),
-        ("tag_scans", ["end_time"]),
-        ("tag_scans", ["setter"]),
+        ("data_extraction_log", ["start_time"]),
+        ("data_extraction_log", ["end_time"]),
+        ("data_extraction_log", ["setter"]),
+        ("data_extraction_log", ["type"]),
+        ("data_extraction_log", ["threshold"]),
         ("folders", ["time_added"]),
         ("folders", ["path"]),
         ("folders", ["included"]),
@@ -177,11 +177,8 @@ def initialize_database(conn: sqlite3.Connection):
         ("bookmarks", ["sha256"]),
         ("bookmarks", ["metadata"]),
         ("bookmarks", ["namespace"]),
-        ("item_tag_scans", ["item"]),
-        ("item_tag_scans", ["setter"]),
-        ("item_tag_scans", ["last_scan"]),
-        ("item_tag_scans", ["tags_set"]),
-        ("item_tag_scans", ["tags_removed"]),
+        ("extraction_log_items", ["item"]),
+        ("extraction_log_items", ["log_id"]),
         ("tags_items", ["item"]),
         ("tags_items", ["tag"]),
         ("tags_items", ["confidence"]),
@@ -507,100 +504,147 @@ def hard_update_items_available(conn: sqlite3.Connection):
         )
 
 
-def add_tag_scan(
+def create_data_extraction_log(
     conn: sqlite3.Connection,
     scan_time: str,
-    end_time: str,
+    type: str,
     setter: str,
-    threshold: float,
+    threshold: float | None,
+):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    INSERT INTO data_extraction_log (
+        start_time,
+        type,
+        setter,
+        threshold
+    )
+    VALUES (?, ?, ?, ?)
+    """,
+        (
+            scan_time,
+            type,
+            setter,
+            threshold,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def update_log(
+    conn: sqlite3.Connection,
+    log_id: int,
     image_files: int,
     video_files: int,
     other_files: int,
-    video_frames: int,
-    total_frames: int,
+    total_segments: int,
     errors: int,
-    timeouts: int,
     total_remaining: int,
 ):
     cursor = conn.cursor()
     cursor.execute(
         """
-    INSERT INTO tag_scans (start_time, end_time, setter, threshold, image_files, video_files, other_files, video_frames, total_frames, errors, timeouts, total_remaining)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    UPDATE data_extraction_log
+    SET end_time = ?,
+    image_files = ?,
+    video_files = ?,
+    other_files = ?,
+    total_segments = ?,
+    errors = ?,
+    total_remaining = ?
+    WHERE id = ?
     """,
         (
-            scan_time,
-            end_time,
-            setter,
-            threshold,
+            datetime.now().isoformat(),
             image_files,
             video_files,
             other_files,
-            video_frames,
-            total_frames,
+            total_segments,
             errors,
-            timeouts,
             total_remaining,
+            log_id,
         ),
     )
 
 
 @dataclass
-class TagScanRecord:
+class LogRecord:
     id: int
     start_time: str
     end_time: str
+    type: str
     setter: str
-    threshold: float
+    threshold: float | None
     image_files: int
     video_files: int
     other_files: int
-    video_frames: int
-    total_frames: int
+    total_segments: int
     errors: int
-    timeouts: int
     total_remaining: int
 
 
-def get_all_tag_scans(conn: sqlite3.Connection) -> List[TagScanRecord]:
+def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tag_scans ORDER BY start_time DESC")
-    scan_records = cursor.fetchall()
-    return [TagScanRecord(*scan_record) for scan_record in scan_records]
+    cursor.execute("SELECT * FROM data_extraction_log ORDER BY start_time DESC")
+    log_records = cursor.fetchall()
+    return [LogRecord(*log_record) for log_record in log_records]
 
 
-def add_item_tag_scan(
+def add_item_to_log(
     conn: sqlite3.Connection,
     item: str,
-    setter: str,
-    last_scan: str,
-    tags_set: int = 0,
-    tags_removed: int = 0,
+    log_id: int,
 ):
     cursor = conn.cursor()
+    item_id = get_item_rowid(conn, item)
     cursor.execute(
         """
-    INSERT INTO item_tag_scans (item, setter, last_scan, tags_set, tags_removed)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(item, setter) DO UPDATE SET last_scan=excluded.last_scan, tags_set=excluded.tags_set, tags_removed=excluded.tags_removed
+    INSERT INTO extraction_log_items (item, log_id)
+    VALUES (?, ?)
     """,
-        (item, setter, last_scan, tags_set, tags_removed),
+        (item_id, log_id),
     )
 
 
-def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
+def get_items_missing_data_extraction(
+    conn: sqlite3.Connection,
+    model_type: str,
+    setter: str,
+    mime_type_filter: List[str] | None = None,
+):
     """
-    Get all items that have not been scanned by the given tag setter.
+    Get all items that have not been scanned by the given setter.
     More efficient than get_items_missing_tags as it does not require a join with the tags table.
     It also avoids joining with the files table to get the path, instead getting paths one by one.
     """
     clauses = f"""
     FROM items
-    LEFT JOIN item_tag_scans
-    ON items.sha256 = item_tag_scans.item
-    AND item_tag_scans.setter = ?
-    WHERE item_tag_scans.item IS NULL
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM extraction_log_items
+        JOIN data_extraction_log
+        ON extraction_log_items.log_id = data_extraction_log.id
+        WHERE items.rowid = extraction_log_items.item
+        AND data_extraction_log.type = ?
+        AND data_extraction_log.setter = ?
+        AND data_extraction_log.end_time IS NOT NULL
+    )
     """
+    if mime_type_filter:
+        clauses += "AND ("
+        for i, _ in enumerate(mime_type_filter):
+            if i == 0:
+                clauses += "items.type LIKE ? || '%'"
+            else:
+                clauses += f" OR items.type LIKE ? || '%'"
+        clauses += ")"
+
+    params = [
+        model_type,
+        setter,
+        *(mime_type_filter if mime_type_filter else ()),
+    ]
 
     count_query = f"""
     SELECT COUNT(*)
@@ -608,15 +652,23 @@ def get_items_missing_tag_scan(conn: sqlite3.Connection, setter: str):
     """
     cursor = conn.cursor()
 
-    cursor.execute(count_query, (setter,))
+    cursor.execute(
+        count_query,
+        params,
+    )
     total_count = cursor.fetchone()[0]
 
     cursor.execute(
         f"""
-    SELECT items.sha256, items.md5, items.type, items.size, items.time_added
+    SELECT
+    items.sha256,
+    items.md5,
+    items.type,
+    items.size,
+    items.time_added
     {clauses}
     """,
-        (setter,),
+        params,
     )
 
     remaining_count: int = total_count
@@ -659,14 +711,41 @@ def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
 
     result_items = cursor.execute(
         """
-    DELETE FROM item_tag_scans
-    WHERE setter = ?
+    DELETE FROM extraction_log_items
+    WHERE log_id IN (
+        SELECT data_extraction_log.id
+        FROM data_extraction_log
+        WHERE setter = ?
+        AND type = 'tags'
+    )
     """,
         (setter,),
     )
 
     items_tags_removed = result_items.rowcount
     return tags_removed, items_tags_removed
+
+
+def remove_setter_from_items(
+    conn: sqlite3.Connection, model_type: str, setter: str
+):
+    cursor = conn.cursor()
+
+    result = cursor.execute(
+        """
+    DELETE FROM extraction_log_items
+    WHERE log_id IN (
+        SELECT data_extraction_log.id
+        FROM data_extraction_log
+        WHERE setter = ?
+        AND type = ?
+    )
+    """,
+        (setter, model_type),
+    )
+
+    items_setter_removed = result.rowcount
+    return items_setter_removed
 
 
 @dataclass
@@ -1226,7 +1305,7 @@ def delete_tags_without_items(
     return total_deleted
 
 
-def delete_item_tag_scans_without_items(
+def delete_log_items_without_item(
     conn: sqlite3.Connection, batch_size: int = 10000
 ):
     cursor = conn.cursor()
@@ -1236,12 +1315,12 @@ def delete_item_tag_scans_without_items(
         # Perform the deletion in batches
         cursor.execute(
             """
-        DELETE FROM item_tag_scans
+        DELETE FROM extraction_log_items
         WHERE rowid IN (
-            SELECT item_tag_scans.rowid
-            FROM item_tag_scans
-            LEFT JOIN items ON items.sha256 = item_tag_scans.item
-            WHERE items.sha256 IS NULL
+            SELECT extraction_log_items.rowid
+            FROM extraction_log_items
+            LEFT JOIN items ON items.rowid = extraction_log_items.item
+            WHERE items.rowid IS NULL
             LIMIT ?
         )
         """,
@@ -1325,14 +1404,20 @@ def get_most_common_tags_frequency(
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
     setters_clause = (
-        f"WHERE setter IN ({','.join(['?']*len(setters))})" if setters else ""
+        f"WHERE data_extraction_log.setter IN ({','.join(['?']*len(setters))})"
+        if setters
+        else ""
     )
     cursor.execute(
         f"""
-                   SELECT COUNT(DISTINCT item || '-' || setter) AS distinct_count
-                   FROM item_tag_scans
-                   {setters_clause}
-                """,
+        SELECT COUNT(
+            DISTINCT extraction_log_items.item || '-' || data_extraction_log.setter
+        ) AS distinct_count
+        FROM extraction_log_items
+        JOIN data_extraction_log
+        ON extraction_log_items.log_id = data_extraction_log.id
+        AND data_extraction_log.type = 'tags'
+        {setters_clause}""",
         setters if setters else (),
     )
     total_items_setters = cursor.fetchone()[0]
