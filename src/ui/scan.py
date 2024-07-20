@@ -108,10 +108,6 @@ def fetch_all_history():
     return fetch_scan_history(), fetch_tagging_history()
 
 
-def report_state_change(report_state: str):
-    return report_state, fetch_scan_history(), fetch_tagging_history()
-
-
 def create_scan_UI():
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
