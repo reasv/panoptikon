@@ -137,7 +137,7 @@ def run_extractor_job(
     scan_end_time = datetime.now().isoformat()
     # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
     remaining_paths = (
-        next(get_items_missing_tag_scan(conn, setter_name), [0, 0])[1] + 1
+        next(get_items_missing_tag_scan(conn, setter_name), [None, -1])[1] + 1
     )
     add_tag_scan(
         conn,
