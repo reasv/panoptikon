@@ -9,7 +9,7 @@ from chromadb.api import ClientAPI
 from faster_whisper.transcribe import Segment, TranscriptionInfo
 
 from src.data_extractors.data_loaders.audio import load_audio
-from src.data_extractors.extractor_jobs import run_extractor_job
+from src.data_extractors.extraction_jobs import run_extractor_job
 from src.data_extractors.models import WhisperSTTModel
 from src.data_extractors.text_embeddings import add_item_text
 from src.types import ItemWithPath
@@ -86,8 +86,7 @@ def run_whisper_extractor_job(
 
     return run_extractor_job(
         conn,
-        model_opts.setter_id(),
-        1,
+        model_opts,
         get_media_paths,
         process_batch,
         handle_item_result,

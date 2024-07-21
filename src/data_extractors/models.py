@@ -3,7 +3,7 @@ from typing import Any, Dict, Generator, List, Tuple
 
 from chromadb.api import ClientAPI
 
-from src.data_extractors.extractor_jobs.extractor_job import (
+from src.data_extractors.extraction_jobs.extractor_job import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
@@ -112,7 +112,7 @@ class TagsModel(ModelOpts):
         return "wd-swinv2-tagger-v3"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.tags import (
+        from src.data_extractors.extraction_jobs.tags import (
             run_tag_extractor_job,
         )
 
@@ -194,7 +194,9 @@ class OCRModel(ModelOpts):
         return "db_resnet50|crnn_mobilenet_v3_small"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.ocr import run_ocr_extractor_job
+        from src.data_extractors.extraction_jobs.ocr import (
+            run_ocr_extractor_job,
+        )
 
         return run_ocr_extractor_job(conn, cdb, self)
 
@@ -276,7 +278,7 @@ class ImageEmbeddingModel(ModelOpts):
         return "ViT-H-14-378-quickgelu|dfn5b"
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.clip import (
+        from src.data_extractors.extraction_jobs.clip import (
             run_image_embedding_extractor_job,
         )
 
@@ -351,7 +353,7 @@ class WhisperSTTModel(ModelOpts):
         return WhisperSTTModel._model_to_setter_id(self.model_repo())
 
     def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.extractor_jobs.whisper import (
+        from src.data_extractors.extraction_jobs.whisper import (
             run_whisper_extractor_job,
         )
 

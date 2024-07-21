@@ -53,7 +53,6 @@ I = TypeVar("I")
 def run_extractor_job(
     conn: sqlite3.Connection,
     model_opts: ModelOpts,
-    batch_size: int,
     input_transform: Callable[[ItemWithPath], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
     output_handler: Callable[[ItemWithPath, Sequence[I], Sequence[R]], None],
@@ -102,7 +101,7 @@ def run_extractor_job(
             model_opts.setter_id(),
             model_opts.supported_mime_types(),
         ),
-        batch_size,
+        model_opts.batch_size(),
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
