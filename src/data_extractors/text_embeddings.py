@@ -101,3 +101,16 @@ def retrieve_item_text(
     )
 
     return process_result_single_query(results)
+
+
+def delete_all_text_from_model(cdb: ClientAPI, model_opt: ModelOpts):
+    collection = get_text_collection(cdb)
+
+    collection.delete(
+        where={
+            "$and": [
+                {"setter": model_opt.setter_id()},
+                {"source": model_opt.model_type()},
+            ]
+        }
+    )

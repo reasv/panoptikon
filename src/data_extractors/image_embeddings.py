@@ -7,7 +7,7 @@ import numpy as np
 from chromadb.api import ClientAPI
 
 from src.data_extractors.ai.clip import CLIPEmbedder
-from src.data_extractors.models import ImageEmbeddingModel
+from src.data_extractors.models import ImageEmbeddingModel, ModelOpts
 from src.data_extractors.utils import query_result_to_file_search_result
 from src.types import ItemWithPath
 
@@ -87,11 +87,26 @@ def add_item_image_embeddings(
             [
                 {
                     "item": item.sha256,
+                    "source": model_opt.model_type(),
                     "setter": model_opt.setter_id(),
+                    "language": "None",
                     "type": item.type,
                     "general_type": item.type.split("/")[0],
                 }
                 for _ in embeddings
             ]
         ),
+    )
+
+
+def delete_all_embeddings_from_model(cdb: ClientAPI, model_opt: ModelOpts):
+    collection = get_image_embeddings_collection(cdb)
+
+    collection.delete(
+        where={
+            "$and": [
+                {"setter": model_opt.setter_id()},
+                {"source": model_opt.model_type()},
+            ]
+        }
     )

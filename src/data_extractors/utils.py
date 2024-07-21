@@ -13,6 +13,7 @@ from src.db import FileSearchResult, get_existing_file_for_sha256
 
 @dataclass
 class ExtractedText:
+    cdb_id: str
     item: str
     source: str
     setter: str
@@ -70,13 +71,22 @@ def process_result_single_query(result: QueryResult) -> List[ExtractedText]:
         return []
     documents = documents[0]
 
+    ids = result["ids"]
+    if not ids:
+        return []
+    ids = ids[0]
+
     return [
-        process_single_result(metadata, document, score)
-        for metadata, document, score in zip(metadatas, documents, scores)
+        process_single_result(id, metadata, document, score)
+        for id, metadata, document, score in zip(
+            ids, metadatas, documents, scores
+        )
     ]
 
 
-def process_single_result(metadata: Metadata, document: str, score: float):
+def process_single_result(
+    id: str, metadata: Metadata, document: str, score: float
+):
     assert isinstance(metadata["item"], str)
     assert isinstance(metadata["source"], str)
     assert isinstance(metadata["setter"], str)
@@ -84,6 +94,7 @@ def process_single_result(metadata: Metadata, document: str, score: float):
     assert isinstance(metadata["type"], str)
     assert isinstance(metadata["general_type"], str)
     return ExtractedText(
+        cdb_id=id,
         item=metadata["item"],
         source=metadata["source"],
         setter=metadata["setter"],

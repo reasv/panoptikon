@@ -8,7 +8,7 @@ from src.data_extractors.extractor_jobs.extractor_job import (
     ExtractorJobReport,
 )
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import delete_tags_from_setter
+from src.db import delete_tags_from_setter, remove_setter_from_items
 
 
 class ModelOpts:
@@ -230,6 +230,20 @@ class OCRModel(ModelOpts):
     def detection_model(self) -> str:
         return self._detection_model
 
+    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        from src.data_extractors.text_embeddings import (
+            delete_all_text_from_model,
+        )
+
+        delete_all_text_from_model(cdb, self)
+        items_affected = remove_setter_from_items(
+            conn, self.model_type(), self.setter_id()
+        )
+        return (
+            f"Deleted text extracted from {items_affected} "
+            + f"items by model {self.setter_id()}.\n"
+        )
+
 
 class ImageEmbeddingModel(ModelOpts):
     _model_name: str
@@ -290,6 +304,20 @@ class ImageEmbeddingModel(ModelOpts):
 
     def clip_model_checkpoint(self) -> str:
         return self._checkpoint
+
+    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        from src.data_extractors.image_embeddings import (
+            delete_all_embeddings_from_model,
+        )
+
+        delete_all_embeddings_from_model(cdb, self)
+        items_affected = remove_setter_from_items(
+            conn, self.model_type(), self.setter_id()
+        )
+        return (
+            f"Deleted image embeddings generated from {items_affected} "
+            + f"items by model {self.setter_id()}.\n"
+        )
 
 
 class WhisperSTTModel(ModelOpts):
@@ -361,3 +389,17 @@ class WhisperSTTModel(ModelOpts):
 
     def model_repo(self) -> str:
         return self._model_repo
+
+    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+        from src.data_extractors.text_embeddings import (
+            delete_all_text_from_model,
+        )
+
+        delete_all_text_from_model(cdb, self)
+        items_affected = remove_setter_from_items(
+            conn, self.model_type(), self.setter_id()
+        )
+        return (
+            f"Deleted text extracted from {items_affected} "
+            + f"items by model {self.setter_id()}.\n"
+        )
