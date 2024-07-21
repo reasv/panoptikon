@@ -131,7 +131,10 @@ def run_extraction_job(
     remaining_paths = (
         next(
             get_items_missing_data_extraction(
-                conn, model_opts.model_type(), model_opts.setter_id()
+                conn,
+                model_opts.model_type(),
+                model_opts.setter_id(),
+                model_opts.supported_mime_types(),
             ),
             [None, -1],
         )[1]
