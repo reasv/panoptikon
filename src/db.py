@@ -77,7 +77,7 @@ def initialize_database(conn: sqlite3.Connection):
         namespace TEXT NOT NULL,
         name TEXT NOT NULL,
         setter TEXT NOT NULL,
-        PRIMARY KEY(namespace, name, setter)
+        UNIQUE(namespace, name, setter)
     )
     """
     )
@@ -88,7 +88,7 @@ def initialize_database(conn: sqlite3.Connection):
         item_id INTEGER NOT NULL,
         tag_id INTEGER NOT NULL,
         confidence REAL DEFAULT 1.0,
-        UNIQUE(item, tag),
+        UNIQUE(item_id, tag_id),
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(tag_id) REFERENCES tags_setters(id) ON DELETE CASCADE
     )
@@ -146,7 +146,7 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS extraction_log_items (
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
-        UNIQUE(item, log_id), -- Unique constraint on item and log_id
+        UNIQUE(item_id, log_id), -- Unique constraint on item and log_id
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
     )
@@ -180,13 +180,13 @@ def initialize_database(conn: sqlite3.Connection):
         ("bookmarks", ["sha256"]),
         ("bookmarks", ["metadata"]),
         ("bookmarks", ["namespace"]),
-        ("extraction_log_items", ["item"]),
+        ("extraction_log_items", ["item_id"]),
         ("extraction_log_items", ["log_id"]),
-        ("tags_items", ["item"]),
-        ("tags_items", ["tag"]),
+        ("tags_items", ["item_id"]),
+        ("tags_items", ["tag_id"]),
         ("tags_items", ["confidence"]),
-        ("tags_items", ["item", "tag"]),
-        ("tags_items", ["tag", "item"]),
+        ("tags_items", ["item_id", "tag_id"]),
+        ("tags_items", ["tag_id", "item_id"]),
         ("tags_setters", ["namespace"]),
         ("tags_setters", ["name"]),
         ("tags_setters", ["setter"]),
@@ -1298,8 +1298,8 @@ def delete_items_without_files(
         WHERE rowid IN (
             SELECT items.id
             FROM items
-            LEFT JOIN files ON files.file_id = items.id
-            WHERE files.file_id IS NULL
+            LEFT JOIN files ON files.id = items.id
+            WHERE files.id IS NULL
             LIMIT ?
         )
         """,
