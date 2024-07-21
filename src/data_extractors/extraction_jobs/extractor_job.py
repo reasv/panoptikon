@@ -50,7 +50,7 @@ R = TypeVar("R")
 I = TypeVar("I")
 
 
-def run_extractor_job(
+def run_extraction_job(
     conn: sqlite3.Connection,
     model_opts: ModelOpts,
     input_transform: Callable[[ItemWithPath], Sequence[I]],

@@ -7,7 +7,7 @@ import PIL.Image
 
 from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
-from src.data_extractors.extraction_jobs import run_extractor_job
+from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import TagsModel
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import create_tag_setter, get_item_rowid, insert_tag_item
@@ -116,7 +116,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     ):
         handle_individual_result(conn, model.setter_id(), item, outputs)
 
-    return run_extractor_job(
+    return run_extraction_job(
         conn,
         model,
         item_image_loader_pillow,

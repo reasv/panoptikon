@@ -1,1 +1,1 @@
-from src.data_extractors.extraction_jobs.extractor_job import run_extractor_job
+from src.data_extractors.extraction_jobs.extractor_job import run_extraction_job

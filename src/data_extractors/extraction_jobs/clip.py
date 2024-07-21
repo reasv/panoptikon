@@ -6,7 +6,7 @@ from chromadb.api import ClientAPI
 
 from src.data_extractors.ai.clip import CLIPEmbedder
 from src.data_extractors.data_loaders.images import item_image_loader_numpy
-from src.data_extractors.extraction_jobs import run_extractor_job
+from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.image_embeddings import add_item_image_embeddings
 from src.data_extractors.models import ImageEmbeddingModel
 from src.types import ItemWithPath
@@ -33,7 +33,7 @@ def run_image_embedding_extractor_job(
         embeddings_list = [embedding.tolist() for embedding in embeddings]
         add_item_image_embeddings(cdb, model_opt, item, inputs, embeddings_list)
 
-    return run_extractor_job(
+    return run_extraction_job(
         conn,
         model_opt,
         item_image_loader_numpy,

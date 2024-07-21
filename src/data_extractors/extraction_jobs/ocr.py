@@ -7,7 +7,7 @@ from chromadb.api import ClientAPI
 from doctr.models import ocr_predictor
 
 from src.data_extractors.data_loaders.images import item_image_loader_numpy
-from src.data_extractors.extraction_jobs import run_extractor_job
+from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
 from src.types import ItemWithPath
@@ -54,7 +54,7 @@ def run_ocr_extractor_job(
             text=merged_text,
         )
 
-    return run_extractor_job(
+    return run_extraction_job(
         conn,
         model_opt,
         item_image_loader_numpy,
