@@ -2,7 +2,8 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple
+from fileinput import filename
+from typing import List, Tuple
 
 from src.types import FileScanData, ItemWithPath
 from src.utils import get_mime_type, normalize_path
@@ -43,6 +44,7 @@ def initialize_database(conn: sqlite3.Connection):
         sha256 TEXT NOT NULL,
         item_id INTEGER NOT NULL,         -- Foreign key to items table
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
+        filename TEXT NOT NULL,           -- Filename extracted from path
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
@@ -232,13 +234,7 @@ def initialize_database(conn: sqlite3.Connection):
         """ 
         CREATE TRIGGER files_path_ai AFTER INSERT ON files BEGIN
         INSERT INTO files_path_fts(rowid, path, filename) 
-        VALUES (new.id, new.path,
-            CASE 
-            WHEN instr(new.path, '/') > 0 THEN substr(new.path, instr(new.path, '/', -1) + 1)
-            WHEN instr(new.path, '\\') > 0 THEN substr(new.path, instr(new.path, '\\', -1) + 1)
-            ELSE new.path
-            END
-        );
+        VALUES (new.id, new.path, new.filename);
         END;
     """
     )
@@ -250,13 +246,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
         CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
         INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
-        VALUES('delete', old.id, old.path, 
-            CASE 
-            WHEN instr(old.path, '/') > 0 THEN substr(old.path, instr(old.path, '/', -1) + 1)
-            WHEN instr(old.path, '\\') > 0 THEN substr(old.path, instr(old.path, '\\', -1) + 1)
-            ELSE old.path
-            END
-        );
+        VALUES('delete', old.id, old.path, old.filename);
         END;
         """
     )
@@ -267,21 +257,9 @@ def initialize_database(conn: sqlite3.Connection):
         """
         CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
         INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
-        VALUES('delete', old.id, old.path, 
-            CASE 
-            WHEN instr(old.path, '/') > 0 THEN substr(old.path, instr(old.path, '/', -1) + 1)
-            WHEN instr(old.path, '\\') > 0 THEN substr(old.path, instr(old.path, '\\', -1) + 1)
-            ELSE old.path
-            END
-        );
+        VALUES('delete', old.id, old.path, old.filename);
         INSERT INTO files_path_fts(rowid, path, filename) 
-        VALUES (new.id, new.path, 
-            CASE 
-            WHEN instr(new.path, '/') > 0 THEN substr(new.path, instr(new.path, '/', -1) + 1)
-            WHEN instr(new.path, '\\') > 0 THEN substr(new.path, instr(new.path, '\\', -1) + 1)
-            ELSE new.path
-            END
-        );
+        VALUES (new.id, new.path, new.filename);
         END;
     """
     )
@@ -297,6 +275,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("files", ["available"]),
         ("files", ["path"]),
         ("files", ["last_seen"]),
+        ("files", ["filename"]),
         ("file_scans", ["start_time"]),
         ("file_scans", ["end_time"]),
         ("file_scans", ["path"]),
@@ -488,13 +467,14 @@ def update_file_data(
                 "SELECT id FROM items WHERE sha256 = ?", (sha256,)
             ).fetchone()[0]
 
+        filename = os.path.basename(path)
         # Path does not exist or has been modified, insert new
         file_insert_result = cursor.execute(
             """
-        INSERT INTO files (sha256, item_id, path, last_modified, last_seen, available)
-        VALUES (?, ?, ?, ?, ?, TRUE)
+        INSERT INTO files (sha256, item_id, path, filename, last_modified, last_seen, available)
+        VALUES (?, ?, ?, ?, ?, ?, TRUE)
         """,
-            (sha256, item_rowid, path, last_modified, scan_time),
+            (sha256, item_rowid, path, filename, last_modified, scan_time),
         )
         file_inserted = file_insert_result.rowcount > 0
 
