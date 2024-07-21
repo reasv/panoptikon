@@ -38,7 +38,11 @@ def build_query(
         min_tag_confidence = 0.0
     if not include_path:
         include_path = ""
-    return f"/search/tags?tags={tag_str}&min_confidence={min_tag_confidence}&include_path={include_path}&page_size={page_size}&page={page}&order_by={order_by}{order_query}"
+    return (
+        f"/search/tags?tags={tag_str}&min_confidence={min_tag_confidence}"
+        + f"&include_path={include_path}&page_size={page_size}"
+        + f"&page={page}&order_by={order_by}{order_query}"
+    )
 
 
 def search_by_tags(
@@ -86,7 +90,12 @@ def search_by_tags(
     tags, tags_match_any = extract_tags_subtype(tags, "*")
     conn = get_database_connection()
     print(
-        f"Searching for tags: {tags} match any: {tags_match_any} (negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) with min confidence {min_tag_confidence} under path prefix {include_path} with page size {results_per_page} and page {page} and order by {order_by} {order} and tag setters {tag_setters} and all setters required {all_setters_required} and item type prefix {item_type} and namespace prefix {namespace_prefix}"
+        f"Searching for tags: {tags} match any: {tags_match_any} "
+        + f"(negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) "
+        + f"with min confidence {min_tag_confidence} under path prefix {include_path} "
+        + f"with page size {results_per_page} and page {page} and order by {order_by} {order} "
+        + f"and tag setters {tag_setters} and all setters required {all_setters_required} and "
+        + f"item type prefix {item_type} and namespace prefix {namespace_prefix}"
     )
     start = time()
     res_list = list(
@@ -119,11 +128,20 @@ def search_by_tags(
     total_pages = total_results // results_per_page + (
         1 if total_results % results_per_page > 0 else 0
     )
+    query = build_query(
+        tags,
+        min_tag_confidence,
+        include_path,
+        results_per_page,
+        page,
+        order_by,
+        order,
+    )
     return (
         results,
         total_results,
         gr.update(value=page, maximum=int(total_pages)),
-        f"[View Results in Gallery]({build_query(tags, min_tag_confidence, include_path, results_per_page, page, order_by, order)})",
+        f"[View Results in Gallery]({query})",
     )
 
 
