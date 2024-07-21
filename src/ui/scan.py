@@ -8,7 +8,7 @@ from src.db import (
     vacuum_database,
 )
 from src.folders import rescan_all_folders, update_folder_lists
-from src.ui.components.extractor_ui import create_extractor_UI
+from src.ui.components.extractor_ui import create_data_extraction_UI
 from src.ui.components.scan_tables import (
     create_job_dataset,
     create_scan_dataset,
@@ -157,7 +157,7 @@ def create_scan_UI():
                             value="",
                         )
             with gr.Row():
-                create_extractor_UI()
+                create_data_extraction_UI()
                 with gr.Column():
                     pass
 
