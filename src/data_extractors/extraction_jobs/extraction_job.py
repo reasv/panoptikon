@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
 from typing import (
     Any,
@@ -14,7 +13,11 @@ from typing import (
     TypeVar,
 )
 
-from src.data_extractors.models import ModelOpts
+import src.data_extractors.models as models
+from src.data_extractors.extraction_jobs.types import (
+    ExtractorJobProgress,
+    ExtractorJobReport,
+)
 from src.db import (
     add_item_to_log,
     create_data_extraction_log,
@@ -24,35 +27,13 @@ from src.db import (
 from src.types import ItemWithPath
 from src.utils import estimate_eta
 
-
-@dataclass
-class ExtractorJobProgress:
-    start_time: datetime
-    processed_items: int
-    total_items: int
-    eta_string: str
-    item: ItemWithPath
-
-
-@dataclass
-class ExtractorJobReport:
-    start_time: datetime
-    end_time: datetime
-    images: int
-    videos: int
-    other: int
-    total: int
-    units: int
-    failed_paths: List[str]
-
-
 R = TypeVar("R")
 I = TypeVar("I")
 
 
 def run_extraction_job(
     conn: sqlite3.Connection,
-    model_opts: ModelOpts,
+    model_opts: models.ModelOpts,
     input_transform: Callable[[ItemWithPath], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
     output_handler: Callable[[ItemWithPath, Sequence[I], Sequence[R]], None],
