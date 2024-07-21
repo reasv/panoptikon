@@ -8,7 +8,11 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobReport,
 )
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import delete_tags_from_setter, remove_setter_from_items
+from src.db import (
+    delete_extracted_text_from_setter,
+    delete_tags_from_setter,
+    remove_setter_from_items,
+)
 
 
 class ModelOpts:
@@ -155,6 +159,7 @@ class TagsModel(ModelOpts):
         tags_removed, items_tags_removed = delete_tags_from_setter(
             conn, self.setter_id()
         )
+
         return (
             f"Removed {tags_removed} tags from {items_tags_removed} "
             + f"items tagged by model {self.setter_id()}.\n"
@@ -240,6 +245,9 @@ class OCRModel(ModelOpts):
         delete_all_text_from_model(cdb, self)
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
+        )
+        delete_extracted_text_from_setter(
+            conn, model_type=self.model_type(), setter=self.setter_id()
         )
         return (
             f"Deleted text extracted from {items_affected} "
@@ -400,6 +408,9 @@ class WhisperSTTModel(ModelOpts):
         delete_all_text_from_model(cdb, self)
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
+        )
+        delete_extracted_text_from_setter(
+            conn, model_type=self.model_type(), setter=self.setter_id()
         )
         return (
             f"Deleted text extracted from {items_affected} "

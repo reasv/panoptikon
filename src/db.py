@@ -164,11 +164,13 @@ def initialize_database(conn: sqlite3.Connection):
         text TEXT NOT NULL,
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
-    )"""
+    )
+    """
     )
 
     cursor.execute(
-        """CREATE VIRTUAL TABLE IF NOT EXISTS extracted_text_fts
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS extracted_text_fts
         USING fts5(
             text,
             content="extracted_text",
@@ -176,15 +178,33 @@ def initialize_database(conn: sqlite3.Connection):
         )
         """
     )
-
+    if trigger_exists(conn, "extracted_text_insert"):
+        cursor.execute("DROP TRIGGER extracted_text_insert")
+    # Triggers to keep the FTS index up to date.
     cursor.execute(
-        """ -- Triggers to keep the FTS index up to date.
+        """
         CREATE TRIGGER extracted_text_insert AFTER INSERT ON extracted_text BEGIN
         INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
         END;
+    """
+    )
+
+    if trigger_exists(conn, "extracted_text_delete"):
+        cursor.execute("DROP TRIGGER extracted_text_delete")
+
+    cursor.execute(
+        """
         CREATE TRIGGER extracted_text_delete AFTER DELETE ON extracted_text BEGIN
         INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
         END;
+    """
+    )
+
+    if trigger_exists(conn, "extracted_text_update"):
+        cursor.execute("DROP TRIGGER extracted_text_update")
+
+    cursor.execute(
+        """
         CREATE TRIGGER extracted_text_update AFTER UPDATE ON extracted_text BEGIN
         INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
         INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
@@ -195,7 +215,7 @@ def initialize_database(conn: sqlite3.Connection):
     # Create FTS table for files
     cursor.execute(
         """
-        CREATE VIRTUAL TABLE files_path_fts
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_path_fts
         USING fts5(
             path,
             filename,
@@ -204,6 +224,9 @@ def initialize_database(conn: sqlite3.Connection):
         );
     """
     )
+
+    if trigger_exists(conn, "files_path_ai"):
+        cursor.execute("DROP TRIGGER files_path_ai")
 
     cursor.execute(
         """ 
@@ -217,7 +240,14 @@ def initialize_database(conn: sqlite3.Connection):
             END
         );
         END;
+    """
+    )
 
+    if trigger_exists(conn, "files_path_ad"):
+        cursor.execute("DROP TRIGGER files_path_ad")
+
+    cursor.execute(
+        """
         CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
         INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
         VALUES('delete', old.id, old.path, 
@@ -228,7 +258,13 @@ def initialize_database(conn: sqlite3.Connection):
             END
         );
         END;
+        """
+    )
 
+    if trigger_exists(conn, "files_path_au"):
+        cursor.execute("DROP TRIGGER files_path_au")
+    cursor.execute(
+        """
         CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
         INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
         VALUES('delete', old.id, old.path, 
@@ -310,6 +346,28 @@ def initialize_database(conn: sqlite3.Connection):
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_item ON files(item_id)"
         )
+
+
+def trigger_exists(conn: sqlite3.Connection, trigger_name: str) -> bool:
+    """
+    Check if a trigger with the given name exists in the SQLite database.
+
+    Args:
+    cursor (sqlite3.Cursor): The SQLite database cursor
+    trigger_name (str): The name of the trigger to check
+
+    Returns:
+    bool: True if the trigger exists, False otherwise
+    """
+    query = """
+    SELECT COUNT(*) 
+    FROM sqlite_master 
+    WHERE type = 'trigger' AND name = ?
+    """
+    cursor = conn.cursor()
+    cursor.execute(query, (trigger_name,))
+    count = cursor.fetchone()[0]
+    return count > 0
 
 
 def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):

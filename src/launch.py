@@ -25,6 +25,8 @@ else:
 
 def launch_app():
     conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN")
     initialize_database(conn)
     conn.commit()
     folders = get_folders_from_database(conn, included=True)
