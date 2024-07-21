@@ -36,7 +36,9 @@ def run_extraction_job(
     model_opts: models.ModelOpts,
     input_transform: Callable[[ItemWithPath], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
-    output_handler: Callable[[ItemWithPath, Sequence[I], Sequence[R]], None],
+    output_handler: Callable[
+        [int, ItemWithPath, Sequence[I], Sequence[R]], None
+    ],
 ):
     """
     Run a job that processes items in the database
@@ -93,7 +95,7 @@ def run_extraction_job(
 
         try:
             if len(inputs) > 0:
-                output_handler(item, inputs, outputs)
+                output_handler(log_id, item, inputs, outputs)
             add_item_to_log(
                 conn,
                 item=item.sha256,

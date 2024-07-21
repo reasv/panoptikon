@@ -106,6 +106,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
         )
 
     def handle_result(
+        __: int,
         item: ItemWithPath,
         _: Sequence[PIL.Image.Image],
         outputs: Sequence[

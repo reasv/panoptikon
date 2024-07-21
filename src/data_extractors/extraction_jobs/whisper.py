@@ -12,6 +12,7 @@ from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
 from src.data_extractors.text_embeddings import add_item_text
+from src.db import insert_extracted_text
 from src.types import ItemWithPath
 
 
@@ -60,6 +61,7 @@ def run_whisper_extractor_job(
         return outputs
 
     def handle_item_result(
+        log_id: int,
         item: ItemWithPath,
         _: Sequence[np.ndarray],
         outputs: Sequence[
@@ -82,6 +84,14 @@ def run_whisper_extractor_job(
             model_opts,
             info.language,
             merged_text,
+        )
+        insert_extracted_text(
+            conn,
+            item.sha256,
+            log_id,
+            text=merged_text,
+            language="en",
+            confidence=None,
         )
 
     return run_extraction_job(

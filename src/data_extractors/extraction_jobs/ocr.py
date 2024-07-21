@@ -10,6 +10,7 @@ from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
+from src.db import insert_extracted_text
 from src.types import ItemWithPath
 
 
@@ -43,7 +44,10 @@ def run_ocr_extractor_job(
         return files_texts
 
     def handle_item_result(
-        item: ItemWithPath, inputs: Sequence[np.ndarray], outputs: Sequence[str]
+        log_id: int,
+        item: ItemWithPath,
+        _: Sequence[np.ndarray],
+        outputs: Sequence[str],
     ):
         merged_text = "\n".join(list(set(outputs)))
         add_item_text(
@@ -52,6 +56,14 @@ def run_ocr_extractor_job(
             model=model_opt,
             language="en",
             text=merged_text,
+        )
+        insert_extracted_text(
+            conn,
+            item.sha256,
+            log_id,
+            text=merged_text,
+            language="en",
+            confidence=None,
         )
 
     return run_extraction_job(

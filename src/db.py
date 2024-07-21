@@ -152,7 +152,103 @@ def initialize_database(conn: sqlite3.Connection):
     )
     """
     )
+    # Create table for extracted text
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS extracted_text (
+        id INTEGER PRIMARY KEY,
+        item_id INTEGER NOT NULL,
+        log_id INTEGER NOT NULL,
+        language TEXT,
+        confidence REAL,
+        text TEXT NOT NULL,
+        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+    )"""
+    )
 
+    cursor.execute(
+        """CREATE VIRTUAL TABLE IF NOT EXISTS extracted_text_fts
+        USING fts5(
+            text,
+            content="extracted_text",
+            content_rowid="id"
+        )
+        """
+    )
+
+    cursor.execute(
+        """ -- Triggers to keep the FTS index up to date.
+        CREATE TRIGGER extracted_text_insert AFTER INSERT ON extracted_text BEGIN
+        INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        CREATE TRIGGER extracted_text_delete AFTER DELETE ON extracted_text BEGIN
+        INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
+        END;
+        CREATE TRIGGER extracted_text_update AFTER UPDATE ON extracted_text BEGIN
+        INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
+        INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+    """
+    )
+
+    # Create FTS table for files
+    cursor.execute(
+        """
+        CREATE VIRTUAL TABLE files_path_fts
+        USING fts5(
+            path,
+            filename,
+            content='files',
+            content_rowid='id'
+        );
+    """
+    )
+
+    cursor.execute(
+        """ 
+        CREATE TRIGGER files_path_ai AFTER INSERT ON files BEGIN
+        INSERT INTO files_path_fts(rowid, path, filename) 
+        VALUES (new.id, new.path,
+            CASE 
+            WHEN instr(new.path, '/') > 0 THEN substr(new.path, instr(new.path, '/', -1) + 1)
+            WHEN instr(new.path, '\\') > 0 THEN substr(new.path, instr(new.path, '\\', -1) + 1)
+            ELSE new.path
+            END
+        );
+        END;
+
+        CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
+        INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+        VALUES('delete', old.id, old.path, 
+            CASE 
+            WHEN instr(old.path, '/') > 0 THEN substr(old.path, instr(old.path, '/', -1) + 1)
+            WHEN instr(old.path, '\\') > 0 THEN substr(old.path, instr(old.path, '\\', -1) + 1)
+            ELSE old.path
+            END
+        );
+        END;
+
+        CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
+        INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+        VALUES('delete', old.id, old.path, 
+            CASE 
+            WHEN instr(old.path, '/') > 0 THEN substr(old.path, instr(old.path, '/', -1) + 1)
+            WHEN instr(old.path, '\\') > 0 THEN substr(old.path, instr(old.path, '\\', -1) + 1)
+            ELSE old.path
+            END
+        );
+        INSERT INTO files_path_fts(rowid, path, filename) 
+        VALUES (new.id, new.path, 
+            CASE 
+            WHEN instr(new.path, '/') > 0 THEN substr(new.path, instr(new.path, '/', -1) + 1)
+            WHEN instr(new.path, '\\') > 0 THEN substr(new.path, instr(new.path, '\\', -1) + 1)
+            ELSE new.path
+            END
+        );
+        END;
+    """
+    )
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -193,6 +289,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("tags_setters", ["namespace", "name"]),
         ("tags_setters", ["namespace", "setter"]),
         ("tags_setters", ["name", "setter"]),
+        ("tags_setters", ["namespace", "name", "setter"]),
+        ("extracted_text", ["item_id"]),
+        ("extracted_text", ["log_id"]),
+        ("extracted_text", ["language"]),
+        ("extracted_text", ["confidence"]),
     ]
 
     for table, columns in indices:
@@ -1661,3 +1762,92 @@ def get_bookmarks(
         bookmarks.append(item)
 
     return bookmarks, total_results
+
+
+def insert_extracted_text(
+    conn: sqlite3.Connection,
+    item_sha256: str,
+    log_id: int,
+    text: str,
+    language: str | None,
+    confidence: float | None,
+) -> int:
+    """
+    Insert extracted text into the database
+    """
+    text = text.strip()
+    if len(text) < 3:
+        return -1
+
+    item_id = get_item_id(conn, item_sha256)
+    assert item_id is not None, f"Item with SHA256 {item_sha256} not found"
+
+    cursor = conn.cursor()
+
+    sql = """
+    INSERT INTO extracted_text (item_id, log_id, language, confidence, text)
+    VALUES (?, ?, ?, ?, ?)
+    """
+    cursor.execute(sql, (item_id, log_id, language, confidence, text))
+    assert cursor.lastrowid is not None, "Last row ID is None"
+    return cursor.lastrowid
+
+
+def delete_extracted_text_from_setter(
+    conn: sqlite3.Connection, model_type: str, setter: str
+):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    DELETE FROM extracted_text
+    WHERE log_id IN (
+        SELECT data_extraction_log.id
+        FROM data_extraction_log
+        WHERE setter = ?
+        AND type = ?
+    )
+    """,
+        (model_type, setter),
+    )
+
+
+def full_text_search(
+    conn: sqlite3.Connection, query: str, page_size: int = 10, page: int = 1
+) -> Tuple[List[ItemWithPath], int]:
+    """
+    Perform a full-text search on the extracted_text table and return paginated results.
+
+    Returns:
+    Tuple[List[ItemWithPath], int]: A tuple containing a list of ItemWithPath objects and the total count of results
+    """
+    cursor = conn.cursor()
+    # Get the total count of results
+    count_sql = """
+    SELECT COUNT(DISTINCT i.id)
+    FROM extracted_text_fts AS fts
+    JOIN extracted_text AS et ON fts.rowid = et.id
+    JOIN items AS i ON et.item_id = i.id
+    JOIN files AS f ON i.id = f.item_id
+    WHERE fts.text MATCH ?
+    """
+    cursor.execute(count_sql, (query,))
+    total_count = cursor.fetchone()[0]
+
+    # Perform the actual search with pagination
+    search_sql = """
+    SELECT DISTINCT i.sha256, i.md5, i.type, i.size, i.time_added, f.path
+    FROM extracted_text_fts AS fts
+    JOIN extracted_text AS et ON fts.rowid = et.id
+    JOIN items AS i ON et.item_id = i.id
+    JOIN files AS f ON i.id = f.item_id
+    WHERE fts.text MATCH ?
+    ORDER BY fts.rank
+    LIMIT ? OFFSET ?
+    """
+    page = max(1, page)
+    offset = (page - 1) * page_size
+    cursor.execute(search_sql, (query, page_size, offset))
+
+    results = [ItemWithPath(*row) for row in cursor.fetchall()]
+
+    return results, total_count

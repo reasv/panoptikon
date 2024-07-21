@@ -26,6 +26,7 @@ def run_image_embedding_extractor_job(
         return embedder.get_image_embeddings(batch)
 
     def handle_item_result(
+        _: int,
         item: ItemWithPath,
         inputs: Sequence[np.ndarray],
         embeddings: Sequence[np.ndarray],
