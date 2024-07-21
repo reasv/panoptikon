@@ -174,11 +174,11 @@ def create_scan_UI():
                     with gr.TabItem(
                         label="Data Extraction History"
                     ) as extractor_tab:
-                        tagging_history = create_job_dataset()
+                        extraction_log = create_job_dataset()
 
         scan_tab.select(
             fn=fetch_all_history,
-            outputs=[scan_history, tagging_history],
+            outputs=[scan_history, extraction_log],
             api_name="fetch_history",
         )
 
@@ -194,7 +194,7 @@ def create_scan_UI():
                 included_directory_list,
                 excluded_directory_list,
                 scan_history,
-                tagging_history,
+                extraction_log,
             ],
             api_name="update_folder_lists",
         )
@@ -202,12 +202,12 @@ def create_scan_UI():
         scan_button.click(
             fn=rescan_folders,
             inputs=[delete_unavailable_files],
-            outputs=[report_textbox, scan_history, tagging_history],
+            outputs=[report_textbox, scan_history, extraction_log],
             api_name="rescan_folders",
         )
 
         extractor_tab.select(
             fn=fetch_all_history,
-            outputs=[scan_history, tagging_history],
+            outputs=[scan_history, extraction_log],
             api_name="fetch_history",
         )
