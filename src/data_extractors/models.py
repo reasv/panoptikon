@@ -3,7 +3,7 @@ from typing import Any, Dict, Generator, List, Tuple
 
 from chromadb.api import ClientAPI
 
-from src.data_extractors.extraction_jobs.extractor_job import (
+from src.data_extractors.extraction_jobs.extraction_job import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
