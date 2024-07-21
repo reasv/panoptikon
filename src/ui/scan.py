@@ -12,8 +12,8 @@ from src.ui.components.extractor_ui import create_extractor_UI
 from src.ui.components.scan_tables import (
     create_job_dataset,
     create_scan_dataset,
+    fetch_extraction_logs,
     fetch_scan_history,
-    fetch_tagging_history,
 )
 
 
@@ -83,7 +83,7 @@ def update_folders(
         "\n".join(current_included_folders),
         "\n".join(current_excluded_folders),
         fetch_scan_history(),
-        fetch_tagging_history(),
+        fetch_extraction_logs(),
     )
 
 
@@ -100,12 +100,12 @@ def rescan_folders(delete_unavailable_files: bool = True):
     return (
         f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.",
         fetch_scan_history(),
-        fetch_tagging_history(),
+        fetch_extraction_logs(),
     )
 
 
 def fetch_all_history():
-    return fetch_scan_history(), fetch_tagging_history()
+    return fetch_scan_history(), fetch_extraction_logs()
 
 
 def create_scan_UI():

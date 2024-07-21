@@ -3,7 +3,6 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from tracemalloc import start
 from typing import (
     Any,
     Callable,
@@ -15,12 +14,12 @@ from typing import (
     TypeVar,
 )
 
-from matplotlib import units
-
+from src.data_extractors.models import ModelOpts
 from src.db import (
     add_item_to_log,
-    add_tag_scan,
+    create_data_extraction_log,
     get_items_missing_data_extraction,
+    update_log,
 )
 from src.types import ItemWithPath
 from src.utils import estimate_eta
@@ -53,7 +52,7 @@ I = TypeVar("I")
 
 def run_extractor_job(
     conn: sqlite3.Connection,
-    setter_name: str,
+    model_opts: ModelOpts,
     batch_size: int,
     input_transform: Callable[[ItemWithPath], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
@@ -63,8 +62,9 @@ def run_extractor_job(
     Run a job that processes items in the database
     using the given batch inference function and item extractor.
     """
-    scan_time = datetime.now().isoformat()
     start_time = datetime.now()
+    scan_time = start_time.isoformat()
+
     failed_items: Dict[str, ItemWithPath] = {}
     processed_items, videos, images, other, total_processed_units = (
         0,
@@ -72,6 +72,14 @@ def run_extractor_job(
         0,
         0,
         0,
+    )
+
+    log_id = create_data_extraction_log(
+        conn,
+        scan_time,
+        model_opts.model_type(),
+        model_opts.setter_id(),
+        model_opts.threshold(),
     )
 
     def run_batch_inference_with_counter(work_units: Sequence):
@@ -88,7 +96,12 @@ def run_extractor_job(
             return []
 
     for item, remaining, inputs, outputs in batch_items(
-        get_items_missing_data_extraction(conn, setter_name),
+        get_items_missing_data_extraction(
+            conn,
+            model_opts.model_type(),
+            model_opts.setter_id(),
+            model_opts.supported_mime_types(),
+        ),
         batch_size,
         transform_input_handle_error,
         run_batch_inference_with_counter,
@@ -103,10 +116,7 @@ def run_extractor_job(
             add_item_to_log(
                 conn,
                 item=item.sha256,
-                setter=setter_name,
-                last_scan=scan_time,
-                tags_set=0,
-                tags_removed=0,
+                log_id=log_id,
             )
             if len(inputs) == 0:
                 continue
@@ -123,7 +133,7 @@ def run_extractor_job(
         total_items = remaining + processed_items
         eta_str = estimate_eta(scan_time, processed_items, remaining)
         print(
-            f"{setter_name}: ({processed_items}/{total_items}) "
+            f"{model_opts.setter_id()}: ({processed_items}/{total_items}) "
             + f"(ETA: {eta_str}) "
             + f"Processed ({item.type}) {item.path}"
         )
@@ -136,32 +146,27 @@ def run_extractor_job(
         + f" {images} images and {videos} videos "
         + f"totalling {total_processed_units} frames"
     )
-
-    # Record the scan in the database log
-    scan_end_time = datetime.now().isoformat()
-    # Get first item from get_items_missing_tag_scan(conn, setter) to get the total number of items remaining
+    # Get first item to obtain the total number of items remaining
     remaining_paths = (
-        next(get_items_missing_data_extraction(conn, setter_name), [None, -1])[
-            1
-        ]
+        next(
+            get_items_missing_data_extraction(
+                conn, model_opts.model_type(), model_opts.setter_id()
+            ),
+            [None, -1],
+        )[1]
         + 1
     )
-    add_tag_scan(
+    update_log(
         conn,
-        scan_time,
-        scan_end_time,
-        setter=setter_name,
-        threshold=0,
+        log_id,
         image_files=images,
         video_files=videos,
         other_files=other,
-        video_frames=0,
-        total_frames=total_processed_units,
+        total_segments=total_processed_units,
         errors=len(failed_items.keys()),
-        timeouts=0,
         total_remaining=remaining_paths,
     )
-    print("Added scan to database")
+    print("Updated log with scan results")
 
     failed_paths = [item.path for item in failed_items.values()]
     yield ExtractorJobReport(

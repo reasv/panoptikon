@@ -529,6 +529,7 @@ def create_data_extraction_log(
             threshold,
         ),
     )
+    assert cursor.lastrowid is not None
     return cursor.lastrowid
 
 

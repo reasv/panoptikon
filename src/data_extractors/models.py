@@ -7,6 +7,7 @@ from src.data_extractors.extractor_jobs.extractor_job import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
+from src.data_extractors.utils import get_threshold_from_env
 from src.db import delete_tags_from_setter
 
 
@@ -33,14 +34,6 @@ class ModelOpts:
         return self._batch_size
 
     @classmethod
-    def name(cls) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    def description(cls) -> str:
-        raise NotImplementedError
-
-    @classmethod
     def available_models(cls) -> List[str]:
         return list(cls._available_models_mapping().keys())
 
@@ -55,6 +48,12 @@ class ModelOpts:
     @classmethod
     def default_model(cls) -> str:
         return cls.available_models()[0]
+
+    def threshold(self) -> float | None:
+        return None
+
+    def supported_mime_types(self) -> List[str] | None:
+        return None
 
     def model_type(self) -> str:
         raise NotImplementedError
@@ -77,6 +76,14 @@ class ModelOpts:
     def delete_extracted_data(
         self, conn: sqlite3.Connection, cdb: ClientAPI
     ) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def name(cls) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def description(cls) -> str:
         raise NotImplementedError
 
 
@@ -148,7 +155,13 @@ class TagsModel(ModelOpts):
         tags_removed, items_tags_removed = delete_tags_from_setter(
             conn, self.setter_id()
         )
-        return f"Removed {tags_removed} tags from {items_tags_removed} items tagged by model {self.setter_id()}.\n"
+        return (
+            f"Removed {tags_removed} tags from {items_tags_removed} "
+            + f"items tagged by model {self.setter_id()}.\n"
+        )
+
+    def threshold(self) -> float | None:
+        return get_threshold_from_env()
 
 
 class OCRModel(ModelOpts):

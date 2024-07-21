@@ -58,16 +58,15 @@ def create_job_dataset(samples=[]):
             "Start Time",
             "End Time",
             "Duration",
-            "Tag Model",
+            "Type",
+            "Model",
             "Threshold",
             "Image Files",
             "Video Files",
             "Other Files",
-            "Video Frames",
-            "Total Frames",
+            "Data Segments",
             "Errors",
-            "Timeouts",
-            "Remaining Untagged",
+            "Remaining Unprocessed",
         ],
         components=[
             "number",
@@ -75,8 +74,7 @@ def create_job_dataset(samples=[]):
             "textbox",
             "textbox",
             "textbox",
-            "number",
-            "number",
+            "textbox",
             "number",
             "number",
             "number",
@@ -115,27 +113,26 @@ def fetch_scan_history():
     return gr.Dataset(samples=file_scans)
 
 
-def fetch_tagging_history():
+def fetch_extraction_logs():
     conn = get_database_connection()
-    tag_scans = get_all_data_extraction_logs(conn)
+    log_records = get_all_data_extraction_logs(conn)
     conn.close()
-    tag_scans = [
+    log_rows = [
         [
             t.id,
             pretty_print_isodate(t.start_time),
             pretty_print_isodate(t.end_time),
             isodate_minutes_diff(t.end_time, t.start_time),
+            t.type,
             t.setter,
             t.threshold,
             t.image_files,
             t.video_files,
             t.other_files,
-            t.video_frames,
-            t.total_frames,
+            t.total_segments,
             t.errors,
-            t.timeouts,
             t.total_remaining,
         ]
-        for t in tag_scans
+        for t in log_records
     ]
-    return gr.Dataset(samples=tag_scans)
+    return gr.Dataset(samples=log_rows)
