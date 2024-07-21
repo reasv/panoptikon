@@ -102,6 +102,7 @@ def initialize_database(conn: sqlite3.Connection):
         type TEXT NOT NULL,
         setter TEXT NOT NULL,
         threshold REAL DEFAULT NULL,
+        batch_size INTEGER NOT NULL,
         image_files INTEGER NOT NULL DEFAULT 0,
         video_files INTEGER NOT NULL DEFAULT 0,
         other_files INTEGER NOT NULL DEFAULT 0,
@@ -510,6 +511,7 @@ def create_data_extraction_log(
     type: str,
     setter: str,
     threshold: float | None,
+    batch_size: int,
 ):
     cursor = conn.cursor()
     cursor.execute(
@@ -518,15 +520,17 @@ def create_data_extraction_log(
         start_time,
         type,
         setter,
-        threshold
+        threshold,
+        batch_size
     )
-    VALUES (?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?)
     """,
         (
             scan_time,
             type,
             setter,
             threshold,
+            batch_size,
         ),
     )
     assert cursor.lastrowid is not None
@@ -577,6 +581,7 @@ class LogRecord:
     type: str
     setter: str
     threshold: float | None
+    batch_size: int
     image_files: int
     video_files: int
     other_files: int
@@ -587,7 +592,24 @@ class LogRecord:
 
 def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM data_extraction_log ORDER BY start_time DESC")
+    cursor.execute(
+        """SELECT
+        id,
+        start_time,
+        end_time,
+        type,
+        setter,
+        threshold,
+        batch_size,
+        image_files,
+        video_files,
+        other_files,
+        total_segments,
+        errors,
+        total_remaining
+        FROM data_extraction_log
+        ORDER BY start_time DESC"""
+    )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
 

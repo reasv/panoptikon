@@ -79,6 +79,7 @@ def run_extraction_job(
         model_opts.model_type(),
         model_opts.setter_id(),
         model_opts.threshold(),
+        model_opts.batch_size(),
     )
 
     def run_batch_inference_with_counter(work_units: Sequence):
