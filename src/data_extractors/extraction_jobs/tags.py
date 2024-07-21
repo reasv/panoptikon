@@ -4,13 +4,19 @@ import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
 import PIL.Image
+from cv2 import add
 
 from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import TagsModel
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import create_tag_setter, get_item_rowid, insert_tag_item
+from src.db import (
+    add_tag_to_item,
+    create_tag_setter,
+    get_item_id,
+    insert_tag_item,
+)
 from src.types import ItemWithPath
 
 
@@ -80,15 +86,12 @@ def handle_individual_result(
         ]
     )
     for namespace, tag, confidence in tags:
-        tag_rowid = create_tag_setter(
-            conn, namespace=namespace, name=tag, setter=setter
-        )
-        item_rowid = get_item_rowid(conn, item.sha256)
-        assert item_rowid is not None
-        insert_tag_item(
+        add_tag_to_item(
             conn,
-            item_rowid=item_rowid,
-            tag_rowid=tag_rowid,
+            namespace=namespace,
+            name=tag,
+            sha256=item.sha256,
+            setter=setter,
             confidence=confidence,
         )
 

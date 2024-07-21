@@ -26,7 +26,8 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS items (
-        sha256 TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY,
+        sha256 TEXT UNIQUE NOT NULL,
         md5 TEXT NOT NULL,
         type TEXT,
         size INTEGER,          -- Size of the file in bytes
@@ -38,14 +39,14 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY,
         sha256 TEXT NOT NULL,
-        item INTEGER NOT NULL,            -- Foreign key to items table
+        item_id INTEGER NOT NULL,         -- Foreign key to items table
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
-        FOREIGN KEY(sha256) REFERENCES items(sha256)
-        FOREIGN KEY(item) REFERENCES items(rowid)
+        FOREIGN KEY(item_id) REFERENCES items(id)
     )
     """
     )
@@ -72,6 +73,7 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS tags_setters (
+        id INTEGER PRIMARY KEY,
         namespace TEXT NOT NULL,
         name TEXT NOT NULL,
         setter TEXT NOT NULL,
@@ -83,12 +85,12 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS tags_items (
-        item INTEGER NOT NULL,
-        tag INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        tag_id INTEGER NOT NULL,
         confidence REAL DEFAULT 1.0,
         UNIQUE(item, tag),
-        FOREIGN KEY(item) REFERENCES items(rowid) ON DELETE CASCADE
-        FOREIGN KEY(tag) REFERENCES tags_setters(rowid) ON DELETE CASCADE
+        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
+        FOREIGN KEY(tag_id) REFERENCES tags_setters(id) ON DELETE CASCADE
     )
     """
     )
@@ -142,10 +144,10 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS extraction_log_items (
-        item INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         UNIQUE(item, log_id), -- Unique constraint on item and log_id
-        FOREIGN KEY(item) REFERENCES items(rowid) ON DELETE CASCADE
+        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
     )
     """
@@ -203,9 +205,9 @@ def initialize_database(conn: sqlite3.Connection):
             """
         )
 
-    if is_column_in_table(conn, "files", "item"):
+    if is_column_in_table(conn, "files", "item_id"):
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_item ON files(item)"
+            "CREATE INDEX IF NOT EXISTS idx_files_item ON files(item_id)"
         )
 
 
@@ -225,34 +227,48 @@ def create_tag_setter(conn: sqlite3.Connection, namespace, name, setter):
         rowid: int = cursor.lastrowid
     else:
         rowid: int = cursor.execute(
-            "SELECT rowid FROM tags_setters WHERE namespace = ? AND name = ? AND setter = ?",
+            "SELECT id FROM tags_setters WHERE namespace = ? AND name = ? AND setter = ?",
             (namespace, name, setter),
         ).fetchone()[0]
     return rowid
 
 
 def insert_tag_item(
-    conn: sqlite3.Connection, item_rowid: int, tag_rowid: int, confidence=1.0
+    conn: sqlite3.Connection, item_id: int, tag_id: int, confidence=1.0
 ):
     # Round confidence to 3 decimal places
     confidence_float = round(float(confidence), 4)
     cursor = conn.cursor()
     cursor.execute(
         """
-    INSERT INTO tags_items (item, tag, confidence)
+    INSERT INTO tags_items (item_id, tag_id, confidence)
     VALUES (?, ?, ? )
-    ON CONFLICT(item, tag) DO UPDATE SET confidence=excluded.confidence
+    ON CONFLICT(item_id, tag_id) DO UPDATE SET confidence=excluded.confidence
     """,
-        (item_rowid, tag_rowid, confidence_float),
+        (item_id, tag_id, confidence_float),
     )
 
 
-def get_item_rowid(conn: sqlite3.Connection, sha256: str) -> int | None:
+def add_tag_to_item(
+    conn: sqlite3.Connection,
+    namespace: str,
+    name: str,
+    setter: str,
+    sha256: str,
+    confidence: float = 1.0,
+):
+    item_id = get_item_id(conn, sha256)
+    assert item_id is not None, f"Item with sha256 {sha256} not found"
+    tag_rowid = create_tag_setter(conn, namespace, name, setter)
+    insert_tag_item(conn, item_id, tag_rowid, confidence)
+
+
+def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
     cursor = conn.cursor()
-    cursor.execute("SELECT rowid FROM items WHERE sha256 = ?", (sha256,))
-    rowid = cursor.fetchone()
-    if rowid:
-        return rowid[0]
+    cursor.execute("SELECT id FROM items WHERE sha256 = ?", (sha256,))
+    item_id = cursor.fetchone()
+    if item_id:
+        return item_id[0]
     return None
 
 
@@ -310,13 +326,13 @@ def update_file_data(
         if not item_rowid:
             # If the item was not inserted, get the rowid from the database
             item_rowid = cursor.execute(
-                "SELECT rowid FROM items WHERE sha256 = ?", (sha256,)
+                "SELECT id FROM items WHERE sha256 = ?", (sha256,)
             ).fetchone()[0]
 
         # Path does not exist or has been modified, insert new
         file_insert_result = cursor.execute(
             """
-        INSERT INTO files (sha256, item, path, last_modified, last_seen, available)
+        INSERT INTO files (sha256, item_id, path, last_modified, last_seen, available)
         VALUES (?, ?, ?, ?, ?, TRUE)
         """,
             (sha256, item_rowid, path, last_modified, scan_time),
@@ -417,7 +433,8 @@ def is_column_in_table(
 
 def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
     """
-    Mark files as unavailable if their path is a subpath of `path` and they were not seen during the scan at `scan_time`
+    Mark files as unavailable if their path is a subpath of `path`
+    and they were not seen during the scan at `scan_time`
     """
     cursor = conn.cursor()
 
@@ -620,10 +637,10 @@ def add_item_to_log(
     log_id: int,
 ):
     cursor = conn.cursor()
-    item_id = get_item_rowid(conn, item)
+    item_id = get_item_id(conn, item)
     cursor.execute(
         """
-    INSERT INTO extraction_log_items (item, log_id)
+    INSERT INTO extraction_log_items (item_id, log_id)
     VALUES (?, ?)
     """,
         (item_id, log_id),
@@ -638,8 +655,10 @@ def get_items_missing_data_extraction(
 ):
     """
     Get all items that have not been scanned by the given setter.
-    More efficient than get_items_missing_tags as it does not require a join with the tags table.
-    It also avoids joining with the files table to get the path, instead getting paths one by one.
+    More efficient than get_items_missing_tags as it does not require
+    a join with the tags table.
+    It also avoids joining with the files table to get the path,
+    instead getting paths one by one.
     """
     clauses = f"""
     FROM items
@@ -648,7 +667,7 @@ def get_items_missing_data_extraction(
         FROM extraction_log_items
         JOIN data_extraction_log
         ON extraction_log_items.log_id = data_extraction_log.id
-        WHERE items.rowid = extraction_log_items.item
+        WHERE items.id = extraction_log_items.item_id
         AND data_extraction_log.type = ?
         AND data_extraction_log.setter = ?
         AND data_extraction_log.end_time IS NOT NULL
@@ -715,7 +734,7 @@ def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
         SELECT tags_items.rowid
         FROM tags_items
         JOIN tags_setters as tags
-        ON tags_items.tag = tags.rowid
+        ON tags_items.tag_id = tags.id
         AND tags.setter = ?
     )
     """,
@@ -807,9 +826,9 @@ def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
         """
     SELECT tags.namespace, tags.name, tags_items.confidence, tags.setter
     FROM items
-    JOIN tags_items ON items.rowid = tags_items.item
+    JOIN tags_items ON items.id = tags_items.item_id
     AND items.sha256 = ?
-    JOIN tags_setters as tags ON tags_items.tag = tags.rowid
+    JOIN tags_setters as tags ON tags_items.tag_id = tags.id
     """,
         (sha256,),
     )
@@ -849,13 +868,14 @@ def build_search_query(
     any_positive_tags_match: bool = False,
 ) -> Tuple[str, List[str | int | float]]:
     """
-    Build a query to search for files based on the given tags, negative tags, and other conditions.
+    Build a query to search for files based on the given tags,
+    negative tags, and other conditions.
     """
 
     # The item mimetype should start with the given item_type
     item_type_condition = (
         f"""
-        JOIN items ON files.item = items.rowid
+        JOIN items ON files.item_id = items.id
         AND items.type LIKE ? || '%'
     """
         if item_type
@@ -881,9 +901,9 @@ def build_search_query(
     negative_tags_condition = (
         f"""
         WHERE files.item NOT IN (
-            SELECT tags_items.item
+            SELECT tags_items.item_id
             FROM tags_setters as tags
-            JOIN tags_items ON tags.rowid = tags_items.tag
+            JOIN tags_items ON tags.id = tags_items.tag_id
             AND tags.name IN ({','.join(['?']*len(negative_tags))})
             {tag_setters_condition}
             {tag_namespace_condition}
@@ -897,7 +917,8 @@ def build_search_query(
     path_condition = (
         f" AND files.path LIKE ? || '%'" if include_path_prefix else ""
     )
-    # If tags are not provided, and no negative tags are provided, this needs to start a WHERE clause
+    # If tags are not provided, and no negative tags are provided,
+    # this needs to start a WHERE clause
     if include_path_prefix and not tags and not negative_tags:
         path_condition = f" WHERE files.path LIKE ? || '%'"
 
@@ -911,12 +932,12 @@ def build_search_query(
         f"""
         SELECT files.path, files.sha256, files.last_modified
         FROM tags_setters as tags
-        JOIN tags_items ON tags.rowid = tags_items.tag
+        JOIN tags_items ON tags.id = tags_items.tag_id
         AND tags.name IN ({','.join(['?']*len(tags))})
         {min_confidence_condition}
         {tag_setters_condition}
         {tag_namespace_condition}
-        JOIN files ON tags_items.item = files.item
+        JOIN files ON tags_items.item_id = files.item_id
         {path_condition}
         {item_type_condition}
         {negative_tags_condition}
@@ -1275,10 +1296,10 @@ def delete_items_without_files(
             """
         DELETE FROM items
         WHERE rowid IN (
-            SELECT items.rowid
+            SELECT items.id
             FROM items
-            LEFT JOIN files ON files.sha256 = items.sha256
-            WHERE files.sha256 IS NULL
+            LEFT JOIN files ON files.file_id = items.id
+            WHERE files.file_id IS NULL
             LIMIT ?
         )
         """,
@@ -1309,8 +1330,8 @@ def delete_tags_without_items(
         WHERE rowid IN (
             SELECT tags_items.rowid
             FROM tags_items
-            LEFT JOIN items ON items.rowid = tags_items.item
-            WHERE items.rowid IS NULL
+            LEFT JOIN items ON items.id = tags_items.item_id
+            WHERE items.id IS NULL
             LIMIT ?
         )
         """,
@@ -1342,8 +1363,8 @@ def delete_log_items_without_item(
         WHERE rowid IN (
             SELECT extraction_log_items.rowid
             FROM extraction_log_items
-            LEFT JOIN items ON items.rowid = extraction_log_items.item
-            WHERE items.rowid IS NULL
+            LEFT JOIN items ON items.id = extraction_log_items.item_id
+            WHERE items.id IS NULL
             LIMIT ?
         )
         """,
@@ -1396,7 +1417,7 @@ def get_most_common_tags(
     query = f"""
     SELECT namespace, name, COUNT(*) as count
     FROM tags_setters as tags
-    JOIN tags_items ON tags.rowid = tags_items.tag
+    JOIN tags_items ON tags.id = tags_items.tag_id
     {namespace_clause}
     {setters_clause}
     {confidence_clause}
@@ -1434,7 +1455,7 @@ def get_most_common_tags_frequency(
     cursor.execute(
         f"""
         SELECT COUNT(
-            DISTINCT extraction_log_items.item || '-' || data_extraction_log.setter
+            DISTINCT extraction_log_items.item_id || '-' || data_extraction_log.setter
         ) AS distinct_count
         FROM extraction_log_items
         JOIN data_extraction_log

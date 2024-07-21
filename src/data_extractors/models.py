@@ -405,3 +405,6 @@ class WhisperSTTModel(ModelOpts):
             f"Deleted text extracted from {items_affected} "
             + f"items by model {self.setter_id()}.\n"
         )
+
+    def supported_mime_types(self) -> List[str] | None:
+        return ["audio/", "video/"]

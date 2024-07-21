@@ -72,7 +72,13 @@ def update_folders(
         # Rollback the transaction on error
         conn.rollback()
         conn.close()
-        return f"Error: {e}", included_folders_text, excluded_folders_text
+        return (
+            f"Error: {e}",
+            included_folders_text,
+            excluded_folders_text,
+            fetch_scan_history(),
+            fetch_extraction_logs(),
+        )
 
     current_included_folders = get_folders_from_database(conn, included=True)
     current_excluded_folders = get_folders_from_database(conn, included=False)
