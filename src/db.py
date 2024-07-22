@@ -1141,7 +1141,7 @@ def build_search_query(
     # Negative tags should not be associated with the item
     negative_tags_condition = (
         f"""
-        WHERE files.item NOT IN (
+        WHERE files.item_id NOT IN (
             SELECT tags_items.item_id
             FROM tags_setters as tags
             JOIN tags_items ON tags.id = tags_items.tag_id
@@ -1257,16 +1257,21 @@ def build_search_query(
 
 
 def print_search_query(query_str: str, params: List[str | float | int]):
-    # Quote strings in params
-    quoted_params = [
-        f"'{param}'" if isinstance(param, str) else param for param in params
-    ]
-    formatted_query = query_str.replace("?", "{}").format(*quoted_params)
-    # Remove empty lines
-    formatted_query = "\n".join(
-        [line for line in formatted_query.split("\n") if line.strip() != ""]
-    )
-    print(formatted_query)
+    try:
+        # Quote strings in params
+        quoted_params = [
+            f"'{param}'" if isinstance(param, str) else param
+            for param in params
+        ]
+        formatted_query = query_str.replace("?", "{}").format(*quoted_params)
+        # Remove empty lines
+        formatted_query = "\n".join(
+            [line for line in formatted_query.split("\n") if line.strip() != ""]
+        )
+        print(formatted_query)
+    except Exception as e:
+        print(f"Error formatting query: {e}")
+        print(query_str, params)
 
 
 OrderByType = (
@@ -1324,9 +1329,11 @@ def search_files(
     if len(tags_match_any) == 1:
         # If only one tag is provided for "match any", we can just use it as a regular tag
         tags.append(tags_match_any[0])
+        tags_match_any = None
     if len(negative_tags_match_all) == 1:
         # If only one tag is provided for negative "match all", we can just use it as a regular negative tag
         negative_tags.append(negative_tags_match_all[0])
+        negative_tags_match_all = None
 
     tag_namespace = tag_namespace or None
     item_type = item_type or None
@@ -1496,8 +1503,12 @@ def search_files(
     LIMIT ? OFFSET ?
     """
     query_params: List[str | int | float] = [*params, page_size, offset]
-
-    cursor.execute(query, query_params)
+    try:
+        cursor.execute(query, query_params)
+    except Exception as e:
+        # Debugging
+        print_search_query(query, params)
+        raise e
     results_count = cursor.rowcount
     while row := cursor.fetchone():
         file = FileSearchResult(*row, get_mime_type(row[0]))  # type: ignore
