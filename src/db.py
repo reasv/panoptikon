@@ -1002,18 +1002,9 @@ class FileSearchResult:
 
 def build_extracted_text_fts_clause(
     match_extracted_text: str | None = None,
-    include_extracted_type_setter_pairs: (
+    require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
-    exclude_extracted_type_setter_pairs: (
-        List[Tuple[str, str]] | None
-    ) = None,  # Pairs of (type, setter) to exclude
-    include_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to include for extracted text
-    exclude_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to exclude for extracted text
 ):
     """
     Build a subquery to match extracted text based on the given conditions.
@@ -1026,37 +1017,14 @@ def build_extracted_text_fts_clause(
         extracted_text_conditions = ["et_fts.text MATCH ?"]
         extracted_text_params.append(match_extracted_text)
 
-        if include_extracted_type_setter_pairs:
+        if require_extracted_type_setter_pairs:
             include_pairs_conditions = " OR ".join(
                 ["(log.type = ? AND log.setter = ?)"]
-                * len(include_extracted_type_setter_pairs)
+                * len(require_extracted_type_setter_pairs)
             )
             extracted_text_conditions.append(f"({include_pairs_conditions})")
-            for type, setter in include_extracted_type_setter_pairs:
+            for type, setter in require_extracted_type_setter_pairs:
                 extracted_text_params.extend([type, setter])
-
-        if exclude_extracted_type_setter_pairs:
-            exclude_pairs_conditions = " OR ".join(
-                ["(log.type = ? AND log.setter = ?)"]
-                * len(exclude_extracted_type_setter_pairs)
-            )
-            extracted_text_conditions.append(
-                f"NOT ({exclude_pairs_conditions})"
-            )
-            for type, setter in exclude_extracted_type_setter_pairs:
-                extracted_text_params.extend([type, setter])
-
-        if include_extracted_types:
-            extracted_text_conditions.append(
-                f"log.type IN ({','.join(['?']*len(include_extracted_types))})"
-            )
-            extracted_text_params.extend(include_extracted_types)
-
-        if exclude_extracted_types:
-            extracted_text_conditions.append(
-                f"log.type NOT IN ({','.join(['?']*len(exclude_extracted_types))})"
-            )
-            extracted_text_params.extend(exclude_extracted_types)
 
         extracted_text_condition = f"""
         JOIN (
@@ -1088,15 +1056,6 @@ def build_search_query(
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
-    exclude_extracted_type_setter_pairs: (
-        List[Tuple[str, str]] | None
-    ) = None,  # Pairs of (type, setter) to exclude
-    require_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to include for extracted text
-    exclude_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to exclude for extracted text
 ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags,
@@ -1107,9 +1066,6 @@ def build_search_query(
         build_extracted_text_fts_clause(
             match_extracted_text,
             require_extracted_type_setter_pairs,
-            exclude_extracted_type_setter_pairs,
-            require_extracted_types,
-            exclude_extracted_types,
         )
     )
 
@@ -1299,15 +1255,6 @@ def search_files(
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
-    exclude_extracted_type_setter_pairs: (
-        List[Tuple[str, str]] | None
-    ) = None,  # Pairs of (type, setter) to exclude
-    require_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to include for extracted text
-    exclude_extracted_types: (
-        List[str] | None
-    ) = None,  # Types to exclude for extracted text
     order_by: OrderByType = "last_modified",
     order: OrderType = None,
     page_size: int | None = 1000,
@@ -1363,9 +1310,6 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            exclude_extracted_type_setter_pairs=exclude_extracted_type_setter_pairs,
-            require_extracted_types=require_extracted_types,
-            exclude_extracted_types=exclude_extracted_types,
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
@@ -1385,9 +1329,6 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            exclude_extracted_type_setter_pairs=exclude_extracted_type_setter_pairs,
-            require_extracted_types=require_extracted_types,
-            exclude_extracted_types=exclude_extracted_types,
         )
 
     if tags_match_any and tags:
