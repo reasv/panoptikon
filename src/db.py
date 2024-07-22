@@ -1043,12 +1043,12 @@ def build_extracted_text_fts_clause(
 def build_search_query(
     tags: List[str],
     negative_tags: List[str] | None = None,
-    tag_namespace: str | None = None,
+    tag_namespaces: List[str] = [],
     min_confidence: float | None = 0.5,
     setters: List[str] = [],
     all_setters_required: bool = False,
-    item_type: str | None = None,
-    include_path_prefix: str | None = None,
+    item_types: List[str] = [],
+    include_path_prefixes: List[str] = [],
     any_positive_tags_match: bool = False,
     match_path: str | None = None,
     match_filename: str | None = None,
@@ -1069,25 +1069,39 @@ def build_search_query(
         )
     )
 
-    # The item mimetype should start with the given item_type
-    item_type_condition = (
-        f"""
-        JOIN items ON files.item_id = items.id
-        AND items.type LIKE ? || '%'
-    """
-        if item_type
-        else ""
-    )
+    # The item mimetype should start with one of the given strings
+    item_type_condition = ""
+    if item_types:
+        if len(item_types) == 1:
+            item_type_condition = "AND items.type LIKE ? || '%'"
+        elif len(item_types) > 1:
+            item_type_condition = "AND ("
+            for i, _ in enumerate(item_types):
+                if i == 0:
+                    item_type_condition += "items.type LIKE ? || '%'"
+                else:
+                    item_type_condition += " OR items.type LIKE ? || '%'"
+            item_type_condition += ")"
+
     # The setter should match the given setter
     tag_setters_condition = (
         f" AND tags.setter IN ({','.join(['?']*len(setters))})"
         if setters
         else ""
     )
+
     # The namespace needs to *start* with the given namespace
-    tag_namespace_condition = (
-        " AND tags.namespace LIKE ? || '%'" if tag_namespace else ""
-    )
+    tag_namespace_condition = ""
+    if len(tag_namespaces) == 1:
+        tag_namespace_condition = " AND tags.namespace LIKE ? || '%'"
+    elif len(tag_namespaces) > 1:
+        tag_namespace_condition = " AND ("
+        for i, _ in enumerate(tag_namespaces):
+            if i == 0:
+                tag_namespace_condition += "tags.namespace LIKE ? || '%'"
+            else:
+                tag_namespace_condition += " OR tags.namespace LIKE ? || '%'"
+        tag_namespace_condition += ")"
 
     # The confidence should be greater than or equal to the given confidence
     min_confidence_condition = (
@@ -1110,14 +1124,25 @@ def build_search_query(
         if negative_tags
         else ""
     )
-    # The path needs to *start* with the given path prefix
-    path_condition = (
-        f" AND files.path LIKE ? || '%'" if include_path_prefix else ""
-    )
-    # If tags are not provided, and no negative tags are provided,
-    # this needs to start a WHERE clause
-    if include_path_prefix and not tags and not negative_tags:
-        path_condition = f" WHERE files.path LIKE ? || '%'"
+
+    path_condition = ""
+    if len(include_path_prefixes) > 0:
+        path_condition_start = "AND"
+        # If no negative or positive tags are provided,
+        # this needs to start a WHERE clause
+        if not tags and not negative_tags:
+            path_condition_start = "WHERE"
+        if len(include_path_prefixes) == 1:
+            # The path needs to *start* with the given path prefix
+            path_condition = f"{path_condition_start} files.path LIKE ? || '%'"
+        elif len(include_path_prefixes) > 1:
+            path_condition = f"{path_condition_start} ("
+            for i, _ in enumerate(include_path_prefixes):
+                if i == 0:
+                    path_condition += "files.path LIKE ? || '%'"
+                else:
+                    path_condition += " OR files.path LIKE ? || '%'"
+            path_condition += ")"
 
     having_clause = (
         "HAVING COUNT(DISTINCT tags.name) = ?"
@@ -1151,7 +1176,9 @@ def build_search_query(
         SELECT
             files.path,
             files.sha256,
-            files.last_modified{additional_select_columns}
+            files.last_modified,
+            items.type
+            {additional_select_columns}
         FROM tags_setters as tags
         JOIN tags_items ON tags.id = tags_items.tag_id
         AND tags.name IN ({','.join(['?']*len(tags))})
@@ -1160,6 +1187,7 @@ def build_search_query(
         {tag_namespace_condition}
         JOIN files ON tags_items.item_id = files.item_id
         {path_condition}
+        JOIN items ON files.item_id = items.id
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
@@ -1170,10 +1198,13 @@ def build_search_query(
         if tags
         else f"""
         SELECT
-        files.path,
-        files.sha256,
-        files.last_modified{additional_select_columns}
+            files.path,
+            files.sha256,
+            files.last_modified,
+            items.type
+            {additional_select_columns}
         FROM files
+        JOIN items ON files.item_id = items.id
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
@@ -1189,22 +1220,22 @@ def build_search_query(
                     *tags,
                     min_confidence,
                     *setters,
-                    tag_namespace,
+                    *tag_namespaces,
                 )
                 if tags
                 else ()
             ),
-            (include_path_prefix if tags else None),
-            item_type,
+            *(include_path_prefixes if tags else []),
+            *item_types,
             match_path,
             match_filename,
             *extracted_text_params,
             *(
-                (*negative_tags, *setters, tag_namespace, min_confidence)
+                (*negative_tags, *setters, *tag_namespaces, min_confidence)
                 if negative_tags
                 else ()
             ),
-            (include_path_prefix if not tags else None),
+            *(include_path_prefixes if not tags else []),
             (
                 # Number of tags to match, or number of tag-setter pairs to match if we require all setters to be present for all tags
                 (
@@ -1254,12 +1285,12 @@ def search_files(
     tags_match_any: List[str] | None = None,
     negative_tags: List[str] | None = None,
     negative_tags_match_all: List[str] | None = None,
-    tag_namespace: str | None = None,
+    tag_namespaces: List[str] | None = None,
     min_confidence: float | None = 0.5,
     setters: List[str] | None = None,
     all_setters_required: bool | None = False,
-    item_type: str | None = None,
-    include_path_prefix: str | None = None,
+    item_types: List[str] | None = None,
+    include_path_prefixes: List[str] | None = None,
     match_path: str | None = None,
     match_filename: str | None = None,
     match_extracted_text: str | None = None,
@@ -1293,9 +1324,9 @@ def search_files(
         negative_tags.append(negative_tags_match_all[0])
         negative_tags_match_all = None
 
-    tag_namespace = tag_namespace or None
-    item_type = item_type or None
-    include_path_prefix = include_path_prefix or None
+    tag_namespaces = tag_namespaces or []
+    item_types = item_types or []
+    include_path_prefixes = include_path_prefixes or []
     min_confidence = min_confidence or None
     setters = setters or []
 
@@ -1308,12 +1339,12 @@ def search_files(
         main_query, params = build_search_query(
             tags=tags_match_any,
             negative_tags=negative_tags,
-            tag_namespace=tag_namespace,
+            tag_namespaces=tag_namespaces,
             min_confidence=min_confidence,
             setters=setters,
             all_setters_required=False,
-            item_type=item_type,
-            include_path_prefix=include_path_prefix,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
             any_positive_tags_match=True,
             # FTS match on path and filename
             match_path=match_path,
@@ -1327,12 +1358,12 @@ def search_files(
         main_query, params = build_search_query(
             tags=tags,
             negative_tags=negative_tags,
-            tag_namespace=tag_namespace,
+            tag_namespaces=tag_namespaces,
             min_confidence=min_confidence,
             setters=setters,
             all_setters_required=all_setters_required,
-            item_type=item_type,
-            include_path_prefix=include_path_prefix,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
             any_positive_tags_match=False,
             # FTS match on path and filename
             match_path=match_path,
@@ -1349,12 +1380,12 @@ def search_files(
         tags_query, tags_params = build_search_query(
             tags=tags_match_any,
             negative_tags=None,
-            tag_namespace=tag_namespace,
+            tag_namespaces=tag_namespaces,
             min_confidence=min_confidence,
             setters=setters,
             all_setters_required=False,
-            item_type=item_type,
-            include_path_prefix=include_path_prefix,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
             any_positive_tags_match=True,
             # FTS match on path and filename
             match_path=match_path,
@@ -1379,12 +1410,12 @@ def search_files(
         negative_tags_query, negative_tags_params = build_search_query(
             tags=negative_tags_match_all,
             negative_tags=None,
-            tag_namespace=tag_namespace,
+            tag_namespaces=tag_namespaces,
             min_confidence=min_confidence,
             setters=setters,
             all_setters_required=all_setters_required,
-            item_type=item_type,
-            include_path_prefix=include_path_prefix,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
             any_positive_tags_match=False,
             # FTS match on path and filename
             match_path=match_path,
@@ -1475,7 +1506,7 @@ def search_files(
         raise e
     results_count = cursor.rowcount
     while row := cursor.fetchone():
-        file = FileSearchResult(*row[0:3], get_mime_type(row[0]))  # type: ignore
+        file = FileSearchResult(*row[0:4])
         if check_path_exists and not os.path.exists(file.path):
             continue
         yield file, total_count
@@ -1926,13 +1957,15 @@ def get_bookmarks(
         SELECT 
         COALESCE(available_files.path, any_files.path) as path,
         bookmarks.sha256,
-        COALESCE(MAX(available_files.last_modified), MAX(any_files.last_modified)) as last_modified
+        COALESCE(MAX(available_files.last_modified), MAX(any_files.last_modified)) as last_modified,
+        items.type
         FROM bookmarks
         LEFT JOIN files AS available_files 
                ON bookmarks.sha256 = available_files.sha256 
                AND available_files.available = 1
         JOIN files AS any_files 
                ON bookmarks.sha256 = any_files.sha256
+        JOIN items ON any_files.item_id = items.id
         WHERE bookmarks.namespace = ?
         GROUP BY bookmarks.sha256
         ORDER BY {order_by_clause}
@@ -1944,7 +1977,7 @@ def get_bookmarks(
 
     bookmarks: List[FileSearchResult] = []
     for row in cursor.fetchall():
-        item = FileSearchResult(*row, get_mime_type(row[0]))  # type: ignore
+        item = FileSearchResult(*row)
         if not os.path.exists(item.path):
             if file := get_existing_file_for_sha256(conn, item.sha256):
                 item.path = file.path
