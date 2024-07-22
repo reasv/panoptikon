@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import urllib.parse
 from time import time
+from typing import List, Tuple
 
 import gradio as gr
 
 import src.data_extractors.models as models
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import (
+    OrderByType,
+    OrderType,
     get_database_connection,
+    get_existing_type_setter_pairs,
     get_folders_from_database,
     search_files,
 )
@@ -21,8 +25,8 @@ def build_query(
     include_path: str | None = None,
     page_size: int = 10,
     page: int = 1,
-    order_by: str = "last_modified",
-    order=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
 ):
     if not include_path:
         include_path = ""
@@ -51,12 +55,18 @@ def search_by_tags(
     results_per_page: int,
     include_path: str | None = None,
     page: int = 1,
-    order_by: str = "last_modified",
-    order=None,
-    tag_setters=None,
-    all_setters_required=False,
-    item_type=None,
-    namespace_prefix=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType | None = None,
+    tag_setters: List[str] | None = None,
+    all_setters_required: bool = False,
+    item_type: str | None = None,
+    namespace_prefix: str | None = None,
+    path_search: str | None = None,
+    search_path_in: str = "full_path",
+    path_order_by_rank: bool = True,
+    extracted_text_search: str | None = None,
+    require_text_extractors: List[Tuple[str, str]] | None = None,
+    extracted_text_order_by_rank: bool = True,
 ):
     if page < 1:
         page = 1
@@ -95,8 +105,29 @@ def search_by_tags(
         + f"with min confidence {min_tag_confidence} under path prefix {include_path} "
         + f"with page size {results_per_page} and page {page} and order by {order_by} {order} "
         + f"and tag setters {tag_setters} and all setters required {all_setters_required} and "
-        + f"item type prefix {item_type} and namespace prefix {namespace_prefix}"
+        + f"item type prefix {item_type} and namespace prefix {namespace_prefix} "
+        + f"and path search {path_search} in {search_path_in} "
+        + f"and extracted text search {extracted_text_search} "
+        + f"and require text extractors {require_text_extractors} "
+        + f"and path order by rank {path_order_by_rank} "
+        + f"and extracted text order by rank {extracted_text_order_by_rank}"
     )
+    # Full text search on filename or path, or extracted text
+    match_path = None
+    match_filename = None
+    match_extracted_text = None
+    if path_search:
+        if search_path_in == "full_path":
+            match_path = path_search
+        else:
+            match_filename = path_search
+        if path_order_by_rank:
+            order_by = "rank_path_fts"
+    if extracted_text_search:
+        match_extracted_text = extracted_text_search
+        if extracted_text_order_by_rank:
+            order_by = "rank_fts"
+
     start = time()
     res_list = list(
         search_files(
@@ -111,6 +142,10 @@ def search_by_tags(
             all_setters_required=all_setters_required,
             item_type=item_type,
             include_path_prefix=include_path,
+            match_path=match_path,
+            match_filename=match_filename,
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_text_extractors,
             order_by=order_by,
             order=order,
             page=page,
@@ -151,12 +186,18 @@ def search_by_tags_search_button(
     results_per_page: int,
     include_path: str | None = None,
     page: int = 1,
-    order_by: str = "last_modified",
-    order=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
     tag_setters=None,
     all_setters_required=False,
     item_type=None,
     namespace_prefix=None,
+    path_search: str | None = None,
+    search_path_in: str = "full_path",
+    path_order_by_rank: bool = True,
+    extracted_text_search: str | None = None,
+    require_text_extractors: List[Tuple[str, str]] | None = None,
+    extracted_text_order_by_rank: bool = True,
 ):
     return search_by_tags(
         tags_str,
@@ -170,6 +211,12 @@ def search_by_tags_search_button(
         all_setters_required,
         item_type,
         namespace_prefix,
+        path_search,
+        search_path_in,
+        path_order_by_rank,
+        extracted_text_search,
+        require_text_extractors,
+        extracted_text_order_by_rank,
     )
 
 
@@ -179,12 +226,18 @@ def search_by_tags_next_page(
     results_per_page: int,
     include_path: str | None = None,
     page: int = 1,
-    order_by: str = "last_modified",
-    order=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
     tag_setters=None,
     all_setters_required=False,
     item_type=None,
     namespace_prefix=None,
+    path_search: str | None = None,
+    search_path_in: str = "full_path",
+    path_order_by_rank: bool = True,
+    extracted_text_search: str | None = None,
+    require_text_extractors: List[Tuple[str, str]] | None = None,
+    extracted_text_order_by_rank: bool = True,
 ):
     return search_by_tags(
         tags_str,
@@ -198,6 +251,12 @@ def search_by_tags_next_page(
         all_setters_required,
         item_type,
         namespace_prefix,
+        path_search,
+        search_path_in,
+        path_order_by_rank,
+        extracted_text_search,
+        require_text_extractors,
+        extracted_text_order_by_rank,
     )
 
 
@@ -207,12 +266,18 @@ def search_by_tags_previous_page(
     results_per_page: int,
     include_path: str | None = None,
     page: int = 1,
-    order_by: str = "last_modified",
-    order=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
     tag_setters=None,
     all_setters_required=False,
     item_type=None,
     namespace_prefix=None,
+    path_search: str | None = None,
+    search_path_in: str = "full_path",
+    path_order_by_rank: bool = True,
+    extracted_text_search: str | None = None,
+    require_text_extractors: List[Tuple[str, str]] | None = None,
+    extracted_text_order_by_rank: bool = True,
 ):
     return search_by_tags(
         tags_str,
@@ -226,6 +291,12 @@ def search_by_tags_previous_page(
         all_setters_required,
         item_type,
         namespace_prefix,
+        path_search,
+        search_path_in,
+        path_order_by_rank,
+        extracted_text_search,
+        require_text_extractors,
+        extracted_text_order_by_rank,
     )
 
 
@@ -236,8 +307,30 @@ def get_folder_list():
     return folders
 
 
+def get_setters_list():
+    conn = get_database_connection(force_readonly=True)
+    setters = get_existing_type_setter_pairs(conn)
+    conn.close()
+    return setters
+
+
 def on_tab_load():
-    return gr.update(choices=get_folder_list())
+    full_setters_list = get_setters_list()
+    setters = [
+        (f"{model_type}|{setter_id}", (model_type, setter_id))
+        for model_type, setter_id in full_setters_list
+        if model_type != "tags"
+    ]
+    existing_tag_setters = [
+        setter_id
+        for model_type, setter_id in full_setters_list
+        if model_type == "tags"
+    ]
+    return (
+        gr.update(choices=get_folder_list()),
+        gr.update(choices=setters),
+        gr.update(choices=existing_tag_setters),
+    )
 
 
 def on_tag_select(selectData: gr.SelectData):
@@ -370,7 +463,28 @@ def create_search_UI(
                                     value="full_path",
                                     scale=1,
                                 )
-                                order_by_rank_desc = gr.Checkbox(
+                                path_order_by_rank = gr.Checkbox(
+                                    label="Order results by relevance if this query is present",
+                                    interactive=True,
+                                    value=True,
+                                    scale=1,
+                                )
+                        with gr.Tab(label="Extracted Text Search"):
+                            with gr.Row():
+                                extracted_text_search = gr.Textbox(
+                                    label="SQL MATCH query on text exctracted by OCR/Whisper",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                require_text_extractors = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Only Search In Text From These Sources",
+                                    multiselect=True,
+                                    scale=1,
+                                )
+                                extracted_text_order_by_rank = gr.Checkbox(
                                     label="Order results by relevance if this query is present",
                                     interactive=True,
                                     value=True,
@@ -393,7 +507,14 @@ def create_search_UI(
             )
             next_page = gr.Button("Next Page", scale=1)
 
-    search_tab.select(fn=on_tab_load, outputs=[selected_folder])
+    search_tab.select(
+        fn=on_tab_load,
+        outputs=[
+            selected_folder,
+            require_text_extractors,
+            tag_setters,
+        ],
+    )
 
     submit_button.click(
         fn=search_by_tags_search_button,
@@ -409,6 +530,12 @@ def create_search_UI(
             all_setters_required,
             item_type,
             namespace_prefix,
+            path_search,
+            search_path_in,
+            path_order_by_rank,
+            extracted_text_search,
+            require_text_extractors,
+            extracted_text_order_by_rank,
         ],
         outputs=[multi_view.files, number_of_results, current_page, link],
     )
@@ -427,6 +554,12 @@ def create_search_UI(
             all_setters_required,
             item_type,
             namespace_prefix,
+            path_search,
+            search_path_in,
+            path_order_by_rank,
+            extracted_text_search,
+            require_text_extractors,
+            extracted_text_order_by_rank,
         ],
         outputs=[multi_view.files, number_of_results, current_page, link],
     )
@@ -445,6 +578,12 @@ def create_search_UI(
             all_setters_required,
             item_type,
             namespace_prefix,
+            path_search,
+            search_path_in,
+            path_order_by_rank,
+            extracted_text_search,
+            require_text_extractors,
+            extracted_text_order_by_rank,
         ],
         outputs=[multi_view.files, number_of_results, current_page, link],
     )
@@ -463,6 +602,12 @@ def create_search_UI(
             all_setters_required,
             item_type,
             namespace_prefix,
+            path_search,
+            search_path_in,
+            path_order_by_rank,
+            extracted_text_search,
+            require_text_extractors,
+            extracted_text_order_by_rank,
         ],
         outputs=[multi_view.files, number_of_results, current_page, link],
     )

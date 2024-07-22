@@ -2,7 +2,7 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Literal, Tuple
 
 from src.types import FileScanData, ItemWithPath
 from src.utils import get_mime_type, normalize_path
@@ -1000,6 +1000,78 @@ class FileSearchResult:
     type: str
 
 
+def build_extracted_text_fts_clause(
+    match_extracted_text: str | None = None,
+    include_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to include
+    exclude_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to exclude
+    include_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to include for extracted text
+    exclude_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to exclude for extracted text
+):
+    """
+    Build a subquery to match extracted text based on the given conditions.
+    """
+
+    # Define subquery for matching extracted text
+    extracted_text_condition = ""
+    extracted_text_params = []
+    if match_extracted_text:
+        extracted_text_conditions = ["et_fts.text MATCH ?"]
+        extracted_text_params.append(match_extracted_text)
+
+        if include_extracted_type_setter_pairs:
+            include_pairs_conditions = " OR ".join(
+                ["(log.type = ? AND log.setter = ?)"]
+                * len(include_extracted_type_setter_pairs)
+            )
+            extracted_text_conditions.append(f"({include_pairs_conditions})")
+            for type, setter in include_extracted_type_setter_pairs:
+                extracted_text_params.extend([type, setter])
+
+        if exclude_extracted_type_setter_pairs:
+            exclude_pairs_conditions = " OR ".join(
+                ["(log.type = ? AND log.setter = ?)"]
+                * len(exclude_extracted_type_setter_pairs)
+            )
+            extracted_text_conditions.append(
+                f"NOT ({exclude_pairs_conditions})"
+            )
+            for type, setter in exclude_extracted_type_setter_pairs:
+                extracted_text_params.extend([type, setter])
+
+        if include_extracted_types:
+            extracted_text_conditions.append(
+                f"log.type IN ({','.join(['?']*len(include_extracted_types))})"
+            )
+            extracted_text_params.extend(include_extracted_types)
+
+        if exclude_extracted_types:
+            extracted_text_conditions.append(
+                f"log.type NOT IN ({','.join(['?']*len(exclude_extracted_types))})"
+            )
+            extracted_text_params.extend(exclude_extracted_types)
+
+        extracted_text_condition = f"""
+        JOIN (
+            SELECT et.item_id, MAX(et_fts.rank) AS max_rank
+            FROM extracted_text_fts AS et_fts
+            JOIN extracted_text AS et ON et_fts.rowid = et.id
+            JOIN data_extraction_log AS log ON et.log_id = log.id
+            WHERE {" AND ".join(extracted_text_conditions)}
+            GROUP BY et.item_id
+        ) AS extracted_text_matches
+        ON files.item_id = extracted_text_matches.item_id
+        """
+    return extracted_text_condition, extracted_text_params
+
+
 def build_search_query(
     tags: List[str],
     negative_tags: List[str] | None = None,
@@ -1010,11 +1082,36 @@ def build_search_query(
     item_type: str | None = None,
     include_path_prefix: str | None = None,
     any_positive_tags_match: bool = False,
+    match_path: str | None = None,
+    match_filename: str | None = None,
+    match_extracted_text: str | None = None,
+    require_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to include
+    exclude_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to exclude
+    require_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to include for extracted text
+    exclude_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to exclude for extracted text
 ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags,
     negative tags, and other conditions.
     """
+    # The items should have text extracted by the given setters matching the query
+    extracted_text_condition, extracted_text_params = (
+        build_extracted_text_fts_clause(
+            match_extracted_text,
+            require_extracted_type_setter_pairs,
+            exclude_extracted_type_setter_pairs,
+            require_extracted_types,
+            exclude_extracted_types,
+        )
+    )
 
     # The item mimetype should start with the given item_type
     item_type_condition = (
@@ -1072,6 +1169,22 @@ def build_search_query(
         else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
     )
 
+    # If we need to match on the path or filename using FTS
+    path_match_condition = ""
+    if match_path or match_filename:
+        path_match_condition = f"""
+        JOIN files_path_fts AS path_fts
+        ON files.id = path_fts.rowid
+        """
+        if match_path:
+            path_match_condition += f"""
+            AND path_fts.path MATCH ?
+            """
+        if match_filename:
+            path_match_condition += f"""
+            AND path_fts.filename MATCH ?
+            """
+
     main_query = (
         f"""
         SELECT files.path, files.sha256, files.last_modified
@@ -1084,6 +1197,8 @@ def build_search_query(
         JOIN files ON tags_items.item_id = files.item_id
         {path_condition}
         {item_type_condition}
+        {path_match_condition}
+        {extracted_text_condition}
         {negative_tags_condition}
         GROUP BY files.path
         {having_clause if not any_positive_tags_match else ""}
@@ -1093,6 +1208,8 @@ def build_search_query(
         SELECT files.path, files.sha256, files.last_modified
         FROM files
         {item_type_condition}
+        {path_match_condition}
+        {extracted_text_condition}
         {negative_tags_condition}
         {path_condition}
     """
@@ -1112,6 +1229,9 @@ def build_search_query(
             ),
             (include_path_prefix if tags else None),
             item_type,
+            match_path,
+            match_filename,
+            *extracted_text_params,
             *(
                 (*negative_tags, *setters, tag_namespace, min_confidence)
                 if negative_tags
@@ -1149,6 +1269,13 @@ def print_search_query(query_str: str, params: List[str | float | int]):
     print(formatted_query)
 
 
+OrderByType = (
+    Literal["last_modified", "path", "rank_fts", "rank_path_fts"] | None
+)
+
+OrderType = Literal["asc", "desc"] | None
+
+
 def search_files(
     conn: sqlite3.Connection,
     tags: List[str],
@@ -1161,8 +1288,23 @@ def search_files(
     all_setters_required: bool | None = False,
     item_type: str | None = None,
     include_path_prefix: str | None = None,
-    order_by: str | None = "last_modified",
-    order: str | None = None,
+    match_path: str | None = None,
+    match_filename: str | None = None,
+    match_extracted_text: str | None = None,
+    require_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to include
+    exclude_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ) = None,  # Pairs of (type, setter) to exclude
+    require_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to include for extracted text
+    exclude_extracted_types: (
+        List[str] | None
+    ) = None,  # Types to exclude for extracted text
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
     page_size: int | None = 1000,
     page: int = 1,
     check_path_exists: bool = False,
@@ -1208,6 +1350,15 @@ def search_files(
             item_type=item_type,
             include_path_prefix=include_path_prefix,
             any_positive_tags_match=True,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            exclude_extracted_type_setter_pairs=exclude_extracted_type_setter_pairs,
+            require_extracted_types=require_extracted_types,
+            exclude_extracted_types=exclude_extracted_types,
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
@@ -1221,6 +1372,15 @@ def search_files(
             item_type=item_type,
             include_path_prefix=include_path_prefix,
             any_positive_tags_match=False,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            exclude_extracted_type_setter_pairs=exclude_extracted_type_setter_pairs,
+            require_extracted_types=require_extracted_types,
+            exclude_extracted_types=exclude_extracted_types,
         )
 
     if tags_match_any and tags:
@@ -1303,16 +1463,30 @@ def search_files(
     else:
         total_count = 0
 
-    if order_by == "path":
-        order_by_clause = "path"
-        # Default order differs for path and last_modified
-        if order == None:
-            order = "asc"
-    else:
-        order_by_clause = "last_modified"
-        if order == None:
-            order = "desc"
+    # Determine order_by_clause and default order setting based on order_by value
+    match order_by:
+        case "rank_fts":
+            if match_extracted_text:
+                order_by_clause = "extracted_text_matches.max_rank"
+            else:
+                order_by_clause = "last_modified"
+        case "rank_path_fts":
+            if match_path or match_filename:
+                order_by_clause = "path_fts.rank"
+            else:
+                order_by_clause = "last_modified"
+        case "path":
+            order_by_clause = "path"
+            # Default order for path is ascending
+            if order is None:
+                order = "asc"
+        case _:
+            order_by_clause = "last_modified"
 
+    # Default order for all other order_by values is descending
+    if order is None:
+        order = "desc"
+    # Determine the order clause
     order_clause = "DESC" if order == "desc" else "ASC"
 
     # Second query to get the items with pagination
@@ -1836,7 +2010,7 @@ def insert_extracted_text(
     return cursor.lastrowid
 
 
-def delete_extracted_text_from_setter(
+def delete_text_extracted_by_setter(
     conn: sqlite3.Connection, model_type: str, setter: str
 ):
     cursor = conn.cursor()
@@ -1854,43 +2028,26 @@ def delete_extracted_text_from_setter(
     )
 
 
-def full_text_search(
-    conn: sqlite3.Connection, query: str, page_size: int = 10, page: int = 1
-) -> Tuple[List[ItemWithPath], int]:
+def get_existing_type_setter_pairs(
+    conn: sqlite3.Connection,
+) -> List[Tuple[str, str]]:
     """
-    Perform a full-text search on the extracted_text table and return paginated results.
+    Returns all the currently existing (type, setter) pairs from the data_extraction_log table.
+
+    Args:
+        conn (sqlite3.Connection): The SQLite database connection.
 
     Returns:
-    Tuple[List[ItemWithPath], int]: A tuple containing a list of ItemWithPath objects and the total count of results
+        List[Tuple[str, str]]: A list of tuples containing (type, setter) pairs.
     """
+    query = """
+    SELECT DISTINCT type, setter
+    FROM data_extraction_log
+    """
+
     cursor = conn.cursor()
-    # Get the total count of results
-    count_sql = """
-    SELECT COUNT(DISTINCT i.id)
-    FROM extracted_text_fts AS fts
-    JOIN extracted_text AS et ON fts.rowid = et.id
-    JOIN items AS i ON et.item_id = i.id
-    JOIN files AS f ON i.id = f.item_id
-    WHERE fts.text MATCH ?
-    """
-    cursor.execute(count_sql, (query,))
-    total_count = cursor.fetchone()[0]
+    cursor.execute(query)
+    results = cursor.fetchall()
+    cursor.close()
 
-    # Perform the actual search with pagination
-    search_sql = """
-    SELECT DISTINCT i.sha256, i.md5, i.type, i.size, i.time_added, f.path
-    FROM extracted_text_fts AS fts
-    JOIN extracted_text AS et ON fts.rowid = et.id
-    JOIN items AS i ON et.item_id = i.id
-    JOIN files AS f ON i.id = f.item_id
-    WHERE fts.text MATCH ?
-    ORDER BY fts.rank
-    LIMIT ? OFFSET ?
-    """
-    page = max(1, page)
-    offset = (page - 1) * page_size
-    cursor.execute(search_sql, (query, page_size, offset))
-
-    results = [ItemWithPath(*row) for row in cursor.fetchall()]
-
-    return results, total_count
+    return results

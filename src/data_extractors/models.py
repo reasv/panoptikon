@@ -9,8 +9,8 @@ from src.data_extractors.extraction_jobs.types import (
 )
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import (
-    delete_extracted_text_from_setter,
     delete_tags_from_setter,
+    delete_text_extracted_by_setter,
     remove_setter_from_items,
 )
 
@@ -246,7 +246,7 @@ class OCRModel(ModelOpts):
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
         )
-        delete_extracted_text_from_setter(
+        delete_text_extracted_by_setter(
             conn, model_type=self.model_type(), setter=self.setter_id()
         )
         return (
@@ -409,7 +409,7 @@ class WhisperSTTModel(ModelOpts):
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
         )
-        delete_extracted_text_from_setter(
+        delete_text_extracted_by_setter(
             conn, model_type=self.model_type(), setter=self.setter_id()
         )
         return (
