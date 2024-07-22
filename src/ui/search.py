@@ -288,7 +288,7 @@ def create_search_UI(
                                         scale=2,
                                     )
                                     selected_folder = gr.Dropdown(
-                                        label="Limit search to items under path",
+                                        label="Restrict search to paths starting with",
                                         choices=[
                                             (folder, folder)
                                             for folder in get_folder_list()
@@ -333,6 +333,7 @@ def create_search_UI(
                                             "image/png",
                                             "image/jpeg",
                                             "video/mp4",
+                                            "video/webm",
                                         ],
                                         allow_custom_value=True,
                                         multiselect=False,
@@ -351,7 +352,30 @@ def create_search_UI(
                                         value=None,
                                         scale=2,
                                     )
-
+                        with gr.Tab(label="Filename & Path Search"):
+                            with gr.Row():
+                                path_search = gr.Textbox(
+                                    label="SQL MATCH query on filename or path",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                search_path_in = gr.Radio(
+                                    choices=[
+                                        ("Full Path", "full_path"),
+                                        ("Filename", "filename"),
+                                    ],
+                                    interactive=True,
+                                    label="Search in",
+                                    value="full_path",
+                                    scale=1,
+                                )
+                                order_by_rank_desc = gr.Checkbox(
+                                    label="Order results by relevance if this query is present",
+                                    interactive=True,
+                                    value=True,
+                                    scale=1,
+                                )
         multi_view = create_multiview(
             select_history=select_history,
             bookmarks_namespace=bookmarks_namespace,
