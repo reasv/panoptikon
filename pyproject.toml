@@ -26,6 +26,7 @@ python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
 python-dotenv = "^1.0.1"
 faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
+sqlite-vec = "^0.0.1a36"
 
 [[tool.poetry.source]]
 name = "pytorch_cuda"

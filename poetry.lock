@@ -5994,6 +5994,19 @@ pymysql = ["pymysql"]
 sqlcipher = ["sqlcipher3_binary"]
 
 [[package]]
+name = "sqlite-vec"
+version = "0.0.1a36"
+description = ""
+optional = false
+python-versions = "*"
+files = [
+    {file = "sqlite_vec-0.0.1a36-py3-none-macosx_10_6_x86_64.whl", hash = "sha256:a67c0535731b228e404b3c03c307739fa31fa6ed45219841f8ec8856a8ae7f05"},
+    {file = "sqlite_vec-0.0.1a36-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c27e0e8ccd2c5950ae790bb2dab40bef1619aed296452f6592f4e807e38c47fb"},
+    {file = "sqlite_vec-0.0.1a36-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux1_x86_64.whl", hash = "sha256:864df9df27908d8fe6014ba54bae8606cdb2435eb3775bbe9694daccb5178ee1"},
+    {file = "sqlite_vec-0.0.1a36-py3-none-win_amd64.whl", hash = "sha256:4f24b8bedbc9ad08777546b26b3f80a4125e1afc5c9fcfd7cbadf6ec7dcd49b3"},
+]
+
+[[package]]
 name = "starlette"
 version = "0.37.2"
 description = "The little ASGI library that shines."
@@ -7299,4 +7312,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "a211f0ed99288fbed0b65ce3b5aa5119cabbdb50f212a5f58f35377eaa0f1575"
+content-hash = "b698adfe89d27d9ffb881326a46fe0529ae831e09c562072963bb5b0d746bfd8"
