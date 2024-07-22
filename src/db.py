@@ -1056,6 +1056,8 @@ def build_search_query(
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
+    restrict_to_bookmarks: bool = False,
+    restrict_to_bookmark_namespaces: List[str] = [],
 ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags,
@@ -1171,6 +1173,22 @@ def build_search_query(
         additional_select_columns += (
             ",\n extracted_text_matches.max_rank AS rank_fts"
         )
+
+    # If this is set, we only search for files that are bookmarked
+    bookmarks_condition = ""
+    if restrict_to_bookmarks:
+        bookmarks_condition = (
+            "JOIN bookmarks ON files.sha256 = bookmarks.sha256"
+        )
+        if restrict_to_bookmark_namespaces:
+            bookmarks_condition += " AND bookmarks.namespace IN ("
+            for i, _ in enumerate(restrict_to_bookmark_namespaces):
+                if i == 0:
+                    bookmarks_condition += "?"
+                else:
+                    bookmarks_condition += ", ?"
+            bookmarks_condition += ")"
+
     main_query = (
         f"""
         SELECT
@@ -1191,6 +1209,7 @@ def build_search_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {bookmarks_condition}
         {negative_tags_condition}
         GROUP BY files.path
         {having_clause if not any_positive_tags_match else ""}
@@ -1208,6 +1227,7 @@ def build_search_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {bookmarks_condition}
         {negative_tags_condition}
         {path_condition}
     """
@@ -1230,6 +1250,7 @@ def build_search_query(
             match_path,
             match_filename,
             *extracted_text_params,
+            *restrict_to_bookmark_namespaces,
             *(
                 (*negative_tags, *setters, *tag_namespaces, min_confidence)
                 if negative_tags
@@ -1297,6 +1318,8 @@ def search_files(
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
+    restrict_to_bookmarks: bool = False,
+    restrict_to_bookmark_namespaces: List[str] | None = None,
     order_by: OrderByType = "last_modified",
     order: OrderType = None,
     page_size: int | None = 1000,
@@ -1329,6 +1352,7 @@ def search_files(
     include_path_prefixes = include_path_prefixes or []
     min_confidence = min_confidence or None
     setters = setters or []
+    restrict_to_bookmark_namespaces = restrict_to_bookmark_namespaces or []
 
     page_size = page_size or 1000000  # Mostly for debugging purposes
     offset = (page - 1) * page_size
@@ -1352,6 +1376,9 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
@@ -1371,6 +1398,9 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
         )
 
     if tags_match_any and tags:
@@ -1393,6 +1423,9 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
         )
 
         # Append the tags query to the main query
@@ -1423,6 +1456,9 @@ def search_files(
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
         )
 
         # Append the negative tags query to the main query
