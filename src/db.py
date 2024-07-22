@@ -2,7 +2,6 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from fileinput import filename
 from typing import List, Tuple
 
 from src.types import FileScanData, ItemWithPath
@@ -176,40 +175,45 @@ def initialize_database(conn: sqlite3.Connection):
         USING fts5(
             text,
             content="extracted_text",
-            content_rowid="id"
+            content_rowid="id",
+            tokenize="porter unicode61 remove_diacritics 2"
         )
         """
     )
-    if trigger_exists(conn, "extracted_text_insert"):
-        cursor.execute("DROP TRIGGER extracted_text_insert")
+    if trigger_exists(conn, "extracted_text_ai"):
+        cursor.execute("DROP TRIGGER extracted_text_ai")
     # Triggers to keep the FTS index up to date.
     cursor.execute(
         """
-        CREATE TRIGGER extracted_text_insert AFTER INSERT ON extracted_text BEGIN
-        INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
+        CREATE TRIGGER extracted_text_ai AFTER INSERT ON extracted_text BEGIN
+            INSERT INTO extracted_text_fts(rowid, text)
+            VALUES (new.id, new.text);
         END;
     """
     )
 
-    if trigger_exists(conn, "extracted_text_delete"):
-        cursor.execute("DROP TRIGGER extracted_text_delete")
+    if trigger_exists(conn, "extracted_text_ad"):
+        cursor.execute("DROP TRIGGER extracted_text_ad")
 
     cursor.execute(
         """
-        CREATE TRIGGER extracted_text_delete AFTER DELETE ON extracted_text BEGIN
-        INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
+        CREATE TRIGGER extracted_text_ad AFTER DELETE ON extracted_text BEGIN
+            INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text)
+            VALUES('delete', old.id, old.text);
         END;
     """
     )
 
-    if trigger_exists(conn, "extracted_text_update"):
-        cursor.execute("DROP TRIGGER extracted_text_update")
+    if trigger_exists(conn, "extracted_text_au"):
+        cursor.execute("DROP TRIGGER extracted_text_au")
 
     cursor.execute(
         """
-        CREATE TRIGGER extracted_text_update AFTER UPDATE ON extracted_text BEGIN
-        INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text) VALUES('delete', old.id, old.text);
-        INSERT INTO extracted_text_fts(rowid, text) VALUES (new.id, new.text);
+        CREATE TRIGGER extracted_text_au AFTER UPDATE ON extracted_text BEGIN
+            INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text)
+            VALUES('delete', old.id, old.text);
+            INSERT INTO extracted_text_fts(rowid, text)
+            VALUES (new.id, new.text);
         END;
     """
     )
@@ -222,7 +226,8 @@ def initialize_database(conn: sqlite3.Connection):
             path,
             filename,
             content='files',
-            content_rowid='id'
+            content_rowid='id',
+            tokenize='trigram case_sensitive 0'
         );
     """
     )
@@ -233,8 +238,8 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """ 
         CREATE TRIGGER files_path_ai AFTER INSERT ON files BEGIN
-        INSERT INTO files_path_fts(rowid, path, filename) 
-        VALUES (new.id, new.path, new.filename);
+            INSERT INTO files_path_fts(rowid, path, filename) 
+            VALUES (new.id, new.path, new.filename);
         END;
     """
     )
@@ -245,8 +250,8 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
         CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
-        INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
-        VALUES('delete', old.id, old.path, old.filename);
+            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+            VALUES('delete', old.id, old.path, old.filename);
         END;
         """
     )
@@ -256,10 +261,10 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
         CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
-        INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
-        VALUES('delete', old.id, old.path, old.filename);
-        INSERT INTO files_path_fts(rowid, path, filename) 
-        VALUES (new.id, new.path, new.filename);
+            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+            VALUES('delete', old.id, old.path, old.filename);
+            INSERT INTO files_path_fts(rowid, path, filename) 
+            VALUES (new.id, new.path, new.filename);
         END;
     """
     )
