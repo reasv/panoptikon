@@ -1125,9 +1125,11 @@ def build_search_query(
         else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
     )
 
+    additional_select_columns = ""
     # If we need to match on the path or filename using FTS
     path_match_condition = ""
     if match_path or match_filename:
+        additional_select_columns = ",\n path_fts.rank as rank_path_fts"
         path_match_condition = f"""
         JOIN files_path_fts AS path_fts
         ON files.id = path_fts.rowid
@@ -1140,10 +1142,16 @@ def build_search_query(
             path_match_condition += f"""
             AND path_fts.filename MATCH ?
             """
-
+    if match_extracted_text:
+        additional_select_columns += (
+            ",\n extracted_text_matches.max_rank AS rank_fts"
+        )
     main_query = (
         f"""
-        SELECT files.path, files.sha256, files.last_modified
+        SELECT
+            files.path,
+            files.sha256,
+            files.last_modified{additional_select_columns}
         FROM tags_setters as tags
         JOIN tags_items ON tags.id = tags_items.tag_id
         AND tags.name IN ({','.join(['?']*len(tags))})
@@ -1161,7 +1169,10 @@ def build_search_query(
     """
         if tags
         else f"""
-        SELECT files.path, files.sha256, files.last_modified
+        SELECT
+        files.path,
+        files.sha256,
+        files.last_modified{additional_select_columns}
         FROM files
         {item_type_condition}
         {path_match_condition}
@@ -1345,6 +1356,12 @@ def search_files(
             item_type=item_type,
             include_path_prefix=include_path_prefix,
             any_positive_tags_match=True,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
         )
 
         # Append the tags query to the main query
@@ -1369,6 +1386,12 @@ def search_files(
             item_type=item_type,
             include_path_prefix=include_path_prefix,
             any_positive_tags_match=False,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
         )
 
         # Append the negative tags query to the main query
@@ -1415,12 +1438,12 @@ def search_files(
     match order_by:
         case "rank_fts":
             if match_extracted_text:
-                order_by_clause = "extracted_text_matches.max_rank"
+                order_by_clause = "rank_fts"
             else:
                 order_by_clause = "last_modified"
         case "rank_path_fts":
             if match_path or match_filename:
-                order_by_clause = "path_fts.rank"
+                order_by_clause = "rank_path_fts"
             else:
                 order_by_clause = "last_modified"
         case "path":
@@ -1452,7 +1475,7 @@ def search_files(
         raise e
     results_count = cursor.rowcount
     while row := cursor.fetchone():
-        file = FileSearchResult(*row, get_mime_type(row[0]))  # type: ignore
+        file = FileSearchResult(*row[0:3], get_mime_type(row[0]))  # type: ignore
         if check_path_exists and not os.path.exists(file.path):
             continue
         yield file, total_count
