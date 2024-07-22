@@ -8,7 +8,7 @@ from src.db import get_database_connection
 
 
 def arbitrary_query(query: str, query_history: List):
-    conn = get_database_connection()
+    conn = get_database_connection(force_readonly=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
     try:
@@ -47,7 +47,9 @@ def create_query_UI():
     ]
     query_history = gr.State(initial_history)
     with gr.TabItem(label="Query Database"):
-        query = gr.Textbox(label="Enter your SQL query here", lines=20)
+        query = gr.Textbox(
+            label="Enter your SQL query here (Read Only)", lines=20
+        )
         run_query = gr.Button("Run Query")
         with gr.Tabs():
             with gr.Tab(label="Results"):
