@@ -1507,7 +1507,7 @@ def search_files(
         cursor.execute(query, query_params)
     except Exception as e:
         # Debugging
-        print_search_query(query, params)
+        print_search_query(query, query_params)
         raise e
     results_count = cursor.rowcount
     while row := cursor.fetchone():
