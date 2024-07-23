@@ -814,7 +814,6 @@ def get_items_missing_data_extraction(
         WHERE items.id = extraction_log_items.item_id
         AND data_extraction_log.type = ?
         AND data_extraction_log.setter = ?
-        AND data_extraction_log.end_time IS NOT NULL
     )
     """
     if mime_type_filter:
