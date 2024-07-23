@@ -12,24 +12,7 @@ from src.db import (
 from src.types import ExtractedText
 
 
-def on_text_picker_change(
-    choice: Tuple[str, str] | None, texts: List[ExtractedText]
-):
-    if choice is None:
-        return gr.update(value="", visible=False)
-    model_type, setter = choice
-    text = next(
-        (t for t in texts if t.setter == setter and t.model_type == model_type),
-        None,
-    )
-    if text is not None:
-        return gr.update(value=text.text, visible=True)
-    return gr.update(value="", visible=False)
-
-
-def on_item_change(
-    selected_files: List[FileSearchResult], chosen_text_setter: Tuple[str, str]
-):
+def on_item_change(selected_files: List[FileSearchResult]):
     if len(selected_files) == 0:
         return [], gr.update(choices=[]), gr.update(value="", visible=False)
 
@@ -45,46 +28,59 @@ def on_item_change(
         if model_type not in ["tags", "clip"]
     ]
     conn.close()
-    return (
-        extracted_texts,
-        gr.update(choices=choices),
-        on_text_picker_change(chosen_text_setter, extracted_texts),
-    )
+    return extracted_texts, gr.update(choices=choices)
 
 
 @dataclass
 class TextViewer:
     texts: gr.State
     text_picker: gr.Dropdown
-    extracted_text: gr.Textbox
 
 
 def create_text_viewer(selected_items: gr.State):
-    texts_state = gr.State([])
-    text_picker = gr.Dropdown(
-        choices=[], label="View Text Extracted by Model", value=None
-    )
-    extracted_text = gr.Textbox(
-        label="Extracted Text",
-        interactive=False,
-        lines=5,
-        visible=False,
-    )
+    with gr.Column():
+        with gr.Row():
+            texts_state = gr.State([])
+            text_picker = gr.Dropdown(
+                type="value",
+                choices=[],
+                interactive=True,
+                multiselect=True,
+                label="View Text Extracted by Model(s)",
+            )
 
-    text_picker.select(
-        fn=on_text_picker_change,
-        inputs=[text_picker, texts_state],
-        outputs=[extracted_text],
-    )
+        @gr.render(inputs=[text_picker, texts_state])
+        def show_text(
+            text_picker: List[Tuple[str, str]] | None,
+            texts_state: List[ExtractedText],
+        ):
+            if text_picker is None:
+                return
+            for model_type, setter in text_picker:
+                text = next(
+                    (
+                        t
+                        for t in texts_state
+                        if t.setter == setter and t.model_type == model_type
+                    ),
+                    None,
+                )
+                if text is not None:
+                    with gr.Row():
+                        gr.Textbox(
+                            label=f"Source: {model_type} ({setter})",
+                            interactive=False,
+                            lines=4,
+                            value=text.text,
+                        )
 
     selected_items.change(
         fn=on_item_change,
-        inputs=[selected_items, text_picker],
-        outputs=[texts_state, text_picker, extracted_text],
+        inputs=[selected_items],
+        outputs=[texts_state, text_picker],
     )
 
     return TextViewer(
         texts=texts_state,
         text_picker=text_picker,
-        extracted_text=extracted_text,
     )
