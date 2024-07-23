@@ -3,13 +3,13 @@ from typing import List, Tuple
 
 import gradio as gr
 
-from src.data_extractors.utils import ExtractedText
 from src.db import (
     FileSearchResult,
     get_database_connection,
     get_existing_type_setter_pairs,
     get_extracted_text_for_item,
 )
+from src.types import ExtractedText
 
 
 def on_text_picker_change(choice: Tuple[str, str], texts: List[ExtractedText]):

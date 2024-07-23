@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Literal, Tuple
 
-from src.types import FileScanData, ItemWithPath
-from src.utils import get_mime_type, normalize_path
+from src.types import ExtractedText, FileScanData, ItemWithPath
+from src.utils import normalize_path
 
 
 def get_database_connection(force_readonly=False) -> sqlite3.Connection:
@@ -2052,6 +2052,48 @@ def insert_extracted_text(
     cursor.execute(sql, (item_id, log_id, language, confidence, text))
     assert cursor.lastrowid is not None, "Last row ID is None"
     return cursor.lastrowid
+
+
+def get_extracted_text_for_item(
+    conn: sqlite3.Connection, item_sha256: str
+) -> List[ExtractedText]:
+    """
+    Get all extracted text for an item
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT
+            items.sha256 as item_sha256,
+            log.type as model_type,
+            log.setter,
+            language,
+            text,
+            confidence
+        FROM extracted_text
+        JOIN data_extraction_log AS log
+        ON extracted_text.log_id = log.id
+        JOIN items ON extracted_text.item_id = items.id
+        WHERE items.sha256 = ?
+    """,
+        (item_sha256,),
+    )
+    rows = cursor.fetchall()
+
+    # Map each row to an ExtractedText dataclass instance
+    extracted_texts = [
+        ExtractedText(
+            item_sha256=row[0],
+            model_type=row[1],
+            setter=row[2],
+            language=row[3],
+            text=row[4],
+            confidence=row[5],
+            score=0,
+        )
+        for row in rows
+    ]
+    return extracted_texts
 
 
 def delete_text_extracted_by_setter(

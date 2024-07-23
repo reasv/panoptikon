@@ -21,3 +21,14 @@ class ItemWithPath:
     size: int
     time_added: str
     path: str
+
+
+@dataclass
+class ExtractedText:
+    item_sha256: str
+    model_type: str
+    setter: str
+    language: str
+    text: str
+    confidence: float | None
+    score: float

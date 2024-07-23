@@ -5,11 +5,6 @@ from typing import List
 
 import gradio as gr
 
-from src.data_extractors.text_embeddings import (
-    ExtractedText,
-    retrieve_item_text,
-)
-from src.data_extractors.utils import get_chromadb_client
 from src.db import (
     FileSearchResult,
     get_all_tags_for_item_name_confidence,
@@ -18,6 +13,7 @@ from src.db import (
 from src.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
 )
+from src.ui.components.text_viewer import create_text_viewer
 from src.ui.components.utils import (
     get_thumbnail,
     on_selected_image_get_bookmark_state,
@@ -36,9 +32,7 @@ def on_files_change(files: List[FileSearchResult]):
 
 def on_selected_files_change_extra_actions(extra_actions: List[str]):
     def on_selected_files_change(
-        selected_files: List[FileSearchResult],
-        selected_image_path: str,
-        selected_text_setter: str,
+        selected_files: List[FileSearchResult], selected_image_path: str
     ):
         nonlocal extra_actions
         if len(selected_files) == 0:
@@ -75,21 +69,6 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                     interactive = False
                     path = None
 
-                cdb = get_chromadb_client()
-                print(f"Retrieving text for {selected_file.sha256}")
-                extracted_text = retrieve_item_text(cdb, selected_file.sha256)
-                print(f"Extracted text: {extracted_text}")
-                print([text.text for text in extracted_text])
-                setters = set([text.setter for text in extracted_text])
-                print(f"Extracted text: {setters}")
-                selected_text = next(
-                    (
-                        t.text
-                        for t in extracted_text
-                        if t.setter == selected_text_setter
-                    ),
-                    None,
-                )
                 updates = (
                     tags,
                     text,
@@ -98,11 +77,6 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                     gr.update(interactive=interactive),
                     gr.update(interactive=interactive),
                     gr.update(interactive=interactive),
-                    extracted_text,
-                    gr.update(choices=list(setters)),  # Update the text picker
-                    gr.update(
-                        value=selected_text, visible=True
-                    ),  # Update the extracted text
                 )
             else:
                 updates = (
@@ -113,9 +87,6 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                     gr.update(),
                     gr.update(),
                     gr.update(),
-                    gr.update(),  # Update the text state
-                    gr.update(),  # Update the text picker
-                    gr.update(),  # Update the extracted text
                 )
         # Add updates to the tuple for extra actions
         for _ in extra_actions:
@@ -141,15 +112,8 @@ def on_select_image(
     return selected_files
 
 
-def on_text_picker_change(evt: str, texts: List[ExtractedText]):
-    print(f"Selected text picker: {evt}")
-    text = next((t for t in texts if t.setter == evt), None)
-    if text is not None:
-        return gr.update(value=text.text, visible=True)
-    return gr.update(value="", visible=False)
-
-
-# We define a dataclass to use as return value for create_image_list which contains all the components we want to expose
+# We define a dataclass to use as return value for create_image_list
+# which contains all the components we want to expose
 @dataclass
 class ImageList:
     file_list: gr.Dataset
@@ -227,16 +191,8 @@ def create_image_list(
                 extra: List[gr.Button] = []
                 for action in extra_actions:
                     extra.append(gr.Button(action, interactive=False, scale=3))
-                texts_state = gr.State([])
-                text_picker = gr.Dropdown(
-                    choices=[], label="View Text Extracted by Model", value=None
-                )
-                extracted_text = gr.Textbox(
-                    label="Extracted Text",
-                    interactive=False,
-                    lines=5,
-                    visible=False,
-                )
+            with gr.Row():
+                create_text_viewer(selected_files)
 
     files.change(
         fn=on_files_change, inputs=[files], outputs=[file_list, selected_files]
@@ -250,7 +206,7 @@ def create_image_list(
 
     selected_files.change(
         fn=on_selected_files_change_extra_actions(extra_actions),
-        inputs=[selected_files, selected_image_path, text_picker],
+        inputs=[selected_files, selected_image_path],
         outputs=[
             tag_list,
             tag_text,
@@ -259,9 +215,6 @@ def create_image_list(
             btn_open_file,
             btn_open_file_explorer,
             bookmark,
-            texts_state,
-            text_picker,
-            extracted_text,
             *extra,
         ],
     )
@@ -274,12 +227,6 @@ def create_image_list(
     btn_open_file_explorer.click(
         fn=open_in_explorer,
         inputs=selected_image_path,
-    )
-
-    text_picker.select(
-        fn=on_text_picker_change,
-        inputs=[text_picker, texts_state],
-        outputs=[extracted_text],
     )
 
     if bookmarks_namespace != None:

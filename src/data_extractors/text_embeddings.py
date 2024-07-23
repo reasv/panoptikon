@@ -6,7 +6,6 @@ from chromadb.api import ClientAPI
 from src.data_extractors.models import ModelOpts
 from src.data_extractors.utils import (
     ExtractedText,
-    process_result_single_query,
     query_result_to_file_search_result,
 )
 from src.types import ItemWithPath
@@ -87,20 +86,6 @@ def search_item_text(
     )
 
     return query_result_to_file_search_result(conn, results)
-
-
-def retrieve_item_text(
-    cdb: ClientAPI,
-    item_sha256: str,
-) -> List[ExtractedText]:
-    collection = get_text_collection(cdb)
-
-    results = collection.query(
-        query_texts="",
-        where={"item": item_sha256},
-    )
-
-    return process_result_single_query(results)
 
 
 def delete_all_text_from_model(cdb: ClientAPI, model_opt: ModelOpts):

@@ -9,19 +9,8 @@ from chromadb.api.types import QueryResult
 from chromadb.types import Metadata
 
 from src.db import FileSearchResult, get_existing_file_for_sha256
-
-
-@dataclass
-class ExtractedText:
-    cdb_id: str
-    item: str
-    source: str
-    setter: str
-    language: str
-    type: str
-    general_type: str
-    text: str
-    score: float
+from src.types import ExtractedText
+from src.utils import get_mime_type
 
 
 def query_result_to_file_search_result(
@@ -29,9 +18,9 @@ def query_result_to_file_search_result(
 ):
     items: Dict[str, List[ExtractedText]] = {}
     for extracted_text in process_result_single_query(results):
-        if extracted_text.item not in items:
-            items[extracted_text.item] = []
-        items[extracted_text.item].append(extracted_text)
+        if extracted_text.item_sha256 not in items:
+            items[extracted_text.item_sha256] = []
+        items[extracted_text.item_sha256].append(extracted_text)
 
     results_scores: List[Tuple[FileSearchResult, float]] = []
     for sha256, text_list in items.items():
@@ -46,7 +35,7 @@ def query_result_to_file_search_result(
                     path=file.path,
                     sha256=file.sha256,
                     last_modified=file.last_modified,
-                    type=text_list[0].type,
+                    type=get_mime_type(file.path) or "unknown",
                 ),
                 highest_score,
             )
@@ -91,17 +80,13 @@ def process_single_result(
     assert isinstance(metadata["source"], str)
     assert isinstance(metadata["setter"], str)
     assert isinstance(metadata["language"], str)
-    assert isinstance(metadata["type"], str)
-    assert isinstance(metadata["general_type"], str)
     return ExtractedText(
-        cdb_id=id,
-        item=metadata["item"],
-        source=metadata["source"],
+        item_sha256=metadata["item"],
+        model_type=metadata["source"],
         setter=metadata["setter"],
         language=metadata["language"],
-        type=metadata["type"],
-        general_type=metadata["general_type"],
         text=document,
+        confidence=None,
         score=score,
     )
 
