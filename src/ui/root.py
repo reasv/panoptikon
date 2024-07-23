@@ -19,7 +19,7 @@ def create_root_UI():
         bookmarks_namespace = gr.State(value="default")
         with gr.Tabs():
             create_search_UI(
-                select_history, bookmarks_namespace=bookmarks_namespace
+                ui, select_history, bookmarks_namespace=bookmarks_namespace
             )
             create_semantic_search_UI(
                 select_history, bookmarks_namespace=bookmarks_namespace

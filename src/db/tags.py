@@ -156,3 +156,20 @@ def delete_tags_without_items(
             break
 
     return total_deleted
+
+
+def get_all_tag_namespaces(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT DISTINCT namespace
+    FROM tags_setters
+    """
+    )
+    namespaces = [namespace[0] for namespace in cursor.fetchall()]
+    namespace_prefixes = set(
+        [namespace.split(":")[0] for namespace in namespaces]
+    )
+    namespaces += list(namespace_prefixes)
+    namespaces.sort()
+    return namespaces

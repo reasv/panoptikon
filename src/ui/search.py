@@ -6,12 +6,14 @@ from typing import List, Tuple
 
 import gradio as gr
 
-import src.data_extractors.models as models
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
+from src.db.bookmarks import get_all_bookmark_namespaces
 from src.db.extraction_log import get_existing_type_setter_pairs
+from src.db.files import get_all_mime_types
 from src.db.folders import get_folders_from_database
 from src.db.search import search_files
+from src.db.tags import get_all_tag_namespaces
 from src.types import OrderByType, OrderType
 from src.ui.components.multi_view import create_multiview
 
@@ -64,6 +66,8 @@ def search(
     extracted_text_search: str | None = None,
     require_text_extractors: List[Tuple[str, str]] | None = None,
     extracted_text_order_by_rank: bool = True,
+    search_in_bookmarks: bool = False,
+    bookmark_namespaces: List[str] | None = None,
     search_action: str | None = None,
 ):
     if search_action == "search_button":
@@ -118,7 +122,8 @@ def search(
         + f"and extracted text search {extracted_text_search} "
         + f"and require text extractors {require_text_extractors} "
         + f"and path order by rank {path_order_by_rank} "
-        + f"and extracted text order by rank {extracted_text_order_by_rank}"
+        + f"and extracted text order by rank {extracted_text_order_by_rank} "
+        + f"and search in bookmarks {search_in_bookmarks} and bookmark namespaces {bookmark_namespaces}"
     )
     # Full text search on filename or path, or extracted text
     match_path = None
@@ -154,6 +159,8 @@ def search(
             match_filename=match_filename,
             match_extracted_text=match_extracted_text,
             require_extracted_type_setter_pairs=require_text_extractors,
+            restrict_to_bookmarks=search_in_bookmarks,
+            restrict_to_bookmark_namespaces=bookmark_namespaces,
             order_by=order_by,
             order=order,
             page=page,
@@ -188,36 +195,31 @@ def search(
     )
 
 
-def get_folder_list():
-    conn = get_database_connection(write_lock=False)
-    folders = get_folders_from_database(conn)
-    conn.close()
-    return folders
-
-
-def get_setters_list():
-    conn = get_database_connection(write_lock=False)
-    setters = get_existing_type_setter_pairs(conn)
-    conn.close()
-    return setters
-
-
 def on_tab_load():
-    full_setters_list = get_setters_list()
-    setters = [
+    conn = get_database_connection(write_lock=False)
+    full_setters_list = get_existing_type_setter_pairs(conn)
+    extracted_text_setters = [
         (f"{model_type}|{setter_id}", (model_type, setter_id))
         for model_type, setter_id in full_setters_list
         if model_type != "tags"
     ]
-    existing_tag_setters = [
+    tag_setters = [
         setter_id
         for model_type, setter_id in full_setters_list
         if model_type == "tags"
     ]
+    bookmark_namespaces = get_all_bookmark_namespaces(conn)
+    file_types = get_all_mime_types(conn)
+    tag_namespaces = get_all_tag_namespaces(conn)
+    folders = get_folders_from_database(conn)
+    conn.close()
     return (
-        gr.update(choices=get_folder_list()),
-        gr.update(choices=setters),
-        gr.update(choices=existing_tag_setters),
+        gr.update(choices=folders),
+        gr.update(choices=extracted_text_setters),
+        gr.update(choices=tag_setters),
+        gr.update(choices=tag_namespaces),
+        gr.update(choices=bookmark_namespaces),
+        gr.update(choices=file_types),
     )
 
 
@@ -226,6 +228,7 @@ def on_tag_select(selectData: gr.SelectData):
 
 
 def create_search_UI(
+    app: gr.Blocks,
     select_history: gr.State | None = None,
     bookmarks_namespace: gr.State | None = None,
 ):
@@ -268,12 +271,9 @@ def create_search_UI(
                                         label="Results per page (0 for max)",
                                         scale=2,
                                     )
-                                    selected_folder = gr.Dropdown(
+                                    restrict_to_paths = gr.Dropdown(
                                         label="Restrict search to paths starting with",
-                                        choices=[
-                                            (folder, folder)
-                                            for folder in get_folder_list()
-                                        ],
+                                        choices=[],
                                         allow_custom_value=True,
                                         multiselect=True,
                                         scale=2,
@@ -296,10 +296,7 @@ def create_search_UI(
                                     tag_setters = gr.Dropdown(
                                         label="Only search tags set by model(s)",
                                         multiselect=True,
-                                        choices=[
-                                            (n, n)
-                                            for n in models.TagsModel.available_models()
-                                        ],
+                                        choices=[],
                                         value=[],
                                         scale=2,
                                     )
@@ -307,28 +304,17 @@ def create_search_UI(
                                         label="Require ALL selected models to have set each tag",
                                         scale=1,
                                     )
-                                    item_type = gr.Dropdown(
-                                        label="Item MimeType Prefix",
-                                        choices=[
-                                            "image/",
-                                            "video/",
-                                            "image/png",
-                                            "image/jpeg",
-                                            "video/mp4",
-                                            "video/webm",
-                                        ],
+                                    allowed_item_type_prefixes = gr.Dropdown(
+                                        label="Item MimeType Prefixes",
+                                        choices=[],
                                         allow_custom_value=True,
                                         multiselect=True,
                                         value=None,
                                         scale=2,
                                     )
-                                    namespace_prefix = gr.Dropdown(
+                                    tag_namespace_prefixes = gr.Dropdown(
                                         label="Tag Namespace Prefix",
-                                        choices=[
-                                            "danbooru:",
-                                            "danbooru:character",
-                                            "danbooru:general",
-                                        ],
+                                        choices=[],
                                         allow_custom_value=True,
                                         multiselect=True,
                                         value=None,
@@ -379,6 +365,22 @@ def create_search_UI(
                                     value=True,
                                     scale=1,
                                 )
+                        with gr.Tab(label="Search in Bookmarks"):
+                            with gr.Row():
+                                restrict_search_to_bookmarks = gr.Checkbox(
+                                    label="Restrict search to bookmarked items",
+                                    interactive=True,
+                                    value=False,
+                                    scale=1,
+                                )
+                                restrict_to_bk_namespaces = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Restrict to these namespaces",
+                                    multiselect=True,
+                                    scale=1,
+                                )
+
         multi_view = create_multiview(
             select_history=select_history,
             bookmarks_namespace=bookmarks_namespace,
@@ -396,33 +398,44 @@ def create_search_UI(
             )
             next_page = gr.Button("Next Page", scale=1)
 
+    onload_outputs = [
+        restrict_to_paths,
+        require_text_extractors,
+        tag_setters,
+        tag_namespace_prefixes,
+        restrict_to_bk_namespaces,
+        allowed_item_type_prefixes,
+    ]
+
     search_tab.select(
         fn=on_tab_load,
-        outputs=[
-            selected_folder,
-            require_text_extractors,
-            tag_setters,
-        ],
+        outputs=onload_outputs,
+    )
+    app.load(
+        fn=on_tab_load,
+        outputs=onload_outputs,
     )
 
     search_inputs = [
         tag_input,
         min_confidence,
         max_results_per_page,
-        selected_folder,
+        restrict_to_paths,
         current_page,
         order_by,
         order,
         tag_setters,
         all_setters_required,
-        item_type,
-        namespace_prefix,
+        allowed_item_type_prefixes,
+        tag_namespace_prefixes,
         path_search,
         search_path_in,
         path_order_by_rank,
         extracted_text_search,
         require_text_extractors,
         extracted_text_order_by_rank,
+        restrict_search_to_bookmarks,
+        restrict_to_bk_namespaces,
     ]
 
     search_outputs = [multi_view.files, number_of_results, current_page, link]

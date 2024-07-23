@@ -297,3 +297,16 @@ def delete_items_without_files(
             break
 
     return total_deleted
+
+
+def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT type FROM items")
+    mime_types = [row[0] for row in cursor.fetchall()]
+    general_types = set()
+    for mime_type in mime_types:
+        general_types.add(mime_type.split("/")[0] + "/")
+
+    mime_types.extend(general_types)
+    mime_types.sort()
+    return mime_types

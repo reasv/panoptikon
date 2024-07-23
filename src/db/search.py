@@ -59,6 +59,8 @@ def search_files(
     min_confidence = min_confidence or None
     setters = setters or []
     restrict_to_bookmark_namespaces = restrict_to_bookmark_namespaces or []
+    if not restrict_to_bookmarks:
+        restrict_to_bookmark_namespaces = []
 
     # Build the main query
     search_query, search_query_params = build_search_query(
