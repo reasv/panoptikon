@@ -49,25 +49,36 @@ def build_query(
     )
 
 
-def search_by_tags(
+def search(
     tags_str: str,
     min_tag_confidence: float | None,
     results_per_page: int,
-    include_path: str | None = None,
+    include_paths: List[str] | None = None,
     page: int = 1,
     order_by: OrderByType = "last_modified",
     order: OrderType | None = None,
     tag_setters: List[str] | None = None,
     all_setters_required: bool = False,
-    item_type: str | None = None,
-    namespace_prefix: str | None = None,
+    item_types: List[str] | None = None,
+    namespace_prefixes: List[str] | None = None,
     path_search: str | None = None,
     search_path_in: str = "full_path",
     path_order_by_rank: bool = True,
     extracted_text_search: str | None = None,
     require_text_extractors: List[Tuple[str, str]] | None = None,
     extracted_text_order_by_rank: bool = True,
+    search_action: str | None = None,
 ):
+    if search_action == "search_button":
+        page = 1
+    elif search_action == "next_page":
+        page += 1
+    elif search_action == "previous_page":
+        page -= 1
+        page = max(1, page)
+    elif search_action == "goto_page":
+        pass
+
     if page < 1:
         page = 1
     if order not in ["asc", "desc", None]:
@@ -80,9 +91,9 @@ def search_by_tags(
     ):
         min_tag_confidence = None
 
-    include_path = include_path.strip() if include_path is not None else None
-    if include_path == "":
-        include_path = None
+    include_paths = include_paths or []
+    include_paths = [path.strip() for path in include_paths]
+
     tags = [tag.strip() for tag in tags_str.split(",") if tag.strip() != ""]
 
     def extract_tags_subtype(tag_list: list[str], prefix: str = "-"):
@@ -102,10 +113,10 @@ def search_by_tags(
     print(
         f"Searching for tags: {tags} match any: {tags_match_any} "
         + f"(negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) "
-        + f"with min confidence {min_tag_confidence} under path prefix {include_path} "
+        + f"with min confidence {min_tag_confidence} under path prefix {include_paths} "
         + f"with page size {results_per_page} and page {page} and order by {order_by} {order} "
         + f"and tag setters {tag_setters} and all setters required {all_setters_required} and "
-        + f"item type prefix {item_type} and namespace prefix {namespace_prefix} "
+        + f"item type prefix {item_types} and namespace prefix {namespace_prefixes} "
         + f"and path search {path_search} in {search_path_in} "
         + f"and extracted text search {extracted_text_search} "
         + f"and require text extractors {require_text_extractors} "
@@ -136,12 +147,12 @@ def search_by_tags(
             negative_tags=negative_tags,
             negative_tags_match_all=negative_tags_match_all,
             tags_match_any=tags_match_any,
-            tag_namespace=namespace_prefix,
+            tag_namespaces=namespace_prefixes,
             min_confidence=min_tag_confidence,
             setters=tag_setters,
             all_setters_required=all_setters_required,
-            item_type=item_type,
-            include_path_prefix=include_path,
+            item_types=item_types,
+            include_path_prefixes=include_paths,
             match_path=match_path,
             match_filename=match_filename,
             match_extracted_text=match_extracted_text,
@@ -166,7 +177,7 @@ def search_by_tags(
     query = build_query(
         tags,
         min_tag_confidence,
-        include_path,
+        include_paths[0] if include_paths else None,
         results_per_page,
         page,
         order_by,
@@ -177,126 +188,6 @@ def search_by_tags(
         total_results,
         gr.update(value=page, maximum=int(total_pages)),
         f"[View Results in Gallery]({query})",
-    )
-
-
-def search_by_tags_search_button(
-    tags_str: str,
-    min_tag_confidence: float,
-    results_per_page: int,
-    include_path: str | None = None,
-    page: int = 1,
-    order_by: OrderByType = "last_modified",
-    order: OrderType = None,
-    tag_setters=None,
-    all_setters_required=False,
-    item_type=None,
-    namespace_prefix=None,
-    path_search: str | None = None,
-    search_path_in: str = "full_path",
-    path_order_by_rank: bool = True,
-    extracted_text_search: str | None = None,
-    require_text_extractors: List[Tuple[str, str]] | None = None,
-    extracted_text_order_by_rank: bool = True,
-):
-    return search_by_tags(
-        tags_str,
-        min_tag_confidence,
-        results_per_page,
-        include_path,
-        1,
-        order_by,
-        order,
-        tag_setters,
-        all_setters_required,
-        item_type,
-        namespace_prefix,
-        path_search,
-        search_path_in,
-        path_order_by_rank,
-        extracted_text_search,
-        require_text_extractors,
-        extracted_text_order_by_rank,
-    )
-
-
-def search_by_tags_next_page(
-    tags_str: str,
-    min_tag_confidence: float,
-    results_per_page: int,
-    include_path: str | None = None,
-    page: int = 1,
-    order_by: OrderByType = "last_modified",
-    order: OrderType = None,
-    tag_setters=None,
-    all_setters_required=False,
-    item_type=None,
-    namespace_prefix=None,
-    path_search: str | None = None,
-    search_path_in: str = "full_path",
-    path_order_by_rank: bool = True,
-    extracted_text_search: str | None = None,
-    require_text_extractors: List[Tuple[str, str]] | None = None,
-    extracted_text_order_by_rank: bool = True,
-):
-    return search_by_tags(
-        tags_str,
-        min_tag_confidence,
-        results_per_page,
-        include_path,
-        page + 1,
-        order_by,
-        order,
-        tag_setters,
-        all_setters_required,
-        item_type,
-        namespace_prefix,
-        path_search,
-        search_path_in,
-        path_order_by_rank,
-        extracted_text_search,
-        require_text_extractors,
-        extracted_text_order_by_rank,
-    )
-
-
-def search_by_tags_previous_page(
-    tags_str: str,
-    min_tag_confidence: float,
-    results_per_page: int,
-    include_path: str | None = None,
-    page: int = 1,
-    order_by: OrderByType = "last_modified",
-    order: OrderType = None,
-    tag_setters=None,
-    all_setters_required=False,
-    item_type=None,
-    namespace_prefix=None,
-    path_search: str | None = None,
-    search_path_in: str = "full_path",
-    path_order_by_rank: bool = True,
-    extracted_text_search: str | None = None,
-    require_text_extractors: List[Tuple[str, str]] | None = None,
-    extracted_text_order_by_rank: bool = True,
-):
-    return search_by_tags(
-        tags_str,
-        min_tag_confidence,
-        results_per_page,
-        include_path,
-        page - 1,
-        order_by,
-        order,
-        tag_setters,
-        all_setters_required,
-        item_type,
-        namespace_prefix,
-        path_search,
-        search_path_in,
-        path_order_by_rank,
-        extracted_text_search,
-        require_text_extractors,
-        extracted_text_order_by_rank,
     )
 
 
@@ -387,6 +278,7 @@ def create_search_UI(
                                             for folder in get_folder_list()
                                         ],
                                         allow_custom_value=True,
+                                        multiselect=True,
                                         scale=2,
                                     )
                                     order_by = gr.Radio(
@@ -429,7 +321,7 @@ def create_search_UI(
                                             "video/webm",
                                         ],
                                         allow_custom_value=True,
-                                        multiselect=False,
+                                        multiselect=True,
                                         value=None,
                                         scale=2,
                                     )
@@ -441,7 +333,7 @@ def create_search_UI(
                                             "danbooru:general",
                                         ],
                                         allow_custom_value=True,
-                                        multiselect=False,
+                                        multiselect=True,
                                         value=None,
                                         scale=2,
                                     )
@@ -516,100 +408,55 @@ def create_search_UI(
         ],
     )
 
+    search_inputs = [
+        tag_input,
+        min_confidence,
+        max_results_per_page,
+        selected_folder,
+        current_page,
+        order_by,
+        order,
+        tag_setters,
+        all_setters_required,
+        item_type,
+        namespace_prefix,
+        path_search,
+        search_path_in,
+        path_order_by_rank,
+        extracted_text_search,
+        require_text_extractors,
+        extracted_text_order_by_rank,
+    ]
+
+    search_outputs = [multi_view.files, number_of_results, current_page, link]
+
+    action_search_button = gr.State("search_button")
+    action_next_page = gr.State("next_page")
+    action_previous_page = gr.State("previous_page")
+    action_goto_page = gr.State("goto_page")
+
     submit_button.click(
-        fn=search_by_tags_search_button,
-        inputs=[
-            tag_input,
-            min_confidence,
-            max_results_per_page,
-            selected_folder,
-            current_page,
-            order_by,
-            order,
-            tag_setters,
-            all_setters_required,
-            item_type,
-            namespace_prefix,
-            path_search,
-            search_path_in,
-            path_order_by_rank,
-            extracted_text_search,
-            require_text_extractors,
-            extracted_text_order_by_rank,
-        ],
-        outputs=[multi_view.files, number_of_results, current_page, link],
+        fn=search,
+        inputs=[*search_inputs, action_search_button],
+        outputs=search_outputs,
     )
 
     current_page.release(
-        fn=search_by_tags,
-        inputs=[
-            tag_input,
-            min_confidence,
-            max_results_per_page,
-            selected_folder,
-            current_page,
-            order_by,
-            order,
-            tag_setters,
-            all_setters_required,
-            item_type,
-            namespace_prefix,
-            path_search,
-            search_path_in,
-            path_order_by_rank,
-            extracted_text_search,
-            require_text_extractors,
-            extracted_text_order_by_rank,
-        ],
-        outputs=[multi_view.files, number_of_results, current_page, link],
+        fn=search,
+        inputs=[*search_inputs, action_goto_page],
+        outputs=search_outputs,
     )
 
     previous_page.click(
-        fn=search_by_tags_previous_page,
-        inputs=[
-            tag_input,
-            min_confidence,
-            max_results_per_page,
-            selected_folder,
-            current_page,
-            order_by,
-            order,
-            tag_setters,
-            all_setters_required,
-            item_type,
-            namespace_prefix,
-            path_search,
-            search_path_in,
-            path_order_by_rank,
-            extracted_text_search,
-            require_text_extractors,
-            extracted_text_order_by_rank,
-        ],
-        outputs=[multi_view.files, number_of_results, current_page, link],
+        fn=search,
+        inputs=[*search_inputs, action_previous_page],
+        outputs=search_outputs,
     )
 
     next_page.click(
-        fn=search_by_tags_next_page,
-        inputs=[
-            tag_input,
-            min_confidence,
-            max_results_per_page,
-            selected_folder,
-            current_page,
-            order_by,
-            order,
-            tag_setters,
-            all_setters_required,
-            item_type,
-            namespace_prefix,
-            path_search,
-            search_path_in,
-            path_order_by_rank,
-            extracted_text_search,
-            require_text_extractors,
-            extracted_text_order_by_rank,
-        ],
-        outputs=[multi_view.files, number_of_results, current_page, link],
+        fn=search,
+        inputs=[*search_inputs, action_next_page],
+        outputs=search_outputs,
     )
 
     multi_view.list_view.tag_list.select(fn=on_tag_select, outputs=[tag_input])

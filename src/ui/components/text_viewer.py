@@ -12,7 +12,11 @@ from src.db import (
 from src.types import ExtractedText
 
 
-def on_text_picker_change(choice: Tuple[str, str], texts: List[ExtractedText]):
+def on_text_picker_change(
+    choice: Tuple[str, str] | None, texts: List[ExtractedText]
+):
+    if choice is None:
+        return gr.update(value="", visible=False)
     model_type, setter = choice
     text = next(
         (t for t in texts if t.setter == setter and t.model_type == model_type),
@@ -27,7 +31,7 @@ def on_item_change(
     selected_files: List[FileSearchResult], chosen_text_setter: Tuple[str, str]
 ):
     if len(selected_files) == 0:
-        return gr.update(choices=[]), gr.update(value="", visible=False)
+        return [], gr.update(choices=[]), gr.update(value="", visible=False)
 
     selected_file = selected_files[0]
     conn = get_database_connection(force_readonly=True)
