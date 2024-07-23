@@ -60,13 +60,103 @@ def search_files(
     setters = setters or []
     restrict_to_bookmark_namespaces = restrict_to_bookmark_namespaces or []
 
-    page_size = page_size or 1000000  # Mostly for debugging purposes
-    offset = (page - 1) * page_size
+    # Build the main query
+    search_query, search_query_params = build_search_query(
+        tags=tags,
+        tags_match_any=tags_match_any,
+        negative_tags=negative_tags,
+        negative_tags_match_all=negative_tags_match_all,
+        tag_namespaces=tag_namespaces,
+        min_confidence=min_confidence,
+        setters=setters,
+        all_setters_required=all_setters_required,
+        item_types=item_types,
+        include_path_prefixes=include_path_prefixes,
+        match_path=match_path,
+        match_filename=match_filename,
+        match_extracted_text=match_extracted_text,
+        require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+        restrict_to_bookmarks=restrict_to_bookmarks,
+        restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+    )
+    # Debugging
+    # print_search_query(count_query, params)
+    cursor = conn.cursor()
+    if return_total_count:
+        # First query to get the total count of items matching the criteria
+        count_query = f"""
+        SELECT COUNT(*)
+        FROM (
+            {search_query}
+        )
+        """
+        try:
+            cursor.execute(count_query, search_query_params)
+        except Exception as e:
+            # Debugging
+            pretty_print_SQL(count_query, search_query_params)
+            raise e
+        total_count: int = cursor.fetchone()[0]
+    else:
+        total_count = 0
 
+    # Build the ORDER BY clause
+    order_by_clause, order_by_params = build_order_by_clause(
+        match_path=bool(match_path),
+        match_filename=bool(match_filename),
+        match_extracted_text=bool(match_extracted_text),
+        order_by=order_by,
+        order=order,
+        page=page,
+        page_size=page_size,
+    )
+
+    try:
+        cursor.execute(
+            (search_query + order_by_clause),
+            [*search_query_params, *order_by_params],
+        )
+    except Exception as e:
+        # Debugging
+        pretty_print_SQL(
+            (search_query + order_by_clause),
+            [*search_query_params, *order_by_params],
+        )
+        raise e
+    results_count = cursor.rowcount
+    while row := cursor.fetchone():
+        file = FileSearchResult(*row[0:4])
+        if check_path_exists and not os.path.exists(file.path):
+            continue
+        yield file, total_count
+    if results_count == 0:
+        return []
+
+
+def build_search_query(
+    tags: List[str],
+    tags_match_any: List[str] | None,
+    negative_tags: List[str],
+    negative_tags_match_all: List[str] | None,
+    tag_namespaces: List[str],
+    min_confidence: float | None,
+    setters: List[str],
+    all_setters_required: bool,
+    item_types: List[str],
+    include_path_prefixes: List[str],
+    match_path: str | None,
+    match_filename: str | None,
+    match_extracted_text: str | None,
+    require_extracted_type_setter_pairs: (
+        List[Tuple[str, str]] | None
+    ),  # Pairs of (type, setter) to include
+    restrict_to_bookmarks: bool,
+    restrict_to_bookmark_namespaces: List[str],
+):
     if tags_match_any and not tags:
         # If "match any" tags are provided, but no positive tags are provided
         # We need to build a query to match on *any* of them being present
-        main_query, params = build_search_query(
+        main_query, params = build_main_query(
             tags=tags_match_any,
             negative_tags=negative_tags,
             tag_namespaces=tag_namespaces,
@@ -88,7 +178,7 @@ def search_files(
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
-        main_query, params = build_search_query(
+        main_query, params = build_main_query(
             tags=tags,
             negative_tags=negative_tags,
             tag_namespaces=tag_namespaces,
@@ -113,7 +203,7 @@ def search_files(
         # If tags "match any" are provided along with match all regular positive tags
         # We need to build a separate query to match on *any* of them being present
         # And then intersect the results with the main query
-        tags_query, tags_params = build_search_query(
+        tags_query, tags_params = build_main_query(
             tags=tags_match_any,
             negative_tags=None,
             tag_namespaces=tag_namespaces,
@@ -146,7 +236,7 @@ def search_files(
         # If negative tags "match all" are provided
         # We need to build a separate query to match on *all* of them being present
         # And then exclude the results from the main query
-        negative_tags_query, negative_tags_params = build_search_query(
+        negative_tags_query, negative_tags_params = build_main_query(
             tags=negative_tags_match_all,
             negative_tags=None,
             tag_namespaces=tag_namespaces,
@@ -186,27 +276,18 @@ def search_files(
             """
         params += negative_tags_params
 
-    # First query to get the total count of items matching the criteria
-    count_query = f"""
-    SELECT COUNT(*)
-    FROM (
-        {main_query}
-    )
-    """
-    # Debugging
-    # print_search_query(count_query, params)
-    cursor = conn.cursor()
-    if return_total_count:
-        try:
-            cursor.execute(count_query, params)
-        except Exception as e:
-            # Debugging
-            pretty_print_SQL(count_query, params)
-            raise e
-        total_count: int = cursor.fetchone()[0]
-    else:
-        total_count = 0
+    return main_query, params
 
+
+def build_order_by_clause(
+    match_path: bool,
+    match_filename: bool,
+    match_extracted_text: bool,
+    order_by: OrderByType,
+    order: OrderType,
+    page: int,
+    page_size: int | None,
+) -> Tuple[str, List[str | int | float]]:
     # Determine order_by_clause and default order setting based on order_by value
     match order_by:
         case "rank_fts":
@@ -234,29 +315,19 @@ def search_files(
     order_clause = "DESC" if order == "desc" else "ASC"
 
     # Second query to get the items with pagination
-    query = f"""
-    {main_query}
+    clause = f"""
     ORDER BY {order_by_clause} {order_clause}
     LIMIT ? OFFSET ?
     """
-    query_params: List[str | int | float] = [*params, page_size, offset]
-    try:
-        cursor.execute(query, query_params)
-    except Exception as e:
-        # Debugging
-        pretty_print_SQL(query, query_params)
-        raise e
-    results_count = cursor.rowcount
-    while row := cursor.fetchone():
-        file = FileSearchResult(*row[0:4])
-        if check_path_exists and not os.path.exists(file.path):
-            continue
-        yield file, total_count
-    if results_count == 0:
-        return []
+    page_size = page_size or 1000000  # Mostly for debugging purposes
+    offset = (page - 1) * page_size
+
+    query_params: List[str | int | float] = [page_size, offset]
+
+    return clause, query_params
 
 
-def build_search_query(
+def build_main_query(
     tags: List[str],
     negative_tags: List[str] | None = None,
     tag_namespaces: List[str] = [],
