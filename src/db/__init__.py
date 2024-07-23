@@ -4,14 +4,19 @@ import sqlite3
 from src.db.utils import is_column_in_table, trigger_exists
 
 
-def get_database_connection(force_readonly=False) -> sqlite3.Connection:
-    # Check if we are in read-only mode
+def get_database_connection(write_lock: bool) -> sqlite3.Connection:
     db_file = os.getenv("DB_FILE", "./db/sqlite.db")
-    if force_readonly or os.environ.get("READONLY", "false").lower() == "true":
-        # Use a read-only connection
-        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
-    else:
+    if write_lock and os.environ.get("READONLY", "false").lower() in [
+        "false",
+        "0",
+    ]:
+        # Acquire a write lock
         conn = sqlite3.connect(db_file)
+    else:
+        # Read-only connection
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+
+    # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
     return conn

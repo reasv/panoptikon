@@ -8,14 +8,11 @@ import gradio as gr
 
 import src.data_extractors.models as models
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import (
-    OrderByType,
-    OrderType,
-    get_database_connection,
-    get_existing_type_setter_pairs,
-    get_folders_from_database,
-    search_files,
-)
+from src.db import get_database_connection
+from src.db.extraction_log import get_existing_type_setter_pairs
+from src.db.folders import get_folders_from_database
+from src.db.search import search_files
+from src.types import OrderByType, OrderType
 from src.ui.components.multi_view import create_multiview
 
 
@@ -109,7 +106,7 @@ def search(
     tags, negative_tags = extract_tags_subtype(tags, "-")
     tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
     tags, tags_match_any = extract_tags_subtype(tags, "*")
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     print(
         f"Searching for tags: {tags} match any: {tags_match_any} "
         + f"(negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) "
@@ -192,14 +189,14 @@ def search(
 
 
 def get_folder_list():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn)
     conn.close()
     return folders
 
 
 def get_setters_list():
-    conn = get_database_connection(force_readonly=True)
+    conn = get_database_connection(write_lock=False)
     setters = get_existing_type_setter_pairs(conn)
     conn.close()
     return setters

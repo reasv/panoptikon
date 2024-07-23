@@ -8,7 +8,7 @@ from src.db import get_database_connection
 
 
 def arbitrary_query(query: str, query_history: List):
-    conn = get_database_connection(force_readonly=True)
+    conn = get_database_connection(write_lock=False)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
     try:

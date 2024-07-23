@@ -66,7 +66,7 @@ def create_semantic_search_UI(
             embedder = CLIPEmbedder(
                 model_name="ViT-H-14-378-quickgelu", pretrained="dfn5b"
             )
-        conn = get_database_connection()
+        conn = get_database_connection(write_lock=False)
         cdb = get_chromadb_client()
         files, scores = search_item_image_embeddings(
             conn,

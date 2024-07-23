@@ -5,13 +5,10 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
-from src.db import FileSearchResult
-from src.files import (
-    get_files_by_extension,
-    get_last_modified_time_and_size,
-    get_mime_type,
-)
+from src.files import get_files_by_extension, get_last_modified_time_and_size
+from src.types import FileSearchResult
 from src.ui.components.multi_view import create_multiview
+from src.utils import get_mime_type
 
 
 def get_images(folder_path: str):

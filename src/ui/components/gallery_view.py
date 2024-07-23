@@ -5,7 +5,7 @@ from typing import List
 
 import gradio as gr
 
-from src.db import FileSearchResult
+from src.types import FileSearchResult
 from src.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
 )

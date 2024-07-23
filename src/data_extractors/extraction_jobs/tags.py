@@ -4,14 +4,12 @@ import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
 import PIL.Image
-from cv2 import add
-
 from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import TagsModel
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import add_tag_to_item
+from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath
 
 

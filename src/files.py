@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime
 from typing import List
 
-from src.db import get_file_by_path
+from src.db.files import get_file_by_path
 from src.types import FileScanData
 from src.utils import get_mime_type, normalize_path
 

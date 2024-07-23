@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import gradio as gr
 
-from src.db import (
-    get_database_connection,
-    get_folders_from_database,
-    vacuum_database,
-)
+from src.db import get_database_connection
+from src.db.folders import get_folders_from_database
+from src.db.utils import vacuum_database
 from src.folders import rescan_all_folders, update_folder_lists
 from src.ui.components.extractor_ui import create_data_extraction_UI
 from src.ui.components.scan_tables import (
@@ -18,14 +16,14 @@ from src.ui.components.scan_tables import (
 
 
 def get_folders():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn)
     conn.close()
     return "\n".join(folders)
 
 
 def get_excluded_folders():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn, included=False)
     conn.close()
     return "\n".join(folders)
@@ -46,7 +44,7 @@ def update_folders(
         if len(excluded_folders_text.strip()) > 0
         else []
     )
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     try:
         cursor = conn.cursor()
         # Begin a transaction
@@ -94,7 +92,7 @@ def update_folders(
 
 
 def rescan_folders(delete_unavailable_files: bool = True):
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
     ids, files_deleted, items_deleted = rescan_all_folders(

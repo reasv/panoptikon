@@ -3,13 +3,14 @@ from __future__ import annotations
 import gradio as gr
 
 import src.data_extractors.models as models
-from src.db import get_database_connection, get_most_common_tags_frequency
+from src.db import get_database_connection
+from src.db.tagstats import get_most_common_tags_frequency
 
 
 def get_labels(setters=None, confidence_threshold=None):
     if confidence_threshold == 0.1:
         confidence_threshold = None
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     tags_character = get_most_common_tags_frequency(
         conn,
         namespace="danbooru:character",

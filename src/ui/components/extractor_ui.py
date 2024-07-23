@@ -5,7 +5,8 @@ import gradio as gr
 
 import src.data_extractors.models as models
 from src.data_extractors.utils import get_chromadb_client
-from src.db import get_database_connection, vacuum_database
+from src.db import get_database_connection
+from src.db.utils import vacuum_database
 
 
 def shorten_path(path: str, max_length=75) -> str:
@@ -14,7 +15,7 @@ def shorten_path(path: str, max_length=75) -> str:
 
 def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
     print(f"Running job for model {model_opt}")
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute("BEGIN")
@@ -58,7 +59,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
 
 def delete_model_data(model_opt: models.ModelOpts):
     print(f"Running data deletion job for model {model_opt}")
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     cdb = get_chromadb_client()
     cursor = conn.cursor()
     cursor.execute("BEGIN")

@@ -1,22 +1,24 @@
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import List
 
-from src.db import (
+from src.db.extraction_log import delete_log_items_without_item
+from src.db.files import (
     add_file_scan,
+    delete_items_without_files,
+    delete_unavailable_files,
+    mark_unavailable_files,
+    update_file_data,
+)
+from src.db.folders import (
     add_folder_to_database,
     delete_files_not_under_included_folders,
     delete_files_under_excluded_folders,
     delete_folders_not_in_list,
-    delete_items_without_files,
-    delete_log_items_without_item,
-    delete_tags_without_items,
-    delete_unavailable_files,
     get_folders_from_database,
-    mark_unavailable_files,
-    update_file_data,
 )
+from src.db.tags import delete_tags_without_items
 from src.files import deduplicate_paths, scan_files
 from src.utils import normalize_path
 

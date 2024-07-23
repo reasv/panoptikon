@@ -4,11 +4,8 @@ import gradio as gr
 import uvicorn
 from gradio.routes import mount_gradio_app
 
-from src.db import (
-    get_database_connection,
-    get_folders_from_database,
-    initialize_database,
-)
+from src.db import get_database_connection, initialize_database
+from src.db.folders import get_folders_from_database
 from src.fapi.app import app
 
 readonly_mode = os.environ.get("READONLY", "false").lower() == "true"
@@ -23,12 +20,19 @@ else:
     print("Running in read-write mode")
 
 
-def launch_app():
-    conn = get_database_connection()
+def run_database_migrations():
+    conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
     initialize_database(conn)
     conn.commit()
+    conn.close()
+
+
+def launch_app():
+    if not readonly_mode:
+        run_database_migrations()
+    conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn, included=True)
     conn.close()
     # gr.set_static_paths(folders)

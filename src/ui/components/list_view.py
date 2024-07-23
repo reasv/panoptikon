@@ -5,11 +5,9 @@ from typing import List
 
 import gradio as gr
 
-from src.db import (
-    FileSearchResult,
-    get_all_tags_for_item_name_confidence,
-    get_database_connection,
-)
+from src.db import get_database_connection
+from src.db.tags import get_all_tags_for_item_name_confidence
+from src.types import FileSearchResult
 from src.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
 )
@@ -56,7 +54,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
             path = selected_file.path
             thumbnail = get_thumbnail(selected_file, True)
             if path != selected_image_path:
-                conn = get_database_connection()
+                conn = get_database_connection(write_lock=False)
                 tags = {
                     t[0]: t[1]
                     for t in get_all_tags_for_item_name_confidence(conn, sha256)

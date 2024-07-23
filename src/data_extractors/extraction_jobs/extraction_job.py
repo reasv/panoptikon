@@ -18,9 +18,9 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
-from src.db import (
+from src.db.extraction_log import (
+    add_data_extraction_log,
     add_item_to_log,
-    create_data_extraction_log,
     get_items_missing_data_extraction,
     update_log,
 )
@@ -56,7 +56,7 @@ def run_extraction_job(
         0,
     )
 
-    log_id = create_data_extraction_log(
+    log_id = add_data_extraction_log(
         conn,
         scan_time,
         model_opts.model_type(),

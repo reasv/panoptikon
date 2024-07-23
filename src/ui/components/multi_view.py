@@ -5,7 +5,7 @@ from typing import List
 
 import gradio as gr
 
-from src.db import FileSearchResult
+from src.types import FileSearchResult
 from src.ui.components.gallery_view import GalleryView, create_gallery_view
 from src.ui.components.list_view import ImageList, create_image_list
 

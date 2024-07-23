@@ -8,8 +8,8 @@ from chromadb.api import ClientAPI
 from chromadb.api.types import QueryResult
 from chromadb.types import Metadata
 
-from src.db import FileSearchResult, get_existing_file_for_sha256
-from src.types import ExtractedText
+from src.db.files import get_existing_file_for_sha256
+from src.types import ExtractedText, FileSearchResult
 from src.utils import get_mime_type
 
 

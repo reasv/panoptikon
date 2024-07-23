@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+from os import write
 from typing import List
 
 import gradio as gr
 
-from src.db import (
-    FileSearchResult,
+from src.db import get_database_connection
+from src.db.bookmarks import (
     add_bookmark,
     delete_bookmarks_exclude_last_n,
     get_all_bookmark_namespaces,
     get_bookmark_metadata,
     get_bookmarks,
-    get_database_connection,
     remove_bookmark,
 )
+from src.types import FileSearchResult
 
 
 def toggle_bookmark(
@@ -24,7 +25,7 @@ def toggle_bookmark(
     if len(selected_files) == 0:
         return gr.update(value="Bookmark")
     selected_image_sha256 = selected_files[0].sha256
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     if button_name == "Bookmark":
         add_bookmark(
             conn, namespace=bookmarks_namespace, sha256=selected_image_sha256
@@ -48,7 +49,7 @@ def on_selected_image_get_bookmark_state(
     if len(selected_files) == 0:
         return gr.update(value="Bookmark")
     sha256 = selected_files[0].sha256
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     is_bookmarked, _ = get_bookmark_metadata(
         conn, namespace=bookmarks_namespace, sha256=sha256
     )
@@ -59,7 +60,7 @@ def on_selected_image_get_bookmark_state(
 
 
 def get_all_bookmark_folders():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     bookmark_folders = get_all_bookmark_namespaces(conn)
     conn.close()
     return bookmark_folders
@@ -72,7 +73,7 @@ def get_all_bookmarks_in_folder(
     order_by: str = "time_added",
     order=None,
 ):
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     bookmarks, total_bookmarks = get_bookmarks(
         conn,
         namespace=bookmarks_namespace,
@@ -86,7 +87,7 @@ def get_all_bookmarks_in_folder(
 
 
 def delete_bookmarks_except_last_n(bookmarks_namespace: str, keep_last_n: int):
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     delete_bookmarks_exclude_last_n(
         conn, namespace=bookmarks_namespace, n=keep_last_n
     )
@@ -95,7 +96,7 @@ def delete_bookmarks_except_last_n(bookmarks_namespace: str, keep_last_n: int):
 
 
 def delete_bookmark(bookmarks_namespace: str, sha256: str):
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=True)
     remove_bookmark(conn, namespace=bookmarks_namespace, sha256=sha256)
     conn.commit()
     conn.close()

@@ -1,5 +1,4 @@
 import sqlite3
-from ast import mod
 from typing import Iterable, List, Sequence, Tuple
 
 import faster_whisper
@@ -12,7 +11,7 @@ from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
 from src.data_extractors.text_embeddings import add_item_text
-from src.db import insert_extracted_text
+from src.db.extracted_text import insert_extracted_text
 from src.types import ItemWithPath
 
 

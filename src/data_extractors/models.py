@@ -8,11 +8,9 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobReport,
 )
 from src.data_extractors.utils import get_threshold_from_env
-from src.db import (
-    delete_tags_from_setter,
-    delete_text_extracted_by_setter,
-    remove_setter_from_items,
-)
+from src.db.extracted_text import delete_text_extracted_by_setter
+from src.db.extraction_log import remove_setter_from_items
+from src.db.tags import delete_tags_from_setter
 
 
 class ModelOpts:

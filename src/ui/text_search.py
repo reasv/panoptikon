@@ -56,7 +56,7 @@ def create_semantic_text_search_UI(
         semantic_search: bool = False,
         full_text_search: bool = False,
     ):
-        conn = get_database_connection()
+        conn = get_database_connection(write_lock=False)
         cdb = get_chromadb_client()
         files = [
             file

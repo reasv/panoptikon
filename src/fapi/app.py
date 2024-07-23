@@ -1,8 +1,8 @@
 import hashlib
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import (
     FileResponse,
@@ -12,17 +12,15 @@ from fastapi.responses import (
 )
 from fastapi.templating import Jinja2Templates
 
-from src.db import (
-    FileSearchResult,
-    get_bookmarks,
-    get_database_connection,
-    search_files,
-)
+from src.db import get_database_connection
+from src.db.bookmarks import get_bookmarks
+from src.db.search import search_files
 from src.files import (
     get_files_by_extension,
     get_image_extensions,
     get_last_modified_time_and_size,
 )
+from src.types import FileSearchResult, OrderByType, OrderType
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -35,7 +33,7 @@ def get_all_bookmarks_in_folder(
     order_by: str = "time_added",
     order=None,
 ):
-    conn = get_database_connection(force_readonly=True)
+    conn = get_database_connection(write_lock=False)
     bookmarks, total_bookmarks = get_bookmarks(
         conn,
         namespace=bookmarks_namespace,
@@ -109,22 +107,22 @@ def get_all_items_with_tags(
     page_size: int = 1000,
     page: int = 1,
     include_path: str | None = None,
-    order_by: str = "last_modified",
-    order=None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
 ) -> Tuple[List[FileSearchResult], int]:
-    conn = get_database_connection(force_readonly=True)
+    conn = get_database_connection(write_lock=False)
     results, total_results = zip(
         *list(
             search_files(
                 conn,
                 tags,
                 negative_tags=[],
-                tag_namespace="danbooru",
+                tag_namespaces=[],
                 min_confidence=min_confidence,
                 setters=None,
                 all_setters_required=False,
-                item_type=None,
-                include_path_prefix=include_path,
+                item_types=[],
+                include_path_prefixes=[include_path] if include_path else [],
                 order_by=order_by,
                 order=order,
                 page=page,
@@ -146,8 +144,8 @@ async def search_by_tags_html(
     include_path: Optional[str] = Query(None),
     page_size: int = Query(100, ge=1),
     page: int = Query(1, ge=1),
-    order_by: str = Query("last_modified"),
-    order=Query(None),
+    order_by: OrderByType = Query("last_modified"),
+    order: OrderType = Query(None),
 ):
     tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
     files_dicts, total = get_all_items_with_tags(
@@ -180,8 +178,8 @@ async def search_by_tags_json(
     include_path: Optional[str] = Query(None),
     page_size: int = Query(100, ge=1),
     page: int = Query(1, ge=1),
-    order_by: str = Query("last_modified"),
-    order=Query(None),
+    order_by: OrderByType = Query("last_modified"),
+    order: OrderType = Query(None),
 ):
     tags_list = [tag.strip() for tag in tags.split(",") if tag.strip() != ""]
     files, total = get_all_items_with_tags(

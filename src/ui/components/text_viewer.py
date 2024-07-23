@@ -3,13 +3,10 @@ from typing import List, Tuple
 
 import gradio as gr
 
-from src.db import (
-    FileSearchResult,
-    get_database_connection,
-    get_existing_type_setter_pairs,
-    get_extracted_text_for_item,
-)
-from src.types import ExtractedText
+from src.db import get_database_connection
+from src.db.extracted_text import get_extracted_text_for_item
+from src.db.extraction_log import get_existing_type_setter_pairs
+from src.types import ExtractedText, FileSearchResult
 
 
 def on_item_change(selected_files: List[FileSearchResult]):
@@ -17,7 +14,7 @@ def on_item_change(selected_files: List[FileSearchResult]):
         return [], gr.update(choices=[]), gr.update(value="", visible=False)
 
     selected_file = selected_files[0]
-    conn = get_database_connection(force_readonly=True)
+    conn = get_database_connection(write_lock=False)
     extracted_texts = get_extracted_text_for_item(
         conn, item_sha256=selected_file.sha256
     )

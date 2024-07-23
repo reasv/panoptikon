@@ -1,10 +1,8 @@
 import gradio as gr
 
-from src.db import (
-    get_all_data_extraction_logs,
-    get_all_file_scans,
-    get_database_connection,
-)
+from src.db import get_database_connection
+from src.db.extraction_log import get_all_data_extraction_logs
+from src.db.files import get_all_file_scans
 from src.utils import isodate_minutes_diff, pretty_print_isodate
 
 
@@ -91,7 +89,7 @@ def create_job_dataset(samples=[]):
 
 
 def fetch_scan_history():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     file_scans = get_all_file_scans(conn)
     conn.close()
     file_scans = [
@@ -116,7 +114,7 @@ def fetch_scan_history():
 
 
 def fetch_extraction_logs():
-    conn = get_database_connection()
+    conn = get_database_connection(write_lock=False)
     log_records = get_all_data_extraction_logs(conn)
     conn.close()
     log_rows = [

@@ -4,10 +4,7 @@ from typing import List
 from chromadb.api import ClientAPI
 
 from src.data_extractors.models import ModelOpts
-from src.data_extractors.utils import (
-    ExtractedText,
-    query_result_to_file_search_result,
-)
+from src.data_extractors.utils import query_result_to_file_search_result
 from src.types import ItemWithPath
 
 

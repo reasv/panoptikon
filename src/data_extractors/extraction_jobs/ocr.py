@@ -10,7 +10,7 @@ from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
 from src.data_extractors.text_embeddings import add_item_text
-from src.db import insert_extracted_text
+from src.db.extracted_text import insert_extracted_text
 from src.types import ItemWithPath
 
 
