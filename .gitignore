@@ -165,6 +165,6 @@ venv/
 thumbs/
 temp_frames/
 scripts/
-db/
+db/**
 .vscode/
 jax_cache/
