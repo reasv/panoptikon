@@ -26,6 +26,8 @@ def search_files(
     ) = None,  # Pairs of (type, setter) to include
     restrict_to_bookmarks: bool = False,
     restrict_to_bookmark_namespaces: List[str] | None = None,
+    any_text_query: str | None = None,
+    any_text_query_targets: List[Tuple[str, str]] | None = None,
     order_by: OrderByType = "last_modified",
     order: OrderType = None,
     page_size: int | None = 1000,
@@ -62,6 +64,10 @@ def search_files(
     if not restrict_to_bookmarks:
         restrict_to_bookmark_namespaces = []
 
+    any_text_query_targets = any_text_query_targets or []
+    if not any_text_query:
+        any_text_query_targets = []
+
     # Build the main query
     search_query, search_query_params = build_search_query(
         tags=tags,
@@ -80,6 +86,8 @@ def search_files(
         require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
         restrict_to_bookmarks=restrict_to_bookmarks,
         restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+        any_text_query=any_text_query,
+        any_text_query_targets=any_text_query_targets,
     )
     # Debugging
     # print_search_query(count_query, params)
@@ -108,6 +116,7 @@ def search_files(
         match_filename=bool(match_filename),
         match_extracted_text=bool(match_extracted_text),
         restrict_to_bookmarks=restrict_to_bookmarks,
+        any_text_query=bool(any_text_query),
         order_by=order_by,
         order=order,
         page=page,
@@ -155,6 +164,8 @@ def build_search_query(
     ),  # Pairs of (type, setter) to include
     restrict_to_bookmarks: bool,
     restrict_to_bookmark_namespaces: List[str],
+    any_text_query: str | None,
+    any_text_query_targets: List[Tuple[str, str]],
 ):
     if tags_match_any and not tags:
         # If "match any" tags are provided, but no positive tags are provided
@@ -178,6 +189,9 @@ def build_search_query(
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+            # Generalized text query
+            any_text_query=any_text_query,
+            any_text_query_targets=any_text_query_targets,
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
@@ -200,6 +214,9 @@ def build_search_query(
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+            # Generalized text query
+            any_text_query=any_text_query,
+            any_text_query_targets=any_text_query_targets,
         )
 
     if tags_match_any and tags:
@@ -225,6 +242,9 @@ def build_search_query(
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+            # Generalized text query
+            any_text_query=any_text_query,
+            any_text_query_targets=any_text_query_targets,
         )
 
         # Append the tags query to the main query
@@ -258,6 +278,9 @@ def build_search_query(
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+            # Generalized text query
+            any_text_query=any_text_query,
+            any_text_query_targets=any_text_query_targets,
         )
 
         # Append the negative tags query to the main query
@@ -287,35 +310,42 @@ def build_order_by_clause(
     match_filename: bool,
     match_extracted_text: bool,
     restrict_to_bookmarks: bool,
+    any_text_query: bool,
     order_by: OrderByType,
     order: OrderType,
     page: int,
     page_size: int | None,
 ) -> Tuple[str, List[str | int | float]]:
     # Determine order_by_clause and default order setting based on order_by value
+    default_order_by_clause = "last_modified"
     match order_by:
         case "rank_fts":
             if match_extracted_text:
                 order_by_clause = "rank_fts"
             else:
-                order_by_clause = "last_modified"
+                order_by_clause = default_order_by_clause
         case "rank_path_fts":
             if match_path or match_filename:
                 order_by_clause = "rank_path_fts"
             else:
-                order_by_clause = "last_modified"
+                order_by_clause = default_order_by_clause
         case "time_added":
             if restrict_to_bookmarks:
                 order_by_clause = "time_added"
             else:
-                order_by_clause = "last_modified"
+                order_by_clause = default_order_by_clause
+        case "rank_any_text":
+            if any_text_query:
+                order_by_clause = "rank_any_text"
+            else:
+                order_by_clause = default_order_by_clause
         case "path":
             order_by_clause = "path"
             # Default order for path is ascending
             if order is None:
                 order = "asc"
         case _:
-            order_by_clause = "last_modified"
+            order_by_clause = default_order_by_clause
 
     # Default order for all other order_by values is descending
     if order is None:
@@ -354,6 +384,9 @@ def build_main_query(
     ) = None,  # Pairs of (type, setter) to include
     restrict_to_bookmarks: bool = False,
     restrict_to_bookmark_namespaces: List[str] = [],
+    # Generalized text query
+    any_text_query: str | None = None,
+    any_text_query_targets: List[Tuple[str, str]] = [],
 ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags,

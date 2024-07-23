@@ -70,6 +70,9 @@ def search(
     bookmark_namespaces: List[str] | None = None,
     order_by_time_added_bk: bool = False,
     search_action: str | None = None,
+    any_text_query: str | None = None,
+    restrict_to_query_types: List[Tuple[str, str]] | None = None,
+    order_by_any_text_rank: bool = False,
 ):
     if search_action == "search_button":
         page = 1
@@ -130,6 +133,10 @@ def search(
     match_path = None
     match_filename = None
     match_extracted_text = None
+
+    if any_text_query:
+        if order_by_any_text_rank:
+            order_by = "rank_any_text"
     if search_in_bookmarks:
         if order_by_time_added_bk:
             order_by = "time_added"
@@ -165,6 +172,8 @@ def search(
             require_extracted_type_setter_pairs=require_text_extractors,
             restrict_to_bookmarks=search_in_bookmarks,
             restrict_to_bookmark_namespaces=bookmark_namespaces,
+            any_text_query=any_text_query,
+            any_text_query_targets=restrict_to_query_types,
             order_by=order_by,
             order=order,
             page=page,
@@ -202,21 +211,34 @@ def search(
 def on_tab_load():
     conn = get_database_connection(write_lock=False)
     full_setters_list = get_existing_type_setter_pairs(conn)
+    bookmark_namespaces = get_all_bookmark_namespaces(conn)
+    file_types = get_all_mime_types(conn)
+    tag_namespaces = get_all_tag_namespaces(conn)
+    folders = get_folders_from_database(conn)
+    conn.close()
+
     extracted_text_setters = [
         (f"{model_type}|{setter_id}", (model_type, setter_id))
         for model_type, setter_id in full_setters_list
-        if model_type != "tags"
+        if model_type != "tags" and model_type != "clip"
     ]
     tag_setters = [
         setter_id
         for model_type, setter_id in full_setters_list
         if model_type == "tags"
     ]
-    bookmark_namespaces = get_all_bookmark_namespaces(conn)
-    file_types = get_all_mime_types(conn)
-    tag_namespaces = get_all_tag_namespaces(conn)
-    folders = get_folders_from_database(conn)
-    conn.close()
+
+    setters_except_tags = [
+        (f"{model_type}|{setter_id}", (model_type, setter_id))
+        for model_type, setter_id in full_setters_list
+        if model_type != "tags"
+    ]
+
+    general_text_sources = [
+        *setters_except_tags,
+        ("Full Path", ("path", "path")),
+        ("Filename", ("path", "filename")),
+    ]
     return (
         gr.update(choices=folders),
         gr.update(choices=extracted_text_setters),
@@ -224,6 +246,7 @@ def on_tab_load():
         gr.update(choices=tag_namespaces),
         gr.update(choices=bookmark_namespaces),
         gr.update(choices=file_types),
+        gr.update(choices=general_text_sources),
     )
 
 
@@ -390,6 +413,27 @@ def create_search_UI(
                                     value=False,
                                     scale=1,
                                 )
+                        with gr.Tab(label="Text Query"):
+                            with gr.Row():
+                                any_text_search = gr.Textbox(
+                                    label="General Text Query",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                restrict_to_query_types = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Restrict query to these targets",
+                                    multiselect=True,
+                                    scale=1,
+                                )
+                                order_by_any_text_rank = gr.Checkbox(
+                                    label="Order by relevance if this query is present",
+                                    interactive=True,
+                                    value=False,
+                                    scale=1,
+                                )
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -415,6 +459,7 @@ def create_search_UI(
         tag_namespace_prefixes,
         restrict_to_bk_namespaces,
         allowed_item_type_prefixes,
+        restrict_to_query_types,
     ]
 
     search_tab.select(
@@ -447,6 +492,9 @@ def create_search_UI(
         restrict_search_to_bookmarks,
         restrict_to_bk_namespaces,
         order_by_time_added_bk,
+        any_text_search,
+        restrict_to_query_types,
+        order_by_any_text_rank,
     ]
 
     search_outputs = [multi_view.files, number_of_results, current_page, link]
