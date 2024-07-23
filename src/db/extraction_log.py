@@ -1,28 +1,10 @@
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple
 
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
-from src.types import ItemWithPath
-
-
-@dataclass
-class LogRecord:
-    id: int
-    start_time: str
-    end_time: str
-    type: str
-    setter: str
-    threshold: float | None
-    batch_size: int
-    image_files: int
-    video_files: int
-    other_files: int
-    total_segments: int
-    errors: int
-    total_remaining: int
+from src.types import ItemWithPath, LogRecord
 
 
 def add_data_extraction_log(

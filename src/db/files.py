@@ -1,9 +1,8 @@
 import os
 import sqlite3
-from dataclasses import dataclass
 from typing import List
 
-from src.types import FileScanData
+from src.types import FileRecord, FileScanData, FileScanRecord
 
 
 def update_file_data(
@@ -114,21 +113,6 @@ def add_file_scan(
     )
     # Return the row id of the inserted record
     return insert_result.lastrowid
-
-
-@dataclass
-class FileScanRecord:
-    id: int
-    start_time: str
-    end_time: str
-    path: str
-    total_available: int
-    new_items: int
-    unchanged_files: int
-    new_files: int
-    modified_files: int
-    marked_unavailable: int
-    errors: int
 
 
 def get_file_scan_by_id(
@@ -246,13 +230,6 @@ def hard_update_items_available(conn: sqlite3.Connection):
         """,
             (available, path),
         )
-
-
-@dataclass
-class FileRecord:
-    sha256: str
-    path: str
-    last_modified: str
 
 
 def get_existing_file_for_sha256(

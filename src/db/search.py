@@ -1,55 +1,259 @@
 import os
 import sqlite3
-from dataclasses import dataclass
-from typing import List, Literal, Tuple
+from typing import List, Tuple
+
+from src.db.utils import pretty_print_SQL
+from src.types import FileSearchResult, OrderByType, OrderType
 
 
-@dataclass
-class FileSearchResult:
-    path: str
-    sha256: str
-    last_modified: str
-    type: str
-
-
-def build_extracted_text_fts_clause(
+def search_files(
+    conn: sqlite3.Connection,
+    tags: List[str],
+    tags_match_any: List[str] | None = None,
+    negative_tags: List[str] | None = None,
+    negative_tags_match_all: List[str] | None = None,
+    tag_namespaces: List[str] | None = None,
+    min_confidence: float | None = 0.5,
+    setters: List[str] | None = None,
+    all_setters_required: bool | None = False,
+    item_types: List[str] | None = None,
+    include_path_prefixes: List[str] | None = None,
+    match_path: str | None = None,
+    match_filename: str | None = None,
     match_extracted_text: str | None = None,
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
+    restrict_to_bookmarks: bool = False,
+    restrict_to_bookmark_namespaces: List[str] | None = None,
+    order_by: OrderByType = "last_modified",
+    order: OrderType = None,
+    page_size: int | None = 1000,
+    page: int = 1,
+    check_path_exists: bool = False,
+    return_total_count: bool = True,
 ):
-    """
-    Build a subquery to match extracted text based on the given conditions.
-    """
+    # Normalize/clean the inputs
+    def clean_tag_list(tag_list: List[str] | None) -> List[str]:
+        if not tag_list:
+            return []
+        return [tag.lower().strip() for tag in tag_list if tag.strip() != ""]
 
-    # Define subquery for matching extracted text
-    extracted_text_condition = ""
-    extracted_text_params = []
-    if match_extracted_text:
-        extracted_text_conditions = ["et_fts.text MATCH ?"]
-        extracted_text_params.append(match_extracted_text)
+    tags_match_any = clean_tag_list(tags_match_any)
+    negative_tags_match_all = clean_tag_list(negative_tags_match_all)
+    tags = clean_tag_list(tags)
+    negative_tags = clean_tag_list(negative_tags)
+    all_setters_required = all_setters_required or False
+    if len(tags_match_any) == 1:
+        # If only one tag is provided for "match any", we can just use it as a regular tag
+        tags.append(tags_match_any[0])
+        tags_match_any = None
+    if len(negative_tags_match_all) == 1:
+        # If only one tag is provided for negative "match all", we can just use it as a regular negative tag
+        negative_tags.append(negative_tags_match_all[0])
+        negative_tags_match_all = None
 
-        if require_extracted_type_setter_pairs:
-            include_pairs_conditions = " OR ".join(
-                ["(log.type = ? AND log.setter = ?)"]
-                * len(require_extracted_type_setter_pairs)
-            )
-            extracted_text_conditions.append(f"({include_pairs_conditions})")
-            for type, setter in require_extracted_type_setter_pairs:
-                extracted_text_params.extend([type, setter])
+    tag_namespaces = tag_namespaces or []
+    item_types = item_types or []
+    include_path_prefixes = include_path_prefixes or []
+    min_confidence = min_confidence or None
+    setters = setters or []
+    restrict_to_bookmark_namespaces = restrict_to_bookmark_namespaces or []
 
-        extracted_text_condition = f"""
-        JOIN (
-            SELECT et.item_id, MAX(et_fts.rank) AS max_rank
-            FROM extracted_text_fts AS et_fts
-            JOIN extracted_text AS et ON et_fts.rowid = et.id
-            JOIN data_extraction_log AS log ON et.log_id = log.id
-            WHERE {" AND ".join(extracted_text_conditions)}
-            GROUP BY et.item_id
-        ) AS extracted_text_matches
-        ON files.item_id = extracted_text_matches.item_id
+    page_size = page_size or 1000000  # Mostly for debugging purposes
+    offset = (page - 1) * page_size
+
+    if tags_match_any and not tags:
+        # If "match any" tags are provided, but no positive tags are provided
+        # We need to build a query to match on *any* of them being present
+        main_query, params = build_search_query(
+            tags=tags_match_any,
+            negative_tags=negative_tags,
+            tag_namespaces=tag_namespaces,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=False,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
+            any_positive_tags_match=True,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+        )
+    else:
+        # Basic case where we need to match all positive tags and none of the negative tags
+        main_query, params = build_search_query(
+            tags=tags,
+            negative_tags=negative_tags,
+            tag_namespaces=tag_namespaces,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=all_setters_required,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
+            any_positive_tags_match=False,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+        )
+
+    if tags_match_any and tags:
+        # If tags "match any" are provided along with match all regular positive tags
+        # We need to build a separate query to match on *any* of them being present
+        # And then intersect the results with the main query
+        tags_query, tags_params = build_search_query(
+            tags=tags_match_any,
+            negative_tags=None,
+            tag_namespaces=tag_namespaces,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=False,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
+            any_positive_tags_match=True,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+        )
+
+        # Append the tags query to the main query
+        main_query = f"""
+        {main_query}
+        INTERSECT
+        {tags_query}
         """
-    return extracted_text_condition, extracted_text_params
+        params += tags_params
+
+    if negative_tags_match_all:
+        # If negative tags "match all" are provided
+        # We need to build a separate query to match on *all* of them being present
+        # And then exclude the results from the main query
+        negative_tags_query, negative_tags_params = build_search_query(
+            tags=negative_tags_match_all,
+            negative_tags=None,
+            tag_namespaces=tag_namespaces,
+            min_confidence=min_confidence,
+            setters=setters,
+            all_setters_required=all_setters_required,
+            item_types=item_types,
+            include_path_prefixes=include_path_prefixes,
+            any_positive_tags_match=False,
+            # FTS match on path and filename
+            match_path=match_path,
+            match_filename=match_filename,
+            # FTS match on extracted text
+            match_extracted_text=match_extracted_text,
+            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            # Restrict to bookmarks
+            restrict_to_bookmarks=restrict_to_bookmarks,
+            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
+        )
+
+        # Append the negative tags query to the main query
+        if tags_match_any and tags:
+            # If we already have an INTERSECT query, we need to use it as a subquery
+            main_query = f"""
+            SELECT *
+            FROM (
+                {main_query}
+            )
+            EXCEPT
+            {negative_tags_query}
+            """
+        else:
+            main_query = f"""
+            {main_query}
+            EXCEPT
+            {negative_tags_query}
+            """
+        params += negative_tags_params
+
+    # First query to get the total count of items matching the criteria
+    count_query = f"""
+    SELECT COUNT(*)
+    FROM (
+        {main_query}
+    )
+    """
+    # Debugging
+    # print_search_query(count_query, params)
+    cursor = conn.cursor()
+    if return_total_count:
+        try:
+            cursor.execute(count_query, params)
+        except Exception as e:
+            # Debugging
+            pretty_print_SQL(count_query, params)
+            raise e
+        total_count: int = cursor.fetchone()[0]
+    else:
+        total_count = 0
+
+    # Determine order_by_clause and default order setting based on order_by value
+    match order_by:
+        case "rank_fts":
+            if match_extracted_text:
+                order_by_clause = "rank_fts"
+            else:
+                order_by_clause = "last_modified"
+        case "rank_path_fts":
+            if match_path or match_filename:
+                order_by_clause = "rank_path_fts"
+            else:
+                order_by_clause = "last_modified"
+        case "path":
+            order_by_clause = "path"
+            # Default order for path is ascending
+            if order is None:
+                order = "asc"
+        case _:
+            order_by_clause = "last_modified"
+
+    # Default order for all other order_by values is descending
+    if order is None:
+        order = "desc"
+    # Determine the order clause
+    order_clause = "DESC" if order == "desc" else "ASC"
+
+    # Second query to get the items with pagination
+    query = f"""
+    {main_query}
+    ORDER BY {order_by_clause} {order_clause}
+    LIMIT ? OFFSET ?
+    """
+    query_params: List[str | int | float] = [*params, page_size, offset]
+    try:
+        cursor.execute(query, query_params)
+    except Exception as e:
+        # Debugging
+        pretty_print_SQL(query, query_params)
+        raise e
+    results_count = cursor.rowcount
+    while row := cursor.fetchone():
+        file = FileSearchResult(*row[0:4])
+        if check_path_exists and not os.path.exists(file.path):
+            continue
+        yield file, total_count
+    if results_count == 0:
+        return []
 
 
 def build_search_query(
@@ -287,276 +491,41 @@ def build_search_query(
     return main_query, params
 
 
-def print_search_query(query_str: str, params: List[str | float | int]):
-    try:
-        # Quote strings in params
-        quoted_params = [
-            f"'{param}'" if isinstance(param, str) else param
-            for param in params
-        ]
-        formatted_query = query_str.replace("?", "{}").format(*quoted_params)
-        # Remove empty lines
-        formatted_query = "\n".join(
-            [line for line in formatted_query.split("\n") if line.strip() != ""]
-        )
-        print(formatted_query)
-    except Exception as e:
-        print(f"Error formatting query: {e}")
-        print(query_str, params)
-
-
-OrderByType = (
-    Literal["last_modified", "path", "rank_fts", "rank_path_fts"] | None
-)
-
-OrderType = Literal["asc", "desc"] | None
-
-
-def search_files(
-    conn: sqlite3.Connection,
-    tags: List[str],
-    tags_match_any: List[str] | None = None,
-    negative_tags: List[str] | None = None,
-    negative_tags_match_all: List[str] | None = None,
-    tag_namespaces: List[str] | None = None,
-    min_confidence: float | None = 0.5,
-    setters: List[str] | None = None,
-    all_setters_required: bool | None = False,
-    item_types: List[str] | None = None,
-    include_path_prefixes: List[str] | None = None,
-    match_path: str | None = None,
-    match_filename: str | None = None,
+def build_extracted_text_fts_clause(
     match_extracted_text: str | None = None,
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
-    restrict_to_bookmarks: bool = False,
-    restrict_to_bookmark_namespaces: List[str] | None = None,
-    order_by: OrderByType = "last_modified",
-    order: OrderType = None,
-    page_size: int | None = 1000,
-    page: int = 1,
-    check_path_exists: bool = False,
-    return_total_count: bool = True,
 ):
-    # Normalize/clean the inputs
-    def clean_tag_list(tag_list: List[str] | None) -> List[str]:
-        if not tag_list:
-            return []
-        return [tag.lower().strip() for tag in tag_list if tag.strip() != ""]
+    """
+    Build a subquery to match extracted text based on the given conditions.
+    """
 
-    tags_match_any = clean_tag_list(tags_match_any)
-    negative_tags_match_all = clean_tag_list(negative_tags_match_all)
-    tags = clean_tag_list(tags)
-    negative_tags = clean_tag_list(negative_tags)
-    all_setters_required = all_setters_required or False
-    if len(tags_match_any) == 1:
-        # If only one tag is provided for "match any", we can just use it as a regular tag
-        tags.append(tags_match_any[0])
-        tags_match_any = None
-    if len(negative_tags_match_all) == 1:
-        # If only one tag is provided for negative "match all", we can just use it as a regular negative tag
-        negative_tags.append(negative_tags_match_all[0])
-        negative_tags_match_all = None
+    # Define subquery for matching extracted text
+    extracted_text_condition = ""
+    extracted_text_params = []
+    if match_extracted_text:
+        extracted_text_conditions = ["et_fts.text MATCH ?"]
+        extracted_text_params.append(match_extracted_text)
 
-    tag_namespaces = tag_namespaces or []
-    item_types = item_types or []
-    include_path_prefixes = include_path_prefixes or []
-    min_confidence = min_confidence or None
-    setters = setters or []
-    restrict_to_bookmark_namespaces = restrict_to_bookmark_namespaces or []
-
-    page_size = page_size or 1000000  # Mostly for debugging purposes
-    offset = (page - 1) * page_size
-
-    if tags_match_any and not tags:
-        # If "match any" tags are provided, but no positive tags are provided
-        # We need to build a query to match on *any* of them being present
-        main_query, params = build_search_query(
-            tags=tags_match_any,
-            negative_tags=negative_tags,
-            tag_namespaces=tag_namespaces,
-            min_confidence=min_confidence,
-            setters=setters,
-            all_setters_required=False,
-            item_types=item_types,
-            include_path_prefixes=include_path_prefixes,
-            any_positive_tags_match=True,
-            # FTS match on path and filename
-            match_path=match_path,
-            match_filename=match_filename,
-            # FTS match on extracted text
-            match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            # Restrict to bookmarks
-            restrict_to_bookmarks=restrict_to_bookmarks,
-            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
-        )
-    else:
-        # Basic case where we need to match all positive tags and none of the negative tags
-        main_query, params = build_search_query(
-            tags=tags,
-            negative_tags=negative_tags,
-            tag_namespaces=tag_namespaces,
-            min_confidence=min_confidence,
-            setters=setters,
-            all_setters_required=all_setters_required,
-            item_types=item_types,
-            include_path_prefixes=include_path_prefixes,
-            any_positive_tags_match=False,
-            # FTS match on path and filename
-            match_path=match_path,
-            match_filename=match_filename,
-            # FTS match on extracted text
-            match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            # Restrict to bookmarks
-            restrict_to_bookmarks=restrict_to_bookmarks,
-            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
-        )
-
-    if tags_match_any and tags:
-        # If tags "match any" are provided along with match all regular positive tags
-        # We need to build a separate query to match on *any* of them being present
-        # And then intersect the results with the main query
-        tags_query, tags_params = build_search_query(
-            tags=tags_match_any,
-            negative_tags=None,
-            tag_namespaces=tag_namespaces,
-            min_confidence=min_confidence,
-            setters=setters,
-            all_setters_required=False,
-            item_types=item_types,
-            include_path_prefixes=include_path_prefixes,
-            any_positive_tags_match=True,
-            # FTS match on path and filename
-            match_path=match_path,
-            match_filename=match_filename,
-            # FTS match on extracted text
-            match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            # Restrict to bookmarks
-            restrict_to_bookmarks=restrict_to_bookmarks,
-            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
-        )
-
-        # Append the tags query to the main query
-        main_query = f"""
-        {main_query}
-        INTERSECT
-        {tags_query}
-        """
-        params += tags_params
-
-    if negative_tags_match_all:
-        # If negative tags "match all" are provided
-        # We need to build a separate query to match on *all* of them being present
-        # And then exclude the results from the main query
-        negative_tags_query, negative_tags_params = build_search_query(
-            tags=negative_tags_match_all,
-            negative_tags=None,
-            tag_namespaces=tag_namespaces,
-            min_confidence=min_confidence,
-            setters=setters,
-            all_setters_required=all_setters_required,
-            item_types=item_types,
-            include_path_prefixes=include_path_prefixes,
-            any_positive_tags_match=False,
-            # FTS match on path and filename
-            match_path=match_path,
-            match_filename=match_filename,
-            # FTS match on extracted text
-            match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
-            # Restrict to bookmarks
-            restrict_to_bookmarks=restrict_to_bookmarks,
-            restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
-        )
-
-        # Append the negative tags query to the main query
-        if tags_match_any and tags:
-            # If we already have an INTERSECT query, we need to use it as a subquery
-            main_query = f"""
-            SELECT *
-            FROM (
-                {main_query}
+        if require_extracted_type_setter_pairs:
+            include_pairs_conditions = " OR ".join(
+                ["(log.type = ? AND log.setter = ?)"]
+                * len(require_extracted_type_setter_pairs)
             )
-            EXCEPT
-            {negative_tags_query}
-            """
-        else:
-            main_query = f"""
-            {main_query}
-            EXCEPT
-            {negative_tags_query}
-            """
-        params += negative_tags_params
+            extracted_text_conditions.append(f"({include_pairs_conditions})")
+            for type, setter in require_extracted_type_setter_pairs:
+                extracted_text_params.extend([type, setter])
 
-    # First query to get the total count of items matching the criteria
-    count_query = f"""
-    SELECT COUNT(*)
-    FROM (
-        {main_query}
-    )
-    """
-    # Debugging
-    # print_search_query(count_query, params)
-    cursor = conn.cursor()
-    if return_total_count:
-        try:
-            cursor.execute(count_query, params)
-        except Exception as e:
-            # Debugging
-            print_search_query(count_query, params)
-            raise e
-        total_count: int = cursor.fetchone()[0]
-    else:
-        total_count = 0
-
-    # Determine order_by_clause and default order setting based on order_by value
-    match order_by:
-        case "rank_fts":
-            if match_extracted_text:
-                order_by_clause = "rank_fts"
-            else:
-                order_by_clause = "last_modified"
-        case "rank_path_fts":
-            if match_path or match_filename:
-                order_by_clause = "rank_path_fts"
-            else:
-                order_by_clause = "last_modified"
-        case "path":
-            order_by_clause = "path"
-            # Default order for path is ascending
-            if order is None:
-                order = "asc"
-        case _:
-            order_by_clause = "last_modified"
-
-    # Default order for all other order_by values is descending
-    if order is None:
-        order = "desc"
-    # Determine the order clause
-    order_clause = "DESC" if order == "desc" else "ASC"
-
-    # Second query to get the items with pagination
-    query = f"""
-    {main_query}
-    ORDER BY {order_by_clause} {order_clause}
-    LIMIT ? OFFSET ?
-    """
-    query_params: List[str | int | float] = [*params, page_size, offset]
-    try:
-        cursor.execute(query, query_params)
-    except Exception as e:
-        # Debugging
-        print_search_query(query, query_params)
-        raise e
-    results_count = cursor.rowcount
-    while row := cursor.fetchone():
-        file = FileSearchResult(*row[0:4])
-        if check_path_exists and not os.path.exists(file.path):
-            continue
-        yield file, total_count
-    if results_count == 0:
-        return []
+        extracted_text_condition = f"""
+        JOIN (
+            SELECT et.item_id, MAX(et_fts.rank) AS max_rank
+            FROM extracted_text_fts AS et_fts
+            JOIN extracted_text AS et ON et_fts.rowid = et.id
+            JOIN data_extraction_log AS log ON et.log_id = log.id
+            WHERE {" AND ".join(extracted_text_conditions)}
+            GROUP BY et.item_id
+        ) AS extracted_text_matches
+        ON files.item_id = extracted_text_matches.item_id
+        """
+    return extracted_text_condition, extracted_text_params

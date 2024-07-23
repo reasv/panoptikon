@@ -1,4 +1,5 @@
 import sqlite3
+from typing import List
 
 
 def trigger_exists(conn: sqlite3.Connection, trigger_name: str) -> bool:
@@ -38,3 +39,21 @@ def vacuum_database(conn: sqlite3.Connection):
     """
     conn.execute("VACUUM")
     conn.execute("ANALYZE")
+
+
+def pretty_print_SQL(query_str: str, params: List[str | float | int]):
+    try:
+        # Quote strings in params
+        quoted_params = [
+            f"'{param}'" if isinstance(param, str) else param
+            for param in params
+        ]
+        formatted_query = query_str.replace("?", "{}").format(*quoted_params)
+        # Remove empty lines
+        formatted_query = "\n".join(
+            [line for line in formatted_query.split("\n") if line.strip() != ""]
+        )
+        print(formatted_query)
+    except Exception as e:
+        print(f"Error formatting query: {e}")
+        print(query_str, params)
