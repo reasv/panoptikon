@@ -68,6 +68,7 @@ def search(
     extracted_text_order_by_rank: bool = True,
     search_in_bookmarks: bool = False,
     bookmark_namespaces: List[str] | None = None,
+    order_by_time_added_bk: bool = False,
     search_action: str | None = None,
 ):
     if search_action == "search_button":
@@ -129,6 +130,9 @@ def search(
     match_path = None
     match_filename = None
     match_extracted_text = None
+    if search_in_bookmarks:
+        if order_by_time_added_bk:
+            order_by = "time_added"
     if path_search:
         if search_path_in == "full_path":
             match_path = path_search
@@ -380,6 +384,12 @@ def create_search_UI(
                                     multiselect=True,
                                     scale=1,
                                 )
+                                order_by_time_added_bk = gr.Checkbox(
+                                    label="Order by Time Added",
+                                    interactive=True,
+                                    value=False,
+                                    scale=1,
+                                )
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -436,6 +446,7 @@ def create_search_UI(
         extracted_text_order_by_rank,
         restrict_search_to_bookmarks,
         restrict_to_bk_namespaces,
+        order_by_time_added_bk,
     ]
 
     search_outputs = [multi_view.files, number_of_results, current_page, link]

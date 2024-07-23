@@ -36,7 +36,8 @@ class ExtractedText:
 
 
 OrderByType = (
-    Literal["last_modified", "path", "rank_fts", "rank_path_fts"] | None
+    Literal["last_modified", "path", "rank_fts", "rank_path_fts", "time_added"]
+    | None
 )
 
 OrderType = Literal["asc", "desc"] | None

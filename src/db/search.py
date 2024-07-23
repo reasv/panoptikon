@@ -107,6 +107,7 @@ def search_files(
         match_path=bool(match_path),
         match_filename=bool(match_filename),
         match_extracted_text=bool(match_extracted_text),
+        restrict_to_bookmarks=restrict_to_bookmarks,
         order_by=order_by,
         order=order,
         page=page,
@@ -285,6 +286,7 @@ def build_order_by_clause(
     match_path: bool,
     match_filename: bool,
     match_extracted_text: bool,
+    restrict_to_bookmarks: bool,
     order_by: OrderByType,
     order: OrderType,
     page: int,
@@ -300,6 +302,11 @@ def build_order_by_clause(
         case "rank_path_fts":
             if match_path or match_filename:
                 order_by_clause = "rank_path_fts"
+            else:
+                order_by_clause = "last_modified"
+        case "time_added":
+            if restrict_to_bookmarks:
+                order_by_clause = "time_added"
             else:
                 order_by_clause = "last_modified"
         case "path":
@@ -466,6 +473,7 @@ def build_main_query(
     # If this is set, we only search for files that are bookmarked
     bookmarks_condition = ""
     if restrict_to_bookmarks:
+        additional_select_columns += ",\n bookmarks.time_added AS time_added"
         bookmarks_condition = (
             "JOIN bookmarks ON files.sha256 = bookmarks.sha256"
         )
