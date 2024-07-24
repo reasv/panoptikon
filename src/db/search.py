@@ -2,6 +2,8 @@ import os
 import sqlite3
 from typing import List, Tuple
 
+from gradio_client import file
+
 from src.db.utils import pretty_print_SQL
 from src.types import FileSearchResult, OrderByType, OrderType
 
@@ -503,6 +505,11 @@ def build_main_query(
             ",\n extracted_text_matches.max_rank AS rank_fts"
         )
 
+    if any_text_query:
+        additional_select_columns += (
+            ",\n text_matches.max_rank AS rank_any_text"
+        )
+
     # If this is set, we only search for files that are bookmarked
     bookmarks_condition = ""
     if restrict_to_bookmarks:
@@ -518,6 +525,11 @@ def build_main_query(
                 else:
                     bookmarks_condition += ", ?"
             bookmarks_condition += ")"
+
+    # Generalized text query
+    any_text_query_clause, any_text_query_params = build_any_text_query_clause(
+        any_text_query, any_text_query_targets
+    )
 
     main_query = (
         f"""
@@ -539,6 +551,7 @@ def build_main_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
         GROUP BY files.path
@@ -557,6 +570,7 @@ def build_main_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
         {path_condition}
@@ -580,6 +594,7 @@ def build_main_query(
             match_path,
             match_filename,
             *extracted_text_params,
+            *any_text_query_params,
             *restrict_to_bookmark_namespaces,
             *(
                 (*negative_tags, *setters, *tag_namespaces, min_confidence)
@@ -643,3 +658,172 @@ def build_extracted_text_fts_clause(
         ON files.item_id = extracted_text_matches.item_id
         """
     return extracted_text_condition, extracted_text_params
+
+
+def build_any_text_query_clause(
+    any_text_query: str | None = None,
+    any_text_query_targets: List[Tuple[str, str]] | None = None,
+):
+    """
+    Build a subquery to match any text (from extracted text or file path/filename)
+    based on the given conditions.
+    """
+
+    if not any_text_query:
+        return "", []
+
+    subqueries = []
+    params: List[str] = []
+
+    # Define subquery for matching extracted text
+    extracted_text_subclause, extracted_text_params = (
+        build_extracted_text_subclause(any_text_query, any_text_query_targets)
+    )
+    if extracted_text_subclause:
+        subqueries.append(extracted_text_subclause)
+        params.extend(extracted_text_params)
+
+    # Define subquery for matching file path and filename
+    path_subclause, path_params = build_path_text_subclause(
+        any_text_query, any_text_query_targets
+    )
+
+    if path_subclause:
+        subqueries.append(path_subclause)
+        params.extend(path_params)
+
+    if len(subqueries) == 0:
+        return "", []
+
+    combined_subquery = " UNION ALL ".join(subqueries)
+
+    final_query = f"""
+        JOIN (
+            WITH combined_results AS (
+                {combined_subquery}
+            )
+            SELECT item_id, MAX(rank) AS max_rank
+            FROM combined_results
+            GROUP BY item_id
+        ) AS text_matches
+        ON files.item_id = text_matches.item_id
+    """
+    return final_query, params
+
+
+def build_extracted_text_subclause(
+    any_text_query: str,
+    any_text_query_targets: List[Tuple[str, str]] | None = None,
+):
+    """
+    Build a subquery to match extracted text based on the given conditions.
+    """
+
+    # Define subquery for matching extracted text
+    extracted_text_subclause = ""
+    extracted_text_params = []
+
+    should_include, type_setter_pairs = should_include_subclause(
+        any_text_query_targets, ["ocr", "stt"]
+    )
+    if not should_include:
+        return extracted_text_subclause, extracted_text_params
+
+    where_conditions = ["et_fts.text MATCH ?"]
+    extracted_text_params.append(any_text_query)
+
+    if type_setter_pairs:
+        include_pairs_conditions = " OR ".join(
+            ["(log.type = ? AND log.setter = ?)"] * len(type_setter_pairs)
+        )
+        where_conditions.append(f"({include_pairs_conditions})")
+        for type, setter in type_setter_pairs:
+            extracted_text_params.extend([type, setter])
+
+    extracted_text_subclause = f"""
+        SELECT et.item_id AS item_id, MAX(et_fts.rank) AS rank
+        FROM extracted_text_fts AS et_fts
+        JOIN extracted_text AS et ON et_fts.rowid = et.id
+        JOIN data_extraction_log AS log ON et.log_id = log.id
+        WHERE {" AND ".join(where_conditions)}
+        GROUP BY et.item_id
+    """
+    return extracted_text_subclause, extracted_text_params
+
+
+def build_path_text_subclause(
+    any_text_query: str,
+    any_text_query_targets: List[Tuple[str, str]] | None = None,
+):
+    """
+    Build a subquery to match file path and filename based on the given conditions.
+    """
+
+    path_subclause = ""
+    path_params: List[str] = []
+
+    should_include, path_filename_targets = should_include_subclause(
+        any_text_query_targets, ["path"]
+    )
+    if not should_include:
+        return path_subclause, path_params
+
+    path_conditions = []
+
+    if not path_filename_targets:
+        # Match on both path and filename
+        path_conditions.append("files_path_fts.path MATCH ?")
+        path_params.append(any_text_query)
+        path_conditions.append("files_path_fts.filename MATCH ?")
+        path_params.append(any_text_query)
+    else:
+        for _, target in path_filename_targets:
+            if target == "path":
+                path_conditions.append("files_path_fts.path MATCH ?")
+                path_params.append(any_text_query)
+            elif target == "filename":
+                path_conditions.append("files_path_fts.filename MATCH ?")
+                path_params.append(any_text_query)
+
+    file_path_condition = " OR ".join(path_conditions)
+
+    path_subclause = f"""
+        SELECT files.item_id AS item_id, MAX(files_path_fts.rank) AS rank
+        FROM files_path_fts
+        JOIN files ON files_path_fts.rowid = files.id
+        WHERE {file_path_condition}
+        GROUP BY files.item_id
+    """
+    return path_subclause, path_params
+
+
+def filter_targets_by_type(
+    model_types: List[str], targets: List[Tuple[str, str]]
+):
+    """
+    Filter a list of targets based on the given model types.
+    """
+    return [
+        (model_type, setter)
+        for model_type, setter in targets
+        if model_type in model_types
+    ]
+
+
+def should_include_subclause(
+    targets: List[Tuple[str, str]] | None, own_target_types: List[str]
+):
+    """
+    Check if a subclause should be included based on the given targets.
+    """
+    if targets:
+        own_targets = filter_targets_by_type(own_target_types, targets)
+        if not own_targets:
+            # If targets were provided, but none of them are our own targets,
+            # Then this subclause was specifically not requested
+            return False, None
+        return True, own_targets
+    else:
+        # If no targets are provided, it means can match on any
+        # Since no specific targets were requested
+        return True, None
