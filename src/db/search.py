@@ -2,8 +2,6 @@ import os
 import sqlite3
 from typing import List, Tuple
 
-from gradio_client import file
-
 from src.db.utils import pretty_print_SQL
 from src.types import FileSearchResult, OrderByType, OrderType
 
@@ -774,16 +772,17 @@ def build_path_text_subclause(
         # Match on both path and filename
         path_conditions.append("files_path_fts.path MATCH ?")
         path_params.append(any_text_query)
-        path_conditions.append("files_path_fts.filename MATCH ?")
-        path_params.append(any_text_query)
     else:
-        for _, target in path_filename_targets:
-            if target == "path":
-                path_conditions.append("files_path_fts.path MATCH ?")
-                path_params.append(any_text_query)
-            elif target == "filename":
-                path_conditions.append("files_path_fts.filename MATCH ?")
-                path_params.append(any_text_query)
+        # Match on either path or filename
+        # It is either-or, because the path contains the filename
+        targets = set([target for _, target in path_filename_targets])
+        if "path" in targets:
+            path_conditions.append("files_path_fts.path MATCH ?")
+            path_params.append(any_text_query)
+        else:
+            # Match on filename
+            path_conditions.append("files_path_fts.filename MATCH ?")
+            path_params.append(any_text_query)
 
     file_path_condition = " OR ".join(path_conditions)
 
