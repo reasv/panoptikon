@@ -69,11 +69,12 @@ def search(
     search_in_bookmarks: bool = False,
     bookmark_namespaces: List[str] | None = None,
     order_by_time_added_bk: bool = False,
-    search_action: str | None = None,
     any_text_query: str | None = None,
     restrict_to_query_types: List[Tuple[str, str]] | None = None,
     order_by_any_text_rank: bool = False,
+    search_action: str | None = None,
 ):
+    print(f"Search action: {search_action}")
     if search_action == "search_button":
         page = 1
     elif search_action == "next_page":
