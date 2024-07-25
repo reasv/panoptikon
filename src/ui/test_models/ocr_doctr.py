@@ -1,9 +1,10 @@
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import gradio as gr
 import numpy as np
 import torch
 from PIL import Image
+from sympy import li
 
 from src.utils import pil_ensure_rgb
 
@@ -21,10 +22,11 @@ def create_doctr_UI():
         with gr.Row():
             with gr.Column(variant="panel"):
                 image = gr.Image(type="pil", image_mode="RGBA", label="Input")
-                language = gr.Dropdown(
-                    ["en", "ch", "fr", "german", "korean", "japan"],
-                    value="en",
-                    label="Language",
+                threshold = gr.Slider(
+                    value=0,
+                    label="Confidence Threshold for Words",
+                    minimum=0,
+                    maximum=1,
                 )
                 with gr.Row():
                     clear = gr.ClearButton(
@@ -36,24 +38,44 @@ def create_doctr_UI():
                         value="Submit", variant="primary", size="lg"
                     )
             with gr.Column(variant="panel"):
-                text = gr.Textbox(label="Output")
-                clear.add([text])
+                with gr.Tabs():
+                    with gr.Tab(label="Output"):
+                        text = gr.Textbox(label="Output", lines=20)
+                        clear.add([text])
+                    with gr.Tab(label="JSON Data"):
+                        json_data = gr.JSON(label="JSON Data")
+                        clear.add([json_data])
+                    with gr.Tab(label="Word Confidences"):
+                        wc_text = gr.Textbox(label="Word Confidences", lines=20)
+                        clear.add([wc_text])
+                    with gr.Tab(label="Confidence Labels"):
+                        confidence_labels = gr.Label(
+                            label="Confidence For Each Word"
+                        )
+                        clear.add([confidence_labels])
 
-    def process_batch(model, batch: Sequence[np.ndarray]) -> List[str]:
+    def process_batch(
+        model, batch: Sequence[np.ndarray], threshold: float
+    ) -> Tuple[List[str], dict, List[Tuple[str, float]]]:
         result = model(batch)
         files_texts: List[str] = []
+        words_confidences: List[Tuple[str, float]] = []
         for page in result.pages:
             file_text = ""
             for block in page.blocks:
                 for line in block.lines:
                     for word in line.words:
+                        if word.confidence < threshold:
+                            continue
                         file_text += word.value + " "
+                        words_confidences.append((word.value, word.confidence))
                     file_text += "\n"
                 file_text += "\n"
             files_texts.append(file_text)
-        return files_texts
+        j = result.export()
+        return files_texts, j, words_confidences
 
-    def run_doctr(image: Image.Image, language):
+    def run_doctr(image: Image.Image, threshold: float):
         from doctr.models import ocr_predictor
 
         image_ndarray = np.array(pil_ensure_rgb(image))
@@ -66,11 +88,21 @@ def create_doctr_UI():
             )
             if torch.cuda.is_available():
                 doctr_model = doctr_model.cuda().half()
-        text = process_batch(doctr_model, [image_ndarray])[0]
-        return text
+        text, j, wc = process_batch(doctr_model, [image_ndarray], threshold)
+        text = text[0]
+        wc_string = "\n".join(
+            [f"{word}: {confidence}" for word, confidence in wc]
+        )
+        wc_dict = {word: confidence for word, confidence in wc}
+        return (
+            text,
+            j,
+            wc_string,
+            wc_dict,
+        )
 
     submit.click(
         fn=run_doctr,
-        inputs=[image, language],
-        outputs=[text],
+        inputs=[image, threshold],
+        outputs=[text, json_data, wc_text, confidence_labels],
     )
