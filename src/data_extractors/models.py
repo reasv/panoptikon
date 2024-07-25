@@ -7,7 +7,11 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
-from src.data_extractors.utils import get_threshold_from_env
+from src.data_extractors.utils import (
+    get_ocr_threshold_from_env,
+    get_threshold_from_env,
+    get_whisper_avg_logprob_threshold_from_env,
+)
 from src.db.extracted_text import delete_text_extracted_by_setter
 from src.db.extraction_log import remove_setter_from_items
 from src.db.tags import delete_tags_from_setter
@@ -252,6 +256,9 @@ class OCRModel(ModelOpts):
             + f"items by model {self.setter_id()}.\n"
         )
 
+    def threshold(self) -> float | None:
+        return get_ocr_threshold_from_env()
+
 
 class ImageEmbeddingModel(ModelOpts):
     _model_name: str
@@ -417,3 +424,6 @@ class WhisperSTTModel(ModelOpts):
 
     def supported_mime_types(self) -> List[str] | None:
         return ["audio/", "video/"]
+
+    def threshold(self) -> float | None:
+        return get_whisper_avg_logprob_threshold_from_env()

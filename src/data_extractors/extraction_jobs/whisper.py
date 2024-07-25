@@ -10,8 +10,12 @@ from faster_whisper.transcribe import Segment, TranscriptionInfo
 from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
-from src.data_extractors.text_embeddings import add_item_text
+from src.data_extractors.text_embeddings import (
+    add_item_text,
+    get_text_embedding_model,
+)
 from src.db.extracted_text import insert_extracted_text
+from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
 
@@ -33,6 +37,10 @@ def run_whisper_extractor_job(
         whisper_model = faster_whisper.BatchedInferencePipeline(
             model=whisper_model, batch_size=model_opts.batch_size()
         )
+
+    threshold = model_opts.threshold()
+
+    text_embedding_model = get_text_embedding_model()
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -70,28 +78,52 @@ def run_whisper_extractor_job(
             ]
         ],
     ):
-        if len(outputs) == 0:
-            return
-        segments, info = outputs[0]  # Only one output per item
-        merged_text = "\n".join([segment.text for segment in segments])
+        for segments, info in outputs:
+            segment_list = [
+                (segment.text, segment.avg_logprob)
+                for segment in segments
+                if not threshold or segment.avg_logprob > threshold
+            ]
+            text_segments = [segment[0] for segment in segment_list]
+            merged_text = "\n".join(text_segments)
 
-        merged_text = merged_text.strip()
+            merged_text = merged_text.strip()
+            if len(merged_text) < 3:
+                continue
 
-        add_item_text(
-            cdb,
-            item,
-            model_opts,
-            info.language,
-            merged_text,
-        )
-        insert_extracted_text(
-            conn,
-            item.sha256,
-            log_id,
-            text=merged_text,
-            language="en",
-            confidence=None,
-        )
+            text_embedding = text_embedding_model.encode([merged_text])
+
+            assert isinstance(
+                text_embedding, np.ndarray
+            ), "embeddings should be numpy arrays"
+            text_embedding_list = text_embedding.tolist()[0]
+
+            average_log_prob = (
+                sum(segment[1] for segment in segment_list) / len(segment_list)
+                if len(segment_list) > 0
+                else None
+            )
+            text_id = insert_extracted_text(
+                conn,
+                item.sha256,
+                log_id,
+                text=merged_text,
+                language=info.language,
+                language_confidence=info.language_probability,
+                confidence=average_log_prob,
+            )
+            add_text_embedding(
+                conn,
+                text_id,
+                text_embedding_list,
+            )
+            add_item_text(
+                cdb,
+                item,
+                model_opts,
+                info.language,
+                merged_text,
+            )
 
     return run_extraction_job(
         conn,

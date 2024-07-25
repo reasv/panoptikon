@@ -96,3 +96,10 @@ def delete_all_text_from_model(cdb: ClientAPI, model_opt: ModelOpts):
             ]
         }
     )
+
+
+def get_text_embedding_model():
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer("all-mpnet-base-v2")
+    return model

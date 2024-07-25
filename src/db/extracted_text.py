@@ -11,6 +11,7 @@ def insert_extracted_text(
     log_id: int,
     text: str,
     language: str | None,
+    language_confidence: float | None,
     confidence: float | None,
 ) -> int:
     """
@@ -26,10 +27,12 @@ def insert_extracted_text(
     cursor = conn.cursor()
 
     sql = """
-    INSERT INTO extracted_text (item_id, log_id, language, confidence, text)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO extracted_text (item_id, log_id, language, language_confidence, confidence, text)
+    VALUES (?, ?, ?, ?, ?, ?)
     """
-    cursor.execute(sql, (item_id, log_id, language, confidence, text))
+    cursor.execute(
+        sql, (item_id, log_id, language, language_confidence, confidence, text)
+    )
     assert cursor.lastrowid is not None, "Last row ID is None"
     return cursor.lastrowid
 

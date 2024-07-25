@@ -3,6 +3,7 @@ import sqlite3
 
 import sqlite_vec
 
+from src.db.text_embeddings import create_text_embeddings_table
 from src.db.utils import is_column_in_table, trigger_exists
 
 
@@ -172,6 +173,7 @@ def initialize_database(conn: sqlite3.Connection):
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         language TEXT,
+        language_confidence REAL,
         confidence REAL,
         text TEXT NOT NULL,
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
@@ -279,6 +281,8 @@ def initialize_database(conn: sqlite3.Connection):
         END;
     """
     )
+
+    create_text_embeddings_table(conn)
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [

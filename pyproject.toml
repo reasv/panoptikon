@@ -23,6 +23,7 @@ python-dotenv = "^1.0.1"
 faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
 sqlite-vec = "^0.0.1a36"
 sqlite-path = "^0.2.1"
+sentence-transformers = "^3.0.1"
 
 [build-system]
 requires = ["poetry-core"]
