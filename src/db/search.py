@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from cgitb import text
 from typing import List, Tuple
 
 from src.db.utils import pretty_print_SQL
@@ -170,7 +171,7 @@ def build_search_query(
     if tags_match_any and not tags:
         # If "match any" tags are provided, but no positive tags are provided
         # We need to build a query to match on *any* of them being present
-        main_query, params = build_main_query(
+        main_query, params = build_inner_query(
             tags=tags_match_any,
             negative_tags=negative_tags,
             tag_namespaces=tag_namespaces,
@@ -185,7 +186,7 @@ def build_search_query(
             match_filename=match_filename,
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            extracted_text_fts_targets=require_extracted_type_setter_pairs,
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
@@ -195,7 +196,7 @@ def build_search_query(
         )
     else:
         # Basic case where we need to match all positive tags and none of the negative tags
-        main_query, params = build_main_query(
+        main_query, params = build_inner_query(
             tags=tags,
             negative_tags=negative_tags,
             tag_namespaces=tag_namespaces,
@@ -210,7 +211,7 @@ def build_search_query(
             match_filename=match_filename,
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            extracted_text_fts_targets=require_extracted_type_setter_pairs,
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
@@ -223,7 +224,7 @@ def build_search_query(
         # If tags "match any" are provided along with match all regular positive tags
         # We need to build a separate query to match on *any* of them being present
         # And then intersect the results with the main query
-        tags_query, tags_params = build_main_query(
+        tags_query, tags_params = build_inner_query(
             tags=tags_match_any,
             negative_tags=None,
             tag_namespaces=tag_namespaces,
@@ -238,7 +239,7 @@ def build_search_query(
             match_filename=match_filename,
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            extracted_text_fts_targets=require_extracted_type_setter_pairs,
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
@@ -259,7 +260,7 @@ def build_search_query(
         # If negative tags "match all" are provided
         # We need to build a separate query to match on *all* of them being present
         # And then exclude the results from the main query
-        negative_tags_query, negative_tags_params = build_main_query(
+        negative_tags_query, negative_tags_params = build_inner_query(
             tags=negative_tags_match_all,
             negative_tags=None,
             tag_namespaces=tag_namespaces,
@@ -274,7 +275,7 @@ def build_search_query(
             match_filename=match_filename,
             # FTS match on extracted text
             match_extracted_text=match_extracted_text,
-            require_extracted_type_setter_pairs=require_extracted_type_setter_pairs,
+            extracted_text_fts_targets=require_extracted_type_setter_pairs,
             # Restrict to bookmarks
             restrict_to_bookmarks=restrict_to_bookmarks,
             restrict_to_bookmark_namespaces=restrict_to_bookmark_namespaces,
@@ -366,7 +367,7 @@ def build_order_by_clause(
     return clause, query_params
 
 
-def build_main_query(
+def build_inner_query(
     tags: List[str],
     negative_tags: List[str] | None = None,
     tag_namespaces: List[str] = [],
@@ -379,14 +380,23 @@ def build_main_query(
     match_path: str | None = None,
     match_filename: str | None = None,
     match_extracted_text: str | None = None,
-    require_extracted_type_setter_pairs: (
+    extracted_text_fts_targets: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
+    extracted_text_fts_languages: List[str] = [],
+    extracted_text_fts_language_min_confidence: float | None = None,
+    extracted_text_min_confidence: float | None = None,
     restrict_to_bookmarks: bool = False,
     restrict_to_bookmark_namespaces: List[str] = [],
     # Generalized text query
     any_text_query: str | None = None,
     any_text_query_targets: List[Tuple[str, str]] = [],
+    # Text embeddings query
+    text_embeddings_query: bytes | None = None,
+    text_embeddings_targets: List[Tuple[str, str]] = [],
+    text_embeddings_languages: List[str] = [],
+    text_embeddings_language_min_confidence: float | None = None,
+    text_embeddings_min_confidence: float | None = None,
 ) -> Tuple[str, List[str | int | float]]:
     """
     Build a query to search for files based on the given tags,
@@ -394,9 +404,22 @@ def build_main_query(
     """
     # The items should have text extracted by the given setters matching the query
     extracted_text_condition, extracted_text_params = (
-        build_extracted_text_fts_clause(
+        build_extracted_text_search_clause(
             match_extracted_text,
-            require_extracted_type_setter_pairs,
+            extracted_text_fts_targets,
+            extracted_text_fts_languages,
+            extracted_text_fts_language_min_confidence,
+            extracted_text_min_confidence,
+        )
+    )
+
+    text_embeddings_condition, text_embeddings_params = (
+        build_extracted_text_search_clause(
+            text_embeddings_query,
+            text_embeddings_targets,
+            text_embeddings_languages,
+            text_embeddings_language_min_confidence,
+            text_embeddings_min_confidence,
         )
     )
 
@@ -508,6 +531,11 @@ def build_main_query(
             ",\n text_matches.max_rank AS rank_any_text"
         )
 
+    if text_embeddings_query:
+        additional_select_columns += (
+            ",\n text_vector_matches.distance AS text_vec_distance"
+        )
+
     # If this is set, we only search for files that are bookmarked
     bookmarks_condition = ""
     if restrict_to_bookmarks:
@@ -549,6 +577,7 @@ def build_main_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {text_embeddings_condition}
         {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
@@ -568,6 +597,7 @@ def build_main_query(
         {item_type_condition}
         {path_match_condition}
         {extracted_text_condition}
+        {text_embeddings_condition}
         {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
@@ -592,6 +622,7 @@ def build_main_query(
             match_path,
             match_filename,
             *extracted_text_params,
+            *text_embeddings_params,
             *any_text_query_params,
             *restrict_to_bookmark_namespaces,
             *(
@@ -618,44 +649,49 @@ def build_main_query(
     return main_query, params
 
 
-def build_extracted_text_fts_clause(
-    match_extracted_text: str | None = None,
+def build_extracted_text_search_clause(
+    text_query: str | bytes | None = None,
     require_extracted_type_setter_pairs: (
         List[Tuple[str, str]] | None
     ) = None,  # Pairs of (type, setter) to include
+    languages: List[str] | None = None,
+    language_min_confidence: float | None = None,
+    extracted_text_min_confidence: float | None = None,
 ):
     """
     Build a subquery to match extracted text based on the given conditions.
     """
+    # Check if the text query is a vector query
+    is_vector_query = isinstance(text_query, bytes)
 
     # Define subquery for matching extracted text
-    extracted_text_condition = ""
-    extracted_text_params = []
-    if match_extracted_text:
-        extracted_text_conditions = ["et_fts.text MATCH ?"]
-        extracted_text_params.append(match_extracted_text)
+    if not text_query:
+        return "", []
 
-        if require_extracted_type_setter_pairs:
-            include_pairs_conditions = " OR ".join(
-                ["(log.type = ? AND log.setter = ?)"]
-                * len(require_extracted_type_setter_pairs)
-            )
-            extracted_text_conditions.append(f"({include_pairs_conditions})")
-            for type, setter in require_extracted_type_setter_pairs:
-                extracted_text_params.extend([type, setter])
-
+    subclause, params = build_extracted_text_search_subclause(
+        text_query,
+        require_extracted_type_setter_pairs,
+        languages,
+        language_min_confidence,
+        extracted_text_min_confidence,
+    )
+    if len(subclause) == 0:
+        return "", []
+    if is_vector_query:
         extracted_text_condition = f"""
-        JOIN (
-            SELECT et.item_id, MAX(et_fts.rank) AS max_rank
-            FROM extracted_text_fts AS et_fts
-            JOIN extracted_text AS et ON et_fts.rowid = et.id
-            JOIN data_extraction_log AS log ON et.log_id = log.id
-            WHERE {" AND ".join(extracted_text_conditions)}
-            GROUP BY et.item_id
-        ) AS extracted_text_matches
-        ON files.item_id = extracted_text_matches.item_id
+            JOIN (
+                {subclause}
+            ) AS text_vector_matches
+            ON files.item_id = text_vector_matches.item_id
         """
-    return extracted_text_condition, extracted_text_params
+    else:
+        extracted_text_condition = f"""
+            JOIN (
+                {subclause}
+            ) AS extracted_text_matches
+            ON files.item_id = extracted_text_matches.item_id
+        """
+    return extracted_text_condition, params
 
 
 def build_any_text_query_clause(
@@ -671,11 +707,13 @@ def build_any_text_query_clause(
         return "", []
 
     subqueries = []
-    params: List[str] = []
+    params: List[str | float | bytes] = []
 
     # Define subquery for matching extracted text
     extracted_text_subclause, extracted_text_params = (
-        build_extracted_text_subclause(any_text_query, any_text_query_targets)
+        build_extracted_text_search_subclause(
+            any_text_query, any_text_query_targets
+        )
     )
     if extracted_text_subclause:
         subqueries.append(extracted_text_subclause)
@@ -709,26 +747,35 @@ def build_any_text_query_clause(
     return final_query, params
 
 
-def build_extracted_text_subclause(
-    any_text_query: str,
-    any_text_query_targets: List[Tuple[str, str]] | None = None,
+def build_extracted_text_search_subclause(
+    text_query: bytes | str,
+    query_targets: List[Tuple[str, str]] | None = None,
+    languages: List[str] | None = None,
+    language_min_confidence: float | None = None,
+    extracted_text_min_confidence: float | None = None,
 ):
     """
     Build a subquery to match extracted text based on the given conditions.
     """
+    # Check if the text query is a vector query
+    is_vector_query = isinstance(text_query, bytes)
 
     # Define subquery for matching extracted text
     extracted_text_subclause = ""
-    extracted_text_params = []
+    extracted_text_params: List[str | float | bytes] = []
 
     should_include, type_setter_pairs = should_include_subclause(
-        any_text_query_targets, ["ocr", "stt"]
+        query_targets, ["ocr", "stt"]
     )
     if not should_include:
         return extracted_text_subclause, extracted_text_params
 
-    where_conditions = ["et_fts.text MATCH ?"]
-    extracted_text_params.append(any_text_query)
+    if is_vector_query:
+        where_conditions = ["et_vec.sentence_embedding MATCH ?"]
+    else:
+        where_conditions = ["et_fts.text MATCH ?"]
+
+    extracted_text_params.append(text_query)
 
     if type_setter_pairs:
         include_pairs_conditions = " OR ".join(
@@ -738,14 +785,37 @@ def build_extracted_text_subclause(
         for type, setter in type_setter_pairs:
             extracted_text_params.extend([type, setter])
 
-    extracted_text_subclause = f"""
-        SELECT et.item_id AS item_id, MAX(et_fts.rank) AS rank
-        FROM extracted_text_fts AS et_fts
-        JOIN extracted_text AS et ON et_fts.rowid = et.id
-        JOIN data_extraction_log AS log ON et.log_id = log.id
-        WHERE {" AND ".join(where_conditions)}
-        GROUP BY et.item_id
-    """
+    if languages:
+        where_conditions.append(
+            "et.language IN ({','.join(['?']*len(languages))})"
+        )
+        extracted_text_params.extend(languages)
+        if language_min_confidence:
+            where_conditions.append("et.language_confidence >= ?")
+            extracted_text_params.append(language_min_confidence)
+
+    if extracted_text_min_confidence:
+        where_conditions.append("et.confidence >= ?")
+        extracted_text_params.append(extracted_text_min_confidence)
+
+    if is_vector_query:
+        extracted_text_subclause = f"""
+            SELECT et.item_id AS item_id, MIN(et_vec.distance) AS distance
+            FROM extracted_text_embed AS et_vec
+            JOIN extracted_text AS et ON et_vec.id = et.id
+            JOIN data_extraction_log AS log ON et.log_id = log.id
+            WHERE {" AND ".join(where_conditions)}
+            GROUP BY et.item_id
+        """
+    else:
+        extracted_text_subclause = f"""
+            SELECT et.item_id AS item_id, MAX(et_fts.rank) AS rank
+            FROM extracted_text_fts AS et_fts
+            JOIN extracted_text AS et ON et_fts.rowid = et.id
+            JOIN data_extraction_log AS log ON et.log_id = log.id
+            WHERE {" AND ".join(where_conditions)}
+            GROUP BY et.item_id
+        """
     return extracted_text_subclause, extracted_text_params
 
 
