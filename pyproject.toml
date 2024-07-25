@@ -15,23 +15,14 @@ python = "^3.12"
 gradio = "^4.37.2"
 pillow = "^10.4.0"
 imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
-paddleocr = "^2.8.0"
-paddlepaddle-gpu = "^2.6.1"
 open-clip-torch = "^2.26.1"
 chromadb = "^0.5.4"
-torch = {version = "^2.3.1+cu121", source = "pytorch_cuda"}
-torchvision = {version = "^0.18.1+cu121", source = "pytorch_cuda"}
-torchaudio = {version = "^2.3.1+cu121", source = "pytorch_cuda"}
 python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
 python-dotenv = "^1.0.1"
 faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
 sqlite-vec = "^0.0.1a36"
-
-[[tool.poetry.source]]
-name = "pytorch_cuda"
-url = "https://download.pytorch.org/whl/cu121"
-priority = "explicit"
+sqlite-path = "^0.2.1"
 
 [build-system]
 requires = ["poetry-core"]

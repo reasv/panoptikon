@@ -1,6 +1,8 @@
 import os
 import sqlite3
 
+import sqlite_vec
+
 from src.db.utils import is_column_in_table, trigger_exists
 
 
@@ -19,6 +21,14 @@ def get_database_connection(write_lock: bool) -> sqlite3.Connection:
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
+    load_sqlite_vec(conn)
+    return conn
+
+
+def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
     return conn
 
 

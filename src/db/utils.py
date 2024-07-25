@@ -1,4 +1,5 @@
 import sqlite3
+import struct
 from typing import List
 
 
@@ -57,3 +58,8 @@ def pretty_print_SQL(query_str: str, params: List[str | float | int]):
     except Exception as e:
         print(f"Error formatting query: {e}")
         print(query_str, params)
+
+
+def serialize_f32(vector: List[float]) -> bytes:
+    """serializes a list of floats into a compact "raw bytes" format"""
+    return struct.pack("%sf" % len(vector), *vector)
