@@ -191,11 +191,17 @@ def build_inner_query(
         {bookmarks_condition}
         {negative_tags_condition}
         {path_condition}
+        {"GROUP BY files.path" if args.extracted_text_embeddings and text_embeddings_condition else ""}
     """
     )
     params: List[str | int | float] = [
         param
         for param in [
+            (
+                args.extracted_text_embeddings.query
+                if args.extracted_text_embeddings and text_embeddings_condition
+                else None
+            ),
             *positive_tag_params,
             *(args.files.include_path_prefixes if tags.positive else []),
             *args.files.item_types,

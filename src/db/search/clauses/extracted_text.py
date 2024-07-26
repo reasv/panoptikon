@@ -19,14 +19,9 @@ def build_extracted_text_search_clause(args: ExtractedTextFilter | None):
         return "", [], ""
     if is_vector_query:
         extracted_text_condition = f"""
-            JOIN (
-                {subclause}
-            ) AS text_vector_matches
-            ON files.item_id = text_vector_matches.item_id
+            {subclause}
         """
-        additional_columns = (
-            ",\n text_vector_matches.distance AS text_vec_distance"
-        )
+        additional_columns = ",\n MIN(vec_distance_L2(et_vec.sentence_embedding, ?)) AS text_vec_distance"
     else:
         extracted_text_condition = f"""
             JOIN (
@@ -58,13 +53,11 @@ def build_extracted_text_search_subclause(args: ExtractedTextFilter):
 
     if is_vector_query:
         where_conditions = [
-            "et_vec.sentence_embedding MATCH ?",
-            "et_vec.k = 1000",
+            "et.id = et_vec.id",
         ]
     else:
         where_conditions = ["et_fts.text MATCH ?"]
-
-    extracted_text_params.append(args.query)
+        extracted_text_params.append(args.query)
 
     if type_setter_pairs:
         include_pairs_conditions = " OR ".join(
@@ -89,12 +82,10 @@ def build_extracted_text_search_subclause(args: ExtractedTextFilter):
 
     if is_vector_query:
         extracted_text_subclause = f"""
-            SELECT et.item_id AS item_id, MIN(et_vec.distance) AS distance
-            FROM extracted_text_embed AS et_vec
-            JOIN extracted_text AS et ON et_vec.id = et.id
+            JOIN extracted_text as et ON et.item_id = files.item_id
             JOIN data_extraction_log AS log ON et.log_id = log.id
-            WHERE {" AND ".join(where_conditions)}
-            GROUP BY et.item_id
+            JOIN extracted_text_embed as et_vec
+            ON {" AND ".join(where_conditions)}
         """
     else:
         extracted_text_subclause = f"""
