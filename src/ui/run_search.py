@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import urllib.parse
-from cgitb import text
 from time import time
 from typing import List, Tuple
 
@@ -31,6 +30,23 @@ from src.db.utils import serialize_f32
 from src.types import FileSearchResult
 
 text_embedding_model = None
+last_embedded_text: str | None = None
+last_embedded_text_embed: bytes | None = None
+
+
+def get_embed(text: str):
+    global last_embedded_text, last_embedded_text_embed
+    if text == last_embedded_text:
+        return last_embedded_text_embed
+    global text_embedding_model
+    if not text_embedding_model:
+        text_embedding_model = get_text_embedding_model()
+    text_embed = text_embedding_model.encode([text])
+    assert isinstance(text_embed, np.ndarray)
+    text_embed_list = text_embed.tolist()[0]
+    last_embedded_text = text
+    last_embedded_text_embed = serialize_f32(text_embed_list)
+    return last_embedded_text_embed
 
 
 def search(
@@ -126,13 +142,7 @@ def search(
         min_confidence=min_tag_confidence,
     )
     if vec_text_search:
-        global text_embedding_model
-        if not text_embedding_model:
-            text_embedding_model = get_text_embedding_model()
-        text_embed = text_embedding_model.encode([vec_text_search])
-        assert isinstance(text_embed, np.ndarray)
-        text_embed_list = text_embed.tolist()[0]
-        vec_text_search_embed = serialize_f32(text_embed_list)
+        vec_text_search_embed = get_embed(vec_text_search)
     else:
         vec_text_search_embed = None
 
