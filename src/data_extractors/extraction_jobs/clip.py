@@ -32,7 +32,6 @@ def run_image_embedding_extractor_job(
         inputs: Sequence[np.ndarray],
         embeddings: Sequence[np.ndarray],
     ):
-        print(type(embeddings[0]))
         embeddings_list = [embedding.tolist() for embedding in embeddings]
         add_item_image_embeddings(cdb, model_opt, item, inputs, embeddings_list)
         for embedding in embeddings_list:

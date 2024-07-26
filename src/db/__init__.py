@@ -282,8 +282,20 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS image_embeddings (
+            id INTEGER PRIMARY KEY,
+            item_id INTEGER NOT NULL,
+            log_id INTEGER NOT NULL,
+            embedding float[],
+            FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+            FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+        );
+        """
+    )
+
     create_text_embeddings_table(conn)
-    create_image_embeddings_tables(conn)
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -330,8 +342,8 @@ def initialize_database(conn: sqlite3.Connection):
         ("extracted_text", ["log_id"]),
         ("extracted_text", ["language"]),
         ("extracted_text", ["confidence"]),
-        ("image_embeddings_meta", ["item_id"]),
-        ("image_embeddings_meta", ["log_id"]),
+        ("image_embeddings", ["item_id"]),
+        ("image_embeddings", ["log_id"]),
     ]
 
     for table, columns in indices:
@@ -359,46 +371,46 @@ def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
     return None
 
 
-def create_image_embeddings_tables(
-    conn: sqlite3.Connection, embedding_size: int = 1024
-):
-    cursor = conn.cursor()
-    cursor.execute(
-        f"""
-        DROP TABLE IF EXISTS image_embeddings_meta;
-        """
-    )
-    cursor.execute(
-        f"""
-        DROP TABLE IF EXISTS image_embeddings;
-        """
-    )
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS image_embeddings_meta (
-            id INTEGER PRIMARY KEY,
-            item_id INTEGER NOT NULL,
-            log_id INTEGER NOT NULL,
-            FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-            FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
-        );
-        """
-    )
-    cursor.execute(
-        f"""
-        CREATE VIRTUAL TABLE IF NOT EXISTS image_embeddings USING vec0(
-            id INTEGER PRIMARY KEY,
-            embedding FLOAT[{embedding_size}]
-        );
-        """
-    )
-    if trigger_exists(conn, "image_embeddings_meta_ad_embed"):
-        cursor.execute("DROP TRIGGER image_embeddings_meta_ad_embed")
-    # Create triggers to keep the image_embeddings table up to date
-    cursor.execute(
-        """
-        CREATE TRIGGER image_embeddings_meta_ad_embed AFTER DELETE ON image_embeddings_meta BEGIN
-            DELETE FROM image_embeddings WHERE id = old.id;
-        END;
-        """
-    )
+# def create_image_embeddings_tables(
+#     conn: sqlite3.Connection, embedding_size: int = 1024
+# ):
+#     cursor = conn.cursor()
+#     cursor.execute(
+#         f"""
+#         DROP TABLE IF EXISTS image_embeddings_meta;
+#         """
+#     )
+#     cursor.execute(
+#         f"""
+#         DROP TABLE IF EXISTS image_embeddings;
+#         """
+#     )
+#     cursor.execute(
+#         f"""
+#         CREATE TABLE IF NOT EXISTS image_embeddings_meta (
+#             id INTEGER PRIMARY KEY,
+#             item_id INTEGER NOT NULL,
+#             log_id INTEGER NOT NULL,
+#             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+#             FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+#         );
+#         """
+#     )
+#     cursor.execute(
+#         f"""
+#         CREATE VIRTUAL TABLE IF NOT EXISTS image_embeddings USING vec0(
+#             id INTEGER PRIMARY KEY,
+#             embedding FLOAT[{embedding_size}]
+#         );
+#         """
+#     )
+#     if trigger_exists(conn, "image_embeddings_meta_ad_embed"):
+#         cursor.execute("DROP TRIGGER image_embeddings_meta_ad_embed")
+#     # Create triggers to keep the image_embeddings table up to date
+#     cursor.execute(
+#         """
+#         CREATE TRIGGER image_embeddings_meta_ad_embed AFTER DELETE ON image_embeddings_meta BEGIN
+#             DELETE FROM image_embeddings WHERE id = old.id;
+#         END;
+#         """
+#     )

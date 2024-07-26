@@ -14,35 +14,27 @@ def insert_image_embedding(
     """
     Insert image embedding into the database
     """
-
     item_id = get_item_id(conn, item_sha256)
     assert item_id is not None, f"Item with SHA256 {item_sha256} not found"
 
-    cursor = conn.cursor()
-
     sql = """
-    INSERT INTO image_embeddings_meta (item_id, log_id)
-    VALUES (?, ?)
+        INSERT INTO image_embeddings (item_id, log_id, embedding)
+        VALUES (?, ?, ?)
     """
-    cursor.execute(sql, (item_id, log_id))
-    assert cursor.lastrowid is not None, "Last row ID is None"
-    metadata_id = cursor.lastrowid
-
     embedding_bytes = serialize_f32(embedding)
-    cursor.execute(
-        "INSERT INTO image_embeddings (id, embedding) VALUES (?, ?)",
-        (metadata_id, embedding_bytes),
-    )
-    return metadata_id
+    cursor = conn.cursor()
+    cursor.execute(sql, (item_id, log_id, embedding_bytes))
+    assert cursor.lastrowid is not None, "Last row ID is None"
+    return cursor.lastrowid
 
 
-def delete_embedding_generated_by_setter(
+def delete_embeddings_generated_by_setter(
     conn: sqlite3.Connection, model_type: str, setter: str
 ):
     cursor = conn.cursor()
     cursor.execute(
         """
-        DELETE FROM image_embeddings_meta
+        DELETE FROM image_embeddings
         WHERE log_id IN (
             SELECT data_extraction_log.id
             FROM data_extraction_log
