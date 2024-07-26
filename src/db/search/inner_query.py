@@ -6,7 +6,7 @@ from src.db.search.clauses.extracted_text import (
     build_extracted_text_search_clause,
 )
 from src.db.search.clauses.path_text import build_path_fts_clause
-from src.db.search.types import FileParams, InnerQueryParams
+from src.db.search.types import FileFilters, InnerQueryParams
 
 
 def build_inner_query(
@@ -95,7 +95,7 @@ def build_inner_query(
         )
     )
     if not args.files:
-        args.files = FileParams()
+        args.files = FileFilters()
     # The item mimetype should start with one of the given strings
     item_type_condition = ""
     if len(args.files.item_types) > 0:

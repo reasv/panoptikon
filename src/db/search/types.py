@@ -23,7 +23,7 @@ OrderType = Literal["asc", "desc"] | None
 
 @typechecked
 @dataclass
-class FileParams:
+class FileFilters:
     item_types: List[str] = []
     include_path_prefixes: List[str] = []
 
@@ -34,7 +34,7 @@ Q = TypeVar("Q", str, bytes)
 
 @typechecked
 @dataclass
-class ExtractedTextParams[Q]:
+class ExtractedTextFilter[Q]:
     query: Q
     targets: List[Tuple[str, str]] = []
     languages: List[str] = []
@@ -44,28 +44,28 @@ class ExtractedTextParams[Q]:
 
 @typechecked
 @dataclass
-class BookmarkParams:
+class BookmarksFilter:
     restrict_to_bookmarks: Literal[True] = True
     namespaces: List[str] = []
 
 
 @typechecked
 @dataclass
-class PathQueryParams:
+class PathTextFilter:
     query: str
     only_match_filename: bool = False
 
 
 @typechecked
 @dataclass
-class AnyTextParams:
+class AnyTextFilter:
     query: str
     targets: List[Tuple[str, str]] = []
 
 
 @typechecked
 @dataclass
-class InnerQueryTagParams:
+class InnerQueryTagFilters:
     positive: List[str]
     negative: List[str] = []
     all_setters_required: bool = False
@@ -77,7 +77,7 @@ class InnerQueryTagParams:
 
 @typechecked
 @dataclass
-class QueryTagParams:
+class QueryTagFilters:
     pos_match_all: List[str] = []
     pos_match_any: List[str] = []
     neg_match_any: List[str] = []
@@ -91,25 +91,25 @@ class QueryTagParams:
 @typechecked
 @dataclass
 class QueryFilters:
-    files: FileParams | None = None
-    path: PathQueryParams | None = None
-    extracted_text: ExtractedTextParams[str] | None = None
-    extracted_text_embeddings: ExtractedTextParams[bytes] | None = None
-    any_text: AnyTextParams | None = None
-    bookmarks: BookmarkParams | None = None
-
-
-@typechecked
-@dataclass
-class QueryParams:
-    tags: QueryTagParams
-    filters: QueryFilters
+    files: FileFilters | None = None
+    path: PathTextFilter | None = None
+    extracted_text: ExtractedTextFilter[str] | None = None
+    extracted_text_embeddings: ExtractedTextFilter[bytes] | None = None
+    any_text: AnyTextFilter | None = None
+    bookmarks: BookmarksFilter | None = None
 
 
 @typechecked
 @dataclass
 class InnerQueryParams:
-    tags: InnerQueryTagParams
+    tags: InnerQueryTagFilters
+    filters: QueryFilters
+
+
+@typechecked
+@dataclass
+class QueryParams:
+    tags: QueryTagFilters
     filters: QueryFilters
 
 

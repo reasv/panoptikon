@@ -4,11 +4,11 @@ from src.db.search.clauses.extracted_text import (
     build_extracted_text_search_subclause,
 )
 from src.db.search.clauses.path_text import build_path_text_subclause
-from src.db.search.types import AnyTextParams, ExtractedTextParams
+from src.db.search.types import AnyTextFilter, ExtractedTextParams
 
 
 def build_any_text_query_clause(
-    args: AnyTextParams | None,
+    args: AnyTextFilter | None,
 ):
     """
     Build a subquery to match any text (from extracted text or file path/filename)

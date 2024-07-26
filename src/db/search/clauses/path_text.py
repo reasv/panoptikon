@@ -1,11 +1,11 @@
 from typing import List
 
 from src.db.search.clauses.utils import should_include_subclause
-from src.db.search.types import AnyTextParams, PathQueryParams
+from src.db.search.types import AnyTextFilter, PathTextFilter
 
 
 def build_path_fts_clause(
-    args: PathQueryParams | None,
+    args: PathTextFilter | None,
 ):
     """
     Build a subquery to match file path or filename based on the given conditions.
@@ -30,7 +30,7 @@ def build_path_fts_clause(
 
 
 def build_path_text_subclause(
-    args: AnyTextParams,
+    args: AnyTextFilter,
 ):
     """
     Build a subquery to match file path and filename based on the given conditions.

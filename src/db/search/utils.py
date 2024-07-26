@@ -2,7 +2,7 @@ from typing import List
 
 from typeguard import typechecked
 
-from src.db.search.types import QueryTagParams, SearchQuery
+from src.db.search.types import QueryTagFilters, SearchQuery
 
 
 @typechecked
@@ -12,7 +12,7 @@ def clean_input(args: SearchQuery) -> SearchQuery:
 
 
 @typechecked
-def clean_tag_params(args: QueryTagParams):
+def clean_tag_params(args: QueryTagFilters):
     # Normalize/clean/deduplicate the inputs
     def clean_tag_list(tag_list: List[str] | None) -> List[str]:
         if not tag_list:
@@ -22,7 +22,7 @@ def clean_tag_params(args: QueryTagParams):
         ]
         return list(set(cleaned_tags))
 
-    tag_args = QueryTagParams(
+    tag_args = QueryTagFilters(
         pos_match_all=clean_tag_list(args.pos_match_all),
         pos_match_any=clean_tag_list(args.pos_match_any),
         neg_match_any=clean_tag_list(args.neg_match_any),

@@ -1,8 +1,8 @@
-from src.db.search.types import BookmarkParams
+from src.db.search.types import BookmarksFilter
 
 
 def build_bookmarks_clause(
-    args: BookmarkParams | None,
+    args: BookmarksFilter | None,
 ):
     """
     Build a subquery to match only files that are bookmarked

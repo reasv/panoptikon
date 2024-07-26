@@ -1,7 +1,7 @@
 from src.db.search.inner_query import build_inner_query
 from src.db.search.types import (
     InnerQueryParams,
-    InnerQueryTagParams,
+    InnerQueryTagFilters,
     QueryParams,
 )
 
@@ -17,7 +17,7 @@ def build_search_query(
         # We need to build a query to match on *any* of them being present
         main_query, params = build_inner_query(
             InnerQueryParams(
-                tags=InnerQueryTagParams(
+                tags=InnerQueryTagFilters(
                     positive=tags.pos_match_any,
                     negative=tags.neg_match_any,
                     all_setters_required=False,
@@ -34,7 +34,7 @@ def build_search_query(
         # There might even be no tags at all in this case
         main_query, params = build_inner_query(
             InnerQueryParams(
-                tags=InnerQueryTagParams(
+                tags=InnerQueryTagFilters(
                     positive=tags.pos_match_all,
                     negative=tags.neg_match_any,
                     any_positive_tags_match=False,
@@ -53,7 +53,7 @@ def build_search_query(
         # And then intersect the results with the main query
         any_tags_query, any_tags_params = build_inner_query(
             InnerQueryParams(
-                tags=InnerQueryTagParams(
+                tags=InnerQueryTagFilters(
                     positive=tags.pos_match_any,
                     negative=[],
                     any_positive_tags_match=True,
@@ -81,7 +81,7 @@ def build_search_query(
 
         negative_tags_query, negative_tags_params = build_inner_query(
             InnerQueryParams(
-                tags=InnerQueryTagParams(
+                tags=InnerQueryTagFilters(
                     positive=tags.neg_match_all,
                     negative=[],
                     any_positive_tags_match=False,
