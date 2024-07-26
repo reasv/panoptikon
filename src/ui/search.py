@@ -40,12 +40,13 @@ def on_tab_load():
     ]
 
     general_text_sources = [
-        *setters_except_tags,
+        *extracted_text_setters,
         ("Full Path", ("path", "path")),
         ("Filename", ("path", "filename")),
     ]
     return (
         gr.update(choices=folders),
+        gr.update(choices=extracted_text_setters),
         gr.update(choices=extracted_text_setters),
         gr.update(choices=tag_setters),
         gr.update(choices=tag_namespaces),
@@ -275,6 +276,7 @@ def create_search_UI(
     onload_outputs = [
         restrict_to_paths,
         require_text_extractors,
+        vec_targets,
         tag_setters,
         tag_namespace_prefixes,
         restrict_to_bk_namespaces,
