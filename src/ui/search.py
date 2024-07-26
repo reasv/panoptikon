@@ -33,10 +33,10 @@ def on_tab_load():
         if model_type == "tags"
     ]
 
-    setters_except_tags = [
-        (f"{model_type}|{setter_id}", (model_type, setter_id))
+    clip_setters = [
+        setter_id
         for model_type, setter_id in full_setters_list
-        if model_type != "tags"
+        if model_type == "clip"
     ]
 
     general_text_sources = [
@@ -53,6 +53,10 @@ def on_tab_load():
         gr.update(choices=bookmark_namespaces),
         gr.update(choices=file_types),
         gr.update(choices=general_text_sources),
+        gr.update(
+            choices=clip_setters,
+            value=clip_setters[0] if clip_setters else None,
+        ),
     )
 
 
@@ -255,6 +259,29 @@ def create_search_UI(
                                     multiselect=True,
                                     scale=1,
                                 )
+                        with gr.Tab(label="Semantic Image Search"):
+                            with gr.Row():
+                                clip_model = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Select CLIP model",
+                                    multiselect=False,
+                                    scale=1,
+                                )
+                                with gr.Tabs():
+                                    with gr.Tab(label="Text Query"):
+                                        clip_text_search = gr.Textbox(
+                                            label="Semantic Text Query",
+                                            value="",
+                                            show_copy_button=True,
+                                            scale=2,
+                                        )
+                                    with gr.Tab(label="Image Query"):
+                                        clip_image_search = gr.Image(
+                                            label="Search for similar images",
+                                            scale=1,
+                                            type="numpy",
+                                        )
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -282,6 +309,7 @@ def create_search_UI(
         restrict_to_bk_namespaces,
         allowed_item_type_prefixes,
         restrict_to_query_types,
+        clip_model,
     ]
 
     search_tab.select(
@@ -319,6 +347,9 @@ def create_search_UI(
         order_by_any_text_rank,
         vec_text_search,
         vec_targets,
+        clip_model,
+        clip_text_search,
+        clip_image_search,
     ]
 
     search_outputs = [multi_view.files, number_of_results, current_page, link]

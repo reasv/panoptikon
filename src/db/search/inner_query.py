@@ -219,6 +219,11 @@ def build_inner_query(
                 if args.extracted_text_embeddings and text_embeddings_condition
                 else None
             ),
+            (
+                args.image_embeddings.query
+                if args.image_embeddings and image_embeddings_clause
+                else None
+            ),
             *positive_tag_params,
             *(args.files.include_path_prefixes if tags.positive else []),
             *args.files.item_types,

@@ -16,6 +16,7 @@ from src.db.search.types import (
     BookmarksFilter,
     ExtractedTextFilter,
     FileFilters,
+    ImageEmbeddingFilter,
     OrderByType,
     OrderParams,
     OrderType,
@@ -49,6 +50,47 @@ def get_embed(text: str):
     return last_embedded_text_embed
 
 
+clip_model = None
+last_clip_text: str | None = None
+last_clip_text_embed: bytes | None = None
+
+
+def get_clip_embed(input: str | np.ndarray, model_name: str):
+    global last_clip_text, last_clip_text_embed
+    if isinstance(input, str) and input == last_clip_text:
+        return last_clip_text_embed
+
+    from src.data_extractors.ai.clip import CLIPEmbedder
+    from src.data_extractors.models import ImageEmbeddingModel
+
+    model_opt = ImageEmbeddingModel(1, model_name)
+    name = model_opt.clip_model_name()
+    pretrained = model_opt.clip_model_checkpoint()
+    global clip_model
+    if not clip_model:
+        clip_model = CLIPEmbedder(name, pretrained)
+        clip_model.load_model()
+    else:
+        assert isinstance(clip_model, CLIPEmbedder), "Invalid type"
+        if clip_model.model_name != name or clip_model.pretrained != pretrained:
+            clip_model.unload_model()
+            clip_model = CLIPEmbedder(name, pretrained)
+            clip_model.load_model()
+    if isinstance(input, str):
+        embed = clip_model.get_text_embeddings([input])[0]
+        assert isinstance(embed, np.ndarray)
+        text_embed_list = embed.tolist()
+        last_clip_text = input
+        last_clip_text_embed = serialize_f32(text_embed_list)
+        return last_clip_text_embed
+    else:  # input is an image
+        embed = clip_model.get_image_embeddings([input])[0]
+        assert isinstance(embed, np.ndarray)
+        embed_list = embed.tolist()
+        image_embedding = serialize_f32(embed_list)
+        return image_embedding
+
+
 def search(
     tags_str: str,
     min_tag_confidence: float | None,
@@ -75,6 +117,9 @@ def search(
     order_by_any_text_rank: bool = False,
     vec_text_search: str | None = None,
     vec_targets: List[Tuple[str, str]] | None = None,
+    clip_model: Tuple[str, str] | None = None,
+    clip_text_query: str | None = None,
+    clip_image_query: np.ndarray | None = None,
     search_action: str | None = None,
 ):
     print(f"Search action: {search_action}")
@@ -108,6 +153,10 @@ def search(
             order_by = "rank_fts"
     if vec_text_search:
         order_by = "text_vec_distance"
+    if clip_text_query:
+        order_by = "image_vec_distance"
+    if clip_image_query is not None:
+        order_by = "image_vec_distance"
 
     minimum_confidence_threshold = get_threshold_from_env()
     if (
@@ -145,6 +194,14 @@ def search(
         vec_text_search_embed = get_embed(vec_text_search)
     else:
         vec_text_search_embed = None
+
+    image_vec_search = None
+    if clip_text_query and clip_model:
+        assert clip_model[0] == "clip", "Invalid model"
+        image_vec_search = get_clip_embed(clip_text_query, clip_model[1])
+    if clip_image_query is not None and clip_model:
+        assert clip_model[0] == "clip", "Invalid model"
+        image_vec_search = get_clip_embed(clip_image_query, clip_model[1])
 
     filters = QueryFilters(
         files=FileFilters(
@@ -195,6 +252,11 @@ def search(
                 min_confidence=None,
             )
             if vec_text_search_embed
+            else None
+        ),
+        image_embeddings=(
+            ImageEmbeddingFilter(query=image_vec_search, target=clip_model)
+            if image_vec_search and clip_model
             else None
         ),
     )

@@ -17,6 +17,10 @@ from PIL import Image as PILImage
 
 
 class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
+    model_name: str
+    pretrained: str
+    batch_size: int
+
     def __init__(
         self,
         model_name="ViT-H-14-378-quickgelu",
@@ -93,7 +97,8 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
         if self.model:
             del self.model
             self.model = None
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def rank_images_by_similarity(self, image_embeddings_dict, text_embedding):
         image_hashes = list(image_embeddings_dict.keys())
