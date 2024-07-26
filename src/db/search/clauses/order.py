@@ -45,6 +45,14 @@ def build_order_by_clause(
                     order = "asc"
             else:
                 order_by_clause = default_order_by_clause
+        case "image_vec_distance":
+            if filters.image_embeddings:
+                order_by_clause = "image_vec_distance"
+                # Default order for image_vec_distance is ascending
+                if order is None:
+                    order = "asc"
+            else:
+                order_by_clause = default_order_by_clause
         case _:
             order_by_clause = default_order_by_clause
 

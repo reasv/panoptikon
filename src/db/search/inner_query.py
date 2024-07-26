@@ -5,6 +5,7 @@ from src.db.search.clauses.bookmarks import build_bookmarks_clause
 from src.db.search.clauses.extracted_text import (
     build_extracted_text_search_clause,
 )
+from src.db.search.clauses.image_embed import build_image_embedding_clause
 from src.db.search.clauses.path_text import build_path_fts_clause
 from src.db.search.types import FileFilters, InnerQueryParams
 
@@ -146,6 +147,20 @@ def build_inner_query(
 
     additional_select_columns += any_text_columns
 
+    (
+        image_embeddings_clause,
+        image_embeddings_params,
+        image_embeddings_columns,
+    ) = build_image_embedding_clause(args.image_embeddings)
+
+    additional_select_columns += image_embeddings_columns
+
+    group_by = ""
+    if args.extracted_text_embeddings and text_embeddings_condition:
+        group_by = "GROUP BY files.path"
+    if args.image_embeddings and image_embeddings_clause:
+        group_by = "GROUP BY files.path"
+
     main_query = (
         f"""
         SELECT
@@ -167,6 +182,7 @@ def build_inner_query(
         {path_match_condition}
         {extracted_text_condition}
         {text_embeddings_condition}
+        {image_embeddings_clause}
         {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
@@ -187,11 +203,12 @@ def build_inner_query(
         {path_match_condition}
         {extracted_text_condition}
         {text_embeddings_condition}
+        {image_embeddings_clause}
         {any_text_query_clause}
         {bookmarks_condition}
         {negative_tags_condition}
         {path_condition}
-        {"GROUP BY files.path" if args.extracted_text_embeddings and text_embeddings_condition else ""}
+        {group_by}
     """
     )
     params: List[str | int | float] = [
@@ -208,6 +225,7 @@ def build_inner_query(
             *path_params,
             *extracted_text_params,
             *text_embeddings_params,
+            *image_embeddings_params,
             *any_text_query_params,
             *bookmark_namespaces,
             *negative_tag_params,

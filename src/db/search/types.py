@@ -65,6 +65,13 @@ class AnyTextFilter:
 
 @typechecked
 @dataclass
+class ImageEmbeddingFilter:
+    query: bytes
+    target: Tuple[str, str]
+
+
+@typechecked
+@dataclass
 class InnerQueryTagFilters:
     positive: List[str] = field(default_factory=list)
     negative: List[str] = field(default_factory=list)
@@ -95,6 +102,7 @@ class QueryFilters:
     path: Union[PathTextFilter, None] = None
     extracted_text: Union[ExtractedTextFilter[str], None] = None
     extracted_text_embeddings: Union[ExtractedTextFilter[bytes], None] = None
+    image_embeddings: Union[ImageEmbeddingFilter, None] = None
     any_text: Union[AnyTextFilter, None] = None
     bookmarks: Union[BookmarksFilter, None] = None
 
