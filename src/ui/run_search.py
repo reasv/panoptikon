@@ -23,6 +23,7 @@ from src.db.search.types import (
     QueryTagFilters,
     SearchQuery,
 )
+from src.db.search.utils import pprint_dataclass
 from src.types import FileSearchResult
 
 
@@ -68,46 +69,6 @@ def search(
     if order not in ["asc", "desc", None]:
         order = None
 
-    minimum_confidence_threshold = get_threshold_from_env()
-    if (
-        not min_tag_confidence
-        or min_tag_confidence <= minimum_confidence_threshold
-    ):
-        min_tag_confidence = None
-
-    include_paths = include_paths or []
-    include_paths = [path.strip() for path in include_paths]
-
-    tags = [tag.strip() for tag in tags_str.split(",") if tag.strip() != ""]
-
-    def extract_tags_subtype(tag_list: list[str], prefix: str = "-"):
-        remaining = []
-        subtype = []
-        for tag in tag_list:
-            if tag.startswith(prefix):
-                subtype.append(tag[1:])
-            else:
-                remaining.append(tag)
-        return remaining, subtype
-
-    tags, negative_tags = extract_tags_subtype(tags, "-")
-    tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
-    tags, tags_match_any = extract_tags_subtype(tags, "*")
-    conn = get_database_connection(write_lock=False)
-    print(
-        f"Searching for tags: {tags} match any: {tags_match_any} "
-        + f"(negative tags: {negative_tags} match all negative tags: {negative_tags_match_all}) "
-        + f"with min confidence {min_tag_confidence} under path prefix {include_paths} "
-        + f"with page size {results_per_page} and page {page} and order by {order_by} {order} "
-        + f"and tag setters {tag_setters} and all setters required {all_setters_required} and "
-        + f"item type prefix {item_types} and namespace prefix {namespace_prefixes} "
-        + f"and path search {path_search} in {search_path_in} "
-        + f"and extracted text search {extracted_text_search} "
-        + f"and require text extractors {require_text_extractors} "
-        + f"and path order by rank {path_order_by_rank} "
-        + f"and extracted text order by rank {extracted_text_order_by_rank} "
-        + f"and search in bookmarks {search_in_bookmarks} and bookmark namespaces {bookmark_namespaces}"
-    )
     # Full text search on filename or path, or extracted text
     if any_text_query:
         if order_by_any_text_rank:
@@ -122,6 +83,16 @@ def search(
         if extracted_text_order_by_rank:
             order_by = "rank_fts"
 
+    minimum_confidence_threshold = get_threshold_from_env()
+    if (
+        not min_tag_confidence
+        or min_tag_confidence <= minimum_confidence_threshold
+    ):
+        min_tag_confidence = None
+
+    include_paths = include_paths or []
+    include_paths = [path.strip() for path in include_paths]
+
     start = time()
     order_args = OrderParams(
         order_by=order_by,
@@ -130,11 +101,19 @@ def search(
         page_size=results_per_page,
     )
 
+    tags_match_all, tags_match_any, negative_tags, negative_tags_match_all = (
+        parse_tags(tags_str)
+    )
+
     tags_args = QueryTagFilters(
-        pos_match_all=tags,
+        pos_match_all=tags_match_all,
         pos_match_any=tags_match_any,
         neg_match_any=negative_tags,
         neg_match_all=negative_tags_match_all,
+        all_setters_required=all_setters_required,
+        setters=tag_setters or [],
+        namespaces=namespace_prefixes or [],
+        min_confidence=min_tag_confidence,
     )
 
     filters = QueryFilters(
@@ -192,26 +171,28 @@ def search(
         count=True,
         check_path=True,
     )
-
+    conn = get_database_connection(write_lock=False)
+    print("Search query:")
+    pprint_dataclass(search_query)
     res_list: List[Tuple[FileSearchResult | None, int]] = list(
         search_files(
             conn,
             search_query,
         )
     ) or [(None, 0)]
-
+    conn.close()
     results, total_results = zip(*res_list) if res_list else ([], [0])
 
     print(f"Search took {round(time() - start, 3)} seconds")
     total_results = total_results[0]
-    conn.close()
+
     print(f"Found {total_results} images")
     # Calculate the total number of pages, we need to round up
     total_pages = total_results // results_per_page + (
         1 if total_results % results_per_page > 0 else 0
     )
     query = build_query(
-        tags,
+        tags_match_all,
         min_tag_confidence,
         include_paths[0] if include_paths else None,
         results_per_page,
@@ -225,6 +206,25 @@ def search(
         gr.update(value=page, maximum=int(total_pages)),
         f"[View Results in Gallery]({query})",
     )
+
+
+def parse_tags(tags_str: str):
+    tags = [tag.strip() for tag in tags_str.split(",") if tag.strip() != ""]
+
+    def extract_tags_subtype(tag_list: list[str], prefix: str = "-"):
+        remaining = []
+        subtype = []
+        for tag in tag_list:
+            if tag.startswith(prefix):
+                subtype.append(tag[1:])
+            else:
+                remaining.append(tag)
+        return remaining, subtype
+
+    tags, negative_tags = extract_tags_subtype(tags, "-")
+    tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
+    tags, tags_match_any = extract_tags_subtype(tags, "*")
+    return tags, tags_match_any, negative_tags, negative_tags_match_all
 
 
 def build_query(

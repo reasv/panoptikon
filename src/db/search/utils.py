@@ -1,3 +1,5 @@
+from dataclasses import asdict, is_dataclass
+from pprint import pprint
 from typing import List
 
 from typeguard import typechecked
@@ -44,3 +46,16 @@ def clean_tag_params(args: QueryTagFilters):
         tag_args.neg_match_all = []
 
     return tag_args
+
+
+def dataclass_to_dict(obj):
+    if is_dataclass(obj):
+        return {k: dataclass_to_dict(v) for k, v in asdict(obj).items()}  # type: ignore
+    elif isinstance(obj, list):
+        return [dataclass_to_dict(i) for i in obj]
+    else:
+        return obj
+
+
+def pprint_dataclass(obj):
+    pprint(dataclass_to_dict(obj))
