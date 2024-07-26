@@ -239,6 +239,21 @@ def create_search_UI(
                                     value=False,
                                     scale=1,
                                 )
+                        with gr.Tab(label="Semantic Text Search"):
+                            with gr.Row():
+                                vec_text_search = gr.Textbox(
+                                    label="Semantic Text Query",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                vec_targets = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Restrict query to these targets",
+                                    multiselect=True,
+                                    scale=1,
+                                )
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -300,6 +315,8 @@ def create_search_UI(
         any_text_search,
         restrict_to_query_types,
         order_by_any_text_rank,
+        vec_text_search,
+        vec_targets,
     ]
 
     search_outputs = [multi_view.files, number_of_results, current_page, link]

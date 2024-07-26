@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import urllib.parse
+from cgitb import text
 from time import time
 from typing import List, Tuple
 
 import gradio as gr
+import numpy as np
 
+from src.data_extractors.text_embeddings import get_text_embedding_model
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
 from src.db.search import search_files
@@ -24,7 +27,10 @@ from src.db.search.types import (
     SearchQuery,
 )
 from src.db.search.utils import pprint_dataclass
+from src.db.utils import serialize_f32
 from src.types import FileSearchResult
+
+text_embedding_model = None
 
 
 def search(
@@ -51,6 +57,8 @@ def search(
     any_text_query: str | None = None,
     restrict_to_query_types: List[Tuple[str, str]] | None = None,
     order_by_any_text_rank: bool = False,
+    vec_text_search: str | None = None,
+    vec_targets: List[Tuple[str, str]] | None = None,
     search_action: str | None = None,
 ):
     print(f"Search action: {search_action}")
@@ -82,6 +90,8 @@ def search(
     if extracted_text_search:
         if extracted_text_order_by_rank:
             order_by = "rank_fts"
+    if vec_text_search:
+        order_by = "text_vec_distance"
 
     minimum_confidence_threshold = get_threshold_from_env()
     if (
@@ -115,6 +125,16 @@ def search(
         namespaces=namespace_prefixes or [],
         min_confidence=min_tag_confidence,
     )
+    if vec_text_search:
+        global text_embedding_model
+        if not text_embedding_model:
+            text_embedding_model = get_text_embedding_model()
+        text_embed = text_embedding_model.encode([vec_text_search])
+        assert isinstance(text_embed, np.ndarray)
+        text_embed_list = text_embed.tolist()[0]
+        vec_text_search_embed = serialize_f32(text_embed_list)
+    else:
+        vec_text_search_embed = None
 
     filters = QueryFilters(
         files=FileFilters(
@@ -158,7 +178,15 @@ def search(
             if any_text_query
             else None
         ),
-        extracted_text_embeddings=None,
+        extracted_text_embeddings=(
+            ExtractedTextFilter[bytes](
+                query=vec_text_search_embed,
+                targets=vec_targets or [],
+                min_confidence=None,
+            )
+            if vec_text_search_embed
+            else None
+        ),
     )
 
     query_args = QueryParams(

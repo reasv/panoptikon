@@ -4,7 +4,7 @@ from src.db.search.clauses.extracted_text import (
     build_extracted_text_search_subclause,
 )
 from src.db.search.clauses.path_text import build_path_text_subclause
-from src.db.search.types import AnyTextFilter, ExtractedTextParams
+from src.db.search.types import AnyTextFilter, ExtractedTextFilter
 
 
 def build_any_text_query_clause(
@@ -24,7 +24,7 @@ def build_any_text_query_clause(
     # Define subquery for matching extracted text
     extracted_text_subclause, extracted_text_params = (
         build_extracted_text_search_subclause(
-            ExtractedTextParams(
+            ExtractedTextFilter(
                 query=args.query,
                 targets=args.targets,
             )

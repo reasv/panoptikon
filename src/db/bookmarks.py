@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Tuple
 
 from src.db.files import get_existing_file_for_sha256
-from src.db.search import FileSearchResult
+from src.types import FileSearchResult
 
 
 def update_bookmarks(

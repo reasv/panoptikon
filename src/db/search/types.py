@@ -1,10 +1,10 @@
-from dataclasses import dataclass
-from typing import List, Literal, Tuple, TypeVar
+from dataclasses import dataclass, field
+from typing import List, Literal, Tuple, TypeVar, Union
 
 from typeguard import typechecked
 
 # Search Query Types
-OrderByType = (
+OrderByType = Union[
     Literal[
         "last_modified",
         "path",
@@ -14,18 +14,18 @@ OrderByType = (
         "rank_any_text",
         "text_vec_distance",
         "image_vec_distance",
-    ]
-    | None
-)
+    ],
+    None,
+]
 
-OrderType = Literal["asc", "desc"] | None
+OrderType = Union[Literal["asc", "desc"], None]
 
 
 @typechecked
 @dataclass
 class FileFilters:
-    item_types: List[str] = []
-    include_path_prefixes: List[str] = []
+    item_types: List[str] = field(default_factory=list)
+    include_path_prefixes: List[str] = field(default_factory=list)
 
 
 # str or bytes
@@ -36,17 +36,17 @@ Q = TypeVar("Q", str, bytes)
 @dataclass
 class ExtractedTextFilter[Q]:
     query: Q
-    targets: List[Tuple[str, str]] = []
-    languages: List[str] = []
-    language_min_confidence: float | None = None
-    min_confidence: float | None = None
+    targets: List[Tuple[str, str]] = field(default_factory=list)
+    languages: List[str] = field(default_factory=list)
+    language_min_confidence: Union[float, None] = None
+    min_confidence: Union[float, None] = None
 
 
 @typechecked
 @dataclass
 class BookmarksFilter:
     restrict_to_bookmarks: Literal[True] = True
-    namespaces: List[str] = []
+    namespaces: List[str] = field(default_factory=list)
 
 
 @typechecked
@@ -60,43 +60,43 @@ class PathTextFilter:
 @dataclass
 class AnyTextFilter:
     query: str
-    targets: List[Tuple[str, str]] = []
+    targets: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @typechecked
 @dataclass
 class InnerQueryTagFilters:
-    positive: List[str]
-    negative: List[str] = []
+    positive: List[str] = field(default_factory=list)
+    negative: List[str] = field(default_factory=list)
     all_setters_required: bool = False
     any_positive_tags_match: bool = False
-    setters: List[str] = []
-    namespaces: List[str] = []
-    min_confidence: float | None = 0.5
+    setters: List[str] = field(default_factory=list)
+    namespaces: List[str] = field(default_factory=list)
+    min_confidence: Union[float, None] = 0.5
 
 
 @typechecked
 @dataclass
 class QueryTagFilters:
-    pos_match_all: List[str] = []
-    pos_match_any: List[str] = []
-    neg_match_any: List[str] = []
-    neg_match_all: List[str] = []
+    pos_match_all: List[str] = field(default_factory=list)
+    pos_match_any: List[str] = field(default_factory=list)
+    neg_match_any: List[str] = field(default_factory=list)
+    neg_match_all: List[str] = field(default_factory=list)
     all_setters_required: bool = False
-    setters: List[str] = []
-    namespaces: List[str] = []
-    min_confidence: float | None = None
+    setters: List[str] = field(default_factory=list)
+    namespaces: List[str] = field(default_factory=list)
+    min_confidence: Union[float, None] = None
 
 
 @typechecked
 @dataclass
 class QueryFilters:
-    files: FileFilters | None = None
-    path: PathTextFilter | None = None
-    extracted_text: ExtractedTextFilter[str] | None = None
-    extracted_text_embeddings: ExtractedTextFilter[bytes] | None = None
-    any_text: AnyTextFilter | None = None
-    bookmarks: BookmarksFilter | None = None
+    files: Union[FileFilters, None] = None
+    path: Union[PathTextFilter, None] = None
+    extracted_text: Union[ExtractedTextFilter[str], None] = None
+    extracted_text_embeddings: Union[ExtractedTextFilter[bytes], None] = None
+    any_text: Union[AnyTextFilter, None] = None
+    bookmarks: Union[BookmarksFilter, None] = None
 
 
 @typechecked
@@ -126,6 +126,6 @@ class OrderParams:
 @dataclass
 class SearchQuery:
     query: QueryParams
-    order_args: OrderParams = OrderParams()
+    order_args: OrderParams = field(default_factory=OrderParams)
     count: bool = True
     check_path: bool = False

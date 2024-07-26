@@ -1,10 +1,10 @@
 from typing import List
 
 from src.db.search.clauses.utils import should_include_subclause
-from src.db.search.types import ExtractedTextParams
+from src.db.search.types import ExtractedTextFilter
 
 
-def build_extracted_text_search_clause(args: ExtractedTextParams | None):
+def build_extracted_text_search_clause(args: ExtractedTextFilter | None):
     """
     Build a subquery to match extracted text based on the given conditions.
     """
@@ -39,7 +39,7 @@ def build_extracted_text_search_clause(args: ExtractedTextParams | None):
     return extracted_text_condition, params, additional_columns
 
 
-def build_extracted_text_search_subclause(args: ExtractedTextParams):
+def build_extracted_text_search_subclause(args: ExtractedTextFilter):
     """
     Build a subquery to match extracted text based on the given conditions.
     """

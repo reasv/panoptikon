@@ -15,12 +15,13 @@ from fastapi.templating import Jinja2Templates
 from src.db import get_database_connection
 from src.db.bookmarks import get_bookmarks
 from src.db.search import search_files
+from src.db.search.types import OrderByType, OrderType
 from src.files import (
     get_files_by_extension,
     get_image_extensions,
     get_last_modified_time_and_size,
 )
-from src.types import FileSearchResult, OrderByType, OrderType
+from src.types import FileSearchResult
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
