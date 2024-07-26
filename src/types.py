@@ -110,6 +110,7 @@ class LogRecord:
 
 
 # Search Query Types
+@typechecked
 @dataclass
 class FileParams:
     item_types: List[str] = []
@@ -120,6 +121,7 @@ class FileParams:
 Q = TypeVar("Q", str, bytes)
 
 
+@typechecked
 @dataclass
 class ExtractedTextParams[Q]:
     query: Q
@@ -129,24 +131,28 @@ class ExtractedTextParams[Q]:
     min_confidence: float | None = None
 
 
+@typechecked
 @dataclass
 class BookmarkParams:
     restrict_to_bookmarks: Literal[True] = True
     namespaces: List[str] = []
 
 
+@typechecked
 @dataclass
 class PathQueryParams:
     query: str
     only_match_filename: bool = False
 
 
+@typechecked
 @dataclass
 class AnyTextParams:
     query: str
     targets: List[Tuple[str, str]] = []
 
 
+@typechecked
 @dataclass
 class InnerQueryTagParams:
     positive: List[str]
@@ -158,6 +164,7 @@ class InnerQueryTagParams:
     min_confidence: float | None = 0.5
 
 
+@typechecked
 @dataclass
 class QueryTagParams:
     pos_match_all: List[str] = []
@@ -170,6 +177,7 @@ class QueryTagParams:
     min_confidence: float | None = None
 
 
+@typechecked
 @dataclass
 class QueryFilters:
     files: FileParams | None = None
@@ -180,18 +188,21 @@ class QueryFilters:
     bookmarks: BookmarkParams | None = None
 
 
+@typechecked
 @dataclass
 class QueryParams:
     tags: QueryTagParams
     filters: QueryFilters
 
 
+@typechecked
 @dataclass
 class InnerQueryParams:
     tags: InnerQueryTagParams
     filters: QueryFilters
 
 
+@typechecked
 @dataclass
 class OrderParams:
     order_by: OrderByType = "last_modified"
