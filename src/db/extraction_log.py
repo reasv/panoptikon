@@ -229,6 +229,8 @@ def get_existing_type_setter_pairs(
     query = """
     SELECT DISTINCT type, setter
     FROM data_extraction_log
+    JOIN extraction_log_items
+    ON data_extraction_log.id = extraction_log_items.log_id
     """
 
     cursor = conn.cursor()

@@ -75,13 +75,12 @@ def add_item_image_embeddings(
     embeddings: List[np.ndarray],
 ):
     collection = get_image_embeddings_collection(cdb)
-    embeddings_list = [embedding.tolist() for embedding in embeddings]
-    collection.add(
+    collection.upsert(
         ids=[
             f"{item.sha256}-{i}-{model_opt.setter_id()}"
             for i, _ in enumerate(embeddings)
         ],
-        embeddings=embeddings_list,
+        embeddings=embeddings,
         images=list(inputs),
         metadatas=(
             [

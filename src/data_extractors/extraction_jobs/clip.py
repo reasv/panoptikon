@@ -9,6 +9,7 @@ from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.image_embeddings import add_item_image_embeddings
 from src.data_extractors.models import ImageEmbeddingModel
+from src.db.image_embeddings import insert_image_embedding
 from src.types import ItemWithPath
 
 
@@ -26,13 +27,16 @@ def run_image_embedding_extractor_job(
         return embedder.get_image_embeddings(batch)
 
     def handle_item_result(
-        _: int,
+        log_id: int,
         item: ItemWithPath,
         inputs: Sequence[np.ndarray],
         embeddings: Sequence[np.ndarray],
     ):
+        print(type(embeddings[0]))
         embeddings_list = [embedding.tolist() for embedding in embeddings]
         add_item_image_embeddings(cdb, model_opt, item, inputs, embeddings_list)
+        for embedding in embeddings_list:
+            insert_image_embedding(conn, item.sha256, log_id, embedding)
 
     return run_extraction_job(
         conn,
