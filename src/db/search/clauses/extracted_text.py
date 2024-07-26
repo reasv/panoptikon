@@ -57,7 +57,10 @@ def build_extracted_text_search_subclause(args: ExtractedTextFilter):
         return extracted_text_subclause, extracted_text_params
 
     if is_vector_query:
-        where_conditions = ["et_vec.sentence_embedding MATCH ?"]
+        where_conditions = [
+            "et_vec.sentence_embedding MATCH ?",
+            "et_vec.k = 1000",
+        ]
     else:
         where_conditions = ["et_fts.text MATCH ?"]
 
