@@ -57,5 +57,24 @@ def dataclass_to_dict(obj):
         return obj
 
 
+def replace_bytes_with_length(d):
+    """
+    Recursively traverses a dictionary and replaces any value that is bytes
+    with a string that says "[x] bytes" where x is the length.
+
+    :param d: Dictionary to traverse
+    :return: Modified dictionary with bytes replaced by their length descriptions
+    """
+    if isinstance(d, dict):
+        return {k: replace_bytes_with_length(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [replace_bytes_with_length(v) for v in d]
+    elif isinstance(d, bytes):
+        return f"[{len(d)} bytes]"
+    else:
+        return d
+
+
 def pprint_dataclass(obj):
-    pprint(dataclass_to_dict(obj))
+    dictclass = dataclass_to_dict(obj)
+    pprint(replace_bytes_with_length(dictclass))
