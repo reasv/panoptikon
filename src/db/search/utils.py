@@ -1,9 +1,8 @@
-from typing import List, Sequence
+from typing import List
 
-from sqlalchemy import Tuple
 from typeguard import typechecked
 
-from src.types import QueryTagParams, SearchQuery
+from src.db.search.types import QueryTagParams, SearchQuery
 
 
 @typechecked
@@ -45,16 +44,3 @@ def clean_tag_params(args: QueryTagParams):
         tag_args.neg_match_all = []
 
     return tag_args
-
-
-def filter_targets_by_type(
-    model_types: Sequence[str], targets: Sequence[Tuple[str, str]]
-):
-    """
-    Filter a list of targets based on the given model types.
-    """
-    return [
-        (model_type, setter)
-        for model_type, setter in targets
-        if model_type in model_types
-    ]
