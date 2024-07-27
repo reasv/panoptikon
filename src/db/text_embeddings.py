@@ -38,22 +38,3 @@ def create_text_embeddings_table(
         END;
         """
     )
-    # if trigger_exists(conn, "ensure_extracted_text_exists"):
-    #     cursor.execute("DROP TRIGGER ensure_extracted_text_exists")
-
-    # cursor.execute(
-    #     """
-    #     CREATE TRIGGER ensure_extracted_text_exists
-    #     BEFORE INSERT ON extracted_text_embed
-    #     FOR EACH ROW
-    #     BEGIN
-    #         -- Check if a corresponding id exists in the extracted_text table
-    #         SELECT
-    #             CASE
-    #                 WHEN (SELECT COUNT(*) FROM extracted_text WHERE id = NEW.id) = 0
-    #                 THEN
-    #                     RAISE(ABORT, 'No corresponding extracted_text row exists.')
-    #             END;
-    #     END;
-    # """
-    # )
