@@ -6,6 +6,41 @@ import torch
 from PIL import Image as PILImage
 
 
+class CLIPModelSingleton:
+    _instances = {}
+    _reference_counts = {}
+
+    @classmethod
+    def get_instance(cls, model_name, pretrained):
+        key = (model_name, pretrained)
+        if key not in cls._instances:
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained
+            )
+            tokenizer = open_clip.get_tokenizer(model_name)
+            cls._instances[key] = {
+                "model": model,
+                "preprocess": preprocess,
+                "tokenizer": tokenizer,
+            }
+            cls._reference_counts[key] = 0
+        cls._reference_counts[key] += 1
+        return cls._instances[key]
+
+    @classmethod
+    def release_instance(cls, model_name, pretrained):
+        key = (model_name, pretrained)
+        if key in cls._reference_counts:
+            cls._reference_counts[key] -= 1
+            if cls._reference_counts[key] == 0:
+                del cls._instances[key]
+                del cls._reference_counts[key]
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return True
+        return False
+
+
 class CLIPEmbedder:
     model_name: str
     pretrained: str
@@ -26,16 +61,17 @@ class CLIPEmbedder:
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self._model_loaded = False
 
     def _load_model(self):
-        if self.model is None:
-            self.model, _, self.preprocess = (
-                open_clip.create_model_and_transforms(
-                    self.model_name, pretrained=self.pretrained
-                )
+        if not self._model_loaded:
+            instance = CLIPModelSingleton.get_instance(
+                self.model_name, self.pretrained
             )
-            self.model.eval().to(self.device)
-            self.tokenizer = open_clip.get_tokenizer(self.model_name)
+            self.model = instance["model"].eval().to(self.device)
+            self.preprocess = instance["preprocess"]
+            self.tokenizer = instance["tokenizer"]
+            self._model_loaded = True
 
     def load_model(self):
         self._load_model()
@@ -84,11 +120,17 @@ class CLIPEmbedder:
         return embeddings
 
     def unload_model(self):
-        if self.model:
-            del self.model
+        if self._model_loaded:
             self.model = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self.preprocess = None
+            self.tokenizer = None
+            CLIPModelSingleton.release_instance(
+                self.model_name, self.pretrained
+            )
+            self._model_loaded = False
+
+    def __del__(self):
+        self.unload_model()
 
     def rank_images_by_similarity(self, image_embeddings_dict, text_embedding):
         image_hashes = list(image_embeddings_dict.keys())
