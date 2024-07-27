@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from typing import List, Sequence
 
 import chromadb
@@ -31,22 +32,23 @@ def search_item_image_embeddings(
         where_query.append({"type": {"$in": allowed_types}})
     if allowed_general_types:
         where_query.append({"general_type": {"$in": allowed_general_types}})
-
+    start_time = time.time()
     results = collection.query(
         query_texts=text_query,
         query_images=image_query,
         n_results=limit,
-        where={
-            "$and": (
-                [
-                    {"setter": setter_id},
-                ]
-                + [{"$or": where_query}]
-                if where_query
-                else []
-            )
-        },  # type: ignore
+        # where={
+        #     "$and": (
+        #         [
+        #             {"setter": setter_id},
+        #         ]
+        #         + [{"$or": where_query}]
+        #         if where_query
+        #         else []
+        #     )
+        # },  # type: ignore
     )
+    print(f"Query time: {round(time.time() - start_time,3)}s")
 
     return query_result_to_file_search_result(conn, results)
 

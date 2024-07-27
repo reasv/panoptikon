@@ -68,7 +68,7 @@ def create_semantic_search_UI(
             )
         conn = get_database_connection(write_lock=False)
         cdb = get_chromadb_client()
-        files, scores = search_item_image_embeddings(
+        files = search_item_image_embeddings(
             conn,
             cdb,
             embedder,
@@ -76,6 +76,8 @@ def create_semantic_search_UI(
             text_query=search_text,
             limit=n_results,
         )
+        files.sort(key=lambda x: x[1], reverse=True)
+        files = [file for file, score in files if file is not None]
         return files, gr.update(interactive=True)
 
     def search_by_image(search_image: np.ndarray, n_results: int):
