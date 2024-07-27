@@ -14,6 +14,7 @@ class CLIPModelSingleton:
     def get_instance(cls, model_name, pretrained):
         key = (model_name, pretrained)
         if key not in cls._instances:
+            print(f"Creating new instance for {model_name} {pretrained}")
             model, _, preprocess = open_clip.create_model_and_transforms(
                 model_name, pretrained=pretrained
             )
@@ -24,6 +25,8 @@ class CLIPModelSingleton:
                 "tokenizer": tokenizer,
             }
             cls._reference_counts[key] = 0
+        else:
+            print(f"Reusing instance for {model_name} {pretrained}")
         cls._reference_counts[key] += 1
         return cls._instances[key]
 
@@ -33,6 +36,7 @@ class CLIPModelSingleton:
         if key in cls._reference_counts:
             cls._reference_counts[key] -= 1
             if cls._reference_counts[key] == 0:
+                print(f"Deleting instance for {model_name} {pretrained}")
                 del cls._instances[key]
                 del cls._reference_counts[key]
                 if torch.cuda.is_available():

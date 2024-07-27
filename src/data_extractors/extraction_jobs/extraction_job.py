@@ -39,6 +39,7 @@ def run_extraction_job(
     output_handler: Callable[
         [int, ItemWithPath, Sequence[I], Sequence[R]], None
     ],
+    final_callback: Callable[[], None] = lambda: None,
 ):
     """
     Run a job that processes items in the database
@@ -153,6 +154,7 @@ def run_extraction_job(
     print("Updated log with scan results")
 
     failed_paths = [item.path for item in failed_items.values()]
+    final_callback()
     yield ExtractorJobReport(
         start_time=start_time,
         end_time=datetime.now(),

@@ -34,10 +34,14 @@ def run_image_embedding_extractor_job(
         for embedding in embeddings_list:
             insert_image_embedding(conn, item.sha256, log_id, embedding)
 
+    def cleanup():
+        embedder.unload_model()
+
     return run_extraction_job(
         conn,
         model_opt,
         item_image_loader_numpy,
         process_batch,
         handle_item_result,
+        cleanup,
     )

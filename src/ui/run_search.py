@@ -7,6 +7,7 @@ from typing import List, Tuple
 import gradio as gr
 import numpy as np
 
+from src.data_extractors.ai.clip import CLIPEmbedder
 from src.data_extractors.ai.text_embed import get_text_embedding_model
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
@@ -50,45 +51,23 @@ def get_embed(text: str):
     return last_embedded_text_embed
 
 
-clip_model = None
-last_clip_text: str | None = None
-last_clip_text_embed: bytes | None = None
-
-
 def get_clip_embed(input: str | np.ndarray, model_name: str):
-    global last_clip_text, last_clip_text_embed
-    if isinstance(input, str) and input == last_clip_text:
-        return last_clip_text_embed
 
-    from src.data_extractors.ai.clip import CLIPEmbedder
     from src.data_extractors.models import ImageEmbeddingModel
 
     model_opt = ImageEmbeddingModel(1, model_name)
     name = model_opt.clip_model_name()
     pretrained = model_opt.clip_model_checkpoint()
-    global clip_model
-    if not clip_model:
-        clip_model = CLIPEmbedder(name, pretrained)
-        clip_model.load_model()
-    else:
-        assert isinstance(clip_model, CLIPEmbedder), "Invalid type"
-        if clip_model.model_name != name or clip_model.pretrained != pretrained:
-            clip_model.unload_model()
-            clip_model = CLIPEmbedder(name, pretrained)
-            clip_model.load_model()
+    clip_model = CLIPEmbedder(name, pretrained)
+    clip_model.load_model()
     if isinstance(input, str):
         embed = clip_model.get_text_embeddings([input])[0]
         assert isinstance(embed, np.ndarray)
-        text_embed_list = embed.tolist()
-        last_clip_text = input
-        last_clip_text_embed = serialize_f32(text_embed_list)
-        return last_clip_text_embed
+        return serialize_f32(embed.tolist())
     else:  # input is an image
         embed = clip_model.get_image_embeddings([input])[0]
         assert isinstance(embed, np.ndarray)
-        embed_list = embed.tolist()
-        image_embedding = serialize_f32(embed_list)
-        return image_embedding
+        return serialize_f32(embed.tolist())
 
 
 def search(
