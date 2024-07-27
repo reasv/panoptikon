@@ -117,7 +117,7 @@ def search(
     order_by_any_text_rank: bool = False,
     vec_text_search: str | None = None,
     vec_targets: List[Tuple[str, str]] | None = None,
-    clip_model: Tuple[str, str] | None = None,
+    clip_model: str | None = None,
     clip_text_query: str | None = None,
     clip_image_query: np.ndarray | None = None,
     search_action: str | None = None,
@@ -197,11 +197,9 @@ def search(
 
     image_vec_search = None
     if clip_text_query and clip_model:
-        assert clip_model[0] == "clip", "Invalid model"
-        image_vec_search = get_clip_embed(clip_text_query, clip_model[1])
+        image_vec_search = get_clip_embed(clip_text_query, clip_model)
     if clip_image_query is not None and clip_model:
-        assert clip_model[0] == "clip", "Invalid model"
-        image_vec_search = get_clip_embed(clip_image_query, clip_model[1])
+        image_vec_search = get_clip_embed(clip_image_query, clip_model)
 
     filters = QueryFilters(
         files=FileFilters(
@@ -255,7 +253,9 @@ def search(
             else None
         ),
         image_embeddings=(
-            ImageEmbeddingFilter(query=image_vec_search, target=clip_model)
+            ImageEmbeddingFilter(
+                query=image_vec_search, target=("clip", clip_model)
+            )
             if image_vec_search and clip_model
             else None
         ),
