@@ -67,11 +67,11 @@ def get_most_common_tags_frequency(
     cursor.execute(
         f"""
         SELECT COUNT(
-            DISTINCT extraction_log_items.item_id || '-' || data_extraction_log.setter
+            DISTINCT items_extractions.item_id || '-' || data_extraction_log.setter
         ) AS distinct_count
-        FROM extraction_log_items
+        FROM items_extractions
         JOIN data_extraction_log
-        ON extraction_log_items.log_id = data_extraction_log.id
+        ON items_extractions.log_id = data_extraction_log.id
         AND data_extraction_log.type = 'tags'
         {setters_clause}""",
         setters if setters else (),

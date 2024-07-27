@@ -56,10 +56,10 @@ def run_extraction_job(
         0,
     )
 
-    log_id = add_data_extraction_log(
+    log_id, setter_id = add_data_extraction_log(
         conn,
         scan_time,
-        model_opts.model_type(),
+        model_opts.data_type(),
         model_opts.setter_id(),
         model_opts.threshold(),
         model_opts.batch_size(),
@@ -81,9 +81,8 @@ def run_extraction_job(
     for item, remaining, inputs, outputs in batch_items(
         get_items_missing_data_extraction(
             conn,
-            model_opts.model_type(),
-            model_opts.setter_id(),
-            model_opts.supported_mime_types(),
+            setter_id=setter_id,
+            mime_type_filter=model_opts.supported_mime_types(),
         ),
         model_opts.batch_size(),
         transform_input_handle_error,
@@ -134,9 +133,8 @@ def run_extraction_job(
         next(
             get_items_missing_data_extraction(
                 conn,
-                model_opts.model_type(),
-                model_opts.setter_id(),
-                model_opts.supported_mime_types(),
+                setter_id=setter_id,
+                mime_type_filter=model_opts.supported_mime_types(),
             ),
             [None, -1],
         )[1]

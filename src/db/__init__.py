@@ -3,7 +3,6 @@ import sqlite3
 
 import sqlite_vec
 
-from src.db.text_embeddings import create_text_embeddings_table
 from src.db.utils import is_column_in_table, trigger_exists
 
 
@@ -113,7 +112,8 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS data_extraction_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        end_time TEXT DEFAULT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT DEFAULT NULL,             -- Using TEXT to store ISO-8601 formatted datetime
+        setter_id INTEGER,                      -- Foreign key to setters table
         type TEXT NOT NULL,
         setter TEXT NOT NULL,
         threshold REAL DEFAULT NULL,
@@ -124,9 +124,20 @@ def initialize_database(conn: sqlite3.Connection):
         total_segments INTEGER NOT NULL DEFAULT 0,
         errors INTEGER NOT NULL DEFAULT 0,
         total_remaining INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(start_time, type, setter)       -- Unique constraint on start_time, type and setter
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE SET NULL
     )
     """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS setters (
+            id INTEGER PRIMARY KEY,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE(name, name)
+        )
+        """
     )
 
     cursor.execute(
@@ -156,12 +167,14 @@ def initialize_database(conn: sqlite3.Connection):
 
     cursor.execute(
         """
-    CREATE TABLE IF NOT EXISTS extraction_log_items (
+    CREATE TABLE IF NOT EXISTS items_extractions (
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
+        setter_id INTEGER NOT NULL,
         UNIQUE(item_id, log_id), -- Unique constraint on item and log_id
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
     )
     """
     )
@@ -172,12 +185,14 @@ def initialize_database(conn: sqlite3.Connection):
         id INTEGER PRIMARY KEY,
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
+        setter_id INTEGER NOT NULL,
         language TEXT,
         language_confidence REAL,
         confidence REAL,
         text TEXT NOT NULL,
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
     )
     """
     )
@@ -288,14 +303,33 @@ def initialize_database(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY,
             item_id INTEGER NOT NULL,
             log_id INTEGER NOT NULL,
+            setter_id INTEGER NOT NULL,
             embedding float[],
             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-            FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+            FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
+            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS text_embeddings (
+            id INTEGER PRIMARY KEY,
+            item_id INTEGER NOT NULL,
+            log_id INTEGER NOT NULL,
+            setter_id INTEGER NOT NULL,
+            text_setter_id INTEGER NOT NULL,
+            text_id INTEGER NOT NULL,
+            embedding float[],
+            FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+            FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
+            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
+            FOREIGN KEY(text_id) REFERENCES extracted_text(id) ON DELETE CASCADE,
+            FOREIGN KEY(text_setter_id) REFERENCES setters(id) ON DELETE CASCADE
         );
         """
     )
 
-    create_text_embeddings_table(conn)
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -317,6 +351,8 @@ def initialize_database(conn: sqlite3.Connection):
         ("data_extraction_log", ["setter"]),
         ("data_extraction_log", ["type"]),
         ("data_extraction_log", ["threshold"]),
+        ("data_extraction_log", ["batch_size"]),
+        ("data_extraction_log", ["setter_id"]),
         ("folders", ["time_added"]),
         ("folders", ["path"]),
         ("folders", ["included"]),
@@ -324,8 +360,9 @@ def initialize_database(conn: sqlite3.Connection):
         ("bookmarks", ["sha256"]),
         ("bookmarks", ["metadata"]),
         ("bookmarks", ["namespace"]),
-        ("extraction_log_items", ["item_id"]),
-        ("extraction_log_items", ["log_id"]),
+        ("items_extractions", ["item_id"]),
+        ("items_extractions", ["log_id"]),
+        ("items_extractions", ["setter_id"]),
         ("tags_items", ["item_id"]),
         ("tags_items", ["tag_id"]),
         ("tags_items", ["confidence"]),
@@ -342,8 +379,15 @@ def initialize_database(conn: sqlite3.Connection):
         ("extracted_text", ["log_id"]),
         ("extracted_text", ["language"]),
         ("extracted_text", ["confidence"]),
+        ("extracted_text", ["setter_id"]),
         ("image_embeddings", ["item_id"]),
         ("image_embeddings", ["log_id"]),
+        ("image_embeddings", ["setter_id"]),
+        ("text_embeddings", ["item_id"]),
+        ("text_embeddings", ["log_id"]),
+        ("text_embeddings", ["setter_id"]),
+        ("text_embeddings", ["text_setter_id"]),
+        ("text_embeddings", ["text_id"]),
     ]
 
     for table, columns in indices:
@@ -369,48 +413,3 @@ def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
     if item_id:
         return item_id[0]
     return None
-
-
-# def create_image_embeddings_tables(
-#     conn: sqlite3.Connection, embedding_size: int = 1024
-# ):
-#     cursor = conn.cursor()
-#     cursor.execute(
-#         f"""
-#         DROP TABLE IF EXISTS image_embeddings_meta;
-#         """
-#     )
-#     cursor.execute(
-#         f"""
-#         DROP TABLE IF EXISTS image_embeddings;
-#         """
-#     )
-#     cursor.execute(
-#         f"""
-#         CREATE TABLE IF NOT EXISTS image_embeddings_meta (
-#             id INTEGER PRIMARY KEY,
-#             item_id INTEGER NOT NULL,
-#             log_id INTEGER NOT NULL,
-#             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-#             FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
-#         );
-#         """
-#     )
-#     cursor.execute(
-#         f"""
-#         CREATE VIRTUAL TABLE IF NOT EXISTS image_embeddings USING vec0(
-#             id INTEGER PRIMARY KEY,
-#             embedding FLOAT[{embedding_size}]
-#         );
-#         """
-#     )
-#     if trigger_exists(conn, "image_embeddings_meta_ad_embed"):
-#         cursor.execute("DROP TRIGGER image_embeddings_meta_ad_embed")
-#     # Create triggers to keep the image_embeddings table up to date
-#     cursor.execute(
-#         """
-#         CREATE TRIGGER image_embeddings_meta_ad_embed AFTER DELETE ON image_embeddings_meta BEGIN
-#             DELETE FROM image_embeddings WHERE id = old.id;
-#         END;
-#         """
-#     )

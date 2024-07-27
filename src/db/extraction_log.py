@@ -4,6 +4,7 @@ from typing import List, Tuple
 
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
+from src.db.setters import upsert_setter
 from src.types import ItemWithPath, LogRecord
 
 
@@ -15,20 +16,23 @@ def add_data_extraction_log(
     threshold: float | None,
     batch_size: int,
 ):
+    setter_id = upsert_setter(conn, type, setter)
     cursor = conn.cursor()
     cursor.execute(
         """
     INSERT INTO data_extraction_log (
         start_time,
+        setter_id,
         type,
         setter,
         threshold,
         batch_size
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     """,
         (
             scan_time,
+            setter_id,
             type,
             setter,
             threshold,
@@ -36,7 +40,7 @@ def add_data_extraction_log(
         ),
     )
     assert cursor.lastrowid is not None
-    return cursor.lastrowid
+    return cursor.lastrowid, setter_id
 
 
 def update_log(
@@ -82,6 +86,7 @@ def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
         id,
         start_time,
         end_time,
+        setter_id,
         type,
         setter,
         threshold,
@@ -93,7 +98,8 @@ def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
         errors,
         total_remaining
         FROM data_extraction_log
-        ORDER BY start_time DESC"""
+        ORDER BY start_time DESC
+        """
     )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
@@ -108,17 +114,18 @@ def add_item_to_log(
     item_id = get_item_id(conn, item)
     cursor.execute(
         """
-    INSERT INTO extraction_log_items (item_id, log_id)
-    VALUES (?, ?)
+    INSERT INTO items_extractions (item_id, log_id, setter_id)
+    SELECT ?, ?, log.setter_id
+    FROM data_extraction_log AS log
+    WHERE log.id = ?
     """,
-        (item_id, log_id),
+        (item_id, log_id, log_id),
     )
 
 
 def get_items_missing_data_extraction(
     conn: sqlite3.Connection,
-    model_type: str,
-    setter: str,
+    setter_id: int,
     mime_type_filter: List[str] | None = None,
 ):
     """
@@ -128,38 +135,41 @@ def get_items_missing_data_extraction(
     It also avoids joining with the files table to get the path,
     instead getting paths one by one.
     """
-    clauses = f"""
-    FROM items
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM extraction_log_items
-        JOIN data_extraction_log
-        ON extraction_log_items.log_id = data_extraction_log.id
-        WHERE items.id = extraction_log_items.item_id
-        AND data_extraction_log.type = ?
-        AND data_extraction_log.setter = ?
+    ctes = f"""
+    WITH unprocessed_items AS (
+        SELECT items.id
+        FROM items
+        LEFT JOIN items_extractions ON items.id = items_extractions.item_id 
+            AND items_extractions.setter_id = ?
+        GROUP BY items.id
+        HAVING COUNT(items_extractions.item_id) = 0
     )
     """
+    params: List[str | int | float] = [setter_id]
+    last_cte = "unprocessed_items"
     if mime_type_filter:
-        clauses += "AND ("
-        for i, _ in enumerate(mime_type_filter):
-            if i == 0:
-                clauses += "items.type LIKE ? || '%'"
-            else:
-                clauses += f" OR items.type LIKE ? || '%'"
-        clauses += ")"
+        or_conditions = " OR ".join(
+            ["items.type LIKE ? || '%'" for _ in mime_type_filter]
+        )
+        new_cte = "mime_type_filtered_items"
+        ctes += f"""
+        , {new_cte} AS (
+            SELECT items.id
+            FROM {last_cte}
+            JOIN items ON items.id = unprocessed_items.id
+            WHERE ( {or_conditions} )"
+        )
+        """
+        params += mime_type_filter
+        last_cte = new_cte
 
-    params = [
-        model_type,
-        setter,
-        *(mime_type_filter if mime_type_filter else ()),
-    ]
+    cursor = conn.cursor()
 
     count_query = f"""
+    {ctes}
     SELECT COUNT(*)
-    {clauses}
+    FROM {last_cte}
     """
-    cursor = conn.cursor()
 
     cursor.execute(
         count_query,
@@ -169,14 +179,16 @@ def get_items_missing_data_extraction(
 
     cursor.execute(
         f"""
-    SELECT
-    items.sha256,
-    items.md5,
-    items.type,
-    items.size,
-    items.time_added
-    {clauses}
-    """,
+        {ctes}
+        SELECT
+        items.sha256,
+        items.md5,
+        items.type,
+        items.size,
+        items.time_added
+        FROM items JOIN {last_cte}
+        ON items.id = {last_cte}.id
+        """,
         params,
     )
 
@@ -192,33 +204,11 @@ def get_items_missing_data_extraction(
             continue
 
 
-def remove_setter_from_items(
-    conn: sqlite3.Connection, model_type: str, setter: str
-):
-    cursor = conn.cursor()
-
-    result = cursor.execute(
-        """
-    DELETE FROM extraction_log_items
-    WHERE log_id IN (
-        SELECT data_extraction_log.id
-        FROM data_extraction_log
-        WHERE setter = ?
-        AND type = ?
-    )
-    """,
-        (setter, model_type),
-    )
-
-    items_setter_removed = result.rowcount
-    return items_setter_removed
-
-
-def get_existing_type_setter_pairs(
+def get_existing_setters(
     conn: sqlite3.Connection,
 ) -> List[Tuple[str, str]]:
     """
-    Returns all the currently existing (type, setter) pairs from the data_extraction_log table.
+    Returns all the currently existing (type, setter) pairs
 
     Args:
         conn (sqlite3.Connection): The SQLite database connection.
@@ -227,10 +217,10 @@ def get_existing_type_setter_pairs(
         List[Tuple[str, str]]: A list of tuples containing (type, setter) pairs.
     """
     query = """
-    SELECT DISTINCT type, setter
-    FROM data_extraction_log
-    JOIN extraction_log_items
-    ON data_extraction_log.id = extraction_log_items.log_id
+    SELECT DISTINCT type, name
+    FROM setters
+    JOIN items_extractions
+    ON setters.id = items_extractions.setter_id
     """
 
     cursor = conn.cursor()
@@ -239,36 +229,3 @@ def get_existing_type_setter_pairs(
     cursor.close()
 
     return results
-
-
-def delete_log_items_without_item(
-    conn: sqlite3.Connection, batch_size: int = 10000
-):
-    cursor = conn.cursor()
-    total_deleted = 0
-
-    while True:
-        # Perform the deletion in batches
-        cursor.execute(
-            """
-        DELETE FROM extraction_log_items
-        WHERE rowid IN (
-            SELECT extraction_log_items.rowid
-            FROM extraction_log_items
-            LEFT JOIN items ON items.id = extraction_log_items.item_id
-            WHERE items.id IS NULL
-            LIMIT ?
-        )
-        """,
-            (batch_size,),
-        )
-
-        # Check the number of rows affected in this batch
-        deleted_rows = cursor.rowcount
-        total_deleted += deleted_rows
-
-        # If no rows were deleted, we are done
-        if deleted_rows == 0:
-            break
-
-    return total_deleted

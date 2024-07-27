@@ -18,29 +18,13 @@ def insert_image_embedding(
     assert item_id is not None, f"Item with SHA256 {item_sha256} not found"
 
     sql = """
-        INSERT INTO image_embeddings (item_id, log_id, embedding)
-        VALUES (?, ?, ?)
+        INSERT INTO image_embeddings (item_id, log_id, setter_id, embedding)
+        SELECT ?, ?, logs.setter_id, ?
+        FROM data_extraction_log AS logs
+        WHERE logs.id = ?
     """
     embedding_bytes = serialize_f32(embedding)
     cursor = conn.cursor()
-    cursor.execute(sql, (item_id, log_id, embedding_bytes))
+    cursor.execute(sql, (item_id, log_id, embedding_bytes, log_id))
     assert cursor.lastrowid is not None, "Last row ID is None"
     return cursor.lastrowid
-
-
-def delete_embeddings_generated_by_setter(
-    conn: sqlite3.Connection, model_type: str, setter: str
-):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        DELETE FROM image_embeddings
-        WHERE log_id IN (
-            SELECT data_extraction_log.id
-            FROM data_extraction_log
-            WHERE setter = ?
-            AND type = ?
-        )
-    """,
-        (model_type, setter),
-    )

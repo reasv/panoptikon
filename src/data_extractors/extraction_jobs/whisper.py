@@ -11,6 +11,7 @@ from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
 from src.db.extracted_text import insert_extracted_text
+from src.db.setters import upsert_setter
 from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
@@ -36,7 +37,9 @@ def run_whisper_extractor_job(
 
     threshold = model_opts.threshold()
 
-    text_embedding_model = get_text_embedding_model()
+    text_embedding_model, data_type, model_name = get_text_embedding_model()
+
+    embedding_setter_id = upsert_setter(conn, data_type, model_name)
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -111,6 +114,7 @@ def run_whisper_extractor_job(
             add_text_embedding(
                 conn,
                 text_id,
+                embedding_setter_id,
                 text_embedding_list,
             )
 

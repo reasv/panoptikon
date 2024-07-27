@@ -5,7 +5,7 @@ import gradio as gr
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
 from src.db.bookmarks import get_all_bookmark_namespaces
-from src.db.extraction_log import get_existing_type_setter_pairs
+from src.db.extraction_log import get_existing_setters
 from src.db.files import get_all_mime_types
 from src.db.folders import get_folders_from_database
 from src.db.tags import get_all_tag_namespaces
@@ -15,7 +15,7 @@ from src.ui.run_search import search
 
 def on_tab_load():
     conn = get_database_connection(write_lock=False)
-    full_setters_list = get_existing_type_setter_pairs(conn)
+    full_setters_list = get_existing_setters(conn)
     bookmark_namespaces = get_all_bookmark_namespaces(conn)
     file_types = get_all_mime_types(conn)
     tag_namespaces = get_all_tag_namespaces(conn)
@@ -25,7 +25,7 @@ def on_tab_load():
     extracted_text_setters = [
         (f"{model_type}|{setter_id}", (model_type, setter_id))
         for model_type, setter_id in full_setters_list
-        if model_type != "tags" and model_type != "clip"
+        if model_type == "text"
     ]
     tag_setters = [
         setter_id

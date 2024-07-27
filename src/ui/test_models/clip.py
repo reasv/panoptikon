@@ -71,7 +71,7 @@ def create_CLIP_ui():
         nonlocal clip, embeddings
         files = get_images(folder_path)
         if clip is None:
-            from src.data_extractors.image_embeddings import CLIPEmbedder
+            from src.data_extractors.ai.clip import CLIPEmbedder
 
             clip = CLIPEmbedder()
             clip.load_model()
@@ -115,7 +115,7 @@ def create_CLIP_ui():
         if image is None:
             return get_images(folder_path)
         if clip is None:
-            from src.data_extractors.image_embeddings import CLIPEmbedder
+            from src.data_extractors.ai.clip import CLIPEmbedder
 
             clip = CLIPEmbedder()
             clip.load_model()

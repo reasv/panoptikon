@@ -5,7 +5,7 @@ import gradio as gr
 
 from src.db import get_database_connection
 from src.db.extracted_text import get_extracted_text_for_item
-from src.db.extraction_log import get_existing_type_setter_pairs
+from src.db.extraction_log import get_existing_setters
 from src.types import ExtractedText, FileSearchResult
 
 
@@ -18,7 +18,7 @@ def on_item_change(selected_files: List[FileSearchResult]):
     extracted_texts = get_extracted_text_for_item(
         conn, item_sha256=selected_file.sha256
     )
-    setters_pairs = get_existing_type_setter_pairs(conn)
+    setters_pairs = get_existing_setters(conn)
     choices = [
         (f"{model_type}|{setter}", (model_type, setter))
         for model_type, setter in setters_pairs

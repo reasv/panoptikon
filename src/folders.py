@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List
 
-from src.db.extraction_log import delete_log_items_without_item
 from src.db.files import (
     add_file_scan,
     delete_items_without_files,
@@ -178,7 +177,6 @@ def update_folder_lists(
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     orphan_items_deleted = delete_items_without_files(conn)
     delete_tags_without_items(conn)
-    delete_log_items_without_item(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,
@@ -207,7 +205,6 @@ def rescan_all_folders(
         unavailable_files_deleted = delete_unavailable_files(conn)
         orphan_items_deleted = delete_items_without_files(conn)
         delete_tags_without_items(conn)
-        delete_log_items_without_item(conn)
     else:
         unavailable_files_deleted = 0
         orphan_items_deleted = 0

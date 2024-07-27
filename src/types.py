@@ -27,11 +27,11 @@ class ItemWithPath:
 class ExtractedText:
     item_sha256: str
     model_type: str
-    setter: str
+    setter_name: str
     language: str
+    language_confidence: float | None
     text: str
     confidence: float | None
-    score: float
 
 
 @dataclass
@@ -69,6 +69,7 @@ class LogRecord:
     id: int
     start_time: str
     end_time: str
+    setter_id: int | None
     type: str
     setter: str
     threshold: float | None

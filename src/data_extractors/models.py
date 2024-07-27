@@ -10,8 +10,7 @@ from src.data_extractors.utils import (
     get_threshold_from_env,
     get_whisper_avg_logprob_threshold_from_env,
 )
-from src.db.extracted_text import delete_text_extracted_by_setter
-from src.db.extraction_log import remove_setter_from_items
+from src.db.setters import delete_setter_by_name
 from src.db.tags import delete_tags_from_setter
 
 
@@ -53,13 +52,19 @@ class ModelOpts:
     def default_model(cls) -> str:
         return cls.available_models()[0]
 
+    def delete_extracted_data(self, conn: sqlite3.Connection):
+        delete_setter_by_name(conn, self.data_type(), self.setter_id())
+        return (
+            f"Deleted text extracted from items by model {self.setter_id()}.\n"
+        )
+
     def threshold(self) -> float | None:
         return None
 
     def supported_mime_types(self) -> List[str] | None:
         return None
 
-    def model_type(self) -> str:
+    def data_type(self) -> str:
         raise NotImplementedError
 
     def run_extractor(
@@ -77,9 +82,6 @@ class ModelOpts:
     def _init(self, model_name: str):
         raise NotImplementedError
 
-    def delete_extracted_data(self, conn: sqlite3.Connection) -> str:
-        raise NotImplementedError
-
     @classmethod
     def name(cls) -> str:
         raise NotImplementedError
@@ -95,7 +97,7 @@ class TagsModel(ModelOpts):
     def _init(self, model_name: str):
         self._model_repo = TagsModel._available_models_mapping()[model_name]
 
-    def model_type(self) -> str:
+    def data_type(self) -> str:
         return "tags"
 
     @classmethod
@@ -176,12 +178,12 @@ class OCRModel(ModelOpts):
             OCRModel._available_models_mapping()[model_name]
         )
 
-    def model_type(self) -> str:
-        return "ocr"
+    def data_type(self) -> str:
+        return "text"
 
     @classmethod
     def name(cls) -> str:
-        return "OCR"
+        return "DocTR"
 
     @classmethod
     def description(cls) -> str:
@@ -194,7 +196,7 @@ class OCRModel(ModelOpts):
 
     @classmethod
     def default_model(cls) -> str:
-        return "db_resnet50|crnn_mobilenet_v3_small"
+        return "doctr|db_resnet50|crnn_mobilenet_v3_small"
 
     def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.ocr import (
@@ -215,7 +217,7 @@ class OCRModel(ModelOpts):
             ("db_resnet50", "parseq"),
         ]
         return {
-            f"{detection}|{recognition}": (detection, recognition)
+            f"doctr|{detection}|{recognition}": (detection, recognition)
             for detection, recognition in options
         }
 
@@ -235,19 +237,6 @@ class OCRModel(ModelOpts):
     def detection_model(self) -> str:
         return self._detection_model
 
-    def delete_extracted_data(self, conn: sqlite3.Connection):
-
-        items_affected = remove_setter_from_items(
-            conn, self.model_type(), self.setter_id()
-        )
-        delete_text_extracted_by_setter(
-            conn, model_type=self.model_type(), setter=self.setter_id()
-        )
-        return (
-            f"Deleted text extracted from {items_affected} "
-            + f"items by model {self.setter_id()}.\n"
-        )
-
     def threshold(self) -> float | None:
         return get_ocr_threshold_from_env()
 
@@ -262,7 +251,7 @@ class ImageEmbeddingModel(ModelOpts):
             ImageEmbeddingModel._available_models_mapping()[model_name]
         )
 
-    def model_type(self) -> str:
+    def data_type(self) -> str:
         return "clip"
 
     @classmethod
@@ -312,16 +301,6 @@ class ImageEmbeddingModel(ModelOpts):
     def clip_model_checkpoint(self) -> str:
         return self._checkpoint
 
-    def delete_extracted_data(self, conn: sqlite3.Connection):
-
-        items_affected = remove_setter_from_items(
-            conn, self.model_type(), self.setter_id()
-        )
-        return (
-            f"Deleted image embeddings generated from {items_affected} "
-            + f"items by model {self.setter_id()}.\n"
-        )
-
 
 class WhisperSTTModel(ModelOpts):
     _model_repo: str
@@ -337,10 +316,10 @@ class WhisperSTTModel(ModelOpts):
 
     @classmethod
     def default_model(cls) -> str:
-        return "distill-large-v3"
+        return "whisper|distill-large-v3"
 
-    def model_type(self) -> str:
-        return "stt"
+    def data_type(self) -> str:
+        return "text"
 
     @classmethod
     def name(cls) -> str:
@@ -380,6 +359,7 @@ class WhisperSTTModel(ModelOpts):
             "distil-small.en": "Systran/faster-distil-whisper-small.en",
             "distill-large-v3": "Systran/faster-distil-whisper-large-v3",
         }
+        _MODELS = {f"whisper|{k}": v for k, v in _MODELS.items()}
         return _MODELS
 
     @classmethod
@@ -392,18 +372,6 @@ class WhisperSTTModel(ModelOpts):
 
     def model_repo(self) -> str:
         return self._model_repo
-
-    def delete_extracted_data(self, conn: sqlite3.Connection):
-        items_affected = remove_setter_from_items(
-            conn, self.model_type(), self.setter_id()
-        )
-        delete_text_extracted_by_setter(
-            conn, model_type=self.model_type(), setter=self.setter_id()
-        )
-        return (
-            f"Deleted text extracted from {items_affected} "
-            + f"items by model {self.setter_id()}.\n"
-        )
 
     def supported_mime_types(self) -> List[str] | None:
         return ["audio/", "video/"]

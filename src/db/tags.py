@@ -83,7 +83,7 @@ def delete_tags_from_setter(conn: sqlite3.Connection, setter: str):
 
     result_items = cursor.execute(
         """
-    DELETE FROM extraction_log_items
+    DELETE FROM items_extractions
     WHERE log_id IN (
         SELECT data_extraction_log.id
         FROM data_extraction_log

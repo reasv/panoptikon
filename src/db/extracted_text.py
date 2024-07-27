@@ -27,11 +27,22 @@ def insert_extracted_text(
     cursor = conn.cursor()
 
     sql = """
-    INSERT INTO extracted_text (item_id, log_id, language, language_confidence, confidence, text)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO extracted_text (item_id, log_id, setter_id, language, language_confidence, confidence, text)
+    SELECT ?, ?, logs.setter_id, ?, ?, ?, ?
+    FROM data_extraction_log AS logs
+    WHERE logs.id = ?
     """
     cursor.execute(
-        sql, (item_id, log_id, language, language_confidence, confidence, text)
+        sql,
+        (
+            item_id,
+            log_id,
+            language,
+            language_confidence,
+            confidence,
+            text,
+            log_id,
+        ),
     )
     assert cursor.lastrowid is not None, "Last row ID is None"
     return cursor.lastrowid
@@ -47,15 +58,16 @@ def get_extracted_text_for_item(
     cursor.execute(
         """
         SELECT
-            items.sha256 as item_sha256,
-            log.type as model_type,
-            log.setter,
+            items.sha256,
+            setters.type,
+            setters.name,
             language,
             text,
-            confidence
+            confidence,
+            language_confidence
         FROM extracted_text
-        JOIN data_extraction_log AS log
-        ON extracted_text.log_id = log.id
+        JOIN setters AS setters 
+        ON extracted_text.setter_id = setters.id
         JOIN items ON extracted_text.item_id = items.id
         WHERE items.sha256 = ?
     """,
@@ -68,30 +80,12 @@ def get_extracted_text_for_item(
         ExtractedText(
             item_sha256=row[0],
             model_type=row[1],
-            setter=row[2],
+            setter_name=row[2],
             language=row[3],
             text=row[4],
             confidence=row[5],
-            score=0,
+            language_confidence=row[6],
         )
         for row in rows
     ]
     return extracted_texts
-
-
-def delete_text_extracted_by_setter(
-    conn: sqlite3.Connection, model_type: str, setter: str
-):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-    DELETE FROM extracted_text
-    WHERE log_id IN (
-        SELECT data_extraction_log.id
-        FROM data_extraction_log
-        WHERE setter = ?
-        AND type = ?
-    )
-    """,
-        (model_type, setter),
-    )

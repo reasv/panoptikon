@@ -51,12 +51,12 @@ def build_any_text_query_clause(
             WITH combined_results AS (
                 {combined_subquery}
             )
-            SELECT item_id, MAX(rank) AS max_rank
+            SELECT item_id, MAX(max_rank) AS max_rank
             FROM combined_results
             GROUP BY item_id
-        ) AS text_matches
-        ON files.item_id = text_matches.item_id
+        ) AS any_text_matches
+        ON files.item_id = any_text_matches.item_id
     """
 
-    additional_columns = ",\n text_matches.max_rank AS rank_any_text"
+    additional_columns = ",\n any_text_matches.max_rank AS rank_any_text"
     return final_query, params, additional_columns

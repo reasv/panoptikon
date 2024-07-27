@@ -18,9 +18,9 @@ def build_image_embedding_clause(args: ImageEmbeddingFilter | None):
     subclause = f"""
         JOIN image_embeddings
         ON image_embeddings.item_id = files.item_id
-        JOIN data_extraction_log AS log
-        ON image_embeddings.log_id = log.id
-        AND log.type = ? AND log.setter = ?
+        JOIN setters as image_setters
+        ON image_embeddings.setter_id = image_setters.id
+        AND image_setters.type = ? AND image_setters.name = ?
     """
     add_column = ",\n MIN(vec_distance_L2(image_embeddings.embedding, ?)) AS image_vec_distance"
     return subclause, params, add_column

@@ -41,7 +41,7 @@ def get_embed(text: str):
         return last_embedded_text_embed
     global text_embedding_model
     if not text_embedding_model:
-        text_embedding_model = get_text_embedding_model()
+        text_embedding_model, _, __ = get_text_embedding_model()
     text_embed = text_embedding_model.encode([text])
     assert isinstance(text_embed, np.ndarray)
     text_embed_list = text_embed.tolist()[0]

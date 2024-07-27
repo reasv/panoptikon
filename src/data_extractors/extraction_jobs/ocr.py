@@ -10,6 +10,7 @@ from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
 from src.db.extracted_text import insert_extracted_text
+from src.db.setters import upsert_setter
 from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
@@ -27,7 +28,8 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
     )
     if torch.cuda.is_available():
         doctr_model = doctr_model.cuda().half()
-    text_embedding_model = get_text_embedding_model()
+    text_embedding_model, model_type, model_name = get_text_embedding_model()
+    embedding_setter_id = upsert_setter(conn, model_type, model_name)
 
     threshold = model_opt.threshold()
 
@@ -108,8 +110,9 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
             )
             add_text_embedding(
                 conn,
-                text_id,
-                embedding,
+                text_id=text_id,
+                setter_id=embedding_setter_id,
+                embedding=embedding,
             )
 
     return run_extraction_job(

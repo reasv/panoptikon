@@ -16,9 +16,9 @@ def build_path_fts_clause(
     path_condition: str | None = None
     path_params = [args.query]
     if args.only_match_filename:
-        path_condition = "files_path_fts.filename MATCH ?"
+        path_condition = "path_fts.filename MATCH ?"
     else:
-        path_condition = "files_path_fts.path MATCH ?"
+        path_condition = "path_fts.path MATCH ?"
     path_clause = f"""
         JOIN files_path_fts AS path_fts
         ON files.id = path_fts.rowid
@@ -66,7 +66,7 @@ def build_path_text_subclause(
     file_path_condition = " OR ".join(path_conditions)
 
     path_subclause = f"""
-        SELECT files.item_id AS item_id, MAX(files_path_fts.rank) AS rank
+        SELECT files.item_id AS item_id, MAX(files_path_fts.rank) AS max_rank
         FROM files_path_fts
         JOIN files ON files_path_fts.rowid = files.id
         WHERE {file_path_condition}
