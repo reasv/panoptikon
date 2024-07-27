@@ -103,7 +103,7 @@ def delete_bookmark(bookmarks_namespace: str, sha256: str):
 
 
 def get_thumbnail(file: FileSearchResult, big: bool = True):
-    if file.type.startswith("video"):
+    if file.type and file.type.startswith("video"):
         return (
             f"./thumbs/{file.sha256}-grid.jpg"
             if big

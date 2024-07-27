@@ -7,7 +7,7 @@ from typing import List, Tuple
 import gradio as gr
 import numpy as np
 
-from src.data_extractors.text_embeddings import get_text_embedding_model
+from src.data_extractors.ai.text_embed import get_text_embedding_model
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
 from src.db.search import search_files

@@ -1,8 +1,6 @@
 import sqlite3
 from typing import Any, Dict, Generator, List, Tuple
 
-from chromadb.api import ClientAPI
-
 from src.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
@@ -65,7 +63,7 @@ class ModelOpts:
         raise NotImplementedError
 
     def run_extractor(
-        self, conn: sqlite3.Connection, cdb: ClientAPI
+        self, conn: sqlite3.Connection
     ) -> Generator[ExtractorJobProgress | ExtractorJobReport, Any, None]:
         raise NotImplementedError
 
@@ -79,9 +77,7 @@ class ModelOpts:
     def _init(self, model_name: str):
         raise NotImplementedError
 
-    def delete_extracted_data(
-        self, conn: sqlite3.Connection, cdb: ClientAPI
-    ) -> str:
+    def delete_extracted_data(self, conn: sqlite3.Connection) -> str:
         raise NotImplementedError
 
     @classmethod
@@ -117,7 +113,7 @@ class TagsModel(ModelOpts):
     def default_model(cls) -> str:
         return "wd-swinv2-tagger-v3"
 
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.tags import (
             run_tag_extractor_job,
         )
@@ -157,7 +153,7 @@ class TagsModel(ModelOpts):
     def model_repo(self) -> str:
         return self._model_repo
 
-    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def delete_extracted_data(self, conn: sqlite3.Connection):
         tags_removed, items_tags_removed = delete_tags_from_setter(
             conn, self.setter_id()
         )
@@ -200,12 +196,12 @@ class OCRModel(ModelOpts):
     def default_model(cls) -> str:
         return "db_resnet50|crnn_mobilenet_v3_small"
 
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.ocr import (
             run_ocr_extractor_job,
         )
 
-        return run_ocr_extractor_job(conn, cdb, self)
+        return run_ocr_extractor_job(conn, self)
 
     @classmethod
     def _available_models_mapping(cls) -> Dict[str, Tuple[str, str]]:
@@ -239,12 +235,8 @@ class OCRModel(ModelOpts):
     def detection_model(self) -> str:
         return self._detection_model
 
-    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.text_embeddings import (
-            delete_all_text_from_model,
-        )
+    def delete_extracted_data(self, conn: sqlite3.Connection):
 
-        delete_all_text_from_model(cdb, self)
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
         )
@@ -290,12 +282,12 @@ class ImageEmbeddingModel(ModelOpts):
     def default_model(cls) -> str:
         return "ViT-H-14-378-quickgelu|dfn5b"
 
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.clip import (
             run_image_embedding_extractor_job,
         )
 
-        return run_image_embedding_extractor_job(conn, cdb, self)
+        return run_image_embedding_extractor_job(conn, self)
 
     @classmethod
     def _available_models_mapping(cls) -> Dict[str, Tuple[str, str]]:
@@ -320,12 +312,8 @@ class ImageEmbeddingModel(ModelOpts):
     def clip_model_checkpoint(self) -> str:
         return self._checkpoint
 
-    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.image_embeddings import (
-            delete_all_embeddings_from_model,
-        )
+    def delete_extracted_data(self, conn: sqlite3.Connection):
 
-        delete_all_embeddings_from_model(cdb, self)
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
         )
@@ -365,12 +353,12 @@ class WhisperSTTModel(ModelOpts):
     def setter_id(self) -> str:
         return WhisperSTTModel._model_to_setter_id(self.model_repo())
 
-    def run_extractor(self, conn: sqlite3.Connection, cdb: ClientAPI):
+    def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.whisper import (
             run_whisper_extractor_job,
         )
 
-        return run_whisper_extractor_job(conn, cdb, self)
+        return run_whisper_extractor_job(conn, self)
 
     @classmethod
     def _available_models_mapping(cls) -> Dict[str, str]:
@@ -405,12 +393,7 @@ class WhisperSTTModel(ModelOpts):
     def model_repo(self) -> str:
         return self._model_repo
 
-    def delete_extracted_data(self, conn: sqlite3.Connection, cdb: ClientAPI):
-        from src.data_extractors.text_embeddings import (
-            delete_all_text_from_model,
-        )
-
-        delete_all_text_from_model(cdb, self)
+    def delete_extracted_data(self, conn: sqlite3.Connection):
         items_affected = remove_setter_from_items(
             conn, self.model_type(), self.setter_id()
         )

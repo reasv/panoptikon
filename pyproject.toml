@@ -16,7 +16,6 @@ gradio = "^4.37.2"
 pillow = "^10.4.0"
 imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
 open-clip-torch = "^2.26.1"
-chromadb = "^0.5.4"
 python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
 python-dotenv = "^1.0.1"

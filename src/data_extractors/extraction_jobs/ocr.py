@@ -3,24 +3,18 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
-from chromadb.api import ClientAPI
 from doctr.models import ocr_predictor
 
+from src.data_extractors.ai.text_embed import get_text_embedding_model
 from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
-from src.data_extractors.text_embeddings import (
-    add_item_text,
-    get_text_embedding_model,
-)
 from src.db.extracted_text import insert_extracted_text
 from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
 
-def run_ocr_extractor_job(
-    conn: sqlite3.Connection, cdb: ClientAPI, model_opt: OCRModel
-):
+def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
     """
     Run a job that processes items in the database using the given batch inference function and item extractor.
     """
@@ -116,13 +110,6 @@ def run_ocr_extractor_job(
                 conn,
                 text_id,
                 embedding,
-            )
-            add_item_text(
-                cdb=cdb,
-                item=item,
-                model=model_opt,
-                language=language["value"] or "unknown",
-                text=cleaned_string,
             )
 
     return run_extraction_job(

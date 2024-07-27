@@ -1,22 +1,12 @@
-from typing import List, Sequence, Union, cast
+from typing import List, Sequence
 
 import numpy as np
 import open_clip
 import torch
-from chromadb.api.types import (
-    Document,
-    Documents,
-    EmbeddingFunction,
-    Embeddings,
-    Image,
-    Images,
-    is_document,
-    is_image,
-)
 from PIL import Image as PILImage
 
 
-class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
+class CLIPEmbedder:
     model_name: str
     pretrained: str
     batch_size: int
@@ -118,20 +108,3 @@ class CLIPEmbedder(EmbeddingFunction[Union[Documents, Images]]):
         sorted_hashes = [image_hashes[i] for i in sorted_indices]
 
         return sorted_hashes
-
-    def __call__(self, input: Union[Documents, Images]) -> Embeddings:
-        embeddings: Embeddings = []
-        for item in input:
-            if is_image(item):
-                embeddings.append(
-                    self.get_image_embeddings([cast(Image, item)])[0]
-                    .squeeze()
-                    .tolist()
-                )
-            elif is_document(item):
-                embeddings.append(
-                    self.get_text_embeddings([cast(Document, item)])[0]
-                    .squeeze()
-                    .tolist()
-                )
-        return embeddings

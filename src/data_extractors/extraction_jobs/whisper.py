@@ -4,23 +4,19 @@ from typing import Iterable, List, Sequence, Tuple
 import faster_whisper
 import numpy as np
 import torch
-from chromadb.api import ClientAPI
 from faster_whisper.transcribe import Segment, TranscriptionInfo
 
+from src.data_extractors.ai.text_embed import get_text_embedding_model
 from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
-from src.data_extractors.text_embeddings import (
-    add_item_text,
-    get_text_embedding_model,
-)
 from src.db.extracted_text import insert_extracted_text
 from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
 
 def run_whisper_extractor_job(
-    conn: sqlite3.Connection, cdb: ClientAPI, model_opts: WhisperSTTModel
+    conn: sqlite3.Connection, model_opts: WhisperSTTModel
 ):
     """
     Run a job that processes items in the database using the given batch inference function and item extractor.
@@ -116,13 +112,6 @@ def run_whisper_extractor_job(
                 conn,
                 text_id,
                 text_embedding_list,
-            )
-            add_item_text(
-                cdb,
-                item,
-                model_opts,
-                info.language,
-                merged_text,
             )
 
     return run_extraction_job(
