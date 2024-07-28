@@ -8,7 +8,7 @@ import gradio as gr
 import numpy as np
 
 from src.data_extractors.ai.clip import CLIPEmbedder
-from src.data_extractors.ai.text_embed import get_text_embedding_model
+from src.data_extractors.ai.text_embed import TextEmbedder
 from src.data_extractors.utils import get_threshold_from_env
 from src.db import get_database_connection
 from src.db.search import search_files
@@ -31,7 +31,6 @@ from src.db.search.utils import pprint_dataclass
 from src.db.utils import serialize_f32
 from src.types import FileSearchResult
 
-text_embedding_model = None
 last_embedded_text: str | None = None
 last_embedded_text_embed: bytes | None = None
 
@@ -40,14 +39,11 @@ def get_embed(text: str):
     global last_embedded_text, last_embedded_text_embed
     if text == last_embedded_text:
         return last_embedded_text_embed
-    global text_embedding_model
-    if not text_embedding_model:
-        text_embedding_model, _, __ = get_text_embedding_model()
-    text_embed = text_embedding_model.encode([text])
-    assert isinstance(text_embed, np.ndarray)
-    text_embed_list = text_embed.tolist()[0]
+    # Set as persistent so that the model is not reloaded every time the function is called
+    embedder = TextEmbedder(persistent=True)
+    text_embed = embedder.get_text_embeddings([text])[0]
     last_embedded_text = text
-    last_embedded_text_embed = serialize_f32(text_embed_list)
+    last_embedded_text_embed = serialize_f32(text_embed)
     return last_embedded_text_embed
 
 
@@ -58,7 +54,8 @@ def get_clip_embed(input: str | np.ndarray, model_name: str):
     model_opt = ImageEmbeddingModel(1, model_name)
     name = model_opt.clip_model_name()
     pretrained = model_opt.clip_model_checkpoint()
-    clip_model = CLIPEmbedder(name, pretrained)
+    # Set as persistent so that the model is not reloaded every time the function is called
+    clip_model = CLIPEmbedder(name, pretrained, persistent=True)
     clip_model.load_model()
     if isinstance(input, str):
         embed = clip_model.get_text_embeddings([input])[0]

@@ -1,12 +1,12 @@
 import sqlite3
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Text, Tuple
 
 import faster_whisper
 import numpy as np
 import torch
 from faster_whisper.transcribe import Segment, TranscriptionInfo
 
-from src.data_extractors.ai.text_embed import get_text_embedding_model
+from src.data_extractors.ai.text_embed import TextEmbedder
 from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
@@ -37,9 +37,11 @@ def run_whisper_extractor_job(
 
     threshold = model_opts.threshold()
 
-    text_embedding_model, data_type, model_name = get_text_embedding_model()
+    text_embedder = TextEmbedder()
 
-    embedding_setter_id = upsert_setter(conn, data_type, model_name)
+    embedding_setter_id = upsert_setter(
+        conn, text_embedder.model_type(), text_embedder.model_name()
+    )
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -90,12 +92,12 @@ def run_whisper_extractor_job(
             if len(merged_text) < 3:
                 continue
 
-            text_embedding = text_embedding_model.encode([merged_text])
+            text_embeddings = text_embedder.get_text_embeddings([merged_text])
 
             assert isinstance(
-                text_embedding, np.ndarray
-            ), "embeddings should be numpy arrays"
-            text_embedding_list = text_embedding.tolist()[0]
+                text_embeddings, list
+            ), "embeddings should be lists of floats"
+            text_embedding = text_embeddings[0]
 
             average_log_prob = (
                 sum(segment[1] for segment in segment_list) / len(segment_list)
@@ -115,7 +117,7 @@ def run_whisper_extractor_job(
                 conn,
                 text_id,
                 embedding_setter_id,
-                text_embedding_list,
+                text_embedding,
             )
 
     return run_extraction_job(

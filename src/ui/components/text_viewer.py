@@ -58,14 +58,15 @@ def create_text_viewer(selected_items: gr.State):
                     (
                         t
                         for t in texts_state
-                        if t.setter == setter and t.model_type == model_type
+                        if t.setter_name == setter
+                        and t.model_type == model_type
                     ),
                     None,
                 )
                 if text is not None:
                     with gr.Row():
                         gr.Textbox(
-                            label=f"Source: {model_type} ({setter})",
+                            label=f"Source: ({setter})",
                             interactive=False,
                             lines=4,
                             value=text.text,

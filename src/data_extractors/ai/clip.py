@@ -55,6 +55,7 @@ class CLIPEmbedder:
         model_name="ViT-H-14-378-quickgelu",
         pretrained="dfn5b",
         batch_size=8,
+        persistent=False,
     ):
         self.model_name = model_name
         self.pretrained = pretrained
@@ -66,6 +67,7 @@ class CLIPEmbedder:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self._model_loaded = False
+        self.persistent = persistent
 
     def _load_model(self):
         if not self._model_loaded:
@@ -134,7 +136,8 @@ class CLIPEmbedder:
             self._model_loaded = False
 
     def __del__(self):
-        self.unload_model()
+        if not self.persistent:
+            self.unload_model()
 
     def rank_images_by_similarity(self, image_embeddings_dict, text_embedding):
         image_hashes = list(image_embeddings_dict.keys())

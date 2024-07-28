@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from doctr.models import ocr_predictor
 
-from src.data_extractors.ai.text_embed import get_text_embedding_model
+from src.data_extractors.ai.text_embed import TextEmbedder
 from src.data_extractors.data_loaders.images import item_image_loader_numpy
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import OCRModel
@@ -28,8 +28,10 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
     )
     if torch.cuda.is_available():
         doctr_model = doctr_model.cuda().half()
-    text_embedding_model, model_type, model_name = get_text_embedding_model()
-    embedding_setter_id = upsert_setter(conn, model_type, model_name)
+    text_embedder = TextEmbedder()
+    embedding_setter_id = upsert_setter(
+        conn, text_embedder.model_type(), text_embedder.model_name()
+    )
 
     threshold = model_opt.threshold()
 
@@ -63,14 +65,9 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
             isinstance(text, str) for text in files_texts
         ), "All elements in files_texts should be strings."
 
-        embeddings = text_embedding_model.encode(files_texts)
-        assert isinstance(
-            embeddings, np.ndarray
-        ), "embeddings should be numpy arrays"
-        embeddings_lists = embeddings.tolist()
-        return list(
-            zip(files_texts, embeddings_lists, languages, word_confidences)
-        )
+        embeddings = text_embedder.get_text_embeddings(files_texts)
+        assert isinstance(embeddings, list), "embeddings should be lists"
+        return list(zip(files_texts, embeddings, languages, word_confidences))
 
     def handle_item_result(
         log_id: int,
