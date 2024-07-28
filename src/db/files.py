@@ -6,25 +6,34 @@ from src.types import FileRecord, FileScanData, FileScanRecord
 
 
 def update_file_data(
-    conn: sqlite3.Connection, scan_time: str, file_data: FileScanData
+    conn: sqlite3.Connection, scan_time: str, meta: FileScanData
 ):
     cursor = conn.cursor()
-    sha256 = file_data.sha256
-    md5 = file_data.md5
-    mime_type = file_data.mime_type
-    file_size = file_data.size
-    path = file_data.path
-    last_modified = file_data.last_modified
-    path_in_db = file_data.path_in_db
-    file_modified = file_data.modified
+    sha256 = meta.sha256
+    path = meta.path
+    last_modified = meta.last_modified
+    path_in_db = meta.path_in_db
+    file_modified = meta.modified
 
     item_insert_result = cursor.execute(
         """
-    INSERT INTO items (sha256, md5, type, size, time_added)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO items (sha256, md5, type, size, time_added, width, height, duration, audio_tracks, video_tracks, subtitle_tracks)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(sha256) DO NOTHING
     """,
-        (sha256, md5, mime_type, file_size, scan_time),
+        (
+            sha256,
+            meta.md5,
+            meta.mime_type,
+            meta.size,
+            scan_time,
+            meta.width,
+            meta.height,
+            meta.duration,
+            meta.audio_tracks,
+            meta.video_tracks,
+            meta.subtitle_tracks,
+        ),
     )
 
     # We need to check if the item was inserted

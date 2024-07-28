@@ -1,7 +1,120 @@
 import json
 import subprocess
+from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
+
+
+@dataclass
+class AudioTrack:
+    index: int
+    duration: float
+    codec: str
+    language: Optional[str]
+
+
+@dataclass
+class VideoTrack:
+    duration: float
+    width: int
+    height: int
+    codec: str
+
+
+@dataclass
+class SubtitleTrack:
+    index: int
+    codec: str
+    language: Optional[str]
+
+
+@dataclass
+class MediaInfo:
+    audio_tracks: List[AudioTrack]
+    video_track: Optional[VideoTrack]
+    subtitle_tracks: List[SubtitleTrack]
+
+
+def extract_media_info(file: str) -> MediaInfo:
+    """
+    Extract detailed information from an audio or video file, including subtitles.
+
+    Parameters
+    ----------
+    file: str
+        The path to the audio or video file to analyze.
+
+    Returns
+    -------
+    MediaInfo
+        A dataclass containing information about audio tracks, video track (if present), and subtitle tracks.
+    """
+    try:
+        # Run ffprobe to get detailed stream and format information
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,duration,width,height,tags:format=duration",
+            "-of",
+            "json",
+            file,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+
+        audio_tracks = []
+        video_track = None
+        subtitle_tracks = []
+
+        # Extract information for each stream
+        for stream in data.get("streams", []):
+            if stream["codec_type"] == "audio":
+                audio_tracks.append(
+                    AudioTrack(
+                        index=stream["index"],
+                        duration=float(stream.get("duration", 0)),
+                        codec=stream["codec_name"],
+                        language=stream.get("tags", {}).get("language"),
+                    )
+                )
+            elif stream["codec_type"] == "video":
+                video_track = VideoTrack(
+                    duration=float(stream.get("duration", 0)),
+                    width=stream["width"],
+                    height=stream["height"],
+                    codec=stream["codec_name"],
+                )
+            elif stream["codec_type"] == "subtitle":
+                subtitle_tracks.append(
+                    SubtitleTrack(
+                        index=stream["index"],
+                        codec=stream["codec_name"],
+                        language=stream.get("tags", {}).get("language"),
+                    )
+                )
+
+        # If stream duration is not available, use format duration
+        format_duration = float(data["format"].get("duration", 0))
+        if video_track and video_track.duration == 0:
+            video_track.duration = format_duration
+        for track in audio_tracks:
+            if track.duration == 0:
+                track.duration = format_duration
+
+        return MediaInfo(
+            audio_tracks=audio_tracks,
+            video_track=video_track,
+            subtitle_tracks=subtitle_tracks,
+        )
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Failed to analyze file: {e.stderr}") from e
+    except (json.JSONDecodeError, KeyError) as e:
+        raise RuntimeError(f"Failed to parse ffprobe output: {str(e)}") from e
+
 
 SAMPLE_RATE = 16000
 

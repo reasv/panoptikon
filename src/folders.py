@@ -70,7 +70,7 @@ def execute_folder_scan(
                 continue
             # Update the file data in the database
             (item_inserted, file_updated, file_deleted, file_inserted) = (
-                update_file_data(conn, scan_time=scan_time, file_data=file_data)
+                update_file_data(conn, scan_time=scan_time, meta=file_data)
             )
             if item_inserted:
                 new_items += 1

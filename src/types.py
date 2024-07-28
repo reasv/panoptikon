@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from re import sub
+from turtle import width
 
 
 @dataclass
@@ -11,6 +13,12 @@ class FileScanData:
     path: str
     path_in_db: bool
     modified: bool
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+    audio_tracks: int | None = None
+    video_tracks: int | None = None
+    subtitle_tracks: int | None = None
 
 
 @dataclass

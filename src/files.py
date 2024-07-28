@@ -4,9 +4,13 @@ import sqlite3
 from datetime import datetime
 from typing import List
 
+from click import File
+
+from src.data_extractors.data_loaders.audio import extract_media_info
+from src.data_extractors.data_loaders.video import video_to_frames
 from src.db.files import get_file_by_path
 from src.types import FileScanData
-from src.utils import get_mime_type, normalize_path
+from src.utils import get_mime_type, make_video_thumbnails, normalize_path
 
 
 def get_files_by_extension(
@@ -98,27 +102,78 @@ def scan_files(
                 # File has been modified since the last scan
                 file_modified = True
 
-        if sha256 is None or md5 is None:
-            print(f"Calculating hashes for {file_path}")
+        if sha256 is None or md5 is None or file_modified:
+            print(f"Extracting metadata for {file_path}")
             try:
-                md5, sha256 = calculate_hashes(file_path)
+                yield extract_file_metadata(
+                    file_path, last_modified, file_size, bool(file_data)
+                )
                 # if file_data:
                 #     if file_data["sha256"] == sha256:
                 # print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size} bytes. Previous mtime: {file_data['last_modified']}, current mtime: {last_modified}.")
             except Exception as e:
-                print(f"Error calculating hashes for {file_path}: {e}")
+                print(f"Error extracting metadata for {file_path}: {e}")
                 yield None
+        else:
+            yield FileScanData(
+                sha256=sha256,
+                md5=md5,
+                mime_type=mime_type,
+                last_modified=last_modified,
+                size=file_size,
+                path=file_path,
+                path_in_db=bool(file_data),
+                modified=False,
+            )
 
-        yield FileScanData(
-            sha256=sha256,  # type: ignore
-            md5=md5,  # type: ignore
-            mime_type=mime_type,  # type: ignore
-            last_modified=last_modified,
-            size=file_size,
-            path=file_path,
-            path_in_db=bool(file_data),
-            modified=file_modified,
+
+def extract_file_metadata(
+    file_path: str, last_modified: str, size: int, path_in_db: bool
+) -> FileScanData:
+    """
+    Extract metadata from a file.
+    """
+    md5, sha256 = calculate_hashes(file_path)
+    mime_type = get_mime_type(file_path)
+    file_scan_data = FileScanData(
+        sha256=sha256,
+        md5=md5,
+        mime_type=mime_type,
+        last_modified=last_modified,
+        size=size,
+        path=file_path,
+        path_in_db=path_in_db,
+        modified=True,
+    )
+    if mime_type.startswith("image"):
+        from PIL import Image
+
+        with Image.open(file_path) as img:
+            width, height = img.size
+        file_scan_data.width = width
+        file_scan_data.height = height
+    elif mime_type.startswith("video"):
+        media_info = extract_media_info(file_path)
+        if media_info.video_track:
+            file_scan_data.width = media_info.video_track.width
+            file_scan_data.height = media_info.video_track.height
+            file_scan_data.duration = media_info.video_track.duration
+            file_scan_data.audio_tracks = len(media_info.audio_tracks)
+            file_scan_data.video_tracks = 1
+            file_scan_data.subtitle_tracks = len(media_info.subtitle_tracks)
+            frames = video_to_frames(file_path, num_frames=4)
+            make_video_thumbnails(frames, sha256, mime_type)
+
+    elif mime_type.startswith("audio"):
+        media_info = extract_media_info(file_path)
+        file_scan_data.duration = sum(
+            track.duration for track in media_info.audio_tracks
         )
+        file_scan_data.audio_tracks = len(media_info.audio_tracks)
+        file_scan_data.video_tracks = 0
+        file_scan_data.subtitle_tracks = len(media_info.subtitle_tracks)
+
+    return file_scan_data
 
 
 def get_image_extensions():
@@ -131,6 +186,14 @@ def get_video_extensions():
 
 def get_audio_extensions():
     return [".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"]
+
+
+def get_html_extensions():
+    return [".html", ".htm"]
+
+
+def get_pdf_extensions():
+    return [".pdf"]
 
 
 def calculate_hashes(file_path: str):

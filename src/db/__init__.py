@@ -41,7 +41,13 @@ def initialize_database(conn: sqlite3.Connection):
         sha256 TEXT UNIQUE NOT NULL,
         md5 TEXT NOT NULL,
         type TEXT,
-        size INTEGER,          -- Size of the file in bytes
+        size INTEGER,                    -- Size of the file in bytes
+        width INTEGER,                   -- Width of the frame in pixels
+        height INTEGER,                  -- Height of the frame in pixels
+        duration REAL,                   -- Duration of the video/audio in seconds
+        audio_tracks INTEGER,            -- Number of audio tracks
+        video_tracks INTEGER,            -- Number of video tracks
+        subtitle_tracks INTEGER,         -- Number of subtitle tracks
         time_added TEXT NOT NULL         -- Using TEXT to store ISO-8601 formatted datetime
     )
     """
