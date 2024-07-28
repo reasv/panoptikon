@@ -21,7 +21,7 @@ def search_files(
     # Build the main query
     search_query, search_query_params = build_search_query(args=args.query)
     # Debugging
-    pretty_print_SQL(search_query, search_query_params)
+    # pretty_print_SQL(search_query, search_query_params)
     cursor = conn.cursor()
     if args.count:
         # First query to get the total count of items matching the criteria

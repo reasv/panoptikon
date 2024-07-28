@@ -102,7 +102,9 @@ def delete_bookmark(bookmarks_namespace: str, sha256: str):
     conn.close()
 
 
-def get_thumbnail(file: FileSearchResult, big: bool = True):
+def get_thumbnail(file: FileSearchResult | None, big: bool = True):
+    if file is None:
+        return None
     if file.type and file.type.startswith("video"):
         return (
             f"./thumbs/{file.sha256}-grid.jpg"
