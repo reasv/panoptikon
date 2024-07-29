@@ -1,6 +1,15 @@
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from pprint import pprint
-from typing import List
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    get_args,
+    get_origin,
+)
 
 from typeguard import typechecked
 
@@ -78,3 +87,36 @@ def replace_bytes_with_length(d):
 def pprint_dataclass(obj):
     dictclass = dataclass_to_dict(obj)
     pprint(replace_bytes_with_length(dictclass))
+
+
+from dataclasses import fields, is_dataclass
+from typing import Any, Optional, Type, get_args, get_origin
+
+T = TypeVar("T")
+
+
+def from_dict(cls: Type[T], data: Dict[str, Any]) -> T:
+    # if not is_dataclass(cls):
+    #     raise TypeError(f"{cls} is not a dataclass.")
+
+    field_types = {f.name: f.type for f in fields(cls)}  # type: ignore
+    init_kwargs = {}
+    for field_name, field_type in field_types.items():
+        field_value = data.get(field_name, None)
+
+        # Check if the field type is Optional
+        origin_type = get_origin(field_type)
+        if origin_type is Optional:
+            # Unwrap Optional to get the actual type
+            field_type = get_args(field_type)[0]
+
+        if field_value is not None:
+            if is_dataclass(field_type):
+                # Recursively convert for nested dataclasses
+                init_kwargs[field_name] = from_dict(field_type, field_value)
+            else:
+                # Directly assign the value
+                init_kwargs[field_name] = field_value
+        # Else: field_value is None, leave out if not needed or keep as None
+
+    return cls(**init_kwargs)

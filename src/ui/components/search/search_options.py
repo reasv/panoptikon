@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from typing import List, Tuple
 
 import gradio as gr
@@ -20,7 +21,7 @@ from src.ui.components.search.vector_options import create_vector_search_opts
 
 
 def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
-    query_state = gr.State(SearchQuery())
+    query_state = gr.State(asdict(SearchQuery()))
     setters_state = gr.State([])
     tag_namespaces_state = gr.State([])
     bookmark_namespaces_state = gr.State([])

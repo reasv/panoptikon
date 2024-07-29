@@ -3,7 +3,7 @@ from __future__ import annotations
 import gradio as gr
 
 from src.db.search.types import SearchQuery
-from src.db.search.utils import pprint_dataclass
+from src.db.search.utils import from_dict, pprint_dataclass
 from src.ui.components.multi_view import create_multiview
 from src.ui.components.search import create_search_options
 
@@ -32,7 +32,7 @@ def create_search_UI(
                 query_state = create_search_options(app, search_tab)
             with gr.Column(scale=1):
                 with gr.Row():
-                    results = gr.Markdown("# Results: 0")
+                    results = gr.Markdown("# 0 Results")
                 with gr.Row():
                     link = gr.Markdown(
                         "## [View Results in Gallery](/search/tags)"
@@ -63,8 +63,8 @@ def create_search_UI(
     )
 
 
-def on_query_change(query_state: SearchQuery):
-    pprint_dataclass(query_state)
+def on_query_change(query_state: dict):
+    pprint_dataclass(from_dict(SearchQuery, query_state))
 
     # onload_outputs = [
     #     restrict_to_paths,
