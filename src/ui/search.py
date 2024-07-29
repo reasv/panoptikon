@@ -83,7 +83,74 @@ def create_search_UI(
                 submit_button = gr.Button("Search", scale=0)
                 with gr.Column(scale=10):
                     with gr.Tabs():
-                        with gr.Tab(label="Options"):
+                        with gr.Tab(label="Semantic Search"):
+                            with gr.Row():
+                                vec_query_type = gr.Dropdown(
+                                    choices=[
+                                        "CLIP Text Query",
+                                        "CLIP Reverse Image Search",
+                                        "Text Embeddings Search",
+                                    ],
+                                    label="Search Type",
+                                    value="CLIP Text Query",
+                                    scale=1,
+                                )
+                                vec_text_search = gr.Textbox(
+                                    label="Search for similar text extracted from images",
+                                    value="",
+                                    show_copy_button=True,
+                                    visible=False,
+                                    scale=2,
+                                )
+                                vec_targets = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Restrict query to text from these sources",
+                                    multiselect=True,
+                                    visible=False,
+                                    scale=2,
+                                )
+                                clip_text_search = gr.Textbox(
+                                    label="Describe the image you are looking for",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                clip_image_search = gr.Image(
+                                    label="Search for similar images",
+                                    scale=2,
+                                    type="numpy",
+                                    visible=False,
+                                )
+                                clip_model = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Select CLIP model",
+                                    multiselect=False,
+                                    scale=1,
+                                )
+                        with gr.Tab(label="Full Text Search"):
+                            with gr.Row():
+                                any_text_search = gr.Textbox(
+                                    label="Match text in any field (supports SQLite MATCH grammar)",
+                                    value="",
+                                    show_copy_button=True,
+                                    scale=2,
+                                )
+                                restrict_to_query_types = gr.Dropdown(
+                                    choices=[],
+                                    interactive=True,
+                                    label="Restrict query to these targets",
+                                    multiselect=True,
+                                    scale=1,
+                                )
+                                order_by_any_text_rank = gr.Checkbox(
+                                    label="Order by relevance if this query is present",
+                                    interactive=True,
+                                    value=False,
+                                    scale=1,
+                                )
+                        with gr.Tab(label="Tag Filters"):
                             with gr.Group():
                                 with gr.Row():
                                     tag_input = gr.Textbox(
@@ -100,36 +167,6 @@ def create_search_UI(
                                         label="Min. Confidence Level for Tags",
                                         scale=2,
                                     )
-                                    max_results_per_page = gr.Slider(
-                                        minimum=0,
-                                        maximum=500,
-                                        value=10,
-                                        step=1,
-                                        label="Results per page (0 for max)",
-                                        scale=2,
-                                    )
-                                    restrict_to_paths = gr.Dropdown(
-                                        label="Restrict search to paths starting with",
-                                        choices=[],
-                                        allow_custom_value=True,
-                                        multiselect=True,
-                                        scale=2,
-                                    )
-                                    order_by = gr.Radio(
-                                        choices=["path", "last_modified"],
-                                        label="Order by",
-                                        value="last_modified",
-                                        scale=2,
-                                    )
-                        with gr.Tab(label="Advanced Options"):
-                            with gr.Group():
-                                with gr.Row():
-                                    order = gr.Radio(
-                                        choices=["asc", "desc", "default"],
-                                        label="Order",
-                                        value="default",
-                                        scale=2,
-                                    )
                                     tag_setters = gr.Dropdown(
                                         label="Only search tags set by model(s)",
                                         multiselect=True,
@@ -141,26 +178,58 @@ def create_search_UI(
                                         label="Require ALL selected models to have set each tag",
                                         scale=1,
                                     )
-                                    allowed_item_type_prefixes = gr.Dropdown(
-                                        label="Item MimeType Prefixes",
-                                        choices=[],
-                                        allow_custom_value=True,
-                                        multiselect=True,
-                                        value=None,
-                                        scale=2,
-                                    )
                                     tag_namespace_prefixes = gr.Dropdown(
-                                        label="Tag Namespace Prefix",
+                                        label="Tag Namespace Prefixes",
                                         choices=[],
                                         allow_custom_value=True,
                                         multiselect=True,
                                         value=None,
                                         scale=2,
                                     )
-                        with gr.Tab(label="Filename & Path Search"):
+
+                        with gr.Tab(label="Advanced"):
+                            with gr.Group():
+                                with gr.Row():
+                                    restrict_to_paths = gr.Dropdown(
+                                        label="Restrict search to paths starting with",
+                                        choices=[],
+                                        allow_custom_value=True,
+                                        multiselect=True,
+                                        scale=2,
+                                    )
+                                    allowed_item_type_prefixes = gr.Dropdown(
+                                        label="Restrict search to these MIME types",
+                                        choices=[],
+                                        allow_custom_value=True,
+                                        multiselect=True,
+                                        value=None,
+                                        scale=2,
+                                    )
+                                    max_results_per_page = gr.Slider(
+                                        minimum=0,
+                                        maximum=500,
+                                        value=10,
+                                        step=1,
+                                        label="Results per page (0 for max)",
+                                        scale=2,
+                                    )
+                                    order_by = gr.Radio(
+                                        choices=["path", "last_modified"],
+                                        label="Order by",
+                                        value="last_modified",
+                                        scale=2,
+                                    )
+                                    order = gr.Radio(
+                                        choices=["asc", "desc", "default"],
+                                        label="Order",
+                                        value="default",
+                                        scale=2,
+                                    )
+
+                        with gr.Tab(label="MATCH Filename/Path"):
                             with gr.Row():
                                 path_search = gr.Textbox(
-                                    label="SQL MATCH query on filename or path",
+                                    label="MATCH query on filename or path",
                                     value="",
                                     show_copy_button=True,
                                     scale=2,
@@ -171,7 +240,7 @@ def create_search_UI(
                                         ("Filename", "filename"),
                                     ],
                                     interactive=True,
-                                    label="Search in",
+                                    label="Match",
                                     value="full_path",
                                     scale=1,
                                 )
@@ -181,10 +250,10 @@ def create_search_UI(
                                     value=True,
                                     scale=1,
                                 )
-                        with gr.Tab(label="Extracted Text Search"):
+                        with gr.Tab(label="MATCH Text Extracted"):
                             with gr.Row():
                                 extracted_text_search = gr.Textbox(
-                                    label="SQL MATCH query on text exctracted by OCR/Whisper",
+                                    label="SQL MATCH query on text exctracted by OCR/Whisper etc.",
                                     value="",
                                     show_copy_button=True,
                                     scale=2,
@@ -215,7 +284,7 @@ def create_search_UI(
                                     interactive=True,
                                     label="Restrict to these namespaces",
                                     multiselect=True,
-                                    scale=1,
+                                    scale=2,
                                 )
                                 order_by_time_added_bk = gr.Checkbox(
                                     label="Order by Time Added",
@@ -223,65 +292,6 @@ def create_search_UI(
                                     value=False,
                                     scale=1,
                                 )
-                        with gr.Tab(label="Text Query"):
-                            with gr.Row():
-                                any_text_search = gr.Textbox(
-                                    label="General Text Query",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                restrict_to_query_types = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Restrict query to these targets",
-                                    multiselect=True,
-                                    scale=1,
-                                )
-                                order_by_any_text_rank = gr.Checkbox(
-                                    label="Order by relevance if this query is present",
-                                    interactive=True,
-                                    value=False,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="Semantic Text Search"):
-                            with gr.Row():
-                                vec_text_search = gr.Textbox(
-                                    label="Semantic Text Query",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                vec_targets = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Restrict query to these targets",
-                                    multiselect=True,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="Semantic Image Search"):
-                            with gr.Row():
-                                clip_model = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Select CLIP model",
-                                    multiselect=False,
-                                    scale=1,
-                                )
-                                with gr.Tabs():
-                                    with gr.Tab(label="Text Query"):
-                                        clip_text_search = gr.Textbox(
-                                            label="Semantic Text Query",
-                                            value="",
-                                            show_copy_button=True,
-                                            scale=2,
-                                        )
-                                    with gr.Tab(label="Image Query"):
-                                        clip_image_search = gr.Image(
-                                            label="Search for similar images",
-                                            scale=1,
-                                            type="numpy",
-                                        )
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -384,3 +394,35 @@ def create_search_UI(
     )
 
     multi_view.list_view.tag_list.select(fn=on_tag_select, outputs=[tag_input])
+
+    def switch_vec_query_type(value: str):
+        update_list = [{"visible": False} for _ in range(5)]
+        (
+            vec_text_update,
+            vec_targets_update,
+            clip_text_update,
+            clip_image_update,
+            clip_model_update,
+        ) = update_list
+        if value == "CLIP Text Query":
+            clip_text_update["visible"] = True
+            clip_model_update["visible"] = True
+        elif value == "CLIP Reverse Image Search":
+            clip_image_update["visible"] = True
+            clip_model_update["visible"] = True
+        elif value == "Text Embeddings Search":
+            vec_text_update["visible"] = True
+            vec_targets_update["visible"] = True
+        return [gr.update(**update) for update in update_list]
+
+    vec_query_type.change(
+        fn=switch_vec_query_type,
+        inputs=[vec_query_type],
+        outputs=[
+            vec_text_search,
+            vec_targets,
+            clip_text_search,
+            clip_image_search,
+            clip_model,
+        ],
+    )
