@@ -1,5 +1,6 @@
 from typing import List
 
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 
@@ -50,7 +51,9 @@ class TextEmbedder:
 
     def get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         self._load_model()
+        assert self._model is not None, "Model not loaded"
         embeddings = self._model.encode(texts)
+        assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
         return embeddings.tolist()  # Convert numpy array to list of lists
 
     def model_name(self) -> str:
