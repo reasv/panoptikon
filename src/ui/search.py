@@ -2,63 +2,10 @@ from __future__ import annotations
 
 import gradio as gr
 
-from src.data_extractors.utils import get_threshold_from_env
-from src.db import get_database_connection
-from src.db.bookmarks import get_all_bookmark_namespaces
-from src.db.extraction_log import get_existing_setters
-from src.db.files import get_all_mime_types
-from src.db.folders import get_folders_from_database
-from src.db.tags import get_all_tag_namespaces
+from src.db.search.types import SearchQuery
+from src.db.search.utils import pprint_dataclass
 from src.ui.components.multi_view import create_multiview
 from src.ui.components.search import create_search_options
-from src.ui.run_search import search
-
-
-def on_tab_load():
-    conn = get_database_connection(write_lock=False)
-    full_setters_list = get_existing_setters(conn)
-    bookmark_namespaces = get_all_bookmark_namespaces(conn)
-    file_types = get_all_mime_types(conn)
-    tag_namespaces = get_all_tag_namespaces(conn)
-    folders = get_folders_from_database(conn)
-    conn.close()
-
-    extracted_text_setters = [
-        (f"{model_type}|{setter_id}", (model_type, setter_id))
-        for model_type, setter_id in full_setters_list
-        if model_type == "text"
-    ]
-    tag_setters = [
-        setter_id
-        for model_type, setter_id in full_setters_list
-        if model_type == "tags"
-    ]
-
-    clip_setters = [
-        setter_id
-        for model_type, setter_id in full_setters_list
-        if model_type == "clip"
-    ]
-
-    general_text_sources = [
-        *extracted_text_setters,
-        ("Full Path", ("path", "path")),
-        ("Filename", ("path", "filename")),
-    ]
-    return (
-        gr.update(choices=folders),
-        gr.update(choices=extracted_text_setters),
-        gr.update(choices=extracted_text_setters),
-        gr.update(choices=tag_setters),
-        gr.update(choices=tag_namespaces),
-        gr.update(choices=bookmark_namespaces),
-        gr.update(choices=file_types),
-        gr.update(choices=general_text_sources),
-        gr.update(
-            choices=clip_setters,
-            value=clip_setters[0] if clip_setters else None,
-        ),
-    )
 
 
 def on_tag_select(selectData: gr.SelectData):
@@ -71,228 +18,27 @@ def create_search_UI(
     bookmarks_namespace: gr.State | None = None,
 ):
     with gr.TabItem(label="Search") as search_tab:
-        with gr.Column(elem_classes="centered-content", scale=0):
-            with gr.Row():
-                link = gr.Markdown("[View Results in Gallery](/search/tags)")
-                number_of_results = gr.Number(
-                    value=0,
-                    show_label=True,
-                    label="Results",
-                    interactive=False,
-                    scale=0,
-                )
-                submit_button = gr.Button("Search", scale=0)
-                with gr.Column(scale=10):
-                    with gr.Tabs():
-                        with gr.Tab(label="Semantic Search"):
-                            with gr.Row():
-                                vec_query_type = gr.Dropdown(
-                                    choices=[
-                                        "CLIP Text Query",
-                                        "CLIP Reverse Image Search",
-                                        "Text Embeddings Search",
-                                    ],
-                                    label="Search Type",
-                                    value="CLIP Text Query",
-                                    scale=1,
-                                )
-                                vec_text_search = gr.Textbox(
-                                    label="Search for similar text extracted from images",
-                                    value="",
-                                    show_copy_button=True,
-                                    visible=False,
-                                    scale=2,
-                                )
-                                vec_targets = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Restrict query to text from these sources",
-                                    multiselect=True,
-                                    visible=False,
-                                    scale=2,
-                                )
-                                clip_text_search = gr.Textbox(
-                                    label="Describe the image you are looking for",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                clip_image_search = gr.Image(
-                                    label="Search for similar images",
-                                    scale=2,
-                                    type="numpy",
-                                    visible=False,
-                                )
-                                clip_model = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Select CLIP model",
-                                    multiselect=False,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="Full Text Search"):
-                            with gr.Row():
-                                any_text_search = gr.Textbox(
-                                    label="Match text in any field (supports SQLite MATCH grammar)",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                restrict_to_query_types = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Restrict query to these targets",
-                                    multiselect=True,
-                                    scale=1,
-                                )
-                                order_by_any_text_rank = gr.Checkbox(
-                                    label="Order by relevance if this query is present",
-                                    interactive=True,
-                                    value=False,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="Tag Filters"):
-                            with gr.Group():
-                                with gr.Row():
-                                    tag_input = gr.Textbox(
-                                        label="Enter tags separated by commas",
-                                        value="",
-                                        show_copy_button=True,
-                                        scale=3,
-                                    )
-                                    min_confidence = gr.Slider(
-                                        minimum=0.05,
-                                        maximum=1,
-                                        value=get_threshold_from_env(),
-                                        step=0.05,
-                                        label="Min. Confidence Level for Tags",
-                                        scale=2,
-                                    )
-                                    tag_setters = gr.Dropdown(
-                                        label="Only search tags set by model(s)",
-                                        multiselect=True,
-                                        choices=[],
-                                        value=[],
-                                        scale=2,
-                                    )
-                                    all_setters_required = gr.Checkbox(
-                                        label="Require ALL selected models to have set each tag",
-                                        scale=1,
-                                    )
-                                    tag_namespace_prefixes = gr.Dropdown(
-                                        label="Tag Namespace Prefixes",
-                                        choices=[],
-                                        allow_custom_value=True,
-                                        multiselect=True,
-                                        value=None,
-                                        scale=2,
-                                    )
-
-                        with gr.Tab(label="Advanced"):
-                            with gr.Group():
-                                with gr.Row():
-                                    restrict_to_paths = gr.Dropdown(
-                                        label="Restrict search to paths starting with",
-                                        choices=[],
-                                        allow_custom_value=True,
-                                        multiselect=True,
-                                        scale=2,
-                                    )
-                                    allowed_item_type_prefixes = gr.Dropdown(
-                                        label="Restrict search to these MIME types",
-                                        choices=[],
-                                        allow_custom_value=True,
-                                        multiselect=True,
-                                        value=None,
-                                        scale=2,
-                                    )
-                                    max_results_per_page = gr.Slider(
-                                        minimum=0,
-                                        maximum=500,
-                                        value=10,
-                                        step=1,
-                                        label="Results per page (0 for max)",
-                                        scale=2,
-                                    )
-                                    order_by = gr.Radio(
-                                        choices=["path", "last_modified"],
-                                        label="Order by",
-                                        value="last_modified",
-                                        scale=2,
-                                    )
-                                    order = gr.Radio(
-                                        choices=["asc", "desc", "default"],
-                                        label="Order",
-                                        value="default",
-                                        scale=2,
-                                    )
-
-                        with gr.Tab(label="MATCH Filename/Path"):
-                            with gr.Row():
-                                path_search = gr.Textbox(
-                                    label="MATCH query on filename or path",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                search_path_in = gr.Radio(
-                                    choices=[
-                                        ("Full Path", "full_path"),
-                                        ("Filename", "filename"),
-                                    ],
-                                    interactive=True,
-                                    label="Match",
-                                    value="full_path",
-                                    scale=1,
-                                )
-                                path_order_by_rank = gr.Checkbox(
-                                    label="Order results by relevance if this query is present",
-                                    interactive=True,
-                                    value=True,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="MATCH Text Extracted"):
-                            with gr.Row():
-                                extracted_text_search = gr.Textbox(
-                                    label="SQL MATCH query on text exctracted by OCR/Whisper etc.",
-                                    value="",
-                                    show_copy_button=True,
-                                    scale=2,
-                                )
-                                require_text_extractors = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Only Search In Text From These Sources",
-                                    multiselect=True,
-                                    scale=1,
-                                )
-                                extracted_text_order_by_rank = gr.Checkbox(
-                                    label="Order results by relevance if this query is present",
-                                    interactive=True,
-                                    value=True,
-                                    scale=1,
-                                )
-                        with gr.Tab(label="Search in Bookmarks"):
-                            with gr.Row():
-                                restrict_search_to_bookmarks = gr.Checkbox(
-                                    label="Restrict search to bookmarked items",
-                                    interactive=True,
-                                    value=False,
-                                    scale=1,
-                                )
-                                restrict_to_bk_namespaces = gr.Dropdown(
-                                    choices=[],
-                                    interactive=True,
-                                    label="Restrict to these namespaces",
-                                    multiselect=True,
-                                    scale=2,
-                                )
-                                order_by_time_added_bk = gr.Checkbox(
-                                    label="Order by Time Added",
-                                    interactive=True,
-                                    value=False,
-                                    scale=1,
-                                )
+        with gr.Row():
+            # link = gr.Markdown("[View Results in Gallery](/search/tags)")
+            # number_of_results = gr.Number(
+            #     value=0,
+            #     show_label=True,
+            #     label="Results",
+            #     interactive=False,
+            #     scale=0,
+            # )
+            # submit_button = gr.Button("Search", scale=0)
+            with gr.Column(scale=8):
+                query_state = create_search_options(app, search_tab)
+            with gr.Column(scale=1):
+                with gr.Row():
+                    results = gr.Markdown("# Results: 0")
+                with gr.Row():
+                    link = gr.Markdown(
+                        "## [View Results in Gallery](/search/tags)"
+                    )
+                with gr.Row():
+                    submit_button = gr.Button("Search", scale=1)
 
         multi_view = create_multiview(
             select_history=select_history,
@@ -311,119 +57,128 @@ def create_search_UI(
             )
             next_page = gr.Button("Next Page", scale=1)
 
-    onload_outputs = [
-        restrict_to_paths,
-        require_text_extractors,
-        vec_targets,
-        tag_setters,
-        tag_namespace_prefixes,
-        restrict_to_bk_namespaces,
-        allowed_item_type_prefixes,
-        restrict_to_query_types,
-        clip_model,
-    ]
-
-    search_tab.select(
-        fn=on_tab_load,
-        outputs=onload_outputs,
-    )
-    app.load(
-        fn=on_tab_load,
-        outputs=onload_outputs,
+    query_state.change(
+        fn=on_query_change,
+        inputs=[query_state],
     )
 
-    search_inputs = [
-        tag_input,
-        min_confidence,
-        max_results_per_page,
-        restrict_to_paths,
-        current_page,
-        order_by,
-        order,
-        tag_setters,
-        all_setters_required,
-        allowed_item_type_prefixes,
-        tag_namespace_prefixes,
-        path_search,
-        search_path_in,
-        path_order_by_rank,
-        extracted_text_search,
-        require_text_extractors,
-        extracted_text_order_by_rank,
-        restrict_search_to_bookmarks,
-        restrict_to_bk_namespaces,
-        order_by_time_added_bk,
-        any_text_search,
-        restrict_to_query_types,
-        order_by_any_text_rank,
-        vec_text_search,
-        vec_targets,
-        clip_model,
-        clip_text_search,
-        clip_image_search,
-    ]
 
-    search_outputs = [multi_view.files, number_of_results, current_page, link]
+def on_query_change(query_state: SearchQuery):
+    pprint_dataclass(query_state)
 
-    action_search_button = gr.State("search_button")
-    action_next_page = gr.State("next_page")
-    action_previous_page = gr.State("previous_page")
-    action_goto_page = gr.State("goto_page")
+    # onload_outputs = [
+    #     restrict_to_paths,
+    #     require_text_extractors,
+    #     vec_targets,
+    #     tag_setters,
+    #     tag_namespace_prefixes,
+    #     restrict_to_bk_namespaces,
+    #     allowed_item_type_prefixes,
+    #     restrict_to_query_types,
+    #     clip_model,
+    # ]
 
-    submit_button.click(
-        fn=search,
-        inputs=[*search_inputs, action_search_button],
-        outputs=search_outputs,
-    )
+    # search_tab.select(
+    #     fn=on_tab_load,
+    #     outputs=onload_outputs,
+    # )
+    # app.load(
+    #     fn=on_tab_load,
+    #     outputs=onload_outputs,
+    # )
 
-    current_page.release(
-        fn=search,
-        inputs=[*search_inputs, action_goto_page],
-        outputs=search_outputs,
-    )
+    # search_inputs = [
+    #     tag_input,
+    #     min_confidence,
+    #     max_results_per_page,
+    #     restrict_to_paths,
+    #     current_page,
+    #     order_by,
+    #     order,
+    #     tag_setters,
+    #     all_setters_required,
+    #     allowed_item_type_prefixes,
+    #     tag_namespace_prefixes,
+    #     path_search,
+    #     search_path_in,
+    #     path_order_by_rank,
+    #     extracted_text_search,
+    #     require_text_extractors,
+    #     extracted_text_order_by_rank,
+    #     restrict_search_to_bookmarks,
+    #     restrict_to_bk_namespaces,
+    #     order_by_time_added_bk,
+    #     any_text_search,
+    #     restrict_to_query_types,
+    #     order_by_any_text_rank,
+    #     vec_text_search,
+    #     vec_targets,
+    #     clip_model,
+    #     clip_text_search,
+    #     clip_image_search,
+    # ]
 
-    previous_page.click(
-        fn=search,
-        inputs=[*search_inputs, action_previous_page],
-        outputs=search_outputs,
-    )
+    # search_outputs = [multi_view.files, number_of_results, current_page, link]
 
-    next_page.click(
-        fn=search,
-        inputs=[*search_inputs, action_next_page],
-        outputs=search_outputs,
-    )
+    # action_search_button = gr.State("search_button")
+    # action_next_page = gr.State("next_page")
+    # action_previous_page = gr.State("previous_page")
+    # action_goto_page = gr.State("goto_page")
 
-    multi_view.list_view.tag_list.select(fn=on_tag_select, outputs=[tag_input])
+    # submit_button.click(
+    #     fn=search,
+    #     inputs=[*search_inputs, action_search_button],
+    #     outputs=search_outputs,
+    # )
 
-    def switch_vec_query_type(value: str):
-        update_list = [{"visible": False} for _ in range(5)]
-        (
-            vec_text_update,
-            vec_targets_update,
-            clip_text_update,
-            clip_image_update,
-            clip_model_update,
-        ) = update_list
-        if value == "CLIP Text Query":
-            clip_text_update["visible"] = True
-            clip_model_update["visible"] = True
-        elif value == "CLIP Reverse Image Search":
-            clip_image_update["visible"] = True
-            clip_model_update["visible"] = True
-        elif value == "Text Embeddings Search":
-            vec_text_update["visible"] = True
-            vec_targets_update["visible"] = True
-        return [gr.update(**update) for update in update_list]
+    # current_page.release(
+    #     fn=search,
+    #     inputs=[*search_inputs, action_goto_page],
+    #     outputs=search_outputs,
+    # )
 
-    vec_query_type.change(
-        fn=switch_vec_query_type,
-        inputs=[vec_query_type],
-        outputs=[
-            vec_text_search,
-            vec_targets,
-            clip_text_search,
-            clip_image_search,
-            clip_model,
-        ],
-    )
+    # previous_page.click(
+    #     fn=search,
+    #     inputs=[*search_inputs, action_previous_page],
+    #     outputs=search_outputs,
+    # )
+
+    # next_page.click(
+    #     fn=search,
+    #     inputs=[*search_inputs, action_next_page],
+    #     outputs=search_outputs,
+    # )
+
+    # multi_view.list_view.tag_list.select(fn=on_tag_select, outputs=[tag_input])
+
+    # def switch_vec_query_type(value: str):
+    #     update_list = [{"visible": False} for _ in range(5)]
+    #     (
+    #         vec_text_update,
+    #         vec_targets_update,
+    #         clip_text_update,
+    #         clip_image_update,
+    #         clip_model_update,
+    #     ) = update_list
+    #     if value == "CLIP Text Query":
+    #         clip_text_update["visible"] = True
+    #         clip_model_update["visible"] = True
+    #     elif value == "CLIP Reverse Image Search":
+    #         clip_image_update["visible"] = True
+    #         clip_model_update["visible"] = True
+    #     elif value == "Text Embeddings Search":
+    #         vec_text_update["visible"] = True
+    #         vec_targets_update["visible"] = True
+    #     return [gr.update(**update) for update in update_list]
+
+    # vec_query_type.change(
+    #     fn=switch_vec_query_type,
+    #     inputs=[vec_query_type],
+    #     outputs=[
+    #         vec_text_search,
+    #         vec_targets,
+    #         clip_text_search,
+    #         clip_image_search,
+    #         clip_model,
+    #     ],
+    # )

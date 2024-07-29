@@ -117,8 +117,8 @@ class InnerQueryParams:
 @typechecked
 @dataclass
 class QueryParams:
-    tags: QueryTagFilters
-    filters: QueryFilters
+    tags: QueryTagFilters = field(default_factory=QueryTagFilters)
+    filters: QueryFilters = field(default_factory=QueryFilters)
 
 
 @typechecked
@@ -133,7 +133,7 @@ class OrderParams:
 @typechecked
 @dataclass
 class SearchQuery:
-    query: QueryParams
+    query: QueryParams = field(default_factory=QueryParams)
     order_args: OrderParams = field(default_factory=OrderParams)
     count: bool = True
     check_path: bool = False
