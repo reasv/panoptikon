@@ -40,7 +40,7 @@ def initialize_database(conn: sqlite3.Connection):
         id INTEGER PRIMARY KEY,
         sha256 TEXT UNIQUE NOT NULL,
         md5 TEXT NOT NULL,
-        type TEXT,
+        type TEXT NOT NULL,              -- Mime type of the file (e.g. image/jpeg)
         size INTEGER,                    -- Size of the file in bytes
         width INTEGER,                   -- Width of the frame in pixels
         height INTEGER,                  -- Height of the frame in pixels
