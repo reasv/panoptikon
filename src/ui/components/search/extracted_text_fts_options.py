@@ -25,12 +25,13 @@ def create_extracted_text_fts_opts(
         with gr.Tab(label="MATCH Text Extracted"):
             with gr.Row():
                 text_query = gr.Textbox(
+                    key="extracted_text_query_fts",
                     label="SQL MATCH query on text exctracted by OCR/Whisper etc.",
-                    value="",
                     show_copy_button=True,
                     scale=2,
                 )
                 targets = gr.Dropdown(
+                    key="extracted_text_targets_fts",
                     choices=extracted_text_setters,  # type: ignore
                     interactive=True,
                     label="Only Search In Text From These Sources",
@@ -38,6 +39,7 @@ def create_extracted_text_fts_opts(
                     scale=1,
                 )
                 confidence = gr.Slider(
+                    key="extracted_text_confidence",
                     minimum=0.05,
                     maximum=1,
                     value=threshold,
@@ -46,6 +48,7 @@ def create_extracted_text_fts_opts(
                     scale=1,
                 )
                 languages = gr.Dropdown(
+                    key="extracted_text_languages",
                     label="Languages",
                     choices=[
                         "en",
@@ -64,6 +67,7 @@ def create_extracted_text_fts_opts(
                     scale=1,
                 )
                 language_confidence = gr.Slider(
+                    key="extracted_text_language_confidence",
                     minimum=0.05,
                     maximum=1,
                     value=threshold,

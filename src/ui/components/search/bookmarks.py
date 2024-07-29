@@ -11,12 +11,14 @@ def create_bookmark_search_opts(query_state: gr.State, namespaces: List[str]):
     with gr.Tab(label="Search in Bookmarks"):
         with gr.Row():
             enable = gr.Checkbox(
+                key="enable_bookmarks",
                 label="Restrict search to bookmarked items",
                 interactive=True,
                 value=False,
                 scale=1,
             )
             in_namespaces = gr.Dropdown(
+                key="bookmark_namespaces",
                 choices=namespaces,
                 interactive=True,
                 label="Restrict to these namespaces",

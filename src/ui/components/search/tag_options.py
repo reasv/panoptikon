@@ -16,12 +16,13 @@ def create_tags_opts(
             with gr.Group():
                 with gr.Row():
                     tag_input = gr.Textbox(
+                        key="tag_input",
                         label="Enter tags separated by commas",
-                        value="",
                         show_copy_button=True,
                         scale=3,
                     )
                     min_confidence = gr.Slider(
+                        key="min_confidence_tags",
                         minimum=0.05,
                         maximum=1,
                         value=get_threshold_from_env(),
@@ -30,17 +31,19 @@ def create_tags_opts(
                         scale=2,
                     )
                     chosen_tag_setters = gr.Dropdown(
+                        key="chosen_tag_setters",
                         label="Only search tags set by model(s)",
                         multiselect=True,
                         choices=tag_setters,
-                        value=[],
                         scale=2,
                     )
                     all_setters_required = gr.Checkbox(
+                        key="all_setters_required",
                         label="Require each tag to have been set by ALL selected models",
                         scale=1,
                     )
                     tag_namespace_prefixes = gr.Dropdown(
+                        key="tag_namespace_prefixes",
                         label="Tag Namespace Prefixes",
                         choices=namespaces,
                         allow_custom_value=True,

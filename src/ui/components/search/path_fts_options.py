@@ -11,12 +11,13 @@ def create_path_fts_opts(query_state: gr.State):
     with gr.Tab(label="MATCH Filename/Path"):
         with gr.Row():
             path_search = gr.Textbox(
+                key="path_search",
                 label="MATCH query on filename or path",
-                value="",
                 show_copy_button=True,
                 scale=2,
             )
             search_path_in = gr.Radio(
+                key="search_path_in",
                 choices=[
                     ("Full Path", "full_path"),
                     ("Filename", "filename"),

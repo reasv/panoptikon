@@ -20,12 +20,13 @@ def create_fts_options(
         with gr.Tab(label="Full Text Search"):
             with gr.Row():
                 text_query = gr.Textbox(
+                    key="text_query_fts",
                     label="Match text in any field (supports SQLite MATCH grammar)",
-                    value="",
                     show_copy_button=True,
                     scale=2,
                 )
                 query_targets = gr.Dropdown(
+                    key="query_targets_fts",
                     choices=text_setters,  # type: ignore
                     interactive=True,
                     label="(Optional) Restrict query to these targets",

@@ -72,6 +72,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
                 with gr.Group():
                     with gr.Row():
                         use_paths = gr.Dropdown(
+                            key="use_paths",
                             label="Restrict search to paths starting with",
                             choices=folders,
                             allow_custom_value=True,
@@ -80,6 +81,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
                         )
                         use_file_types = gr.Dropdown(
                             label="Restrict search to these MIME types",
+                            key="use_file_types",
                             choices=file_types,
                             allow_custom_value=True,
                             multiselect=True,
@@ -87,6 +89,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
                             scale=2,
                         )
                         res_per_page = gr.Slider(
+                            key="res_per_page",
                             minimum=0,
                             maximum=500,
                             value=10,
@@ -95,6 +98,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
                             scale=2,
                         )
                         order_by = gr.Radio(
+                            key="orderby",
                             choices=["path", "last_modified"],
                             label="Order by",
                             value="last_modified",
@@ -102,13 +106,14 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
                             interactive=True,
                         )
                         order = gr.Radio(
+                            key="order",
                             choices=["asc", "desc", "default"],
                             label="Order",
                             value="default",
                             scale=2,
                         )
             create_bookmark_search_opts(query_state, bookmark_namespaces)
-            # create_vector_search_opts(setters)
+            create_vector_search_opts(setters)
             create_fts_options(query_state, extracted_text_setters)
             create_tags_opts(query_state, tag_namespaces, tag_setters)
             create_path_fts_opts(query_state)
