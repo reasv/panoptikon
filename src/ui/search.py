@@ -10,6 +10,7 @@ from src.db.files import get_all_mime_types
 from src.db.folders import get_folders_from_database
 from src.db.tags import get_all_tag_namespaces
 from src.ui.components.multi_view import create_multiview
+from src.ui.components.search import create_search_options
 from src.ui.run_search import search
 
 
@@ -69,7 +70,7 @@ def create_search_UI(
     select_history: gr.State | None = None,
     bookmarks_namespace: gr.State | None = None,
 ):
-    with gr.TabItem(label="Tag Search") as search_tab:
+    with gr.TabItem(label="Search") as search_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
                 link = gr.Markdown("[View Results in Gallery](/search/tags)")
