@@ -6,10 +6,7 @@ from src.db.search.types import SearchQuery
 from src.db.search.utils import from_dict, pprint_dataclass
 from src.ui.components.multi_view import create_multiview
 from src.ui.components.search import create_search_options
-
-
-def on_tag_select(selectData: gr.SelectData):
-    return selectData.value
+from src.ui.run_search import search
 
 
 def create_search_UI(
@@ -18,21 +15,13 @@ def create_search_UI(
     bookmarks_namespace: gr.State | None = None,
 ):
     with gr.TabItem(label="Search") as search_tab:
+        n_results = gr.State(0)
         with gr.Row():
-            # link = gr.Markdown("[View Results in Gallery](/search/tags)")
-            # number_of_results = gr.Number(
-            #     value=0,
-            #     show_label=True,
-            #     label="Results",
-            #     interactive=False,
-            #     scale=0,
-            # )
-            # submit_button = gr.Button("Search", scale=0)
             with gr.Column(scale=8):
                 query_state = create_search_options(app, search_tab)
             with gr.Column(scale=1):
                 with gr.Row():
-                    results = gr.Markdown("# 0 Results")
+                    results_str = gr.Markdown("# 0 Results")
                 with gr.Row():
                     link = gr.Markdown(
                         "## [View Results in Gallery](/search/tags)"
@@ -62,9 +51,53 @@ def create_search_UI(
         inputs=[query_state],
     )
 
+    n_results.change(
+        fn=on_n_results_change,
+        inputs=[n_results],
+        outputs=[results_str],
+    )
+
+    search_inputs = [query_state, current_page]
+    search_outputs = [multi_view.files, n_results, current_page, link]
+    action_search_button = gr.State("search_button")
+    action_next_page = gr.State("next_page")
+    action_previous_page = gr.State("previous_page")
+    action_goto_page = gr.State("goto_page")
+    submit_button.click(
+        fn=search,
+        inputs=[*search_inputs, action_search_button],
+        outputs=search_outputs,
+    )
+
+    current_page.release(
+        fn=search,
+        inputs=[*search_inputs, action_goto_page],
+        outputs=search_outputs,
+    )
+
+    previous_page.click(
+        fn=search,
+        inputs=[*search_inputs, action_previous_page],
+        outputs=search_outputs,
+    )
+
+    next_page.click(
+        fn=search,
+        inputs=[*search_inputs, action_next_page],
+        outputs=search_outputs,
+    )
+
+
+def on_n_results_change(n_results: int):
+    return f"# {n_results} Results"
+
 
 def on_query_change(query_state: dict):
     pprint_dataclass(from_dict(SearchQuery, query_state))
+
+
+def on_tag_select(selectData: gr.SelectData):
+    return selectData.value
 
     # onload_outputs = [
     #     restrict_to_paths,

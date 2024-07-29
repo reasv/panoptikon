@@ -21,7 +21,6 @@ OrderByType = Union[
 OrderType = Union[Literal["asc", "desc"], None]
 
 
-@typechecked
 @dataclass
 class FileFilters:
     item_types: List[str] = field(default_factory=list)
@@ -32,7 +31,6 @@ class FileFilters:
 Q = TypeVar("Q", str, bytes)
 
 
-@typechecked
 @dataclass
 class ExtractedTextFilter[Q]:
     query: Q
@@ -42,35 +40,30 @@ class ExtractedTextFilter[Q]:
     min_confidence: Union[float, None] = None
 
 
-@typechecked
 @dataclass
 class BookmarksFilter:
     restrict_to_bookmarks: Literal[True] = True
     namespaces: List[str] = field(default_factory=list)
 
 
-@typechecked
 @dataclass
 class PathTextFilter:
     query: str
     only_match_filename: bool = False
 
 
-@typechecked
 @dataclass
 class AnyTextFilter:
     query: str
     targets: List[Tuple[str, str]] = field(default_factory=list)
 
 
-@typechecked
 @dataclass
 class ImageEmbeddingFilter:
     query: bytes
     target: Tuple[str, str]
 
 
-@typechecked
 @dataclass
 class InnerQueryTagFilters:
     positive: List[str] = field(default_factory=list)
@@ -82,7 +75,6 @@ class InnerQueryTagFilters:
     min_confidence: Union[float, None] = 0.5
 
 
-@typechecked
 @dataclass
 class QueryTagFilters:
     pos_match_all: List[str] = field(default_factory=list)
@@ -95,7 +87,6 @@ class QueryTagFilters:
     min_confidence: Union[float, None] = None
 
 
-@typechecked
 @dataclass
 class QueryFilters:
     files: Union[FileFilters, None] = None
@@ -107,21 +98,18 @@ class QueryFilters:
     bookmarks: Union[BookmarksFilter, None] = None
 
 
-@typechecked
 @dataclass
 class InnerQueryParams:
     tags: InnerQueryTagFilters
     filters: QueryFilters
 
 
-@typechecked
 @dataclass
 class QueryParams:
     tags: QueryTagFilters = field(default_factory=QueryTagFilters)
     filters: QueryFilters = field(default_factory=QueryFilters)
 
 
-@typechecked
 @dataclass
 class OrderParams:
     order_by: OrderByType = "last_modified"
@@ -130,7 +118,6 @@ class OrderParams:
     page_size: int = 10
 
 
-@typechecked
 @dataclass
 class SearchQuery:
     query: QueryParams = field(default_factory=QueryParams)

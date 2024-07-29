@@ -225,3 +225,22 @@ def isodate_minutes_diff(date1: str, date2: str) -> str:
         return f"{int(minutes)}m{int(seconds)}s"
     else:
         return f"{int(seconds)}s"
+
+
+def parse_tags(tags_str: str):
+    tags = [tag.strip() for tag in tags_str.split(",") if tag.strip() != ""]
+
+    def extract_tags_subtype(tag_list: list[str], prefix: str = "-"):
+        remaining = []
+        subtype = []
+        for tag in tag_list:
+            if tag.startswith(prefix):
+                subtype.append(tag[1:])
+            else:
+                remaining.append(tag)
+        return remaining, subtype
+
+    tags, negative_tags = extract_tags_subtype(tags, "-")
+    tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
+    tags, tags_match_any = extract_tags_subtype(tags, "*")
+    return tags, tags_match_any, negative_tags, negative_tags_match_all
