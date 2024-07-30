@@ -8,6 +8,8 @@ from src.db.utils import is_column_in_table, trigger_exists
 
 def get_database_connection(write_lock: bool) -> sqlite3.Connection:
     db_file = os.getenv("DB_FILE", "./db/sqlite.db")
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(db_file), exist_ok=True)
     if write_lock and os.environ.get("READONLY", "false").lower() in [
         "false",
         "0",
@@ -276,9 +278,9 @@ def initialize_database(conn: sqlite3.Connection):
         cursor.execute("DROP TRIGGER files_path_ai")
 
     cursor.execute(
-        """ 
+        """
         CREATE TRIGGER files_path_ai AFTER INSERT ON files BEGIN
-            INSERT INTO files_path_fts(rowid, path, filename) 
+            INSERT INTO files_path_fts(rowid, path, filename)
             VALUES (new.id, new.path, new.filename);
         END;
     """
@@ -290,7 +292,7 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
         CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
-            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename)
             VALUES('delete', old.id, old.path, old.filename);
         END;
         """
@@ -301,9 +303,9 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
         CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
-            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename) 
+            INSERT INTO files_path_fts(files_path_fts, rowid, path, filename)
             VALUES('delete', old.id, old.path, old.filename);
-            INSERT INTO files_path_fts(rowid, path, filename) 
+            INSERT INTO files_path_fts(rowid, path, filename)
             VALUES (new.id, new.path, new.filename);
         END;
     """

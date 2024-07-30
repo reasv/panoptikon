@@ -1,7 +1,4 @@
 from dataclasses import dataclass
-from re import sub
-from turtle import width
-
 
 @dataclass
 class FileScanData:

@@ -168,3 +168,5 @@ scripts/
 db/**
 .vscode/
 jax_cache/
+
+.DS_Store
