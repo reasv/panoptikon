@@ -12,15 +12,20 @@ def get_database_connection(write_lock: bool) -> sqlite3.Connection:
         "false",
         "0",
     ]:
+        write_lock = True
         # Acquire a write lock
         conn = sqlite3.connect(db_file)
     else:
+        write_lock = False
         # Read-only connection
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
 
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
+    # Enable WAL mode
+    if write_lock:
+        cursor.execute("PRAGMA journal_mode=WAL")
     load_sqlite_vec(conn)
     return conn
 
@@ -177,7 +182,8 @@ def initialize_database(conn: sqlite3.Connection):
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
-        UNIQUE(item_id, log_id), -- Unique constraint on item and log_id
+        UNIQUE(item_id, log_id),    -- Unique constraint on item and log_id
+        UNIQUE(item_id, setter_id), -- Unique constraint on item and setter_id
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
         FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
