@@ -1,17 +1,16 @@
 from dataclasses import asdict
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 import numpy as np
-from torch import Tag
 
 from src.db.search.types import (
     ExtractedTextFilter,
     ImageEmbeddingFilter,
     SearchQuery,
 )
-from src.db.search.utils import from_dict
 from src.types import SearchStats
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 
 def create_vector_search_opts(
@@ -106,92 +105,74 @@ def create_vector_search_opts(
             fn=on_vec_query_type_change,
         )
 
-        def on_stats_change(
-            query_state_dict: dict,
-            search_stats_dict: dict,
-        ):
-            query = from_dict(SearchQuery, query_state_dict)
-            search_stats = from_dict(SearchStats, search_stats_dict)
+    def on_data_change(
+        query: SearchQuery,
+        args: dict[AnyComponent, Any],
+    ) -> SearchQuery:
+        vec_query_type_val: str | None = args[vec_query_type]
+        te_embedding_model_val: str | None = args[te_embedding_model]
+        te_text_query_val: str | None = args[te_text_query]
+        te_text_targets_val: List[Tuple[str, str]] | None = args[
+            te_text_targets
+        ]
+        clip_model_val: str | None = args[clip_model]
+        clip_text_query_val: str | None = args[clip_text_query]
+        clip_image_search_val: np.ndarray | None = args[clip_image_search]
 
-            query_types = []
-
-            if search_stats.clip_setters:
-                query_types += ["CLIP Text Query", "CLIP Reverse Image Search"]
-            if search_stats.te_setters:
-                query_types += ["Text Vector Search"]
-
-            return {
-                query_state: asdict(query),
-                tab: gr.Tab(visible=bool(query_types)),
-                vec_query_type: gr.update(choices=query_types),
-                te_embedding_model: gr.update(choices=search_stats.te_setters),
-                clip_model: gr.update(choices=search_stats.clip_setters),
-                te_text_targets: gr.update(choices=search_stats.et_setters),
-            }
-
-        gr.on(
-            triggers=[search_stats_state.change],
-            fn=on_stats_change,
-            inputs=[query_state, search_stats_state],
-            outputs=[query_state, *elements],
-        )
-        gr.on(
-            triggers=[
-                vec_query_type.select,
-                te_embedding_model.select,
-                te_text_query.input,
-                te_text_targets.select,
-                clip_model.select,
-                clip_text_query.input,
-                clip_image_search.input,
-            ],
-            fn=on_change_data,
-            inputs=[
-                query_state,
-                vec_query_type,
-                te_embedding_model,
-                te_text_query,
-                te_text_targets,
-                clip_model,
-                clip_text_query,
-                clip_image_search,
-            ],
-            outputs=[query_state],
-        )
-
-
-def on_change_data(
-    query_state_dict: dict,
-    vec_query_type: str | None,
-    te_embedding_model: str | None,
-    te_text_query: str | None,
-    te_text_targets: List[Tuple[str, str]] | None,
-    clip_model: str | None,
-    clip_text_query: str | None,
-    clip_image_search: np.ndarray | None,
-):
-    query_state = from_dict(SearchQuery, query_state_dict)
-    query_state.query.filters.extracted_text_embeddings = None
-    query_state.query.filters.image_embeddings = None
-    if vec_query_type == "Text Vector Search":
-        if te_text_query:
-            query_state.query.filters.extracted_text_embeddings = (
-                ExtractedTextFilter[bytes](
-                    query=te_text_query.encode("utf-8"),
-                    targets=te_text_targets or [],
+        query.query.filters.extracted_text_embeddings = None
+        query.query.filters.image_embeddings = None
+        if vec_query_type_val == "Text Vector Search":
+            if te_text_query_val:
+                query.query.filters.extracted_text_embeddings = (
+                    ExtractedTextFilter[bytes](
+                        query=te_text_query_val.encode("utf-8"),
+                        targets=te_text_targets_val or [],
+                    )
                 )
-            )
-    elif vec_query_type == "CLIP Text Query":
-        if clip_text_query and clip_model:
-            query_state.query.filters.image_embeddings = ImageEmbeddingFilter(
-                query=clip_text_query.encode("utf-8"),
-                target=("clip", clip_model),
-            )
-    elif vec_query_type == "CLIP Reverse Image Search":
-        if clip_image_search is not None and clip_model:
-            query_state.query.filters.image_embeddings = ImageEmbeddingFilter(
-                query=clip_image_search,  # type: ignore
-                target=("clip", clip_model),
-            )
+        elif vec_query_type_val == "CLIP Text Query":
+            if clip_text_query_val and clip_model_val:
+                query.query.filters.image_embeddings = ImageEmbeddingFilter(
+                    query=clip_text_query_val.encode("utf-8"),
+                    target=("clip", clip_model_val),
+                )
+        elif vec_query_type_val == "CLIP Reverse Image Search":
+            if clip_image_search_val is not None and clip_model_val:
+                assert isinstance(
+                    clip_image_search_val, np.ndarray
+                ), "Expected numpy array for image search"
+                query.query.filters.image_embeddings = ImageEmbeddingFilter(
+                    query=clip_image_search_val,  # type: ignore
+                    target=("clip", clip_model_val),
+                )
 
-    return asdict(query_state)
+        return query
+
+    def on_stats_change(
+        query: SearchQuery,
+        search_stats: SearchStats,
+    ) -> Dict[AnyComponent, Any]:
+        query_types = []
+
+        if search_stats.clip_setters:
+            query_types += ["CLIP Text Query", "CLIP Reverse Image Search"]
+        if search_stats.te_setters:
+            query_types += ["Text Vector Search"]
+
+        return {
+            query_state: asdict(query),
+            tab: gr.Tab(visible=bool(query_types)),
+            vec_query_type: gr.update(choices=query_types),
+            te_embedding_model: gr.update(choices=search_stats.te_setters),
+            clip_model: gr.update(choices=search_stats.clip_setters),
+            te_text_targets: gr.update(choices=search_stats.et_setters),
+        }
+
+    bind_event_listeners(
+        query_state,
+        search_stats_state,
+        elements,
+        on_data_change,
+        on_stats_change,
+    )
+
+    return elements, on_data_change

@@ -24,11 +24,17 @@ def get_triggers(components: list[AnyComponent]) -> list[Callable]:
             triggers.append(component.select)
         elif isinstance(component, gr.Textbox):
             triggers.append(component.input)
+        elif isinstance(component, gr.Image):
+            triggers.append(component.input)
     return triggers
 
 
 def filter_inputs(inputs: list[AnyComponent]) -> list[Component]:
-    return [input for input in inputs if not isinstance(input, gr.Tab)]
+    return [
+        input
+        for input in inputs
+        if not (isinstance(input, gr.Tab) or isinstance(input, gr.Accordion))
+    ]
 
 
 def bind_event_listeners(
