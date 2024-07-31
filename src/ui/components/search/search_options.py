@@ -1,8 +1,6 @@
 from dataclasses import asdict
-from typing import List, Literal, Tuple
 
 import gradio as gr
-from sqlalchemy import all_
 
 from src.db import get_database_connection
 from src.db.bookmarks import get_all_bookmark_namespaces
@@ -10,18 +8,18 @@ from src.db.extracted_text import get_text_stats
 from src.db.extraction_log import get_existing_setters
 from src.db.files import get_all_mime_types
 from src.db.folders import get_folders_from_database
-from src.db.search.types import FileFilters, SearchQuery
+from src.db.search.types import SearchQuery
 from src.db.tags import get_all_tag_namespaces
-from src.types import ExtractedTextStats, SearchStats
-from src.ui.components.search.basic_options import create_basic_search_opts
+from src.types import SearchStats
+from src.ui.components.search.any_fts import create_fts_options
+from src.ui.components.search.base import create_basic_search_opts
 from src.ui.components.search.bookmarks import create_bookmark_search_opts
-from src.ui.components.search.extracted_text_fts_options import (
+from src.ui.components.search.extracted_text_fts import (
     create_extracted_text_fts_opts,
 )
-from src.ui.components.search.fts_options import create_fts_options
-from src.ui.components.search.path_fts_options import create_path_fts_opts
-from src.ui.components.search.tag_options import create_tags_opts
-from src.ui.components.search.vector_options import create_vector_search_opts
+from src.ui.components.search.path_fts import create_path_fts_opts
+from src.ui.components.search.tags import create_tags_opts
+from src.ui.components.search.vector import create_vector_search_opts
 
 
 def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
