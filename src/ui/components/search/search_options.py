@@ -70,7 +70,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
             query = process(query, args, True)
         return query
 
-    return query_state
+    return query_state, all_inputs, build_full_query
 
 
 def on_tab_load():
