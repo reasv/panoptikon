@@ -30,7 +30,9 @@ def bind_event_listeners(
     search_stats_state: gr.State,
     elements: List[Component],
     on_data_change: Callable[[SearchQuery, Dict[Component, Any]], SearchQuery],
-    on_stats_change: Callable[[SearchQuery, SearchStats], Dict[Component, Any]],
+    on_stats_change: (
+        Callable[[SearchQuery, SearchStats], Dict[Component, Any]] | None
+    ) = None,
 ):
 
     def on_data_change_wrapper(args: dict[Component, Any]) -> dict[str, Any]:
@@ -43,6 +45,9 @@ def bind_event_listeners(
         inputs={query_state, *elements},
         outputs=[query_state],
     )
+
+    if on_stats_change is None:
+        return
 
     def on_stats_change_wrapper(
         query_state_dict: dict,

@@ -41,7 +41,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
         create_vector_search_opts(query_state, search_stats_state)
         create_fts_options(query_state, search_stats_state)
         create_tags_opts(query_state, search_stats_state)
-        create_path_fts_opts(query_state)
+        create_path_fts_opts(query_state, search_stats_state)
         create_extracted_text_fts_opts(query_state, search_stats_state)
 
     return query_state
