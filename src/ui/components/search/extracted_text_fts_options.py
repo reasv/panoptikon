@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Any, List, Tuple
+from typing import Any, Dict, List
 
 import gradio as gr
 
@@ -8,8 +8,8 @@ from src.data_extractors.utils import (
     get_whisper_avg_logprob_threshold_from_env,
 )
 from src.db.search.types import ExtractedTextFilter, SearchQuery
-from src.db.search.utils import from_dict
 from src.types import SearchStats
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 threshold = min(
     get_ocr_threshold_from_env(),
@@ -21,8 +21,9 @@ def create_extracted_text_fts_opts(
     query_state: gr.State,
     search_stats_state: gr.State,
 ):
+    elements: List[AnyComponent] = []
     with gr.Tab(label="MATCH Text Extracted") as tab:
-        elements: List[Any] = [tab]
+        elements.append(tab)
         with gr.Row():
             text_query = gr.Textbox(
                 key="extracted_text_query_fts",
@@ -71,32 +72,33 @@ def create_extracted_text_fts_opts(
             )
             elements.append(language_confidence)
 
-    gr.on(
-        triggers=[
-            text_query.input,
-            targets.select,
-            confidence.release,
-            languages.select,
-            language_confidence.release,
-        ],
-        fn=on_change_data,
-        inputs=[
-            query_state,
-            text_query,
-            targets,
-            confidence,
-            languages,
-            language_confidence,
-        ],
-        outputs=[query_state],
-    )
+    def on_change_data(query: SearchQuery, args: dict[AnyComponent, Any]):
+        text_query_val: str | None = args[text_query]
+        query_targets: List[str] | None = args[targets]
+        confidence_val: float = args[confidence]
+        languages_val: List[str] | None = args[languages]
+        language_confidence_val: float = args[language_confidence]
+
+        if text_query_val:
+            query.query.filters.extracted_text = ExtractedTextFilter(
+                query=text_query_val,
+                targets=[("text", target) for target in query_targets or []],
+                min_confidence=confidence_val,
+            )
+            if languages_val:
+                query.query.filters.extracted_text.languages = languages_val
+                query.query.filters.extracted_text.language_min_confidence = (
+                    language_confidence_val
+                )
+        else:
+            query.query.filters.extracted_text = None
+
+        return query
 
     def on_stats_change(
-        query_state_dict: dict,
-        search_stats_dict: dict,
-    ):
-        query = from_dict(SearchQuery, query_state_dict)
-        search_stats = from_dict(SearchStats, search_stats_dict)
+        query: SearchQuery,
+        search_stats: SearchStats,
+    ) -> Dict[AnyComponent, Any]:
 
         extracted_text_available = bool(search_stats.et_setters)
         if not extracted_text_available:
@@ -115,36 +117,11 @@ def create_extracted_text_fts_opts(
             ),
         }
 
-    gr.on(
-        triggers=[search_stats_state.change],
-        fn=on_stats_change,
-        inputs=[query_state, search_stats_state],
-        outputs=[query_state, *elements],
+    bind_event_listeners(
+        query_state,
+        search_stats_state,
+        elements,
+        on_change_data,
+        on_stats_change,
     )
-
-
-def on_change_data(
-    query_state_dict: dict,
-    text_query: str | None,
-    query_targets: List[str] | None,
-    confidence: float,
-    languages: List[str] | None,
-    language_confidence: float,
-):
-    query_state = from_dict(SearchQuery, query_state_dict)
-
-    if text_query:
-        query_state.query.filters.extracted_text = ExtractedTextFilter(
-            query=text_query,
-            targets=[("text", target) for target in query_targets or []],
-            min_confidence=confidence,
-        )
-        if languages:
-            query_state.query.filters.extracted_text.languages = languages
-            query_state.query.filters.extracted_text.language_min_confidence = (
-                language_confidence
-            )
-    else:
-        query_state.query.filters.extracted_text = None
-
-    return asdict(query_state)
+    return elements, on_change_data

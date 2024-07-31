@@ -8,8 +8,10 @@ from src.db.search.types import SearchQuery
 from src.db.search.utils import from_dict
 from src.types import SearchStats
 
+AnyComponent = Component | gr.Tab
 
-def get_triggers(components: list[Component]) -> list[Callable]:
+
+def get_triggers(components: list[AnyComponent]) -> list[Callable]:
     triggers = []
     for component in components:
         if isinstance(component, gr.Slider):
@@ -25,24 +27,30 @@ def get_triggers(components: list[Component]) -> list[Callable]:
     return triggers
 
 
+def filter_inputs(inputs: list[AnyComponent]) -> list[Component]:
+    return [input for input in inputs if not isinstance(input, gr.Tab)]
+
+
 def bind_event_listeners(
     query_state: gr.State,
     search_stats_state: gr.State,
-    elements: List[Component],
-    on_data_change: Callable[[SearchQuery, Dict[Component, Any]], SearchQuery],
+    elements: List[AnyComponent],
+    on_data_change: Callable[
+        [SearchQuery, Dict[AnyComponent, Any]], SearchQuery
+    ],
     on_stats_change: (
-        Callable[[SearchQuery, SearchStats], Dict[Component, Any]] | None
+        Callable[[SearchQuery, SearchStats], Dict[AnyComponent, Any]] | None
     ) = None,
 ):
 
-    def on_data_change_wrapper(args: dict[Component, Any]) -> dict[str, Any]:
+    def on_data_change_wrapper(args: dict[AnyComponent, Any]) -> dict[str, Any]:
         query = from_dict(SearchQuery, args[query_state])
         return asdict(on_data_change(query, args))
 
     gr.on(
         triggers=get_triggers(elements),
         fn=on_data_change_wrapper,
-        inputs={query_state, *elements},
+        inputs={query_state, *filter_inputs(elements)},
         outputs=[query_state],
     )
 

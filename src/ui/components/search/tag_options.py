@@ -1,12 +1,12 @@
 from dataclasses import asdict
-from typing import Any, List
+from typing import Any, Dict, List
 
 import gradio as gr
 
 from src.data_extractors.utils import get_threshold_from_env
 from src.db.search.types import QueryTagFilters, SearchQuery
-from src.db.search.utils import from_dict
 from src.types import SearchStats
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 from src.utils import parse_tags
 
 
@@ -14,7 +14,7 @@ def create_tags_opts(
     query_state: gr.State,
     search_stats_state: gr.State,
 ):
-    elements: List[Any] = []
+    elements: List[AnyComponent] = []
     with gr.Tab(label="Tag Filters") as tab:
         elements.append(tab)
         with gr.Group():
@@ -61,12 +61,45 @@ def create_tags_opts(
                 )
                 elements.append(tag_namespace_prefixes)
 
+        def on_data_change(
+            query: SearchQuery, args: dict[AnyComponent, Any]
+        ) -> SearchQuery:
+            tag_input_val: str | None = args[tag_input]
+            min_confidence_val: float | None = args[min_confidence]
+            chosen_tag_setters_val: list[str] | None = args[chosen_tag_setters]
+            all_setters_required_val: bool = args[all_setters_required]
+            tag_namespace_prefixes_val: list[str] | None = args[
+                tag_namespace_prefixes
+            ]
+
+            if tag_input_val:
+                pos_match_all, pos_match_any, neg_match_any, neg_match_all = (
+                    parse_tags(tag_input_val)
+                )
+                minimum_confidence_threshold = get_threshold_from_env()
+                if (
+                    not min_confidence_val
+                    or min_confidence_val <= minimum_confidence_threshold
+                ):
+                    min_confidence_val = None
+                query.query.tags = QueryTagFilters(
+                    pos_match_all=pos_match_all,
+                    pos_match_any=pos_match_any,
+                    neg_match_any=neg_match_any,
+                    neg_match_all=neg_match_all,
+                    min_confidence=min_confidence_val,
+                    setters=chosen_tag_setters_val or [],
+                    all_setters_required=all_setters_required_val,
+                    namespaces=tag_namespace_prefixes_val or [],
+                )
+            else:
+                query.query.tags = QueryTagFilters()
+            return query
+
         def on_stats_change(
-            query_state_dict: dict,
-            search_stats_dict: dict,
-        ):
-            query = from_dict(SearchQuery, query_state_dict)
-            search_stats = from_dict(SearchStats, search_stats_dict)
+            query: SearchQuery,
+            search_stats: SearchStats,
+        ) -> Dict[AnyComponent, Any]:
             tags_available = bool(search_stats.tag_setters)
             if not tags_available:
                 query.query.tags = QueryTagFilters()
@@ -81,60 +114,12 @@ def create_tags_opts(
                 ),
             }
 
-        gr.on(
-            triggers=[search_stats_state.change],
-            fn=on_stats_change,
-            inputs=[query_state, search_stats_state],
-            outputs=[query_state, *elements],
-        )
-    gr.on(
-        triggers=[
-            tag_input.input,
-            min_confidence.release,
-            chosen_tag_setters.select,
-            all_setters_required.input,
-            tag_namespace_prefixes.select,
-        ],
-        fn=on_change_data,
-        inputs=[
-            query_state,
-            tag_input,
-            min_confidence,
-            chosen_tag_setters,
-            all_setters_required,
-            tag_namespace_prefixes,
-        ],
-        outputs=[query_state],
+    bind_event_listeners(
+        query_state,
+        search_stats_state,
+        elements,
+        on_data_change,
+        on_stats_change,
     )
 
-
-def on_change_data(
-    query_state_dict: dict,
-    tag_input: str | None,
-    min_confidence: float | None,
-    chosen_tag_setters: list[str] | None,
-    all_setters_required: bool,
-    tag_namespace_prefixes: list[str] | None,
-):
-    query_state = from_dict(SearchQuery, query_state_dict)
-    if tag_input:
-        pos_match_all, pos_match_any, neg_match_any, neg_match_all = parse_tags(
-            tag_input
-        )
-        minimum_confidence_threshold = get_threshold_from_env()
-        if not min_confidence or min_confidence <= minimum_confidence_threshold:
-            min_confidence = None
-
-        query_state.query.tags = QueryTagFilters(
-            pos_match_all=pos_match_all,
-            pos_match_any=pos_match_any,
-            neg_match_any=neg_match_any,
-            neg_match_all=neg_match_all,
-            min_confidence=min_confidence,
-            setters=chosen_tag_setters or [],
-            all_setters_required=all_setters_required,
-            namespaces=tag_namespace_prefixes or [],
-        )
-    else:
-        query_state.query.tags = QueryTagFilters()
-    return asdict(query_state)
+    return elements, on_data_change

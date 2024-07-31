@@ -1,18 +1,17 @@
 from typing import Any, Dict, List
 
 import gradio as gr
-from gradio.components import Component
 
 from src.db.search.types import BookmarksFilter, SearchQuery
 from src.types import SearchStats
-from src.ui.components.search.utils import bind_event_listeners
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 
 def create_bookmark_search_opts(
     query_state: gr.State,
     search_stats_state: gr.State,
 ):
-    elements: List[Component] = []
+    elements: List[AnyComponent] = []
     with gr.Tab(label="Search in Bookmarks"):
         with gr.Row():
             enable = gr.Checkbox(
@@ -34,7 +33,7 @@ def create_bookmark_search_opts(
             elements.append(in_namespaces)
 
     def on_data_change(
-        query: SearchQuery, args: dict[Component, Any]
+        query: SearchQuery, args: dict[AnyComponent, Any]
     ) -> SearchQuery:
         enable_val: bool = args[enable]
         in_namespaces_val: List[str] = args[in_namespaces]
@@ -50,7 +49,7 @@ def create_bookmark_search_opts(
     def on_stats_change(
         query: SearchQuery,
         search_stats: SearchStats,
-    ) -> Dict[Component, Any]:
+    ) -> Dict[AnyComponent, Any]:
         return {
             in_namespaces: gr.update(choices=search_stats.bookmark_namespaces),
         }
