@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class FileScanData:
     sha256: str
@@ -85,3 +86,10 @@ class LogRecord:
     total_segments: int
     errors: int
     total_remaining: int
+
+
+@dataclass
+class ExtractedTextStats:
+    lowest_confidence: float | None = None
+    lowest_language_confidence: float | None = None
+    languages: list[str] = []

@@ -2,7 +2,7 @@ import sqlite3
 from typing import List
 
 from src.db import get_item_id
-from src.types import ExtractedText
+from src.types import ExtractedText, ExtractedTextStats
 
 
 def insert_extracted_text(
@@ -89,3 +89,32 @@ def get_extracted_text_for_item(
         for row in rows
     ]
     return extracted_texts
+
+
+def get_text_stats(conn: sqlite3.Connection) -> ExtractedTextStats:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT DISTINCT language
+        FROM extracted_text
+        WHERE language IS NOT NULL
+        """
+    )
+    rows = cursor.fetchall()
+    languages = [row[0] for row in rows]
+    # Get the minimum overall language confidence and the minimum confidence
+
+    cursor.execute(
+        """
+        SELECT MIN(language_confidence), MIN(confidence)
+        FROM extracted_text
+        """
+    )
+    row = cursor.fetchone()
+    language_confidence = row[0]
+    confidence = row[1]
+    return ExtractedTextStats(
+        languages=languages,
+        lowest_language_confidence=language_confidence,
+        lowest_confidence=confidence,
+    )
