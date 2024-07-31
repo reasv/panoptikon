@@ -1,12 +1,10 @@
-from dataclasses import asdict
 from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 
 from src.db.search.types import AnyTextFilter, SearchQuery
-from src.db.search.utils import from_dict
 from src.types import SearchStats
-from src.ui.components.search.utils import AnyComponent, bind_event_listeners
+from src.ui.components.search.utils import AnyComponent
 
 
 def create_fts_options(
@@ -37,7 +35,9 @@ def create_fts_options(
             elements.append(query_targets)
 
     def on_data_change(
-        query: SearchQuery, args: dict[AnyComponent, Any]
+        query: SearchQuery,
+        args: dict[AnyComponent, Any],
+        final_query_build: bool = False,
     ) -> SearchQuery:
         text_query_val: str | None = args[text_query]
         query_targets_val: List[Tuple[str, str]] | None = args[query_targets]

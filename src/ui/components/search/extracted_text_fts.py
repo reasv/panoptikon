@@ -1,4 +1,3 @@
-from dataclasses import asdict
 from typing import Any, Dict, List
 
 import gradio as gr
@@ -9,7 +8,7 @@ from src.data_extractors.utils import (
 )
 from src.db.search.types import ExtractedTextFilter, SearchQuery
 from src.types import SearchStats
-from src.ui.components.search.utils import AnyComponent, bind_event_listeners
+from src.ui.components.search.utils import AnyComponent
 
 threshold = min(
     get_ocr_threshold_from_env(),
@@ -71,7 +70,11 @@ def create_extracted_text_fts_opts(
             )
             elements.append(language_confidence)
 
-    def on_change_data(query: SearchQuery, args: dict[AnyComponent, Any]):
+    def on_change_data(
+        query: SearchQuery,
+        args: dict[AnyComponent, Any],
+        final_query_build: bool = False,
+    ) -> SearchQuery:
         text_query_val: str | None = args[text_query]
         query_targets: List[str] | None = args[targets]
         confidence_val: float = args[confidence]

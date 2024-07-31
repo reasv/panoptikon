@@ -46,7 +46,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
     ]
     all_inputs: List[AnyComponent] = []
     process_functions: List[
-        Callable[[SearchQuery, Dict[AnyComponent, Any]], SearchQuery]
+        Callable[[SearchQuery, Dict[AnyComponent, Any], bool], SearchQuery]
     ] = []
     with gr.Tabs():
         for module in search_option_modules:
@@ -67,7 +67,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
         """Build the full search query object from the search modules' output components"""
         query = SearchQuery()
         for process in process_functions:
-            query = process(query, args)
+            query = process(query, args, True)
         return query
 
     return query_state

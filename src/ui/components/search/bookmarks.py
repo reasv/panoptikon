@@ -4,7 +4,7 @@ import gradio as gr
 
 from src.db.search.types import BookmarksFilter, SearchQuery
 from src.types import SearchStats
-from src.ui.components.search.utils import AnyComponent, bind_event_listeners
+from src.ui.components.search.utils import AnyComponent
 
 
 def create_bookmark_search_opts(
@@ -32,7 +32,9 @@ def create_bookmark_search_opts(
             elements.append(in_namespaces)
 
     def on_data_change(
-        query: SearchQuery, args: dict[AnyComponent, Any]
+        query: SearchQuery,
+        args: dict[AnyComponent, Any],
+        final_query_build: bool = False,
     ) -> SearchQuery:
         enable_val: bool = args[enable]
         in_namespaces_val: List[str] = args[in_namespaces]

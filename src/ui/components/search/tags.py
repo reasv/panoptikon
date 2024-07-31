@@ -6,7 +6,7 @@ import gradio as gr
 from src.data_extractors.utils import get_threshold_from_env
 from src.db.search.types import QueryTagFilters, SearchQuery
 from src.types import SearchStats
-from src.ui.components.search.utils import AnyComponent, bind_event_listeners
+from src.ui.components.search.utils import AnyComponent
 from src.utils import parse_tags
 
 
@@ -59,7 +59,9 @@ def create_tags_opts(query_state: gr.State):
                 elements.append(tag_namespace_prefixes)
 
         def on_data_change(
-            query: SearchQuery, args: dict[AnyComponent, Any]
+            query: SearchQuery,
+            args: dict[AnyComponent, Any],
+            final_query_build: bool = False,
         ) -> SearchQuery:
             tag_input_val: str | None = args[tag_input]
             min_confidence_val: float | None = args[min_confidence]

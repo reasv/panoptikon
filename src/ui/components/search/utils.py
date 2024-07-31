@@ -42,7 +42,7 @@ def bind_event_listeners(
     search_stats_state: gr.State,
     elements: List[AnyComponent],
     on_data_change: Callable[
-        [SearchQuery, Dict[AnyComponent, Any]], SearchQuery
+        [SearchQuery, Dict[AnyComponent, Any], bool], SearchQuery
     ],
     on_stats_change: (
         Callable[[SearchQuery, SearchStats], Dict[AnyComponent, Any]] | None
@@ -51,7 +51,7 @@ def bind_event_listeners(
 
     def on_data_change_wrapper(args: dict[AnyComponent, Any]) -> dict[str, Any]:
         query = from_dict(SearchQuery, args[query_state])
-        return asdict(on_data_change(query, args))
+        return asdict(on_data_change(query, args, False))
 
     gr.on(
         triggers=get_triggers(elements),

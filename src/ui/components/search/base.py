@@ -6,7 +6,7 @@ import gradio as gr
 from src.db.search.types import FileFilters, OrderByType, SearchQuery
 from src.db.search.utils import from_dict
 from src.types import SearchStats
-from src.ui.components.search.utils import AnyComponent, bind_event_listeners
+from src.ui.components.search.utils import AnyComponent
 
 
 def create_basic_search_opts(
@@ -64,7 +64,11 @@ def create_basic_search_opts(
                 )
                 elements.append(order)
 
-    def on_data_change(query: SearchQuery, args: dict[AnyComponent, Any]):
+    def on_data_change(
+        query: SearchQuery,
+        args: dict[AnyComponent, Any],
+        final_query_build: bool = False,
+    ) -> SearchQuery:
         use_paths_val: List[str] | None = args[use_paths]
         use_file_types_val: List[str] | None = args[use_file_types]
         res_per_page_val: int = args[res_per_page]
