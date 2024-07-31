@@ -5,7 +5,6 @@ import gradio as gr
 from gradio.components import Component
 
 from src.db.search.types import PathTextFilter, SearchQuery
-from src.db.search.utils import from_dict
 from src.ui.components.search.utils import bind_event_listeners
 
 
