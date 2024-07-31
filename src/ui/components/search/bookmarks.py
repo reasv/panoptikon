@@ -5,9 +5,13 @@ import gradio as gr
 
 from src.db.search.types import BookmarksFilter, SearchQuery
 from src.db.search.utils import from_dict
+from src.types import SearchStats
 
 
-def create_bookmark_search_opts(query_state: gr.State, namespaces: List[str]):
+def create_bookmark_search_opts(
+    query_state: gr.State,
+    search_stats_state: gr.State,
+):
     with gr.Tab(label="Search in Bookmarks"):
         with gr.Row():
             enable = gr.Checkbox(
@@ -19,7 +23,7 @@ def create_bookmark_search_opts(query_state: gr.State, namespaces: List[str]):
             )
             in_namespaces = gr.Dropdown(
                 key="bookmark_namespaces",
-                choices=namespaces,
+                choices=[],
                 interactive=True,
                 label="Restrict to these namespaces",
                 multiselect=True,
@@ -30,6 +34,23 @@ def create_bookmark_search_opts(query_state: gr.State, namespaces: List[str]):
         fn=on_change_data,
         inputs=[query_state, enable, in_namespaces],
         outputs=[query_state],
+    )
+
+    def on_stats_change(
+        query_state_dict: dict,
+        search_stats_dict: dict,
+    ):
+        search_stats = from_dict(SearchStats, search_stats_dict)
+
+        return {
+            in_namespaces: gr.update(choices=search_stats.bookmark_namespaces),
+        }
+
+    gr.on(
+        triggers=[search_stats_state.change],
+        fn=on_stats_change,
+        inputs=[query_state, search_stats_state],
+        outputs=[in_namespaces],
     )
 
 

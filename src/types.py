@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Tuple, Union
 
 
 @dataclass
@@ -90,6 +91,18 @@ class LogRecord:
 
 @dataclass
 class ExtractedTextStats:
-    lowest_confidence: float | None = None
-    lowest_language_confidence: float | None = None
-    languages: list[str] = []
+    lowest_confidence: Union[float, None] = None
+    lowest_language_confidence: Union[float, None] = None
+    languages: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchStats:
+    all_setters: List[Tuple[str, str]] = field(default_factory=list)
+    et_setters: List[Tuple[str, str]] = field(default_factory=list)
+    et_stats: ExtractedTextStats = field(default_factory=ExtractedTextStats)
+    tag_setters: List[str] = field(default_factory=list)
+    tag_namespaces: List[str] = field(default_factory=list)
+    bookmark_namespaces: List[str] = field(default_factory=list)
+    file_types: List[str] = field(default_factory=list)
+    folders: List[str] = field(default_factory=list)
