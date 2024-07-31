@@ -9,7 +9,6 @@ from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 def create_bookmark_search_opts(
     query_state: gr.State,
-    search_stats_state: gr.State,
 ):
     elements: List[AnyComponent] = []
     with gr.Tab(label="Search in Bookmarks"):
@@ -54,11 +53,4 @@ def create_bookmark_search_opts(
             in_namespaces: gr.update(choices=search_stats.bookmark_namespaces),
         }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_data_change,
-        on_stats_change,
-    )
-    return elements, on_data_change
+    return elements, on_data_change, on_stats_change

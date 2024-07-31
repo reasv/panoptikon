@@ -10,10 +10,7 @@ from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 from src.utils import parse_tags
 
 
-def create_tags_opts(
-    query_state: gr.State,
-    search_stats_state: gr.State,
-):
+def create_tags_opts(query_state: gr.State):
     elements: List[AnyComponent] = []
     with gr.Tab(label="Tag Filters") as tab:
         elements.append(tab)
@@ -114,12 +111,4 @@ def create_tags_opts(
                 ),
             }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_data_change,
-        on_stats_change,
-    )
-
-    return elements, on_data_change
+    return elements, on_data_change, on_stats_change

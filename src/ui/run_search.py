@@ -88,54 +88,6 @@ def search(
     if page < 1:
         page = 1
 
-    # Full text search on filename or path, or extracted text
-    # if any_text_query:
-    #     if order_by_any_text_rank:
-    #         order_by = "rank_any_text"
-    # if search_in_bookmarks:
-    #     if order_by_time_added_bk:
-    #         order_by = "time_added"
-    # if path_search:
-    #     if path_order_by_rank:
-    #         order_by = "rank_path_fts"
-    # if extracted_text_search:
-    #     if extracted_text_order_by_rank:
-    #         order_by = "rank_fts"
-    # if vec_text_search:
-    #     order_by = "text_vec_distance"
-    # if clip_text_query:
-    #     order_by = "image_vec_distance"
-    # if clip_image_query is not None:
-    #     order_by = "image_vec_distance"
-
-    # if vec_text_search:
-    #     vec_text_search_embed = get_embed(vec_text_search)
-    # else:
-    #     vec_text_search_embed = None
-
-    # image_vec_search = None
-    # if clip_text_query and clip_model:
-    #     image_vec_search = get_clip_embed(clip_text_query, clip_model)
-    # if clip_image_query is not None and clip_model:
-    #     image_vec_search = get_clip_embed(clip_image_query, clip_model)
-    # extracted_text_embeddings=(
-    #         ExtractedTextFilter[bytes](
-    #             query=vec_text_search_embed,
-    #             targets=vec_targets or [],
-    #             min_confidence=None,
-    #         )
-    #         if vec_text_search_embed
-    #         else None
-
-    # )
-    # image_embeddings=(
-    #         ImageEmbeddingFilter(
-    #             query=image_vec_search, target=("clip", clip_model)
-    #         )
-    #         if image_vec_search and clip_model
-    #         else None
-    #     )
-
     if query_state.query.filters.extracted_text_embeddings:
         text_embeddings = get_embed(
             query_state.query.filters.extracted_text_embeddings.query.decode(

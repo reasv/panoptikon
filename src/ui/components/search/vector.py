@@ -13,9 +13,7 @@ from src.types import SearchStats
 from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 
-def create_vector_search_opts(
-    query_state: gr.State, search_stats_state: gr.State
-):
+def create_vector_search_opts(query_state: gr.State):
     elements: List[Any] = []
     with gr.Tab(label="Semantic Search") as tab:
         elements.append(tab)
@@ -159,7 +157,6 @@ def create_vector_search_opts(
             query_types += ["Text Vector Search"]
 
         return {
-            query_state: asdict(query),
             tab: gr.Tab(visible=bool(query_types)),
             vec_query_type: gr.update(choices=query_types),
             te_embedding_model: gr.update(choices=search_stats.te_setters),
@@ -167,12 +164,4 @@ def create_vector_search_opts(
             te_text_targets: gr.update(choices=search_stats.et_setters),
         }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_data_change,
-        on_stats_change,
-    )
-
-    return elements, on_data_change
+    return elements, on_data_change, on_stats_change

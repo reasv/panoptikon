@@ -19,7 +19,6 @@ threshold = min(
 
 def create_extracted_text_fts_opts(
     query_state: gr.State,
-    search_stats_state: gr.State,
 ):
     elements: List[AnyComponent] = []
     with gr.Tab(label="MATCH Text Extracted") as tab:
@@ -104,7 +103,6 @@ def create_extracted_text_fts_opts(
         if not extracted_text_available:
             query.query.filters.extracted_text = None
         return {
-            query_state: asdict(query),
             targets: gr.Dropdown(choices=search_stats.et_setters),
             languages: gr.Dropdown(choices=search_stats.et_stats.languages),
             language_confidence: search_stats.et_stats.lowest_language_confidence,
@@ -117,11 +115,4 @@ def create_extracted_text_fts_opts(
             ),
         }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_change_data,
-        on_stats_change,
-    )
-    return elements, on_change_data
+    return elements, on_change_data, on_stats_change

@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from typing import Any, Callable, Dict, List
 
 import gradio as gr
 
@@ -19,6 +20,7 @@ from src.ui.components.search.extracted_text_fts import (
 )
 from src.ui.components.search.path_fts import create_path_fts_opts
 from src.ui.components.search.tags import create_tags_opts
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 from src.ui.components.search.vector import create_vector_search_opts
 
 
@@ -33,14 +35,40 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
         api_name=False,
     )
 
+    search_option_modules = [
+        create_basic_search_opts,
+        create_bookmark_search_opts,
+        create_vector_search_opts,
+        create_fts_options,
+        create_tags_opts,
+        create_path_fts_opts,
+        create_extracted_text_fts_opts,
+    ]
+    all_inputs: List[AnyComponent] = []
+    process_functions: List[
+        Callable[[SearchQuery, Dict[AnyComponent, Any]], SearchQuery]
+    ] = []
     with gr.Tabs():
-        create_basic_search_opts(query_state, search_stats_state)
-        create_bookmark_search_opts(query_state, search_stats_state)
-        create_vector_search_opts(query_state, search_stats_state)
-        create_fts_options(query_state, search_stats_state)
-        create_tags_opts(query_state, search_stats_state)
-        create_path_fts_opts(query_state, search_stats_state)
-        create_extracted_text_fts_opts(query_state, search_stats_state)
+        for module in search_option_modules:
+            inputs, process_inputs, on_stats_change = module(query_state)
+            all_inputs.extend(inputs)
+            process_functions.append(process_inputs)
+            bind_event_listeners(
+                query_state,
+                search_stats_state,
+                inputs,
+                process_inputs,
+                on_stats_change,
+            )
+    process_functions.reverse()  # Reverse the order of processing functions
+    # This is because the function that controls sorting of results should be the last one to run
+
+    def build_full_query(args: dict[AnyComponent, Any]) -> SearchQuery:
+        """Build the full search query object from the search modules' output components"""
+        query = SearchQuery()
+        for process in process_functions:
+            query = process(query, args)
+        return query
 
     return query_state
 
@@ -64,7 +92,6 @@ def on_tab_load():
 
     clip_setters = [s for t, s in setters if t == "clip"]
     te_setters = [s for t, s in setters if t == "text-embedding"]
-
     stats = SearchStats(
         tag_namespaces=tag_namespaces,
         bookmark_namespaces=bookmark_namespaces,

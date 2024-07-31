@@ -11,9 +11,8 @@ from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 def create_basic_search_opts(
     query_state: gr.State,
-    search_stats_state: gr.State,
 ):
-    elements: List[Any] = []
+    elements: List[AnyComponent] = []
     default_order_by_choices: List[OrderByType] = ["last_modified", "path"]
     with gr.Tab(label="Options"):
         with gr.Group():
@@ -106,14 +105,6 @@ def create_basic_search_opts(
             use_file_types: gr.update(choices=search_stats.file_types),
         }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_data_change,
-        on_stats_change,
-    )
-
     def on_query_change(query_state_dict: dict, order_by_current: str):
         query = from_dict(SearchQuery, query_state_dict)
         order_by_opts: List[OrderByType] = [x for x in default_order_by_choices]
@@ -153,4 +144,4 @@ def create_basic_search_opts(
         fn=on_query_change,
     )
 
-    return elements, on_data_change
+    return elements, on_data_change, on_stats_change

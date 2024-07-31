@@ -8,7 +8,7 @@ from src.db.search.types import PathTextFilter, SearchQuery
 from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 
-def create_path_fts_opts(query_state: gr.State, search_stats_state: gr.State):
+def create_path_fts_opts(query_state: gr.State):
     with gr.Tab(label="MATCH Filename/Path"):
         elements = []
         with gr.Row():
@@ -45,10 +45,4 @@ def create_path_fts_opts(query_state: gr.State, search_stats_state: gr.State):
 
         return query
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_change_data,
-    )
-    return elements, on_change_data
+    return elements, on_change_data, None

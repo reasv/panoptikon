@@ -11,7 +11,6 @@ from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 def create_fts_options(
     query_state: gr.State,
-    search_stats_state: gr.State,
 ):
     path_setters = [
         ("Full Path", ("path", "path")),
@@ -37,7 +36,7 @@ def create_fts_options(
             )
             elements.append(query_targets)
 
-    def on_change_data(
+    def on_data_change(
         query: SearchQuery, args: dict[AnyComponent, Any]
     ) -> SearchQuery:
         text_query_val: str | None = args[text_query]
@@ -62,16 +61,7 @@ def create_fts_options(
         ]
         all_targets = path_setters + text_setters
         return {
-            query_state: asdict(query),
             query_targets: gr.update(choices=all_targets),
         }
 
-    bind_event_listeners(
-        query_state,
-        search_stats_state,
-        elements,
-        on_change_data,
-        on_stats_change,
-    )
-
-    return elements, on_change_data
+    return elements, on_data_change, on_stats_change
