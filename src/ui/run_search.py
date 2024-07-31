@@ -135,6 +135,35 @@ def search(
     #         if image_vec_search and clip_model
     #         else None
     #     )
+
+    if query_state.query.filters.extracted_text_embeddings:
+        text_embeddings = get_embed(
+            query_state.query.filters.extracted_text_embeddings.query.decode(
+                "utf-8"
+            )
+        )
+        if text_embeddings is None:
+            query_state.query.filters.extracted_text_embeddings = None
+        else:
+            query_state.query.filters.extracted_text_embeddings.query = (
+                text_embeddings
+            )
+
+    if query_state.query.filters.image_embeddings:
+        query = query_state.query.filters.image_embeddings.query
+        if isinstance(query, bytes):
+            decoded_query: np.ndarray | str = query.decode("utf-8")
+        else:
+            decoded_query = query  # type: ignore
+        image_embeddings = get_clip_embed(
+            decoded_query,
+            query_state.query.filters.image_embeddings.target[1],
+        )
+        if image_embeddings is None:
+            query_state.query.filters.image_embeddings = None
+        else:
+            query_state.query.filters.image_embeddings.query = image_embeddings
+
     start = time()
     query_state.order_args.page = page
     search_query = SearchQuery(

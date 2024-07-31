@@ -101,6 +101,8 @@ class SearchStats:
     all_setters: List[Tuple[str, str]] = field(default_factory=list)
     et_setters: List[Tuple[str, str]] = field(default_factory=list)
     et_stats: ExtractedTextStats = field(default_factory=ExtractedTextStats)
+    clip_setters: List[str] = field(default_factory=list)
+    te_setters: List[str] = field(default_factory=list)
     tag_setters: List[str] = field(default_factory=list)
     tag_namespaces: List[str] = field(default_factory=list)
     bookmark_namespaces: List[str] = field(default_factory=list)

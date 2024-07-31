@@ -38,7 +38,7 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
     with gr.Tabs():
         create_basic_search_opts(query_state, search_stats_state)
         create_bookmark_search_opts(query_state, search_stats_state)
-        # create_vector_search_opts(query_state, search_stats_state)
+        create_vector_search_opts(query_state, search_stats_state)
         create_fts_options(query_state, search_stats_state)
         create_tags_opts(query_state, search_stats_state)
         create_path_fts_opts(query_state)
@@ -62,12 +62,17 @@ def on_tab_load():
         for model_type, setter_id in setters
         if model_type == "text"
     ]
-    tag_setters = [id for t, id in setters if t == "tags"]
+    tag_setters = [s for t, s in setters if t == "tags"]
+
+    clip_setters = [s for t, s in setters if t == "clip"]
+    te_setters = [s for t, s in setters if t == "text-embedding"]
 
     stats = SearchStats(
         tag_namespaces=tag_namespaces,
         bookmark_namespaces=bookmark_namespaces,
         all_setters=setters,
+        clip_setters=clip_setters,
+        te_setters=te_setters,
         file_types=file_types,
         folders=folders,
         et_stats=text_stats,

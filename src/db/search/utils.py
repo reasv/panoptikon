@@ -12,6 +12,7 @@ from typing import (
     get_origin,
 )
 
+import numpy as np
 from typeguard import typechecked
 
 from src.db.search.types import QueryTagFilters, SearchQuery
@@ -81,6 +82,8 @@ def replace_bytes_with_length(d):
         return [replace_bytes_with_length(v) for v in d]
     elif isinstance(d, bytes):
         return f"[{len(d)} bytes]"
+    elif isinstance(d, np.ndarray):
+        return f"[{d.size} bytes]"
     else:
         return d
 
@@ -90,14 +93,20 @@ def remove_empty_and_none(data):
         return {
             k: remove_empty_and_none(v)
             for k, v in data.items()
-            if v is not None and v != []
+            if v is not None
+            and not (isinstance(v, (list, np.ndarray)) and len(v) == 0)
         }
     elif isinstance(data, list):
         return [
             remove_empty_and_none(item)
             for item in data
-            if item is not None and item != []
+            if item is not None
+            and not (isinstance(item, (list, np.ndarray)) and len(item) == 0)
         ]
+    elif isinstance(data, np.ndarray):
+        if data.size == 0:
+            return None
+        return data
     else:
         return data
 
