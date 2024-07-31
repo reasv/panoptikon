@@ -1,11 +1,12 @@
 from dataclasses import asdict
-from typing import Any, List, Literal
+from typing import Any, Dict, List, Literal
 
 import gradio as gr
 
 from src.db.search.types import FileFilters, OrderByType, SearchQuery
 from src.db.search.utils import from_dict
 from src.types import SearchStats
+from src.ui.components.search.utils import AnyComponent, bind_event_listeners
 
 
 def create_basic_search_opts(
@@ -64,24 +65,53 @@ def create_basic_search_opts(
                 )
                 elements.append(order)
 
-    def on_stats_change(
-        query_state_dict: dict,
-        search_stats_dict: dict,
-    ):
-        query = from_dict(SearchQuery, query_state_dict)
-        search_stats = from_dict(SearchStats, search_stats_dict)
+    def on_data_change(query: SearchQuery, args: dict[AnyComponent, Any]):
+        use_paths_val: List[str] | None = args[use_paths]
+        use_file_types_val: List[str] | None = args[use_file_types]
+        res_per_page_val: int = args[res_per_page]
+        order_by_val: OrderByType = args[order_by]
+        order_val: Literal["asc", "desc", "default"] = args[order]
 
+        if use_paths_val or use_file_types_val:
+            use_paths_val = (
+                [path.strip() for path in use_paths_val]
+                if use_paths_val
+                else None
+            )
+            use_file_types_val = (
+                [file_type.strip() for file_type in use_file_types_val]
+                if use_file_types_val
+                else None
+            )
+            query.query.filters.files = FileFilters(
+                item_types=use_file_types_val or [],
+                include_path_prefixes=use_paths_val or [],
+            )
+        else:
+            query.query.filters.files = None
+
+        query.order_args.page_size = res_per_page_val
+        query.order_args.order = None if order_val == "default" else order_val
+        query.order_args.order_by = order_by_val
+
+        return query
+
+    def on_stats_change(
+        query: SearchQuery,
+        search_stats: SearchStats,
+    ) -> Dict[AnyComponent, Any]:
         return {
             query_state: asdict(query),
             use_paths: gr.update(choices=search_stats.folders),
             use_file_types: gr.update(choices=search_stats.file_types),
         }
 
-    gr.on(
-        triggers=[search_stats_state.change],
-        fn=on_stats_change,
-        inputs=[query_state, search_stats_state],
-        outputs=[query_state, *elements],
+    bind_event_listeners(
+        query_state,
+        search_stats_state,
+        elements,
+        on_data_change,
+        on_stats_change,
     )
 
     def on_query_change(query_state_dict: dict, order_by_current: str):
@@ -122,53 +152,5 @@ def create_basic_search_opts(
         outputs=[query_state, order_by],
         fn=on_query_change,
     )
-    gr.on(
-        triggers=[
-            use_paths.select,
-            use_file_types.select,
-            res_per_page.release,
-            order_by.select,
-            order.select,
-        ],
-        fn=on_change_data,
-        inputs=[
-            query_state,
-            use_paths,
-            use_file_types,
-            res_per_page,
-            order_by,
-            order,
-        ],
-        outputs=[query_state],
-    )
 
-
-def on_change_data(
-    query_state_dict: dict,
-    use_paths: List[str] | None,
-    use_file_types: List[str] | None,
-    res_per_page: int,
-    order_by: OrderByType,
-    order: Literal["asc", "desc", "default"],
-):
-    query_state = from_dict(SearchQuery, query_state_dict)
-
-    if use_paths or use_file_types:
-        use_paths = [path.strip() for path in use_paths] if use_paths else None
-        use_file_types = (
-            [file_type.strip() for file_type in use_file_types]
-            if use_file_types
-            else None
-        )
-        query_state.query.filters.files = FileFilters(
-            item_types=use_file_types or [],
-            include_path_prefixes=use_paths or [],
-        )
-    else:
-        query_state.query.filters.files = None
-
-    query_state.order_args.page_size = res_per_page
-    query_state.order_args.order = None if order == "default" else order
-    query_state.order_args.order_by = order_by
-
-    return asdict(query_state)
+    return elements, on_data_change
