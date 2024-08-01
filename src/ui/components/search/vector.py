@@ -134,6 +134,7 @@ def create_vector_search_opts(query_state: gr.State):
                         targets=te_text_targets_val or [],
                     )
                 )
+                query.order_args.order_by = "text_vec_distance"
         elif vec_query_type_val == "CLIP Text Query":
             if clip_text_query_val and clip_model_val:
                 if not final_query_build:
@@ -146,6 +147,7 @@ def create_vector_search_opts(query_state: gr.State):
                     query=embedded_query,
                     target=("clip", clip_model_val),
                 )
+                query.order_args.order_by = "image_vec_distance"
         elif vec_query_type_val == "CLIP Reverse Image Search":
             if clip_image_search_val is not None and clip_model_val:
                 assert isinstance(
@@ -161,6 +163,7 @@ def create_vector_search_opts(query_state: gr.State):
                     query=embedded_query,
                     target=("clip", clip_model_val),
                 )
+                query.order_args.order_by = "image_vec_distance"
 
         return query
 

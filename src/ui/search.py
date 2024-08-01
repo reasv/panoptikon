@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from time import time
+from typing import Any, List, Tuple
+
 import gradio as gr
 
-from src.db.search.types import SearchQuery
-from src.db.search.utils import from_dict, pprint_dataclass
+from src.db import get_database_connection
+from src.db.search import search_files
+from src.db.search.utils import pprint_dataclass
+from src.types import FileSearchResult
 from src.ui.components.multi_view import create_multiview
 from src.ui.components.search import create_search_options
-from src.ui.run_search import search
+from src.ui.components.search.utils import AnyComponent
 
 
 def create_search_UI(
@@ -18,7 +23,7 @@ def create_search_UI(
         n_results = gr.State(0)
         with gr.Row():
             with gr.Column(scale=8):
-                query_state = create_search_options(app, search_tab)
+                inputs, build_query = create_search_options(app, search_tab)
             with gr.Column(scale=1):
                 with gr.Row():
                     results_str = gr.Markdown("# 0 Results")
@@ -46,172 +51,84 @@ def create_search_UI(
             )
             next_page = gr.Button("Next Page", scale=1)
 
-    query_state.change(
-        fn=on_query_change,
-        inputs=[query_state],
-    )
+    @n_results.change(inputs=[n_results], outputs=[results_str])
+    def on_n_results_change(n_results: int):
+        return f"# {n_results} Results"
 
-    n_results.change(
-        fn=on_n_results_change,
-        inputs=[n_results],
-        outputs=[results_str],
-    )
+    def search(
+        args: dict[AnyComponent, Any],
+        search_action: str | None = None,
+    ):
+        search_query = build_query(args)
+        print(f"Search action: {search_action}")
+        page: int = args[current_page]
+        if search_action == "search_button":
+            page = 1
+        elif search_action == "next_page":
+            page += 1
+        elif search_action == "previous_page":
+            page -= 1
+            page = max(1, page)
+        elif search_action == "goto_page":
+            pass
+        if page < 1:
+            page = 1
 
-    search_inputs = [query_state, current_page]
+        start = time()
+        search_query.order_args.page = page
+        search_query.count = True
+        search_query.check_path = True
+
+        conn = get_database_connection(write_lock=False)
+        print("Search query:")
+        pprint_dataclass(search_query)
+        res_list: List[Tuple[FileSearchResult | None, int]] = list(
+            search_files(
+                conn,
+                search_query,
+            )
+        ) or [(None, 0)]
+        conn.close()
+        results, total_results = zip(*res_list) if res_list else ([], [0])
+
+        print(f"Search took {round(time() - start, 3)} seconds")
+        total_results = total_results[0]
+
+        print(f"Found {total_results} images")
+        # Calculate the total number of pages, we need to round up
+        total_pages = total_results // search_query.order_args.page_size + (
+            1 if total_results % search_query.order_args.page_size > 0 else 0
+        )
+        return {
+            multi_view.files: results,
+            n_results: total_results,
+            current_page: gr.update(value=page, maximum=int(total_pages)),
+            # link: gr.update(),
+        }
+
+    search_inputs = {*inputs, current_page}
     search_outputs = [multi_view.files, n_results, current_page, link]
-    action_search_button = gr.State("search_button")
-    action_next_page = gr.State("next_page")
-    action_previous_page = gr.State("previous_page")
-    action_goto_page = gr.State("goto_page")
+
     submit_button.click(
-        fn=search,
-        inputs=[*search_inputs, action_search_button],
+        fn=lambda args: search(args, search_action="search_button"),
+        inputs=search_inputs,
         outputs=search_outputs,
     )
 
     current_page.release(
-        fn=search,
-        inputs=[*search_inputs, action_goto_page],
+        fn=lambda args: search(args, search_action="goto_page"),
+        inputs=search_inputs,
         outputs=search_outputs,
     )
 
     previous_page.click(
-        fn=search,
-        inputs=[*search_inputs, action_previous_page],
+        fn=lambda args: search(args, search_action="previous_page"),
+        inputs=search_inputs,
         outputs=search_outputs,
     )
 
     next_page.click(
-        fn=search,
-        inputs=[*search_inputs, action_next_page],
+        fn=lambda args: search(args, search_action="next_page"),
+        inputs=search_inputs,
         outputs=search_outputs,
     )
-
-
-def on_n_results_change(n_results: int):
-    return f"# {n_results} Results"
-
-
-def on_query_change(query_state: dict):
-    pprint_dataclass(from_dict(SearchQuery, query_state))
-
-
-def on_tag_select(selectData: gr.SelectData):
-    return selectData.value
-
-    # onload_outputs = [
-    #     restrict_to_paths,
-    #     require_text_extractors,
-    #     vec_targets,
-    #     tag_setters,
-    #     tag_namespace_prefixes,
-    #     restrict_to_bk_namespaces,
-    #     allowed_item_type_prefixes,
-    #     restrict_to_query_types,
-    #     clip_model,
-    # ]
-
-    # search_tab.select(
-    #     fn=on_tab_load,
-    #     outputs=onload_outputs,
-    # )
-    # app.load(
-    #     fn=on_tab_load,
-    #     outputs=onload_outputs,
-    # )
-
-    # search_inputs = [
-    #     tag_input,
-    #     min_confidence,
-    #     max_results_per_page,
-    #     restrict_to_paths,
-    #     current_page,
-    #     order_by,
-    #     order,
-    #     tag_setters,
-    #     all_setters_required,
-    #     allowed_item_type_prefixes,
-    #     tag_namespace_prefixes,
-    #     path_search,
-    #     search_path_in,
-    #     path_order_by_rank,
-    #     extracted_text_search,
-    #     require_text_extractors,
-    #     extracted_text_order_by_rank,
-    #     restrict_search_to_bookmarks,
-    #     restrict_to_bk_namespaces,
-    #     order_by_time_added_bk,
-    #     any_text_search,
-    #     restrict_to_query_types,
-    #     order_by_any_text_rank,
-    #     vec_text_search,
-    #     vec_targets,
-    #     clip_model,
-    #     clip_text_search,
-    #     clip_image_search,
-    # ]
-
-    # search_outputs = [multi_view.files, number_of_results, current_page, link]
-
-    # action_search_button = gr.State("search_button")
-    # action_next_page = gr.State("next_page")
-    # action_previous_page = gr.State("previous_page")
-    # action_goto_page = gr.State("goto_page")
-
-    # submit_button.click(
-    #     fn=search,
-    #     inputs=[*search_inputs, action_search_button],
-    #     outputs=search_outputs,
-    # )
-
-    # current_page.release(
-    #     fn=search,
-    #     inputs=[*search_inputs, action_goto_page],
-    #     outputs=search_outputs,
-    # )
-
-    # previous_page.click(
-    #     fn=search,
-    #     inputs=[*search_inputs, action_previous_page],
-    #     outputs=search_outputs,
-    # )
-
-    # next_page.click(
-    #     fn=search,
-    #     inputs=[*search_inputs, action_next_page],
-    #     outputs=search_outputs,
-    # )
-
-    # multi_view.list_view.tag_list.select(fn=on_tag_select, outputs=[tag_input])
-
-    # def switch_vec_query_type(value: str):
-    #     update_list = [{"visible": False} for _ in range(5)]
-    #     (
-    #         vec_text_update,
-    #         vec_targets_update,
-    #         clip_text_update,
-    #         clip_image_update,
-    #         clip_model_update,
-    #     ) = update_list
-    #     if value == "CLIP Text Query":
-    #         clip_text_update["visible"] = True
-    #         clip_model_update["visible"] = True
-    #     elif value == "CLIP Reverse Image Search":
-    #         clip_image_update["visible"] = True
-    #         clip_model_update["visible"] = True
-    #     elif value == "Text Embeddings Search":
-    #         vec_text_update["visible"] = True
-    #         vec_targets_update["visible"] = True
-    #     return [gr.update(**update) for update in update_list]
-
-    # vec_query_type.change(
-    #     fn=switch_vec_query_type,
-    #     inputs=[vec_query_type],
-    #     outputs=[
-    #         vec_text_search,
-    #         vec_targets,
-    #         clip_text_search,
-    #         clip_image_search,
-    #         clip_model,
-    #     ],
-    # )
