@@ -19,7 +19,7 @@ def build_mime_type_filter_cte(
         ["items.type LIKE ? || '%'" for _ in filter.mime_type_prefixes]
     )
     cte = f"""
-    WITH {name} AS (
+    {name} AS (
         SELECT items.id
         FROM items
         {prev_cte_join_clause}

@@ -15,7 +15,7 @@ def build_path_filter_cte(filter: PathFilter, filter_on: str | None, name: str):
         ['files.path LIKE ? || "%"' for _ in filter.path_prefixes]
     )
     cte = f"""
-    WITH {name} AS (
+    {name} AS (
         SELECT items.id
         FROM items
         {prev_cte_join_clause}

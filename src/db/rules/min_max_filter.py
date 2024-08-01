@@ -18,7 +18,7 @@ def build_min_max_filter_cte(
         prev_cte_join_clause = ""
 
     cte = f"""
-    WITH {name} AS (
+    {name} AS (
         SELECT items.id
         FROM (
             SELECT 

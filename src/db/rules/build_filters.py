@@ -10,7 +10,6 @@ from src.db.rules.types import (
     MinMaxFilter,
     PathFilter,
     ProcessedItemsFilter,
-    RuleItemFilters,
 )
 
 
@@ -88,12 +87,17 @@ def build_query(positive: List[FilterType], negative: List[FilterType]):
         else ""
     )
     query = f"""
-        {', '.join(positive_ctes + negative_ctes)}
-        WITH final_results AS (
-            SELECT items.id
+        WITH
+        {', '.join(positive_ctes + negative_ctes)},
+        final_results AS (
+            SELECT {positive_last}.id
             FROM {positive_last}
             {negative_union_clause}
         )
+    """
+
+    result_query = f"""
+        {query}
         SELECT
             items.sha256,
             items.md5,
@@ -103,4 +107,9 @@ def build_query(positive: List[FilterType], negative: List[FilterType]):
         FROM items JOIN final_results
         ON items.id = final_results.id
     """
-    return query, positive_params + negative_params
+    count_query = f"""  
+        {query}
+        SELECT COUNT(*)
+        FROM final_results
+    """
+    return result_query, count_query, positive_params + negative_params
