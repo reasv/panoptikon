@@ -74,11 +74,13 @@ def on_selected_image_change_extra_actions(extra_actions: List[str]):
             selected_file_index = files.index(selected_file)
             if path.strip() == "":
                 interactive = False
-        gallery_update = (
-            gr.update(selected_index=selected_file_index)
-            if len(files) > 0
-            else gr.update(value=[])
-        )
+        # gallery_update = (
+        #     gr.update(selected_index=selected_file_index)
+        #     if len(files) > 0
+        #     else gr.update(value=[])
+        # )
+
+        gallery_update = gr.update() if len(files) > 0 else gr.update(value=[])
 
         # Do not update if the path is the same
         if path == selected_image_path:
