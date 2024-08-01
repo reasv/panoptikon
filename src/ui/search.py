@@ -103,11 +103,10 @@ def create_search_UI(
             multi_view.files: results,
             n_results: total_results,
             current_page: gr.update(value=page, maximum=int(total_pages)),
-            # link: gr.update(),
         }
 
     search_inputs = {*inputs, current_page}
-    search_outputs = [multi_view.files, n_results, current_page, link]
+    search_outputs = [multi_view.files, n_results, current_page]
 
     submit_button.click(
         fn=lambda args: search(args, search_action="search_button"),

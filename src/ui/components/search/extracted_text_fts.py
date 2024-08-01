@@ -2,18 +2,9 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
-from src.data_extractors.utils import (
-    get_ocr_threshold_from_env,
-    get_whisper_avg_logprob_threshold_from_env,
-)
 from src.db.search.types import ExtractedTextFilter, SearchQuery
 from src.types import SearchStats
 from src.ui.components.search.utils import AnyComponent
-
-threshold = min(
-    get_ocr_threshold_from_env(),
-    get_whisper_avg_logprob_threshold_from_env() or 0,
-)
 
 
 def create_extracted_text_fts_opts(
@@ -40,9 +31,9 @@ def create_extracted_text_fts_opts(
             elements.append(targets)
             confidence = gr.Slider(
                 key="extracted_text_confidence",
-                minimum=0.05,
+                minimum=0,
                 maximum=1,
-                value=threshold,
+                value=0,
                 step=0.05,
                 label="Min. Confidence Level from Text Extraction",
                 scale=1,
@@ -61,9 +52,9 @@ def create_extracted_text_fts_opts(
             elements.append(languages)
             language_confidence = gr.Slider(
                 key="extracted_text_language_confidence",
-                minimum=0.05,
+                minimum=0,
                 maximum=1,
-                value=threshold,
+                value=0,
                 step=0.05,
                 label="Min. Confidence Level for Language Detection",
                 scale=1,
@@ -85,12 +76,12 @@ def create_extracted_text_fts_opts(
             query.query.filters.extracted_text = ExtractedTextFilter(
                 query=text_query_val,
                 targets=[("text", target) for target in query_targets or []],
-                min_confidence=confidence_val,
+                min_confidence=confidence_val or None,
             )
             if languages_val:
                 query.query.filters.extracted_text.languages = languages_val
                 query.query.filters.extracted_text.language_min_confidence = (
-                    language_confidence_val
+                    language_confidence_val or None
                 )
         else:
             query.query.filters.extracted_text = None
@@ -108,8 +99,8 @@ def create_extracted_text_fts_opts(
         return {
             targets: gr.Dropdown(choices=search_stats.et_setters),
             languages: gr.Dropdown(choices=search_stats.et_stats.languages),
-            language_confidence: search_stats.et_stats.lowest_language_confidence,
-            confidence: search_stats.et_stats.lowest_confidence,
+            # language_confidence: search_stats.et_stats.lowest_language_confidence,
+            # confidence: search_stats.et_stats.lowest_confidence,
             tab: gr.Tab(visible=extracted_text_available),
             text_query: (
                 gr.Textbox(value="")
