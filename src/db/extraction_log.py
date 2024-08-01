@@ -221,6 +221,11 @@ def get_existing_setters(
     FROM setters
     JOIN items_extractions
     ON setters.id = items_extractions.setter_id
+    UNION
+    SELECT DISTINCT type, name
+    FROM setters
+    JOIN text_embeddings
+    ON setters.id = text_embeddings.setter_id
     """
 
     cursor = conn.cursor()
