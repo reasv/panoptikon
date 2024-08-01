@@ -83,7 +83,7 @@ def run_extraction_job(
         get_items_missing_data_extraction(
             conn,
             setter_id=setter_id,
-            mime_type_filter=model_opts.supported_mime_types(),
+            model_opts=model_opts,
         ),
         model_opts.batch_size(),
         transform_input_handle_error,
@@ -135,7 +135,7 @@ def run_extraction_job(
             get_items_missing_data_extraction(
                 conn,
                 setter_id=setter_id,
-                mime_type_filter=model_opts.supported_mime_types(),
+                model_opts=model_opts,
             ),
             [None, -1],
         )[1]

@@ -3,6 +3,7 @@ from datetime import datetime
 from time import time
 from typing import List, Tuple
 
+from src.data_extractors.models import ModelOpts
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_query
@@ -128,9 +129,7 @@ def add_item_to_log(
 
 
 def get_items_missing_data_extraction(
-    conn: sqlite3.Connection,
-    setter_id: int,
-    mime_type_filter: List[str] | None = None,
+    conn: sqlite3.Connection, setter_id: int, model_opts: ModelOpts
 ):
     """
     Get all items that should be processed by the given setter.
@@ -139,12 +138,10 @@ def get_items_missing_data_extraction(
     It also avoids joining with the files table to get the path,
     instead getting paths one by one.
     """
+    rules = model_opts.item_extraction_rules(setter_id)
     result_query, count_query, params = build_query(
-        positive=[
-            ProcessedItemsFilter(setter_id),
-            *([MimeFilter(mime_type_filter or [])] if mime_type_filter else []),
-        ],
-        negative=[],
+        positive=rules.positive,
+        negative=rules.negative,
     )
     pretty_print_SQL(result_query, params)
     start_time = time()

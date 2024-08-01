@@ -47,5 +47,5 @@ class FilterSet:
 
 @dataclass
 class RuleItemFilters:
-    positive: FilterSet
-    negative: FilterSet
+    positive: List[FilterType]
+    negative: List[FilterType]

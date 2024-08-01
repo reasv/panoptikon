@@ -10,6 +10,7 @@ from src.data_extractors.utils import (
     get_threshold_from_env,
     get_whisper_avg_logprob_threshold_from_env,
 )
+from src.db.rules.types import MimeFilter, ProcessedItemsFilter, RuleItemFilters
 from src.db.setters import delete_setter_by_name
 from src.db.tags import delete_tags_from_setter
 
@@ -63,6 +64,18 @@ class ModelOpts:
 
     def supported_mime_types(self) -> List[str] | None:
         return None
+
+    def item_extraction_rules(self, setter_id: int) -> RuleItemFilters:
+        rules = []
+        rules.append(ProcessedItemsFilter(setter_id=setter_id))
+        mime_types = self.supported_mime_types()
+        if mime_types:
+            rules.append(
+                MimeFilter(
+                    mime_type_prefixes=mime_types,
+                )
+            )
+        return RuleItemFilters(positive=rules, negative=[])
 
     def data_type(self) -> str:
         raise NotImplementedError
