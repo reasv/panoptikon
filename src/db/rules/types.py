@@ -1,18 +1,18 @@
 from dataclasses import dataclass
 from typing import List, Literal, Union
 
-from sqlalchemy import column
-from zipp import Path
 
-
+@dataclass
 class PathFilter:
     path_prefixes: List[str]
 
 
+@dataclass
 class MimeFilter:
     mime_type_prefixes: List[str]
 
 
+@dataclass
 class MinMaxFilter:
     min_value: float
     max_value: float
@@ -24,13 +24,28 @@ class MinMaxFilter:
         "video_tracks",
         "audio_tracks",
         "subtitle_tracks",
+        "largest_dimension",
+        "smallest_dimension",
     ]
 
 
-FilterType = Union[PathFilter, MimeFilter, MinMaxFilter]
+@dataclass
+class ProcessedItemsFilter:
+    setter_id: int
+
+
+FilterType = Union[PathFilter, MimeFilter, MinMaxFilter, ProcessedItemsFilter]
 
 
 @dataclass
-class FileFilters:
-    positive: List[FilterType]
-    negative: List[FilterType]
+class FilterSet:
+    processed_items: ProcessedItemsFilter
+    mime_types: MimeFilter
+    paths: PathFilter
+    min_max: List[MinMaxFilter]
+
+
+@dataclass
+class RuleItemFilters:
+    positive: FilterSet
+    negative: FilterSet

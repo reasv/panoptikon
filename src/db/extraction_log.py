@@ -129,7 +129,7 @@ def get_items_missing_data_extraction(
     mime_type_filter: List[str] | None = None,
 ):
     """
-    Get all items that have not been scanned by the given setter.
+    Get all items that should be processed by the given setter.
     More efficient than get_items_missing_tags as it does not require
     a join with the tags table.
     It also avoids joining with the files table to get the path,
@@ -156,7 +156,7 @@ def get_items_missing_data_extraction(
         , {new_cte} AS (
             SELECT items.id
             FROM {last_cte}
-            JOIN items ON items.id = unprocessed_items.id
+            JOIN items ON items.id = {last_cte}.id
             WHERE ( {or_conditions} )"
         )
         """
