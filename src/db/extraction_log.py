@@ -6,7 +6,7 @@ from typing import List, Tuple
 from src.data_extractors.models import ModelOpts
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
-from src.db.rules.build_filters import build_query
+from src.db.rules.build_filters import build_multirule_query
 from src.db.rules.types import MimeFilter, ProcessedItemsFilter
 from src.db.setters import upsert_setter
 from src.db.utils import pretty_print_SQL
@@ -139,11 +139,8 @@ def get_items_missing_data_extraction(
     instead getting paths one by one.
     """
     rules = model_opts.item_extraction_rules(setter_id)
-    prefix = "rule1"
-    query, params = build_query(
-        positive=rules.positive,
-        negative=rules.negative,
-        prefix=prefix,
+    query, params = build_multirule_query(
+        [rules],
     )
     result_query = f"""
         WITH
@@ -154,14 +151,14 @@ def get_items_missing_data_extraction(
             items.type,
             items.size,
             items.time_added
-        FROM items JOIN {prefix}_final_results
-        ON items.id = {prefix}_final_results.id
+        FROM items JOIN multirule_results
+        ON items.id = multirule_results.id
     """
     count_query = f"""
         WITH
         {query}
         SELECT COUNT(*)
-        FROM {prefix}_final_results
+        FROM multirule_results
     """
     pretty_print_SQL(result_query, params)
     start_time = time()
