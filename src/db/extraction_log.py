@@ -139,10 +139,30 @@ def get_items_missing_data_extraction(
     instead getting paths one by one.
     """
     rules = model_opts.item_extraction_rules(setter_id)
-    result_query, count_query, params = build_query(
+    prefix = "rule1"
+    query, params = build_query(
         positive=rules.positive,
         negative=rules.negative,
+        prefix=prefix,
     )
+    result_query = f"""
+        WITH
+        {query}
+        SELECT
+            items.sha256,
+            items.md5,
+            items.type,
+            items.size,
+            items.time_added
+        FROM items JOIN {prefix}_final_results
+        ON items.id = {prefix}_final_results.id
+    """
+    count_query = f"""
+        WITH
+        {query}
+        SELECT COUNT(*)
+        FROM {prefix}_final_results
+    """
     pretty_print_SQL(result_query, params)
     start_time = time()
     cursor = conn.cursor()

@@ -1,4 +1,7 @@
+from sys import prefix
 from typing import List
+
+from numpy import full
 
 from src.db.rules.mime_type_filter import build_mime_type_filter_cte
 from src.db.rules.min_max_filter import build_min_max_filter_cte
@@ -10,6 +13,7 @@ from src.db.rules.types import (
     MinMaxFilter,
     PathFilter,
     ProcessedItemsFilter,
+    RuleItemFilters,
 )
 
 
@@ -60,14 +64,16 @@ def build_independent_filters_cte(name_prefix: str, filters: List[FilterType]):
     return ctes, params, cte_names
 
 
-def build_query(positive: List[FilterType], negative: List[FilterType]):
+def build_query(
+    positive: List[FilterType], negative: List[FilterType], prefix: str
+):
     positive_ctes, positive_params, positive_last = build_chained_filters_cte(
-        "positive",
+        prefix + "_positive",
         positive,
     )
     negative_ctes, negative_params, negative_cte_names = (
         build_independent_filters_cte(
-            "negative",
+            prefix + "_negative",
             negative,
         )
     )
@@ -87,29 +93,44 @@ def build_query(positive: List[FilterType], negative: List[FilterType]):
         else ""
     )
     query = f"""
-        WITH
         {', '.join(positive_ctes + negative_ctes)},
-        final_results AS (
+        {prefix}_final_results AS (
             SELECT {positive_last}.id
             FROM {positive_last}
             {negative_union_clause}
         )
     """
 
-    result_query = f"""
-        {query}
-        SELECT
-            items.sha256,
-            items.md5,
-            items.type,
-            items.size,
-            items.time_added
-        FROM items JOIN final_results
-        ON items.id = final_results.id
+    return query, positive_params + negative_params
+
+
+def build_multirule_query(rules: List[RuleItemFilters]):
+    full_params = []
+    full_query = ""
+    final_result_cte_names = []
+    for i, rule in enumerate(rules):
+        prefix = f"rule{i + 1}"
+        query, params = build_query(rule.positive, rule.negative, prefix)
+        full_params.extend(params)
+        # Combine the CTEs
+        full_query = f"{full_query}, {query}"
+        final_result_cte_names.append(f"{prefix}_final_results")
+
+    final_result_union = ""
+    for i, cte_name in enumerate(final_result_cte_names):
+        if i == 0:
+            final_result_union = f"SELECT id FROM {cte_name}"
+        else:
+            final_result_union = (
+                f"{final_result_union} UNION SELECT id FROM {cte_name}"
+            )
+
+    full_query = f"""
+        {full_query},
+        multirule_results AS (
+            SELECT id
+            FROM ({final_result_union})
+        )
     """
-    count_query = f"""  
-        {query}
-        SELECT COUNT(*)
-        FROM final_results
-    """
-    return result_query, count_query, positive_params + negative_params
+
+    return full_query, full_params
