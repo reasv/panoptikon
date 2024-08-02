@@ -427,6 +427,12 @@ def initialize_database(conn: sqlite3.Connection):
         ("extraction_rules_setters", ["setter_name"]),
         ("setters", ["type"]),
         ("setters", ["name"]),
+        ("items", ["width"]),
+        ("items", ["height"]),
+        ("items", ["duration"]),
+        ("items", ["audio_tracks"]),
+        ("items", ["video_tracks"]),
+        ("items", ["subtitle_tracks"]),
     ]
 
     for table, columns in indices:
