@@ -4,11 +4,6 @@ from src.db.rules.types import MinMaxFilter
 def build_min_max_filter_cte(
     filter: MinMaxFilter, filter_on: str | None, name: str
 ):
-    if filter.max_value:
-        less_than_clause = f"AND items_data.{filter.column_name} <= ?"
-    else:
-        less_than_clause = ""
-
     if filter_on:
         prev_cte_join_clause = f"""
         JOIN
@@ -16,6 +11,16 @@ def build_min_max_filter_cte(
         """
     else:
         prev_cte_join_clause = ""
+
+    if filter.max_value == filter.min_value:
+        where_conditions = [f"items_data.{filter.column_name} = ?"]
+        params = [filter.min_value]
+    else:
+        where_conditions = [f"items_data.{filter.column_name} >= ?"]
+        params = [filter.min_value]
+        if filter.max_value:
+            where_conditions.append(f"items_data.{filter.column_name} <= ?")
+            params.append(filter.max_value)
 
     cte = f"""
     {name} AS (
@@ -35,12 +40,7 @@ def build_min_max_filter_cte(
                 items
             {prev_cte_join_clause}
         ) AS items_data
-        WHERE items_data.{filter.column_name} >= ?
-        {less_than_clause}
+        WHERE {' AND '.join(where_conditions)}
     )
     """
-    return cte, (
-        [filter.min_value, filter.max_value]
-        if filter.max_value
-        else [filter.min_value]
-    )
+    return cte, params
