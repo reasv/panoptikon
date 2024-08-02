@@ -132,3 +132,74 @@ def update_rule(
             for setter_type, setter_name in setters
         ],
     )
+
+
+def get_rules_for_setter(
+    conn: sqlite3.Connection, setter_type: str, setter_name: str
+) -> List[StoredRule]:
+    cursor = conn.cursor()
+
+    # First, get all rule IDs that have this setter
+    cursor.execute(
+        """
+        SELECT DISTINCT rule_id 
+        FROM extraction_rules_setters 
+        WHERE setter_type = ? AND setter_name = ?
+    """,
+        (setter_type, setter_name),
+    )
+
+    rule_ids = [row[0] for row in cursor.fetchall()]
+
+    if not rule_ids:
+        return []  # No rules found for this setter
+
+    # Now, get the details for these rules
+    stored_rules = []
+    for rule_id in rule_ids:
+        # Get the rule data
+        cursor.execute(
+            "SELECT rule FROM extraction_rules WHERE id = ?", (rule_id,)
+        )
+        rule_data = cursor.fetchone()
+
+        if rule_data is None:
+            continue  # This shouldn't happen, but just in case
+
+        # Get all setters for this rule
+        cursor.execute(
+            """
+            SELECT setter_type, setter_name 
+            FROM extraction_rules_setters 
+            WHERE rule_id = ?
+        """,
+            (rule_id,),
+        )
+        setters = cursor.fetchall()
+
+        # Deserialize the filters
+        filters = deserialize_rule_item_filters(rule_data[0])
+
+        stored_rules.append(
+            StoredRule(id=rule_id, setters=setters, filters=filters)
+        )
+
+    return stored_rules
+
+
+def get_rules_for_setter_id(
+    conn: sqlite3.Connection, setter_id: int
+) -> List[StoredRule]:
+    cursor = conn.cursor()
+
+    # First, get the setter type and name
+    cursor.execute("SELECT type, name FROM setters WHERE id = ?", (setter_id,))
+    setter_data = cursor.fetchone()
+
+    if setter_data is None:
+        return []  # No setter found with this id
+
+    setter_type, setter_name = setter_data
+
+    # Use the existing function to get the rules
+    return get_rules_for_setter(conn, setter_type, setter_name)

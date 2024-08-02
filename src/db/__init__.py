@@ -148,7 +148,7 @@ def initialize_database(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY,
             type TEXT NOT NULL,
             name TEXT NOT NULL,
-            UNIQUE(name, name)
+            UNIQUE(type, name)
         )
         """
     )
