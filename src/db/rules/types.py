@@ -12,21 +12,35 @@ class MimeFilter:
     mime_type_prefixes: List[str]
 
 
+min_max_columns = [
+    "width",
+    "height",
+    "duration",
+    "size",
+    "video_tracks",
+    "audio_tracks",
+    "subtitle_tracks",
+    "largest_dimension",
+    "smallest_dimension",
+]
+MinMaxColumnType = Literal[
+    "width",
+    "height",
+    "duration",
+    "size",
+    "video_tracks",
+    "audio_tracks",
+    "subtitle_tracks",
+    "largest_dimension",
+    "smallest_dimension",
+]
+
+
 @dataclass
 class MinMaxFilter:
     min_value: float
     max_value: float
-    column_name: Literal[
-        "width",
-        "height",
-        "duration",
-        "size",
-        "video_tracks",
-        "audio_tracks",
-        "subtitle_tracks",
-        "largest_dimension",
-        "smallest_dimension",
-    ]
+    column_name: MinMaxColumnType
 
 
 @dataclass

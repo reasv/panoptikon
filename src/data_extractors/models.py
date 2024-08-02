@@ -1,4 +1,5 @@
 import sqlite3
+from tkinter import ALL
 from typing import Any, Dict, Generator, List, Tuple
 
 from src.data_extractors.extraction_jobs.types import (
@@ -393,3 +394,11 @@ class WhisperSTTModel(ModelOpts):
 
     def threshold(self) -> float | None:
         return get_whisper_avg_logprob_threshold_from_env()
+
+
+ALL_MODEL_OPTS = [
+    TagsModel,
+    OCRModel,
+    ImageEmbeddingModel,
+    WhisperSTTModel,
+]
