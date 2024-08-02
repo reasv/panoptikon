@@ -65,9 +65,13 @@ class ModelOpts:
     def supported_mime_types(self) -> List[str] | None:
         return None
 
-    def item_extraction_rules(self, setter_id: int) -> RuleItemFilters:
+    def item_extraction_rules(self) -> RuleItemFilters:
         rules = []
-        rules.append(ProcessedItemsFilter(setter_id=setter_id))
+        rules.append(
+            ProcessedItemsFilter(
+                setter_type=self.data_type(), setter_name=self.setter_id()
+            )
+        )
         mime_types = self.supported_mime_types()
         if mime_types:
             rules.append(
@@ -129,9 +133,7 @@ class TagsModel(ModelOpts):
         return "wd-swinv2-tagger-v3"
 
     def run_extractor(self, conn: sqlite3.Connection):
-        from src.data_extractors.extraction_jobs.tags import (
-            run_tag_extractor_job,
-        )
+        from src.data_extractors.extraction_jobs.tags import run_tag_extractor_job
 
         return run_tag_extractor_job(conn, self)
 
@@ -212,9 +214,7 @@ class OCRModel(ModelOpts):
         return "doctr|db_resnet50|crnn_mobilenet_v3_small"
 
     def run_extractor(self, conn: sqlite3.Connection):
-        from src.data_extractors.extraction_jobs.ocr import (
-            run_ocr_extractor_job,
-        )
+        from src.data_extractors.extraction_jobs.ocr import run_ocr_extractor_job
 
         return run_ocr_extractor_job(conn, self)
 
