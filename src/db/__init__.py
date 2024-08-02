@@ -344,6 +344,25 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS extraction_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule TEXT NOT NULL,
+            );
+        """
+    )
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS extraction_rules_setters (
+                rule_id INTEGER NOT NULL,
+                setter_type TEXT NOT NULL,
+                setter_name TEXT NOT NULL,
+                FOREIGN KEY(rule_id) REFERENCES extraction_rules(id) ON DELETE CASCADE,
+            );
+        """
+    )
+
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -402,6 +421,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("text_embeddings", ["setter_id"]),
         ("text_embeddings", ["text_setter_id"]),
         ("text_embeddings", ["text_id"]),
+        ("extraction_rules_setters", ["rule_id"]),
+        ("extraction_rules_setters", ["setter_type"]),
+        ("extraction_rules_setters", ["setter_name"]),
+        ("setters", ["type"]),
+        ("setters", ["name"]),
     ]
 
     for table, columns in indices:
