@@ -200,7 +200,7 @@ def create_rule_builder(rule: StoredRule, rules_state: gr.State):
         gr.Markdown(
             "## Items MUST **NOT** MATCH **ANY** of the following filters:"
         )
-        for i, filter in enumerate(rule.filters.positive):
+        for i, filter in enumerate(rule.filters.negative):
             create_filter_edit(rules_state, rule, "neg", i, filter)
 
     with gr.Accordion(label="Add Filter"):

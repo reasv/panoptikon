@@ -11,7 +11,14 @@ from typing import (
     get_origin,
 )
 
-from src.db.rules.types import FilterType, RuleItemFilters
+from src.db.rules.types import (
+    FilterType,
+    MimeFilter,
+    MinMaxFilter,
+    PathFilter,
+    ProcessedItemsFilter,
+    RuleItemFilters,
+)
 
 T = TypeVar("T")
 
@@ -63,23 +70,30 @@ class RuleItemFiltersEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-def serialize_rule_item_filters(rule_filters: RuleItemFilters) -> str:
-    return json.dumps(rule_filters, cls=RuleItemFiltersEncoder)
+class FilterEncoder(json.JSONEncoder):
+    def default(self, o: Any) -> Any:
+        if isinstance(
+            o, (PathFilter, MimeFilter, ProcessedItemsFilter, MinMaxFilter)
+        ):
+            return {"type": o.__class__.__name__, "data": o.__dict__}
+        return super().default(o)
 
 
-def deserialize_rule_item_filters(json_str: str) -> RuleItemFilters:
-    def decode_rule_item_filters(dct):
-        if "__dataclass__" in dct and dct["__dataclass__"] == "RuleItemFilters":
-            return RuleItemFilters(
-                positive=[
-                    deserialize_filter(json.dumps(item))
-                    for item in dct["positive"]
-                ],
-                negative=[
-                    deserialize_filter(json.dumps(item))
-                    for item in dct["negative"]
-                ],
-            )
-        return dct
+def serialize_rule_item_filters(filters: RuleItemFilters) -> str:
+    return json.dumps(
+        {"positive": filters.positive, "negative": filters.negative},
+        cls=FilterEncoder,
+    )
 
-    return json.loads(json_str, object_hook=decode_rule_item_filters)
+
+def deserialize_rule_item_filters(serialized: str) -> RuleItemFilters:
+    data = json.loads(serialized)
+
+    def deserialize_filter(filter_data):
+        filter_type = globals()[filter_data["type"]]
+        return filter_type(**filter_data["data"])
+
+    return RuleItemFilters(
+        positive=[deserialize_filter(f) for f in data["positive"]],
+        negative=[deserialize_filter(f) for f in data["negative"]],
+    )

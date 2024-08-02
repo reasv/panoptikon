@@ -2,10 +2,7 @@ import sqlite3
 from tkinter import ALL
 from typing import Any, Dict, Generator, List, Tuple
 
-from src.data_extractors.extraction_jobs.types import (
-    ExtractorJobProgress,
-    ExtractorJobReport,
-)
+import src.data_extractors.extraction_jobs.types as job_types
 from src.data_extractors.utils import (
     get_ocr_threshold_from_env,
     get_threshold_from_env,
@@ -85,7 +82,9 @@ class ModelOpts:
 
     def run_extractor(
         self, conn: sqlite3.Connection
-    ) -> Generator[ExtractorJobProgress | ExtractorJobReport, Any, None]:
+    ) -> Generator[
+        job_types.ExtractorJobProgress | job_types.ExtractorJobReport, Any, None
+    ]:
         raise NotImplementedError
 
     def setter_name(self) -> str:

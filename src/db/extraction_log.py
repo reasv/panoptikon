@@ -1,9 +1,11 @@
 import sqlite3
 from datetime import datetime
 from time import time
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
-from src.data_extractors.models import ModelOpts
+if TYPE_CHECKING:
+    import src.data_extractors.models as models
+
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_multirule_query
@@ -130,7 +132,7 @@ def add_item_to_log(
 
 
 def get_items_missing_data_extraction(
-    conn: sqlite3.Connection, setter_id: int, model_opts: ModelOpts
+    conn: sqlite3.Connection, setter_id: int, model_opts: "models.ModelOpts"
 ):
     """
     Get all items that should be processed by the given setter.

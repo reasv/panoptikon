@@ -349,7 +349,7 @@ def initialize_database(conn: sqlite3.Connection):
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                rule TEXT NOT NULL,
+                rule TEXT NOT NULL
             );
         """
     )
@@ -359,7 +359,7 @@ def initialize_database(conn: sqlite3.Connection):
                 rule_id INTEGER NOT NULL,
                 setter_type TEXT NOT NULL,
                 setter_name TEXT NOT NULL,
-                FOREIGN KEY(rule_id) REFERENCES extraction_rules(id) ON DELETE CASCADE,
+                FOREIGN KEY(rule_id) REFERENCES extraction_rules(id) ON DELETE CASCADE
             );
         """
     )
