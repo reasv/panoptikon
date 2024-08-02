@@ -335,6 +335,7 @@ def initialize_database(conn: sqlite3.Connection):
             text_setter_id INTEGER NOT NULL,
             text_id INTEGER NOT NULL,
             embedding float[],
+            UNIQUE(setter_id, text_id),
             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
             FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
             FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
