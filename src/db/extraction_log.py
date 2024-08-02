@@ -7,6 +7,8 @@ from src.data_extractors.models import ModelOpts
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_multirule_query
+from src.db.rules.rules import get_rules_for_setter_id
+from src.db.rules.types import combine_rule_item_filters
 from src.db.setters import upsert_setter
 from src.db.utils import pretty_print_SQL
 from src.types import ItemWithPath, LogRecord
@@ -137,9 +139,19 @@ def get_items_missing_data_extraction(
     It also avoids joining with the files table to get the path,
     instead getting paths one by one.
     """
-    rules = model_opts.item_extraction_rules(setter_id)
+    model_filters = model_opts.item_extraction_rules()
+    user_rules = get_rules_for_setter_id(conn, setter_id)
+    # Merge each user rule with the model's buit-in filters
+    combined_filters = [
+        combine_rule_item_filters(model_filters, user_rule.filters)
+        for user_rule in user_rules
+    ]
+    # If no user rules are present, use only the model's built-in filters
+    if not combined_filters:
+        combined_filters = [model_filters]
+
     query, params = build_multirule_query(
-        [rules],
+        combined_filters,
     )
     result_query = f"""
         WITH
