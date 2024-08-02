@@ -4,6 +4,7 @@ import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
 import PIL.Image
+
 from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extraction_jobs import run_extraction_job
@@ -111,7 +112,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
             Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]
         ],
     ):
-        handle_individual_result(conn, model.setter_id(), item, outputs)
+        handle_individual_result(conn, model.setter_name(), item, outputs)
 
     return run_extraction_job(
         conn,

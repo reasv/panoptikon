@@ -29,10 +29,10 @@ class ModelOpts:
         self._init(model_name)
 
     def __str__(self):
-        return self.setter_id()
+        return self.setter_name()
 
     def __repr__(self):
-        return self.setter_id()
+        return self.setter_name()
 
     def batch_size(self) -> int:
         return self._batch_size
@@ -54,10 +54,8 @@ class ModelOpts:
         return cls.available_models()[0]
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
-        delete_setter_by_name(conn, self.data_type(), self.setter_id())
-        return (
-            f"Deleted text extracted from items by model {self.setter_id()}.\n"
-        )
+        delete_setter_by_name(conn, self.data_type(), self.setter_name())
+        return f"Deleted text extracted from items by model {self.setter_name()}.\n"
 
     def threshold(self) -> float | None:
         return None
@@ -69,7 +67,7 @@ class ModelOpts:
         rules = []
         rules.append(
             ProcessedItemsFilter(
-                setter_type=self.data_type(), setter_name=self.setter_id()
+                setter_type=self.data_type(), setter_name=self.setter_name()
             )
         )
         mime_types = self.supported_mime_types()
@@ -89,7 +87,7 @@ class ModelOpts:
     ) -> Generator[ExtractorJobProgress | ExtractorJobReport, Any, None]:
         raise NotImplementedError
 
-    def setter_id(self) -> str:
+    def setter_name(self) -> str:
         raise NotImplementedError
 
     @classmethod
@@ -125,15 +123,17 @@ class TagsModel(ModelOpts):
     def description(cls) -> str:
         return "Generate danbooru-type tags for images and videos"
 
-    def setter_id(self) -> str:
-        return TagsModel._model_to_setter_id(self.model_repo())
+    def setter_name(self) -> str:
+        return TagsModel._model_to_setter_name(self.model_repo())
 
     @classmethod
     def default_model(cls) -> str:
         return "wd-swinv2-tagger-v3"
 
     def run_extractor(self, conn: sqlite3.Connection):
-        from src.data_extractors.extraction_jobs.tags import run_tag_extractor_job
+        from src.data_extractors.extraction_jobs.tags import (
+            run_tag_extractor_job,
+        )
 
         return run_tag_extractor_job(conn, self)
 
@@ -159,7 +159,7 @@ class TagsModel(ModelOpts):
         return {name.split("/")[-1]: name for name in V3_MODELS}
 
     @classmethod
-    def _model_to_setter_id(cls, model_repo: str) -> str:
+    def _model_to_setter_name(cls, model_repo: str) -> str:
         # Reverse the available models dict
         model_to_name = {
             v: k for k, v in cls._available_models_mapping().items()
@@ -172,12 +172,12 @@ class TagsModel(ModelOpts):
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
         tags_removed, items_tags_removed = delete_tags_from_setter(
-            conn, self.setter_id()
+            conn, self.setter_name()
         )
 
         return (
             f"Removed {tags_removed} tags from {items_tags_removed} "
-            + f"items tagged by model {self.setter_id()}.\n"
+            + f"items tagged by model {self.setter_name()}.\n"
         )
 
     def threshold(self) -> float | None:
@@ -204,8 +204,8 @@ class OCRModel(ModelOpts):
     def description(cls) -> str:
         return "Extract text from images, videos, and documents through OCR"
 
-    def setter_id(self) -> str:
-        return OCRModel._model_to_setter_id(
+    def setter_name(self) -> str:
+        return OCRModel._model_to_setter_name(
             self.detection_model(), self.recognition_model()
         )
 
@@ -214,7 +214,9 @@ class OCRModel(ModelOpts):
         return "doctr|db_resnet50|crnn_mobilenet_v3_small"
 
     def run_extractor(self, conn: sqlite3.Connection):
-        from src.data_extractors.extraction_jobs.ocr import run_ocr_extractor_job
+        from src.data_extractors.extraction_jobs.ocr import (
+            run_ocr_extractor_job,
+        )
 
         return run_ocr_extractor_job(conn, self)
 
@@ -235,7 +237,7 @@ class OCRModel(ModelOpts):
         }
 
     @classmethod
-    def _model_to_setter_id(
+    def _model_to_setter_name(
         cls, detection_model: str, recognition_model: str
     ) -> str:
         # Reverse the available models dict
@@ -275,8 +277,8 @@ class ImageEmbeddingModel(ModelOpts):
     def description(cls) -> str:
         return "Generate Image Embeddings using OpenAI's CLIP model for semantic image search"
 
-    def setter_id(self) -> str:
-        return ImageEmbeddingModel._model_to_setter_id(
+    def setter_name(self) -> str:
+        return ImageEmbeddingModel._model_to_setter_name(
             self.clip_model_name(), self.clip_model_checkpoint()
         )
 
@@ -301,7 +303,7 @@ class ImageEmbeddingModel(ModelOpts):
         }
 
     @classmethod
-    def _model_to_setter_id(cls, model_name: str, checkpoint: str) -> str:
+    def _model_to_setter_name(cls, model_name: str, checkpoint: str) -> str:
         # Reverse the available models dict
         model_to_name = {
             v: k for k, v in cls._available_models_mapping().items()
@@ -342,8 +344,8 @@ class WhisperSTTModel(ModelOpts):
     def description(cls) -> str:
         return "Extract text from audio in audio and video files using OpenAI's Whisper model"
 
-    def setter_id(self) -> str:
-        return WhisperSTTModel._model_to_setter_id(self.model_repo())
+    def setter_name(self) -> str:
+        return WhisperSTTModel._model_to_setter_name(self.model_repo())
 
     def run_extractor(self, conn: sqlite3.Connection):
         from src.data_extractors.extraction_jobs.whisper import (
@@ -376,7 +378,7 @@ class WhisperSTTModel(ModelOpts):
         return _MODELS
 
     @classmethod
-    def _model_to_setter_id(cls, model_repo: str) -> str:
+    def _model_to_setter_name(cls, model_repo: str) -> str:
         # Reverse the available models dict
         model_to_name = {
             v: k for k, v in cls._available_models_mapping().items()

@@ -61,7 +61,7 @@ def run_extraction_job(
         conn,
         scan_time,
         model_opts.data_type(),
-        model_opts.setter_id(),
+        model_opts.setter_name(),
         model_opts.threshold(),
         model_opts.batch_size(),
     )
@@ -116,7 +116,7 @@ def run_extraction_job(
         total_items = remaining + processed_items
         eta_str = estimate_eta(scan_time, processed_items, remaining)
         print(
-            f"{model_opts.setter_id()}: ({processed_items}/{total_items}) "
+            f"{model_opts.setter_name()}: ({processed_items}/{total_items}) "
             + f"(ETA: {eta_str}) "
             + f"Processed ({item.type}) {item.path}"
         )
