@@ -340,7 +340,7 @@ def create_add_filter(
                     """
                     Allows you to filter files based on their path.
 
-                    Requires that the file's path starts with one of the given strings.
+                    Requires that the file's path start with one of the given strings.
                     Do not use glob patterns like '*' or '?'.
                     If you want to match all files in a directory, remember to include the trailing slash.
                     You can type in custom values.
