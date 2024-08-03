@@ -2,10 +2,9 @@ import sqlite3
 from typing import Any, Dict, Generator, List, Tuple, Type
 
 import src.data_extractors.extraction_jobs.types as job_types
-from src.data_extractors.utils import (
-    get_ocr_threshold_from_env,
-    get_threshold_from_env,
-    get_whisper_avg_logprob_threshold_from_env,
+from src.db.group_settings import (
+    retrieve_model_group_settings,
+    save_model_group_settings,
 )
 from src.db.rules.types import MimeFilter, ProcessedItemsFilter, RuleItemFilters
 from src.db.setters import delete_setter_by_name
@@ -43,6 +42,35 @@ class ModelOpts:
         return 64
 
     @classmethod
+    def default_threshold(cls) -> float | None:
+        return None
+
+    @classmethod
+    def get_group_batch_size(cls, conn: sqlite3.Connection) -> int:
+        settings = retrieve_model_group_settings(conn, cls.group_name())
+        if settings:
+            return settings[0]
+        return cls.default_batch_size()
+
+    @classmethod
+    def get_group_threshold(cls, conn: sqlite3.Connection) -> float | None:
+        settings = retrieve_model_group_settings(conn, cls.group_name())
+        if settings:
+            return settings[1]
+
+    @classmethod
+    def set_group_threshold(cls, conn: sqlite3.Connection, threshold: float):
+        save_model_group_settings(
+            conn, cls.group_name(), cls.get_group_batch_size(conn), threshold
+        )
+
+    @classmethod
+    def set_group_batch_size(cls, conn: sqlite3.Connection, batch_size: int):
+        save_model_group_settings(
+            conn, cls.group_name(), batch_size, cls.get_group_threshold(conn)
+        )
+
+    @classmethod
     def valid_model(cls, model_name: str) -> bool:
         return model_name in cls.available_models()
 
@@ -53,9 +81,6 @@ class ModelOpts:
     def delete_extracted_data(self, conn: sqlite3.Connection):
         delete_setter_by_name(conn, self.data_type(), self.setter_name())
         return f"Deleted text extracted from items by model {self.setter_name()}.\n"
-
-    def threshold(self) -> float | None:
-        return None
 
     def supported_mime_types(self) -> List[str] | None:
         return None
@@ -129,6 +154,10 @@ class TagsModel(ModelOpts):
         return "Tags"
 
     @classmethod
+    def default_threshold(cls) -> float | None:
+        return 0.1
+
+    @classmethod
     def description(cls) -> str:
         return "Generate danbooru-type tags for images and videos"
 
@@ -185,9 +214,6 @@ class TagsModel(ModelOpts):
         msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
         return msg
 
-    def threshold(self) -> float | None:
-        return get_threshold_from_env()
-
 
 class OCRModel(ModelOpts):
     _detection_model: str
@@ -197,6 +223,10 @@ class OCRModel(ModelOpts):
         self._detection_model, self._recognition_model = (
             OCRModel._available_models_mapping()[model_name]
         )
+
+    @classmethod
+    def default_threshold(cls) -> float | None:
+        return 0.41
 
     @classmethod
     def data_type(cls) -> str:
@@ -261,9 +291,6 @@ class OCRModel(ModelOpts):
 
     def detection_model(self) -> str:
         return self._detection_model
-
-    def threshold(self) -> float | None:
-        return get_ocr_threshold_from_env()
 
 
 class ImageEmbeddingModel(ModelOpts):
@@ -345,6 +372,10 @@ class WhisperSTTModel(ModelOpts):
         return 1
 
     @classmethod
+    def default_threshold(cls) -> float | None:
+        return 0
+
+    @classmethod
     def group_name(cls) -> str:
         return "whisper"
 
@@ -410,9 +441,6 @@ class WhisperSTTModel(ModelOpts):
 
     def supported_mime_types(self) -> List[str] | None:
         return ["audio/", "video/"]
-
-    def threshold(self) -> float | None:
-        return get_whisper_avg_logprob_threshold_from_env()
 
 
 class ModelOptsFactory:
