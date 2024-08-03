@@ -14,7 +14,7 @@ class FileScanData:
     modified: bool
     width: int | None = None
     height: int | None = None
-    duration: int | None = None
+    duration: float | None = None
     audio_tracks: int | None = None
     video_tracks: int | None = None
     subtitle_tracks: int | None = None
