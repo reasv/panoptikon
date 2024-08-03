@@ -76,6 +76,9 @@ def get_mime_type(file_path: str):
     Get the MIME type of the file at the given path.
     """
     mime_type, _ = mimetypes.guess_type(file_path, strict=False)
+    assert (
+        mime_type is not None
+    ), f"Could not determine MIME type for {file_path}"
     return mime_type
 
 
