@@ -22,7 +22,7 @@ def on_item_change(selected_files: List[FileSearchResult]):
     choices = [
         (f"{model_type}|{setter}", (model_type, setter))
         for model_type, setter in setters_pairs
-        if model_type not in ["tags", "clip"]
+        if model_type == "text"
     ]
     conn.close()
     return extracted_texts, gr.update(choices=choices)
