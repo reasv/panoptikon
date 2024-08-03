@@ -11,28 +11,30 @@ def get_most_common_tags(
 ):
     cursor = conn.cursor()
     namespace_clause = "AND tags.namespace LIKE ? || '%'" if namespace else ""
-    setters_clause = (
-        f"AND tags.setter IN ({','.join(['?']*len(setters))})"
-        if setters
-        else ""
-    )
+
     confidence_clause = (
         f"AND tags_items.confidence >= ?" if confidence_threshold else ""
+    )
+    setters_clause = (
+        f"AND setters.name IN ({','.join(['?']*len(setters))})"
+        if setters
+        else ""
     )
     setters = setters or []
     query_args = [
         arg
-        for arg in [namespace, *setters, confidence_threshold, limit]
+        for arg in [namespace, confidence_threshold, *setters, limit]
         if arg is not None
     ]
 
     query = f"""
     SELECT namespace, name, COUNT(*) as count
-    FROM tags_setters as tags
+    FROM tags
     JOIN tags_items ON tags.id = tags_items.tag_id
     {namespace_clause}
-    {setters_clause}
     {confidence_clause}
+    JOIN setters ON tags_items.setter_id = setters.id
+    {setters_clause}
     GROUP BY namespace, name
     ORDER BY count DESC
     LIMIT ?
@@ -60,19 +62,18 @@ def get_most_common_tags_frequency(
     # Get the total number of item_setter pairs
     cursor = conn.cursor()
     setters_clause = (
-        f"WHERE data_extraction_log.setter IN ({','.join(['?']*len(setters))})"
+        f"WHERE setters.name IN ({','.join(['?']*len(setters))})"
         if setters
         else ""
     )
     cursor.execute(
         f"""
         SELECT COUNT(
-            DISTINCT items_extractions.item_id || '-' || data_extraction_log.setter
+            DISTINCT tags_items.item_id || '-' || tags_items.setter_id
         ) AS distinct_count
-        FROM items_extractions
-        JOIN data_extraction_log
-        ON items_extractions.log_id = data_extraction_log.id
-        AND data_extraction_log.type = 'tags'
+        FROM tags_items
+        JOIN setters
+        ON tags_items.setter_id = setters.id
         {setters_clause}""",
         setters if setters else (),
     )

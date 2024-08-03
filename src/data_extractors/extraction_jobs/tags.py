@@ -56,6 +56,7 @@ def translate_tags_result(
 
 def handle_individual_result(
     conn: sqlite3.Connection,
+    log_id: int,
     setter: str,
     item: ItemWithPath,
     results: Sequence[
@@ -87,6 +88,7 @@ def handle_individual_result(
             sha256=item.sha256,
             setter=setter,
             confidence=confidence,
+            log_id=log_id,
         )
 
 
@@ -105,14 +107,16 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
         )
 
     def handle_result(
-        __: int,
+        log_id: int,
         item: ItemWithPath,
         _: Sequence[PIL.Image.Image],
         outputs: Sequence[
             Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]
         ],
     ):
-        handle_individual_result(conn, model.setter_name(), item, outputs)
+        handle_individual_result(
+            conn, log_id, model.setter_name(), item, outputs
+        )
 
     return run_extraction_job(
         conn,

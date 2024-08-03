@@ -26,13 +26,6 @@ def build_inner_query(
         f"AND tags_items.confidence >= ?" if tags.min_confidence else ""
     )
 
-    # The setter should match the given setter
-    tag_setters_condition = (
-        f" AND tags.setter IN ({','.join(['?']*len(tags.setters))})"
-        if tags.setters
-        else ""
-    )
-
     # The namespace needs to *start* with the given namespace
     tag_namespace_condition = ""
     if tags.namespaces:
@@ -41,12 +34,19 @@ def build_inner_query(
         )
         tag_namespace_condition = f"AND ({or_cond})"
 
+    # The setter should match the given setter
+    tag_setters_condition = (
+        f" AND setters.name IN ({','.join(['?']*len(tags.setters))})"
+        if tags.setters
+        else ""
+    )
+
     positive_tag_params: List[float | str | None] = (
         [
             *tags.positive,
             tags.min_confidence,
-            *tags.setters,
             *tags.namespaces,
+            *tags.setters,
         ]
         if tags.positive
         else []
@@ -57,12 +57,13 @@ def build_inner_query(
         f"""
         WHERE files.item_id NOT IN (
             SELECT tags_items.item_id
-            FROM tags_setters as tags
+            FROM tags
             JOIN tags_items ON tags.id = tags_items.tag_id
             AND tags.name IN ({','.join(['?']*len(tags.negative))})
-            {tag_setters_condition}
             {tag_namespace_condition}
             {min_confidence_condition}
+            JOIN setters ON tags_items.setter_id = setters.id
+            {tag_setters_condition}
         )
     """
         if tags.negative
@@ -71,9 +72,9 @@ def build_inner_query(
     negative_tag_params: List[float | str | None] = (
         [
             *tags.negative,
-            *tags.setters,
             *tags.namespaces,
             tags.min_confidence,
+            *tags.setters,
         ]
         if tags.negative
         else []
@@ -83,7 +84,7 @@ def build_inner_query(
         having_clause = (
             "HAVING COUNT(DISTINCT tags.name) = ?"
             if not tags.all_setters_required
-            else "HAVING COUNT(DISTINCT tags.setter || '-' || tags.name) = ?"
+            else "HAVING COUNT(DISTINCT tags_items.setter_id || '-' || tags.name) = ?"
         )
     else:
         having_clause = ""
@@ -169,12 +170,13 @@ def build_inner_query(
             files.last_modified,
             items.type
             {additional_select_columns}
-        FROM tags_setters as tags
+        FROM tags
         JOIN tags_items ON tags.id = tags_items.tag_id
         AND tags.name IN ({','.join(['?']*len(tags.positive))})
         {min_confidence_condition}
-        {tag_setters_condition}
         {tag_namespace_condition}
+        JOIN setters ON tags_items.setter_id = setters.id
+        {tag_setters_condition}
         JOIN files ON tags_items.item_id = files.item_id
         {path_condition}
         JOIN items ON files.item_id = items.id

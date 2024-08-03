@@ -97,12 +97,11 @@ def initialize_database(conn: sqlite3.Connection):
 
     cursor.execute(
         """
-    CREATE TABLE IF NOT EXISTS tags_setters (
+    CREATE TABLE IF NOT EXISTS tags (
         id INTEGER PRIMARY KEY,
         namespace TEXT NOT NULL,
         name TEXT NOT NULL,
-        setter TEXT NOT NULL,
-        UNIQUE(namespace, name, setter)
+        UNIQUE(namespace, name),
     )
     """
     )
@@ -112,10 +111,14 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS tags_items (
         item_id INTEGER NOT NULL,
         tag_id INTEGER NOT NULL,
+        setter_id INTEGER NOT NULL,
+        log_id INTEGER,
         confidence REAL DEFAULT 1.0,
-        UNIQUE(item_id, tag_id),
+        UNIQUE(item_id, tag_id, setter_id),  -- Unique constraint on item, tag and setter
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
-        FOREIGN KEY(tag_id) REFERENCES tags_setters(id) ON DELETE CASCADE
+        FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
     )
     """
     )
@@ -159,7 +162,7 @@ def initialize_database(conn: sqlite3.Connection):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time_added TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
         path TEXT NOT NULL,
-        included BOOLEAN NOT NULL,       -- BOOLEAN to indicate if folder is included or specifically excluded
+        included BOOLEAN NOT NULL,              -- BOOLEAN to indicate if folder is included or specifically excluded
         UNIQUE(path)  -- Unique constraint on path
     )
     """
@@ -402,15 +405,13 @@ def initialize_database(conn: sqlite3.Connection):
         ("tags_items", ["item_id"]),
         ("tags_items", ["tag_id"]),
         ("tags_items", ["confidence"]),
+        ("tags_items", ["setter_id"]),
+        ("tags_items", ["log_id"]),
         ("tags_items", ["item_id", "tag_id"]),
         ("tags_items", ["tag_id", "item_id"]),
-        ("tags_setters", ["namespace"]),
-        ("tags_setters", ["name"]),
-        ("tags_setters", ["setter"]),
-        ("tags_setters", ["namespace", "name"]),
-        ("tags_setters", ["namespace", "setter"]),
-        ("tags_setters", ["name", "setter"]),
-        ("tags_setters", ["namespace", "name", "setter"]),
+        ("tags", ["namespace"]),
+        ("tags", ["name"]),
+        ("tags", ["namespace", "name"]),
         ("extracted_text", ["item_id"]),
         ("extracted_text", ["log_id"]),
         ("extracted_text", ["language"]),
