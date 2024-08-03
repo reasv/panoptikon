@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +43,17 @@ def execute_folder_scan(
     included_folders = [
         folder for folder in included_folders if folder in all_included_folders
     ]
+    for folder in included_folders:
+        if not os.path.exists(folder):
+            raise FileNotFoundError(
+                f"Folder {folder} does not exist. Aborting scan."
+            )
+        if not os.path.isdir(folder):
+            raise NotADirectoryError(
+                f"Path {folder} is not a directory. Aborting scan."
+            )
+        if not os.listdir(folder):
+            raise FileNotFoundError(f"Folder {folder} is empty. Aborting scan.")
 
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
