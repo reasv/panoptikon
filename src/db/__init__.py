@@ -385,7 +385,7 @@ def initialize_database(conn: sqlite3.Connection):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 batch_size INTEGER NOT NULL,
-                threshold REAL,
+                threshold REAL
             );
         """
     )

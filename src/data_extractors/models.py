@@ -57,6 +57,7 @@ class ModelOpts:
         settings = retrieve_model_group_settings(conn, cls.group_name())
         if settings:
             return settings[1]
+        return cls.default_threshold()
 
     @classmethod
     def set_group_threshold(cls, conn: sqlite3.Connection, threshold: float):

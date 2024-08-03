@@ -157,7 +157,7 @@ def create_scan_UI(app: gr.Blocks):
                             value="",
                         )
             with gr.Row():
-                create_data_extraction_UI()
+                create_data_extraction_UI(app, scan_tab)
                 with gr.Column():
                     pass
 

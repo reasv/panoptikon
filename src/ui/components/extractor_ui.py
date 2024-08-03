@@ -2,6 +2,7 @@ import datetime
 from typing import List, Type
 
 import gradio as gr
+from cv2 import threshold
 
 import src.data_extractors.models as models
 from src.data_extractors.extraction_jobs.types import (
@@ -72,6 +73,8 @@ def delete_model_data(model_opt: models.ModelOpts):
 
 
 def extraction_job_UI(
+    app: gr.Blocks,
+    tab: gr.Tab,
     model_type: Type[models.ModelOpts],
 ):
     def run_job(batch: int, chosen_model: List[str]):
@@ -120,6 +123,48 @@ def extraction_job_UI(
                     maximum=128,
                     value=model_type.default_batch_size(),
                 )
+                threshold = gr.Slider(
+                    label="Confidence Threshold",
+                    minimum=0.0,
+                    maximum=1.0,
+                    interactive=model_type.default_threshold() is not None,
+                    visible=model_type.default_threshold() is not None,
+                    value=model_type.default_threshold(),
+                )
+
+                def retrieve_group_settings():
+                    conn = get_database_connection(write_lock=False)
+                    batch_size_val = model_type.get_group_batch_size(conn)
+                    threshold_val = model_type.get_group_threshold(conn)
+                    conn.close()
+                    return batch_size_val, threshold_val
+
+                gr.on(
+                    triggers=[tab.select, app.load],
+                    fn=retrieve_group_settings,
+                    outputs=[batch_size, threshold],
+                )
+
+                def update_group_settings(
+                    batch_size_val: int, threshold_val: float | None
+                ):
+                    conn = get_database_connection(write_lock=True)
+                    conn.execute("BEGIN")
+                    model_type.set_group_batch_size(conn, batch_size_val)
+                    if threshold_val is not None:
+                        model_type.set_group_threshold(conn, threshold_val)
+                    conn.commit()
+                    batch_size_val = model_type.get_group_batch_size(conn)
+                    threshold_val = model_type.get_group_threshold(conn)
+                    conn.close()
+                    return batch_size_val, threshold_val
+
+                gr.on(
+                    triggers=[batch_size.release, threshold.release],
+                    fn=update_group_settings,
+                    inputs=[batch_size, threshold],
+                    outputs=[batch_size, threshold],
+                )
         with gr.Row():
             run_button = gr.Button("Run Batch Job")
             delete_button = gr.Button(
@@ -142,8 +187,8 @@ def extraction_job_UI(
     )
 
 
-def create_data_extraction_UI():
+def create_data_extraction_UI(app: gr.Blocks, tab: gr.Tab):
     with gr.Row():
         with gr.Tabs():
             for model_opts in models.ModelOptsFactory.get_all_model_opts():
-                extraction_job_UI(model_opts)
+                extraction_job_UI(app, tab, model_opts)
