@@ -6,6 +6,8 @@ import gradio as gr
 
 from src.data_extractors import models
 from src.db import get_database_connection
+from src.db.files import get_all_mime_types
+from src.db.folders import get_folders_from_database
 from src.db.rules.rules import (
     add_rule,
     delete_rule,
@@ -24,6 +26,7 @@ from src.db.rules.types import (
     StoredRule,
     min_max_columns,
 )
+from src.types import RuleStats
 
 
 def update_filter(
@@ -148,16 +151,22 @@ def create_new_rule(setters: List[Tuple[str, str]]):
 def on_tab_load():
     conn = get_database_connection(write_lock=False)
     rules = get_rules(conn)
+    file_types = get_all_mime_types(conn)
+    folders = get_folders_from_database(conn)
     conn.close()
-    return rules
+    return rules, RuleStats(
+        file_types=file_types,
+        folders=folders,
+    )
 
 
 def create_rule_builder_UI(app: gr.Blocks, tab: gr.Tab):
     rules_state = gr.State([])
+    context = gr.State(RuleStats())
     gr.on(
         triggers=[tab.select, app.load],
         fn=on_tab_load,
-        outputs=[rules_state],
+        outputs=[rules_state, context],
         api_name=False,
     )
     with gr.Row():
@@ -198,12 +207,12 @@ def create_rule_builder_UI(app: gr.Blocks, tab: gr.Tab):
         with gr.Column():
             create_add_rule(rules_state)
 
-    @gr.render(inputs=[rules_state])
-    def builder(rules: List[StoredRule]):
+    @gr.render(inputs=[rules_state, context])
+    def builder(rules: List[StoredRule], context: RuleStats):
         rule_count = len(rules)
         gr.Markdown(f"# Stored Rules ({rule_count}):")
         for rule in rules:
-            create_rule_builder(rule, rules_state)
+            create_rule_builder(rule, context, rules_state)
         if rule_count == 0:
             gr.Markdown("## No rules stored yet.")
 
@@ -247,7 +256,9 @@ def create_add_rule(rules_state: gr.State):
             create_model_type_tab(model_type)
 
 
-def create_rule_builder(rule: StoredRule, rules_state: gr.State):
+def create_rule_builder(
+    rule: StoredRule, context: RuleStats, rules_state: gr.State
+):
     disabled_str = "Enabled" if rule.enabled else "Disabled"
     with gr.Row():
         gr.Markdown(f"## Rule ID: {rule.id:04} ({disabled_str})")
@@ -269,7 +280,7 @@ def create_rule_builder(rule: StoredRule, rules_state: gr.State):
         with gr.Column():
             gr.Markdown("## Item filters:")
             with gr.Accordion(label="Add New Filter", open=False):
-                create_add_filter(rules_state, rule)
+                create_add_filter(rules_state, context, rule)
 
             pos_count = len(rule.filters.positive)
             with gr.Accordion(
@@ -280,7 +291,9 @@ def create_rule_builder(rule: StoredRule, rules_state: gr.State):
                         "## Items MUST MATCH **ALL** of the following filters:"
                     )
                     for i, filter in enumerate(rule.filters.positive):
-                        create_filter_edit(rules_state, rule, "pos", i, filter)
+                        create_filter_edit(
+                            rules_state, context, rule, "pos", i, filter
+                        )
             neg_count = len(rule.filters.negative)
             with gr.Accordion(
                 label=f"Negative filters ({neg_count}):", open=neg_count > 0
@@ -290,7 +303,9 @@ def create_rule_builder(rule: StoredRule, rules_state: gr.State):
                         "## Items MUST **NOT** MATCH **ANY** of the following filters:"
                     )
                     for i, filter in enumerate(rule.filters.negative):
-                        create_filter_edit(rules_state, rule, "neg", i, filter)
+                        create_filter_edit(
+                            rules_state, context, rule, "neg", i, filter
+                        )
 
     @delete_rule_btn.click(outputs=[rules_state])
     def delete():
@@ -353,6 +368,7 @@ def create_add_models(rule: StoredRule, rules_state: gr.State):
 
 def create_add_filter(
     rules_state: gr.State,
+    context: RuleStats,
     rule: StoredRule,
 ):
     pos_neg = gr.Dropdown(
@@ -381,6 +397,7 @@ def create_add_filter(
                 with gr.Column():
                     paths = gr.Dropdown(
                         label="File path starts with one of",
+                        choices=context.folders,
                         multiselect=True,
                         allow_custom_value=True,
                         value=[],
@@ -405,6 +422,7 @@ def create_add_filter(
                 with gr.Column():
                     mime_types = gr.Dropdown(
                         label="MIME Type starts with one of",
+                        choices=context.file_types,
                         multiselect=True,
                         allow_custom_value=True,
                         value=[],
@@ -478,21 +496,27 @@ def create_add_filter(
 
 def create_filter_edit(
     rules_state: gr.State,
+    context: RuleStats,
     rule: StoredRule,
     dir: Literal["pos", "neg"],
     filter_idx: int,
     filter: FilterType,
 ):
     if isinstance(filter, PathFilter):
-        return path_filter_edit(rules_state, rule, dir, filter_idx, filter)
+        return path_filter_edit(
+            rules_state, context, rule, dir, filter_idx, filter
+        )
     elif isinstance(filter, MimeFilter):
-        return mime_type_filter_edit(rules_state, rule, dir, filter_idx, filter)
+        return mime_type_filter_edit(
+            rules_state, context, rule, dir, filter_idx, filter
+        )
     elif isinstance(filter, MinMaxFilter):
         return min_max_filter_edit(rules_state, rule, dir, filter_idx, filter)
 
 
 def path_filter_edit(
     rules_state: gr.State,
+    context: RuleStats,
     rule: StoredRule,
     dir: Literal["pos", "neg"],
     filter_idx: int,
@@ -502,6 +526,7 @@ def path_filter_edit(
     element = gr.Dropdown(
         key=f"rule{rule.id}_{dir}_filter_{filter_idx}",
         label="File path starts with one of",
+        choices=context.folders,
         multiselect=True,
         allow_custom_value=True,
         value=filter.path_prefixes,
@@ -526,6 +551,7 @@ def path_filter_edit(
 
 def mime_type_filter_edit(
     rules_state: gr.State,
+    context: RuleStats,
     rule: StoredRule,
     dir: Literal["pos", "neg"],
     filter_idx: int,
@@ -534,6 +560,7 @@ def mime_type_filter_edit(
     gr.Markdown(f"### Mime Type Filter")
     element = gr.Dropdown(
         key=f"rule{rule.id}_{dir}_filter_{filter_idx}",
+        choices=context.file_types,
         label="MIME Type starts with one of",
         multiselect=True,
         allow_custom_value=True,
