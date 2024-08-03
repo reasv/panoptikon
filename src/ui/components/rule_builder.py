@@ -252,7 +252,7 @@ def create_add_rule(rules_state: gr.State):
 
     gr.Markdown("# Add New Rule")
     with gr.Tabs():
-        for model_type in models.ALL_MODEL_OPTS:
+        for model_type in models.ModelOptsFactory.get_all_model_opts():
             create_model_type_tab(model_type)
 
 
@@ -362,7 +362,7 @@ def create_add_models(rule: StoredRule, rules_state: gr.State):
                         )
 
     with gr.Tabs():
-        for model_type in models.ALL_MODEL_OPTS:
+        for model_type in models.ModelOptsFactory.get_all_model_opts():
             create_model_type_tab(model_type)
 
 

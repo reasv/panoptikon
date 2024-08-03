@@ -145,7 +145,5 @@ def extraction_job_UI(
 def create_data_extraction_UI():
     with gr.Row():
         with gr.Tabs():
-            extraction_job_UI(models.TagsModel)
-            extraction_job_UI(models.OCRModel)
-            extraction_job_UI(models.WhisperSTTModel)
-            extraction_job_UI(models.ImageEmbeddingModel)
+            for model_opts in models.ModelOptsFactory.get_all_model_opts():
+                extraction_job_UI(model_opts)

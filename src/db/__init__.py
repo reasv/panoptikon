@@ -379,6 +379,17 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS model_group_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                batch_size INTEGER NOT NULL,
+                threshold REAL,
+            );
+        """
+    )
+
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -447,6 +458,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("items", ["video_tracks"]),
         ("items", ["subtitle_tracks"]),
         ("extraction_rules", ["enabled"]),
+        ("system_config", ["k"]),
     ]
 
     for table, columns in indices:

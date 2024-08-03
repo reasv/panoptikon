@@ -1,6 +1,5 @@
 import sqlite3
-from tkinter import ALL
-from typing import Any, Dict, Generator, List, Tuple
+from typing import Any, Dict, Generator, List, Tuple, Type
 
 import src.data_extractors.extraction_jobs.types as job_types
 from src.data_extractors.utils import (
@@ -106,6 +105,10 @@ class ModelOpts:
     def description(cls) -> str:
         raise NotImplementedError
 
+    @classmethod
+    def group_name(cls) -> str:
+        raise NotImplementedError
+
 
 class TagsModel(ModelOpts):
     _model_repo: str
@@ -116,6 +119,10 @@ class TagsModel(ModelOpts):
     @classmethod
     def data_type(cls) -> str:
         return "tags"
+
+    @classmethod
+    def group_name(cls) -> str:
+        return "wd-tags"
 
     @classmethod
     def name(cls) -> str:
@@ -196,6 +203,10 @@ class OCRModel(ModelOpts):
         return "text"
 
     @classmethod
+    def group_name(cls) -> str:
+        return "doctr"
+
+    @classmethod
     def name(cls) -> str:
         return "DocTR"
 
@@ -270,6 +281,10 @@ class ImageEmbeddingModel(ModelOpts):
         return "clip"
 
     @classmethod
+    def group_name(cls) -> str:
+        return "clip"
+
+    @classmethod
     def name(cls) -> str:
         return "CLIP Image Embeddings"
 
@@ -328,6 +343,10 @@ class WhisperSTTModel(ModelOpts):
     @classmethod
     def default_batch_size(cls) -> int:
         return 1
+
+    @classmethod
+    def group_name(cls) -> str:
+        return "whisper"
 
     @classmethod
     def default_model(cls) -> str:
@@ -396,9 +415,14 @@ class WhisperSTTModel(ModelOpts):
         return get_whisper_avg_logprob_threshold_from_env()
 
 
-ALL_MODEL_OPTS = [
-    TagsModel,
-    OCRModel,
-    ImageEmbeddingModel,
-    WhisperSTTModel,
-]
+class ModelOptsFactory:
+    @classmethod
+    def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
+        return [TagsModel, OCRModel, ImageEmbeddingModel, WhisperSTTModel]
+
+    @classmethod
+    def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:
+        for model_opts in cls.get_all_model_opts():
+            if model_opts.valid_model(setter_name):
+                return model_opts
+        raise ValueError(f"Invalid model name {setter_name}")
