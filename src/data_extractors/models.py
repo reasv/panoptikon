@@ -10,7 +10,7 @@ from src.data_extractors.utils import (
 )
 from src.db.rules.types import MimeFilter, ProcessedItemsFilter, RuleItemFilters
 from src.db.setters import delete_setter_by_name
-from src.db.tags import delete_tags_from_setter
+from src.db.tags import delete_orphan_tags
 
 
 class ModelOpts:
@@ -173,14 +173,10 @@ class TagsModel(ModelOpts):
         return self._model_repo
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
-        tags_removed, items_tags_removed = delete_tags_from_setter(
-            conn, self.setter_name()
-        )
-
-        return (
-            f"Removed {tags_removed} tags from {items_tags_removed} "
-            + f"items tagged by model {self.setter_name()}.\n"
-        )
+        msg = super().delete_extracted_data(conn)
+        orphans_deleted = delete_orphan_tags(conn)
+        msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
+        return msg
 
     def threshold(self) -> float | None:
         return get_threshold_from_env()
