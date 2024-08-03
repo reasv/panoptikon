@@ -1,5 +1,4 @@
 import sqlite3
-from dataclasses import dataclass
 from typing import List, Tuple
 
 # Assuming we have the serialization functions from before
@@ -45,7 +44,9 @@ def get_rule(
     cursor = conn.cursor()
 
     # Get the rule
-    cursor.execute("SELECT rule FROM extraction_rules WHERE id = ?", (rule_id,))
+    cursor.execute(
+        "SELECT rule, enabled FROM extraction_rules WHERE id = ?", (rule_id,)
+    )
     rule_data = cursor.fetchone()
 
     if rule_data is None:
@@ -60,8 +61,11 @@ def get_rule(
 
     # Deserialize the filters
     filters = deserialize_rule_item_filters(rule_data[0])
+    enabled = bool(rule_data[1])
 
-    return StoredRule(id=rule_id, setters=setters, filters=filters)
+    return StoredRule(
+        id=rule_id, enabled=enabled, setters=setters, filters=filters
+    )
 
 
 def get_rules(
@@ -70,11 +74,11 @@ def get_rules(
     cursor = conn.cursor()
 
     # Get all rules
-    cursor.execute("SELECT id, rule FROM extraction_rules")
+    cursor.execute("SELECT id, rule, enabled FROM extraction_rules")
     rules_data = cursor.fetchall()
 
     stored_rules = []
-    for rule_id, rule_data in rules_data:
+    for rule_id, rule_data, enabled in rules_data:
         # Get the setters for each rule
         cursor.execute(
             "SELECT setter_type, setter_name FROM extraction_rules_setters WHERE rule_id = ?",
@@ -86,7 +90,12 @@ def get_rules(
         filters = deserialize_rule_item_filters(rule_data)
 
         stored_rules.append(
-            StoredRule(id=rule_id, setters=setters, filters=filters)
+            StoredRule(
+                id=rule_id,
+                enabled=bool(enabled),
+                setters=setters,
+                filters=filters,
+            )
         )
 
     return stored_rules
@@ -159,7 +168,8 @@ def get_rules_for_setter(
     for rule_id in rule_ids:
         # Get the rule data
         cursor.execute(
-            "SELECT rule FROM extraction_rules WHERE id = ?", (rule_id,)
+            "SELECT rule, enabled FROM extraction_rules WHERE id = ? AND enabled = 1",
+            (rule_id,),
         )
         rule_data = cursor.fetchone()
 
@@ -181,7 +191,12 @@ def get_rules_for_setter(
         filters = deserialize_rule_item_filters(rule_data[0])
 
         stored_rules.append(
-            StoredRule(id=rule_id, setters=setters, filters=filters)
+            StoredRule(
+                id=rule_id,
+                enabled=bool(rule_data[1]),
+                setters=setters,
+                filters=filters,
+            )
         )
 
     return stored_rules
@@ -203,3 +218,25 @@ def get_rules_for_setter_id(
 
     # Use the existing function to get the rules
     return get_rules_for_setter(conn, setter_type, setter_name)
+
+
+def disable_rule(
+    conn: sqlite3.Connection,
+    rule_id: int,
+):
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE extraction_rules SET enabled = 0 WHERE id = ?", (rule_id,)
+    )
+
+
+def enable_rule(
+    conn: sqlite3.Connection,
+    rule_id: int,
+):
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE extraction_rules SET enabled = 1 WHERE id = ?", (rule_id,)
+    )

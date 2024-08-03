@@ -61,6 +61,7 @@ class RuleItemFilters:
 @dataclass
 class StoredRule:
     id: int
+    enabled: bool
     setters: List[Tuple[str, str]]
     filters: RuleItemFilters
 

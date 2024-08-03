@@ -344,10 +344,12 @@ def initialize_database(conn: sqlite3.Connection):
         );
         """
     )
+
     cursor.execute(
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
                 rule TEXT NOT NULL
             );
         """
@@ -433,6 +435,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("items", ["audio_tracks"]),
         ("items", ["video_tracks"]),
         ("items", ["subtitle_tracks"]),
+        ("extraction_rules", ["enabled"]),
     ]
 
     for table, columns in indices:

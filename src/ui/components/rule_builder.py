@@ -6,7 +6,14 @@ import gradio as gr
 
 from src.data_extractors import models
 from src.db import get_database_connection
-from src.db.rules.rules import add_rule, delete_rule, get_rules, update_rule
+from src.db.rules.rules import (
+    add_rule,
+    delete_rule,
+    disable_rule,
+    enable_rule,
+    get_rules,
+    update_rule,
+)
 from src.db.rules.types import (
     FilterType,
     MimeFilter,
@@ -108,6 +115,19 @@ def add_setters_to_rule(
     conn = get_database_connection(write_lock=True)
     conn.execute("BEGIN TRANSACTION")
     update_rule(conn, rule.id, new_setters, rule.filters)
+    conn.commit()
+    rules = get_rules(conn)
+    conn.close()
+    return rules
+
+
+def toggle_rule_enabled(rule: StoredRule) -> List[StoredRule]:
+    conn = get_database_connection(write_lock=True)
+    conn.execute("BEGIN TRANSACTION")
+    if rule.enabled:
+        disable_rule(conn, rule.id)
+    else:
+        enable_rule(conn, rule.id)
     conn.commit()
     rules = get_rules(conn)
     conn.close()
@@ -228,10 +248,13 @@ def create_add_rule(rules_state: gr.State):
 
 
 def create_rule_builder(rule: StoredRule, rules_state: gr.State):
+    disabled_str = "Enabled" if rule.enabled else "Disabled"
     with gr.Row():
-        gr.Markdown(f"## Rule ID: {rule.id:04}")
+        gr.Markdown(f"## Rule ID: {rule.id:04} ({disabled_str})")
     with gr.Row():
         delete_rule_btn = gr.Button("Delete Rule", scale=0)
+        toggle_button_str = "Disable" if rule.enabled else "Enable"
+        toggle_rule_btn = gr.Button(f"{toggle_button_str} Rule", scale=0)
     with gr.Row():
         with gr.Column():
             gr.Markdown("## Models:")
@@ -272,6 +295,10 @@ def create_rule_builder(rule: StoredRule, rules_state: gr.State):
     @delete_rule_btn.click(outputs=[rules_state])
     def delete():
         return delete_entire_rule(rule)
+
+    @toggle_rule_btn.click(outputs=[rules_state])
+    def toggle():
+        return toggle_rule_enabled(rule)
 
 
 def create_remove_models(rule: StoredRule, rules_state: gr.State):
