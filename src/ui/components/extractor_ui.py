@@ -4,6 +4,10 @@ from typing import List, Type
 import gradio as gr
 
 import src.data_extractors.models as models
+from src.data_extractors.extraction_jobs.types import (
+    ExtractorJobProgress,
+    ExtractorJobReport,
+)
 from src.db import get_database_connection
 from src.db.utils import vacuum_database
 
@@ -20,7 +24,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
     failed, images, videos, other, units = [], 0, 0, 0, 0
     start_time = datetime.datetime.now()
     for progress in model_opt.run_extractor(conn):
-        if type(progress) == models.ExtractorJobProgress:
+        if type(progress) == ExtractorJobProgress:
             # Job is in progress
             progress_tracker(
                 (progress.processed_items, progress.total_items),
@@ -30,7 +34,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
                 ),
                 unit="files",
             )
-        elif type(progress) == models.ExtractorJobReport:
+        elif type(progress) == ExtractorJobReport:
             # Job is complete
             images = progress.images
             videos = progress.videos

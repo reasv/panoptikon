@@ -113,7 +113,7 @@ def build_multirule_query(rules: List[RuleItemFilters]):
         query, params = build_query(rule.positive, rule.negative, prefix)
         full_params.extend(params)
         # Combine the CTEs
-        full_query = f"{full_query}, {query}"
+        full_query = f"{full_query}, {query}" if full_query else query
         final_result_cte_names.append(f"{prefix}_final_results")
 
     final_result_union = ""

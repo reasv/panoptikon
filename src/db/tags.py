@@ -77,7 +77,7 @@ def delete_orphan_tags(conn: sqlite3.Connection):
             SELECT tags.rowid
             FROM tags
             LEFT JOIN tags_items ON tags_items.tag_id = tags.id
-            WHERE tags_items.id IS NULL
+            WHERE tags_items.rowid IS NULL
         )
     """
     )

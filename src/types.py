@@ -108,3 +108,9 @@ class SearchStats:
     bookmark_namespaces: List[str] = field(default_factory=list)
     file_types: List[str] = field(default_factory=list)
     folders: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RuleStats:
+    folders: List[str] = field(default_factory=list)
+    file_types: List[str] = field(default_factory=list)

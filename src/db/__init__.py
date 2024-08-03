@@ -71,7 +71,7 @@ def initialize_database(conn: sqlite3.Connection):
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         scan_id INTEGER NOT NULL,
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
-        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE PREVENT,
+        FOREIGN KEY(item_id) REFERENCES items(id)
         FOREIGN KEY(scan_id) REFERENCES file_scans(id) ON DELETE CASCADE
     )
     """
@@ -102,7 +102,7 @@ def initialize_database(conn: sqlite3.Connection):
         id INTEGER PRIMARY KEY,
         namespace TEXT NOT NULL,
         name TEXT NOT NULL,
-        UNIQUE(namespace, name),
+        UNIQUE(namespace, name)
     )
     """
     )

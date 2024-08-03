@@ -28,14 +28,14 @@ def get_most_common_tags(
     ]
 
     query = f"""
-    SELECT namespace, name, COUNT(*) as count
+    SELECT tags.namespace, tags.name, COUNT(*) as count
     FROM tags
     JOIN tags_items ON tags.id = tags_items.tag_id
     {namespace_clause}
     {confidence_clause}
     JOIN setters ON tags_items.setter_id = setters.id
     {setters_clause}
-    GROUP BY namespace, name
+    GROUP BY tags.namespace, tags.name
     ORDER BY count DESC
     LIMIT ?
     """

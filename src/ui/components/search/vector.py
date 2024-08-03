@@ -233,13 +233,21 @@ def create_vector_search_opts(query_state: gr.State):
         if not query.query.filters.extracted_text_embeddings:
             updates[te_embedding_model] = gr.Dropdown(
                 choices=search_stats.te_setters,
-                value=search_stats.te_setters[0],
+                value=(
+                    search_stats.te_setters[0]
+                    if search_stats.te_setters
+                    else None
+                ),
             )
 
         if not query.query.filters.image_embeddings:
             updates[clip_model] = gr.Dropdown(
                 choices=search_stats.clip_setters,
-                value=search_stats.clip_setters[0],
+                value=(
+                    search_stats.clip_setters[0]
+                    if search_stats.clip_setters
+                    else None
+                ),
             )
         return updates
 

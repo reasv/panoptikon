@@ -93,7 +93,7 @@ def add_file_scan(conn: sqlite3.Connection, scan_time: str, path: str) -> int:
     insert_result = cursor.execute(
         """
     INSERT INTO file_scans (start_time, path)
-    VALUES (?, ?,)
+    VALUES (?, ?)
     """,
         (
             scan_time,
@@ -176,7 +176,7 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_id: int, path: str):
         """
     SELECT COUNT(*)
     FROM files
-    WHERE last_seen != ?
+    WHERE scan_id != ?
     AND path LIKE ? || '%'
     """,
         (scan_id, path),
@@ -189,7 +189,7 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_id: int, path: str):
         """
         UPDATE files
         SET available = FALSE
-        WHERE last_seen != ?
+        WHERE scan_id != ?
         AND path LIKE ? || '%'
     """,
         (scan_id, path),
