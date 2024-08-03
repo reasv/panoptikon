@@ -59,6 +59,8 @@ def scan_files(
     include_images=True,
     include_video=True,
     include_audio=False,
+    include_html=False,
+    include_pdf=False,
     allowed_extensions: List[str] = [],
 ):
     """
@@ -68,6 +70,8 @@ def scan_files(
         include_images * get_image_extensions()
         + include_video * get_video_extensions()
         + include_audio * get_audio_extensions()
+        + include_html * get_html_extensions()
+        + include_pdf * get_pdf_extensions()
     )
     for file_path in get_files_by_extension(
         starting_points=starting_points,
