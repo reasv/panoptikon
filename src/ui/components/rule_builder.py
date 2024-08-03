@@ -229,7 +229,7 @@ def create_add_rule(rules_state: gr.State):
 
 def create_rule_builder(rule: StoredRule, rules_state: gr.State):
     with gr.Row():
-        gr.Markdown(f"## Rule #{rule.id}")
+        gr.Markdown(f"## Rule ID: {rule.id:04}")
     with gr.Row():
         delete_rule_btn = gr.Button("Delete Rule", scale=0)
     with gr.Row():
@@ -335,22 +335,78 @@ def create_add_filter(
     )
     with gr.Tabs():
         with gr.Tab("Path Filter"):
-            paths = gr.Dropdown(
-                label="File path starts with one of",
-                multiselect=True,
-                allow_custom_value=True,
-                value=[],
-            )
-            path_filter_btn = gr.Button("Add Path Filter")
+            with gr.Row():
+                gr.Markdown(
+                    """
+                    Allows you to filter files based on their path.
+
+                    Requires that the file's path starts with one of the given strings.
+                    Do not use glob patterns like '*' or '?'.
+                    If you want to match all files in a directory, remember to include the trailing slash.
+                    You can type in custom values.
+                    #### Warning
+                    When used as a negative "MUST NOT" filter, this filter will exclude any files that start with the given paths,
+                    even if a copy of the same file is present in included paths, the file will be excluded.
+                    This is because identical files are treated as the same item, and the filter is applied to the item, not the file.
+                    """
+                )
+            with gr.Row():
+                with gr.Column():
+                    paths = gr.Dropdown(
+                        label="File path starts with one of",
+                        multiselect=True,
+                        allow_custom_value=True,
+                        value=[],
+                    )
+                with gr.Column():
+                    path_filter_btn = gr.Button("Add Path Filter", scale=0)
         with gr.Tab("MIME Type Filter"):
-            mime_types = gr.Dropdown(
-                label="MIME Type starts with one of",
-                multiselect=True,
-                allow_custom_value=True,
-                value=[],
-            )
-            mime_filter_btn = gr.Button("Add MIME Type Filter")
+            with gr.Row():
+                gr.Markdown(
+                    """
+                    Allows you to filter files based on their MIME type.
+
+                    Requires that the file's MIME type starts with one of the given strings.
+                    Which means that the MIME type must be one of the given strings or start with one of them.
+                    This is to allow for filters like 'image/' to match all image types, or 'video/' to match all video types.
+                    You can still use specific MIME types like 'image/jpeg' or 'video/mp4'.
+                    Do not use glob patterns like '*' or '?'.
+                    You can type in custom values.
+                    """
+                )
+            with gr.Row():
+                with gr.Column():
+                    mime_types = gr.Dropdown(
+                        label="MIME Type starts with one of",
+                        multiselect=True,
+                        allow_custom_value=True,
+                        value=[],
+                    )
+                with gr.Column():
+                    mime_filter_btn = gr.Button("Add MIME Type Filter", scale=0)
         with gr.Tab("Min Max Filter"):
+            with gr.Row():
+                gr.Markdown(
+                    """
+                    Allows you to filter files based on the values in a specific column.
+
+                    Requires that the value in the column is between the given minimum and maximum values.
+                    The range is inclusive, meaning that if the minimum value is 0 and the maximum value is 10,
+                    the filter will match any value between 0 and 10, including 0 and 10.
+                    If the minimum and maximum values are equal the filter turns into an equality filter.
+                    You can use this to filter files based on their width, height, duration, etc.
+
+                    `largest_dimension` is a special column that represents the largest of width and height.
+                    `smallest_dimension` is a special column that represents the smallest of width and height.
+
+                    `duration` represents the duration of a video or audio in seconds.
+                    `size` represents the size of the file in bytes.
+                    All values are floating point numbers.
+                    #### No upper bound
+                    If min is not 0 and max is 0, the filter will match any value greater than or equal to min,
+                    with no upper bound.
+                    """
+                )
             with gr.Row():
                 column_name = gr.Dropdown(
                     label="Column Name",
@@ -360,7 +416,7 @@ def create_add_filter(
                 minimum = gr.Number(label="Min Value", value=0)
                 maximum = gr.Number(label="Max Value", value=0)
             with gr.Row():
-                min_max_filter_btn = gr.Button("Add Min Max Filter")
+                min_max_filter_btn = gr.Button("Add Min Max Filter", scale=0)
 
     @path_filter_btn.click(inputs=[pos_neg, paths], outputs=[rules_state])
     def create_path_filter(pos_neg: str, paths: List[str]):
