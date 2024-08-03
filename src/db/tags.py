@@ -13,7 +13,7 @@ def upsert_tag(
     result = cursor.execute(
         """
     INSERT INTO tags (namespace, name)
-    VALUES (?, ?, ?, ?)
+    VALUES (?, ?)
     ON CONFLICT(namespace, name) DO NOTHING
     """,
         (namespace, name),
