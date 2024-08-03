@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from typing import Dict
+
 import gradio as gr
 
 from src.db import get_database_connection
+from src.db.config import persist_system_config, retrieve_system_config
 from src.db.folders import get_folders_from_database
 from src.db.utils import vacuum_database
 from src.folders import rescan_all_folders, update_folder_lists
@@ -32,7 +35,6 @@ def get_excluded_folders():
 def update_folders(
     included_folders_text: str,
     excluded_folders_text: str,
-    delete_unavailable_files: bool = True,
 ):
     new_included_folders = (
         [p for p in included_folders_text.strip().split("\n")]
@@ -53,13 +55,12 @@ def update_folders(
             conn,
             new_included_folders,
             new_excluded_folders,
-            delete_unavailable_files,
         )
         update_result_text = f"""
         Removed {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;
         Included folders added (and scanned): {", ".join(update_result.included_added)} ({len(update_result.scan_ids)});
         Excluded folders added: {", ".join(update_result.excluded_added)};
-        Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem {"(enabled)" if delete_unavailable_files else "(disabled)"};
+        Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;
         Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;
         Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;
         Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed.
@@ -91,13 +92,11 @@ def update_folders(
     )
 
 
-def rescan_folders(delete_unavailable_files: bool = True):
+def rescan_folders():
     conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
-    ids, files_deleted, items_deleted = rescan_all_folders(
-        conn, delete_unavailable=delete_unavailable_files
-    )
+    ids, files_deleted, items_deleted = rescan_all_folders(conn)
     conn.commit()
     vacuum_database(conn)
     conn.close()
@@ -112,7 +111,7 @@ def fetch_all_history():
     return fetch_scan_history(), fetch_extraction_logs()
 
 
-def create_scan_UI():
+def create_scan_UI(app: gr.Blocks):
     with gr.TabItem(label="File Scan & Tagging") as scan_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
@@ -141,12 +140,9 @@ def create_scan_UI():
                         The 'Rescan all Directories' button will rescan all directories. But it will not apply changes to the directory lists or generate tags.                      
                         """
                         )
-                    with gr.Row():
-                        delete_unavailable_files = gr.Checkbox(
-                            label="Remove files from the database if they are no longer found on the filesystem",
-                            value=True,
-                            interactive=True,
-                        )
+
+                    create_scan_settings_configurator(scan_tab, app)
+
                     with gr.Row():
                         update_button = gr.Button(
                             "Update Directory Lists and Scan New Entries"
@@ -185,7 +181,6 @@ def create_scan_UI():
             inputs=[
                 included_directory_list,
                 excluded_directory_list,
-                delete_unavailable_files,
             ],
             outputs=[
                 report_textbox,
@@ -199,7 +194,6 @@ def create_scan_UI():
 
         scan_button.click(
             fn=rescan_folders,
-            inputs=[delete_unavailable_files],
             outputs=[report_textbox, scan_history, extraction_log],
             api_name="rescan_folders",
         )
@@ -209,3 +203,98 @@ def create_scan_UI():
             outputs=[scan_history, extraction_log],
             api_name="fetch_history",
         )
+
+
+def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
+    elements = []
+    with gr.Row():
+        gr.Markdown("### Scan Settings (Persisted to Database)")
+    with gr.Row():
+        delete_unavailable = gr.Checkbox(
+            label="Remove files from the database if they are no longer found on the filesystem",
+            value=True,
+            interactive=True,
+        )
+        elements.append(delete_unavailable)
+    with gr.Row():
+        gr.Markdown("### Search for these file types:")
+        scan_images = gr.Checkbox(
+            label="Images",
+            value=True,
+            interactive=True,
+        )
+        elements.append(scan_images)
+        scan_videos = gr.Checkbox(
+            label="Videos",
+            value=True,
+            interactive=True,
+        )
+        elements.append(scan_videos)
+        scan_audio = gr.Checkbox(
+            label="Audio",
+            value=False,
+            interactive=True,
+        )
+        elements.append(scan_audio)
+        scan_html = gr.Checkbox(
+            label="HTML Files",
+            value=False,
+            interactive=True,
+        )
+        elements.append(scan_html)
+        scan_pdf = gr.Checkbox(
+            label="PDF",
+            value=False,
+            interactive=True,
+        )
+        elements.append(scan_pdf)
+
+    def update_file_types(args: Dict[gr.Checkbox, bool]):
+        conn = get_database_connection(write_lock=True)
+        config = retrieve_system_config(conn)
+        conn.execute("BEGIN")
+        config.remove_unavailable_files = args[delete_unavailable]
+        config.scan_images = args[scan_images]
+        config.scan_video = args[scan_videos]
+        config.scan_audio = args[scan_audio]
+        config.scan_html = args[scan_html]
+        config.scan_pdf = args[scan_pdf]
+        print(config)
+        persist_system_config(conn, config)
+        conn.commit()
+        conn.close()
+        return load_settings()
+
+    gr.on(
+        triggers=[
+            scan_images.input,
+            scan_videos.input,
+            scan_audio.input,
+            scan_html.input,
+            scan_pdf.input,
+            delete_unavailable.input,
+        ],
+        fn=update_file_types,
+        inputs={*elements},
+        outputs=[*elements],
+    )
+
+    def load_settings():
+        conn = get_database_connection(write_lock=False)
+        config = retrieve_system_config(conn)
+        conn.close()
+        return {
+            scan_images: config.scan_images,
+            scan_videos: config.scan_video,
+            scan_audio: config.scan_audio,
+            scan_html: config.scan_html,
+            scan_pdf: config.scan_pdf,
+            delete_unavailable: config.remove_unavailable_files,
+        }
+
+    gr.on(
+        triggers=[tab.select, app.load],
+        fn=load_settings,
+        outputs=[*elements],
+        api_name=False,
+    )

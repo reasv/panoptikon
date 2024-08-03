@@ -370,6 +370,15 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS system_config (
+                k string NOT NULL UNIQUE,
+                v
+            );
+        """
+    )
+
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [

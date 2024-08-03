@@ -114,3 +114,13 @@ class SearchStats:
 class RuleStats:
     folders: List[str] = field(default_factory=list)
     file_types: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SystemConfig:
+    remove_unavailable_files: bool = True
+    scan_images: bool = True
+    scan_video: bool = True
+    scan_audio: bool = False
+    scan_html: bool = False
+    scan_pdf: bool = False

@@ -1,9 +1,11 @@
 import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
 
+from src.db.config import retrieve_system_config
 from src.db.files import (
     add_file_scan,
     delete_items_without_files,
@@ -24,11 +26,7 @@ from src.utils import normalize_path
 
 
 def execute_folder_scan(
-    conn: sqlite3.Connection,
-    included_folders: None | List[str] = None,
-    include_images=True,
-    include_video=True,
-    include_audio=False,
+    conn: sqlite3.Connection, included_folders: None | List[str] = None
 ) -> list[int]:
     """
     Execute a scan of the files in the given `included_folders`, or all folders marked as `included` within the db, and update the database with the results.
@@ -58,7 +56,7 @@ def execute_folder_scan(
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
-
+    system_config = retrieve_system_config(conn)
     print(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
@@ -75,9 +73,11 @@ def execute_folder_scan(
             conn,
             starting_points=[folder],
             excluded_paths=excluded_folders,
-            include_images=include_images,
-            include_video=include_video,
-            include_audio=include_audio,
+            include_images=system_config.scan_images,
+            include_video=system_config.scan_video,
+            include_audio=system_config.scan_audio,
+            include_html=system_config.scan_html,
+            include_pdf=system_config.scan_pdf,
         ):
             if file_data is None:
                 errors += 1
@@ -142,7 +142,6 @@ def update_folder_lists(
     conn: sqlite3.Connection,
     included_folders: List[str],
     excluded_folders: List[str],
-    delete_unavailable: bool = True,
 ):
     """
     Update the database with the new `included_folders` and `excluded_folders` lists.
@@ -181,7 +180,9 @@ def update_folder_lists(
 
     scan_ids = execute_folder_scan(conn, included_folders=included_added)
 
-    if delete_unavailable:
+    system_config = retrieve_system_config(conn)
+
+    if system_config.remove_unavailable_files:
         unavailable_files_deleted = delete_unavailable_files(conn)
     else:
         unavailable_files_deleted = 0
