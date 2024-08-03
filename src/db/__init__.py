@@ -344,7 +344,6 @@ def initialize_database(conn: sqlite3.Connection):
         );
         """
     )
-
     cursor.execute(
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules (
@@ -360,6 +359,7 @@ def initialize_database(conn: sqlite3.Connection):
                 setter_type TEXT NOT NULL,
                 setter_name TEXT NOT NULL,
                 FOREIGN KEY(rule_id) REFERENCES extraction_rules(id) ON DELETE CASCADE
+                UNIQUE(rule_id, setter_type, setter_name)
             );
         """
     )
