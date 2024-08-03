@@ -77,7 +77,8 @@ class ModelOpts:
             )
         return RuleItemFilters(positive=rules, negative=[])
 
-    def data_type(self) -> str:
+    @classmethod
+    def data_type(cls) -> str:
         raise NotImplementedError
 
     def run_extractor(
@@ -112,7 +113,8 @@ class TagsModel(ModelOpts):
     def _init(self, model_name: str):
         self._model_repo = TagsModel._available_models_mapping()[model_name]
 
-    def data_type(self) -> str:
+    @classmethod
+    def data_type(cls) -> str:
         return "tags"
 
     @classmethod
@@ -193,7 +195,8 @@ class OCRModel(ModelOpts):
             OCRModel._available_models_mapping()[model_name]
         )
 
-    def data_type(self) -> str:
+    @classmethod
+    def data_type(cls) -> str:
         return "text"
 
     @classmethod
@@ -266,7 +269,8 @@ class ImageEmbeddingModel(ModelOpts):
             ImageEmbeddingModel._available_models_mapping()[model_name]
         )
 
-    def data_type(self) -> str:
+    @classmethod
+    def data_type(cls) -> str:
         return "clip"
 
     @classmethod
@@ -333,7 +337,8 @@ class WhisperSTTModel(ModelOpts):
     def default_model(cls) -> str:
         return "whisper|distill-large-v3"
 
-    def data_type(self) -> str:
+    @classmethod
+    def data_type(cls) -> str:
         return "text"
 
     @classmethod
