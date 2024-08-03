@@ -82,15 +82,15 @@ def initialize_database(conn: sqlite3.Connection):
     CREATE TABLE IF NOT EXISTS file_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
-        end_time TEXT NOT NULL,           -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT,           -- Using TEXT to store ISO-8601 formatted datetime
         path TEXT NOT NULL,
-        total_available INTEGER NOT NULL,
-        new_items INTEGER NOT NULL,
-        unchanged_files INTEGER NOT NULL,
-        new_files INTEGER NOT NULL,
-        modified_files INTEGER NOT NULL,
-        marked_unavailable INTEGER NOT NULL,
-        errors INTEGER NOT NULL,
+        total_available INTEGER NOT NULL DEFAULT 0,
+        new_items INTEGER NOT NULL DEFAULT 0,
+        unchanged_files INTEGER NOT NULL DEFAULT 0,
+        new_files INTEGER NOT NULL DEFAULT 0,
+        modified_files INTEGER NOT NULL DEFAULT 0,
+        marked_unavailable INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
         UNIQUE(start_time, path)       -- Unique constraint on time and path
     )
     """
