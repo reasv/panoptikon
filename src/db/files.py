@@ -6,7 +6,7 @@ from src.types import FileRecord, FileScanData, FileScanRecord
 
 
 def update_file_data(
-    conn: sqlite3.Connection, scan_time: str, meta: FileScanData
+    conn: sqlite3.Connection, time_added: str, scan_id: int, meta: FileScanData
 ):
     cursor = conn.cursor()
     sha256 = meta.sha256
@@ -26,7 +26,7 @@ def update_file_data(
             meta.md5,
             meta.mime_type,
             meta.size,
-            scan_time,
+            time_added,
             meta.width,
             meta.height,
             meta.duration,
@@ -44,14 +44,14 @@ def update_file_data(
 
     file_updated = False
     if path_in_db and not file_modified:
-        # Path exists and has not changed, update last_seen and available
+        # Path exists and has not changed, update scan_id and available
         file_update_result = cursor.execute(
             """
         UPDATE files
-        SET last_seen = ?, available = TRUE
+        SET scan_id = ?, available = TRUE
         WHERE path = ?
         """,
-            (scan_time, path),
+            (scan_id, path),
         )
 
         file_updated = file_update_result.rowcount > 0
@@ -75,21 +75,40 @@ def update_file_data(
         # Path does not exist or has been modified, insert new
         file_insert_result = cursor.execute(
             """
-        INSERT INTO files (sha256, item_id, path, filename, last_modified, last_seen, available)
+        INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available)
         VALUES (?, ?, ?, ?, ?, ?, TRUE)
         """,
-            (sha256, item_rowid, path, filename, last_modified, scan_time),
+            (sha256, item_rowid, path, filename, last_modified, scan_id),
         )
         file_inserted = file_insert_result.rowcount > 0
 
     return item_inserted, file_updated, file_deleted, file_inserted
 
 
-def add_file_scan(
+def add_file_scan(conn: sqlite3.Connection, scan_time: str, path: str) -> int:
+    """
+    Logs a file scan into the database
+    """
+    cursor = conn.cursor()
+    insert_result = cursor.execute(
+        """
+    INSERT INTO file_scans (start_time, path)
+    VALUES (?, ?,)
+    """,
+        (
+            scan_time,
+            path,
+        ),
+    )
+    # Return the row id of the inserted record
+    assert insert_result.lastrowid is not None, "No row id returned"
+    return insert_result.lastrowid
+
+
+def update_file_scan(
     conn: sqlite3.Connection,
-    scan_time: str,
+    scan_id: int,
     end_time: str,
-    path: str,
     new_items: int,
     unchanged_files: int,
     new_files: int,
@@ -98,30 +117,25 @@ def add_file_scan(
     errors: int,
     total_available: int,
 ):
-    """
-    Logs a file scan into the database
-    """
     cursor = conn.cursor()
-    insert_result = cursor.execute(
+    cursor.execute(
         """
-    INSERT INTO file_scans (start_time, end_time, path, total_available, new_items, unchanged_files, new_files, modified_files, marked_unavailable, errors)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    UPDATE file_scans
+    SET end_time = ?, new_items = ?, unchanged_files = ?, new_files = ?, modified_files = ?, marked_unavailable = ?, errors = ?, total_available = ?
+    WHERE id = ?
     """,
         (
-            scan_time,
             end_time,
-            path,
-            total_available,
             new_items,
             unchanged_files,
             new_files,
             modified_files,
             marked_unavailable,
             errors,
+            total_available,
+            scan_id,
         ),
     )
-    # Return the row id of the inserted record
-    return insert_result.lastrowid
 
 
 def get_file_scan_by_id(
@@ -150,10 +164,10 @@ def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
     return [FileScanRecord(*scan_record) for scan_record in scan_records]
 
 
-def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
+def mark_unavailable_files(conn: sqlite3.Connection, scan_id: int, path: str):
     """
     Mark files as unavailable if their path is a subpath of `path`
-    and they were not seen during the scan at `scan_time`
+    and they were not seen during the scan `scan_id`
     """
     cursor = conn.cursor()
 
@@ -163,22 +177,22 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
     SELECT COUNT(*)
     FROM files
     WHERE last_seen != ?
-    AND path LIKE ?
+    AND path LIKE ? || '%'
     """,
-        (scan_time, path + "%"),
+        (scan_id, path),
     )
 
     marked_unavailable = precount_result.fetchone()[0]
 
-    # If a file has not been seen in scan that happened at scan_time, mark it as unavailable
+    # If a file has not been seen in the scan `scan_id` mark it as unavailable
     cursor.execute(
         """
         UPDATE files
         SET available = FALSE
         WHERE last_seen != ?
-        AND path LIKE ?
+        AND path LIKE ? || '%'
     """,
-        (scan_time, path + "%"),
+        (scan_id, path),
     )
 
     # Count available files
@@ -187,9 +201,9 @@ def mark_unavailable_files(conn: sqlite3.Connection, scan_time: str, path: str):
         SELECT COUNT(*)
         FROM files
         WHERE available = TRUE
-        AND path LIKE ?
+        AND path LIKE ? || '%'
     """,
-        (path + "%",),
+        (path,),
     )
     available_files: int = result_available.fetchone()[0]
 
@@ -220,25 +234,6 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
         file_dict = None
 
     return file_dict
-
-
-def hard_update_items_available(conn: sqlite3.Connection):
-    # This function is used to update the availability of files in the database
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT path FROM files")
-    files = cursor.fetchall()
-
-    for (path,) in files:
-        available = os.path.exists(path)
-        cursor.execute(
-            """
-        UPDATE files
-        SET Available = ?
-        WHERE path = ?
-        """,
-            (available, path),
-        )
 
 
 def get_existing_file_for_sha256(

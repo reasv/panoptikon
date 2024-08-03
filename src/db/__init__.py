@@ -69,9 +69,10 @@ def initialize_database(conn: sqlite3.Connection):
         path TEXT UNIQUE NOT NULL,        -- Ensuring path is unique
         filename TEXT NOT NULL,           -- Filename extracted from path
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
-        last_seen TEXT NOT NULL,          -- Using TEXT to store ISO-8601 formatted datetime
+        scan_id INTEGER NOT NULL,
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
-        FOREIGN KEY(item_id) REFERENCES items(id)
+        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE PREVENT,
+        FOREIGN KEY(scan_id) REFERENCES file_scans(id) ON DELETE CASCADE
     )
     """
     )
@@ -380,7 +381,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("files", ["last_modified"]),
         ("files", ["available"]),
         ("files", ["path"]),
-        ("files", ["last_seen"]),
+        ("files", ["scan_id"]),
         ("files", ["filename"]),
         ("file_scans", ["start_time"]),
         ("file_scans", ["end_time"]),

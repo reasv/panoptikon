@@ -9,6 +9,7 @@ from src.db.files import (
     delete_unavailable_files,
     mark_unavailable_files,
     update_file_data,
+    update_file_scan,
 )
 from src.db.folders import (
     add_folder_to_database,
@@ -17,7 +18,6 @@ from src.db.folders import (
     delete_folders_not_in_list,
     get_folders_from_database,
 )
-from src.db.tags import delete_tags_without_items
 from src.files import deduplicate_paths, scan_files
 from src.utils import normalize_path
 
@@ -57,6 +57,8 @@ def execute_folder_scan(
             0,
             0,
         )
+        scan_id = add_file_scan(conn, scan_time, folder)
+        scan_ids.append(scan_id)
         for file_data in scan_files(
             conn,
             starting_points=[folder],
@@ -70,7 +72,9 @@ def execute_folder_scan(
                 continue
             # Update the file data in the database
             (item_inserted, file_updated, file_deleted, file_inserted) = (
-                update_file_data(conn, scan_time=scan_time, meta=file_data)
+                update_file_data(
+                    conn, time_added=scan_time, scan_id=scan_id, meta=file_data
+                )
             )
             if item_inserted:
                 new_items += 1
@@ -86,26 +90,23 @@ def execute_folder_scan(
                 new_files += 1
         # Mark files that were not found in the scan but are present in the db as `unavailable`
         marked_unavailable, total_available = mark_unavailable_files(
-            conn, scan_time=scan_time, path=folder
+            conn, scan_id=scan_id, path=folder
         )
         print(
             f"Scan of {folder} complete. New items: {new_items}, Unchanged files: {unchanged_files}, New files: {new_files}, Modified files: {modified_files}, Marked unavailable: {marked_unavailable}, Errors: {errors}, Total available: {total_available}"
         )
         end_time = datetime.now().isoformat()
-        scan_ids.append(
-            add_file_scan(
-                conn,
-                scan_time=scan_time,
-                end_time=end_time,
-                path=folder,
-                new_items=new_items,
-                unchanged_files=unchanged_files,
-                new_files=new_files,
-                modified_files=modified_files,
-                marked_unavailable=marked_unavailable,
-                errors=errors,
-                total_available=total_available,
-            )
+        update_file_scan(
+            conn,
+            scan_id=scan_id,
+            end_time=end_time,
+            new_items=new_items,
+            unchanged_files=unchanged_files,
+            new_files=new_files,
+            modified_files=modified_files,
+            marked_unavailable=marked_unavailable,
+            errors=errors,
+            total_available=total_available,
         )
 
     return scan_ids
@@ -176,7 +177,6 @@ def update_folder_lists(
     excluded_folder_files_deleted = delete_files_under_excluded_folders(conn)
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     orphan_items_deleted = delete_items_without_files(conn)
-    delete_tags_without_items(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,
@@ -204,7 +204,6 @@ def rescan_all_folders(
     if delete_unavailable:
         unavailable_files_deleted = delete_unavailable_files(conn)
         orphan_items_deleted = delete_items_without_files(conn)
-        delete_tags_without_items(conn)
     else:
         unavailable_files_deleted = 0
         orphan_items_deleted = 0
