@@ -345,7 +345,7 @@ def create_add_filter(
                     If you want to match all files in a directory, remember to include the trailing slash.
                     You can type in custom values.
                     #### Warning
-                    When used as a negative "MUST NOT" filter, this filter will exclude any files that start with the given paths,
+                    When used as a negative "MUST NOT" filter, this filter will exclude any files that start with the given paths;
                     even if a copy of the same file is present in included paths, the file will be excluded.
                     This is because identical files are treated as the same item, and the filter is applied to the item, not the file.
                     """
