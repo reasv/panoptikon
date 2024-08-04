@@ -1,18 +1,15 @@
 import sqlite3
-from typing import Iterable, List, Sequence, Text, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import faster_whisper
 import numpy as np
 import torch
 from faster_whisper.transcribe import Segment, TranscriptionInfo
 
-from src.data_extractors.ai.text_embed import TextEmbedder
 from src.data_extractors.data_loaders.audio import load_audio
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import WhisperSTTModel
 from src.db.extracted_text import insert_extracted_text
-from src.db.setters import upsert_setter
-from src.db.text_embeddings import add_text_embedding
 from src.types import ItemWithPath
 
 
@@ -37,12 +34,6 @@ def run_whisper_extractor_job(
         )
 
     threshold = model_opts.get_group_threshold(conn)
-
-    text_embedder = TextEmbedder()
-
-    embedding_setter_id = upsert_setter(
-        conn, text_embedder.model_type(), text_embedder.model_name()
-    )
 
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
@@ -92,20 +83,12 @@ def run_whisper_extractor_job(
             merged_text = merged_text.strip()
             if len(merged_text) < 3:
                 continue
-
-            text_embeddings = text_embedder.get_text_embeddings([merged_text])
-
-            assert isinstance(
-                text_embeddings, list
-            ), "embeddings should be lists of floats"
-            text_embedding = text_embeddings[0]
-
             average_log_prob = (
                 sum(segment[1] for segment in segment_list) / len(segment_list)
                 if len(segment_list) > 0
                 else None
             )
-            text_id = insert_extracted_text(
+            insert_extracted_text(
                 conn,
                 item.sha256,
                 log_id,
@@ -113,12 +96,6 @@ def run_whisper_extractor_job(
                 language=info.language,
                 language_confidence=info.language_probability,
                 confidence=average_log_prob,
-            )
-            add_text_embedding(
-                conn,
-                text_id,
-                embedding_setter_id,
-                text_embedding,
             )
 
     return run_extraction_job(
