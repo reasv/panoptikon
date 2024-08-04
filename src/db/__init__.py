@@ -222,7 +222,7 @@ def initialize_database(conn: sqlite3.Connection):
             text,
             content="extracted_text",
             content_rowid="id",
-            tokenize="porter unicode61 remove_diacritics 2"
+            tokenize="trigram case_sensitive 0"
         )
         """
     )
