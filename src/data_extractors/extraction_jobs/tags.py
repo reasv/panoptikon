@@ -9,7 +9,6 @@ from src.data_extractors.ai.wd_tagger import Predictor
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import TagsModel
-from src.data_extractors.utils import get_threshold_from_env
 from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath
 
@@ -96,7 +95,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     """
     Run a job that processes items in the database using the given tagging model.
     """
-    score_threshold = get_threshold_from_env()
+    score_threshold = model.get_group_threshold(conn)
     print(f"Using score threshold {score_threshold}")
     tag_predictor = Predictor(model_repo=model.model_repo())
     tag_predictor.load_model()

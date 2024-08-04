@@ -14,10 +14,11 @@ from src.types import ItemWithPath
 def run_image_embedding_extractor_job(
     conn: sqlite3.Connection, model_opt: ImageEmbeddingModel
 ):
+    batch_size = model_opt.get_group_batch_size(conn)
     embedder = CLIPEmbedder(
         model_name=model_opt.clip_model_name(),
         pretrained=model_opt.clip_model_checkpoint(),
-        batch_size=model_opt.batch_size(),
+        batch_size=batch_size,
     )
     embedder.load_model()
 

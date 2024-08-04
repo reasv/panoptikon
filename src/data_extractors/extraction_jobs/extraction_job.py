@@ -56,14 +56,15 @@ def run_extraction_job(
         0,
         0,
     )
-
+    threshold = model_opts.get_group_threshold(conn)
+    batch_size = model_opts.get_group_batch_size(conn)
     log_id, setter_id = add_data_extraction_log(
         conn,
         scan_time,
         model_opts.data_type(),
         model_opts.setter_name(),
-        model_opts.threshold(),
-        model_opts.batch_size(),
+        threshold,
+        batch_size,
     )
 
     def run_batch_inference_with_counter(work_units: Sequence):
@@ -85,7 +86,7 @@ def run_extraction_job(
             setter_id=setter_id,
             model_opts=model_opts,
         ),
-        model_opts.batch_size(),
+        batch_size,
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
@@ -150,6 +151,7 @@ def run_extraction_job(
         total_segments=total_processed_units,
         errors=len(failed_items.keys()),
         total_remaining=remaining_paths,
+        finished=True,
     )
     print("Updated log with scan results")
 

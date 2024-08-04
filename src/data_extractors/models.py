@@ -12,12 +12,8 @@ from src.db.tags import delete_orphan_tags
 
 
 class ModelOpts:
-    _batch_size: int
 
-    def __init__(
-        self, batch_size: int | None = 64, model_name: str | None = None
-    ):
-        self._batch_size = batch_size or self.default_batch_size()
+    def __init__(self, model_name: str | None = None):
         if model_name is None:
             model_name = self.default_model()
         assert self.valid_model(model_name), f"Invalid model {model_name}"
@@ -29,9 +25,6 @@ class ModelOpts:
 
     def __repr__(self):
         return self.setter_name()
-
-    def batch_size(self) -> int:
-        return self._batch_size
 
     @classmethod
     def available_models(cls) -> List[str]:

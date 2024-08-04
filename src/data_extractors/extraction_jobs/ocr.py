@@ -33,7 +33,7 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
         conn, text_embedder.model_type(), text_embedder.model_name()
     )
 
-    threshold = model_opt.threshold()
+    threshold = model_opt.get_group_threshold(conn)
 
     def process_batch(
         batch: Sequence[np.ndarray],

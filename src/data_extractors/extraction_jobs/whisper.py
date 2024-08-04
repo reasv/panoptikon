@@ -30,12 +30,13 @@ def run_whisper_extractor_job(
     whisper_model = faster_whisper.WhisperModel(
         model_opts.model_repo(), device=device, compute_type="float16"
     )
-    if model_opts.batch_size() > 1:
+    batch_size = model_opts.get_group_batch_size(conn)
+    if batch_size > 1:
         whisper_model = faster_whisper.BatchedInferencePipeline(
-            model=whisper_model, batch_size=model_opts.batch_size()
+            model=whisper_model, batch_size=batch_size
         )
 
-    threshold = model_opts.threshold()
+    threshold = model_opts.get_group_threshold(conn)
 
     text_embedder = TextEmbedder()
 

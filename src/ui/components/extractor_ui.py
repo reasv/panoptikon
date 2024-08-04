@@ -2,7 +2,6 @@ import datetime
 from typing import List, Type
 
 import gradio as gr
-from cv2 import threshold
 
 import src.data_extractors.models as models
 from src.data_extractors.extraction_jobs.types import (
@@ -77,12 +76,10 @@ def extraction_job_UI(
     tab: gr.Tab,
     model_type: Type[models.ModelOpts],
 ):
-    def run_job(batch: int, chosen_model: List[str]):
+    def run_job(chosen_model: List[str]):
         report_string = ""
         for model_name in chosen_model:
-            extractor_model = model_type(
-                batch_size=batch, model_name=model_name
-            )
+            extractor_model = model_type(model_name=model_name)
             report_string += run_model_job(extractor_model)
         return report_string
 
@@ -177,7 +174,7 @@ def extraction_job_UI(
 
     run_button.click(
         fn=run_job,
-        inputs=[batch_size, model_choice],
+        inputs=[model_choice],
         outputs=[report_box],
     )
     delete_button.click(

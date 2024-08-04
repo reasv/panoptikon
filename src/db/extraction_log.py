@@ -60,6 +60,7 @@ def update_log(
     total_segments: int,
     errors: int,
     total_remaining: int,
+    finished: bool = False,
 ):
     cursor = conn.cursor()
     cursor.execute(
@@ -75,7 +76,7 @@ def update_log(
     WHERE id = ?
     """,
         (
-            datetime.now().isoformat(),
+            datetime.now().isoformat() if finished else None,
             image_files,
             video_files,
             other_files,

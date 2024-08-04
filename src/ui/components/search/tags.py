@@ -3,7 +3,6 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
-from src.data_extractors.utils import get_threshold_from_env
 from src.db.search.types import QueryTagFilters, SearchQuery
 from src.types import SearchStats
 from src.ui.components.search.utils import AnyComponent
@@ -27,7 +26,7 @@ def create_tags_opts(query_state: gr.State):
                     key="min_confidence_tags",
                     minimum=0.05,
                     maximum=1,
-                    value=get_threshold_from_env(),
+                    value=0,
                     step=0.05,
                     label="Min. Confidence Level for Tags",
                     scale=2,
@@ -75,11 +74,7 @@ def create_tags_opts(query_state: gr.State):
                 pos_match_all, pos_match_any, neg_match_any, neg_match_all = (
                     parse_tags(tag_input_val)
                 )
-                minimum_confidence_threshold = get_threshold_from_env()
-                if (
-                    not min_confidence_val
-                    or min_confidence_val <= minimum_confidence_threshold
-                ):
+                if not min_confidence_val:
                     min_confidence_val = None
                 query.query.tags = QueryTagFilters(
                     pos_match_all=pos_match_all,
