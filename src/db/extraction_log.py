@@ -24,6 +24,8 @@ def add_data_extraction_log(
     threshold: float | None,
     batch_size: int,
 ):
+    # Remove any incomplete logs before starting a new one
+    remove_incomplete_logs(conn)
     setter_id = upsert_setter(conn, type, setter)
     cursor = conn.cursor()
     cursor.execute(
@@ -85,6 +87,22 @@ def update_log(
             total_remaining,
             log_id,
         ),
+    )
+
+
+def remove_incomplete_logs(conn: sqlite3.Connection):
+    """
+    Remove any logs that have a start time but no end time.
+    This is done to ensure that the database does not contain
+    any incomplete logs. As a result of foreign key constraints,
+    any data extracted for these logs will also be deleted.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        DELETE FROM data_extraction_log
+        WHERE end_time IS NULL
+    """
     )
 
 
