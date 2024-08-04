@@ -22,6 +22,7 @@ from src.db.extraction_log import (
     add_data_extraction_log,
     add_item_to_log,
     get_items_missing_data_extraction,
+    get_unprocessed_extractions_for_item,
     update_log,
 )
 from src.types import ItemWithPath
@@ -104,11 +105,39 @@ def run_extraction_job(
         try:
             if len(inputs) > 0:
                 output_handler(log_id, item, inputs, outputs)
-            add_item_to_log(
-                conn,
-                item=item.sha256,
-                log_id=log_id,
-            )
+            if model_opts.target_entity() == "item":
+                # If the model operates on individual items, add the item to the log
+                add_item_to_log(
+                    conn,
+                    item=item.sha256,
+                    log_id=log_id,
+                )
+            else:
+                # This model operates not on the original items, but on the extracted data
+                # Specifically, data extracted by a previous model,
+                # and more specifically, data of type model_opts.target_entity()
+                # We're going to assume it has processed all such data not yet processed
+                # and record it as such, so until new data of this type
+                # is produced for this item, it will not be processed again.
+                items_extractions = get_unprocessed_extractions_for_item(
+                    conn,
+                    item=item.sha256,
+                    input_type=model_opts.target_entity(),
+                    setter_id=setter_id,
+                )
+                # Each of these represents an instance of data being previously extracted
+                # from this item, by a different model,
+                # and the idea is this model is now
+                # processing that data, and should not process it again.
+                # We record it so the model's filters can filter this item out next run.
+                for extraction_id in items_extractions:
+                    add_item_to_log(
+                        conn,
+                        item=item.sha256,
+                        log_id=log_id,
+                        previous_extraction_id=extraction_id,
+                    )
+
             if len(inputs) == 0:
                 continue
         except Exception as e:

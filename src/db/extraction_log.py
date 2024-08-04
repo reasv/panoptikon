@@ -257,3 +257,34 @@ def get_existing_setters(
     cursor.close()
 
     return results
+
+
+def get_unprocessed_extractions_for_item(
+    conn: sqlite3.Connection, item: str, input_type: str, setter_id: int
+) -> List[int]:
+    """
+    Find all extractions of the specified input_type for this item
+    that have not yet been processed by the specified setter.
+    """
+    item_id = get_item_id(conn, item)
+    query = """
+        SELECT ie.id
+        FROM items_extractions AS ie
+        JOIN setters AS s ON ie.setter_id = s.id
+        WHERE ie.item_id = ?
+        AND s.type = ?
+        AND NOT EXISTS (
+            SELECT 1
+            FROM items_extractions AS ie2
+            WHERE ie2.source_extraction_id = ie.id
+            AND ie2.setter_id = ?
+        )
+    """
+    params = (item_id, input_type, setter_id)
+
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    cursor.close()
+
+    return [result[0] for result in results]
