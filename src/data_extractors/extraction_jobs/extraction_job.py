@@ -40,6 +40,7 @@ def run_extraction_job(
         [int, ItemWithPath, Sequence[I], Sequence[R]], None
     ],
     final_callback: Callable[[], None] = lambda: None,
+    transaction_per_item: bool = False,
 ):
     """
     Run a job that processes items in the database
@@ -66,6 +67,9 @@ def run_extraction_job(
         threshold,
         batch_size,
     )
+    if transaction_per_item:
+        # Commit the current transaction after adding the log
+        conn.commit()
 
     def run_batch_inference_with_counter(work_units: Sequence):
         nonlocal total_processed_units
@@ -90,6 +94,9 @@ def run_extraction_job(
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
+        if transaction_per_item:
+            # Start a new transaction for each item
+            conn.execute("BEGIN TRANSACTION")
         processed_items += 1
         if failed_items.get(item.sha256) is not None:
             continue
@@ -121,6 +128,20 @@ def run_extraction_job(
             + f"(ETA: {eta_str}) "
             + f"Processed ({item.type}) {item.path}"
         )
+        update_log(
+            conn,
+            log_id,
+            image_files=images,
+            video_files=videos,
+            other_files=other,
+            total_segments=total_processed_units,
+            errors=len(failed_items.keys()),
+            total_remaining=remaining,
+            finished=False,
+        )
+        if transaction_per_item:
+            # Commit the transaction after updating the log
+            conn.commit()
         yield ExtractorJobProgress(
             start_time, processed_items, total_items, eta_str, item
         )
@@ -142,6 +163,10 @@ def run_extraction_job(
         )[1]
         + 1
     )
+    if transaction_per_item:
+        # Start a new transaction to update the log with the final results
+        # The transaction will be committed by the caller
+        conn.execute("BEGIN TRANSACTION")
     update_log(
         conn,
         log_id,
