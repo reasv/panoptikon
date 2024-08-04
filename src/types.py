@@ -126,5 +126,5 @@ class SystemConfig:
     scan_pdf: bool = False
 
 
-OutputDataType = Literal["tags", "text", "clip"]
+OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
 TargetEntityType = Literal["items", "text"]

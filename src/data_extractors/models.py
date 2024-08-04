@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Any, Dict, Generator, List, Literal, Tuple, Type
+from typing import Any, Dict, Generator, List, Tuple, Type
 
 import src.data_extractors.extraction_jobs.types as job_types
 from src.db.group_settings import (
@@ -374,6 +374,85 @@ class ImageEmbeddingModel(ModelOpts):
         return self._checkpoint
 
 
+class TextEmbeddingModel(ModelOpts):
+    _model_name: str
+
+    def _init(self, model_name: str):
+
+        self._model_name = TextEmbeddingModel._available_models_mapping()[
+            model_name
+        ]
+
+    @classmethod
+    def data_type(cls) -> OutputDataType:
+        return "text-embedding"
+
+    @classmethod
+    def group_name(cls) -> str:
+        return "sentence-transformers"
+
+    @classmethod
+    def name(cls) -> str:
+        return "Text Embeddings"
+
+    @classmethod
+    def description(cls) -> str:
+        return """
+    Generate Text Embeddings from extracted text 
+    using Sentence Transformers.
+    Enables semantic text search.
+    This will generate embeddings for text already extracted 
+    by other models such as Whisper Speech-to-Text, or OCR.
+    If you haven't run those models yet, you should do so first.
+    """
+
+    def setter_name(self) -> str:
+        return TextEmbeddingModel._model_to_setter_name(self._model_name)
+
+    @classmethod
+    def default_model(cls) -> str:
+        return "all-mpnet-base-v2"
+
+    def run_extractor(self, conn: sqlite3.Connection):
+        from src.data_extractors.extraction_jobs.text_embeddings import (
+            run_text_embedding_extractor_job,
+        )
+
+        return run_text_embedding_extractor_job(conn, self)
+
+    @classmethod
+    def _available_models_mapping(cls) -> Dict[str, str]:
+
+        SENTENCE_TRANSFORMERS = ["all-mpnet-base-v2", "all-MiniLM-L6-v2"]
+        return {model_name: model_name for model_name in SENTENCE_TRANSFORMERS}
+
+    @classmethod
+    def _model_to_setter_name(cls, model_name: str) -> str:
+        # Reverse the available models dict
+        model_to_name = {
+            v: k for k, v in cls._available_models_mapping().items()
+        }
+        return model_to_name[model_name]
+
+    def load_model(self):
+        from src.data_extractors.ai.text_embed import TextEmbedder
+
+        TextEmbedder(self._model_name, persistent=True)
+
+    def unload_model(self):
+        from src.data_extractors.ai.text_embed import TextEmbedder
+
+        embedder_model = TextEmbedder(self._model_name, load_model=False)
+        embedder_model.unload_model()
+
+    def run_batch_inference(self, texts: List[str]) -> List[List[float]]:
+        from src.data_extractors.ai.text_embed import TextEmbedder
+
+        embedder = TextEmbedder(self._model_name)
+        embeddings = embedder.get_text_embeddings(texts)
+        return embeddings
+
+
 class WhisperSTTModel(ModelOpts):
     _model_repo: str
 
@@ -462,7 +541,13 @@ class WhisperSTTModel(ModelOpts):
 class ModelOptsFactory:
     @classmethod
     def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
-        return [TagsModel, OCRModel, ImageEmbeddingModel, WhisperSTTModel]
+        return [
+            TagsModel,
+            OCRModel,
+            WhisperSTTModel,
+            ImageEmbeddingModel,
+            TextEmbeddingModel,
+        ]
 
     @classmethod
     def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:

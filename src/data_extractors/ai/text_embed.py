@@ -49,6 +49,9 @@ class TextEmbedder:
             self._model = TextEmbedderSingleton.get_instance(self._model_name)
             self._model_loaded = True
 
+    def load_model(self):
+        self._load_model()
+
     def get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         self._load_model()
         assert self._model is not None, "Model not loaded"
