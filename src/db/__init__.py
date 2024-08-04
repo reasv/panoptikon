@@ -185,14 +185,21 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS items_extractions (
+        id INTEGER PRIMARY KEY,
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
-        UNIQUE(item_id, log_id),    -- Unique constraint on item and log_id
-        UNIQUE(item_id, setter_id), -- Unique constraint on item and setter_id
-        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
-        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
-        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+        source_extraction_id INTEGER,                     -- Reference to a previous extraction from which data was further processed
+        is_origin BOOLEAN,                                -- Indicates if the extraction is the original extraction. True if it is, NULL if not
+        UNIQUE(item_id, log_id, is_origin),               -- Origin extractions should be unique per item (and job)
+        UNIQUE(item_id, setter_id, is_origin),            -- Origin extractions should be unique per item (and setter)
+        UNIQUE(item_id, log_id, source_extraction_id),    -- Derived extractions should be unique per extraction they are derived from (and job)
+        UNIQUE(item_id, setter_id, source_extraction_id), -- Derived extractions should be unique per extraction they are derived from (and setter)
+        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+        FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
+        FOREIGN KEY(source_extraction_id) REFERENCES items_extractions(id) ON DELETE CASCADE,
+        CHECK ((is_origin = TRUE AND source_extraction_id IS NULL) OR (is_origin IS NULL AND source_extraction_id IS NOT NULL))
     )
     """
     )

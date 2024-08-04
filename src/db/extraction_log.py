@@ -136,17 +136,23 @@ def add_item_to_log(
     conn: sqlite3.Connection,
     item: str,
     log_id: int,
+    previous_extraction_id: int | None = None,
 ):
     cursor = conn.cursor()
     item_id = get_item_id(conn, item)
+    if previous_extraction_id is None:
+        is_origin = True
+    else:
+        is_origin = None
+
     cursor.execute(
         """
-    INSERT INTO items_extractions (item_id, log_id, setter_id)
-    SELECT ?, ?, log.setter_id
+    INSERT INTO items_extractions (item_id, log_id, setter_id, is_origin, source_extraction_id)
+    SELECT ?, ?, log.setter_id, ?, ?
     FROM data_extraction_log AS log
     WHERE log.id = ?
     """,
-        (item_id, log_id, log_id),
+        (item_id, log_id, is_origin, previous_extraction_id, log_id),
     )
 
 

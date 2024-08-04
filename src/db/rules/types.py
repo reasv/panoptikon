@@ -49,7 +49,20 @@ class ProcessedItemsFilter:
     setter_name: str
 
 
-FilterType = Union[PathFilter, MimeFilter, MinMaxFilter, ProcessedItemsFilter]
+@dataclass
+class ProcessedExtractedDataFilter:
+    setter_type: str
+    setter_name: str
+    data_type: str
+
+
+FilterType = Union[
+    PathFilter,
+    MimeFilter,
+    MinMaxFilter,
+    ProcessedItemsFilter,
+    ProcessedExtractedDataFilter,
+]
 
 
 @dataclass

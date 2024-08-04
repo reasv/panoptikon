@@ -1,21 +1,13 @@
 import json
-from dataclasses import asdict, dataclass, is_dataclass
-from typing import (
-    Any,
-    Callable,
-    List,
-    Type,
-    TypeVar,
-    Union,
-    get_args,
-    get_origin,
-)
+from dataclasses import asdict
+from typing import Any, TypeVar, Union, get_args, get_origin
 
 from src.db.rules.types import (
     FilterType,
     MimeFilter,
     MinMaxFilter,
     PathFilter,
+    ProcessedExtractedDataFilter,
     ProcessedItemsFilter,
     RuleItemFilters,
 )
@@ -73,7 +65,14 @@ class RuleItemFiltersEncoder(json.JSONEncoder):
 class FilterEncoder(json.JSONEncoder):
     def default(self, o: Any) -> Any:
         if isinstance(
-            o, (PathFilter, MimeFilter, ProcessedItemsFilter, MinMaxFilter)
+            o,
+            (
+                PathFilter,
+                MimeFilter,
+                ProcessedItemsFilter,
+                MinMaxFilter,
+                ProcessedExtractedDataFilter,
+            ),
         ):
             return {"type": o.__class__.__name__, "data": o.__dict__}
         return super().default(o)
