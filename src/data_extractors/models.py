@@ -1,14 +1,20 @@
 import sqlite3
-from typing import Any, Dict, Generator, List, Tuple, Type
+from typing import Any, Dict, Generator, List, Literal, Tuple, Type
 
 import src.data_extractors.extraction_jobs.types as job_types
 from src.db.group_settings import (
     retrieve_model_group_settings,
     save_model_group_settings,
 )
-from src.db.rules.types import MimeFilter, ProcessedItemsFilter, RuleItemFilters
+from src.db.rules.types import (
+    MimeFilter,
+    ProcessedExtractedDataFilter,
+    ProcessedItemsFilter,
+    RuleItemFilters,
+)
 from src.db.setters import delete_setter_by_name
 from src.db.tags import delete_orphan_tags
+from src.types import OutputDataType, TargetEntityType
 
 
 class ModelOpts:
@@ -25,6 +31,10 @@ class ModelOpts:
 
     def __repr__(self):
         return self.setter_name()
+
+    @classmethod
+    def target_entity(cls) -> TargetEntityType:
+        return "items"
 
     @classmethod
     def available_models(cls) -> List[str]:
@@ -76,16 +86,27 @@ class ModelOpts:
         delete_setter_by_name(conn, self.data_type(), self.setter_name())
         return f"Deleted text extracted from items by model {self.setter_name()}.\n"
 
-    def supported_mime_types(self) -> List[str] | None:
+    @classmethod
+    def supported_mime_types(cls) -> List[str] | None:
         return None
 
     def item_extraction_rules(self) -> RuleItemFilters:
         rules = []
-        rules.append(
-            ProcessedItemsFilter(
-                setter_type=self.data_type(), setter_name=self.setter_name()
+        if self.target_entity() == "items":
+            rules.append(
+                ProcessedItemsFilter(
+                    setter_type=self.data_type(), setter_name=self.setter_name()
+                )
             )
-        )
+        elif self.target_entity() == "text":
+            rules.append(
+                ProcessedExtractedDataFilter(
+                    setter_type=self.data_type(),
+                    setter_name=self.setter_name(),
+                    data_type="text",
+                )
+            )
+
         mime_types = self.supported_mime_types()
         if mime_types:
             rules.append(
@@ -96,7 +117,7 @@ class ModelOpts:
         return RuleItemFilters(positive=rules, negative=[])
 
     @classmethod
-    def data_type(cls) -> str:
+    def data_type(cls) -> OutputDataType:
         raise NotImplementedError
 
     def run_extractor(
@@ -136,7 +157,7 @@ class TagsModel(ModelOpts):
         self._model_repo = TagsModel._available_models_mapping()[model_name]
 
     @classmethod
-    def data_type(cls) -> str:
+    def data_type(cls) -> OutputDataType:
         return "tags"
 
     @classmethod
@@ -223,7 +244,7 @@ class OCRModel(ModelOpts):
         return 0.41
 
     @classmethod
-    def data_type(cls) -> str:
+    def data_type(cls) -> OutputDataType:
         return "text"
 
     @classmethod
@@ -298,7 +319,7 @@ class ImageEmbeddingModel(ModelOpts):
         )
 
     @classmethod
-    def data_type(cls) -> str:
+    def data_type(cls) -> OutputDataType:
         return "clip"
 
     @classmethod
@@ -378,7 +399,7 @@ class WhisperSTTModel(ModelOpts):
         return "whisper|distill-large-v3"
 
     @classmethod
-    def data_type(cls) -> str:
+    def data_type(cls) -> OutputDataType:
         return "text"
 
     @classmethod
@@ -433,7 +454,8 @@ class WhisperSTTModel(ModelOpts):
     def model_repo(self) -> str:
         return self._model_repo
 
-    def supported_mime_types(self) -> List[str] | None:
+    @classmethod
+    def supported_mime_types(cls) -> List[str] | None:
         return ["audio/", "video/"]
 
 

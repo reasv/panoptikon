@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import List, Literal, Tuple, Union
 
+from src.types import OutputDataType
+
 
 @dataclass
 class PathFilter:
@@ -45,15 +47,15 @@ class MinMaxFilter:
 
 @dataclass
 class ProcessedItemsFilter:
-    setter_type: str
+    setter_type: OutputDataType
     setter_name: str
 
 
 @dataclass
 class ProcessedExtractedDataFilter:
-    setter_type: str
+    setter_type: OutputDataType
     setter_name: str
-    data_type: str
+    data_type: OutputDataType
 
 
 FilterType = Union[

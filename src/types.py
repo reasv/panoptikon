@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Union
+from typing import List, Literal, Tuple, Union
 
 
 @dataclass
@@ -124,3 +124,7 @@ class SystemConfig:
     scan_audio: bool = False
     scan_html: bool = False
     scan_pdf: bool = False
+
+
+OutputDataType = Literal["tags", "text", "clip"]
+TargetEntityType = Literal["items", "text"]
