@@ -86,7 +86,7 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
             if cleaned_string in string_set:
                 continue
             string_set.add(cleaned_string)
-            min_confidence = min(word_confidences)
+            avg_confidence = sum(word_confidences) / len(word_confidences)
             assert (
                 isinstance(language["confidence"], float)
                 or language["confidence"] is None
@@ -103,7 +103,7 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
                 text=cleaned_string,
                 language=language["value"],
                 language_confidence=language["confidence"],
-                confidence=min_confidence,
+                confidence=avg_confidence,
             )
             add_text_embedding(
                 conn,
