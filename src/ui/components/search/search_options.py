@@ -116,5 +116,6 @@ def on_tab_load():
         et_stats=text_stats,
         tag_setters=tag_setters,
         et_setters=extracted_text_setters,
+        loaded=True,
     )
     return asdict(stats)
