@@ -259,16 +259,22 @@ def create_vector_search_opts(query_state: gr.State):
 
 last_embedded_text: str | None = None
 last_embedded_text_embed: bytes | None = None
+last_used_model: str | None = None
 
 
 def get_embed(text: str, model_name: str) -> bytes:
-    global last_embedded_text, last_embedded_text_embed
-    if text == last_embedded_text and last_embedded_text_embed is not None:
+    global last_embedded_text, last_embedded_text_embed, last_used_model
+    if (
+        text == last_embedded_text
+        and model_name == last_used_model
+        and last_embedded_text_embed is not None
+    ):
         return last_embedded_text_embed
     # Set as persistent so that the model is not reloaded every time the function is called
     embedder = TextEmbedder(model_name=model_name, persistent=True)
     text_embed = embedder.get_text_embeddings([text])[0]
     last_embedded_text = text
+    last_used_model = model_name
     last_embedded_text_embed = serialize_f32(text_embed)
     return last_embedded_text_embed
 
