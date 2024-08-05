@@ -55,7 +55,9 @@ def build_extracted_text_search_subclause(
     params: List[str | float | bytes] = []
 
     should_include, type_setter_pairs = should_include_subclause(
-        args.targets, ["text"]  # type: ignore
+        args.targets,  # type: ignore
+        # Tags are also stored as text in the extracted_text table
+        ["text", "tags"],
     )
     if not should_include:
         return extracted_text_subclause, params

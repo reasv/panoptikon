@@ -1,9 +1,9 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 
 from src.db.search.types import ExtractedTextFilter, SearchQuery
-from src.types import SearchStats
+from src.types import OutputDataType, SearchStats
 from src.ui.components.search.utils import AnyComponent
 
 
@@ -67,7 +67,7 @@ def create_extracted_text_fts_opts(
         final_query_build: bool = False,
     ) -> SearchQuery:
         text_query_val: str | None = args[text_query]
-        query_targets: List[str] | None = args[targets]
+        query_targets: List[Tuple[OutputDataType, str]] | None = args[targets]
         confidence_val: float = args[confidence]
         languages_val: List[str] | None = args[languages]
         language_confidence_val: float = args[language_confidence]
@@ -75,7 +75,7 @@ def create_extracted_text_fts_opts(
         if text_query_val:
             query.query.filters.extracted_text = ExtractedTextFilter(
                 query=text_query_val,
-                targets=[("text", target) for target in query_targets or []],
+                targets=query_targets or [],
                 min_confidence=confidence_val or None,
             )
             if languages_val:
@@ -97,7 +97,7 @@ def create_extracted_text_fts_opts(
         if not extracted_text_available:
             query.query.filters.extracted_text = None
         return {
-            targets: gr.Dropdown(choices=search_stats.et_setters),
+            targets: gr.Dropdown(choices=search_stats.et_setters),  # type: ignore
             languages: gr.Dropdown(choices=search_stats.et_stats.languages),
             # language_confidence: search_stats.et_stats.lowest_language_confidence,
             # confidence: search_stats.et_stats.lowest_confidence,

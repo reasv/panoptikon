@@ -10,13 +10,17 @@ def build_processed_extracted_data_filter_cte(
         """
     else:
         prev_cte_join_clause = ""
+
+    target_type_conditions = " OR ".join(
+        [f"s.type = ?" for _ in range(len(filter.data_types))]
+    )
     cte = f"""
     {name} AS (
         SELECT DISTINCT ie.item_id AS id
         FROM items_extractions AS ie
         {prev_cte_join_clause}
         JOIN setters AS s ON ie.setter_id = s.id
-        WHERE s.type = ?
+        WHERE {target_type_conditions}
         AND NOT EXISTS (
             SELECT 1
             FROM items_extractions AS ie2
@@ -27,4 +31,4 @@ def build_processed_extracted_data_filter_cte(
         )
     )
     """
-    return cte, [filter.data_type, filter.setter_type, filter.setter_name]
+    return cte, [*filter.data_types, filter.setter_type, filter.setter_name]

@@ -55,7 +55,7 @@ class ProcessedItemsFilter:
 class ProcessedExtractedDataFilter:
     setter_type: OutputDataType
     setter_name: str
-    data_type: OutputDataType
+    data_types: List[OutputDataType]
 
 
 FilterType = Union[

@@ -99,7 +99,7 @@ class ExtractedTextStats:
 @dataclass
 class SearchStats:
     all_setters: List[Tuple[str, str]] = field(default_factory=list)
-    et_setters: List[Tuple[str, str]] = field(default_factory=list)
+    et_setters: List[Tuple[str, Tuple[str, str]]] = field(default_factory=list)
     et_stats: ExtractedTextStats = field(default_factory=ExtractedTextStats)
     clip_setters: List[str] = field(default_factory=list)
     te_setters: List[str] = field(default_factory=list)

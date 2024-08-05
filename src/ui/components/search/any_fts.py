@@ -55,11 +55,7 @@ def create_fts_options(
         query: SearchQuery,
         search_stats: SearchStats,
     ) -> Dict[AnyComponent, Any]:
-        text_setters = [
-            (name, ("text", setter_id))
-            for name, setter_id in search_stats.et_setters
-        ]
-        all_targets = path_setters + text_setters
+        all_targets = path_setters + search_stats.et_setters
         return {
             query_targets: gr.update(choices=all_targets),
         }

@@ -97,9 +97,9 @@ def on_tab_load():
     conn.close()
 
     extracted_text_setters = [
-        (f"{setter_id}", setter_id)
-        for model_type, setter_id in setters
-        if model_type == "text"
+        (setter_name, (model_type, setter_name))
+        for model_type, setter_name in setters
+        if model_type == "text" or model_type == "tags"
     ]
     tag_setters = [s for t, s in setters if t == "tags"]
 

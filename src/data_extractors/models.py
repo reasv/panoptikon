@@ -100,11 +100,14 @@ class ModelOpts:
                 )
             )
         else:
+            data_types: List[OutputDataType] = [target_entity]
+            if target_entity == "text":
+                data_types.append("tags")  # Tags are also stored as text
             rules.append(
                 ProcessedExtractedDataFilter(
                     setter_type=self.data_type(),
                     setter_name=self.setter_name(),
-                    data_type=target_entity,
+                    data_types=data_types,
                 )
             )
 
