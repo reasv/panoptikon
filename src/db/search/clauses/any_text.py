@@ -26,7 +26,7 @@ def build_any_text_query_clause(
         build_extracted_text_search_subclause(
             ExtractedTextFilter(
                 query=args.query,
-                targets=args.targets,
+                targets=args.targets,  # type: ignore
             )
         )
     )

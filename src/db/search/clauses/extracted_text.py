@@ -1,10 +1,15 @@
 from typing import List
 
 from src.db.search.clauses.utils import should_include_subclause
-from src.db.search.types import ExtractedTextFilter
+from src.db.search.types import (
+    ExtractedTextEmbeddingsFilter,
+    ExtractedTextFilter,
+)
 
 
-def build_extracted_text_search_clause(args: ExtractedTextFilter | None):
+def build_extracted_text_search_clause(
+    args: ExtractedTextFilter | ExtractedTextEmbeddingsFilter | None,
+):
     """
     Build a subquery to match extracted text based on the given conditions.
     """
@@ -12,7 +17,7 @@ def build_extracted_text_search_clause(args: ExtractedTextFilter | None):
     if not args or not args.query:
         return "", [], ""
     # Check if the text query is a vector query
-    is_vector_query = isinstance(args.query, bytes)
+    is_vector_query = isinstance(args, ExtractedTextEmbeddingsFilter)
 
     subclause, params = build_extracted_text_search_subclause(args)
     if len(subclause) == 0:
@@ -36,30 +41,34 @@ def build_extracted_text_search_clause(args: ExtractedTextFilter | None):
     return extracted_text_condition, params, additional_columns
 
 
-def build_extracted_text_search_subclause(args: ExtractedTextFilter):
+def build_extracted_text_search_subclause(
+    args: ExtractedTextFilter | ExtractedTextEmbeddingsFilter,
+):
     """
     Build a subquery to match extracted text based on the given conditions.
     """
     # Check if the text query is a vector query
-    is_vector_query = isinstance(args.query, bytes)
+    is_vector_query = isinstance(args, ExtractedTextEmbeddingsFilter)
 
     # Define subquery for matching extracted text
     extracted_text_subclause = ""
-    extracted_text_params: List[str | float | bytes] = []
+    params: List[str | float | bytes] = []
 
     should_include, type_setter_pairs = should_include_subclause(
-        args.targets, ["text"]
+        args.targets, ["text"]  # type: ignore
     )
     if not should_include:
-        return extracted_text_subclause, extracted_text_params
+        return extracted_text_subclause, params
 
     if is_vector_query:
+        # If the query is a vector query, we need to match on the text embeddings model
+        params.extend(args.target)
         where_conditions = [
             "et.setter_id = text_setters.id",
         ]
     else:
         where_conditions = ["et_fts.text MATCH ?"]
-        extracted_text_params.append(args.query)
+        params.append(args.query)
 
     if type_setter_pairs:
         include_pairs_conditions = " OR ".join(
@@ -68,25 +77,29 @@ def build_extracted_text_search_subclause(args: ExtractedTextFilter):
         )
         where_conditions.append(f"({include_pairs_conditions})")
         for type, setter in type_setter_pairs:
-            extracted_text_params.extend([type, setter])
+            params.extend([type, setter])
 
     if args.languages:
         where_conditions.append(
             "et.language IN ({','.join(['?']*len(languages))})"
         )
-        extracted_text_params.extend(args.languages)
+        params.extend(args.languages)
         if args.language_min_confidence:
             where_conditions.append("et.language_confidence >= ?")
-            extracted_text_params.append(args.language_min_confidence)
+            params.append(args.language_min_confidence)
 
     if args.min_confidence:
         where_conditions.append("et.confidence >= ?")
-        extracted_text_params.append(args.min_confidence)
+        params.append(args.min_confidence)
 
     if is_vector_query:
         extracted_text_subclause = f"""
             JOIN text_embeddings AS et_vec
             ON et_vec.item_id = files.item_id
+            JOIN setters as vec_setters
+            ON et_vec.setter_id = vec_setters.id
+            AND vec_setters.type = ?
+            AND vec_setters.name = ?
             JOIN extracted_text AS et
             ON et_vec.text_id = et.id
             JOIN setters AS text_setters
@@ -101,4 +114,4 @@ def build_extracted_text_search_subclause(args: ExtractedTextFilter):
             WHERE {" AND ".join(where_conditions)}
             GROUP BY et.item_id
         """
-    return extracted_text_subclause, extracted_text_params
+    return extracted_text_subclause, params

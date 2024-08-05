@@ -3,6 +3,8 @@ from typing import List, Literal, Tuple, TypeVar, Union
 
 from typeguard import typechecked
 
+from src.types import OutputDataType
+
 # Search Query Types
 OrderByType = Union[
     Literal[
@@ -27,14 +29,20 @@ class FileFilters:
     include_path_prefixes: List[str] = field(default_factory=list)
 
 
-# str or bytes
-Q = TypeVar("Q", str, bytes)
+@dataclass
+class ExtractedTextFilter:
+    query: str
+    targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
+    languages: List[str] = field(default_factory=list)
+    language_min_confidence: Union[float, None] = None
+    min_confidence: Union[float, None] = None
 
 
 @dataclass
-class ExtractedTextFilter[Q]:
-    query: Q
-    targets: List[Tuple[str, str]] = field(default_factory=list)
+class ExtractedTextEmbeddingsFilter:
+    query: bytes
+    target: Tuple[OutputDataType, str]
+    text_targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     language_min_confidence: Union[float, None] = None
     min_confidence: Union[float, None] = None
@@ -61,7 +69,7 @@ class AnyTextFilter:
 @dataclass
 class ImageEmbeddingFilter:
     query: bytes
-    target: Tuple[str, str]
+    target: Tuple[OutputDataType, str]
 
 
 @dataclass
@@ -91,8 +99,8 @@ class QueryTagFilters:
 class QueryFilters:
     files: Union[FileFilters, None] = None
     path: Union[PathTextFilter, None] = None
-    extracted_text: Union[ExtractedTextFilter[str], None] = None
-    extracted_text_embeddings: Union[ExtractedTextFilter[bytes], None] = None
+    extracted_text: Union[ExtractedTextFilter, None] = None
+    extracted_text_embeddings: Union[ExtractedTextEmbeddingsFilter, None] = None
     image_embeddings: Union[ImageEmbeddingFilter, None] = None
     any_text: Union[AnyTextFilter, None] = None
     bookmarks: Union[BookmarksFilter, None] = None

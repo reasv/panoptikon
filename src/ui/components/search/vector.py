@@ -6,12 +6,12 @@ import numpy as np
 from src.data_extractors.ai.clip import CLIPEmbedder
 from src.data_extractors.ai.text_embed import TextEmbedder
 from src.db.search.types import (
-    ExtractedTextFilter,
+    ExtractedTextEmbeddingsFilter,
     ImageEmbeddingFilter,
     SearchQuery,
 )
 from src.db.utils import serialize_f32
-from src.types import SearchStats
+from src.types import OutputDataType, SearchStats
 from src.ui.components.search.utils import AnyComponent
 
 
@@ -154,7 +154,7 @@ def create_vector_search_opts(query_state: gr.State):
         vec_query_type_val: str | None = args[vec_query_type]
         te_embedding_model_val: str | None = args[te_embedding_model]
         te_text_query_val: str | None = args[te_text_query]
-        te_text_targets_val: List[Tuple[str, str]] | None = args[
+        te_text_targets_val: List[Tuple[OutputDataType, str]] | None = args[
             te_text_targets
         ]
         confidence_val: float = args[confidence]
@@ -167,12 +167,13 @@ def create_vector_search_opts(query_state: gr.State):
         query.query.filters.extracted_text_embeddings = None
         query.query.filters.image_embeddings = None
         if vec_query_type_val == "Text Vector Search":
-            if te_text_query_val:
+            if te_text_query_val and te_embedding_model_val:
                 embedded_query = get_embed(te_text_query_val)
                 query.query.filters.extracted_text_embeddings = (
-                    ExtractedTextFilter[bytes](
+                    ExtractedTextEmbeddingsFilter(
                         query=embedded_query,
-                        targets=te_text_targets_val or [],
+                        target=("text-embedding", te_embedding_model_val),
+                        text_targets=te_text_targets_val or [],
                         min_confidence=confidence_val or None,
                         languages=languages_val or [],
                         language_min_confidence=language_confidence_val or None,
@@ -274,7 +275,7 @@ def get_clip_embed(input: str | np.ndarray, model_name: str):
 
     from src.data_extractors.models import ImageEmbeddingModel
 
-    model_opt = ImageEmbeddingModel(1, model_name)
+    model_opt = ImageEmbeddingModel(model_name)
     name = model_opt.clip_model_name()
     pretrained = model_opt.clip_model_checkpoint()
     # Set as persistent so that the model is not reloaded every time the function is called
