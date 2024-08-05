@@ -71,6 +71,7 @@ def run_whisper_extractor_job(
             ]
         ],
     ):
+        index = 0
         for segments, info in outputs:
             segment_list = [
                 (segment.text, segment.avg_logprob)
@@ -91,12 +92,14 @@ def run_whisper_extractor_job(
             insert_extracted_text(
                 conn,
                 item.sha256,
-                log_id,
+                index=index,
+                log_id=log_id,
                 text=merged_text,
                 language=info.language,
                 language_confidence=info.language_probability,
                 confidence=average_log_prob,
             )
+            index += 1
 
     return run_extraction_job(
         conn,

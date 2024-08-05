@@ -8,6 +8,7 @@ from src.types import ExtractedText, ExtractedTextStats
 def insert_extracted_text(
     conn: sqlite3.Connection,
     item_sha256: str,
+    index: int,
     log_id: int,
     text: str,
     language: str | None,
@@ -27,14 +28,15 @@ def insert_extracted_text(
     cursor = conn.cursor()
 
     sql = """
-    INSERT INTO extracted_text (item_id, log_id, setter_id, language, language_confidence, confidence, text)
-    SELECT ?, ?, logs.setter_id, ?, ?, ?, ?
+    INSERT INTO extracted_text (idx, item_id, log_id, setter_id, language, language_confidence, confidence, text)
+    SELECT ?, ?, ?, logs.setter_id, ?, ?, ?, ?
     FROM data_extraction_log AS logs
     WHERE logs.id = ?
     """
     cursor.execute(
         sql,
         (
+            index,
             item_id,
             log_id,
             language,

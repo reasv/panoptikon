@@ -1,4 +1,5 @@
 import sqlite3
+from operator import index
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -68,6 +69,7 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
     ):
         # Deduplicate the text from the OCR output
         string_set = set()
+        index = 0
         for extracted_string, language, word_confidences in outputs:
             cleaned_string = extracted_string.lower().strip()
             if len(cleaned_string) < 3:
@@ -88,12 +90,14 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
             insert_extracted_text(
                 conn,
                 item.sha256,
-                log_id,
+                index=index,
+                log_id=log_id,
                 text=cleaned_string,
                 language=language["value"],
                 language_confidence=language["confidence"],
                 confidence=avg_confidence,
             )
+            index += 1
 
     return run_extraction_job(
         conn,

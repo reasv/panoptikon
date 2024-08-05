@@ -211,10 +211,13 @@ def initialize_database(conn: sqlite3.Connection):
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
+        idx INTEGER NOT NULL,
         language TEXT,
         language_confidence REAL,
         confidence REAL,
         text TEXT NOT NULL,
+        UNIQUE(item_id, setter_id, idx),
+        UNIQUE(item_id, log_id, idx),
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
         FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
