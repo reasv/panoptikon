@@ -105,7 +105,7 @@ def run_extraction_job(
         try:
             if len(inputs) > 0:
                 output_handler(log_id, item, inputs, outputs)
-            if model_opts.target_entity() == "item":
+            if model_opts.target_entity() == "items":
                 # If the model operates on individual items, add the item to the log
                 add_item_to_log(
                     conn,

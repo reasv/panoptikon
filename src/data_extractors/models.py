@@ -384,6 +384,10 @@ class TextEmbeddingModel(ModelOpts):
         ]
 
     @classmethod
+    def target_entity(cls) -> TargetEntityType:
+        return "text"
+
+    @classmethod
     def data_type(cls) -> OutputDataType:
         return "text-embedding"
 
@@ -397,14 +401,14 @@ class TextEmbeddingModel(ModelOpts):
 
     @classmethod
     def description(cls) -> str:
-        return """
-    Generate Text Embeddings from extracted text 
-    using Sentence Transformers.
-    Enables semantic text search.
-    This will generate embeddings for text already extracted 
-    by other models such as Whisper Speech-to-Text, or OCR.
-    If you haven't run those models yet, you should do so first.
-    """
+        return (
+            "Generate Text Embeddings from extracted text "
+            + "using Sentence Transformers."
+            + "Enables semantic text search."
+            + "This will generate embeddings for text already extracted "
+            + "by other models such as Whisper Speech-to-Text, or OCR. "
+            + "If you haven't run those models yet, you should do so first. "
+        )
 
     def setter_name(self) -> str:
         return TextEmbeddingModel._model_to_setter_name(self._model_name)
