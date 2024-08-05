@@ -18,6 +18,7 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
+from src.db.config import retrieve_system_config
 from src.db.extraction_log import (
     add_data_extraction_log,
     add_item_to_log,
@@ -41,7 +42,6 @@ def run_extraction_job(
         [int, ItemWithPath, Sequence[I], Sequence[R]], None
     ],
     final_callback: Callable[[], None] = lambda: None,
-    transaction_per_item: bool = False,
 ):
     """
     Run a job that processes items in the database
@@ -58,6 +58,7 @@ def run_extraction_job(
         0,
         0,
     )
+    system_config = retrieve_system_config(conn)
     threshold = model_opts.get_group_threshold(conn)
     batch_size = model_opts.get_group_batch_size(conn)
     log_id, setter_id = add_data_extraction_log(
@@ -68,7 +69,7 @@ def run_extraction_job(
         threshold,
         batch_size,
     )
-    if transaction_per_item:
+    if system_config.transaction_per_item:
         # Commit the current transaction after adding the log
         conn.commit()
 
@@ -95,7 +96,7 @@ def run_extraction_job(
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
-        if transaction_per_item:
+        if system_config.transaction_per_item:
             # Start a new transaction for each item
             conn.execute("BEGIN TRANSACTION")
         processed_items += 1
@@ -168,7 +169,7 @@ def run_extraction_job(
             total_remaining=remaining,
             finished=False,
         )
-        if transaction_per_item:
+        if system_config.transaction_per_item:
             # Commit the transaction after updating the log
             conn.commit()
         yield ExtractorJobProgress(
@@ -192,7 +193,7 @@ def run_extraction_job(
         )[1]
         + 1
     )
-    if transaction_per_item:
+    if system_config.transaction_per_item:
         # Start a new transaction to update the log with the final results
         # The transaction will be committed by the caller
         conn.execute("BEGIN TRANSACTION")

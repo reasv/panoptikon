@@ -125,6 +125,7 @@ class SystemConfig:
     scan_audio: bool = False
     scan_html: bool = False
     scan_pdf: bool = False
+    transaction_per_item: bool = False
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
