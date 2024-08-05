@@ -3,12 +3,14 @@ from __future__ import annotations
 import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
+import numpy as np
 import PIL.Image
 
-from src.data_extractors.ai.wd_tagger import Predictor
+from src.data_extractors.ai.wd_tagger import Predictor, mcut_threshold
 from src.data_extractors.data_loaders.images import item_image_loader_pillow
 from src.data_extractors.extraction_jobs import run_extraction_job
 from src.data_extractors.models import TagsModel
+from src.db.extracted_text import insert_extracted_text
 from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath
 
@@ -62,22 +64,23 @@ def handle_individual_result(
         Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]
     ],
 ):
-    character_res, general_res = aggregate_results(list(results))
+    character_res, general_rating_res = aggregate_results(list(results))
+
+    chars = [(tag, confidence) for tag, confidence in character_res.items()]
+    general = [
+        (tag, confidence)
+        for tag, confidence in general_rating_res.items()
+        if not tag.startswith("rating:")
+    ]
+    rating = [
+        (tag, confidence)
+        for tag, confidence in general_rating_res.items()
+        if tag.startswith("rating:")
+    ]
     tags = (
-        [
-            ("danbooru:character", tag, confidence)
-            for tag, confidence in character_res.items()
-        ]
-        + [
-            ("danbooru:general", tag, confidence)
-            for tag, confidence in general_res.items()
-            if not tag.startswith("rating:")
-        ]
-        + [
-            ("danbooru:rating", tag, confidence)
-            for tag, confidence in general_res.items()
-            if tag.startswith("rating:")
-        ]
+        [("danbooru:character", tag, confidence) for tag, confidence in chars]
+        + [("danbooru:general", tag, confidence) for tag, confidence in general]
+        + [("danbooru:rating", tag, confidence) for tag, confidence in rating]
     )
     for namespace, tag, confidence in tags:
         add_tag_to_item(
@@ -89,6 +92,44 @@ def handle_individual_result(
             confidence=confidence,
             log_id=log_id,
         )
+
+    all_tags_string = ", ".join([tag for tag, _ in rating + chars + general])
+    min_confidence = min([confidence for _, confidence in general])
+
+    insert_extracted_text(
+        conn,
+        item.sha256,
+        0,
+        log_id=log_id,
+        text=all_tags_string,
+        language="danbooru",
+        language_confidence=1.0,
+        confidence=min_confidence,
+    )
+
+    # Save another tag set as text using mcut threshold
+    m_thresh = mcut_threshold(
+        np.array([confidence for _, confidence in general])
+    )
+    new_general = [
+        (tag, confidence)
+        for tag, confidence in general
+        if confidence >= m_thresh
+    ]
+    mcut_tags_string = ", ".join(
+        [tag for tag, _ in rating + chars + new_general]
+    )
+    # During search, we can filter by this confidence value
+    insert_extracted_text(
+        conn,
+        item.sha256,
+        1,
+        log_id=log_id,
+        text=mcut_tags_string,
+        language="danbooru",
+        language_confidence=1.0,
+        confidence=m_thresh,
+    )
 
 
 def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):

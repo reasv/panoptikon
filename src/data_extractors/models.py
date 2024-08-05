@@ -92,18 +92,19 @@ class ModelOpts:
 
     def item_extraction_rules(self) -> RuleItemFilters:
         rules = []
-        if self.target_entity() == "items":
+        target_entity = self.target_entity()
+        if target_entity == "items":
             rules.append(
                 ProcessedItemsFilter(
                     setter_type=self.data_type(), setter_name=self.setter_name()
                 )
             )
-        elif self.target_entity() == "text":
+        else:
             rules.append(
                 ProcessedExtractedDataFilter(
                     setter_type=self.data_type(),
                     setter_name=self.setter_name(),
-                    data_type="text",
+                    data_type=target_entity,
                 )
             )
 
@@ -403,11 +404,11 @@ class TextEmbeddingModel(ModelOpts):
     def description(cls) -> str:
         return (
             "Generate Text Embeddings from extracted text "
-            + "using Sentence Transformers."
-            + "Enables semantic text search."
+            + "using Sentence Transformers. "
+            + "Enables semantic text search. "
             + "This will generate embeddings for text already extracted "
             + "by other models such as Whisper Speech-to-Text, or OCR. "
-            + "If you haven't run those models yet, you should do so first. "
+            + "If you haven't run those models yet, you should do so first."
         )
 
     def setter_name(self) -> str:
