@@ -168,12 +168,14 @@ def create_vector_search_opts(query_state: gr.State):
         query.query.filters.image_embeddings = None
         if vec_query_type_val == "Text Vector Search":
             if te_text_query_val and te_embedding_model_val:
-                embedded_query = get_embed(te_text_query_val)
+                embedded_query = get_embed(
+                    te_text_query_val, te_embedding_model_val
+                )
                 query.query.filters.extracted_text_embeddings = (
                     ExtractedTextEmbeddingsFilter(
                         query=embedded_query,
-                        target=("text-embedding", te_embedding_model_val),
-                        text_targets=te_text_targets_val or [],
+                        model=("text-embedding", te_embedding_model_val),
+                        targets=te_text_targets_val or [],
                         min_confidence=confidence_val or None,
                         languages=languages_val or [],
                         language_min_confidence=language_confidence_val or None,
@@ -259,12 +261,12 @@ last_embedded_text: str | None = None
 last_embedded_text_embed: bytes | None = None
 
 
-def get_embed(text: str) -> bytes:
+def get_embed(text: str, model_name: str) -> bytes:
     global last_embedded_text, last_embedded_text_embed
     if text == last_embedded_text and last_embedded_text_embed is not None:
         return last_embedded_text_embed
     # Set as persistent so that the model is not reloaded every time the function is called
-    embedder = TextEmbedder(persistent=True)
+    embedder = TextEmbedder(model_name=model_name, persistent=True)
     text_embed = embedder.get_text_embeddings([text])[0]
     last_embedded_text = text
     last_embedded_text_embed = serialize_f32(text_embed)

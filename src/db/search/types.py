@@ -41,8 +41,8 @@ class ExtractedTextFilter:
 @dataclass
 class ExtractedTextEmbeddingsFilter:
     query: bytes
-    target: Tuple[OutputDataType, str]
-    text_targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
+    model: Tuple[OutputDataType, str]
+    targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     language_min_confidence: Union[float, None] = None
     min_confidence: Union[float, None] = None

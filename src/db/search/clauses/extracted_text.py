@@ -62,7 +62,7 @@ def build_extracted_text_search_subclause(
 
     if is_vector_query:
         # If the query is a vector query, we need to match on the text embeddings model
-        params.extend(args.target)
+        params.extend(args.model)
         where_conditions = [
             "et.setter_id = text_setters.id",
         ]
