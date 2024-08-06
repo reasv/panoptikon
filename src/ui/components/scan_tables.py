@@ -1,9 +1,12 @@
+import datetime
+import re
+
 import gradio as gr
 
 from src.db import get_database_connection
 from src.db.extraction_log import get_all_data_extraction_logs
 from src.db.files import get_all_file_scans
-from src.utils import isodate_minutes_diff, pretty_print_isodate
+from src.utils import estimate_eta, isodate_minutes_diff, pretty_print_isodate
 
 
 def create_scan_dataset(samples=[]):
@@ -119,12 +122,28 @@ def fetch_extraction_logs():
     conn = get_database_connection(write_lock=False)
     log_records = get_all_data_extraction_logs(conn)
     conn.close()
+    now_str = datetime.datetime.now().isoformat()
     log_rows = [
         [
             t.id,
             pretty_print_isodate(t.start_time),
-            pretty_print_isodate(t.end_time),
-            isodate_minutes_diff(t.end_time, t.start_time),
+            (
+                pretty_print_isodate(t.end_time)
+                if t.end_time
+                else "ETA: "
+                + estimate_eta(
+                    t.start_time,
+                    items_processed=(
+                        t.video_files + t.image_files + t.other_files
+                    ),
+                    remaining_items=t.total_remaining,
+                )
+            ),
+            (
+                isodate_minutes_diff(t.end_time, t.start_time)
+                if t.end_time
+                else isodate_minutes_diff(now_str, t.start_time)
+            ),
             t.type,
             t.setter,
             t.setter_id is None,

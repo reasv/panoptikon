@@ -75,7 +75,7 @@ class FileRecord:
 class LogRecord:
     id: int
     start_time: str
-    end_time: str
+    end_time: str | None
     setter_id: int | None
     type: str
     setter: str
@@ -125,7 +125,7 @@ class SystemConfig:
     scan_audio: bool = False
     scan_html: bool = False
     scan_pdf: bool = False
-    transaction_per_item: bool = False
+    transaction_per_item: bool = True
     enable_cron_job: bool = False
     cron_schedule: str = "0 3 * * *"
 

@@ -205,6 +205,12 @@ def create_scan_UI(app: gr.Blocks):
             outputs=[scan_history, extraction_log],
             api_name="fetch_history",
         )
+        update_timer = gr.Timer(5)
+        update_timer.tick(
+            fn=fetch_all_history,
+            outputs=[scan_history, extraction_log],
+            api_name=None,
+        )
 
 
 def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
@@ -218,6 +224,12 @@ def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
             interactive=True,
         )
         elements.append(delete_unavailable)
+        transaction_item = gr.Checkbox(
+            label="Use one transaction per item when running an extraction job",
+            value=True,
+            interactive=True,
+        )
+        elements.append(transaction_item)
     with gr.Row():
         gr.Markdown("### Search for these file types:")
         scan_images = gr.Checkbox(
@@ -256,6 +268,7 @@ def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
         config = retrieve_system_config(conn)
         conn.execute("BEGIN")
         config.remove_unavailable_files = args[delete_unavailable]
+        config.transaction_per_item = args[transaction_item]
         config.scan_images = args[scan_images]
         config.scan_video = args[scan_videos]
         config.scan_audio = args[scan_audio]
@@ -292,6 +305,7 @@ def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
             scan_html: config.scan_html,
             scan_pdf: config.scan_pdf,
             delete_unavailable: config.remove_unavailable_files,
+            transaction_item: config.transaction_per_item,
         }
 
     gr.on(
