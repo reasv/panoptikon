@@ -165,9 +165,9 @@ def check_audio_stream(file: str) -> bool:
         ) from e
 
 
-def load_audio(file: str, sr: int = SAMPLE_RATE):
+def load_audio(file: str, sr: int = SAMPLE_RATE) -> List[np.ndarray]:
     """
-    Open an audio file and read as mono waveform, resampling as necessary
+    Open an audio file and read all audio tracks as mono waveforms, resampling as necessary.
 
     Parameters
     ----------
@@ -179,34 +179,65 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
 
     Returns
     -------
-    A NumPy array containing the audio waveform, in float32 dtype.
+    List[np.ndarray]
+        A list of NumPy arrays, each containing the audio waveform of a track, in float32 dtype.
+        Returns an empty list if no audio tracks are found.
     """
     try:
-        # Launches a subprocess to decode audio while down-mixing and resampling as necessary.
-        # Requires the ffmpeg CLI to be installed.
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-threads",
-            "0",
-            "-i",
+        # Get the number of audio streams in the file
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
             file,
-            "-f",
-            "s16le",
-            "-ac",
-            "1",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            str(sr),
-            "-",
         ]
-        out = subprocess.run(cmd, capture_output=True, check=True).stdout
-    except subprocess.CalledProcessError as e:
-        if not check_audio_stream(file):
-            return None
-        raise RuntimeError(
-            f"Failed to load audio: {format_ffmpeg_error(e.stderr.decode())}"
-        ) from e
+        result = subprocess.run(
+            probe_cmd, capture_output=True, text=True, check=True
+        )
+        stream_indices = [
+            int(x) for x in result.stdout.strip().split("\n") if x
+        ]
 
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+        if not stream_indices:
+            return []
+
+        audio_tracks = []
+        for index in stream_indices:
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-threads",
+                "0",
+                "-i",
+                file,
+                "-map",
+                f"0:a:{index}",
+                "-f",
+                "s16le",
+                "-ac",
+                "1",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                str(sr),
+                "-",
+            ]
+            out = subprocess.run(cmd, capture_output=True, check=True).stdout
+            audio_data = (
+                np.frombuffer(out, np.int16).flatten().astype(np.float32)
+                / 32768.0
+            )
+            audio_tracks.append(audio_data)
+
+        return audio_tracks
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg failed: {e.stderr.decode()}") from e
+    except Exception as e:
+        raise RuntimeError(f"An unexpected error occurred: {str(e)}") from e

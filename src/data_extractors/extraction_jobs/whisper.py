@@ -38,10 +38,10 @@ def run_whisper_extractor_job(
     def get_media_paths(item: ItemWithPath) -> Sequence[np.ndarray]:
         if item.type.startswith("video"):
             audio = load_audio(item.path)
-            return [audio] if audio is not None else []
+            return audio
         elif item.type.startswith("audio"):
             audio = load_audio(item.path)
-            return [audio] if audio is not None else []
+            return audio
         return []
 
     def process_batch(batch: Sequence[np.ndarray]) -> List[

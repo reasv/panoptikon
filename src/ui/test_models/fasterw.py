@@ -39,7 +39,7 @@ def transcribe_audio(
     if audio is None and audio_file is not None:
         audio = load_audio(audio_file)
 
-    if audio is None:
+    if not audio:
         return "[No audio provided]", None
 
     device = "cpu"
@@ -54,13 +54,13 @@ def transcribe_audio(
             model=whisper_model, batch_size=batch_size
         )
     segments, info = whisper_model.transcribe(
-        audio,
+        audio[0],
         language=language,
     )
     print(info)
     print(segments)
     merged_text = "\n".join([segment.text for segment in segments])
-    return merged_text, (SAMPLE_RATE, audio)
+    return merged_text, (SAMPLE_RATE, audio[0])
 
 
 def create_whisper_ui():
