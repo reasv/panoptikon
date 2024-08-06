@@ -128,7 +128,7 @@ def handle_individual_result(
         1,
         log_id=log_id,
         text=mcut_tags_string,
-        language="danbooru",
+        language="danbooru-mcut",
         language_confidence=1.0,
         confidence=m_thresh,
     )
