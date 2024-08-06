@@ -33,8 +33,8 @@ class ModelOpts:
         return self.setter_name()
 
     @classmethod
-    def target_entity(cls) -> TargetEntityType:
-        return "items"
+    def target_entities(cls) -> List[TargetEntityType]:
+        return ["items"]
 
     @classmethod
     def available_models(cls) -> List[str]:
@@ -92,22 +92,19 @@ class ModelOpts:
 
     def item_extraction_rules(self) -> RuleItemFilters:
         rules = []
-        target_entity = self.target_entity()
-        if target_entity == "items":
+        target_entities = self.target_entities()
+        if "items" in target_entities:
             rules.append(
                 ProcessedItemsFilter(
                     setter_type=self.data_type(), setter_name=self.setter_name()
                 )
             )
         else:
-            data_types: List[OutputDataType] = [target_entity]
-            if target_entity == "text":
-                data_types.append("tags")  # Tags are also stored as text
             rules.append(
                 ProcessedExtractedDataFilter(
                     setter_type=self.data_type(),
                     setter_name=self.setter_name(),
-                    data_types=data_types,
+                    data_types=target_entities,  # type: ignore
                 )
             )
 
@@ -388,8 +385,8 @@ class TextEmbeddingModel(ModelOpts):
         ]
 
     @classmethod
-    def target_entity(cls) -> TargetEntityType:
-        return "text"
+    def target_entities(cls) -> List[TargetEntityType]:
+        return ["text", "tags"]  # Tags are also stored as text
 
     @classmethod
     def data_type(cls) -> OutputDataType:

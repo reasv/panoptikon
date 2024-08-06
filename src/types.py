@@ -129,4 +129,4 @@ class SystemConfig:
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
-TargetEntityType = Literal["items", "text"]
+TargetEntityType = Literal["items", "text", "tags"]

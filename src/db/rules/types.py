@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Literal, Tuple, Union
+from typing import List, Literal, Sequence, Tuple, Union
 
 from src.types import OutputDataType
 
@@ -55,7 +55,7 @@ class ProcessedItemsFilter:
 class ProcessedExtractedDataFilter:
     setter_type: OutputDataType
     setter_name: str
-    data_types: List[OutputDataType]
+    data_types: Sequence[OutputDataType]
 
 
 FilterType = Union[

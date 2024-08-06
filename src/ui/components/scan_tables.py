@@ -46,8 +46,8 @@ def create_scan_dataset(samples=[]):
 
 
 def create_job_dataset(samples=[]):
-    tagging_history = gr.Dataset(
-        label="Tagging History",
+    job_history = gr.Dataset(
+        label="Data Extraction Log",
         type="index",
         samples_per_page=25,
         samples=samples,
@@ -58,6 +58,7 @@ def create_job_dataset(samples=[]):
             "Duration",
             "Type",
             "Model",
+            "Data Deleted",
             "Batch Size",
             "Threshold",
             "Image Files",
@@ -74,6 +75,7 @@ def create_job_dataset(samples=[]):
             "textbox",
             "textbox",
             "textbox",
+            "checkbox",
             "number",
             "number",
             "number",
@@ -85,7 +87,7 @@ def create_job_dataset(samples=[]):
         ],
         scale=1,
     )
-    return tagging_history
+    return job_history
 
 
 def fetch_scan_history():
@@ -125,6 +127,7 @@ def fetch_extraction_logs():
             isodate_minutes_diff(t.end_time, t.start_time),
             t.type,
             t.setter,
+            t.setter_id is None,
             t.batch_size,
             t.threshold,
             t.image_files,

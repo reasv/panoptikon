@@ -1,7 +1,8 @@
 import sqlite3
 from datetime import datetime
 from time import time
-from typing import TYPE_CHECKING, List, Tuple
+from tkinter import SE
+from typing import TYPE_CHECKING, List, Sequence, Tuple
 
 if TYPE_CHECKING:
     import src.data_extractors.models as models
@@ -260,19 +261,23 @@ def get_existing_setters(
 
 
 def get_unprocessed_extractions_for_item(
-    conn: sqlite3.Connection, item: str, input_type: str, setter_id: int
+    conn: sqlite3.Connection,
+    item: str,
+    input_type: Sequence[str],
+    setter_id: int,
 ) -> List[int]:
     """
     Find all extractions of the specified input_type for this item
     that have not yet been processed by the specified setter.
     """
     item_id = get_item_id(conn, item)
-    query = """
+    input_type_condition = ", ".join(["?" for _ in input_type])
+    query = f"""
         SELECT ie.id
         FROM items_extractions AS ie
         JOIN setters AS s ON ie.setter_id = s.id
         WHERE ie.item_id = ?
-        AND s.type = ?
+        AND s.type IN ({input_type_condition})
         AND NOT EXISTS (
             SELECT 1
             FROM items_extractions AS ie2
@@ -280,7 +285,7 @@ def get_unprocessed_extractions_for_item(
             AND ie2.setter_id = ?
         )
     """
-    params = (item_id, input_type, setter_id)
+    params = (item_id, *input_type, setter_id)
 
     cursor = conn.cursor()
     cursor.execute(query, params)

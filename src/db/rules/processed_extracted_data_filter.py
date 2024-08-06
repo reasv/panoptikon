@@ -20,7 +20,7 @@ def build_processed_extracted_data_filter_cte(
         FROM items_extractions AS ie
         {prev_cte_join_clause}
         JOIN setters AS s ON ie.setter_id = s.id
-        WHERE {target_type_conditions}
+        WHERE ({target_type_conditions})
         AND NOT EXISTS (
             SELECT 1
             FROM items_extractions AS ie2

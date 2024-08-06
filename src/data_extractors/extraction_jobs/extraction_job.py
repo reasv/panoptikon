@@ -106,7 +106,7 @@ def run_extraction_job(
         try:
             if len(inputs) > 0:
                 output_handler(log_id, item, inputs, outputs)
-            if model_opts.target_entity() == "items":
+            if model_opts.target_entities() == ["items"]:
                 # If the model operates on individual items, add the item to the log
                 add_item_to_log(
                     conn,
@@ -116,14 +116,14 @@ def run_extraction_job(
             else:
                 # This model operates not on the original items, but on the extracted data
                 # Specifically, data extracted by a previous model,
-                # and more specifically, data of type model_opts.target_entity()
+                # and more specifically, data of type model_opts.target_entities()
                 # We're going to assume it has processed all such data not yet processed
                 # and record it as such, so until new data of this type
                 # is produced for this item, it will not be processed again.
                 items_extractions = get_unprocessed_extractions_for_item(
                     conn,
                     item=item.sha256,
-                    input_type=model_opts.target_entity(),
+                    input_type=model_opts.target_entities(),
                     setter_id=setter_id,
                 )
                 # Each of these represents an instance of data being previously extracted
@@ -131,6 +131,7 @@ def run_extraction_job(
                 # and the idea is this model is now
                 # processing that data, and should not process it again.
                 # We record it so the model's filters can filter this item out next run.
+                print(f"Adding {len(items_extractions)} extractions to log")
                 for extraction_id in items_extractions:
                     add_item_to_log(
                         conn,
