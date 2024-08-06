@@ -67,11 +67,13 @@ def handle_individual_result(
     character_res, general_rating_res = aggregate_results(list(results))
 
     chars = [(tag, confidence) for tag, confidence in character_res.items()]
+    chars.sort(key=lambda x: x[1], reverse=True)
     general = [
         (tag, confidence)
         for tag, confidence in general_rating_res.items()
         if not tag.startswith("rating:")
     ]
+    general.sort(key=lambda x: x[1], reverse=True)
     rating = [
         (tag, confidence)
         for tag, confidence in general_rating_res.items()
