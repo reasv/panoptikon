@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 import gradio as gr
+from croniter import croniter
 
 from src.db import get_database_connection
 from src.db.config import persist_system_config, retrieve_system_config
 from src.db.folders import get_folders_from_database
+from src.db.rules.rules import get_rules
 from src.db.utils import vacuum_database
 from src.folders import rescan_all_folders, update_folder_lists
 from src.ui.components.extractor_ui import create_data_extraction_UI
@@ -159,7 +161,7 @@ def create_scan_UI(app: gr.Blocks):
             with gr.Row():
                 create_data_extraction_UI(app, scan_tab)
                 with gr.Column():
-                    pass
+                    create_cron_settings(scan_tab, app)
 
             with gr.Row():
                 with gr.Tabs():
@@ -290,6 +292,115 @@ def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
             scan_html: config.scan_html,
             scan_pdf: config.scan_pdf,
             delete_unavailable: config.remove_unavailable_files,
+        }
+
+    gr.on(
+        triggers=[tab.select, app.load],
+        fn=load_settings,
+        outputs=[*elements],
+        api_name=False,
+    )
+
+
+def create_cron_settings(tab: gr.Tab, app: gr.Blocks):
+    elements = []
+    with gr.Row():
+        gr.Markdown("## Scan And Data Extraction Cron Job")
+    with gr.Row():
+        gr.Markdown(
+            """
+The cron job will run the file scan and data extraction job regularly at the specified schedule.
+
+First, the file scan job will scan the directories for new files and update the database with the new files.
+Then, the data extraction jobs will process the new files and extract tags from them.
+
+The scheduler will only select models that have rules associated with them. If a model has no rules, it will not be scheduled.
+Go to the rules configuration tab and create rules for the models you want to schedule.
+An empty rule with no filters is sufficient, and it will match all files.
+
+Currently, these models would be scheduled:
+        """
+        )
+    with gr.Row():
+        model_list = gr.Markdown("")
+        elements.append(model_list)
+    with gr.Row():
+        gr.Markdown("### Cron Schedule")
+    with gr.Row():
+        enable_cronjob = gr.Checkbox(
+            label="Enable",
+            value=False,
+            interactive=True,
+        )
+        elements.append(enable_cronjob)
+        cron_string = gr.Textbox(
+            label="Cron string",
+            value="* * * * *",
+            interactive=True,
+        )
+        elements.append(cron_string)
+    with gr.Row():
+        save_button = gr.Button("Save", scale=0)
+        elements.append(save_button)
+    with gr.Row():
+        gr.Markdown(
+            """
+The cron schedule is a string that defines the frequency of the scan and data extraction job.
+The format is as follows:
+```
+* * * * *
+| | | | +-- Day of the Week (range: 0-6, 0 is Sunday)
+| | | +---- Month (range: 1-12)
+| | +------ Day of the Month (range: 1-31)
+| +-------- Hour (range: 0-23)
++---------- Minute (range: 0-59)
+```
+For example, the default value `0 3 * * *` means the job will run at 3 AM every day.
+Or, in order to run it every hour, use `0 * * * *`, every four hours: `0 */4 * * *`.
+        """
+        )
+
+    def update_file_types(args: Dict[gr.Checkbox | gr.Textbox, Any]):
+        conn = get_database_connection(write_lock=True)
+        config = retrieve_system_config(conn)
+        conn.execute("BEGIN")
+        assert isinstance(args[enable_cronjob], bool)
+        assert isinstance(args[cron_string], str)
+        config.enable_cron_job = args[enable_cronjob]
+        if croniter.is_valid(args[cron_string]):
+            config.cron_schedule = args[cron_string]
+        print(config)
+        persist_system_config(conn, config)
+        conn.commit()
+        conn.close()
+        return load_settings()
+
+    gr.on(
+        triggers=[
+            save_button.click,
+        ],
+        fn=update_file_types,
+        inputs={*elements},
+        outputs=[*elements],
+    )
+
+    def load_settings():
+        conn = get_database_connection(write_lock=False)
+        config = retrieve_system_config(conn)
+        rules = get_rules(conn)
+        conn.close()
+        models = []
+        for rule in rules:
+            if rule.enabled:
+                models.extend(rule.setters)
+        if models:
+            model_list_str = ", ".join([f"{m[1]}" for m in models])
+        else:
+            model_list_str = "No models scheduled. Go to the rules tab and create rules for the models you want to schedule."
+        return {
+            enable_cronjob: config.enable_cron_job,
+            cron_string: config.cron_schedule,
+            model_list: model_list_str,
         }
 
     gr.on(

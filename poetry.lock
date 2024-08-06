@@ -552,6 +552,20 @@ files = [
 colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [[package]]
+name = "click-spinner"
+version = "0.1.10"
+description = "Spinner for Click"
+optional = false
+python-versions = "*"
+files = [
+    {file = "click-spinner-0.1.10.tar.gz", hash = "sha256:87eacf9d7298973a25d7615ef57d4782aebf913a532bba4b28a37e366e975daf"},
+    {file = "click_spinner-0.1.10-py2.py3-none-any.whl", hash = "sha256:d1ffcff1fdad9882396367f15fb957bcf7f5c64ab91927dee2127e0d2991ee84"},
+]
+
+[package.extras]
+test = ["click", "pytest", "six"]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 description = "Cross-platform colored terminal text."
@@ -658,6 +672,20 @@ docs = ["furo", "sphinx (>=7.2)", "sphinx-copybutton"]
 mypy = ["contourpy[bokeh,docs]", "docutils-stubs", "mypy (==1.8.0)", "types-Pillow"]
 test = ["Pillow", "contourpy[test-no-images]", "matplotlib"]
 test-no-images = ["pytest", "pytest-cov", "pytest-xdist", "wurlitzer"]
+
+[[package]]
+name = "croniter"
+version = "1.4.1"
+description = "croniter provides iteration for datetime object with cron like format"
+optional = false
+python-versions = ">=2.6, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*"
+files = [
+    {file = "croniter-1.4.1-py2.py3-none-any.whl", hash = "sha256:9595da48af37ea06ec3a9f899738f1b2c1c13da3c38cea606ef7cd03ea421128"},
+    {file = "croniter-1.4.1.tar.gz", hash = "sha256:1a6df60eacec3b7a0aa52a8f2ef251ae3dd2a7c7c8b9874e73e791636d55a361"},
+]
+
+[package.dependencies]
+python-dateutil = "*"
 
 [[package]]
 name = "cssselect2"
@@ -853,6 +881,24 @@ typer = ">=0.12.3"
 standard = ["fastapi", "uvicorn[standard] (>=0.15.0)"]
 
 [[package]]
+name = "fastapi-utilities"
+version = "0.2.0"
+description = "Reusable utilities for FastAPI"
+optional = false
+python-versions = ">=3.7,<4.0"
+files = [
+    {file = "fastapi_utilities-0.2.0-py3-none-any.whl", hash = "sha256:f2f0c91a279141185ed8de10f2d4c30dd85f80a983c09cb5535302ad6299444f"},
+    {file = "fastapi_utilities-0.2.0.tar.gz", hash = "sha256:8932db04060cdd55c2630065865b43f61647125368405500732cd26d125af73c"},
+]
+
+[package.dependencies]
+click-spinner = ">=0.1.10,<0.2.0"
+croniter = ">=1.0.13,<2.0.0"
+fastapi = "*"
+pydantic = "*"
+sqlalchemy = "*"
+
+[[package]]
 name = "faster-whisper"
 version = "1.0.3"
 description = "Faster Whisper transcription with CTranslate2"
@@ -886,8 +932,9 @@ name = "ffmpy"
 version = "0.3.3"
 description = "A simple Python wrapper for ffmpeg"
 optional = false
-python-versions = "*"
+python-versions = ">=3.8.1,<4.0.0"
 files = [
+    {file = "ffmpy-0.3.3-py3-none-any.whl", hash = "sha256:4ba083a0b92544dbc8ed5b3074c5ca26f812e618b72851467f4f2e9125e111d7"},
     {file = "ffmpy-0.3.3.tar.gz", hash = "sha256:924cde7e0bb1b5eb58d21ada3b1622f95069c98769bbdf100ed381c7e750a55e"},
 ]
 
@@ -2461,7 +2508,6 @@ description = "Nvidia JIT LTO Library"
 optional = false
 python-versions = ">=3"
 files = [
-    {file = "nvidia_nvjitlink_cu12-12.5.82-py3-none-manylinux2014_aarch64.whl", hash = "sha256:98103729cc5226e13ca319a10bbf9433bbbd44ef64fe72f45f067cacc14b8d27"},
     {file = "nvidia_nvjitlink_cu12-12.5.82-py3-none-manylinux2014_x86_64.whl", hash = "sha256:f9b37bc5c8cf7509665cb6ada5aaa0ce65618f2332b7d3e78e9790511f111212"},
     {file = "nvidia_nvjitlink_cu12-12.5.82-py3-none-win_amd64.whl", hash = "sha256:e782564d705ff0bf61ac3e1bf730166da66dd2fe9012f111ede5fc49b64ae697"},
 ]
@@ -5657,4 +5703,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "f87ac288f2e63bf62a1ec4a8205f67945692286d5f9d6151a0e02d4e58c67672"
+content-hash = "db31af41c9ac85a4e5ca4283f3fd5c681eb4589d1d2b78fc8d2945c6c37d1e94"

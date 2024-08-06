@@ -126,6 +126,8 @@ class SystemConfig:
     scan_html: bool = False
     scan_pdf: bool = False
     transaction_per_item: bool = False
+    enable_cron_job: bool = False
+    cron_schedule: str = "0 3 * * *"
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
