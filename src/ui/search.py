@@ -4,6 +4,7 @@ from time import time
 from typing import Any, List, Tuple
 
 import gradio as gr
+from matplotlib import interactive
 
 from src.db import get_database_connection
 from src.db.search import search_files
@@ -21,6 +22,7 @@ def create_search_UI(
 ):
     with gr.TabItem(label="Search") as search_tab:
         n_results = gr.State(0)
+        n_pages = gr.State(1)
         with gr.Row():
             with gr.Column(scale=8):
                 inputs, build_query = create_search_options(app, search_tab)
@@ -103,10 +105,11 @@ def create_search_UI(
             multi_view.files: results,
             n_results: total_results,
             current_page: gr.update(value=page, maximum=int(total_pages)),
+            n_pages: total_pages,
         }
 
-    search_inputs = {*inputs, current_page}
-    search_outputs = [multi_view.files, n_results, current_page]
+    search_inputs = {*inputs, n_pages, current_page}
+    search_outputs = [multi_view.files, n_results, n_pages, current_page]
 
     submit_button.click(
         fn=lambda args: search(args, search_action="search_button"),
@@ -130,4 +133,32 @@ def create_search_UI(
         fn=lambda args: search(args, search_action="next_page"),
         inputs=search_inputs,
         outputs=search_outputs,
+    )
+
+    def on_total_pages_change(total_pages_val: int, current_page_val: int):
+        if total_pages_val == 1:
+            return {
+                next_page: gr.update(interactive=False),
+                previous_page: gr.update(interactive=False),
+            }
+        if current_page_val == 1:
+            return {
+                next_page: gr.update(interactive=True),
+                previous_page: gr.update(interactive=False),
+            }
+        if current_page_val == total_pages_val:
+            return {
+                next_page: gr.update(interactive=False),
+                previous_page: gr.update(interactive=True),
+            }
+        return {
+            next_page: gr.update(interactive=True),
+            previous_page: gr.update(interactive=True),
+        }
+
+    gr.on(
+        triggers=[n_pages.change, current_page.change],
+        inputs=[n_pages, current_page],
+        outputs=[next_page, previous_page],
+        fn=on_total_pages_change,
     )

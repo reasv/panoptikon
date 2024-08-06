@@ -53,20 +53,12 @@ def create_text_viewer(selected_items: gr.State):
         ):
             if text_picker is None:
                 return
-            for model_type, setter in text_picker:
-                text = next(
-                    (
-                        t
-                        for t in texts_state
-                        if t.setter_name == setter
-                        and t.model_type == model_type
-                    ),
-                    None,
-                )
-                if text is not None:
+            setters = [setter for _, setter in text_picker]
+            for text in texts_state:
+                if text.setter_name in setters:
                     with gr.Row():
                         gr.Textbox(
-                            label=f"Source: ({setter})",
+                            label=f"Source: {text.setter_name}, Language: {text.language}, Confidence: {text.confidence}",
                             interactive=False,
                             lines=4,
                             value=text.text,
