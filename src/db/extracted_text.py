@@ -25,6 +25,12 @@ def insert_extracted_text(
     item_id = get_item_id(conn, item_sha256)
     assert item_id is not None, f"Item with SHA256 {item_sha256} not found"
 
+    confidence = round(float(confidence), 4) if confidence is not None else None
+    language_confidence = (
+        round(float(language_confidence), 4)
+        if language_confidence is not None
+        else None
+    )
     cursor = conn.cursor()
 
     sql = """
