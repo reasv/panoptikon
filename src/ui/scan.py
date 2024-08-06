@@ -311,9 +311,6 @@ def create_cron_settings(tab: gr.Tab, app: gr.Blocks):
             """
 The cron job will run the file scan and data extraction job regularly at the specified schedule.
 
-First, the file scan job will scan the directories for new files and update the database with the new files.
-Then, the data extraction jobs will process the new files and extract tags from them.
-
 The scheduler will only select models that have rules associated with them. If a model has no rules, it will not be scheduled.
 Go to the rules configuration tab and create rules for the models you want to schedule.
 An empty rule with no filters is sufficient, and it will match all files.
