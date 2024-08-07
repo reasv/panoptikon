@@ -560,3 +560,8 @@ class ModelOptsFactory:
             if model_opts.valid_model(setter_name):
                 return model_opts
         raise ValueError(f"Invalid model name {setter_name}")
+
+    @classmethod
+    def get_model(cls, model_name: str) -> ModelOpts:
+        model_opts = cls.get_model_opts(model_name)
+        return model_opts(model_name)
