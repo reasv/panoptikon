@@ -58,6 +58,7 @@ def run_extraction_job(
         0,
         0,
     )
+    data_load_time, inference_time = 0.0, 0.0
     system_config = retrieve_system_config(conn)
     threshold = model_opts.get_group_threshold(conn)
     batch_size = model_opts.get_group_batch_size(conn)
@@ -74,13 +75,20 @@ def run_extraction_job(
         conn.commit()
 
     def run_batch_inference_with_counter(work_units: Sequence):
-        nonlocal total_processed_units
+        nonlocal total_processed_units, inference_time
         total_processed_units += len(work_units)
-        return run_batch_inference(work_units)
+        inf_start = datetime.now()
+        o = run_batch_inference(work_units)
+        inference_time += (datetime.now() - inf_start).total_seconds()
+        return o
 
     def transform_input_handle_error(item: ItemWithPath):
         try:
-            return input_transform(item)
+            nonlocal data_load_time
+            load_start = datetime.now()
+            o = input_transform(item)
+            data_load_time += (datetime.now() - load_start).total_seconds()
+            return o
         except Exception as e:
             print(f"Error processing item {item.path}: {e}")
             failed_items[item.sha256] = item
@@ -168,6 +176,8 @@ def run_extraction_job(
             total_segments=total_processed_units,
             errors=len(failed_items.keys()),
             total_remaining=remaining,
+            data_load_time=data_load_time,
+            inference_time=inference_time,
             finished=False,
         )
         if system_config.transaction_per_item:
@@ -207,6 +217,8 @@ def run_extraction_job(
         total_segments=total_processed_units,
         errors=len(failed_items.keys()),
         total_remaining=remaining_paths,
+        data_load_time=data_load_time,
+        inference_time=inference_time,
         finished=True,
     )
     print("Updated log with scan results")

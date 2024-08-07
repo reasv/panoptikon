@@ -1,7 +1,6 @@
 import sqlite3
 from datetime import datetime
 from time import time
-from tkinter import SE
 from typing import TYPE_CHECKING, List, Sequence, Tuple
 
 if TYPE_CHECKING:
@@ -63,6 +62,8 @@ def update_log(
     total_segments: int,
     errors: int,
     total_remaining: int,
+    data_load_time: float,
+    inference_time: float,
     finished: bool = False,
 ):
     cursor = conn.cursor()
@@ -75,7 +76,9 @@ def update_log(
     other_files = ?,
     total_segments = ?,
     errors = ?,
-    total_remaining = ?
+    total_remaining = ?,
+    data_load_time = ?,
+    inference_time = ?
     WHERE id = ?
     """,
         (
@@ -86,6 +89,8 @@ def update_log(
             total_segments,
             errors,
             total_remaining,
+            data_load_time,
+            inference_time,
             log_id,
         ),
     )
@@ -124,7 +129,9 @@ def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
         other_files,
         total_segments,
         errors,
-        total_remaining
+        total_remaining,
+        data_load_time,
+        inference_time
         FROM data_extraction_log
         ORDER BY start_time DESC
         """

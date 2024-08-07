@@ -6,7 +6,12 @@ import gradio as gr
 from src.db import get_database_connection
 from src.db.extraction_log import get_all_data_extraction_logs
 from src.db.files import get_all_file_scans
-from src.utils import estimate_eta, isodate_minutes_diff, pretty_print_isodate
+from src.utils import (
+    estimate_eta,
+    isodate_minutes_diff,
+    pretty_print_isodate,
+    seconds_to_hms,
+)
 
 
 def create_scan_dataset(samples=[]):
@@ -59,6 +64,8 @@ def create_job_dataset(samples=[]):
             "Start Time",
             "End Time",
             "Duration",
+            "Data Load Time",
+            "Inference Time",
             "Type",
             "Model",
             "Data Deleted",
@@ -73,6 +80,8 @@ def create_job_dataset(samples=[]):
         ],
         components=[
             "number",
+            "textbox",
+            "textbox",
             "textbox",
             "textbox",
             "textbox",
@@ -144,6 +153,8 @@ def fetch_extraction_logs():
                 if t.end_time
                 else isodate_minutes_diff(now_str, t.start_time)
             ),
+            seconds_to_hms(t.data_load_time),
+            seconds_to_hms(t.inference_time),
             t.type,
             t.setter,
             t.setter_id is None,

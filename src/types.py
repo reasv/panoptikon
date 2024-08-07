@@ -87,6 +87,8 @@ class LogRecord:
     total_segments: int
     errors: int
     total_remaining: int
+    data_load_time: float
+    inference_time: float
 
 
 @dataclass

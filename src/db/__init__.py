@@ -141,6 +141,8 @@ def initialize_database(conn: sqlite3.Connection):
         total_segments INTEGER NOT NULL DEFAULT 0,
         errors INTEGER NOT NULL DEFAULT 0,
         total_remaining INTEGER NOT NULL DEFAULT 0,
+        data_load_time REAL DEFAULT 0,
+        inference_time REAL DEFAULT 0,
         FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE SET NULL
     )
     """
