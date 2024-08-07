@@ -284,7 +284,7 @@ def delete_items_without_files(
         WHERE rowid IN (
             SELECT items.id
             FROM items
-            LEFT JOIN files ON files.id = items.id
+            LEFT JOIN files ON files.item_id = items.id
             WHERE files.id IS NULL
             LIMIT ?
         )
