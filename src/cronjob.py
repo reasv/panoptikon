@@ -11,7 +11,6 @@ def run_cronjob():
     print("Running cronjob")
     conn.execute("BEGIN TRANSACTION")
     rescan_all_folders(conn)
-    print("committing rescan")
     conn.commit()
     print("Rescanned all folders")
     rules = get_rules(conn)
@@ -19,7 +18,7 @@ def run_cronjob():
     for rule in rules:
         setters.extend([setter for _, setter in rule.setters])
     setters = list(set(setters))
-    print(f"Found {len(setters)} models to run: {','.join(setters)}")
+    print(f"Found {len(setters)} models to run ({','.join(setters)})")
     model_opts: List[ModelOpts] = []
     for setter in setters:
         model_opts.append(ModelOptsFactory.get_model(setter))
@@ -30,3 +29,4 @@ def run_cronjob():
         model_opt.run_extractor(conn)
         conn.commit()
     conn.close()
+    print("Cronjob finished")
