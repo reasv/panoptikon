@@ -1,5 +1,6 @@
 import hashlib
 import os
+from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, Query, Request
@@ -11,7 +12,9 @@ from fastapi.responses import (
     RedirectResponse,
 )
 from fastapi.templating import Jinja2Templates
+from fastapi_utilities.repeat.repeat_at import repeat_at
 
+from src.api.job import try_cronjob
 from src.db import get_database_connection
 from src.db.bookmarks import get_bookmarks
 from src.db.search import search_files
@@ -23,7 +26,19 @@ from src.files import (
 )
 from src.types import FileSearchResult
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cronjob()
+    yield
+
+
+@repeat_at(cron="* * * * *")
+def cronjob():
+    try_cronjob()
+
+
+app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
 
