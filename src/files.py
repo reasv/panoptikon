@@ -4,12 +4,19 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import List, Tuple
-from venv import logger
 
 from src.data_extractors.data_loaders.audio import extract_media_info
 from src.data_extractors.data_loaders.video import video_to_frames
 from src.db import get_item_id
 from src.db.files import get_file_by_path
+from src.db.rules.rules import get_rules_for_setter
+from src.db.rules.types import (
+    MimeFilter,
+    MinMaxFilter,
+    NotInPathFilter,
+    PathFilter,
+    StoredRule,
+)
 from src.types import FileRecord, FileScanData, ItemScanMeta
 from src.utils import get_mime_type, make_video_thumbnails, normalize_path
 
@@ -75,6 +82,7 @@ def scan_files(
         + include_html * get_html_extensions()
         + include_pdf * get_pdf_extensions()
     )
+    user_rules = get_rules_for_setter(conn, "files", "file_scan")
     for file_path in get_files_by_extension(
         starting_points=starting_points,
         excluded_paths=excluded_paths,
@@ -90,6 +98,11 @@ def scan_files(
             )
             yield None, 0.0, 0.0
             continue
+
+        # Check if the file matches any user rules
+        if not matches_rules(user_rules, file_path, size=file_size):
+            logger.debug(f"File {file_path} does not match any rules")
+            yield None, 0.0, 0.0
 
         # Assume file is new or has changed
         new_or_new_timestamp = True
@@ -117,6 +130,88 @@ def scan_files(
                 new_file_timestamp=False,
                 new_file_hash=False,
             ), 0.0, 0.0
+
+
+def matches_rules(rules: List[StoredRule], file_path: str, size: int) -> bool:
+    """
+    Check if the given file path matches any of the given rules.
+    Only checks MIME type and path for now.
+    """
+    for rule in rules:
+        if matches_rule(rule, file_path, size):
+            return True
+    return False
+
+
+def matches_rule(rule: StoredRule, file_path: str, size: int) -> bool:
+    """
+    Check if the given file path matches the given rule.
+    """
+    for filter in rule.filters.positive:
+        if (
+            not isinstance(filter, PathFilter)
+            and not isinstance(filter, NotInPathFilter)
+            and not isinstance(filter, MimeFilter)
+            and not (
+                isinstance(filter, MinMaxFilter)
+                and filter.column_name == "size"
+            )
+        ):
+            logger.debug(
+                f"Unsupported filter type: {type(filter)} for file {file_path}"
+            )
+            continue
+        if not matches_filter(filter, file_path, size):
+            return False
+    for filter in rule.filters.negative:
+        # For negative filters,
+        # we only support MimeFilter and size because
+        # PathFilter and NotInPathFilter would
+        # have inconsistent behavior with the SQL equivalent
+        # which uses EXCEPT on the positive query.
+        if not isinstance(filter, MimeFilter) and not (
+            isinstance(filter, MinMaxFilter) and filter.column_name == "size"
+        ):
+            logger.debug(
+                f"Unsupported filter type: {type(filter)} for file {file_path}"
+            )
+            continue
+        if matches_filter(filter, file_path, size):
+            return False
+    return True
+
+
+def matches_filter(
+    filter: PathFilter | NotInPathFilter | MimeFilter | MinMaxFilter,
+    file_path: str,
+    size: int,
+) -> bool:
+    """
+    Check if the given file path matches the given filter.
+    """
+    if isinstance(filter, PathFilter):
+        for path in filter.path_prefixes:
+            if file_path.startswith(path):
+                return True
+    elif isinstance(filter, NotInPathFilter):
+        for path in filter.path_prefixes:
+            if file_path.startswith(path):
+                return False
+        return True
+    elif isinstance(filter, MimeFilter):
+        file_mime_type = get_mime_type(file_path)
+        for mime_type in filter.mime_type_prefixes:
+            if file_mime_type.startswith(mime_type):
+                return True
+    elif isinstance(filter, MinMaxFilter):
+        assert filter.column_name == "size", "Unsupported column name"
+        if filter.min_value == filter.max_value:
+            return size == filter.min_value
+        if filter.min_value > 0 and filter.max_value == 0:
+            # Only min value is set
+            return size >= filter.min_value
+        return filter.min_value <= size <= filter.max_value
+    return False
 
 
 def extract_file_metadata(
