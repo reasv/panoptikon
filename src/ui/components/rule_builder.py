@@ -4,6 +4,7 @@ import logging
 from typing import List, Literal, Tuple, Type
 
 import gradio as gr
+from cv2 import add
 
 from src.data_extractors import models
 from src.db import get_database_connection
@@ -220,6 +221,45 @@ def create_rule_builder_UI(app: gr.Blocks, tab: gr.Tab):
             gr.Markdown("## No rules stored yet.")
 
 
+def create_file_type_tab(rules_state: gr.State, rule: StoredRule | None = None):
+    with gr.TabItem(label="File Scan"):
+        with gr.Row():
+            gr.Markdown(
+                """
+## File Scanning rule
+This special type applies a rule to the file scanning system, 
+rather than data extraction.
+Files that do not match the rule will not be added to the database.
+Existing files that no longer match the rule will be removed from the database
+on the next scan.
+
+            """
+            )
+        with gr.Row():
+            if rule is None:
+                add_models_btn = gr.Button("Create New Rule for File Scanning")
+
+                @add_models_btn.click(outputs=[rules_state])
+                def add_rule():
+                    return create_new_rule(
+                        [
+                            ("files", "file_scan"),
+                        ]
+                    )
+
+            else:
+                add_models_btn = gr.Button("Add File Scanning")
+
+                @add_models_btn.click(outputs=[rules_state])
+                def add_models():
+                    return add_setters_to_rule(
+                        rule,
+                        [
+                            ("files", "file_scan"),
+                        ],
+                    )
+
+
 def create_add_rule(rules_state: gr.State):
 
     def create_model_type_tab(model_type: Type[models.ModelOpts]):
@@ -257,6 +297,7 @@ def create_add_rule(rules_state: gr.State):
     with gr.Tabs():
         for model_type in models.ModelOptsFactory.get_all_model_opts():
             create_model_type_tab(model_type)
+        create_file_type_tab(rules_state)
 
 
 def create_rule_builder(
@@ -367,6 +408,7 @@ def create_add_models(rule: StoredRule, rules_state: gr.State):
     with gr.Tabs():
         for model_type in models.ModelOptsFactory.get_all_model_opts():
             create_model_type_tab(model_type)
+        create_file_type_tab(rules_state, rule)
 
 
 def create_add_filter(

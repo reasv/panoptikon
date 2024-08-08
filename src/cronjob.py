@@ -19,7 +19,9 @@ def run_cronjob():
     rules = get_rules(conn)
     setters = []
     for rule in rules:
-        setters.extend([setter for _, setter in rule.setters])
+        setters.extend(
+            [setter for type, setter in rule.setters if type != "files"]
+        )
     setters = list(set(setters))
     logger.info(f"Found {len(setters)} models to run ({','.join(setters)})")
     model_opts: List[ModelOpts] = []

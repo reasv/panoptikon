@@ -408,7 +408,9 @@ Or, in order to run it every hour, use `0 * * * *`, every four hours: `0 */4 * *
             if rule.enabled:
                 models.extend(rule.setters)
         if models:
-            model_list_str = ", ".join([f"{m[1]}" for m in models])
+            model_list_str = ", ".join(
+                [f"{name}" for type, name in models if type != "files"]
+            )
         else:
             model_list_str = "No models scheduled. Go to the rules tab and create rules for the models you want to schedule."
         return {
