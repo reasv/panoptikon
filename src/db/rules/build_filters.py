@@ -2,7 +2,10 @@ from typing import List
 
 from src.db.rules.mime_type_filter import build_mime_type_filter_cte
 from src.db.rules.min_max_filter import build_min_max_filter_cte
-from src.db.rules.path_filter import build_path_filter_cte
+from src.db.rules.path_filter import (
+    build_not_in_path_filter_cte,
+    build_path_filter_cte,
+)
 from src.db.rules.processed_extracted_data_filter import (
     build_processed_extracted_data_filter_cte,
 )
@@ -11,6 +14,7 @@ from src.db.rules.types import (
     FilterType,
     MimeFilter,
     MinMaxFilter,
+    NotInPathFilter,
     PathFilter,
     ProcessedExtractedDataFilter,
     ProcessedItemsFilter,
@@ -25,6 +29,9 @@ def get_filter_builder(filter: FilterType):
     elif isinstance(filter, PathFilter):
 
         return build_path_filter_cte
+    elif isinstance(filter, NotInPathFilter):
+
+        return build_not_in_path_filter_cte
     elif isinstance(filter, ProcessedItemsFilter):
 
         return build_processed_items_filter_cte

@@ -10,6 +10,11 @@ class PathFilter:
 
 
 @dataclass
+class NotInPathFilter:
+    path_prefixes: List[str]
+
+
+@dataclass
 class MimeFilter:
     mime_type_prefixes: List[str]
 
@@ -60,6 +65,7 @@ class ProcessedExtractedDataFilter:
 
 FilterType = Union[
     PathFilter,
+    NotInPathFilter,
     MimeFilter,
     MinMaxFilter,
     ProcessedItemsFilter,

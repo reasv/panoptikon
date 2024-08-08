@@ -22,6 +22,7 @@ from src.db.rules.types import (
     MimeFilter,
     MinMaxColumnType,
     MinMaxFilter,
+    NotInPathFilter,
     PathFilter,
     RuleItemFilters,
     StoredRule,
@@ -421,20 +422,22 @@ def create_add_filter(
         value="MUST MATCH",
     )
     with gr.Tabs():
-        with gr.Tab("Path Filter"):
+        with gr.Tab("In Path Filter"):
             with gr.Row():
                 gr.Markdown(
                     """
-                    Allows you to filter files based on their path.
+                    Matches files whose path starts with **one of** the given strings.
 
-                    Requires that the file's path start with one of the given strings.
                     Do not use glob patterns like '*' or '?'.
                     If you want to match all files in a directory, remember to include the trailing slash.
-                    You can type in custom values.
+                    
+                    You can type in custom values. Just press Enter after typing.
                     #### Warning
                     When used as a negative "MUST NOT" filter, this filter will exclude any files that start with the given paths;
-                    even if a copy of the same file is present in included paths, the file will be excluded.
-                    This is because identical files are treated as the same item, and the filter is applied to the item, not the file.
+                    **even if** a copy of the same file is present in otherwise included paths, the file **will** be *excluded*.
+                    This is because identical files are treated as the same unique item,
+                    and filters are applied to items, not files.
+                    For the desired behavior, use the "Not In Path Filter" instead, as a positive "MUST MATCH" filter.
                     """
                 )
             with gr.Row():
@@ -448,6 +451,35 @@ def create_add_filter(
                     )
                 with gr.Column():
                     path_filter_btn = gr.Button("Add Path Filter", scale=0)
+        with gr.Tab("Not In Path Filter"):
+            with gr.Row():
+                gr.Markdown(
+                    """
+                    Matches files whose path does **not** start with **any** of the given strings.
+                    Use this filter to exclude a folder.
+
+                    Do not use glob patterns like '*' or '?'.
+                    If you want to match a directory, remember to include the trailing slash.
+
+                    You can type in custom values. Just press Enter after typing.
+                    #### Warning
+                    Intended to be used as a positive "MUST MATCH" filter for the desired behavior.
+                    Using this as a negative "MUST NOT MATCH" filter will lead to undesirable consequences.
+                    """
+                )
+            with gr.Row():
+                with gr.Column():
+                    not_in_paths = gr.Dropdown(
+                        label="File path does not start with any of",
+                        choices=context.folders,
+                        multiselect=True,
+                        allow_custom_value=True,
+                        value=[],
+                    )
+                with gr.Column():
+                    not_in_path_filter_btn = gr.Button(
+                        "Add Not In Path Filter", scale=0
+                    )
         with gr.Tab("MIME Type Filter"):
             with gr.Row():
                 gr.Markdown(
@@ -459,7 +491,8 @@ def create_add_filter(
                     This is to allow for filters like 'image/' to match all image types, or 'video/' to match all video types.
                     You can still use specific MIME types like 'image/jpeg' or 'video/mp4'.
                     Do not use glob patterns like '*' or '?'.
-                    You can type in custom values.
+                    
+                    You can type in custom values. Just press Enter after typing.
                     """
                 )
             with gr.Row():
@@ -490,9 +523,9 @@ def create_add_filter(
 
                     `duration` represents the duration of a video or audio in seconds.
                     `size` represents the size of the file in bytes.
-                    All values are floating point numbers.
+                    All values are saved as floating point numbers, even if the column represents an integer.
                     #### No upper bound
-                    If min is not 0 and max is 0, the filter will match any value greater than or equal to min,
+                    If min is *not* 0 and max *is* 0, the filter will match any value greater than or equal to min,
                     with no upper bound.
                     """
                 )
@@ -510,6 +543,15 @@ def create_add_filter(
     @path_filter_btn.click(inputs=[pos_neg, paths], outputs=[rules_state])
     def create_path_filter(pos_neg: str, paths: List[str]):
         filter = PathFilter(path_prefixes=paths)
+        direction = "pos" if pos_neg == "MUST MATCH" else "neg"
+        new_rules = add_filter(rule, direction, filter)
+        return new_rules
+
+    @not_in_path_filter_btn.click(
+        inputs=[pos_neg, not_in_paths], outputs=[rules_state]
+    )
+    def create_not_in_path_filter(pos_neg: str, not_in_paths: List[str]):
+        filter = NotInPathFilter(path_prefixes=not_in_paths)
         direction = "pos" if pos_neg == "MUST MATCH" else "neg"
         new_rules = add_filter(rule, direction, filter)
         return new_rules
@@ -550,6 +592,10 @@ def create_filter_edit(
         return path_filter_edit(
             rules_state, context, rule, dir, filter_idx, filter
         )
+    if isinstance(filter, NotInPathFilter):
+        return not_in_path_filter_edit(
+            rules_state, context, rule, dir, filter_idx, filter
+        )
     elif isinstance(filter, MimeFilter):
         return mime_type_filter_edit(
             rules_state, context, rule, dir, filter_idx, filter
@@ -570,6 +616,41 @@ def path_filter_edit(
     element = gr.Dropdown(
         key=f"rule{rule.id}_{dir}_filter_{filter_idx}",
         label="File path starts with one of",
+        choices=context.folders,
+        multiselect=True,
+        allow_custom_value=True,
+        value=filter.path_prefixes,
+    )
+    with gr.Row():
+        update_button = gr.Button("Update")
+        delete_button = gr.Button("Remove")
+
+    @update_button.click(inputs=[element], outputs=[rules_state])
+    def update_path_filter(path_prefixes: List[str]):
+        filter.path_prefixes = path_prefixes
+        new_rules = update_filter(rule, dir, filter_idx, filter)
+        return new_rules
+
+    @delete_button.click(outputs=[rules_state])
+    def delete_path_filter():
+        new_rules = remove_filter(rule, dir, filter_idx)
+        return new_rules
+
+    return element
+
+
+def not_in_path_filter_edit(
+    rules_state: gr.State,
+    context: RuleStats,
+    rule: StoredRule,
+    dir: Literal["pos", "neg"],
+    filter_idx: int,
+    filter: NotInPathFilter,
+):
+    gr.Markdown(f"### File Not In Path Filter")
+    element = gr.Dropdown(
+        key=f"rule{rule.id}_{dir}_filter_{filter_idx}",
+        label="File path does not start with any of",
         choices=context.folders,
         multiselect=True,
         allow_custom_value=True,

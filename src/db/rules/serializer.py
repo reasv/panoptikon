@@ -6,6 +6,7 @@ from src.db.rules.types import (
     FilterType,
     MimeFilter,
     MinMaxFilter,
+    NotInPathFilter,
     PathFilter,
     ProcessedExtractedDataFilter,
     ProcessedItemsFilter,
@@ -68,6 +69,7 @@ class FilterEncoder(json.JSONEncoder):
             o,
             (
                 PathFilter,
+                NotInPathFilter,
                 MimeFilter,
                 ProcessedItemsFilter,
                 MinMaxFilter,
