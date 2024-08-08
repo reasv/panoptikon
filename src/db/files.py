@@ -364,45 +364,57 @@ def delete_files_not_allowed(conn: sqlite3.Connection):
         SELECT COUNT(*)
         FROM multirule_results
     """
-    count_all_items = f"""
-        SELECT COUNT(*)
-        FROM items
-    """
     pretty_print_SQL(count_query, params)
     cursor = conn.cursor()
     cursor.execute(count_query, params)
     count: int = cursor.fetchone()[0]
+    count_all_items = f"""
+        SELECT COUNT(*)
+        FROM items
+    """
     cursor.execute(count_all_items)
     total_items: int = cursor.fetchone()[0]
-    logger.debug(f"{count} items out of {total_items} items match the rules")
-
-    items_deleted = 0
-    while True:
-        cursor.execute(
-            f"""
-            WITH
-            {query}
-            DELETE FROM files
-            WHERE item_id IN (
-                SELECT item_id
-                FROM files
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM multirule_results
-                    WHERE multirule_results.id = files.item_id
-                )
-                LIMIT ?
-            );
-        """,
-            params + [1000],
+    if count < total_items:
+        logger.warning(
+            f"{count} items out of {total_items} items match the rules"
         )
-        items_deleted += cursor.rowcount
-        if cursor.rowcount == 0:
-            break
+    else:
+        logger.debug(f"All {total_items} items match the rules")
 
-    if items_deleted > 0:
-        logger.warning(f"Deleted {items_deleted} files")
+    assert count <= total_items, "Too many items match the rules"
+
+    count_all_files = f"""
+        SELECT COUNT(*)
+        FROM files
+    """
+    cursor.execute(count_all_files)
+    total_files: int = cursor.fetchone()[0]
+    logger.debug(f"{total_files} files in the database before deletion")
+
+    cursor.execute(
+        f"""
+        WITH
+        {query}
+        DELETE FROM files
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM multirule_results
+            WHERE multirule_results.id = files.item_id
+        );
+    """,
+        params,
+    )
+
+    cursor.execute(count_all_files)
+    total_files_after: int = cursor.fetchone()[0]
+    files_deleted = total_files - total_files_after
+
+    logger.debug(f"{total_files_after} files in the database after deletion")
+    if files_deleted > 0:
+        logger.warning(
+            f"Deleted {files_deleted} files due to file scan rules set by the user"
+        )
     else:
         logger.debug("No items deleted")
 
-    return items_deleted
+    return files_deleted
