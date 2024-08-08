@@ -1,9 +1,15 @@
+import logging
 import os
 import sqlite3
 from typing import List
 
 from src.db import get_item_id
+from src.db.rules.build_filters import build_multirule_query
+from src.db.rules.rules import get_rules_for_setter
+from src.db.utils import pretty_print_SQL
 from src.types import FileRecord, FileScanData, FileScanRecord
+
+logger = logging.getLogger(__name__)
 
 
 def update_file_data(
@@ -341,3 +347,62 @@ def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
     mime_types.extend(general_types)
     mime_types.sort()
     return mime_types
+
+
+def delete_files_not_allowed(conn: sqlite3.Connection):
+    user_rules = get_rules_for_setter(conn, "files", "file_scan")
+    if not user_rules:
+        logger.debug("No rules for files, skipping deletion")
+        return 0
+    filters = [rule.filters for rule in user_rules]
+    query, params = build_multirule_query(
+        filters,
+    )
+    count_query = f"""
+        WITH
+        {query}
+        SELECT COUNT(*)
+        FROM multirule_results
+    """
+    count_all_items = f"""
+        SELECT COUNT(*)
+        FROM items
+    """
+    pretty_print_SQL(count_query, params)
+    cursor = conn.cursor()
+    cursor.execute(count_query, params)
+    count: int = cursor.fetchone()[0]
+    cursor.execute(count_all_items)
+    total_items: int = cursor.fetchone()[0]
+    logger.debug(f"{count} items out of {total_items} items match the rules")
+
+    items_deleted = 0
+    while True:
+        cursor.execute(
+            f"""
+            WITH
+            {query}
+            DELETE FROM files
+            WHERE item_id IN (
+                SELECT item_id
+                FROM files
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM multirule_results
+                    WHERE multirule_results.id = files.item_id
+                )
+                LIMIT ?
+            );
+        """,
+            params + [1000],
+        )
+        items_deleted += cursor.rowcount
+        if cursor.rowcount == 0:
+            break
+
+    if items_deleted > 0:
+        logger.warning(f"Deleted {items_deleted} files")
+    else:
+        logger.debug("No items deleted")
+
+    return items_deleted

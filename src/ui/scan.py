@@ -68,6 +68,7 @@ def update_folders(
         Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;
         Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;
         Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;
+        Removed {update_result.rule_files_deleted} files from the database that were not allowed by user rules;
         Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed.
         """
         conn.commit()
@@ -101,12 +102,15 @@ def rescan_folders():
     conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
-    ids, files_deleted, items_deleted = rescan_all_folders(conn)
+    ids, files_deleted, items_deleted, rule_files_deleted = rescan_all_folders(
+        conn
+    )
     conn.commit()
     vacuum_database(conn)
     conn.close()
     return (
-        f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items.",
+        f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items."
+        + f"Files deleted due to rules: {rule_files_deleted}",
         fetch_scan_history(),
         fetch_extraction_logs(),
     )

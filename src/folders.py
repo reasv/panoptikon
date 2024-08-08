@@ -8,6 +8,7 @@ from typing import List
 from src.db.config import retrieve_system_config
 from src.db.files import (
     add_file_scan,
+    delete_files_not_allowed,
     delete_items_without_files,
     delete_unavailable_files,
     mark_unavailable_files,
@@ -159,6 +160,7 @@ class UpdateFoldersResult:
     excluded_folder_files_deleted: int
     orphan_files_deleted: int
     orphan_items_deleted: int
+    rule_files_deleted: int
     scan_ids: List[int]
 
 
@@ -213,6 +215,7 @@ def update_folder_lists(
 
     excluded_folder_files_deleted = delete_files_under_excluded_folders(conn)
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
+    rule_files_deleted = delete_files_not_allowed(conn)
     orphan_items_deleted = delete_items_without_files(conn)
 
     return UpdateFoldersResult(
@@ -225,6 +228,7 @@ def update_folder_lists(
         orphan_files_deleted=orphan_files_deleted,
         orphan_items_deleted=orphan_items_deleted,
         scan_ids=scan_ids,
+        rule_files_deleted=rule_files_deleted,
     )
 
 
@@ -238,9 +242,15 @@ def rescan_all_folders(conn: sqlite3.Connection):
     system_config = retrieve_system_config(conn)
     if system_config.remove_unavailable_files:
         unavailable_files_deleted = delete_unavailable_files(conn)
-        orphan_items_deleted = delete_items_without_files(conn)
     else:
         unavailable_files_deleted = 0
-        orphan_items_deleted = 0
 
-    return scan_ids, unavailable_files_deleted, orphan_items_deleted
+    rule_files_deleted = delete_files_not_allowed(conn)
+    orphan_items_deleted = delete_items_without_files(conn)
+
+    return (
+        scan_ids,
+        unavailable_files_deleted,
+        orphan_items_deleted,
+        rule_files_deleted,
+    )
