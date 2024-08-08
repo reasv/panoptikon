@@ -95,6 +95,8 @@ def create_search_UI(
         conn.close()
         results, total_results = zip(*res_list) if res_list else ([], [0])
 
+        results = [r for r in results if r is not None]
+
         logger.debug(f"Search took {round(time() - start, 3)} seconds")
         total_results = total_results[0]
 
