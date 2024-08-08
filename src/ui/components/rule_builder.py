@@ -4,7 +4,6 @@ import logging
 from typing import List, Literal, Tuple, Type
 
 import gradio as gr
-from cv2 import add
 
 from src.data_extractors import models
 from src.db import get_database_connection
