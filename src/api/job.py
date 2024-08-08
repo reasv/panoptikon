@@ -1,4 +1,4 @@
-import time
+import logging
 from datetime import datetime
 
 from croniter import croniter
@@ -6,6 +6,8 @@ from croniter import croniter
 from src.cronjob import run_cronjob
 from src.db import get_database_connection
 from src.db.config import retrieve_system_config
+
+logger = logging.getLogger(__name__)
 
 
 # Function to get the cron string
@@ -49,5 +51,7 @@ def try_cronjob():
     if next_scheduled_time and datetime.now() >= next_scheduled_time:
         # Call the task function
         run_cronjob()
+        next_scheduled_time = None
         # Update the schedule after running the task
         update_schedule()
+        logger.info(f"Next scheduled time: {next_scheduled_time}")
