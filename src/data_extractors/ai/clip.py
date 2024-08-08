@@ -1,9 +1,12 @@
+import logging
 from typing import List, Sequence
 
 import numpy as np
 import open_clip
 import torch
 from PIL import Image as PILImage
+
+logger = logging.getLogger(__name__)
 
 
 class CLIPModelSingleton:
@@ -14,7 +17,7 @@ class CLIPModelSingleton:
     def get_instance(cls, model_name, pretrained):
         key = (model_name, pretrained)
         if key not in cls._instances:
-            print(f"Creating new instance for {model_name} {pretrained}")
+            logger.info(f"Creating new instance for {model_name} {pretrained}")
             model, _, preprocess = open_clip.create_model_and_transforms(
                 model_name, pretrained=pretrained
             )
@@ -26,7 +29,7 @@ class CLIPModelSingleton:
             }
             cls._reference_counts[key] = 0
         else:
-            print(f"Reusing instance for {model_name} {pretrained}")
+            logger.info(f"Reusing instance for {model_name} {pretrained}")
         cls._reference_counts[key] += 1
         return cls._instances[key]
 
@@ -36,7 +39,7 @@ class CLIPModelSingleton:
         if key in cls._reference_counts:
             cls._reference_counts[key] -= 1
             if cls._reference_counts[key] == 0:
-                print(f"Deleting instance for {model_name} {pretrained}")
+                logger.info(f"Deleting instance for {model_name} {pretrained}")
                 del cls._instances[key]
                 del cls._reference_counts[key]
                 if torch.cuda.is_available():

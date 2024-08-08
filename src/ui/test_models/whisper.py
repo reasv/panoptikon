@@ -1,3 +1,4 @@
+import logging
 from typing import Tuple
 
 import gradio as gr
@@ -5,6 +6,8 @@ import numpy as np
 
 # from src.data_extractors.data_loaders.audio import SAMPLE_RATE, load_audio
 from src.data_extractors.models import WhisperSTTModel
+
+logger = logging.getLogger(__name__)
 
 
 def transcribe_audio(
@@ -16,7 +19,7 @@ def transcribe_audio(
 ) -> Tuple[str, Tuple[int, np.ndarray] | None]:
     if model_repo is None:
         return "[No model selected]", None
-    print(
+    logger.info(
         f"""
         Transcribing audio with model: {model_repo} \
         and language: {language}
@@ -31,7 +34,7 @@ def transcribe_audio(
     )
 
     if audio:
-        print(f"Sample rate: {sample_rate}")
+        logger.info(f"Sample rate: {sample_rate}")
 
     if audio is None and audio_file is not None:
         audio = whisperx.load_audio(audio_file)
@@ -54,7 +57,7 @@ def transcribe_audio(
         batch_size=batch_size,
         language=language,
     )
-    print(result)
+    logger.info(result)
     merged_text = "\n".join([segment["text"] for segment in result["segments"]])
     return merged_text, (whisperx.audio.SAMPLE_RATE, audio)
 

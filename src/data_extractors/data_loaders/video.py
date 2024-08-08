@@ -53,7 +53,9 @@ def select_representative_frames(frames, max_frames):
 
 def extract_keyframes_ffmpeg(path: str, num_frames: int):
     # Create a temporary directory to store extracted frames
-    temp_dir = "temp_frames"
+    # Get directory name from environment variable
+
+    temp_dir = os.getenv("TEMP_DIR", "./data/tmp")
     os.makedirs(temp_dir, exist_ok=True)
 
     # Build ffmpeg command to extract keyframes
@@ -96,7 +98,7 @@ def extract_keyframes_ffmpeg(path: str, num_frames: int):
 
 def extract_frames_ffmpeg(path: str, num_frames: int):
     # Create a temporary directory to store extracted frames
-    temp_dir = "temp_frames"
+    temp_dir = os.getenv("TEMP_DIR", "./data/tmp")
     os.makedirs(temp_dir, exist_ok=True)
 
     # Get the duration of the video in seconds

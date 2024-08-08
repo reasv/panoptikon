@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 
 import gradio as gr
@@ -18,6 +19,8 @@ from src.ui.components.scan_tables import (
     fetch_extraction_logs,
     fetch_scan_history,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_folders():
@@ -274,7 +277,7 @@ def create_scan_settings_configurator(tab: gr.Tab, app: gr.Blocks):
         config.scan_audio = args[scan_audio]
         config.scan_html = args[scan_html]
         config.scan_pdf = args[scan_pdf]
-        print(config)
+        logger.debug(config)
         persist_system_config(conn, config)
         conn.commit()
         conn.close()
@@ -380,7 +383,7 @@ Or, in order to run it every hour, use `0 * * * *`, every four hours: `0 */4 * *
         config.enable_cron_job = args[enable_cronjob]
         if croniter.is_valid(args[cron_string]):
             config.cron_schedule = args[cron_string]
-        print(config)
+        logger.debug(config)
         persist_system_config(conn, config)
         conn.commit()
         conn.close()

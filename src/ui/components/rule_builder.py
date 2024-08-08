@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Literal, Tuple, Type
 
 import gradio as gr
@@ -27,6 +28,8 @@ from src.db.rules.types import (
     min_max_columns,
 )
 from src.types import RuleStats
+
+logger = logging.getLogger(__name__)
 
 
 def update_filter(
@@ -99,7 +102,7 @@ def remove_setters_from_rule(
 ):
     # Convert to_remove to a list of tuples
     to_remove = [(type, setter) for type, setter in to_remove]
-    print(rule.setters, to_remove)
+    logger.debug(rule.setters, to_remove)
     new_setters = [setter for setter in rule.setters if setter not in to_remove]
     conn = get_database_connection(write_lock=True)
     conn.execute("BEGIN TRANSACTION")

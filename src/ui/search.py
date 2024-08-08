@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import logging
 from time import time
 from typing import Any, List, Tuple
 
 import gradio as gr
-from matplotlib import interactive
 
 from src.db import get_database_connection
 from src.db.search import search_files
@@ -13,6 +13,8 @@ from src.types import FileSearchResult
 from src.ui.components.multi_view import create_multiview
 from src.ui.components.search import create_search_options
 from src.ui.components.search.utils import AnyComponent
+
+logger = logging.getLogger(__name__)
 
 
 def create_search_UI(
@@ -62,7 +64,7 @@ def create_search_UI(
         search_action: str | None = None,
     ):
         search_query = build_query(args)
-        print(f"Search action: {search_action}")
+        logger.debug(f"Search action: {search_action}")
         page: int = args[current_page]
         if search_action == "search_button":
             page = 1
@@ -82,7 +84,7 @@ def create_search_UI(
         search_query.check_path = True
 
         conn = get_database_connection(write_lock=False)
-        print("Search query:")
+        logger.debug("Search query:")
         pprint_dataclass(search_query)
         res_list: List[Tuple[FileSearchResult | None, int]] = list(
             search_files(
@@ -93,10 +95,10 @@ def create_search_UI(
         conn.close()
         results, total_results = zip(*res_list) if res_list else ([], [0])
 
-        print(f"Search took {round(time() - start, 3)} seconds")
+        logger.debug(f"Search took {round(time() - start, 3)} seconds")
         total_results = total_results[0]
 
-        print(f"Found {total_results} images")
+        logger.debug(f"Found {total_results} images")
         # Calculate the total number of pages, we need to round up
         total_pages = total_results // search_query.order_args.page_size + (
             1 if total_results % search_query.order_args.page_size > 0 else 0

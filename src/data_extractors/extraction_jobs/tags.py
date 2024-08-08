@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Dict, List, Sequence, Tuple
 
@@ -13,6 +14,8 @@ from src.data_extractors.models import TagsModel
 from src.db.extracted_text import insert_extracted_text
 from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath
+
+logger = logging.getLogger(__name__)
 
 
 def combine_results(results: List[dict[str, float]]) -> dict[str, float]:
@@ -139,7 +142,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     Run a job that processes items in the database using the given tagging model.
     """
     score_threshold = model.get_group_threshold(conn)
-    print(f"Using score threshold {score_threshold}")
+    logger.info(f"Using score threshold {score_threshold}")
     tag_predictor = Predictor(model_repo=model.model_repo())
     tag_predictor.load_model()
 

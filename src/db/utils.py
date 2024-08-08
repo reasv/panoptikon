@@ -1,6 +1,9 @@
+import logging
 import sqlite3
 import struct
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 
 def trigger_exists(conn: sqlite3.Connection, trigger_name: str) -> bool:
@@ -54,10 +57,10 @@ def pretty_print_SQL(query_str: str, params: List[str | float | int]):
         formatted_query = "\n".join(
             [line for line in formatted_query.split("\n") if line.strip() != ""]
         )
-        print(formatted_query)
+        logger.debug(formatted_query)
     except Exception as e:
-        print(f"Error formatting query: {e}")
-        print(query_str, params)
+        logger.error(f"Error formatting query: {e}")
+        logger.error(query_str, params)
 
 
 def serialize_f32(vector: List[float]) -> bytes:

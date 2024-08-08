@@ -1,4 +1,5 @@
 import datetime
+import logging
 from typing import List, Type
 
 import gradio as gr
@@ -11,13 +12,15 @@ from src.data_extractors.extraction_jobs.types import (
 from src.db import get_database_connection
 from src.db.utils import vacuum_database
 
+logger = logging.getLogger(__name__)
+
 
 def shorten_path(path: str, max_length=75) -> str:
     return ("..." + path[-max_length:]) if len(path) > max_length else path
 
 
 def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
-    print(f"Running job for model {model_opt}")
+    logger.info(f"Running job for model {model_opt}")
     conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")
@@ -60,7 +63,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
 
 
 def delete_model_data(model_opt: models.ModelOpts):
-    print(f"Running data deletion job for model {model_opt}")
+    logger.info(f"Running data deletion job for model {model_opt}")
     conn = get_database_connection(write_lock=True)
     cursor = conn.cursor()
     cursor.execute("BEGIN")

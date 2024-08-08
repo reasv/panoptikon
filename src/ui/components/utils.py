@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from os import write
+import logging
+import os
 from typing import List
 
 import gradio as gr
@@ -16,6 +17,8 @@ from src.db.bookmarks import (
 )
 from src.types import FileSearchResult
 
+logger = logging.getLogger(__name__)
+
 
 def toggle_bookmark(
     bookmarks_namespace: str,
@@ -30,12 +33,12 @@ def toggle_bookmark(
         add_bookmark(
             conn, namespace=bookmarks_namespace, sha256=selected_image_sha256
         )
-        print(f"Added bookmark")
+        logger.debug(f"Added bookmark")
     else:
         remove_bookmark(
             conn, namespace=bookmarks_namespace, sha256=selected_image_sha256
         )
-        print(f"Removed bookmark")
+        logger.debug(f"Removed bookmark")
     conn.commit()
     conn.close()
     return on_selected_image_get_bookmark_state(
@@ -106,10 +109,12 @@ def get_thumbnail(file: FileSearchResult | None, big: bool = True):
     if file is None:
         return None
     if file.type and file.type.startswith("video"):
+        # Get thumbnails directory from environment variable
+        thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
         return (
-            f"./thumbs/{file.sha256}-grid.jpg"
+            f"{thumbnail_dir}/{file.sha256}-grid.jpg"
             if big
-            else f"./thumbs/{file.sha256}-0.jpg"
+            else f"{thumbnail_dir}/{file.sha256}-0.jpg"
         )
     else:
         return file.path

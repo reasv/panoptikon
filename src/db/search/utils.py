@@ -1,5 +1,6 @@
+import logging
 from dataclasses import asdict, fields, is_dataclass
-from pprint import pprint
+from pprint import pformat
 from typing import (
     Any,
     Dict,
@@ -16,6 +17,8 @@ import numpy as np
 from typeguard import typechecked
 
 from src.db.search.types import QueryTagFilters, SearchQuery
+
+logger = logging.getLogger(__name__)
 
 
 @typechecked
@@ -114,7 +117,8 @@ def remove_empty_and_none(data):
 def pprint_dataclass(obj):
     dictclass = dataclass_to_dict(obj)
     dictclass = remove_empty_and_none(dictclass)
-    pprint(replace_bytes_with_length(dictclass))
+    pstring = pformat(replace_bytes_with_length(dictclass))
+    logger.debug(pstring)
 
 
 from dataclasses import fields, is_dataclass

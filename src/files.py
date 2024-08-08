@@ -1,8 +1,10 @@
 import hashlib
+import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Tuple
+from venv import logger
 
 from src.data_extractors.data_loaders.audio import extract_media_info
 from src.data_extractors.data_loaders.video import video_to_frames
@@ -11,6 +13,8 @@ from src.db.files import get_file_by_path
 from src.types import FileRecord, FileScanData, ItemScanMeta
 from src.utils import get_mime_type, make_video_thumbnails, normalize_path
 
+logger = logging.getLogger(__name__)
+
 
 def get_files_by_extension(
     starting_points: List[str], excluded_paths: List[str], extensions: List[str]
@@ -18,7 +22,7 @@ def get_files_by_extension(
     """
     Get all files with the given extensions in the given starting points and their entire directory trees, excluding the given excluded paths.
     """
-    print(
+    logger.info(
         f"Scanning for files with extensions {extensions} in {starting_points} excluding {excluded_paths}"
     )
     excluded_paths = [
@@ -81,7 +85,9 @@ def scan_files(
                 file_path
             )
         except Exception as e:
-            print(f"Error getting last modified time for {file_path}: {e}")
+            logger.info(
+                f"Error getting last modified time for {file_path}: {e}"
+            )
             yield None, 0.0, 0.0
             continue
 
@@ -100,7 +106,7 @@ def scan_files(
                     conn, file_path, last_modified, file_size, file_record
                 )
             except Exception as e:
-                print(f"Error extracting metadata for {file_path}: {e}")
+                logger.error(f"Error extracting metadata for {file_path}: {e}")
                 yield None, 0.0, 0.0
         else:
             assert file_record is not None
@@ -127,7 +133,7 @@ def extract_file_metadata(
     md5, sha256 = calculate_hashes(file_path)
     hash_time_seconds = (datetime.now() - hash_start).total_seconds()
     if file_record is not None and file_record.sha256 == sha256:
-        print(
+        logger.warning(
             f"File has a different timestamp "
             + f"but the same hash (P: {file_record.last_modified}, "
             + f"N: {last_modified}): {file_path}"
@@ -144,7 +150,7 @@ def extract_file_metadata(
             0.0,
         )
     if get_item_id(conn, sha256):
-        print(f"Item already exists: {file_path}")
+        logger.info(f"Item already exists: {file_path}")
         return (
             FileScanData(
                 sha256=sha256,
@@ -156,7 +162,7 @@ def extract_file_metadata(
             hash_time_seconds,
             0.0,
         )
-    print(f"Extracting metadata for {file_path}")
+    logger.info(f"Extracting metadata for {file_path}")
     meta_start = datetime.now()
     mime_type = get_mime_type(file_path)
     item_meta = ItemScanMeta(
@@ -240,19 +246,21 @@ def calculate_hashes(file_path: str):
                 hash_sha256.update(chunk)
         return hash_md5.hexdigest(), hash_sha256.hexdigest()
     except FileNotFoundError:
-        print(f"Error: The file '{file_path}' does not exist.")
+        logger.error(f"Error: The file '{file_path}' does not exist.")
     except PermissionError:
-        print(
+        logger.error(
             f"Error: You do not have permission to access the file '{file_path}'."
         )
     except IsADirectoryError:
-        print(f"Error: The path '{file_path}' is a directory, not a file.")
+        logger.error(
+            f"Error: The path '{file_path}' is a directory, not a file."
+        )
     except NotADirectoryError:
-        print(
+        logger.error(
             f"Error: A component of the path '{file_path}' is not a directory."
         )
     except OSError as e:
-        print(
+        logger.error(
             f"Error: An OS error occurred while accessing the file '{file_path}': {e}"
         )
     raise Exception("Error calculating hashes")
@@ -266,13 +274,17 @@ def get_os_stat(path: str):
         info = os.stat(path)
         return info
     except FileNotFoundError:
-        print(f"Error: The path '{path}' does not exist.")
+        logger.error(f"Error: The path '{path}' does not exist.")
     except PermissionError:
-        print(f"Error: You do not have permission to access the path '{path}'.")
+        logger.error(
+            f"Error: You do not have permission to access the path '{path}'."
+        )
     except NotADirectoryError:
-        print(f"Error: A component of the path '{path}' is not a directory.")
+        logger.error(
+            f"Error: A component of the path '{path}' is not a directory."
+        )
     except OSError as e:
-        print(
+        logger.error(
             f"Error: An OS error occurred while accessing the path '{path}': {e}"
         )
 

@@ -163,10 +163,9 @@ cython_debug/
 
 venv/
 thumbs/
-temp_frames/
 scripts/
 db/**
 .vscode/
-jax_cache/
 
 .DS_Store
+data/

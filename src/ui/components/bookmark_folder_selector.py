@@ -1,26 +1,29 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import gradio as gr
 
 from src.ui.components.utils import get_all_bookmark_folders
 
+logger = logging.getLogger(__name__)
+
 
 def on_bookmark_folder_change(bookmarks_namespace: str):
-    print(f"Bookmark namespace changed to {bookmarks_namespace}")
+    logger.debug(f"Bookmark namespace changed to {bookmarks_namespace}")
     return bookmarks_namespace
 
 
 def on_input(namespace_chosen: str, bookmarks_namespace: str):
-    print(f"Previous namespace {bookmarks_namespace}")
-    print(f"Input namespace {namespace_chosen}")
+    logger.debug(f"Previous namespace {bookmarks_namespace}")
+    logger.debug(f"Input namespace {namespace_chosen}")
     new_value = (
         namespace_chosen
         if len(namespace_chosen.strip()) > 0
         else bookmarks_namespace
     )
-    print(f"New namespace {new_value}")
+    logger.debug(f"New namespace {new_value}")
     return new_value, new_value
 
 

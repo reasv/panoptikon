@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List
 
 import gradio as gr
@@ -15,6 +16,8 @@ from src.ui.components.utils import (
     get_all_bookmarks_in_folder,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def get_bookmarks_paths(
     bookmarks_namespace: str,
@@ -26,7 +29,7 @@ def get_bookmarks_paths(
     bookmarks, total_bookmarks = get_all_bookmarks_in_folder(
         bookmarks_namespace, order_by=order_by, order=order
     )
-    print(
+    logger.debug(
         f"Bookmarks fetched from {bookmarks_namespace} folder. Total: {total_bookmarks}, Displayed: {len(bookmarks)}"
     )
     return bookmarks
@@ -39,7 +42,7 @@ def erase_bookmarks_fn(
     order: str | None = None,
 ):
     delete_bookmarks_except_last_n(bookmarks_namespace, keep_last_n)
-    print("Bookmarks erased")
+    logger.debug("Bookmarks erased")
     bookmarks = get_bookmarks_paths(
         bookmarks_namespace, order_by=order_by, order=order
     )
@@ -53,12 +56,12 @@ def delete_bookmark_fn(
     order: str | None = None,
 ):
     if len(selected_files) == 0:
-        print("No bookmark selected")
+        logger.debug("No bookmark selected")
         return
     delete_bookmark(
         bookmarks_namespace=bookmarks_namespace, sha256=selected_files[0].sha256
     )
-    print("Bookmark deleted")
+    logger.debug("Bookmark deleted")
     bookmarks = get_bookmarks_paths(
         bookmarks_namespace, order_by=order_by, order=order
     )

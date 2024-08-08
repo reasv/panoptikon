@@ -7,17 +7,22 @@ from gradio.routes import mount_gradio_app
 from src.api.app import app
 from src.db import get_database_connection, initialize_database
 from src.db.folders import get_folders_from_database
+from src.log import setup_logging
 
+setup_logging()
 readonly_mode = os.environ.get("READONLY", "false").lower() == "true"
+import logging
+
+logger = logging.getLogger(__name__)
 
 if readonly_mode:
     import src.ui.root_readonly as root
 
-    print("Running in read-only mode")
+    logger.info("Running in read-only mode")
 else:
     import src.ui.root as root
 
-    print("Running in read-write mode")
+    logger.info("Running in read-write mode")
 
 
 def run_database_migrations():

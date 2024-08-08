@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from typing import (
@@ -28,6 +29,8 @@ from src.db.extraction_log import (
 )
 from src.types import ItemWithPath
 from src.utils import estimate_eta
+
+logger = logging.getLogger(__name__)
 
 R = TypeVar("R")
 I = TypeVar("I")
@@ -90,7 +93,7 @@ def run_extraction_job(
             data_load_time += (datetime.now() - load_start).total_seconds()
             return o
         except Exception as e:
-            print(f"Error processing item {item.path}: {e}")
+            logger.error(f"Error processing item {item.path}: {e}")
             failed_items[item.sha256] = item
             return []
 
@@ -139,7 +142,9 @@ def run_extraction_job(
                 # and the idea is this model is now
                 # processing that data, and should not process it again.
                 # We record it so the model's filters can filter this item out next run.
-                print(f"Adding {len(items_extractions)} extractions to log")
+                logger.debug(
+                    f"Adding {len(items_extractions)} extractions to log"
+                )
                 for extraction_id in items_extractions:
                     add_item_to_log(
                         conn,
@@ -151,7 +156,7 @@ def run_extraction_job(
             if len(inputs) == 0:
                 continue
         except Exception as e:
-            print(f"Error handling item {item.path}: {e}")
+            logger.error(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
             continue
         if item.type.startswith("video"):
@@ -162,7 +167,7 @@ def run_extraction_job(
             other += 1
         total_items = remaining + processed_items
         eta_str = estimate_eta(scan_time, processed_items, remaining)
-        print(
+        logger.info(
             f"{model_opts.setter_name()}: ({processed_items}/{total_items}) "
             + f"(ETA: {eta_str}) "
             + f"Processed ({item.type}) {item.path}"
@@ -187,7 +192,7 @@ def run_extraction_job(
             start_time, processed_items, total_items, eta_str, item
         )
 
-    print(
+    logger.info(
         f"Processed {processed_items} items:"
         + f" {images} images and {videos} videos "
         + f"totalling {total_processed_units} frames"
@@ -221,7 +226,7 @@ def run_extraction_job(
         inference_time=inference_time,
         finished=True,
     )
-    print("Updated log with scan results")
+    logger.info("Updated log with scan results")
 
     failed_paths = [item.path for item in failed_items.values()]
     final_callback()

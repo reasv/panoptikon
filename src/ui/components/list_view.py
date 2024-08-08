@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import List
 
@@ -19,10 +20,12 @@ from src.ui.components.utils import (
 )
 from src.utils import open_file, open_in_explorer
 
+logger = logging.getLogger(__name__)
+
 
 def on_files_change(files: List[FileSearchResult]):
     image_list = [[get_thumbnail(file, False), file.path] for file in files]
-    print(f"Received {len(image_list)} images")
+    logger.debug(f"Received {len(image_list)} images")
     return gr.update(samples=image_list), (
         [] if len(image_list) == 0 else [files[0]]
     )
@@ -100,7 +103,7 @@ def on_select_image(
     files: List[FileSearchResult],
     selected_files: List[FileSearchResult],
 ):
-    print(f"Selected image index: {evt} in file list")
+    logger.debug(f"Selected image index: {evt} in file list")
     image_index: int = evt
     image = files[image_index]
     if len(selected_files) > 0:

@@ -2,8 +2,6 @@ import os
 import sqlite3
 from typing import List
 
-from sympy import false
-
 from src.db import get_item_id
 from src.types import FileRecord, FileScanData, FileScanRecord
 

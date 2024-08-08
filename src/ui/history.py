@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 from typing import List
 
 import gradio as gr
 
 from src.ui.components.multi_view import create_multiview
 
+logger = logging.getLogger(__name__)
+
 
 def get_history_paths(select_history: List[str]):
-    print(f"History length is {len(select_history)}")
+    logger.debug(f"History length is {len(select_history)}")
     # Should be in reverse order
     return select_history[::-1]
 
@@ -18,7 +21,7 @@ def erase_history_fn(select_history: List[str], keep_last_n: int):
         select_history = select_history[-keep_last_n:]
     else:
         select_history = []
-    print("History erased")
+    logger.debug("History erased")
     history = get_history_paths(select_history)
     return select_history, history
 

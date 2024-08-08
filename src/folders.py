@@ -1,7 +1,6 @@
+import logging
 import os
 import sqlite3
-import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -24,6 +23,8 @@ from src.db.folders import (
 )
 from src.files import deduplicate_paths, scan_files
 from src.utils import normalize_path
+
+logger = logging.getLogger(__name__)
 
 
 def execute_folder_scan(
@@ -59,7 +60,7 @@ def execute_folder_scan(
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
     system_config = retrieve_system_config(conn)
-    print(f"Scanning folders: {included_folders}")
+    logger.info(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
         (
@@ -124,7 +125,7 @@ def execute_folder_scan(
         marked_unavailable, total_available = mark_unavailable_files(
             conn, scan_id=scan_id, path=folder
         )
-        print(
+        logger.info(
             f"Scan of {folder} complete. New items: {new_items}, Unchanged files: {unchanged_files}, New files: {new_files}, Modified files: {modified_files}, Marked unavailable: {marked_unavailable}, Errors: {errors}, Total available: {total_available}"
         )
         end_time = datetime.now().isoformat()

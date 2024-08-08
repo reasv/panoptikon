@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
@@ -26,6 +27,8 @@ from src.files import (
 )
 from src.types import FileSearchResult
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,7 +36,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-@repeat_at(cron="* * * * *")
+@repeat_at(cron="* * * * *", logger=logger)
 def cronjob():
     try_cronjob()
 
@@ -81,7 +84,7 @@ async def get_bookmarks_page(
         order=order,
     )
     files = [(file.sha256, file.path) for file in files_result]
-    print(total)
+    logger.debug(total)
     return templates.TemplateResponse(
         "gallery.html",
         {
@@ -174,8 +177,8 @@ async def search_by_tags_html(
         order=order,
     )
     files = [(file.sha256, file.path) for file in files_dicts]
-    print(tags, tags_list)
-    print(total)
+    logger.debug(tags, tags_list)
+    logger.debug(total)
     return templates.TemplateResponse(
         "gallery.html",
         {
@@ -207,7 +210,7 @@ async def search_by_tags_json(
         order_by,
         order,
     )
-    print(total)
+    logger.debug(total)
     return JSONResponse(
         {
             "files": jsonable_encoder(files),
@@ -229,7 +232,9 @@ async def browse_folder(request: Request, foldername: str):
         # Skip files that are not directly in the current directory
         dirname = os.path.join(os.path.dirname(file_path), "")
         if not include_subdirs and dirname != foldername:
-            print(f"Skipping {dirname} because it is not in {foldername}")
+            logger.debug(
+                f"Skipping {dirname} because it is not in {foldername}"
+            )
             continue
 
         # Calculate sha256 hash of the file path instead of the file content for speed
@@ -255,7 +260,7 @@ async def browse_folder(request: Request, foldername: str):
         reverse = request.query_params.get("desc", "false") == "true"
         files_dicts.sort(key=lambda x: x["path"], reverse=reverse)
 
-    print(len(files_dicts))
+    logger.debug(len(files_dicts))
 
     files = [(file["sha256"], file["path"]) for file in files_dicts]
     # Extract "show" parameter from query string

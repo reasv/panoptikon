@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, List, Sequence, Tuple
 if TYPE_CHECKING:
     import src.data_extractors.models as models
 
+import logging
+
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_multirule_query
@@ -14,6 +16,8 @@ from src.db.rules.types import combine_rule_item_filters
 from src.db.setters import upsert_setter
 from src.db.utils import pretty_print_SQL
 from src.types import ItemWithPath, LogRecord
+
+logger = logging.getLogger(__name__)
 
 
 def add_data_extraction_log(
@@ -221,7 +225,7 @@ def get_items_missing_data_extraction(
         params,
     )
 
-    print(f"Query took {time() - start_time:.2f}s")
+    logger.debug(f"Query took {time() - start_time:.2f}s")
 
     remaining_count: int = total_count
     while row := cursor.fetchone():

@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from typing import Dict, List, Literal, Tuple
@@ -5,6 +6,8 @@ from unittest.mock import patch
 
 import gradio as gr
 from transformers.dynamic_module_utils import get_imports
+
+logger = logging.getLogger(__name__)
 
 
 def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
@@ -49,7 +52,7 @@ def load_model(model_name, flash_attention):
             .eval()
         )
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    print(f"Model {model_name} loaded.")
+    logger.debug(f"Model {model_name} loaded.")
     return model, processor
 
 
@@ -167,7 +170,7 @@ def create_florence_2_ui():
             # Load all models
             model_list = list(models_jobs.keys())
 
-        print("Loading models...")
+        logger.info("Loading models...")
         time_start_models = time.time()
         progress(0)
         for model_name in model_list:
@@ -176,7 +179,7 @@ def create_florence_2_ui():
             progress(float(len(loaded_models.items())) / float(len(model_list)), desc=f"Loading {model_name}...")
             loaded_models[model_name] = load_model(model_name, use_flash_attn)
 
-        print(
+        logger.info(
             f"{len(loaded_models.items())} Models loaded in {round(time.time() - time_start_models, 2)} seconds."
         )
     
@@ -186,7 +189,7 @@ def create_florence_2_ui():
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("Models unloaded.")
+        logger.info("Models unloaded.")
 
     def process_image(image: gr.Image, model_list: List[str] | None, task_types: List[Literal['caption', 'ocr', 'ocr_region', 'basic_caption', 'detailed_caption', 'most_detailed_caption']] | None, flash_attention: bool, progress=gr.Progress()):
         if model_list is not None and len(model_list) == 0:
@@ -242,7 +245,7 @@ def create_florence_2_ui():
                         "time": str(round(time.time() - task_start_time, 2))
                     }
                 )
-                print(
+                logger.info(
                     f"{model_name} - {task_prompt} - Time: {results[-1]["time"]}"
                 )
                 
