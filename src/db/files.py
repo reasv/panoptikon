@@ -2,86 +2,102 @@ import os
 import sqlite3
 from typing import List
 
+from sympy import false
+
+from src.db import get_item_id
 from src.types import FileRecord, FileScanData, FileScanRecord
 
 
 def update_file_data(
-    conn: sqlite3.Connection, time_added: str, scan_id: int, meta: FileScanData
+    conn: sqlite3.Connection, time_added: str, scan_id: int, data: FileScanData
 ):
+
+    sha256 = data.sha256
+    meta = data.item_metadata
+
     cursor = conn.cursor()
-    sha256 = meta.sha256
-    path = meta.path
-    last_modified = meta.last_modified
-    path_in_db = meta.path_in_db
-    file_modified = meta.modified
+    item_id = get_item_id(conn, sha256)
+    if meta and item_id is None:
+        # Insert the item into the database
+        cursor.execute(
+            """
+        INSERT INTO items
+        (sha256, md5, type, size, time_added, width, height, duration, audio_tracks, video_tracks, subtitle_tracks)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                sha256,
+                meta.md5,
+                meta.mime_type,
+                meta.size,
+                time_added,
+                meta.width,
+                meta.height,
+                meta.duration,
+                meta.audio_tracks,
+                meta.video_tracks,
+                meta.subtitle_tracks,
+            ),
+        )
+        assert (
+            cursor.lastrowid is not None
+        ), f"Item not inserted for sha256: {sha256} ({data.path})"
+        # Get the rowid of the inserted item, if it was inserted
+        item_id = cursor.lastrowid
+        item_inserted = True
+    else:
+        assert (
+            item_id is not None
+        ), f"Item not found and no meta given for sha256: {sha256} ({data.path})"
+        item_inserted = False
 
-    item_insert_result = cursor.execute(
-        """
-    INSERT INTO items (sha256, md5, type, size, time_added, width, height, duration, audio_tracks, video_tracks, subtitle_tracks)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(sha256) DO NOTHING
-    """,
-        (
-            sha256,
-            meta.md5,
-            meta.mime_type,
-            meta.size,
-            time_added,
-            meta.width,
-            meta.height,
-            meta.duration,
-            meta.audio_tracks,
-            meta.video_tracks,
-            meta.subtitle_tracks,
-        ),
-    )
-
-    # We need to check if the item was inserted
-    item_inserted = item_insert_result.rowcount > 0
-
-    # Get the rowid of the inserted item, if it was inserted
-    item_rowid: int | None = cursor.lastrowid if item_inserted else None
-
-    file_updated = False
-    if path_in_db and not file_modified:
-        # Path exists and has not changed, update scan_id and available
+    if not data.new_file_hash:
+        # Path exists and hash has not changed, update scan_id and available
+        # Potentially, the last_modified time has changed, update it
+        # Though this is a weird special case,
+        # given that the hash is the same
         file_update_result = cursor.execute(
             """
         UPDATE files
-        SET scan_id = ?, available = TRUE
+        SET scan_id = ?, available = TRUE, last_modified = ?
         WHERE path = ?
         """,
-            (scan_id, path),
+            (
+                scan_id,
+                data.last_modified,
+                data.path,
+            ),
         )
 
         file_updated = file_update_result.rowcount > 0
+        file_deleted = False
+        file_inserted = False
+        return item_inserted, file_updated, file_deleted, file_inserted
 
-    file_deleted = False
-    file_inserted = False
-    if not path_in_db or file_modified:
-        # If the path already exists, delete the old entry
-        file_delete_result = cursor.execute(
-            "DELETE FROM files WHERE path = ?", (path,)
-        )
-        file_deleted = file_delete_result.rowcount > 0
+    # The file is either new or has a new hash
+    # Files are immutable, therefore,
+    # when their hashes change,
+    # they must be utterly destroyed,
+    # and then reborn from the ashes
+    file_delete_result = cursor.execute(
+        "DELETE FROM files WHERE path = ?", (data.path,)
+    )
+    # If the file was not in the database, it was not deleted
+    file_deleted = file_delete_result.rowcount > 0
 
-        if not item_rowid:
-            # If the item was not inserted, get the rowid from the database
-            item_rowid = cursor.execute(
-                "SELECT id FROM items WHERE sha256 = ?", (sha256,)
-            ).fetchone()[0]
+    filename = os.path.basename(data.path)
+    # Path does not exist or has been modified, insert new
+    file_insert_result = cursor.execute(
+        """
+    INSERT INTO files
+    (sha256, item_id, path, filename, last_modified, scan_id, available)
+    VALUES (?, ?, ?, ?, ?, ?, TRUE)
+    """,
+        (sha256, item_id, data.path, filename, data.last_modified, scan_id),
+    )
+    file_inserted = file_insert_result.rowcount > 0
 
-        filename = os.path.basename(path)
-        # Path does not exist or has been modified, insert new
-        file_insert_result = cursor.execute(
-            """
-        INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available)
-        VALUES (?, ?, ?, ?, ?, ?, TRUE)
-        """,
-            (sha256, item_rowid, path, filename, last_modified, scan_id),
-        )
-        file_inserted = file_insert_result.rowcount > 0
-
+    file_updated = False
     return item_inserted, file_updated, file_deleted, file_inserted
 
 
@@ -116,12 +132,26 @@ def update_file_scan(
     marked_unavailable: int,
     errors: int,
     total_available: int,
+    false_changes: int,
+    metadata_time: float,
+    hashing_time: float,
 ):
     cursor = conn.cursor()
     cursor.execute(
         """
     UPDATE file_scans
-    SET end_time = ?, new_items = ?, unchanged_files = ?, new_files = ?, modified_files = ?, marked_unavailable = ?, errors = ?, total_available = ?
+    SET 
+        end_time = ?,
+        new_items = ?,
+        unchanged_files = ?, 
+        new_files = ?,
+        modified_files = ?,
+        marked_unavailable = ?, 
+        errors = ?,
+        total_available = ?,
+        false_changes = ?,
+        metadata_time = ?,
+        hashing_time = ?
     WHERE id = ?
     """,
         (
@@ -133,6 +163,9 @@ def update_file_scan(
             marked_unavailable,
             errors,
             total_available,
+            false_changes,
+            metadata_time,
+            hashing_time,
             scan_id,
         ),
     )
@@ -215,7 +248,7 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
 
     cursor.execute(
         """
-    SELECT files.*, items.md5, items.size
+    SELECT files.sha256, files.last_modified
     FROM files
     JOIN items ON files.sha256 = items.sha256
     WHERE files.path = ?
@@ -223,17 +256,13 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
         (path,),
     )
 
-    file_record = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if file_record:
-        # Get column names from the cursor description
-        column_names = [desc[0] for desc in cursor.description]
-        # Construct a dictionary using column names and file record
-        file_dict = dict(zip(column_names, file_record))
+    if not row:
+        return None
     else:
-        file_dict = None
-
-    return file_dict
+        sha256, last_modified = row
+        return FileRecord(sha256=sha256, path=path, last_modified=last_modified)
 
 
 def get_existing_file_for_sha256(

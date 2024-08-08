@@ -33,6 +33,9 @@ def create_scan_dataset(samples=[]):
             "New Files",
             "Unchanged Files",
             "Modified Files",
+            "Wrongly Detected Changes",
+            "Metadata Scan Time",
+            "File Hashing Time",
         ],
         components=[
             "number",
@@ -47,6 +50,9 @@ def create_scan_dataset(samples=[]):
             "number",
             "number",
             "number",
+            "number",
+            "textbox",
+            "textbox",
         ],
         scale=1,
     )
@@ -120,6 +126,9 @@ def fetch_scan_history():
             f.new_files,
             f.unchanged_files,
             f.modified_files,
+            f.false_changes,
+            seconds_to_hms(f.metadata_time),
+            seconds_to_hms(f.hashing_time),
         ]
         for f in file_scans
     ]

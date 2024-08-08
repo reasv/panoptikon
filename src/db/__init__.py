@@ -91,6 +91,9 @@ def initialize_database(conn: sqlite3.Connection):
         modified_files INTEGER NOT NULL DEFAULT 0,
         marked_unavailable INTEGER NOT NULL DEFAULT 0,
         errors INTEGER NOT NULL DEFAULT 0,
+        false_changes INTEGER NOT NULL DEFAULT 0,
+        metadata_time REAL DEFAULT 0,
+        hashing_time REAL DEFAULT 0,
         UNIQUE(start_time, path)       -- Unique constraint on time and path
     )
     """

@@ -1,15 +1,14 @@
 import hashlib
 import os
 import sqlite3
-from datetime import datetime
-from typing import List
-
-from click import File
+from datetime import datetime, timedelta, timezone
+from typing import List, Tuple
 
 from src.data_extractors.data_loaders.audio import extract_media_info
 from src.data_extractors.data_loaders.video import video_to_frames
+from src.db import get_item_id
 from src.db.files import get_file_by_path
-from src.types import FileScanData
+from src.types import FileRecord, FileScanData, ItemScanMeta
 from src.utils import get_mime_type, make_video_thumbnails, normalize_path
 
 
@@ -78,106 +77,135 @@ def scan_files(
         excluded_paths=excluded_paths,
         extensions=allowed_extensions,
     ):
-        mime_type = get_mime_type(file_path)
         try:
             last_modified, file_size = get_last_modified_time_and_size(
                 file_path
             )
         except Exception as e:
-            yield None
+            print(f"Error getting last modified time for {file_path}: {e}")
+            yield None, 0.0, 0.0
             continue
 
-        md5: str | None = None
-        sha256: str | None = None
-
-        file_modified = True  # Assume the file has been modified
-
+        # Assume file is new or has changed
+        new_or_new_timestamp = True
         # Check if the file is already in the database
-        if file_data := get_file_by_path(conn, file_path):
+        if file_record := get_file_by_path(conn, file_path):
             # Check if the file has been modified since the last scan
-            if parse_iso_date(file_data["last_modified"]) == int(
-                os.stat(file_path).st_mtime
-            ):
-                # Reuse the existing hash and mime type
-                md5 = file_data["md5"]
-                sha256 = file_data["sha256"]
-                file_modified = False
-            else:
-                # File has been modified since the last scan
-                file_modified = True
+            if last_modified == file_record.last_modified:
+                # File has not been modified
+                new_or_new_timestamp = False
 
-        if sha256 is None or md5 is None or file_modified:
-            print(f"Extracting metadata for {file_path}")
+        if new_or_new_timestamp:
             try:
                 yield extract_file_metadata(
-                    file_path, last_modified, file_size, bool(file_data)
+                    conn, file_path, last_modified, file_size, file_record
                 )
-                # if file_data:
-                #     if file_data["sha256"] == sha256:
-                # print(f"File {file_path} has the same SHA-256 hash as the last scan, despite looking like it has been modified. Previous size: {file_data['size']}, current size: {file_size} bytes. Previous mtime: {file_data['last_modified']}, current mtime: {last_modified}.")
             except Exception as e:
                 print(f"Error extracting metadata for {file_path}: {e}")
-                yield None
+                yield None, 0.0, 0.0
         else:
+            assert file_record is not None
             yield FileScanData(
-                sha256=sha256,
-                md5=md5,
-                mime_type=mime_type,
-                last_modified=last_modified,
-                size=file_size,
-                path=file_path,
-                path_in_db=bool(file_data),
-                modified=False,
-            )
+                sha256=file_record.sha256,
+                last_modified=file_record.last_modified,
+                path=file_record.path,
+                new_file_timestamp=False,
+                new_file_hash=False,
+            ), 0.0, 0.0
 
 
 def extract_file_metadata(
-    file_path: str, last_modified: str, size: int, path_in_db: bool
-) -> FileScanData:
+    conn: sqlite3.Connection,
+    file_path: str,
+    last_modified: str,
+    size: int,
+    file_record: FileRecord | None,
+) -> Tuple[FileScanData, float, float]:
     """
     Extract metadata from a file.
     """
+    hash_start = datetime.now()
     md5, sha256 = calculate_hashes(file_path)
+    hash_time_seconds = (datetime.now() - hash_start).total_seconds()
+    if file_record is not None and file_record.sha256 == sha256:
+        print(
+            f"File has a different timestamp "
+            + f"but the same hash (P: {file_record.last_modified}, "
+            + f"N: {last_modified}): {file_path}"
+        )
+        return (
+            FileScanData(
+                sha256=sha256,
+                last_modified=last_modified,
+                path=file_path,
+                new_file_timestamp=True,
+                new_file_hash=False,
+            ),
+            hash_time_seconds,
+            0.0,
+        )
+    if get_item_id(conn, sha256):
+        print(f"Item already exists: {file_path}")
+        return (
+            FileScanData(
+                sha256=sha256,
+                last_modified=last_modified,
+                path=file_path,
+                new_file_timestamp=True,
+                new_file_hash=True,
+            ),
+            hash_time_seconds,
+            0.0,
+        )
+    print(f"Extracting metadata for {file_path}")
+    meta_start = datetime.now()
     mime_type = get_mime_type(file_path)
-    file_scan_data = FileScanData(
-        sha256=sha256,
+    item_meta = ItemScanMeta(
         md5=md5,
         mime_type=mime_type,
-        last_modified=last_modified,
         size=size,
-        path=file_path,
-        path_in_db=path_in_db,
-        modified=True,
     )
     if mime_type.startswith("image"):
         from PIL import Image
 
         with Image.open(file_path) as img:
             width, height = img.size
-        file_scan_data.width = width
-        file_scan_data.height = height
+        item_meta.width = width
+        item_meta.height = height
     elif mime_type.startswith("video"):
         media_info = extract_media_info(file_path)
         if media_info.video_track:
-            file_scan_data.width = media_info.video_track.width
-            file_scan_data.height = media_info.video_track.height
-            file_scan_data.duration = media_info.video_track.duration
-            file_scan_data.audio_tracks = len(media_info.audio_tracks)
-            file_scan_data.video_tracks = 1
-            file_scan_data.subtitle_tracks = len(media_info.subtitle_tracks)
+            item_meta.width = media_info.video_track.width
+            item_meta.height = media_info.video_track.height
+            item_meta.duration = media_info.video_track.duration
+            item_meta.audio_tracks = len(media_info.audio_tracks)
+            item_meta.video_tracks = 1
+            item_meta.subtitle_tracks = len(media_info.subtitle_tracks)
             frames = video_to_frames(file_path, num_frames=4)
             make_video_thumbnails(frames, sha256, mime_type)
 
     elif mime_type.startswith("audio"):
         media_info = extract_media_info(file_path)
-        file_scan_data.duration = sum(
+        item_meta.duration = sum(
             track.duration for track in media_info.audio_tracks
         )
-        file_scan_data.audio_tracks = len(media_info.audio_tracks)
-        file_scan_data.video_tracks = 0
-        file_scan_data.subtitle_tracks = len(media_info.subtitle_tracks)
+        item_meta.audio_tracks = len(media_info.audio_tracks)
+        item_meta.video_tracks = 0
+        item_meta.subtitle_tracks = len(media_info.subtitle_tracks)
 
-    return file_scan_data
+    meta_time_seconds = (datetime.now() - meta_start).total_seconds()
+    return (
+        FileScanData(
+            sha256=sha256,
+            last_modified=last_modified,
+            path=file_path,
+            new_file_timestamp=True,
+            new_file_hash=True,
+            item_metadata=item_meta,
+        ),
+        hash_time_seconds,
+        meta_time_seconds,
+    )
 
 
 def get_image_extensions():
@@ -257,9 +285,15 @@ def get_last_modified_time_and_size(file_path: str):
     Get the last modified time and the size of the file at the given path.
     """
     stat = get_os_stat(file_path)
-    mtime = stat.st_mtime
     size = stat.st_size
-    return datetime.fromtimestamp(mtime).isoformat(), size
+    mtime_ns = stat.st_mtime_ns
+    # Avoid floating point arithmetic by using integer division
+    timestamp_s = mtime_ns // 1_000_000_000
+    nanoseconds = mtime_ns % 1_000_000_000
+    dt = datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+    # Format the datetime to ISO 8601 string without microseconds
+    iso_format = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    return iso_format, size
 
 
 def get_file_size(file_path: str):

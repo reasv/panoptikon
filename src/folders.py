@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -29,7 +30,8 @@ def execute_folder_scan(
     conn: sqlite3.Connection, included_folders: None | List[str] = None
 ) -> list[int]:
     """
-    Execute a scan of the files in the given `included_folders`, or all folders marked as `included` within the db, and update the database with the results.
+    Execute a scan of the files in the given `included_folders`,
+    or all folders marked as `included` within the db, and update the database with the results.
     Marks files that were not found in the scan but are present in the db as `unavailable`.
     Will never scan folders not marked as `included` in the database.
     """
@@ -60,16 +62,25 @@ def execute_folder_scan(
     print(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
-        new_items, unchanged_files, new_files, modified_files, errors = (
+        (
+            new_items,
+            unchanged_files,
+            new_files,
+            modified_files,
+            errors,
+            false_mod_timestamps,
+        ) = (
+            0,
             0,
             0,
             0,
             0,
             0,
         )
+        time_hashing, time_metadata = 0.0, 0.0
         scan_id = add_file_scan(conn, scan_time, folder)
         scan_ids.append(scan_id)
-        for file_data in scan_files(
+        for file_data, hash_time, metadata_time in scan_files(
             conn,
             starting_points=[folder],
             excluded_paths=excluded_folders,
@@ -79,13 +90,22 @@ def execute_folder_scan(
             include_html=system_config.scan_html,
             include_pdf=system_config.scan_pdf,
         ):
+            time_hashing += hash_time
+            time_metadata += metadata_time
             if file_data is None:
                 errors += 1
                 continue
+            if (
+                file_data.new_file_timestamp == True
+                and file_data.new_file_hash == False
+            ):
+                # File timestamp changed but hash is the same
+                false_mod_timestamps += 1
+
             # Update the file data in the database
             (item_inserted, file_updated, file_deleted, file_inserted) = (
                 update_file_data(
-                    conn, time_added=scan_time, scan_id=scan_id, meta=file_data
+                    conn, time_added=scan_time, scan_id=scan_id, data=file_data
                 )
             )
             if item_inserted:
@@ -119,6 +139,9 @@ def execute_folder_scan(
             marked_unavailable=marked_unavailable,
             errors=errors,
             total_available=total_available,
+            false_changes=false_mod_timestamps,
+            metadata_time=time_metadata,
+            hashing_time=time_hashing,
         )
 
     return scan_ids
@@ -204,17 +227,15 @@ def update_folder_lists(
     )
 
 
-def rescan_all_folders(
-    conn: sqlite3.Connection, delete_unavailable: bool = True
-):
+def rescan_all_folders(conn: sqlite3.Connection):
     """
     Rescan all included folders in the database and update the database with the results.
     Executes the related cleanup operations.
 
     """
     scan_ids = execute_folder_scan(conn)
-
-    if delete_unavailable:
+    system_config = retrieve_system_config(conn)
+    if system_config.remove_unavailable_files:
         unavailable_files_deleted = delete_unavailable_files(conn)
         orphan_items_deleted = delete_items_without_files(conn)
     else:

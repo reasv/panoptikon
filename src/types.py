@@ -1,23 +1,29 @@
 from dataclasses import dataclass, field
+from re import I
 from typing import List, Literal, Tuple, Union
 
 
 @dataclass
-class FileScanData:
-    sha256: str
+class ItemScanMeta:
     md5: str
     mime_type: str
-    last_modified: str
     size: int
-    path: str
-    path_in_db: bool
-    modified: bool
     width: int | None = None
     height: int | None = None
     duration: float | None = None
     audio_tracks: int | None = None
     video_tracks: int | None = None
     subtitle_tracks: int | None = None
+
+
+@dataclass
+class FileScanData:
+    sha256: str
+    last_modified: str
+    path: str
+    new_file_timestamp: bool
+    new_file_hash: bool
+    item_metadata: ItemScanMeta | None = None
 
 
 @dataclass
@@ -62,6 +68,9 @@ class FileScanRecord:
     modified_files: int
     marked_unavailable: int
     errors: int
+    false_changes: int
+    metadata_time: float
+    hashing_time: float
 
 
 @dataclass
