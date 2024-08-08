@@ -60,12 +60,11 @@ def scan_files(
     include_audio=False,
     include_html=False,
     include_pdf=False,
-    allowed_extensions: List[str] = [],
 ):
     """
     Scan files in the given starting points and their entire directory trees, excluding the given excluded paths, and including images, video, and/or audio files.
     """
-    allowed_extensions.extend(
+    extensions = (
         include_images * get_image_extensions()
         + include_video * get_video_extensions()
         + include_audio * get_audio_extensions()
@@ -75,7 +74,7 @@ def scan_files(
     for file_path in get_files_by_extension(
         starting_points=starting_points,
         excluded_paths=excluded_paths,
-        extensions=allowed_extensions,
+        extensions=extensions,
     ):
         try:
             last_modified, file_size = get_last_modified_time_and_size(
