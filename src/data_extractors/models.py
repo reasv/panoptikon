@@ -428,7 +428,11 @@ class TextEmbeddingModel(ModelOpts):
     @classmethod
     def _available_models_mapping(cls) -> Dict[str, str]:
 
-        SENTENCE_TRANSFORMERS = ["all-mpnet-base-v2", "all-MiniLM-L6-v2"]
+        SENTENCE_TRANSFORMERS = [
+            "all-mpnet-base-v2",
+            "all-MiniLM-L6-v2",
+            "dunzhang/stella_en_400M_v5",
+        ]
         return {model_name: model_name for model_name in SENTENCE_TRANSFORMERS}
 
     @classmethod
