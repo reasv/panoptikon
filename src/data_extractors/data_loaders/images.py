@@ -2,11 +2,10 @@ import os
 from typing import List
 
 import numpy as np
-from doctr.io.html import read_html
-from doctr.io.pdf import read_pdf
 from PIL import Image as PILImage
 from PIL import ImageSequence
 
+from src.data_extractors.data_loaders.pdf import read_pdf
 from src.data_extractors.data_loaders.video import video_to_frames
 from src.types import ItemWithPath
 from src.utils import pil_ensure_rgb
@@ -46,8 +45,14 @@ def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
         frames = video_to_frames(item.path, num_frames=4)
         return [np.array(pil_ensure_rgb(frame)) for frame in frames]
     if item.type.startswith("application/pdf"):
+        from doctr.io.html import read_html
+        from doctr.io.pdf import read_pdf
+
         return read_pdf(item.path)
     if item.type.startswith("text/html"):
+        from doctr.io.html import read_html
+        from doctr.io.pdf import read_pdf
+
         return read_pdf(read_html(item.path))
     return []
 
@@ -63,6 +68,8 @@ def item_image_loader_pillow(item: ItemWithPath) -> List[PILImage.Image]:
     if item.type.startswith("application/pdf"):
         return [PILImage.fromarray(page) for page in read_pdf(item.path)]
     if item.type.startswith("text/html"):
+        from doctr.io.html import read_html
+
         return [
             PILImage.fromarray(page) for page in read_pdf(read_html(item.path))
         ]
@@ -70,10 +77,13 @@ def item_image_loader_pillow(item: ItemWithPath) -> List[PILImage.Image]:
 
 
 def get_pdf_image(file_path: str) -> PILImage.Image:
+
     return PILImage.fromarray(read_pdf(file_path)[0])
 
 
 def get_html_image(file_path: str) -> PILImage.Image:
+    from doctr.io.html import read_html
+
     return PILImage.fromarray(read_pdf(read_html(file_path))[0])
 
 
@@ -81,7 +91,7 @@ def generate_thumbnail(
     image_path,
     thumbnail_path,
     max_dimensions=(4096, 4096),
-    max_file_size=20 * 1024 * 1024,
+    max_file_size=24 * 1024 * 1024,
 ):
     """
     Generates a thumbnail for an overly large image.
