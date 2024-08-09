@@ -21,9 +21,7 @@ def get_database_connection(
     os.makedirs(user_data_db_dir, exist_ok=True)
     os.makedirs(storage_db_dir, exist_ok=True)
 
-    index = os.getenv("INDEX_DB", "default")
-    user_data = os.getenv("USER_DATA_DB", "default")
-    storage = os.getenv("STORAGE_DB", "default")
+    index, user_data, storage = get_db_names()
 
     db_file = os.path.join(index_db_dir, f"{index}.db")
     user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
@@ -66,6 +64,13 @@ def get_database_connection(
     cursor.execute("PRAGMA foreign_keys = ON")
     load_sqlite_vec(conn)
     return conn
+
+
+def get_db_names():
+    index = os.getenv("INDEX_DB", "default")
+    user_data = os.getenv("USER_DATA_DB", "default")
+    storage = os.getenv("STORAGE_DB", index)  # Default to same name as index
+    return index, user_data, storage
 
 
 def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
