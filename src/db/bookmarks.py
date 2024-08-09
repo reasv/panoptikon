@@ -83,7 +83,9 @@ def get_bookmark_metadata(
         """
     SELECT metadata
     FROM user_data.bookmarks
-    WHERE sha256 = ? AND namespace = ?, user = ?
+    WHERE sha256 = ?
+    AND namespace = ?
+    AND user = ?
     """,
         (sha256, namespace, user),
     )

@@ -30,6 +30,7 @@ def get_database_connection(
     if write_lock and not readonly_mode:
         write_lock = True
         # Acquire a write lock
+        logger.debug(f"Opening index database in write mode")
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
         # Enable Write-Ahead Logging (WAL) mode
@@ -37,18 +38,22 @@ def get_database_connection(
     else:
         write_lock = False
         # Read-only connection
+        logger.debug(f"Opening index database in read-only mode")
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
 
     # Attach user data database
     if user_data_wl and not readonly_mode:
+        logger.debug(f"Opening user data database in write mode")
         conn.execute(f"ATTACH DATABASE '{user_db_file}' AS user_data")
         # Enable Write-Ahead Logging (WAL) mode
         cursor = conn.cursor()
         cursor.execute("PRAGMA user_data.journal_mode=WAL")
-    else:
+    elif not write_lock:
+        logger.debug(f"Opening user data database in read-only mode")
         conn.execute(
             f"ATTACH DATABASE 'file:{user_db_file}?mode=ro' AS user_data"
         )
+        # unable to open database: file:data/user_data/default.db?mode=ro
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")

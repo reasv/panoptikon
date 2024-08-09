@@ -185,7 +185,7 @@ def update_folder_lists(
     Any files under the `excluded_folders` will be DELETED.
     Any files not under the `included_folders` will be DELETED.
     Any orphaned items without files will be DELETED.
-    Bookmarks on orhpaned items will be DELETED.
+    Bookmarks on orphaned items will be DELETED.
     """
     new_included_folders = [
         normalize_path(p) for p in included_folders if len(p.strip()) > 0
