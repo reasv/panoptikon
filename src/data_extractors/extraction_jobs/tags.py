@@ -146,6 +146,9 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     tag_predictor = Predictor(model_repo=model.model_repo())
     tag_predictor.load_model()
 
+    def load_images(item: ItemWithPath):
+        return item_image_loader_pillow(conn, item)
+
     def batch_inference_func(batch_images: Sequence[PIL.Image.Image]):
         return tag_predictor.predict(
             batch_images, general_thresh=score_threshold, character_thresh=None
@@ -166,7 +169,7 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
     return run_extraction_job(
         conn,
         model,
-        item_image_loader_pillow,
+        load_images,
         batch_inference_func,
         handle_result,
     )

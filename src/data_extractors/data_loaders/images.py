@@ -1,4 +1,6 @@
+import logging
 import os
+import sqlite3
 from typing import List
 
 import numpy as np
@@ -7,8 +9,11 @@ from PIL import ImageSequence
 
 from src.data_extractors.data_loaders.pdf import read_pdf
 from src.data_extractors.data_loaders.video import video_to_frames
+from src.db.storage import get_frames, store_frames
 from src.types import ItemWithPath
 from src.utils import pil_ensure_rgb
+
+logger = logging.getLogger(__name__)
 
 
 def gif_to_frames(path: str) -> List[PILImage.Image]:
@@ -33,7 +38,9 @@ def gif_to_frames(path: str) -> List[PILImage.Image]:
     return frames
 
 
-def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
+def item_image_loader_numpy(
+    conn: sqlite3.Connection, item: ItemWithPath
+) -> List[np.ndarray]:
     if item.type.startswith("image/gif"):
         return [
             np.array(pil_ensure_rgb(frame))
@@ -42,7 +49,17 @@ def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
     if item.type.startswith("image"):
         return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
     if item.type.startswith("video"):
-        frames = video_to_frames(item.path, num_frames=4)
+        if frames := get_frames(conn, item.sha256):
+            logger.debug(f"Loaded {len(frames)} frames from database")
+        else:
+            frames = video_to_frames(item.path, num_frames=4)
+            store_frames(
+                conn,
+                item.sha256,
+                file_mime_type=item.type,
+                process_version=1,
+                frames=frames,
+            )
         return [np.array(pil_ensure_rgb(frame)) for frame in frames]
     if item.type.startswith("application/pdf"):
         return read_pdf(item.path)
@@ -53,14 +70,26 @@ def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
     return []
 
 
-def item_image_loader_pillow(item: ItemWithPath) -> List[PILImage.Image]:
+def item_image_loader_pillow(
+    conn: sqlite3.Connection, item: ItemWithPath
+) -> List[PILImage.Image]:
     if item.type.startswith("image/gif"):
         return [frame for frame in gif_to_frames(item.path)]
     if item.type.startswith("image"):
         return [PILImage.open(item.path)]
     if item.type.startswith("video"):
-        frames = video_to_frames(item.path, num_frames=4)
-        return frames
+        if frames := get_frames(conn, item.sha256):
+            logger.debug(f"Loaded {len(frames)} frames from database")
+        else:
+            frames = video_to_frames(item.path, num_frames=4)
+            store_frames(
+                conn,
+                item.sha256,
+                file_mime_type=item.type,
+                process_version=1,
+                frames=frames,
+            )
+        return [frame for frame in frames]
     if item.type.startswith("application/pdf"):
         return [PILImage.fromarray(page) for page in read_pdf(item.path)]
     if item.type.startswith("text/html"):

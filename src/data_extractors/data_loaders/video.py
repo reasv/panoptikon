@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 from io import BytesIO
@@ -5,6 +6,8 @@ from typing import List
 
 import PIL.Image
 from PIL.Image import Image
+
+logger = logging.getLogger(__name__)
 
 
 def select_representative_frames(frames, max_frames):
@@ -167,5 +170,6 @@ def video_to_frames(
     """
     if num_frames is None:
         num_frames = 4
+    logger.debug(f"Extracting {num_frames} frames from video at {video_path}")
     keyframes = extract_frames_ffmpeg(video_path, num_frames=num_frames)
     return keyframes

@@ -29,6 +29,9 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
 
     threshold = model_opt.get_group_threshold(conn)
 
+    def load_images(item: ItemWithPath):
+        return item_image_loader_numpy(conn, item)
+
     def process_batch(
         batch: Sequence[np.ndarray],
     ) -> List[Tuple[str, dict[str, str | float | None], List[float]]]:
@@ -102,7 +105,7 @@ def run_ocr_extractor_job(conn: sqlite3.Connection, model_opt: OCRModel):
     return run_extraction_job(
         conn,
         model_opt,
-        item_image_loader_numpy,
+        load_images,
         process_batch,
         handle_item_result,
     )

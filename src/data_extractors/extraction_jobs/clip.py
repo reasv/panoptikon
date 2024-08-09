@@ -22,6 +22,9 @@ def run_image_embedding_extractor_job(
     )
     embedder.load_model()
 
+    def load_images(item: ItemWithPath):
+        return item_image_loader_numpy(conn, item)
+
     def process_batch(batch: Sequence[np.ndarray]):
         return embedder.get_image_embeddings(batch)
 
@@ -41,7 +44,7 @@ def run_image_embedding_extractor_job(
     return run_extraction_job(
         conn,
         model_opt,
-        item_image_loader_numpy,
+        load_images,
         process_batch,
         handle_item_result,
         cleanup,
