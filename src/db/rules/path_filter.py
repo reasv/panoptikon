@@ -19,7 +19,7 @@ def build_path_filter_cte(filter: PathFilter, filter_on: str | None, name: str):
         SELECT items.id
         FROM items
         {prev_cte_join_clause}
-        JOIN files ON items.id = files.id
+        JOIN files ON items.id = files.item_id
         WHERE {or_conditions}
         GROUP BY items.id
     )
@@ -49,7 +49,7 @@ def build_not_in_path_filter_cte(
         SELECT items.id
         FROM items
         {prev_cte_join_clause}
-        JOIN files ON items.id = files.id
+        JOIN files ON items.id = files.item_id
         WHERE {and_conditions}
         GROUP BY items.id
     )
