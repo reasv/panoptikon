@@ -44,10 +44,8 @@ def get_database_connection(
     else:
         write_lock = False
         # Read-only connection
-        logger.debug(f"Opening index database in read-only mode")
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
         # Attach storage database
-        logger.debug(f"Attaching storage database in read-only mode")
         conn.execute(
             f"ATTACH DATABASE 'file:{storage_db_file}?mode=ro' AS storage"
         )
@@ -60,11 +58,9 @@ def get_database_connection(
         cursor = conn.cursor()
         cursor.execute("PRAGMA user_data.journal_mode=WAL")
     elif not write_lock:
-        logger.debug(f"Opening user data database in read-only mode")
         conn.execute(
             f"ATTACH DATABASE 'file:{user_db_file}?mode=ro' AS user_data"
         )
-        # unable to open database: file:data/user_data/default.db?mode=ro
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
@@ -552,11 +548,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("model_group_settings", ["batch_size"]),
         ("model_group_settings", ["threshold"]),
         ("storage.thumbnails", ["item_sha256"]),
-        ("storage.thumbnails", ["index"]),
+        ("storage.thumbnails", ["idx"]),
         ("storage.frames", ["item_sha256"]),
-        ("storage.frames", ["index"]),
-        ("storage.thumbnails", ["file_mime_type"]),
-        ("storage.frames", ["file_mime_type"]),
+        ("storage.frames", ["idx"]),
+        ("storage.thumbnails", ["item_mime_type"]),
+        ("storage.frames", ["item_mime_type"]),
         ("storage.thumbnails", ["width"]),
         ("storage.thumbnails", ["height"]),
         ("storage.frames", ["width"]),
