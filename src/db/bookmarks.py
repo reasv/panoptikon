@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -9,31 +10,29 @@ from src.types import FileSearchResult
 
 def update_bookmarks(
     conn: sqlite3.Connection,
-    items_sha256: List[str],
+    items: List[Tuple[str, dict | None]],  # List of (sha256, metadata)
     namespace: str = "default",
+    user: str = "user",
 ):
     cursor = conn.cursor()
     # Add all items as bookmarks, if they don't already exist, in a single query
     cursor.executemany(
         """
-    INSERT INTO bookmarks (namespace, sha256, time_added)
-    VALUES (?, ?, ?)
-    ON CONFLICT(namespace, sha256) DO NOTHING
+    INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user, namespace, sha256)
+    DO UPDATE SET metadata = excluded.metadata
     """,
         [
-            (namespace, sha256, datetime.now().isoformat())
-            for sha256 in items_sha256
+            (
+                user,
+                namespace,
+                sha256,
+                datetime.now().isoformat(),
+                json.dumps(metadata) if metadata else None,
+            )
+            for sha256, metadata in items
         ],
-    )
-
-    # Remove all items that are not in the list
-    cursor.execute(
-        """
-    DELETE FROM bookmarks
-    WHERE sha256 NOT IN ({}) AND namespace = ?
-    """.format(
-            ",".join(["?"] * len(items_sha256)), items_sha256, namespace
-        )
     )
 
 
@@ -41,81 +40,103 @@ def add_bookmark(
     conn: sqlite3.Connection,
     sha256: str,
     namespace: str = "default",
-    metadata: str | None = None,
+    user: str = "user",
+    metadata: dict | None = None,
 ):
+    metadata_str = json.dumps(metadata) if metadata else None
     cursor = conn.cursor()
     cursor.execute(
         """
-    INSERT INTO bookmarks (namespace, sha256, time_added, metadata)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(namespace, sha256) DO NOTHING
+    INSERT INTO user_data.bookmarks
+        (user, namespace, sha256, time_added, metadata)
+        VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(user, namespace, sha256) DO NOTHING
     """,
-        (namespace, sha256, datetime.now().isoformat(), metadata),
+        (user, namespace, sha256, datetime.now().isoformat(), metadata_str),
     )
 
 
 def remove_bookmark(
-    conn: sqlite3.Connection, sha256: str, namespace: str = "default"
+    conn: sqlite3.Connection,
+    sha256: str,
+    namespace: str = "default",
+    user: str = "user",
 ):
     cursor = conn.cursor()
     cursor.execute(
         """
-    DELETE FROM bookmarks
-    WHERE sha256 = ? AND namespace = ?
+    DELETE FROM user_data.bookmarks
+    WHERE sha256 = ? AND namespace = ? AND user = ?
     """,
-        (sha256, namespace),
+        (sha256, namespace, user),
     )
 
 
 def get_bookmark_metadata(
-    conn: sqlite3.Connection, sha256: str, namespace: str = "default"
-):
+    conn: sqlite3.Connection,
+    sha256: str,
+    namespace: str = "default",
+    user: str = "user",
+) -> Tuple[bool, dict | None]:
     cursor = conn.cursor()
     cursor.execute(
         """
     SELECT metadata
-    FROM bookmarks
-    WHERE sha256 = ? AND namespace = ?
+    FROM user_data.bookmarks
+    WHERE sha256 = ? AND namespace = ?, user = ?
     """,
-        (sha256, namespace),
+        (sha256, namespace, user),
     )
-    metadata = cursor.fetchone()
+    result = cursor.fetchone()
+    if not result:
+        return False, None
 
-    return (True, metadata[0]) if metadata else (False, None)
+    metadata: dict | None = json.loads(result[0]) if result[0] else None
+
+    return (True, metadata)
 
 
 def delete_bookmarks_exclude_last_n(
-    conn: sqlite3.Connection, n: int, namespace: str = "default"
+    conn: sqlite3.Connection,
+    n: int,
+    namespace: str = "default",
+    user: str = "user",
 ):
     cursor = conn.cursor()
     # Delete all bookmarks except the last n based on time_added
     cursor.execute(
         """
-        DELETE FROM bookmarks
+        DELETE FROM user_data.bookmarks
         WHERE namespace = ?
+        AND user = ?
         AND sha256 NOT IN (
             SELECT sha256
-            FROM bookmarks
+            FROM user_data.bookmarks
             WHERE namespace = ?
+            AND user = ?
             ORDER BY time_added DESC
             LIMIT ?
         )
     """,
-        (namespace, namespace, n),
+        (namespace, user, namespace, user, n),
     )
 
-    conn.commit()
 
-
-def get_all_bookmark_namespaces(conn: sqlite3.Connection) -> List[str]:
+def get_all_bookmark_namespaces(
+    conn: sqlite3.Connection, user: str = "user", include_wildcard: bool = False
+) -> List[str]:
     cursor = conn.cursor()
+    wildcard_user = "OR user = '*'" if include_wildcard else ""
     # Get all bookmark namespaces, order by namespace name
     cursor.execute(
-        """
+        f"""
         SELECT DISTINCT namespace
-        FROM bookmarks
+        FROM user_data.bookmarks
+        WHERE user = ?
+        {wildcard_user}
         ORDER BY namespace
-    """
+        """,
+        (user,),
     )
     namespaces = cursor.fetchall()
     return [namespace[0] for namespace in namespaces]
@@ -124,27 +145,31 @@ def get_all_bookmark_namespaces(conn: sqlite3.Connection) -> List[str]:
 def get_bookmarks(
     conn: sqlite3.Connection,
     namespace: str = "default",
-    page_size=1000,
-    page=1,
-    order_by="time_added",
-    order=None,
+    user: str = "user",
+    page_size: int = 1000,
+    page: int = 1,
+    order_by: str = "time_added",
+    order: str | None = None,
+    include_wildcard: bool = False,
 ) -> Tuple[List[FileSearchResult], int]:
 
     if page_size < 1:
         page_size = 1000000
     offset = (page - 1) * page_size
-
+    wildcard_user = "OR user = '*'" if include_wildcard else ""
     # Fetch bookmarks with their paths, prioritizing available files
     cursor = conn.cursor()
     cursor.execute(
-        """
-        SELECT COUNT(DISTINCT bookmarks.sha256)
-        FROM bookmarks
+        f"""
+        SELECT
+            COUNT(DISTINCT user_data.bookmarks.sha256)
+        FROM user_data.bookmarks
         JOIN files
-        ON bookmarks.sha256 = files.sha256
-        WHERE bookmarks.namespace = ?
+        ON user_data.bookmarks.sha256 = files.sha256
+        WHERE user_data.bookmarks.namespace = ?
+        AND (user_data.bookmarks.user = ? {wildcard_user})
     """,
-        (namespace,),
+        (namespace, user),
     )
     total_results = cursor.fetchone()[0]
     # Can order by time_added, path, or last_modified
@@ -158,7 +183,7 @@ def get_bookmarks(
         if order == None:
             order = "desc"
     else:
-        order_by_clause = "bookmarks.time_added"
+        order_by_clause = "user_data.bookmarks.time_added"
         if order == None:
             order = "desc"
 
@@ -166,24 +191,31 @@ def get_bookmarks(
     cursor.execute(
         f"""
         SELECT 
-        COALESCE(available_files.path, any_files.path) as path,
-        bookmarks.sha256,
-        COALESCE(MAX(available_files.last_modified), MAX(any_files.last_modified)) as last_modified,
-        items.type
-        FROM bookmarks
+            COALESCE(
+                available_files.path,
+                any_files.path
+            ) as path,
+            user_data.bookmarks.sha256,
+            COALESCE(
+                MAX(available_files.last_modified),
+                MAX(any_files.last_modified)
+            ) as last_modified,
+            items.type
+        FROM user_data.bookmarks
         LEFT JOIN files AS available_files 
-               ON bookmarks.sha256 = available_files.sha256 
+               ON user_data.bookmarks.sha256 = available_files.sha256 
                AND available_files.available = 1
         JOIN files AS any_files 
-               ON bookmarks.sha256 = any_files.sha256
+               ON user_data.bookmarks.sha256 = any_files.sha256
         JOIN items ON any_files.item_id = items.id
-        WHERE bookmarks.namespace = ?
-        GROUP BY bookmarks.sha256
+        WHERE user_data.bookmarks.namespace = ?
+        AND (user_data.bookmarks.user = ? {wildcard_user})
+        GROUP BY user_data.bookmarks.sha256
         ORDER BY {order_by_clause}
         {order_clause}
         LIMIT ? OFFSET ?
     """,
-        (namespace, page_size, offset),
+        (namespace, user, page_size, offset),
     )
 
     bookmarks: List[FileSearchResult] = []

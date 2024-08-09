@@ -28,7 +28,7 @@ def toggle_bookmark(
     if len(selected_files) == 0:
         return gr.update(value="Bookmark")
     selected_image_sha256 = selected_files[0].sha256
-    conn = get_database_connection(write_lock=True)
+    conn = get_database_connection(write_lock=False, user_data_wl=True)
     if button_name == "Bookmark":
         add_bookmark(
             conn, namespace=bookmarks_namespace, sha256=selected_image_sha256
@@ -90,7 +90,7 @@ def get_all_bookmarks_in_folder(
 
 
 def delete_bookmarks_except_last_n(bookmarks_namespace: str, keep_last_n: int):
-    conn = get_database_connection(write_lock=True)
+    conn = get_database_connection(write_lock=False, user_data_wl=True)
     delete_bookmarks_exclude_last_n(
         conn, namespace=bookmarks_namespace, n=keep_last_n
     )

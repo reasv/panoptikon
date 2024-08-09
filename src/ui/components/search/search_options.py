@@ -89,7 +89,9 @@ def create_search_options(app: gr.Blocks, search_tab: gr.Tab):
 def on_tab_load():
     conn = get_database_connection(write_lock=False)
     setters = get_existing_setters(conn)
-    bookmark_namespaces = get_all_bookmark_namespaces(conn)
+    bookmark_namespaces = get_all_bookmark_namespaces(
+        conn, include_wildcard=True
+    )
     file_types = get_all_mime_types(conn)
     tag_namespaces = get_all_tag_namespaces(conn)
     folders = get_folders_from_database(conn)

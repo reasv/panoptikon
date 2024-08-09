@@ -1,33 +1,57 @@
+import logging
 import os
 import sqlite3
 
 import sqlite_vec
 
-from src.db.utils import is_column_in_table, trigger_exists
+from src.db.utils import trigger_exists
+
+logger = logging.getLogger(__name__)
 
 
-def get_database_connection(write_lock: bool) -> sqlite3.Connection:
-    db_file = os.getenv("DB_FILE", "./db/sqlite.db")
+def get_database_connection(
+    write_lock: bool, user_data_wl: bool = False
+) -> sqlite3.Connection:
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    index_db_dir = os.path.join(data_dir, "index")
+    user_data_db_dir = os.path.join(data_dir, "user_data")
     # Ensure the directory exists
-    os.makedirs(os.path.dirname(db_file), exist_ok=True)
-    if write_lock and os.environ.get("READONLY", "false").lower() in [
-        "false",
-        "0",
-    ]:
+    os.makedirs(index_db_dir, exist_ok=True)
+    os.makedirs(user_data_db_dir, exist_ok=True)
+
+    index = os.getenv("INDEX_DB", "default")
+    user_data = os.getenv("USER_DATA_DB", "default")
+
+    db_file = os.path.join(index_db_dir, f"{index}.db")
+    user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
+
+    readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
+    # Attach index database
+    if write_lock and not readonly_mode:
         write_lock = True
         # Acquire a write lock
         conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        # Enable Write-Ahead Logging (WAL) mode
+        cursor.execute("PRAGMA journal_mode=WAL")
     else:
         write_lock = False
         # Read-only connection
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
 
+    # Attach user data database
+    if user_data_wl and not readonly_mode:
+        conn.execute(f"ATTACH DATABASE '{user_db_file}' AS user_data")
+        # Enable Write-Ahead Logging (WAL) mode
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA user_data.journal_mode=WAL")
+    else:
+        conn.execute(
+            f"ATTACH DATABASE 'file:{user_db_file}?mode=ro' AS user_data"
+        )
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
-    # Enable WAL mode
-    if write_lock:
-        cursor.execute("PRAGMA journal_mode=WAL")
     load_sqlite_vec(conn)
     return conn
 
@@ -176,13 +200,13 @@ def initialize_database(conn: sqlite3.Connection):
 
     cursor.execute(
         """
-    CREATE TABLE IF NOT EXISTS bookmarks (
+    CREATE TABLE IF NOT EXISTS user_data.bookmarks (
+        user TEXT NOT NULL, -- User who created the bookmark
         namespace TEXT NOT NULL, -- Namespace for the bookmark
         sha256 TEXT NOT NULL, -- SHA256 of the item
         time_added TEXT NOT NULL, -- Using TEXT to store ISO-8601 formatted datetime
         metadata TEXT, -- JSON string to store additional metadata
-        FOREIGN KEY(sha256) REFERENCES items(sha256) ON DELETE CASCADE,
-        PRIMARY KEY(namespace, sha256)
+        PRIMARY KEY(user, namespace, sha256)
     )
     """
     )
@@ -418,6 +442,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("files", ["path"]),
         ("files", ["scan_id"]),
         ("files", ["filename"]),
+        ("files", ["item_id"]),
         ("file_scans", ["start_time"]),
         ("file_scans", ["end_time"]),
         ("file_scans", ["path"]),
@@ -431,10 +456,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("folders", ["time_added"]),
         ("folders", ["path"]),
         ("folders", ["included"]),
-        ("bookmarks", ["time_added"]),
-        ("bookmarks", ["sha256"]),
-        ("bookmarks", ["metadata"]),
-        ("bookmarks", ["namespace"]),
+        ("user_data.bookmarks", ["time_added"]),
+        ("user_data.bookmarks", ["sha256"]),
+        ("user_data.bookmarks", ["metadata"]),
+        ("user_data.bookmarks", ["namespace"]),
+        ("user_data.bookmarks", ["user"]),
         ("items_extractions", ["item_id"]),
         ("items_extractions", ["log_id"]),
         ("items_extractions", ["setter_id"]),
@@ -477,19 +503,21 @@ def initialize_database(conn: sqlite3.Connection):
     ]
 
     for table, columns in indices:
-        columns_str = ", ".join(columns)
-        index_name = f"idx_{table}_{'_'.join(columns)}"
-        cursor.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS
-            {index_name} ON {table}({columns_str})
-            """
-        )
+        if "." in table:
+            database, table = table.split(".")
+            index_name = f"{database}.idx_{table}_{'_'.join(columns)}"
+        else:
+            index_name = f"idx_{table}_{'_'.join(columns)}"
 
-    if is_column_in_table(conn, "files", "item_id"):
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_item ON files(item_id)"
-        )
+        sql = f"""
+            CREATE INDEX IF NOT EXISTS
+            {index_name} ON {table}({', '.join(columns)})
+            """
+        try:
+            cursor.execute(sql)
+        except sqlite3.OperationalError as e:
+            logger.error(sql)
+            raise e
 
 
 def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
