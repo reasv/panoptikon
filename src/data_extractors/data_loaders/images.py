@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import numpy as np
@@ -66,3 +67,54 @@ def item_image_loader_pillow(item: ItemWithPath) -> List[PILImage.Image]:
             PILImage.fromarray(page) for page in read_pdf(read_html(item.path))
         ]
     return []
+
+
+def get_pdf_image(file_path: str) -> PILImage.Image:
+    return PILImage.fromarray(read_pdf(file_path)[0])
+
+
+def get_html_image(file_path: str) -> PILImage.Image:
+    return PILImage.fromarray(read_pdf(read_html(file_path))[0])
+
+
+def generate_thumbnail(
+    image_path,
+    thumbnail_path,
+    max_dimensions=(4096, 4096),
+    max_file_size=20 * 1024 * 1024,
+):
+    """
+    Generates a thumbnail for an overly large image.
+
+    Parameters:
+    - image_path (str): Path to the original image.
+    - thumbnail_path (str): Path where the thumbnail will be saved.
+    - max_dimensions (tuple): Maximum width and height for an image to be considered overly large.
+    - max_file_size (int): Maximum file size (in bytes) for an image to be considered overly large.
+
+    Returns:
+    - bool: True if a thumbnail was created, False if the image was not overly large.
+    """
+    really_small_file_size = 5 * 1024 * 1024  # 5 MB
+    # Check if the image is overly large based on file size
+    file_size = os.path.getsize(image_path)
+    if file_size <= really_small_file_size:
+        return False
+
+    with PILImage.open(image_path) as img:
+        # Check if the image is overly large based on dimensions
+        if (
+            img.size[0] <= max_dimensions[0]
+            and img.size[1] <= max_dimensions[1]
+            and file_size <= max_file_size
+        ):
+            return False
+
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        # Generate thumbnail
+        img.thumbnail(max_dimensions, PILImage.Resampling.LANCZOS)
+        img.save(thumbnail_path, "JPEG")
+
+    return True

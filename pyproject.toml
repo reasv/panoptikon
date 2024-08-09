@@ -25,6 +25,7 @@ sqlite-path = "^0.2.1"
 sentence-transformers = "^3.0.1"
 typeguard = "^4.3.0"
 fastapi-utilities = "^0.2.0"
+mutagen = "^1.47.0"
 
 [build-system]
 requires = ["poetry-core"]

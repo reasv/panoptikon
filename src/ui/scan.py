@@ -109,7 +109,7 @@ def rescan_folders():
     vacuum_database(conn)
     conn.close()
     return (
-        f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items."
+        f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items. "
         + f"Files deleted due to rules: {rule_files_deleted}",
         fetch_scan_history(),
         fetch_extraction_logs(),

@@ -5,7 +5,15 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Tuple
 
-from src.data_extractors.data_loaders.audio import extract_media_info
+from src.data_extractors.data_loaders.audio import (
+    extract_media_info,
+    get_audio_thumbnail,
+)
+from src.data_extractors.data_loaders.images import (
+    generate_thumbnail,
+    get_html_image,
+    get_pdf_image,
+)
 from src.data_extractors.data_loaders.video import video_to_frames
 from src.db import get_item_id
 from src.db.files import get_file_by_path
@@ -123,6 +131,7 @@ def scan_files(
                 yield None, 0.0, 0.0
         else:
             assert file_record is not None
+            ensure_thumbnail_exists(file_record.sha256, file_path)
             yield FileScanData(
                 sha256=file_record.sha256,
                 last_modified=file_record.last_modified,
@@ -226,6 +235,7 @@ def extract_file_metadata(
     """
     hash_start = datetime.now()
     md5, sha256 = calculate_hashes(file_path)
+    ensure_thumbnail_exists(sha256, file_path)
     hash_time_seconds = (datetime.now() - hash_start).total_seconds()
     if file_record is not None and file_record.sha256 == sha256:
         logger.warning(
@@ -281,8 +291,6 @@ def extract_file_metadata(
             item_meta.audio_tracks = len(media_info.audio_tracks)
             item_meta.video_tracks = 1
             item_meta.subtitle_tracks = len(media_info.subtitle_tracks)
-            frames = video_to_frames(file_path, num_frames=4)
-            make_video_thumbnails(frames, sha256, mime_type)
 
     elif mime_type.startswith("audio"):
         media_info = extract_media_info(file_path)
@@ -428,3 +436,43 @@ def deduplicate_paths(paths: List[str]):
         ):
             deduplicated_paths.append(path)
     return deduplicated_paths
+
+
+def ensure_thumbnail_exists(sha256: str, file_path: str):
+    """
+    Ensure that a thumbnail exists for the given item.
+    """
+    mime_type = get_mime_type(file_path)
+    thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
+    os.makedirs(thumbnail_dir, exist_ok=True)
+    thumb_file = f"{thumbnail_dir}/{sha256}.jpg"
+    if mime_type.startswith("video"):
+        if os.path.exists(f"{thumbnail_dir}/{sha256}-grid.jpg"):
+            return
+        frames = video_to_frames(file_path, num_frames=4)
+        make_video_thumbnails(frames, sha256, mime_type)
+        logger.debug(f"Generated video thumbnails for {file_path}")
+        return
+    if os.path.exists(thumb_file):
+        return
+    if mime_type.startswith("audio"):
+        get_audio_thumbnail(mime_type, file_path, thumb_file)
+        logger.debug(f"Generated audio placeholder for {file_path}")
+    elif mime_type.startswith("image"):
+        generated = generate_thumbnail(file_path, thumb_file)
+        if generated:
+            logger.debug(f"Generated image thumbnail for {file_path}")
+    elif mime_type.startswith("application/pdf"):
+        try:
+            get_pdf_image(file_path).save(thumb_file)
+            logger.debug(f"Generated PDF thumbnail for {file_path}")
+        except Exception as e:
+            logger.error(f"Error generating PDF thumbnail for {file_path}: {e}")
+    elif mime_type.startswith("text/html"):
+        try:
+            get_html_image(file_path).save(thumb_file)
+            logger.debug(f"Generated HTML thumbnail for {file_path}")
+        except Exception as e:
+            logger.error(
+                f"Error generating HTML thumbnail for {file_path}: {e}"
+            )

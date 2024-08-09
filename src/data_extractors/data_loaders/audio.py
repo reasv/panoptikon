@@ -322,13 +322,15 @@ def create_audio_placeholder(
         b = int(start_color[2] + (end_color[2] - start_color[2]) * (i / height))
         ImageDraw.Draw(image).line([(0, i), (width, i)], fill=(r, g, b))
 
-    # Load a font for the musical note and MIME type
+    # Load fonts for the musical note, MIME type, and other text
     try:
         font_large = ImageFont.truetype("arial.ttf", 400)
         font_small = ImageFont.truetype("arial.ttf", 50)
+        font_medium = ImageFont.truetype("arial.ttf", 60)
     except IOError:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
+        font_medium = ImageFont.load_default()
 
     # Draw the musical note (text representation)
     draw = ImageDraw.Draw(image)
@@ -339,7 +341,7 @@ def create_audio_placeholder(
         text_bbox[3] - text_bbox[1],
     )
 
-    # Randomized position with a small offset
+    # Randomized position with a small offset for the musical note
     offset_x = random.randint(-50, 50)
     offset_y = random.randint(-50, 50)
     position = (
@@ -352,6 +354,11 @@ def create_audio_placeholder(
     # Draw the MIME type in the lower left corner
     mime_position = (10, height - 60)
     draw.text(mime_position, mime_type, font=font_small, fill=(255, 255, 255))
+
+    # Draw the artist, album, and title at the top of the image
+    draw.text((10, 10), f"{artist}", font=font_medium, fill=(255, 255, 255))
+    draw.text((10, 80), f"{album}", font=font_medium, fill=(255, 255, 255))
+    draw.text((10, 150), f"{title}", font=font_medium, fill=(255, 255, 255))
 
     image.save(file_name)
 

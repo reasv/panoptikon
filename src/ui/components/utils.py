@@ -108,13 +108,15 @@ def delete_bookmark(bookmarks_namespace: str, sha256: str):
 def get_thumbnail(file: FileSearchResult | None, big: bool = True):
     if file is None:
         return None
+    thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
     if file.type and file.type.startswith("video"):
         # Get thumbnails directory from environment variable
-        thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
         return (
             f"{thumbnail_dir}/{file.sha256}-grid.jpg"
             if big
             else f"{thumbnail_dir}/{file.sha256}-0.jpg"
         )
     else:
+        if os.path.exists(f"{thumbnail_dir}/{file.sha256}.jpg"):
+            return f"{thumbnail_dir}/{file.sha256}.jpg"
         return file.path
