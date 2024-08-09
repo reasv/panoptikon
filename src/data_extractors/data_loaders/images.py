@@ -45,13 +45,9 @@ def item_image_loader_numpy(item: ItemWithPath) -> List[np.ndarray]:
         frames = video_to_frames(item.path, num_frames=4)
         return [np.array(pil_ensure_rgb(frame)) for frame in frames]
     if item.type.startswith("application/pdf"):
-        from doctr.io.html import read_html
-        from doctr.io.pdf import read_pdf
-
         return read_pdf(item.path)
     if item.type.startswith("text/html"):
         from doctr.io.html import read_html
-        from doctr.io.pdf import read_pdf
 
         return read_pdf(read_html(item.path))
     return []
