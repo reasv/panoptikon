@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import List, Tuple
 
@@ -452,6 +453,7 @@ def ensure_thumbnail_exists(
     """
     Ensure that a thumbnail exists for the given item.
     """
+    start_time = time.time()
     thumbnail_process_version = 1
     frame_version = 1
     if has_thumbnail(conn, sha256, thumbnail_process_version):
@@ -488,12 +490,17 @@ def ensure_thumbnail_exists(
             f"No thumbnail generation for type {mime_type}: {file_path}"
         )
         return
+    generation_time = round(time.time() - start_time, 2)
     if thumbs:
-        logger.debug(f"Generated image thumbnail for {file_path}")
+        store_start = time.time()
         store_thumbnails(
             conn,
             sha256,
             mime_type,
             thumbnail_process_version,
             thumbs,
+        )
+        store_time = round(time.time() - store_start, 2)
+        logger.debug(
+            f"Generated image thumbnail (Gen: {generation_time} DB: {store_time}) for {file_path}"
         )

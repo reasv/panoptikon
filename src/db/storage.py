@@ -1,6 +1,7 @@
 import io
 import logging
 import sqlite3
+import time
 from typing import Sequence
 
 import PIL.Image as PILImage
@@ -46,8 +47,8 @@ def store_thumbnails(
 
 def get_thumb_format(item_mime_type: str) -> str:
     # Check if the source file format is lossless
-    if item_mime_type in ["image/png", "image/tiff", "image/bmp"]:
-        return "PNG"
+    # if item_mime_type in ["image/png", "image/tiff", "image/bmp"]:
+    #     return "PNG"
     # Default to JPEG for lossy formats
     return "JPEG"
 
@@ -67,8 +68,13 @@ def convert_image_mode(image: PILImage.Image, format: str) -> PILImage.Image:
 
 def thumbnail_to_bytes(thumbnail: PILImage.Image, format: str = "PNG") -> bytes:
     thumbnail = convert_image_mode(thumbnail, format)
+    start_time = time.time()
     with io.BytesIO() as output:
         thumbnail.save(output, format)  # Save as PNG or any other format
+        size = round(output.tell() / (1024 * 1024), 4)  # Size in MB
+        logger.debug(
+            f"Thumbnail converted to {format} (size {size}) in {time.time() - start_time:.2f} seconds"
+        )
         return output.getvalue()
 
 
