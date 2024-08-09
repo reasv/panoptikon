@@ -4,6 +4,8 @@ import logging.config
 import os
 import sys
 
+from src.db import get_db_names
+
 
 def setup_logging():
     # Wrap sys.stdout to use UTF-8 encoding
@@ -13,7 +15,10 @@ def setup_logging():
     # Read log level from environment variable
     loglevel = os.getenv("LOGLEVEL", "INFO").upper()
     # Get logs folder from environment variable
-    logs_file = os.getenv("LOGS_FILE", "./data/panoptikon.log")
+    index, _, _ = get_db_names()
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    default_logs_file = os.path.join(data_dir, "logs", f"{index}.log")
+    logs_file = os.getenv("LOGS_FILE", default_logs_file)
     # Ensure the directory for the log file exists
     logs_folder = os.path.dirname(logs_file)
     os.makedirs(logs_folder, exist_ok=True)
