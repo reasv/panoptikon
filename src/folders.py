@@ -23,6 +23,7 @@ from src.db.folders import (
     delete_folders_not_in_list,
     get_folders_from_database,
 )
+from src.db.storage import delete_orphaned_frames, delete_orphaned_thumbnails
 from src.files import deduplicate_paths, ensure_thumbnail_exists, scan_files
 from src.utils import normalize_path
 
@@ -100,7 +101,7 @@ def execute_folder_scan(
                 continue
             thumbgen_start = time.time()
             try:
-                ensure_thumbnail_exists(file_data.sha256, file_data.path)
+                ensure_thumbnail_exists(conn, file_data.sha256, file_data.path)
             except Exception as e:
                 logger.error(
                     f"Error generating thumbnail for {file_data.path}: {e}"
@@ -227,6 +228,8 @@ def update_folder_lists(
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     rule_files_deleted = delete_files_not_allowed(conn)
     orphan_items_deleted = delete_items_without_files(conn)
+    delete_orphaned_frames(conn)
+    delete_orphaned_thumbnails(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,

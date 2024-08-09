@@ -1,3 +1,4 @@
+import io
 import json
 import random
 import subprocess
@@ -297,8 +298,8 @@ def load_audio_single(file: str, sr: int = SAMPLE_RATE) -> List[np.ndarray]:
 
 
 def create_audio_placeholder(
-    mime_type: str, file_name: str, artist: str, album: str, title: str
-) -> None:
+    mime_type: str, artist: str, album: str, title: str
+) -> Image.Image:
     """idk what this does, chatgpt wrote it"""
     width, height = 1024, 1024
     image = Image.new("RGB", (width, height), "#1a1a1a")
@@ -360,10 +361,10 @@ def create_audio_placeholder(
     draw.text((10, 80), f"{album}", font=font_medium, fill=(255, 255, 255))
     draw.text((10, 150), f"{title}", font=font_medium, fill=(255, 255, 255))
 
-    image.save(file_name)
+    return image
 
 
-def get_audio_thumbnail(mime_type: str, file_path: str, save_path: str):
+def get_audio_thumbnail(mime_type: str, file_path: str):
     artist, album, title = None, None, None
     try:
         audio = mutagen.File(file_path)  # type: ignore
@@ -400,13 +401,12 @@ def get_audio_thumbnail(mime_type: str, file_path: str, save_path: str):
             raise ValueError("Unsupported audio format")
 
         if artwork:
-            # Save the extracted artwork
-            with open(save_path, "wb") as img_file:
-                img_file.write(artwork)
+            # return the artwork as a PIL image
+            return Image.open(io.BytesIO(artwork))
         else:
             raise ValueError("No cover art found")
 
     except Exception as e:
-        create_audio_placeholder(
-            mime_type, save_path, artist or "", album or "", title or ""
+        return create_audio_placeholder(
+            mime_type, artist or "", album or "", title or ""
         )

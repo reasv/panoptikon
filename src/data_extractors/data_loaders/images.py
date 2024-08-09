@@ -85,7 +85,6 @@ def get_html_image(file_path: str) -> PILImage.Image:
 
 def generate_thumbnail(
     image_path,
-    thumbnail_path,
     max_dimensions=(4096, 4096),
     max_file_size=24 * 1024 * 1024,
 ):
@@ -105,22 +104,17 @@ def generate_thumbnail(
     # Check if the image is overly large based on file size
     file_size = os.path.getsize(image_path)
     if file_size <= really_small_file_size:
-        return False
+        return None
 
-    with PILImage.open(image_path) as img:
-        # Check if the image is overly large based on dimensions
-        if (
-            img.size[0] <= max_dimensions[0]
-            and img.size[1] <= max_dimensions[1]
-            and file_size <= max_file_size
-        ):
-            return False
+    img = PILImage.open(image_path)
+    # Check if the image is overly large based on dimensions
+    if (
+        img.size[0] <= max_dimensions[0]
+        and img.size[1] <= max_dimensions[1]
+        and file_size <= max_file_size
+    ):
+        return None
 
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-
-        # Generate thumbnail
-        img.thumbnail(max_dimensions, PILImage.Resampling.LANCZOS)
-        img.save(thumbnail_path, "JPEG")
-
-    return True
+    # Generate thumbnail
+    img.thumbnail(max_dimensions, PILImage.Resampling.LANCZOS)
+    return img

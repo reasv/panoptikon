@@ -176,13 +176,10 @@ def make_video_thumbnails(
     """
     # Get thumbnail directory from environment variable
 
-    thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
-    os.makedirs(thumbnail_dir, exist_ok=True)
     grid = create_image_grid(frames)
     write_text_on_image(grid, mime_type)
-    grid.save(f"{thumbnail_dir}/{sha256}-grid.jpg")
     write_text_on_image(frames[0], mime_type)
-    frames[0].save(f"{thumbnail_dir}/{sha256}-0.jpg")
+    return [grid, frames[0]]
 
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:

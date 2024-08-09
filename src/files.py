@@ -25,6 +25,13 @@ from src.db.rules.types import (
     PathFilter,
     StoredRule,
 )
+from src.db.storage import (
+    get_frames,
+    has_frame,
+    has_thumbnail,
+    store_frames,
+    store_thumbnails,
+)
 from src.types import FileRecord, FileScanData, ItemScanMeta
 from src.utils import get_mime_type, make_video_thumbnails, normalize_path
 
@@ -439,41 +446,54 @@ def deduplicate_paths(paths: List[str]):
     return deduplicated_paths
 
 
-def ensure_thumbnail_exists(sha256: str, file_path: str):
+def ensure_thumbnail_exists(
+    conn: sqlite3.Connection, sha256: str, file_path: str
+):
     """
     Ensure that a thumbnail exists for the given item.
     """
+    thumbnail_process_version = 1
+    frame_version = 1
+    if has_thumbnail(conn, sha256, thumbnail_process_version):
+        return
     mime_type = get_mime_type(file_path)
-    thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
-    os.makedirs(thumbnail_dir, exist_ok=True)
-    thumb_file = f"{thumbnail_dir}/{sha256}.jpg"
+
     if mime_type.startswith("video"):
-        if os.path.exists(f"{thumbnail_dir}/{sha256}-grid.jpg"):
-            return
-        frames = video_to_frames(file_path, num_frames=4)
-        make_video_thumbnails(frames, sha256, mime_type)
-        logger.debug(f"Generated video thumbnails for {file_path}")
-        return
-    if os.path.exists(thumb_file):
-        return
-    if mime_type.startswith("audio"):
-        get_audio_thumbnail(mime_type, file_path, thumb_file)
-        logger.debug(f"Generated audio placeholder for {file_path}")
-    elif mime_type.startswith("image"):
-        generated = generate_thumbnail(file_path, thumb_file)
-        if generated:
-            logger.debug(f"Generated image thumbnail for {file_path}")
-    elif mime_type.startswith("application/pdf"):
-        try:
-            get_pdf_image(file_path).save(thumb_file)
-            logger.debug(f"Generated PDF thumbnail for {file_path}")
-        except Exception as e:
-            logger.error(f"Error generating PDF thumbnail for {file_path}: {e}")
-    elif mime_type.startswith("text/html"):
-        try:
-            get_html_image(file_path).save(thumb_file)
-            logger.debug(f"Generated HTML thumbnail for {file_path}")
-        except Exception as e:
-            logger.error(
-                f"Error generating HTML thumbnail for {file_path}: {e}"
+        if frames := get_frames(conn, sha256):
+            logger.debug(f"Found video frames for {file_path}")
+        else:
+            logger.debug(f"Extracting video frames for {file_path}")
+            frames = video_to_frames(file_path, num_frames=4)
+            store_frames(
+                conn,
+                sha256=sha256,
+                file_mime_type=mime_type,
+                process_version=frame_version,
+                frames=frames,
             )
+        assert len(frames) > 0, "No frames found"
+        logger.debug(f"Generating video thumbnails for {file_path}")
+        thumbs = make_video_thumbnails(frames, sha256, mime_type)
+    elif mime_type.startswith("audio"):
+        thumbs = [get_audio_thumbnail(mime_type, file_path)]
+    elif mime_type.startswith("image"):
+        thumb = generate_thumbnail(file_path)
+        thumbs = [thumb] if thumb else []
+    elif mime_type.startswith("application/pdf"):
+        thumbs = [get_pdf_image(file_path)]
+    elif mime_type.startswith("text/html"):
+        thumbs = [get_html_image(file_path)]
+    else:
+        logger.debug(
+            f"No thumbnail generation for type {mime_type}: {file_path}"
+        )
+        return
+    if thumbs:
+        logger.debug(f"Generated image thumbnail for {file_path}")
+        store_thumbnails(
+            conn,
+            sha256,
+            mime_type,
+            thumbnail_process_version,
+            thumbs,
+        )

@@ -15,15 +15,19 @@ def get_database_connection(
     data_dir = os.getenv("DATA_FOLDER", "data")
     index_db_dir = os.path.join(data_dir, "index")
     user_data_db_dir = os.path.join(data_dir, "user_data")
+    storage_db_dir = os.path.join(data_dir, "storage")
     # Ensure the directory exists
     os.makedirs(index_db_dir, exist_ok=True)
     os.makedirs(user_data_db_dir, exist_ok=True)
+    os.makedirs(storage_db_dir, exist_ok=True)
 
     index = os.getenv("INDEX_DB", "default")
     user_data = os.getenv("USER_DATA_DB", "default")
+    storage = os.getenv("STORAGE_DB", "default")
 
     db_file = os.path.join(index_db_dir, f"{index}.db")
     user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
+    storage_db_file = os.path.join(storage_db_dir, f"{storage}.db")
 
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
     # Attach index database
@@ -32,6 +36,8 @@ def get_database_connection(
         # Acquire a write lock
         logger.debug(f"Opening index database in write mode")
         conn = sqlite3.connect(db_file)
+        logger.debug(f"Attaching storage database in write mode")
+        conn.execute(f"ATTACH DATABASE '{storage_db_file}' AS storage")
         cursor = conn.cursor()
         # Enable Write-Ahead Logging (WAL) mode
         cursor.execute("PRAGMA journal_mode=WAL")
@@ -40,6 +46,11 @@ def get_database_connection(
         # Read-only connection
         logger.debug(f"Opening index database in read-only mode")
         conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        # Attach storage database
+        logger.debug(f"Attaching storage database in read-only mode")
+        conn.execute(
+            f"ATTACH DATABASE 'file:{storage_db_file}?mode=ro' AS storage"
+        )
 
     # Attach user data database
     if user_data_wl and not readonly_mode:
@@ -434,6 +445,38 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS storage.thumbnails (
+                id INTEGER PRIMARY KEY,
+                item_sha256 TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                item_mime_type TEXT NOT NULL,        -- MIME type of the source file
+                width INTEGER NOT NULL,              -- Width of the thumbnail in pixels
+                height INTEGER NOT NULL,             -- Height of the thumbnail in pixels
+                version INTEGER NOT NULL,            -- Version of the thumbnail creation process
+                thumbnail BLOB NOT NULL,             -- The thumbnail image data (stored as a BLOB)
+                UNIQUE(item_sha256, idx)
+            );
+        """
+    )
+
+    cursor.execute(
+        f"""
+            CREATE TABLE IF NOT EXISTS storage.frames (
+                id INTEGER PRIMARY KEY,
+                item_sha256 TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                item_mime_type TEXT NOT NULL,        -- MIME type of the source file
+                width INTEGER NOT NULL,              -- Width of the frame in pixels
+                height INTEGER NOT NULL,             -- Height of the frame in pixels
+                version INTEGER NOT NULL,            -- Version of the frame extraction process
+                frame BLOB NOT NULL,                 -- The extracted frame image data (stored as a BLOB)
+                UNIQUE(item_sha256, idx)
+            );
+        """
+    )
+
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -505,6 +548,21 @@ def initialize_database(conn: sqlite3.Connection):
         ("items", ["subtitle_tracks"]),
         ("extraction_rules", ["enabled"]),
         ("system_config", ["k"]),
+        ("model_group_settings", ["name"]),
+        ("model_group_settings", ["batch_size"]),
+        ("model_group_settings", ["threshold"]),
+        ("storage.thumbnails", ["item_sha256"]),
+        ("storage.thumbnails", ["index"]),
+        ("storage.frames", ["item_sha256"]),
+        ("storage.frames", ["index"]),
+        ("storage.thumbnails", ["file_mime_type"]),
+        ("storage.frames", ["file_mime_type"]),
+        ("storage.thumbnails", ["width"]),
+        ("storage.thumbnails", ["height"]),
+        ("storage.frames", ["width"]),
+        ("storage.frames", ["height"]),
+        ("storage.thumbnails", ["version"]),
+        ("storage.frames", ["version"]),
     ]
 
     for table, columns in indices:
