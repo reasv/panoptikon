@@ -1,9 +1,15 @@
+import io
 import logging
 import logging.config
 import os
+import sys
 
 
 def setup_logging():
+    # Wrap sys.stdout to use UTF-8 encoding
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
     # Read log level from environment variable
     loglevel = os.getenv("LOGLEVEL", "INFO").upper()
     # Get logs folder from environment variable
@@ -25,6 +31,10 @@ def setup_logging():
                     "level": "WARNING",
                     "propagate": False,
                 },
+                "weasyprint": {
+                    "level": "ERROR",
+                    "propagate": False,
+                },
             },
         }
     )
@@ -32,7 +42,7 @@ def setup_logging():
         level=loglevel,
         format="%(asctime)s [%(levelname)s][%(name)s] - %(message)s",
         handlers=[
-            logging.FileHandler(logs_file),
+            logging.FileHandler(logs_file, encoding="utf-8"),
             logging.StreamHandler(),
         ],
     )
