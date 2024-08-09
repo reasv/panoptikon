@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -22,7 +23,7 @@ from src.db.folders import (
     delete_folders_not_in_list,
     get_folders_from_database,
 )
-from src.files import deduplicate_paths, scan_files
+from src.files import deduplicate_paths, ensure_thumbnail_exists, scan_files
 from src.utils import normalize_path
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def execute_folder_scan(
             0,
             0,
         )
-        time_hashing, time_metadata = 0.0, 0.0
+        time_hashing, time_metadata, time_thumbgen = 0.0, 0.0, 0.0
         scan_id = add_file_scan(conn, scan_time, folder)
         scan_ids.append(scan_id)
         for file_data, hash_time, metadata_time in scan_files(
@@ -97,6 +98,14 @@ def execute_folder_scan(
             if file_data is None:
                 errors += 1
                 continue
+            thumbgen_start = time.time()
+            try:
+                ensure_thumbnail_exists(file_data.sha256, file_data.path)
+            except Exception as e:
+                logger.error(
+                    f"Error generating thumbnail for {file_data.path}: {e}"
+                )
+            time_thumbgen += time.time() - thumbgen_start
             if (
                 file_data.new_file_timestamp == True
                 and file_data.new_file_hash == False
@@ -144,6 +153,7 @@ def execute_folder_scan(
             false_changes=false_mod_timestamps,
             metadata_time=time_metadata,
             hashing_time=time_hashing,
+            thumbgen_time=time_thumbgen,
         )
 
     return scan_ids

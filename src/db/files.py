@@ -139,6 +139,7 @@ def update_file_scan(
     false_changes: int,
     metadata_time: float,
     hashing_time: float,
+    thumbgen_time: float,
 ):
     cursor = conn.cursor()
     cursor.execute(
@@ -155,7 +156,8 @@ def update_file_scan(
         total_available = ?,
         false_changes = ?,
         metadata_time = ?,
-        hashing_time = ?
+        hashing_time = ?,
+        thumbgen_time = ?
     WHERE id = ?
     """,
         (
@@ -170,6 +172,7 @@ def update_file_scan(
             false_changes,
             metadata_time,
             hashing_time,
+            thumbgen_time,
             scan_id,
         ),
     )

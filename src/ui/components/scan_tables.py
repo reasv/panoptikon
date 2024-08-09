@@ -36,6 +36,7 @@ def create_scan_dataset(samples=[]):
             "Wrongly Detected Changes",
             "Metadata Scan Time",
             "File Hashing Time",
+            "Thumb Gen Time",
         ],
         components=[
             "number",
@@ -51,6 +52,7 @@ def create_scan_dataset(samples=[]):
             "number",
             "number",
             "number",
+            "textbox",
             "textbox",
             "textbox",
         ],
@@ -129,6 +131,7 @@ def fetch_scan_history():
             f.false_changes,
             seconds_to_hms(f.metadata_time),
             seconds_to_hms(f.hashing_time),
+            seconds_to_hms(f.thumbgen_time),
         ]
         for f in file_scans
     ]
