@@ -108,9 +108,12 @@ def scan_files(
             continue
 
         # Check if the file matches any user rules
-        if not matches_rules(user_rules, file_path, size=file_size):
+        if user_rules and not matches_rules(
+            user_rules, file_path, size=file_size
+        ):
             logger.debug(f"File {file_path} does not match any rules")
             yield None, 0.0, 0.0
+            continue
 
         # Assume file is new or has changed
         new_or_new_timestamp = True
@@ -131,7 +134,6 @@ def scan_files(
                 yield None, 0.0, 0.0
         else:
             assert file_record is not None
-            ensure_thumbnail_exists(file_record.sha256, file_path)
             yield FileScanData(
                 sha256=file_record.sha256,
                 last_modified=file_record.last_modified,
@@ -235,7 +237,6 @@ def extract_file_metadata(
     """
     hash_start = datetime.now()
     md5, sha256 = calculate_hashes(file_path)
-    ensure_thumbnail_exists(sha256, file_path)
     hash_time_seconds = (datetime.now() - hash_start).total_seconds()
     if file_record is not None and file_record.sha256 == sha256:
         logger.warning(
