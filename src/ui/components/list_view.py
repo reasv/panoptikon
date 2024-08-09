@@ -14,7 +14,7 @@ from src.ui.components.bookmark_folder_selector import (
 )
 from src.ui.components.text_viewer import create_text_viewer
 from src.ui.components.utils import (
-    get_thumbnail,
+    get_item_thumbnail,
     on_selected_image_get_bookmark_state,
     toggle_bookmark,
 )
@@ -24,7 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 def on_files_change(files: List[FileSearchResult]):
-    image_list = [[get_thumbnail(file, False), file.path] for file in files]
+    conn = get_database_connection(write_lock=False)
+    image_list = [
+        [get_item_thumbnail(conn, file, False), file.path] for file in files
+    ]
+    conn.close()
     logger.debug(f"Received {len(image_list)} images")
     return gr.update(samples=image_list), (
         [] if len(image_list) == 0 else [files[0]]
@@ -55,14 +59,14 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
             interactive = True
             sha256 = selected_file.sha256
             path = selected_file.path
-            thumbnail = get_thumbnail(selected_file, True)
+            conn = get_database_connection(write_lock=False)
+            thumbnail = get_item_thumbnail(conn, selected_file, True)
             if path != selected_image_path:
-                conn = get_database_connection(write_lock=False)
+
                 tags = {
                     t[0]: t[1]
                     for t in get_all_tags_for_item_name_confidence(conn, sha256)
                 }
-                conn.close()
                 # Tags in the format "tag1 tag2 tag3"
                 text = ", ".join(tags.keys())
 
@@ -89,6 +93,7 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                     gr.update(),
                     gr.update(),
                 )
+            conn.close()
         # Add updates to the tuple for extra actions
         for _ in extra_actions:
             updates += (gr.update(interactive=interactive),)

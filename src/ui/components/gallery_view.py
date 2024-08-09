@@ -6,12 +6,13 @@ from typing import List
 
 import gradio as gr
 
+from src.db import get_database_connection
 from src.types import FileSearchResult
 from src.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
 )
 from src.ui.components.utils import (
-    get_thumbnail,
+    get_item_thumbnail,
     on_selected_image_get_bookmark_state,
     toggle_bookmark,
 )
@@ -25,7 +26,11 @@ def on_change_columns_slider(columns_slider: int):
 
 
 def on_files_change(files: List[FileSearchResult]):
-    image_list = [(get_thumbnail(file, True), file.path) for file in files]
+    conn = get_database_connection(write_lock=False)
+    image_list = [
+        (get_item_thumbnail(conn, file, True), file.path) for file in files
+    ]
+    conn.close()
     logger.debug(f"Received {len(image_list)} images")
     return (
         (gr.update(value=image_list), [files[0]])

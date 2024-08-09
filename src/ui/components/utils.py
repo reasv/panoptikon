@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
-import os
+import random
+import sqlite3
 from typing import List
 
 import gradio as gr
+from PIL import Image, ImageDraw, ImageFont
 
 from src.db import get_database_connection
 from src.db.bookmarks import (
@@ -15,6 +17,7 @@ from src.db.bookmarks import (
     get_bookmarks,
     remove_bookmark,
 )
+from src.db.storage import get_thumbnail
 from src.types import FileSearchResult
 
 logger = logging.getLogger(__name__)
@@ -105,18 +108,90 @@ def delete_bookmark(bookmarks_namespace: str, sha256: str):
     conn.close()
 
 
-def get_thumbnail(file: FileSearchResult | None, big: bool = True):
+def create_placeholder_image_with_gradient(size=(512, 512), text="No Preview"):
+    # Create a gradient background
+    gradient = Image.new("RGB", size)
+    draw = ImageDraw.Draw(gradient)
+
+    for y in range(size[1]):
+        r = int(255 * (y / size[1]))
+        g = int(255 * (random.random()))
+        b = int(255 * ((size[1] - y) / size[1]))
+        for x in range(size[0]):
+            draw.point((x, y), fill=(r, g, b))
+
+    # Draw the blocked symbol (a circle with a diagonal line through it)
+    symbol_radius = min(size) // 6
+    symbol_center = (size[0] // 2, size[1] // 3)
+    draw.ellipse(
+        [
+            (
+                symbol_center[0] - symbol_radius,
+                symbol_center[1] - symbol_radius,
+            ),
+            (
+                symbol_center[0] + symbol_radius,
+                symbol_center[1] + symbol_radius,
+            ),
+        ],
+        outline="black",
+        width=5,
+    )
+    draw.line(
+        [
+            (
+                symbol_center[0] - symbol_radius,
+                symbol_center[1] + symbol_radius,
+            ),
+            (
+                symbol_center[0] + symbol_radius,
+                symbol_center[1] - symbol_radius,
+            ),
+        ],
+        fill="black",
+        width=5,
+    )
+
+    # Load a default font
+    try:
+        font = ImageFont.load_default()
+    except IOError:
+        font = ImageFont.load_default()
+
+    # Calculate text size using textbbox
+    text_bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+
+    # Draw the "No Preview" text below the symbol
+    text_position = (
+        size[0] // 2 - text_width // 2,
+        size[1] // 2 + symbol_radius // 2,
+    )
+    draw.text(text_position, text, fill="black", font=font)
+
+    return gradient
+
+
+def get_item_thumbnail(
+    conn: sqlite3.Connection, file: FileSearchResult | None, big: bool = True
+):
     if file is None:
         return None
-    thumbnail_dir = os.getenv("THUMBNAIL_DIR", "./data/thumbs")
-    if file.type and file.type.startswith("video"):
-        # Get thumbnails directory from environment variable
-        return (
-            f"{thumbnail_dir}/{file.sha256}-grid.jpg"
-            if big
-            else f"{thumbnail_dir}/{file.sha256}-0.jpg"
-        )
-    else:
-        if os.path.exists(f"{thumbnail_dir}/{file.sha256}.jpg"):
-            return f"{thumbnail_dir}/{file.sha256}.jpg"
+    if file.type is None:
         return file.path
+    if file.type.startswith("video"):
+        index = 0 if big else 1
+        return (
+            get_thumbnail(conn, file.sha256, index)
+            or create_placeholder_image_with_gradient()
+        )
+    elif file.type.startswith("image/gif"):
+        return file.path
+    elif file.type.startswith("image"):
+        return get_thumbnail(conn, file.sha256, 0) or file.path
+    else:
+        return (
+            get_thumbnail(conn, file.sha256, 0)
+            or create_placeholder_image_with_gradient()
+        )
