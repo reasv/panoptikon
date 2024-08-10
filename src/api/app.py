@@ -19,7 +19,16 @@ from src.api.job import try_cronjob
 from src.db import get_database_connection
 from src.db.bookmarks import get_bookmarks
 from src.db.search import search_files
-from src.db.search.types import OrderByType, OrderType
+from src.db.search.types import (
+    FileFilters,
+    OrderByType,
+    OrderParams,
+    OrderType,
+    QueryFilters,
+    QueryParams,
+    QueryTagFilters,
+    SearchQuery,
+)
 from src.files import (
     get_files_by_extension,
     get_image_extensions,
@@ -134,19 +143,27 @@ def get_all_items_with_tags(
         *list(
             search_files(
                 conn,
-                tags,
-                negative_tags=[],
-                tag_namespaces=[],
-                min_confidence=min_confidence,
-                setters=None,
-                all_setters_required=False,
-                item_types=[],
-                include_path_prefixes=[include_path] if include_path else [],
-                order_by=order_by,
-                order=order,
-                page=page,
-                page_size=page_size,
-                check_path_exists=True,
+                SearchQuery(
+                    query=QueryParams(
+                        tags=QueryTagFilters(
+                            pos_match_all=tags,
+                            min_confidence=min_confidence,
+                        ),
+                        filters=QueryFilters(
+                            files=FileFilters(
+                                include_path_prefixes=(
+                                    [include_path] if include_path else []
+                                ),
+                            )
+                        ),
+                    ),
+                    order_args=OrderParams(
+                        page_size=page_size,
+                        page=page,
+                        order_by=order_by,
+                        order=order,
+                    ),
+                ),
             )
         )
     )
