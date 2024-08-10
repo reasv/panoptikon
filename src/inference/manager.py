@@ -1,8 +1,7 @@
-from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from threading import Lock
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from src.inference.model import BaseModel
 
