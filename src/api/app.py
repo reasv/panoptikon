@@ -16,6 +16,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi_utilities.repeat.repeat_at import repeat_at
 
 from src.api.job import try_cronjob
+from src.api.routers import inference
 from src.db import get_database_connection
 from src.db.bookmarks import get_bookmarks
 from src.db.search import search_files
@@ -52,6 +53,8 @@ def cronjob():
 
 app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
+
+app.include_router(inference.router)
 
 
 def get_all_bookmarks_in_folder(
