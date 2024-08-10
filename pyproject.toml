@@ -12,7 +12,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.12"
-gradio = "^4.37.2"
+gradio = "^4.38.0"
 pillow = "^10.4.0"
 imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
 open-clip-torch = "^2.26.1"
@@ -26,6 +26,7 @@ sentence-transformers = "^3.0.1"
 typeguard = "^4.3.0"
 fastapi-utilities = "^0.2.0"
 mutagen = "^1.47.0"
+toml = "^0.10.2"
 
 [build-system]
 requires = ["poetry-core"]
