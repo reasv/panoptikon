@@ -171,18 +171,18 @@ def unload_model(
     return {"status": "unloaded"}
 
 
-@router.delete("/clear_cache/{cache_key}")
+@router.delete("/cache/{cache_key}")
 def clear_cache(cache_key: str) -> Dict[str, str]:
     ModelManager().clear_cache(cache_key)
     return {"status": "cache cleared"}
 
 
-@router.get("/list/loaded")
+@router.get("/cache")
 async def list_loaded_models() -> Dict[str, List[str]]:
     return ModelManager().list_loaded_models()
 
 
-@router.get("/list/metadata")
+@router.get("/metadata")
 async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
     return registry.list_inference_ids()
 
