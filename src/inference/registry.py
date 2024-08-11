@@ -33,7 +33,7 @@ class ModelRegistry:
 
     @classmethod
     def register_model(
-        cls, model_class: Type["InferenceModel"], model_name: str
+        cls, model_name: str, model_class: Type["InferenceModel"]
     ) -> None:
         """Register a BaseModel subclass with a given name."""
         cls._registry[model_name] = model_class

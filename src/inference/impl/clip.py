@@ -165,4 +165,4 @@ class ClipModel(InferenceModel):
             self._model_loaded = False
 
 
-ModelRegistry.register_model(ClipModel, "clip")
+ModelRegistry.register_model("clip", ClipModel)
