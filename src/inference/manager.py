@@ -1,9 +1,12 @@
+import logging
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Set
 
 from src.inference.model import InferenceModel
+
+logger = logging.getLogger(__name__)
 
 
 class ModelManager:
@@ -62,12 +65,17 @@ class ModelManager:
 
             # Load the model only after managing the LRU cache
             if inference_id not in self._models:
-                model_instance.load()
+                try:
+                    model_instance.load()
+                except Exception as e:
+                    logger.error(f"Failed to load model {inference_id}: {e}")
+                    self._remove_from_lru(cache_key, inference_id)
+                    raise e
                 self._models[inference_id] = model_instance
 
             # Calculate the new expiration time
             expiration_time: datetime = datetime.now() + timedelta(
-                seconds=ttl_seconds
+                seconds=ttl_seconds if ttl_seconds >= 0 else 10**10
             )
             self._lru_caches[cache_key][inference_id] = expiration_time
 

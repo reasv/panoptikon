@@ -58,7 +58,7 @@ def predict(
 
     # Load the model with cache key, LRU size, and long TTL to avoid unloading during prediction
     model: InferenceModel = ModelManager().load_model(
-        f"{group}/{inference_id}", model_instance, cache_key, lru_size, 6000
+        f"{group}/{inference_id}", model_instance, cache_key, lru_size, -1
     )
 
     # Process inputs into a list of PredictionInput objects
@@ -78,20 +78,23 @@ def predict(
         for file_input in file_inputs:
             file_data = file_input.file.read()
             processed_inputs.append(PredictionInput(data=None, file=file_data))
-
-    # Perform prediction
-    outputs: List[bytes | dict | list | str] = list(
-        model.predict(processed_inputs)
-    )
-
-    # Update the model's TTL after the prediction is made
-    ModelManager().load_model(
-        f"{group}/{inference_id}",
-        model_instance,
-        cache_key,
-        lru_size,
-        ttl_seconds,
-    )
+    try:
+        # Perform prediction
+        outputs: List[bytes | dict | list | str] = list(
+            model.predict(processed_inputs)
+        )
+    except Exception as e:
+        logger.error(f"Prediction failed for model {inference_id}: {e}")
+        raise HTTPException(status_code=500, detail="Prediction failed")
+    finally:
+        # Update the model's TTL after the prediction is made
+        ModelManager().load_model(
+            f"{group}/{inference_id}",
+            model_instance,
+            cache_key,
+            lru_size,
+            ttl_seconds,
+        )
 
     # Handle the outputs by returning a streaming response if there is only one binary output
     if len(outputs) == 1 and isinstance(outputs[0], bytes):
