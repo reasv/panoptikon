@@ -1,5 +1,5 @@
 from io import BytesIO
-from typing import List, Sequence
+from typing import List, Sequence, Union
 
 from PIL import Image as PILImage
 
@@ -15,7 +15,7 @@ class ClipModel(InferenceModel):
         model_name: str,
         pretrained: str | None = None,
         context_length: int | None = None,
-        **kwargs
+        **kwargs,
     ):
         self.model_name: str = model_name
         self.pretrained: str | None = pretrained
@@ -27,18 +27,28 @@ class ClipModel(InferenceModel):
         if self._model_loaded:
             return
         import open_clip
+        import torch
 
         self.model, _, preprocess = open_clip.create_model_and_transforms(
             model_name=self.model_name,
             pretrained=self.pretrained,
-            **self.init_args
+            **self.init_args,
         )
         assert not isinstance(
             preprocess, tuple
         ), "Expected single preprocess function"
         self.preprocess = preprocess
 
-        self.device = get_device()
+        self.devices = get_device()
+
+        if isinstance(self.devices, list):
+            # If multiple devices are available, use DataParallel to handle distribution
+            self.model = torch.nn.DataParallel(
+                self.model, device_ids=self.devices
+            )
+            self.device = self.devices[0]  # Primary device
+        else:
+            self.device = self.devices
 
         self.model.eval().to(self.device)
         self.tokenizer = open_clip.get_tokenizer(
@@ -51,7 +61,7 @@ class ClipModel(InferenceModel):
 
     def predict(
         self, inputs: Sequence[PredictionInput]
-    ) -> Sequence[bytes | dict | list | str]:
+    ) -> Sequence[Union[bytes, dict, list, str]]:
         import torch
 
         # Ensure the model is loaded
@@ -59,9 +69,7 @@ class ClipModel(InferenceModel):
 
         text_inputs = []
         image_inputs = []
-        results: List[None | bytes] = [None] * len(
-            inputs
-        )  # Placeholder for the results
+        results: List[None | bytes] = [None] * len(inputs)
 
         # Separate text and image inputs, storing their original indices
         for idx, input_item in enumerate(inputs):
@@ -79,31 +87,66 @@ class ClipModel(InferenceModel):
                 tokens = self.tokenizer(list(texts))
                 tokens = torch.tensor(tokens).to(self.device)
 
-                text_features = self.model.encode_text(tokens)
-                text_features /= text_features.norm(
-                    dim=-1, keepdim=True
-                )  # Normalize the text features
+                if isinstance(self.devices, list):
+                    # Split the tokens across devices if multiple GPUs are available
+                    token_batches = torch.split(
+                        tokens, max(1, len(tokens) // len(self.devices))
+                    )
+                    text_features = []
 
-                # Convert text features to list and store them in the results list
+                    for i, token_batch in enumerate(token_batches):
+                        token_batch = token_batch.to(
+                            self.devices[i % len(self.devices)]
+                        )
+                        text_features_batch = self.model.module.encode_text(
+                            token_batch
+                        )
+                        text_features_batch /= text_features_batch.norm(
+                            dim=-1, keepdim=True
+                        )
+                        text_features.append(text_features_batch.cpu())
+
+                    text_features = torch.cat(text_features)
+                else:
+                    text_features = self.model.encode_text(tokens)
+                    text_features /= text_features.norm(dim=-1, keepdim=True)
+
                 for i, idx in enumerate(indices):
-                    results[idx] = text_features[i].cpu().numpy().tobytes()
+                    results[idx] = text_features[i].numpy().tobytes()
 
             # Process image inputs if any
             if image_inputs:
                 indices, images = zip(*image_inputs)
                 processed_images = torch.stack(
-                    [
-                        self.preprocess(img).to(self.device)  # type: ignore
-                        for img in images
-                    ]
+                    [self.preprocess(img) for img in images]  # type: ignore
                 )
 
-                image_features = self.model.encode_image(processed_images)
-                image_features /= image_features.norm(
-                    dim=-1, keepdim=True
-                )  # Normalize the image features
+                if isinstance(self.devices, list):
+                    # Split the images across devices if multiple GPUs are available
+                    image_batches = torch.split(
+                        processed_images,
+                        max(1, len(processed_images) // len(self.devices)),
+                    )
+                    image_features = []
 
-                # Convert image features to list and store them in the results list
+                    for i, image_batch in enumerate(image_batches):
+                        image_batch = image_batch.to(
+                            self.devices[i % len(self.devices)]
+                        )
+                        image_features_batch = self.model.module.encode_image(
+                            image_batch
+                        )
+                        image_features_batch /= image_features_batch.norm(
+                            dim=-1, keepdim=True
+                        )
+                        image_features.append(image_features_batch.cpu())
+
+                    image_features = torch.cat(image_features)
+                else:
+                    processed_images = processed_images.to(self.device)
+                    image_features = self.model.encode_image(processed_images)
+                    image_features /= image_features.norm(dim=-1, keepdim=True)
+
                 for i, idx in enumerate(indices):
                     results[idx] = image_features[i].cpu().numpy().tobytes()
 

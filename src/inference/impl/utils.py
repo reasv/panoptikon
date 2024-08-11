@@ -6,6 +6,9 @@ def get_device():
     Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.
     """
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            return [torch.device(f"cuda:{i}") for i in range(num_gpus)]
         return torch.device("cuda")
     elif torch.backends.mps.is_available():  # Apple Silicon (M1/M2)
         return torch.device("mps")
