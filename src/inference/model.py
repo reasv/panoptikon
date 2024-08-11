@@ -1,8 +1,5 @@
 from abc import ABC, abstractmethod
-from collections import OrderedDict, defaultdict
-from datetime import datetime, timedelta
-from threading import Lock
-from typing import Any, Dict, List, Optional, Set
+from typing import List, Sequence
 
 from src.inference.types import PredictionInput
 
@@ -13,7 +10,9 @@ class BaseModel(ABC):
         pass
 
     @abstractmethod
-    def predict(self, inputs: List[PredictionInput]) -> List[Any]:
+    def predict(
+        self, inputs: Sequence[PredictionInput]
+    ) -> List[bytes | dict | list | str]:
         pass
 
     @abstractmethod

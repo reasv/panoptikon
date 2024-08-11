@@ -78,7 +78,7 @@ def predict(
             processed_inputs.append(PredictionInput(data=None, file=file_data))
 
     # Perform prediction
-    outputs: List[Any] = model.predict(processed_inputs)
+    outputs: List[bytes | dict | list | str] = model.predict(processed_inputs)
 
     # Update the model's TTL after the prediction is made
     ModelManager().load_model(
@@ -105,6 +105,7 @@ def predict(
             part_headers = f'--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="output{idx}.bin"\r\n\r\n'.encode(
                 "utf-8"
             )
+            assert isinstance(output, bytes), "Output must be bytes"
             multipart_data.append(part_headers + output + b"\r\n")
 
         multipart_data.append(f"--{boundary}--\r\n".encode("utf-8"))
