@@ -3,7 +3,15 @@ import logging
 from io import BytesIO
 from typing import Any, Dict, List, Union
 
-from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.inference.manager import BaseModel, ModelManager
@@ -80,6 +88,24 @@ def predict(
     if len(outputs) == 1 and isinstance(outputs[0], bytes):
         return StreamingResponse(
             BytesIO(outputs[0]), media_type="application/octet-stream"
+        )
+
+    # Check if all outputs are binary
+    if all(isinstance(output, bytes) for output in outputs):
+        # Return a multipart response with all binary outputs
+        boundary = "multipart-boundary"
+        multipart_data = []
+
+        for idx, output in enumerate(outputs):
+            part_headers = f'--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="output{idx}.bin"\r\n\r\n'.encode(
+                "utf-8"
+            )
+            multipart_data.append(part_headers + output + b"\r\n")
+
+        multipart_data.append(f"--{boundary}--\r\n".encode("utf-8"))
+        return Response(
+            content=b"".join(multipart_data),
+            media_type=f"multipart/mixed; boundary={boundary}",
         )
 
     # Handle the outputs by encoding binary data if necessary
