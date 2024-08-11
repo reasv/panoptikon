@@ -9,11 +9,11 @@ def get_device():
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
             return [torch.device(f"cuda:{i}") for i in range(num_gpus)]
-        return torch.device("cuda")
+        return [torch.device("cuda")]
     elif torch.backends.mps.is_available():  # Apple Silicon (M1/M2)
-        return torch.device("mps")
+        return [torch.device("mps")]
     else:
-        return torch.device("cpu")
+        return [torch.device("cpu")]
 
 
 def clear_cache() -> None:

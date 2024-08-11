@@ -80,11 +80,7 @@ class ClipModel(InferenceModel):
         if self._model_loaded:
             return
 
-        devices = get_device()
-        if not isinstance(devices, list):
-            self.devices = [self.devices]
-        else:
-            self.devices = devices
+        self.devices = get_device()
 
         num_gpus: int = len(self.devices)
 

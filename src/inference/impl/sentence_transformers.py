@@ -29,7 +29,7 @@ class SentenceTransformersModel(InferenceModel):
             model_name_or_path=self.model_name,
             **self.init_args,
         )
-        if isinstance(self.devices, list):
+        if len(self.devices) > 1:
             self.pool = self.model.start_multi_process_pool()
         else:
             self.pool = None
