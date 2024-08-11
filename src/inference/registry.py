@@ -17,12 +17,18 @@ class ModelRegistry:
         {}
     )  # Class property shared across all instances
 
-    def __init__(self, base_folder: str, user_folder: str) -> None:
+    def __init__(
+        self,
+        base_folder: str,
+        user_folder: str,
+        allow_inference_id_overrides: bool = False,
+    ) -> None:
         self._config: Dict[str, Dict[str, Any]] = {}  # Instance property
         self._last_modified_time: float = 0.0  # Instance property
         self._lock: Lock = Lock()  # Instance property, unique to each instance
         self.base_folder = Path(base_folder)  # Instance property
         self.user_folder = Path(user_folder)  # Instance property
+        self.allow_inference_id_overrides = allow_inference_id_overrides
         self.reload_registry()
 
     @classmethod
@@ -100,26 +106,26 @@ class ModelRegistry:
                         )
 
                         # Process and merge inference IDs within the group
-                        for inf_id, inf_data in group_data.get(
+                        for inference_id, inf_data in group_data.get(
                             "inference_ids", {}
                         ).items():
-                            full_inference_id = f"{group_name}|{inf_id}"
                             if (
-                                full_inference_id
+                                inference_id
                                 in config_data[group_name]["inference_ids"]
+                                and not self.allow_inference_id_overrides
                             ):
                                 raise ValueError(
-                                    f"Duplicate inference_id '{full_inference_id}' found in {file}"
+                                    f"Duplicate inference_id '{group_name}/{inference_id}' found in {file}"
                                 )
 
-                            # Merge group-level and inference-level config
+                            # Merge group-level and inference_id-level config
                             inf_config = {
                                 **config_data[group_name]["group_config"],
                                 **inf_data.get("config", {}),
                             }
 
                             config_data[group_name]["inference_ids"][
-                                full_inference_id
+                                inference_id
                             ] = {
                                 "config": inf_config,
                                 "metadata": inf_data.get("metadata", {}),
@@ -127,37 +133,47 @@ class ModelRegistry:
                 except Exception as e:
                     logger.error(f"Error loading TOML file {file}: {e}")
 
-    def get_model_instance(self, inference_id: str) -> "BaseModel":
-        """Retrieve and instantiate a BaseModel subclass based on the inference ID."""
+    def get_model_instance(
+        self, group_name: str, inference_id: str
+    ) -> "BaseModel":
+        """Retrieve and instantiate a BaseModel subclass based on the inference ID and group name."""
         self.reload_registry()  # Ensure the registry is up to date before retrieving a model
         with self._lock:
-            for group_name, group_data in self._config.items():
-                if inference_id in group_data["inference_ids"]:
-                    config = group_data["inference_ids"][inference_id]
-                    model_class_name = group_data["model_class"]
-                    model_class = self._registry.get(model_class_name)
-                    if not model_class:
-                        raise ValueError(
-                            f"Model class '{model_class_name}' not found in registry for inference_id '{inference_id}'"
-                        )
+            if group_name not in self._config:
+                raise ValueError(f"Group '{group_name}' not found in registry")
+            group_data = self._config[group_name]
+            if inference_id not in group_data["inference_ids"]:
+                raise ValueError(
+                    f"Inference ID '{inference_id}' not found in group '{group_name}'"
+                )
+            config = group_data["inference_ids"][inference_id]
+            model_class_name = group_data["model_class"]
+            model_class = self._registry.get(model_class_name)
+            if not model_class:
+                raise ValueError(
+                    f"Model class '{model_class_name}' not found in registry for inference_id '{inference_id}'"
+                )
 
-                    model_instance = model_class(**config["config"])
-                    return model_instance
-        raise ValueError(f"Inference ID '{inference_id}' not found")
+            model_instance = model_class(**config["config"])
+            return model_instance
 
-    def get_metadata(self, inference_id: str) -> Optional[Dict[str, Any]]:
+    def get_metadata(
+        self, group_name: str, inference_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve the metadata associated with an inference ID."""
         self.reload_registry()  # Ensure the registry is up to date before retrieving metadata
         with self._lock:
-            for group_name, group_data in self._config.items():
-                if inference_id in group_data["inference_ids"]:
-                    return {
-                        "group_metadata": group_data.get("group_metadata", {}),
-                        "inference_id_metadata": group_data["inference_ids"][
-                            inference_id
-                        ].get("metadata", {}),
-                    }
-        return None
+            if group_name not in self._config:
+                return None
+            group_data = self._config[group_name]
+            if inference_id not in group_data["inference_ids"]:
+                return None
+            return {
+                "group_metadata": group_data.get("group_metadata", {}),
+                "inference_id_metadata": group_data["inference_ids"][
+                    inference_id
+                ].get("metadata", {}),
+            }
 
     def list_inference_ids(self) -> Dict[str, Dict[str, Any]]:
         """List all inference IDs divided by group, including group and individual metadata."""

@@ -31,8 +31,9 @@ router = APIRouter(
 )
 
 
-@router.post("/predict/{inference_id}")
+@router.post("/predict/{group}/{inference_id}")
 def predict(
+    group: str,
     inference_id: str,
     cache_key: str = Query(...),
     lru_size: int = Query(...),
@@ -51,11 +52,11 @@ def predict(
             )
 
     # Instantiate the model (without loading)
-    model_instance: BaseModel = registry.get_model_instance(inference_id)
+    model_instance: BaseModel = registry.get_model_instance(group, inference_id)
 
     # Load the model with cache key, LRU size, and long TTL to avoid unloading during prediction
     model: BaseModel = ModelManager().load_model(
-        inference_id, model_instance, cache_key, lru_size, 6000
+        f"{group}/{inference_id}", model_instance, cache_key, lru_size, 6000
     )
 
     # Process inputs into a list of PredictionInput objects
@@ -81,7 +82,11 @@ def predict(
 
     # Update the model's TTL after the prediction is made
     ModelManager().load_model(
-        inference_id, model_instance, cache_key, lru_size, ttl_seconds
+        f"{group}/{inference_id}",
+        model_instance,
+        cache_key,
+        lru_size,
+        ttl_seconds,
     )
 
     # Handle the outputs by returning a streaming response if there is only one binary output
@@ -130,17 +135,24 @@ def predict(
     return JSONResponse(content={"outputs": encoded_outputs})
 
 
-@router.put("/load/{inference_id}")
+@router.put("/load/{group}/{inference_id}")
 def load_model(
+    group: str,
     inference_id: str,
     cache_key: str,
     lru_size: int,
     ttl_seconds: int,
 ) -> Dict[str, str]:
     try:
-        model_instance: BaseModel = registry.get_model_instance(inference_id)
+        model_instance: BaseModel = registry.get_model_instance(
+            group, inference_id
+        )
         ModelManager().load_model(
-            inference_id, model_instance, cache_key, lru_size, ttl_seconds
+            f"{group}/{inference_id}",
+            model_instance,
+            cache_key,
+            lru_size,
+            ttl_seconds,
         )
         return {"status": "loaded"}
     except Exception as e:
@@ -148,9 +160,13 @@ def load_model(
         raise HTTPException(status_code=500, detail="Failed to load model")
 
 
-@router.put("/unload")
-def unload_model(cache_key: str, inference_id: str) -> Dict[str, str]:
-    ModelManager().unload_model(cache_key, inference_id)
+@router.put("/unload/{group}/{inference_id}")
+def unload_model(
+    group: str,
+    inference_id: str,
+    cache_key: str,
+) -> Dict[str, str]:
+    ModelManager().unload_model(cache_key, f"{group}/{inference_id}")
     return {"status": "unloaded"}
 
 
