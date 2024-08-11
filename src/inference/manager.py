@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Set
 
-from src.inference.model import BaseModel
+from src.inference.model import InferenceModel
 
 
 class ModelManager:
@@ -11,7 +11,7 @@ class ModelManager:
     _lock: Lock = Lock()
 
     def __init__(self) -> None:
-        self._models: Dict[str, BaseModel] = {}
+        self._models: Dict[str, InferenceModel] = {}
         self._lru_caches: Dict[str, OrderedDict[str, datetime]] = defaultdict(
             OrderedDict
         )
@@ -38,18 +38,18 @@ class ModelManager:
     def _unload_model(self, inference_id: str) -> None:
         """Unload the model when no cache keys reference it."""
         if inference_id in self._models:
-            model: BaseModel = self._models.pop(inference_id)
+            model: InferenceModel = self._models.pop(inference_id)
             model.unload()
             del self._cache_key_map[inference_id]
 
     def load_model(
         self,
         inference_id: str,
-        model_instance: BaseModel,
+        model_instance: InferenceModel,
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-    ) -> BaseModel:
+    ) -> InferenceModel:
         with self._lock:
 
             # Update the model in the LRU cache with the new expiration time

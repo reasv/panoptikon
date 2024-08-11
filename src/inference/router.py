@@ -14,7 +14,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from src.inference.manager import BaseModel, ModelManager
+from src.inference.manager import InferenceModel, ModelManager
 from src.inference.registry import ModelRegistry, get_base_config_folder
 from src.inference.types import PredictionInput
 
@@ -52,10 +52,12 @@ def predict(
             )
 
     # Instantiate the model (without loading)
-    model_instance: BaseModel = registry.get_model_instance(group, inference_id)
+    model_instance: InferenceModel = registry.get_model_instance(
+        group, inference_id
+    )
 
     # Load the model with cache key, LRU size, and long TTL to avoid unloading during prediction
-    model: BaseModel = ModelManager().load_model(
+    model: InferenceModel = ModelManager().load_model(
         f"{group}/{inference_id}", model_instance, cache_key, lru_size, 6000
     )
 
@@ -145,7 +147,7 @@ def load_model(
     ttl_seconds: int,
 ) -> Dict[str, str]:
     try:
-        model_instance: BaseModel = registry.get_model_instance(
+        model_instance: InferenceModel = registry.get_model_instance(
             group, inference_id
         )
         ModelManager().load_model(

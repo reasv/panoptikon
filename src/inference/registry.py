@@ -7,13 +7,13 @@ from typing import Any, Dict, Optional, Type
 
 import tomlkit
 
-from src.inference.model import BaseModel
+from src.inference.model import InferenceModel
 
 logger = logging.getLogger(__name__)
 
 
 class ModelRegistry:
-    _registry: Dict[str, Type["BaseModel"]] = (
+    _registry: Dict[str, Type["InferenceModel"]] = (
         {}
     )  # Class property shared across all instances
 
@@ -33,7 +33,7 @@ class ModelRegistry:
 
     @classmethod
     def register_model(
-        cls, model_class: Type["BaseModel"], model_name: str
+        cls, model_class: Type["InferenceModel"], model_name: str
     ) -> None:
         """Register a BaseModel subclass with a given name."""
         cls._registry[model_name] = model_class
@@ -135,7 +135,7 @@ class ModelRegistry:
 
     def get_model_instance(
         self, group_name: str, inference_id: str
-    ) -> "BaseModel":
+    ) -> "InferenceModel":
         """Retrieve and instantiate a BaseModel subclass based on the inference ID and group name."""
         self.reload_registry()  # Ensure the registry is up to date before retrieving a model
         with self._lock:

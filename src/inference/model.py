@@ -4,7 +4,7 @@ from typing import List, Sequence
 from src.inference.types import PredictionInput
 
 
-class BaseModel(ABC):
+class InferenceModel(ABC):
     @abstractmethod
     def load(self) -> None:
         pass
