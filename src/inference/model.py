@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set
 
+from src.inference.types import PredictionInput
+
 
 class BaseModel(ABC):
     @abstractmethod
@@ -11,7 +13,7 @@ class BaseModel(ABC):
         pass
 
     @abstractmethod
-    def predict(self, inputs: List[Any]) -> List[Any]:
+    def predict(self, inputs: List[PredictionInput]) -> List[Any]:
         pass
 
     @abstractmethod

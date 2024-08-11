@@ -1,17 +1,20 @@
+import base64
 import logging
-from typing import Any, Dict, List
+from io import BytesIO
+from typing import Any, Dict, List, Union
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.inference.manager import BaseModel, ModelManager
 from src.inference.registry import ModelRegistry, get_base_config_folder
+from src.inference.types import PredictionInput
 
 logger = logging.getLogger(__name__)
 
 registry = ModelRegistry(
     base_folder=str(get_base_config_folder()), user_folder="inference_config"
 )
-
 
 router = APIRouter(
     prefix="/inference",
@@ -23,46 +26,122 @@ router = APIRouter(
 @router.post("/predict/{inference_id}")
 def predict(
     inference_id: str,
-    inputs: List[Any],
-    cache_key: str,
-    lru_size: int,
-    ttl_seconds: int,
-) -> List[Any]:
+    cache_key: str = Query(...),
+    lru_size: int = Query(...),
+    ttl_seconds: int = Query(...),
+    inputs: Union[List[Union[dict, str]], None] = Body(None),  # JSON inputs
+    file_inputs: List[UploadFile] = File(
+        []
+    ),  # Optional file inputs (multipart form-data)
+):
+    # Ensure that if both inputs and file_inputs are provided, they have the same length
+    if inputs and file_inputs:
+        if len(inputs) != len(file_inputs):
+            raise HTTPException(
+                status_code=400,
+                detail="JSON inputs and file inputs must have the same length.",
+            )
+
     # Instantiate the model (without loading)
     model_instance: BaseModel = registry.get_model_instance(inference_id)
 
-    # Load the model with cache key, LRU size, and TTL
+    # Load the model with cache key, LRU size, and long TTL to avoid unloading during prediction
     model: BaseModel = ModelManager().load_model(
-        inference_id, model_instance, cache_key, lru_size, ttl_seconds
+        inference_id, model_instance, cache_key, lru_size, 6000
     )
+
+    # Process inputs into a list of PredictionInput objects
+    processed_inputs = []
+
+    if inputs and file_inputs:
+        # Combine JSON and file inputs into PredictionInput instances
+        for data_input, file_input in zip(inputs, file_inputs):
+            file_data = file_input.file.read()
+            processed_inputs.append(
+                PredictionInput(data=data_input, file=file_data)
+            )
+    elif inputs:
+        for data_input in inputs:
+            processed_inputs.append(PredictionInput(data=data_input, file=None))
+    elif file_inputs:
+        for file_input in file_inputs:
+            file_data = file_input.file.read()
+            processed_inputs.append(PredictionInput(data=None, file=file_data))
 
     # Perform prediction
-    outputs: List[Any] = model.predict(inputs)
+    outputs: List[Any] = model.predict(processed_inputs)
 
-    # Call load model again, in order to make sure TTL is updated
-    # after the prediction is made
-    model: BaseModel = ModelManager().load_model(
+    # Update the model's TTL after the prediction is made
+    ModelManager().load_model(
         inference_id, model_instance, cache_key, lru_size, ttl_seconds
     )
 
-    return outputs
+    # Handle the outputs by returning a streaming response if there is only one binary output
+    if len(outputs) == 1 and isinstance(outputs[0], bytes):
+        return StreamingResponse(
+            BytesIO(outputs[0]), media_type="application/octet-stream"
+        )
+
+    # Handle the outputs by encoding binary data if necessary
+    encoded_outputs = []
+    for output in outputs:
+        if isinstance(output, (str, dict, list)):
+            # Directly append JSON-serializable outputs
+            encoded_outputs.append(output)
+        elif isinstance(output, bytes):
+            # Encode binary data to base64 for safe JSON transport
+            encoded_outputs.append(
+                {
+                    "__type__": "base64",
+                    "content": base64.b64encode(output).decode("utf-8"),
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=500, detail="Unexpected output type from the model."
+            )
+
+    return JSONResponse(content={"outputs": encoded_outputs})
 
 
-@router.post("/unload/{cache_key}/{inference_id}")
+@router.put("/load/{inference_id}")
+def load_model(
+    inference_id: str,
+    cache_key: str,
+    lru_size: int,
+    ttl_seconds: int,
+) -> Dict[str, str]:
+    try:
+        model_instance: BaseModel = registry.get_model_instance(inference_id)
+        ModelManager().load_model(
+            inference_id, model_instance, cache_key, lru_size, ttl_seconds
+        )
+        return {"status": "loaded"}
+    except Exception as e:
+        logger.error(f"Failed to load model {inference_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load model")
+
+
+@router.put("/unload")
 def unload_model(cache_key: str, inference_id: str) -> Dict[str, str]:
     ModelManager().unload_model(cache_key, inference_id)
     return {"status": "unloaded"}
 
 
-@router.post("/clear_cache/{cache_key}")
+@router.delete("/clear_cache/{cache_key}")
 def clear_cache(cache_key: str) -> Dict[str, str]:
     ModelManager().clear_cache(cache_key)
     return {"status": "cache cleared"}
 
 
-@router.get("/list")
-async def list_models() -> Dict[str, List[str]]:
+@router.get("/list/loaded")
+async def list_loaded_models() -> Dict[str, List[str]]:
     return ModelManager().list_loaded_models()
+
+
+@router.get("/list/metadata")
+async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
+    return registry.list_inference_ids()
 
 
 @router.post("/check_ttl")
