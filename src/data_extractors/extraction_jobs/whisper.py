@@ -30,7 +30,7 @@ def run_whisper_extractor_job(
     batch_size = model_opts.get_group_batch_size(conn)
     if batch_size > 1:
         whisper_model = faster_whisper.BatchedInferencePipeline(
-            model=whisper_model, batch_size=batch_size
+            model=whisper_model
         )
 
     threshold = model_opts.get_group_threshold(conn)
