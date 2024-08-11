@@ -12,7 +12,7 @@ class InferenceModel(ABC):
     @abstractmethod
     def predict(
         self, inputs: Sequence[PredictionInput]
-    ) -> List[bytes | dict | list | str]:
+    ) -> Sequence[bytes | dict | list | str]:
         pass
 
     @abstractmethod

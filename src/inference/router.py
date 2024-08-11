@@ -80,7 +80,9 @@ def predict(
             processed_inputs.append(PredictionInput(data=None, file=file_data))
 
     # Perform prediction
-    outputs: List[bytes | dict | list | str] = model.predict(processed_inputs)
+    outputs: List[bytes | dict | list | str] = list(
+        model.predict(processed_inputs)
+    )
 
     # Update the model's TTL after the prediction is made
     ModelManager().load_model(
