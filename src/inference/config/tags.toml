@@ -1,0 +1,9 @@
+[group.tags]
+model_class = "wd_tagger"
+config = { }
+metadata = { description = "Danbooru style taggers" }
+
+[group.tags.inference_ids]
+wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
+wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagger-v3" }, metadata = { description = "ConvNext Based Tagger" } }
+wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }

@@ -91,6 +91,11 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     return image
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 class WDTagger(InferenceModel):
     def __init__(self, model_repo: str):
         self.model_repo = model_repo
@@ -114,6 +119,7 @@ class WDTagger(InferenceModel):
         self.devices = get_device()
         self.model.to(self.devices[0])
         self._model_loaded = True
+        logger.info("Model loaded")
 
     def prepare_image(self, image: Image.Image):
         # ensure image is RGB
@@ -252,9 +258,11 @@ class WDTagger(InferenceModel):
             del self.transform
             del self.labels
             clear_cache()
+            logger.info("Model unloaded")
             self._model_loaded = False
 
     def __del__(self):
+        logger.info("Model deleted")
         self.unload()
 
 

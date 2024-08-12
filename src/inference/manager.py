@@ -13,16 +13,24 @@ class ModelManager:
     _instance: Optional["ModelManager"] = None
     _lock: Lock = Lock()
 
+    def __del__(self) -> None:
+        logger.debug("ModelManager deleted")
+
     def __init__(self) -> None:
+        if hasattr(self, "_initialized") and self._initialized:
+            return  # Skip reinitialization if already initialized
+        logger.debug("Initializing ModelManager")
         self._models: Dict[str, InferenceModel] = {}
         self._lru_caches: Dict[str, OrderedDict[str, datetime]] = defaultdict(
             OrderedDict
         )
         self._cache_key_map: Dict[str, Set[str]] = defaultdict(set)
         self._cache_lock: Lock = Lock()
+        self._initialized = True  # Mark the instance as initialized
 
     def __new__(cls) -> "ModelManager":
         if cls._instance is None:
+            logger.debug("Creating ModelManager")
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super(ModelManager, cls).__new__(cls)
@@ -31,6 +39,9 @@ class ModelManager:
     def _remove_from_lru(self, cache_key: str, inference_id: str) -> None:
         """Remove a model from the LRU cache."""
         if inference_id in self._lru_caches[cache_key]:
+            logger.debug(
+                f"Removing model {inference_id} from cache {cache_key}"
+            )
             del self._lru_caches[cache_key][inference_id]
             self._cache_key_map[inference_id].discard(cache_key)
             if not self._cache_key_map[
@@ -42,6 +53,7 @@ class ModelManager:
         """Unload the model when no cache keys reference it."""
         if inference_id in self._models:
             model: InferenceModel = self._models.pop(inference_id)
+            logger.debug(f"Unloading model {inference_id}")
             model.unload()
             del self._cache_key_map[inference_id]
 
@@ -90,6 +102,9 @@ class ModelManager:
             if not self._cache_key_map[
                 oldest_inference_id
             ]:  # Unload if no more cache keys reference this model
+                logger.debug(
+                    f"Unloading model {oldest_inference_id} due to LRU cache eviction"
+                )
                 self._unload_model(oldest_inference_id)
 
     def unload_model(self, cache_key: str, inference_id: str) -> None:
@@ -100,6 +115,7 @@ class ModelManager:
     def clear_cache(self, cache_key: str) -> None:
         """Clear the entire LRU cache for a specific cache key."""
         with self._lock:
+            logger.debug(f"Clearing cache {cache_key}")
             lru_cache: OrderedDict[str, datetime] = self._lru_caches.pop(
                 cache_key, OrderedDict()
             )

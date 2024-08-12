@@ -53,7 +53,13 @@ class ModelRegistry:
         with self._lock:
             latest_time = self._get_latest_modified_time()
             if latest_time > self._last_modified_time:
-                config_data = defaultdict(lambda: {"inference_ids": {}})
+                config_data = defaultdict(
+                    lambda: {
+                        "inference_ids": {},
+                        "group_config": {},
+                        "group_metadata": {},
+                    }
+                )
 
                 # Load and merge configurations from both folders
                 self._load_folder(self.base_folder, config_data)
@@ -75,6 +81,8 @@ class ModelRegistry:
                 try:
                     with open(file, "r") as f:
                         data = tomlkit.load(f)
+                        logger.debug(f"Loading TOML file: {file}")
+                        logger.debug(data)
                     for group_name, group_data in data.get("group", {}).items():
                         if "model_class" not in group_data:
                             raise ValueError(
@@ -132,6 +140,7 @@ class ModelRegistry:
                             }
                 except Exception as e:
                     logger.error(f"Error loading TOML file {file}: {e}")
+                    raise e
 
     def get_model_instance(
         self, group_name: str, inference_id: str
