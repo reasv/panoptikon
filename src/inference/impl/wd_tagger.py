@@ -142,7 +142,7 @@ class WDTagger(InferenceModel):
         self.load()
         image_inputs: List[PILImage.Image] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for idx, input_item in enumerate(inputs):
+        for input_item in inputs:
             if input_item.file:
                 image: PILImage.Image = PILImage.open(
                     BytesIO(input_item.file)
