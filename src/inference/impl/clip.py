@@ -1,6 +1,8 @@
 import multiprocessing as mp
+import uuid
 from io import BytesIO
 from multiprocessing.queues import Queue
+from threading import Lock
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -33,12 +35,12 @@ def worker_process(
 
     while True:
         task: Optional[
-            Tuple[str, Union[torch.Tensor, List[PILImage.Image]]]
+            Tuple[str, str, Union[torch.Tensor, List[PILImage.Image]]]
         ] = task_queue.get()
         if task is None:  # Poison pill to stop the process
             break
 
-        mode, batch = task
+        prediction_id, mode, batch = task
         with torch.inference_mode():
             if mode == "text":
                 tokens: torch.Tensor = torch.tensor(batch).to(
@@ -52,7 +54,7 @@ def worker_process(
                 features: torch.Tensor = model.encode_image(images)
 
             features /= features.norm(dim=-1, keepdim=True)
-            result_queue.put(features.cpu().numpy())
+            result_queue.put((prediction_id, features.cpu().numpy()))
 
     del model
     torch.cuda.empty_cache()
@@ -74,6 +76,7 @@ class ClipModel(InferenceModel):
         self.processes: List[mp.Process] = []
         self.task_queues: List[Queue] = []
         self.result_queues: List[Queue] = []
+        self.predict_lock = Lock()
         self.devices
 
     def load(self) -> None:
@@ -111,63 +114,70 @@ class ClipModel(InferenceModel):
     def predict(
         self, inputs: Sequence[PredictionInput]
     ) -> Sequence[Union[bytes, dict, list, str]]:
-        self.load()
+        with self.predict_lock:
+            self.load()
+            prediction_id = str(uuid.uuid4())
+            text_inputs: List[Tuple[int, str]] = []
+            image_inputs: List[Tuple[int, PILImage.Image]] = []
+            results: List[Optional[bytes]] = [None] * len(inputs)
 
-        text_inputs: List[Tuple[int, str]] = []
-        image_inputs: List[Tuple[int, PILImage.Image]] = []
-        results: List[Optional[bytes]] = [None] * len(inputs)
+            for idx, input_item in enumerate(inputs):
+                if isinstance(input_item.data, str):
+                    text_inputs.append((idx, input_item.data))
+                elif input_item.file:
+                    image: PILImage.Image = PILImage.open(
+                        BytesIO(input_item.file)
+                    ).convert("RGB")
+                    image_inputs.append((idx, image))
 
-        for idx, input_item in enumerate(inputs):
-            if isinstance(input_item.data, str):
-                text_inputs.append((idx, input_item.data))
-            elif input_item.file:
-                image: PILImage.Image = PILImage.open(
-                    BytesIO(input_item.file)
-                ).convert("RGB")
-                image_inputs.append((idx, image))
+            num_gpus: int = len(self.devices)
 
-        num_gpus: int = len(self.devices)
+            if text_inputs:
+                indices, texts = zip(*text_inputs)
+                tokens: torch.Tensor = self.tokenizer(list(texts))
+                text_batches: List[np.ndarray] = np.array_split(
+                    tokens, num_gpus
+                )
 
-        if text_inputs:
-            indices, texts = zip(*text_inputs)
-            tokens: torch.Tensor = self.tokenizer(list(texts))
-            text_batches: List[np.ndarray] = np.array_split(tokens, num_gpus)
+                for i, batch in enumerate(text_batches):
+                    if batch.size > 0:
+                        self.task_queues[i].put((prediction_id, "text", batch))
 
-            for i, batch in enumerate(text_batches):
-                if batch.size > 0:
-                    self.task_queues[i].put(("text", batch))
+                text_features: List[np.ndarray] = []
+                for i in range(num_gpus):
+                    if text_batches[i].size > 0:
+                        result_id, features = self.result_queues[i].get()
+                        if result_id == prediction_id:
+                            text_features.extend(features)
 
-            text_features: List[np.ndarray] = []
-            for i in range(num_gpus):
-                if text_batches[i].size > 0:
-                    text_features.extend(self.result_queues[i].get())
+                for idx, feature in zip(indices, text_features):
+                    results[idx] = feature.tobytes()
 
-            for idx, feature in zip(indices, text_features):
-                results[idx] = feature.tobytes()
+            if image_inputs:
+                indices, images = zip(*image_inputs)
+                image_batches: Sequence[Sequence[PILImage.Image]] = [
+                    list(batch) for batch in np.array_split(images, num_gpus)
+                ]
 
-        if image_inputs:
-            indices, images = zip(*image_inputs)
-            image_batches: Sequence[Sequence[PILImage.Image]] = [
-                list(batch) for batch in np.array_split(images, num_gpus)
-            ]
+                for i, batch in enumerate(image_batches):
+                    if len(batch) > 0:
+                        self.task_queues[i].put((prediction_id, "image", batch))
 
-            for i, batch in enumerate(image_batches):
-                if len(batch) > 0:
-                    self.task_queues[i].put(("image", batch))
+                image_features: List[np.ndarray] = []
+                for i in range(num_gpus):
+                    if len(image_batches[i]) > 0:
+                        result_id, features_img = self.result_queues[i].get()
+                        if result_id == prediction_id:
+                            image_features.extend(features_img)
 
-            image_features: List[np.ndarray] = []
-            for i in range(num_gpus):
-                if len(image_batches[i]) > 0:
-                    image_features.extend(self.result_queues[i].get())
+                for idx, feature in zip(indices, image_features):
+                    results[idx] = feature.tobytes()
 
-            for idx, feature in zip(indices, image_features):
-                results[idx] = feature.tobytes()
-
-        output: List[bytes] = [res for res in results if res is not None]
-        assert len(output) == len(
-            inputs
-        ), "Mismatched output length and input length"
-        return output
+            output: List[bytes] = [res for res in results if res is not None]
+            assert len(output) == len(
+                inputs
+            ), "Mismatched output length and input length"
+            return output
 
     def unload(self) -> None:
         if self._model_loaded:
