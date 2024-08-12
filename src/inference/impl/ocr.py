@@ -13,7 +13,7 @@ from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
 
 
-class DoctrOCRModel(InferenceModel):
+class DoctrModel(InferenceModel):
     def __init__(
         self,
         detection_model: str,
