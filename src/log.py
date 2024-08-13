@@ -40,6 +40,10 @@ def setup_logging():
                     "level": "ERROR",
                     "propagate": False,
                 },
+                "multipart.multipart": {
+                    "level": "WARNING",
+                    "propagate": False,
+                },
             },
         }
     )
