@@ -119,7 +119,7 @@ class WDTagger(InferenceModel):
         self.devices = get_device()
         self.model.to(self.devices[0])
         self._model_loaded = True
-        logger.info("Model loaded")
+        logger.debug(f"Model {self.model_repo} loaded")
 
     def prepare_image(self, image: Image.Image):
         # ensure image is RGB
@@ -161,7 +161,6 @@ class WDTagger(InferenceModel):
                 general_thresh = None  # Use mcut thresholding
             character_thresh = config.get("character_threshold", None)
             tags = self.get_tags(probs, general_thresh, character_thresh)
-            logger.warning(f"gg {tags}")
             outputs.append(
                 {
                     "namespace": "danbooru",
@@ -269,11 +268,12 @@ class WDTagger(InferenceModel):
             del self.transform
             del self.labels
             clear_cache()
-            logger.info("Model unloaded")
+            logger.debug(f"Model {self.model_repo} unloaded")
             self._model_loaded = False
 
     def __del__(self):
-        logger.info("Model deleted")
+        if self._model_loaded:
+            logger.debug(f"Model {self.model_repo} deleted")
         self.unload()
 
 

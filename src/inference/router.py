@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import (
     APIRouter,
-    Body,
     File,
     Form,
     HTTPException,
@@ -43,14 +42,12 @@ def predict(
     lru_size: int = Query(...),
     ttl_seconds: int = Query(...),
     data: str = Form(...),  # The JSON data as a string
-    files: List[UploadFile] = File(...),  # The binary files
+    files: List[UploadFile] = File([]),  # The binary files
 ):
     parsed_json = json.loads(data)
-    parsed_inputs: List[Union[dict, list, str]] = parsed_json.get("inputs", [])
-    logger.debug(f"Received inputs: {parsed_inputs}")
-    # Initialize a list for PredictionInput objects
+    inputs: List[Union[dict, list, str]] = parsed_json.get("inputs", [])
     prediction_inputs = [
-        PredictionInput(data=item, file=None) for item in parsed_inputs
+        PredictionInput(data=item, file=None) for item in inputs
     ]
     if not prediction_inputs:
         raise HTTPException(status_code=400, detail="No inputs provided")
@@ -69,8 +66,6 @@ def predict(
                 detail=f"Invalid index {index} in Content-Disposition header",
             )
 
-    logger.debug(f"Received inputs: {len(prediction_inputs)}")
-
     # Instantiate the model (without loading)
     model_instance: InferenceModel = registry.get_model_instance(
         group, inference_id
@@ -81,9 +76,9 @@ def predict(
         f"{group}/{inference_id}", model_instance, cache_key, lru_size, -1
     )
 
-    logger.debug(f"Processing inputs for model {inference_id}")
-    logger.debug(f"Inputs: {parsed_inputs}")
-    logger.debug(f"Files: {files}")
+    logger.debug(
+        f"Processing {len(prediction_inputs)} ({len(files)} files) inputs for model {group}/{inference_id}"
+    )
 
     try:
         # Perform prediction
@@ -103,7 +98,6 @@ def predict(
             ttl_seconds,
         )
 
-    logger.debug(f"Outputs: {outputs}")
     # Handle the outputs by returning a streaming response if there is only one binary output
     if len(outputs) == 1 and isinstance(outputs[0], bytes):
         return StreamingResponse(
@@ -155,7 +149,6 @@ def extract_index_from_content_disposition(header: str) -> Optional[int]:
     """Extract the 'index' from the Content-Disposition header."""
     if not header:
         return None
-    logger.debug(header)
     parts = header.split(";")
     for part in parts:
         part = part.strip()
