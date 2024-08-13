@@ -151,6 +151,8 @@ class WDTagger(InferenceModel):
             else:
                 raise ValueError("Tagger requires image inputs.")
 
+        logger.debug(f"Running inference on {len(image_inputs)} images")
+
         prob_list = self.run_batch(image_inputs, 0)
         outputs: List[dict] = []
         for probs, config in zip(prob_list, configs):
@@ -159,6 +161,7 @@ class WDTagger(InferenceModel):
                 general_thresh = None  # Use mcut thresholding
             character_thresh = config.get("character_threshold", None)
             tags = self.get_tags(probs, general_thresh, character_thresh)
+            logger.warning(f"gg {tags}")
             outputs.append(
                 {
                     "namespace": "danbooru",
@@ -171,8 +174,6 @@ class WDTagger(InferenceModel):
                     "character_mcut": tags.general_mcut,
                 }
             )
-
-        outputs: List[dict] = []
 
         return outputs
 
@@ -214,8 +215,10 @@ class WDTagger(InferenceModel):
         labels = list(zip(self.labels.names, probs.numpy()))
 
         # First 4 labels_data are actually ratings
-        rating_labels = dict([labels[i] for i in self.labels.rating])
-
+        rating_labels_all = [labels[i] for i in self.labels.rating]
+        rating_labels = dict(
+            [(label, float(probs)) for label, probs in rating_labels_all]
+        )
         # General labels, pick any where prediction confidence > threshold
         general_labels_all = [labels[i] for i in self.labels.general]
 
@@ -227,7 +230,11 @@ class WDTagger(InferenceModel):
             general_thresh = general_mcut
 
         general_labels = dict(
-            [x for x in general_labels_all if x[1] > general_thresh]
+            [
+                (label, float(probs))
+                for label, probs in general_labels_all
+                if probs > general_thresh
+            ]
         )
 
         character_labels_all = [labels[i] for i in self.labels.character]
@@ -241,7 +248,11 @@ class WDTagger(InferenceModel):
 
         # Character labels, pick any where prediction confidence > threshold
         character_labels = dict(
-            [x for x in character_labels_all if x[1] > character_thresh]
+            [
+                (label, float(probs))
+                for label, probs in character_labels_all
+                if probs > character_thresh
+            ]
         )
 
         return TagResult(

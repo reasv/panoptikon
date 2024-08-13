@@ -1,12 +1,14 @@
 import base64
+import json
 import logging
 from io import BytesIO
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import (
     APIRouter,
     Body,
     File,
+    Form,
     HTTPException,
     Query,
     Response,
@@ -40,18 +42,34 @@ def predict(
     cache_key: str = Query(...),
     lru_size: int = Query(...),
     ttl_seconds: int = Query(...),
-    inputs: Union[List[Union[dict, str]], None] = Body(None),  # JSON inputs
-    file_inputs: List[UploadFile] = File(
-        []
-    ),  # Optional file inputs (multipart form-data)
+    data: str = Form(...),  # The JSON data as a string
+    files: List[UploadFile] = File(...),  # The binary files
 ):
-    # Ensure that if both inputs and file_inputs are provided, they have the same length
-    if inputs and file_inputs:
-        if len(inputs) != len(file_inputs):
+    parsed_json = json.loads(data)
+    parsed_inputs: List[Union[dict, list, str]] = parsed_json.get("inputs", [])
+    logger.debug(f"Received inputs: {parsed_inputs}")
+    # Initialize a list for PredictionInput objects
+    prediction_inputs = [
+        PredictionInput(data=item, file=None) for item in parsed_inputs
+    ]
+    if not prediction_inputs:
+        raise HTTPException(status_code=400, detail="No inputs provided")
+
+    # Populate PredictionInput objects
+    for file in files:
+        # Extract the index from the Content-Disposition header
+        content_disposition = file.headers.get("content-disposition")
+        index = extract_index_from_content_disposition(content_disposition)
+
+        if index is not None and 0 <= index < len(prediction_inputs):
+            prediction_inputs[index].file = file.file.read()
+        else:
             raise HTTPException(
                 status_code=400,
-                detail="JSON inputs and file inputs must have the same length.",
+                detail=f"Invalid index {index} in Content-Disposition header",
             )
+
+    logger.debug(f"Received inputs: {len(prediction_inputs)}")
 
     # Instantiate the model (without loading)
     model_instance: InferenceModel = registry.get_model_instance(
@@ -63,27 +81,14 @@ def predict(
         f"{group}/{inference_id}", model_instance, cache_key, lru_size, -1
     )
 
-    # Process inputs into a list of PredictionInput objects
-    processed_inputs = []
+    logger.debug(f"Processing inputs for model {inference_id}")
+    logger.debug(f"Inputs: {parsed_inputs}")
+    logger.debug(f"Files: {files}")
 
-    if inputs and file_inputs:
-        # Combine JSON and file inputs into PredictionInput instances
-        for data_input, file_input in zip(inputs, file_inputs):
-            file_data = file_input.file.read()
-            processed_inputs.append(
-                PredictionInput(data=data_input, file=file_data)
-            )
-    elif inputs:
-        for data_input in inputs:
-            processed_inputs.append(PredictionInput(data=data_input, file=None))
-    elif file_inputs:
-        for file_input in file_inputs:
-            file_data = file_input.file.read()
-            processed_inputs.append(PredictionInput(data=None, file=file_data))
     try:
         # Perform prediction
         outputs: List[bytes | dict | list | str] = list(
-            model.predict(processed_inputs)
+            model.predict(prediction_inputs)
         )
     except Exception as e:
         logger.error(f"Prediction failed for model {inference_id}: {e}")
@@ -98,6 +103,7 @@ def predict(
             ttl_seconds,
         )
 
+    logger.debug(f"Outputs: {outputs}")
     # Handle the outputs by returning a streaming response if there is only one binary output
     if len(outputs) == 1 and isinstance(outputs[0], bytes):
         return StreamingResponse(
@@ -143,6 +149,22 @@ def predict(
             )
 
     return JSONResponse(content={"outputs": encoded_outputs})
+
+
+def extract_index_from_content_disposition(header: str) -> Optional[int]:
+    """Extract the 'index' from the Content-Disposition header."""
+    if not header:
+        return None
+    logger.debug(header)
+    parts = header.split(";")
+    for part in parts:
+        part = part.strip()
+        if part.startswith("filename="):
+            try:
+                return int(part.split("=")[1].strip().strip('"'))
+            except (IndexError, ValueError):
+                return None
+    return None
 
 
 @router.put("/load/{group}/{inference_id}")
