@@ -21,3 +21,13 @@ db_resnet50_master = { config = { detection_model = "db_resnet50", recognition_m
 db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_small" }, metadata = { description = "ResNet50 with ViTSTR Small" } }
 db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ResNet50 with ViTSTR Base" } }
 db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "ResNet50 with PARSEQ" } }
+
+[group.textembed]
+model_class = "sentence_transformers"
+config = {}
+metadata = { description = "Sentence Transformers Text Embeddings" }
+
+[group.textembed.inference_ids]
+all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer" } }
+all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
+stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5" }, metadata = { description = "Stella English 400M Sentence Transformer" } }

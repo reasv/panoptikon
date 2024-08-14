@@ -16,6 +16,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.inference.impl.ocr import DoctrModel
+from src.inference.impl.sentence_transformers import SentenceTransformersModel
 from src.inference.impl.wd_tagger import WDTagger
 from src.inference.manager import InferenceModel, ModelManager
 from src.inference.registry import ModelRegistry, get_base_config_folder
@@ -28,6 +29,7 @@ registry = ModelRegistry(
 )
 registry.register_model("wd_tagger", WDTagger)
 registry.register_model("doctr", DoctrModel)
+registry.register_model("sentence_transformers", SentenceTransformersModel)
 
 router = APIRouter(
     prefix="/inference",

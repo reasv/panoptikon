@@ -67,6 +67,3 @@ class SentenceTransformersModel(InferenceModel):
             del self.pool
             clear_cache()
             self._model_loaded = False
-
-
-ModelRegistry.register_model("sentence_transformers", SentenceTransformersModel)
