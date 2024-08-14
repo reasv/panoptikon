@@ -156,16 +156,16 @@ class ModelRegistry:
                 )
             inference_id_config = group_data["inference_ids"][inference_id]
             model_config = inference_id_config["config"]
-            model_class_name = model_config["inf_impl"]
+            model_class_name = model_config["impl_class"]
             model_class = self._registry.get(model_class_name)
             if not model_class:
                 raise ValueError(
                     f"Inference Implementation class '{model_class_name}' not found in registry for inference_id '{group_name}/{inference_id}'"
                 )
-            # Instantiate the model with the merged config but without the inf_impl
+            # Instantiate the model with the merged config but without the impl_class
             # Copy the config to avoid modifying the original
             model_config = dict(model_config)
-            model_config.pop("inf_impl", None)
+            model_config.pop("impl_class", None)
             model_instance = model_class(**model_config)
             return model_instance
 

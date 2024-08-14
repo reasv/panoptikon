@@ -1,5 +1,5 @@
 [group.tags]
-config = { inf_impl = "wd_tagger" }
+config = { impl_class = "wd_tagger" }
 metadata = { description = "Danbooru style taggers" }
 
 [group.tags.inference_ids]
@@ -8,7 +8,7 @@ wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagge
 wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
 
 [group.doctr]
-config = { inf_impl = "doctr" }
+config = { impl_class = "doctr" }
 metadata = { description = "DocTR OCR" }
 
 [group.doctr.inference_ids]
@@ -21,7 +21,7 @@ db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognit
 db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "PARSEQ" } }
 
 [group.textembed]
-config = { inf_impl = "sentence_transformers" }
+config = { impl_class = "sentence_transformers" }
 metadata = { description = "Sentence Transformers Text Embeddings" }
 
 [group.textembed.inference_ids]
@@ -30,7 +30,7 @@ all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { 
 stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5" }, metadata = { description = "Stella English 400M Sentence Transformer" } }
 
 [group.whisper]
-config = { inf_impl = "faster_whisper" }
+config = { impl_class = "faster_whisper" }
 metadata = { description = "Whisper models for speech recognition" }
 
 [group.whisper.inference_ids]
@@ -52,7 +52,7 @@ distil-large-v2 = { config = { model_name = "Systran/faster-distil-whisper-large
 distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-large-v3" }, metadata = { description = "Distilled Large Whisper Model v3" } }
 
 [group.clip]
-config = { inf_impl = "openclip" }
+config = { impl_class = "openclip" }
 metadata = { description = "OpenCLIP models for text and image embedding" }
 
 [group.clip.inference_ids]
