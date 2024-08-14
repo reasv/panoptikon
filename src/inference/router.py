@@ -14,12 +14,12 @@ from src.inference.utils import encode_output_response, parse_input_request
 
 logger = logging.getLogger(__name__)
 
-registry = ModelRegistry(user_folder="config/inference")
-registry.register_model(WDTagger)
-registry.register_model(DoctrModel)
-registry.register_model(SentenceTransformersModel)
-registry.register_model(FasterWhisperModel)
-registry.register_model(ClipModel)
+ModelRegistry.set_user_folder("config/inference")
+ModelRegistry.register_model(WDTagger)
+ModelRegistry.register_model(DoctrModel)
+ModelRegistry.register_model(SentenceTransformersModel)
+ModelRegistry.register_model(FasterWhisperModel)
+ModelRegistry.register_model(ClipModel)
 
 router = APIRouter(
     prefix="/inference",
@@ -42,14 +42,10 @@ def predict(
     logger.debug(
         f"Processing {len(inputs)} ({len(files)} files) inputs for model {group}/{inference_id}"
     )
-    # Instantiate the model (without loading)
-    model_instance: InferenceModel = registry.get_model_instance(
-        group, inference_id
-    )
 
     # Load the model with cache key, LRU size, and long TTL to avoid unloading during prediction
     model: InferenceModel = ModelManager().load_model(
-        f"{group}/{inference_id}", model_instance, cache_key, lru_size, -1
+        f"{group}/{inference_id}", cache_key, lru_size, -1
     )
 
     try:
@@ -62,7 +58,6 @@ def predict(
         # Update the model's TTL after the prediction is made
         ModelManager().load_model(
             f"{group}/{inference_id}",
-            model_instance,
             cache_key,
             lru_size,
             ttl_seconds,
@@ -80,12 +75,8 @@ def load_model(
     ttl_seconds: int,
 ) -> Dict[str, str]:
     try:
-        model_instance: InferenceModel = registry.get_model_instance(
-            group, inference_id
-        )
         ModelManager().load_model(
             f"{group}/{inference_id}",
-            model_instance,
             cache_key,
             lru_size,
             ttl_seconds,
@@ -119,7 +110,7 @@ async def list_loaded_models() -> Dict[str, List[str]]:
 
 @router.get("/metadata")
 async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
-    return registry.list_inference_ids()
+    return ModelRegistry().list_inference_ids()
 
 
 @router.post("/check_ttl")

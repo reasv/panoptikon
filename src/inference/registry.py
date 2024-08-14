@@ -13,21 +13,34 @@ logger = logging.getLogger(__name__)
 
 
 class ModelRegistry:
-    _registry: Dict[str, Type["InferenceModel"]] = (
-        {}
-    )  # Class property shared across all instances
+    _registry: Dict[str, Type["InferenceModel"]] = {}
+    _instance: Optional["ModelRegistry"] = (
+        None  # Class-level variable to hold the singleton instance
+    )
+    _user_folder: Optional[Path] = None
 
-    def __init__(
-        self,
-        user_folder: str,
-    ) -> None:
-        self._config: Dict[str, Dict[str, Any]] = {}  # Instance property
-        self._last_modified_time: float = 0.0  # Instance property
-        self._lock: Lock = Lock()  # Instance property, unique to each instance
-        self.base_folder = get_base_config_folder()  # Instance property
-        self.user_folder = Path(user_folder)  # Instance property
-        self.allow_inference_id_overrides = False  # Instance property
-        self.reload_registry()
+    def __new__(cls, *args, **kwargs) -> "ModelRegistry":
+        """Override the __new__ method to ensure a single instance."""
+        if cls._instance is None:
+            cls._instance = super(ModelRegistry, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if not hasattr(
+            self, "_initialized"
+        ):  # Ensure __init__ is only run once
+            self._config: Dict[str, Dict[str, Any]] = {}
+            self._last_modified_time: float = 0.0
+            self._lock: Lock = Lock()
+            self.base_folder = get_base_config_folder()
+            self.allow_inference_id_overrides = False
+            self.reload_registry()
+            self._initialized = True  # Mark the instance as initialized
+
+    @classmethod
+    def set_user_folder(cls, folder: str) -> None:
+        """Set the path to the user configuration folder."""
+        cls._user_folder = Path(folder)
 
     @classmethod
     def register_model(cls, model_class: Type["InferenceModel"]) -> None:
@@ -37,7 +50,11 @@ class ModelRegistry:
     def _get_latest_modified_time(self) -> float:
         """Get the latest modified time of all TOML files in the config folders."""
         latest_time = 0.0
-        for folder in [self.base_folder, self.user_folder]:
+        for folder in [
+            f
+            for f in [self.base_folder, self._user_folder]
+            if isinstance(f, Path)
+        ]:
             for file in sorted(folder.glob("*.toml")):
                 file_time = file.stat().st_mtime
                 if file_time > latest_time:
@@ -59,7 +76,8 @@ class ModelRegistry:
 
                 # Load and merge configurations from both folders
                 self._load_folder(self.base_folder, config_data)
-                self._load_folder(self.user_folder, config_data)
+                if self._user_folder:
+                    self._load_folder(self._user_folder, config_data)
 
                 # Safely update the config
                 self._config = dict(config_data)
@@ -123,10 +141,10 @@ class ModelRegistry:
                     logger.error(f"Error loading TOML file {file}: {e}")
                     raise e
 
-    def get_model_instance(
-        self, group_name: str, inference_id: str
-    ) -> "InferenceModel":
+    def get_model_instance(self, full_inference_id: str) -> "InferenceModel":
         """Retrieve and instantiate a BaseModel subclass based on the inference ID and group name."""
+
+        group_name, inference_id = full_inference_id.split("/", 1)
         self.reload_registry()  # Ensure the registry is up to date before retrieving a model
         with self._lock:
             if group_name not in self._config:

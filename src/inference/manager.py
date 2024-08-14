@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Dict, List, Optional, Set
 
 from src.inference.model import InferenceModel
+from src.inference.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,6 @@ class ModelManager:
     def load_model(
         self,
         inference_id: str,
-        model_instance: InferenceModel,
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
@@ -78,6 +78,9 @@ class ModelManager:
             # Load the model only after managing the LRU cache
             if inference_id not in self._models:
                 try:
+                    model_instance = ModelRegistry().get_model_instance(
+                        inference_id
+                    )
                     model_instance.load()
                 except Exception as e:
                     logger.error(f"Failed to load model {inference_id}: {e}")
