@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import requests as r
 from requests import Response
@@ -66,34 +66,34 @@ class InferenceAPIClient:
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-    ):
+    ) -> Dict[str, Any]:
         url = f"{self.base_url}/load/{inference_id}"
         params = {
             "cache_key": cache_key,
             "lru_size": lru_size,
             "ttl_seconds": ttl_seconds,
         }
-        handle_resp(r.put(url, params=params))
+        return handle_resp(r.put(url, params=params))
 
     def unload_model(
         self,
         inference_id: str,
         cache_key: str,
-    ):
+    ) -> Dict[str, Any]:
         url = f"{self.base_url}/cache/{cache_key}/{inference_id}"
-        handle_resp(r.delete(url))
+        return handle_resp(r.delete(url))
 
     def clear_cache(
         self,
         cache_key: str,
-    ):
-        handle_resp(r.delete(f"{self.base_url}/cache/{cache_key}"))
+    ) -> Dict[str, Any]:
+        return handle_resp(r.delete(f"{self.base_url}/cache/{cache_key}"))
 
-    def get_cached_models(self):
-        handle_resp(r.get(f"{self.base_url}/cache"))
+    def get_cached_models(self) -> Dict[str, Any]:
+        return handle_resp(r.get(f"{self.base_url}/cache"))
 
-    def get_metadata(self):
-        handle_resp(r.get(f"{self.base_url}/metadata"))
+    def get_metadata(self) -> Dict[str, dict]:
+        return handle_resp(r.get(f"{self.base_url}/metadata"))
 
 
 def handle_resp(response: Response):
@@ -102,6 +102,7 @@ def handle_resp(response: Response):
     else:
         logger.debug("Response content:", response.content)
         response.raise_for_status()
+        raise ValueError("Unexpected response")
 
 
 def handle_predict_resp(
