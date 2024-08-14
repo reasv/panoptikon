@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi_utilities.repeat.repeat_every import repeat_every
 
 from src.inference.impl.clip import ClipModel
 from src.inference.impl.ocr import DoctrModel
@@ -113,7 +114,12 @@ async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
     return ModelRegistry().list_inference_ids()
 
 
-@router.post("/check_ttl")
-async def check_ttl() -> Dict[str, str]:
+@repeat_every(seconds=10, logger=logger)
+def check_ttl() -> Dict[str, str]:
+    """Check the TTL of all loaded models and unload expired ones.
+    Should be called periodically to ensure that models are not kept in memory indefinitely.
+    Returns:
+        Dict[str, str]: _description_
+    """
     ModelManager().check_ttl_expired()
     return {"status": "ttl checked"}
