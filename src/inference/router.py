@@ -115,11 +115,8 @@ async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
 
 
 @repeat_every(seconds=10, logger=logger)
-def check_ttl() -> Dict[str, str]:
+def check_ttl():
     """Check the TTL of all loaded models and unload expired ones.
     Should be called periodically to ensure that models are not kept in memory indefinitely.
-    Returns:
-        Dict[str, str]: _description_
     """
     ModelManager().check_ttl_expired()
-    return {"status": "ttl checked"}
