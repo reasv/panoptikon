@@ -88,7 +88,7 @@ def load_model(
         raise HTTPException(status_code=500, detail="Failed to load model")
 
 
-@router.put("/unload/{group}/{inference_id}")
+@router.delete("/cache/{cache_key}/{group}/{inference_id}")
 def unload_model(
     group: str,
     inference_id: str,
@@ -105,12 +105,12 @@ def clear_cache(cache_key: str) -> Dict[str, str]:
 
 
 @router.get("/cache")
-async def list_loaded_models() -> Dict[str, List[str]]:
+async def get_cached_models() -> Dict[str, List[str]]:
     return ModelManager().list_loaded_models()
 
 
 @router.get("/metadata")
-async def list_model_metadata() -> Dict[str, Dict[str, Any]]:
+async def get_metadata() -> Dict[str, Dict[str, Any]]:
     return ModelRegistry().list_inference_ids()
 
 
