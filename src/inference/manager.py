@@ -10,6 +10,10 @@ from src.inference.registry import ModelRegistry
 logger = logging.getLogger(__name__)
 
 
+def never() -> datetime:
+    return datetime.max
+
+
 class ModelManager:
     _instance: Optional["ModelManager"] = None
     _lock: Lock = Lock()
@@ -67,10 +71,18 @@ class ModelManager:
     ) -> InferenceModel:
         with self._lock:
 
-            # Update the model in the LRU cache with the new expiration time
+            # Update the model in the LRU cache
+            self._cache_key_map[inference_id].add(cache_key)
             if inference_id in self._lru_caches[cache_key]:
                 self._lru_caches[cache_key].move_to_end(inference_id)
-            self._cache_key_map[inference_id].add(cache_key)
+
+            # Calculate the new expiration time
+            expiration_time = (
+                (datetime.now() + timedelta(seconds=ttl_seconds))
+                if ttl_seconds >= 0
+                else never()
+            )
+            self._lru_caches[cache_key][inference_id] = expiration_time
 
             # Resize LRU cache if necessary before loading the model
             self._resize_lru(cache_key, lru_size)
@@ -88,12 +100,6 @@ class ModelManager:
                     raise e
                 self._models[inference_id] = model_instance
 
-            # Calculate the new expiration time
-            expiration_time: datetime = datetime.now() + timedelta(
-                seconds=ttl_seconds if ttl_seconds >= 0 else 10**10
-            )
-            self._lru_caches[cache_key][inference_id] = expiration_time
-
             return self._models[inference_id]
 
     def _resize_lru(self, cache_key: str, lru_size: int) -> None:
@@ -106,13 +112,14 @@ class ModelManager:
                 oldest_inference_id
             ]:  # Unload if no more cache keys reference this model
                 logger.debug(
-                    f"Unloading model {oldest_inference_id} due to LRU cache eviction"
+                    f"{oldest_inference_id} evicted from LRU cache {cache_key}"
                 )
                 self._unload_model(oldest_inference_id)
 
     def unload_model(self, cache_key: str, inference_id: str) -> None:
         """Explicitly unload a model and remove it from the cache."""
         with self._lock:
+            logger.debug(f"{inference_id} unload requested")
             self._remove_from_lru(cache_key, inference_id)
 
     def clear_cache(self, cache_key: str) -> None:
@@ -145,4 +152,5 @@ class ModelManager:
                     if datetime.now() > expiration_time:
                         expired_models.append(inference_id)
                 for inference_id in expired_models:
+                    logger.debug(f"{inference_id} TTL expired")
                     self._remove_from_lru(cache_key, inference_id)
