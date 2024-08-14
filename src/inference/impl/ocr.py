@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import re
 from io import BytesIO
 from multiprocessing.queues import Queue
 from typing import List, Optional, Sequence, Tuple, Union
@@ -52,14 +53,14 @@ class DoctrModel(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        image_inputs: List[Tuple[int, np.ndarray]] = []
+        image_inputs: List[np.ndarray] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for idx, input_item in enumerate(inputs):
+        for input_item in inputs:
             if input_item.file:
                 image: PILImage.Image = PILImage.open(
                     BytesIO(input_item.file)
                 ).convert("RGB")
-                image_inputs.append((idx, np.array(image)))
+                image_inputs.append((np.array(image)))
             else:
                 raise ValueError("OCR requires image inputs.")
 
@@ -94,6 +95,10 @@ class DoctrModel(InferenceModel):
         for file_text, language, word_confidence in zip(
             files_texts, languages, word_confidences
         ):
+            file_text = file_text.strip()
+            file_text = clean_whitespace(file_text)
+            if not file_text:
+                continue
             avg_confidence = sum(word_confidence) / len(word_confidences)
             assert (
                 isinstance(language["confidence"], float)
@@ -118,3 +123,10 @@ class DoctrModel(InferenceModel):
             del self.model
             clear_cache()
             self._model_loaded = False
+
+
+def clean_whitespace(input_string: str) -> str:
+    # Replace three or more consecutive whitespaces with just two
+    cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
+
+    return cleaned_string

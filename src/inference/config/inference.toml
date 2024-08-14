@@ -1,0 +1,23 @@
+[group.tags]
+model_class = "wd_tagger"
+config = { }
+metadata = { description = "Danbooru style taggers" }
+
+[group.tags.inference_ids]
+wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
+wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagger-v3" }, metadata = { description = "ConvNext Based Tagger" } }
+wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
+
+[group.doctr]
+model_class = "doctr"
+config = { }
+metadata = { description = "DocTR OCR" }
+
+[group.doctr.inference_ids]
+db_resnet50_crnn_vgg16_bn = { config = { detection_model = "db_resnet50", recognition_model = "crnn_vgg16_bn" }, metadata = { description = "ResNet50 with CRNN VGG16 BN" } }
+db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "ResNet50 with CRNN MobileNet V3 Small" } }
+db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "ResNet50 with CRNN MobileNet V3 Large" } }
+db_resnet50_master = { config = { detection_model = "db_resnet50", recognition_model = "master" }, metadata = { description = "ResNet50 with MASTER" } }
+db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_small" }, metadata = { description = "ResNet50 with ViTSTR Small" } }
+db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ResNet50 with ViTSTR Base" } }
+db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "ResNet50 with PARSEQ" } }

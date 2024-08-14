@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from src.inference.impl.ocr import DoctrModel
 from src.inference.impl.wd_tagger import WDTagger
 from src.inference.manager import InferenceModel, ModelManager
 from src.inference.registry import ModelRegistry, get_base_config_folder
@@ -26,6 +27,7 @@ registry = ModelRegistry(
     base_folder=str(get_base_config_folder()), user_folder="inference_config"
 )
 registry.register_model("wd_tagger", WDTagger)
+registry.register_model("doctr", DoctrModel)
 
 router = APIRouter(
     prefix="/inference",
