@@ -5,7 +5,6 @@ from PIL import Image as PILImage
 
 from src.inference.impl.utils import clear_cache, get_device
 from src.inference.model import InferenceModel
-from src.inference.registry import ModelRegistry
 from src.inference.types import PredictionInput
 
 
@@ -22,6 +21,10 @@ class ClipModel(InferenceModel):
         self.context_length: int | None = context_length
         self.init_args = kwargs
         self._model_loaded: bool = False
+
+    @classmethod
+    def name(cls) -> str:
+        return "openclip"
 
     def load(self) -> None:
         if self._model_loaded:

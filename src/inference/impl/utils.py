@@ -1,3 +1,7 @@
+import numpy as np
+from PIL import Image
+
+
 def get_device():
     import torch
 
@@ -26,3 +30,43 @@ def clear_cache() -> None:
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
         return torch.cuda.empty_cache()
     # No need to clear cache for MPS or CPU as they handle memory differently
+
+
+def mcut_threshold(probs: np.ndarray) -> float:
+    """
+    Maximum Cut Thresholding (MCut)
+    Largeron, C., Moulin, C., & Gery, M. (2012). MCut: A Thresholding Strategy
+     for Multi-label Classification. In 11th International Symposium, IDA 2012
+     (pp. 172-183).
+    """
+    sorted_probs = probs[probs.argsort()[::-1]]
+    difs = sorted_probs[:-1] - sorted_probs[1:]
+    t = difs.argmax()
+    thresh = (sorted_probs[t] + sorted_probs[t + 1]) / 2
+    return thresh
+
+
+def pil_pad_square(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    # get the largest dimension so we can pad to a square
+    px = max(image.size)
+    # pad to square with white background
+    canvas = Image.new("RGB", (px, px), (255, 255, 255))
+    canvas.paste(image, ((px - w) // 2, (px - h) // 2))
+    return canvas
+
+
+def pil_ensure_rgb(image: Image.Image) -> Image.Image:
+    # convert to RGB/RGBA if not already (deals with palette images etc.)
+    if image.mode not in ["RGB", "RGBA"]:
+        image = (
+            image.convert("RGBA")
+            if "transparency" in image.info
+            else image.convert("RGB")
+        )
+    # convert RGBA to RGB with white background
+    if image.mode == "RGBA":
+        canvas = Image.new("RGBA", image.size, (255, 255, 255))
+        canvas.alpha_composite(image)
+        image = canvas.convert("RGB")
+    return image

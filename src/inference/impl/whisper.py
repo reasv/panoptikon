@@ -1,12 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
 from src.inference.impl.utils import clear_cache, get_device
 from src.inference.model import InferenceModel
-from src.inference.registry import ModelRegistry
 from src.inference.types import PredictionInput
 
 
@@ -21,6 +19,10 @@ class FasterWhisperModel(InferenceModel):
         self.init_args = init_args
         self.transcribe_args = transcribe_args
         self._model_loaded: bool = False
+
+    @classmethod
+    def name(cls) -> str:
+        return "faster_whisper"
 
     def load(self) -> None:
         from faster_whisper import WhisperModel

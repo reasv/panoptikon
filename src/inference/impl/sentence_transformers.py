@@ -2,7 +2,6 @@ from typing import List, Sequence
 
 from src.inference.impl.utils import clear_cache, get_device
 from src.inference.model import InferenceModel
-from src.inference.registry import ModelRegistry
 from src.inference.types import PredictionInput
 
 
@@ -17,6 +16,10 @@ class SentenceTransformersModel(InferenceModel):
         self.init_args = init_args
         self.encode_args = encode_args
         self._model_loaded: bool = False
+
+    @classmethod
+    def name(cls) -> str:
+        return "sentence_transformers"
 
     def load(self) -> None:
         from sentence_transformers import SentenceTransformer

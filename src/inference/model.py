@@ -5,6 +5,11 @@ from src.inference.types import PredictionInput
 
 
 class InferenceModel(ABC):
+    @classmethod
+    @abstractmethod
+    def name(cls) -> str:
+        pass
+
     @abstractmethod
     def load(self) -> None:
         pass

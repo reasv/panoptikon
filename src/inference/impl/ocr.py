@@ -1,12 +1,8 @@
-import multiprocessing as mp
 import re
 from io import BytesIO
-from multiprocessing.queues import Queue
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Sequence
 
 import numpy as np
-import open_clip
-import torch
 from PIL import Image as PILImage
 
 from src.inference.impl.utils import clear_cache, get_device
@@ -30,7 +26,12 @@ class DoctrModel(InferenceModel):
         self.init_args = kwargs
         self._model_loaded: bool = False
 
+    @classmethod
+    def name(cls) -> str:
+        return "doctr"
+
     def load(self) -> None:
+        import torch
         from doctr.models import ocr_predictor
 
         if self._model_loaded:

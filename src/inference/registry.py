@@ -19,24 +19,20 @@ class ModelRegistry:
 
     def __init__(
         self,
-        base_folder: str,
         user_folder: str,
-        allow_inference_id_overrides: bool = False,
     ) -> None:
         self._config: Dict[str, Dict[str, Any]] = {}  # Instance property
         self._last_modified_time: float = 0.0  # Instance property
         self._lock: Lock = Lock()  # Instance property, unique to each instance
-        self.base_folder = Path(base_folder)  # Instance property
+        self.base_folder = get_base_config_folder()  # Instance property
         self.user_folder = Path(user_folder)  # Instance property
-        self.allow_inference_id_overrides = allow_inference_id_overrides
+        self.allow_inference_id_overrides = False  # Instance property
         self.reload_registry()
 
     @classmethod
-    def register_model(
-        cls, model_name: str, model_class: Type["InferenceModel"]
-    ) -> None:
-        """Register a BaseModel subclass with a given name."""
-        cls._registry[model_name] = model_class
+    def register_model(cls, model_class: Type["InferenceModel"]) -> None:
+        """Register a BaseModel subclass"""
+        cls._registry[model_class.name()] = model_class
 
     def _get_latest_modified_time(self) -> float:
         """Get the latest modified time of all TOML files in the config folders."""
@@ -82,27 +78,12 @@ class ModelRegistry:
                     with open(file, "r") as f:
                         data = tomlkit.load(f)
                         logger.debug(f"Loading TOML file: {file}")
-                        logger.debug(data)
+
+                    self.allow_inference_id_overrides = data.get(
+                        "allow_override", False
+                    )
                     for group_name, group_data in data.get("group", {}).items():
-                        if "model_class" not in group_data:
-                            raise ValueError(
-                                f"Group '{group_name}' in {file} must define a 'model_class'"
-                            )
-
                         # Store or merge group-level config and metadata separately
-                        if "model_class" in config_data[group_name]:
-                            if (
-                                config_data[group_name]["model_class"]
-                                != group_data["model_class"]
-                            ):
-                                raise ValueError(
-                                    f"Conflicting model classes for group '{group_name}' in {file}"
-                                )
-                        else:
-                            config_data[group_name]["model_class"] = group_data[
-                                "model_class"
-                            ]
-
                         # Merge group config, giving precedence to the latest loaded
                         config_data[group_name]["group_config"].update(
                             group_data.get("config", {})
@@ -155,15 +136,19 @@ class ModelRegistry:
                 raise ValueError(
                     f"Inference ID '{inference_id}' not found in group '{group_name}'"
                 )
-            config = group_data["inference_ids"][inference_id]
-            model_class_name = group_data["model_class"]
+            inference_id_config = group_data["inference_ids"][inference_id]
+            model_config = inference_id_config["config"]
+            model_class_name = model_config["inf_impl"]
             model_class = self._registry.get(model_class_name)
             if not model_class:
                 raise ValueError(
-                    f"Model class '{model_class_name}' not found in registry for inference_id '{inference_id}'"
+                    f"Inference Implementation class '{model_class_name}' not found in registry for inference_id '{group_name}/{inference_id}'"
                 )
-
-            model_instance = model_class(**config["config"])
+            # Instantiate the model with the merged config but without the inf_impl
+            # Copy the config to avoid modifying the original
+            model_config = dict(model_config)
+            model_config.pop("inf_impl", None)
+            model_instance = model_class(**model_config)
             return model_instance
 
     def get_metadata(
@@ -202,12 +187,10 @@ class ModelRegistry:
             return result
 
 
-import os
-from pathlib import Path
-
-
 def get_base_config_folder() -> Path:
     """Return the path to the base configuration folder inside the source directory."""
+    if folder := os.getenv("BASE_INFERENCE_CONFIG_FOLDER"):
+        return Path(folder)
     # Get the absolute path of the current script's directory
     current_script_path = Path(__file__).resolve()
 

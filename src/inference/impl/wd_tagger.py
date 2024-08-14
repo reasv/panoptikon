@@ -1,19 +1,19 @@
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
-import huggingface_hub
 import numpy as np
 import pandas as pd
-import timm
-import torch
 from PIL import Image
 from PIL import Image as PILImage
-from timm.data import create_transform, resolve_data_config
-from torch import Tensor, nn
-from torch.nn import functional as F
 
-from src.inference.impl.utils import clear_cache, get_device
+from src.inference.impl.utils import (
+    clear_cache,
+    get_device,
+    mcut_threshold,
+    pil_ensure_rgb,
+    pil_pad_square,
+)
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
 
@@ -29,6 +29,8 @@ class LabelData:
 
 
 def load_labels(model_repo: str):
+    import huggingface_hub
+
     csv_path = huggingface_hub.hf_hub_download(
         model_repo,
         LABEL_FILENAME,
@@ -51,46 +53,6 @@ def load_labels(model_repo: str):
     return tag_data
 
 
-def mcut_threshold(probs: np.ndarray) -> float:
-    """
-    Maximum Cut Thresholding (MCut)
-    Largeron, C., Moulin, C., & Gery, M. (2012). MCut: A Thresholding Strategy
-     for Multi-label Classification. In 11th International Symposium, IDA 2012
-     (pp. 172-183).
-    """
-    sorted_probs = probs[probs.argsort()[::-1]]
-    difs = sorted_probs[:-1] - sorted_probs[1:]
-    t = difs.argmax()
-    thresh = (sorted_probs[t] + sorted_probs[t + 1]) / 2
-    return thresh
-
-
-def pil_pad_square(image: Image.Image) -> Image.Image:
-    w, h = image.size
-    # get the largest dimension so we can pad to a square
-    px = max(image.size)
-    # pad to square with white background
-    canvas = Image.new("RGB", (px, px), (255, 255, 255))
-    canvas.paste(image, ((px - w) // 2, (px - h) // 2))
-    return canvas
-
-
-def pil_ensure_rgb(image: Image.Image) -> Image.Image:
-    # convert to RGB/RGBA if not already (deals with palette images etc.)
-    if image.mode not in ["RGB", "RGBA"]:
-        image = (
-            image.convert("RGBA")
-            if "transparency" in image.info
-            else image.convert("RGB")
-        )
-    # convert RGBA to RGB with white background
-    if image.mode == "RGBA":
-        canvas = Image.new("RGBA", image.size, (255, 255, 255))
-        canvas.alpha_composite(image)
-        image = canvas.convert("RGB")
-    return image
-
-
 import logging
 
 logger = logging.getLogger(__name__)
@@ -101,7 +63,15 @@ class WDTagger(InferenceModel):
         self.model_repo = model_repo
         self._model_loaded = False
 
+    @classmethod
+    def name(cls) -> str:
+        return "wd_tagger"
+
     def load(self):
+        import timm
+        from timm.data import create_transform, resolve_data_config
+        from torch import nn
+
         if self._model_loaded:
             return
         self.labels = load_labels(self.model_repo)
@@ -134,7 +104,9 @@ class WDTagger(InferenceModel):
         inputs = inputs[:, [2, 1, 0]]
         return inputs
 
-    def prepare_images(self, images: Sequence[Image.Image]) -> Tensor:
+    def prepare_images(self, images: Sequence[Image.Image]):
+        import torch
+
         batch = [self.prepare_image(image) for image in images]
         return torch.cat(batch, dim=0)
 
@@ -181,6 +153,9 @@ class WDTagger(InferenceModel):
         images: Sequence[Image.Image],
         dev_idx: int,
     ):
+        import torch
+        from torch.nn import functional as F
+
         self.load()
 
         image_inputs = self.prepare_images(images)
@@ -203,7 +178,7 @@ class WDTagger(InferenceModel):
 
     def get_tags(
         self,
-        probs: Tensor,
+        probs: Any,
         general_thresh: float | None,
         character_thresh: float | None,
     ):
