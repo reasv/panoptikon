@@ -14,13 +14,13 @@ config = { }
 metadata = { description = "DocTR OCR" }
 
 [group.doctr.inference_ids]
-db_resnet50_crnn_vgg16_bn = { config = { detection_model = "db_resnet50", recognition_model = "crnn_vgg16_bn" }, metadata = { description = "ResNet50 with CRNN VGG16 BN" } }
-db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "ResNet50 with CRNN MobileNet V3 Small" } }
-db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "ResNet50 with CRNN MobileNet V3 Large" } }
-db_resnet50_master = { config = { detection_model = "db_resnet50", recognition_model = "master" }, metadata = { description = "ResNet50 with MASTER" } }
-db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_small" }, metadata = { description = "ResNet50 with ViTSTR Small" } }
-db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ResNet50 with ViTSTR Base" } }
-db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "ResNet50 with PARSEQ" } }
+db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
+db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "CRNN MobileNet V3 Large" } }
+db_resnet50_crnn_vgg16_bn = { config = { detection_model = "db_resnet50", recognition_model = "crnn_vgg16_bn" }, metadata = { description = "CRNN VGG16 BN OCR" } }
+db_resnet50_master = { config = { detection_model = "db_resnet50", recognition_model = "master" }, metadata = { description = "MASTER" } }
+db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_small" }, metadata = { description = "ViTSTR Small" } }
+db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ViTSTR Base" } }
+db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "PARSEQ" } }
 
 [group.textembed]
 model_class = "sentence_transformers"
@@ -54,3 +54,179 @@ distil-large-v2 = { config = { model_name = "Systran/faster-distil-whisper-large
 "distil-medium.en" = { config = { model_name = "Systran/faster-distil-whisper-medium.en" }, metadata = { description = "Distilled Medium English Whisper Model" } }
 "distil-small.en" = { config = { model_name = "Systran/faster-distil-whisper-small.en" }, metadata = { description = "Distilled Small English Whisper Model" } }
 distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-large-v3" }, metadata = { description = "Distilled Large Whisper Model v3" } }
+
+[group.clip]
+model_class = "openclip"
+config = {}
+metadata = { description = "OpenCLIP models for text and image embedding" }
+
+[group.clip.inference_ids]
+ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
+ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
+apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
+apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link="https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
+apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link="https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
+apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link="https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
+ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
+ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
+ViT-B-32_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp XL (s13b_b90k). ViT-B-32 are the least resource intensive ViT model type." } }
+ViT-g-14_laion2b_s34b_b88k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s34b_b88k). ViT-G-14 are the largest ViT model type, however not currently the best performing." } }
+ViT-L-14_openai = { config = { model_name = "ViT-L-14", pretrained = "openai" }, metadata = { description = "Original CLIP model trained by OpenAI" } }
+ViT-B-32_openai = { config = { model_name = "ViT-B-32", pretrained = "openai" }, metadata = { description = "ViT-B-32 model trained by OpenAI. ViT-B-32 are the least resource intensive ViT model type." } }
+MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
+MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
+coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model fine-tuned on MSCOCO" } }
+coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model fine-tuned on MSCOCO" } }
+convnext_xxlarge_laion2b_s34b_b82k_augreg_soup = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_soup" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)" } }
+convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft_soup" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)" } }
+convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
+convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
+convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
+mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link="https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link="https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link="https://huggingface.co/Marqo/marqo-fashionCLIP" } }
+marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link="https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
+open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link="https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
+imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link="https://huggingface.co/imageomics/bioclip" } }
+
+# More CLIP models
+# RN50_openai = { config = { model_name = "RN50", pretrained = "openai" }, metadata = { description = "RN50 model trained by OpenAI" } }
+# RN50_yfcc15m = { config = { model_name = "RN50", pretrained = "yfcc15m" }, metadata = { description = "RN50 model pretrained on YFCC15M" } }
+# RN50_cc12m = { config = { model_name = "RN50", pretrained = "cc12m" }, metadata = { description = "RN50 model pretrained on CC12M" } }
+# RN50-quickgelu_openai = { config = { model_name = "RN50-quickgelu", pretrained = "openai" }, metadata = { description = "RN50-quickgelu model trained by OpenAI" } }
+# RN50-quickgelu_yfcc15m = { config = { model_name = "RN50-quickgelu", pretrained = "yfcc15m" }, metadata = { description = "RN50-quickgelu model pretrained on YFCC15M" } }
+# RN50-quickgelu_cc12m = { config = { model_name = "RN50-quickgelu", pretrained = "cc12m" }, metadata = { description = "RN50-quickgelu model pretrained on CC12M" } }
+# RN101_openai = { config = { model_name = "RN101", pretrained = "openai" }, metadata = { description = "RN101 model trained by OpenAI" } }
+# RN101_yfcc15m = { config = { model_name = "RN101", pretrained = "yfcc15m" }, metadata = { description = "RN101 model pretrained on YFCC15M" } }
+# RN101-quickgelu_openai = { config = { model_name = "RN101-quickgelu", pretrained = "openai" }, metadata = { description = "RN101-quickgelu model trained by OpenAI" } }
+# RN101-quickgelu_yfcc15m = { config = { model_name = "RN101-quickgelu", pretrained = "yfcc15m" }, metadata = { description = "RN101-quickgelu model pretrained on YFCC15M" } }
+# RN50x4_openai = { config = { model_name = "RN50x4", pretrained = "openai" }, metadata = { description = "RN50x4 model trained by OpenAI" } }
+# RN50x16_openai = { config = { model_name = "RN50x16", pretrained = "openai" }, metadata = { description = "RN50x16 model trained by OpenAI" } }
+# RN50x64_openai = { config = { model_name = "RN50x64", pretrained = "openai" }, metadata = { description = "RN50x64 model trained by OpenAI" } }
+# ViT-B-32_openai = { config = { model_name = "ViT-B-32", pretrained = "openai" }, metadata = { description = "ViT-B-32 model trained by OpenAI" } }
+# ViT-B-32_laion400m_e31 = { config = { model_name = "ViT-B-32", pretrained = "laion400m_e31" }, metadata = { description = "ViT-B-32 model pretrained on LAION400M (e31)" } }
+# ViT-B-32_laion400m_e32 = { config = { model_name = "ViT-B-32", pretrained = "laion400m_e32" }, metadata = { description = "ViT-B-32 model pretrained on LAION400M (e32)" } }
+# ViT-B-32_laion2b_e16 = { config = { model_name = "ViT-B-32", pretrained = "laion2b_e16" }, metadata = { description = "ViT-B-32 model pretrained on LAION2B (e16)" } }
+# ViT-B-32_laion2b_s34b_b79k = { config = { model_name = "ViT-B-32", pretrained = "laion2b_s34b_b79k" }, metadata = { description = "ViT-B-32 model pretrained on LAION2B (s34b_b79k)" } }
+# ViT-B-32_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp XL (s13b_b90k)" } }
+# ViT-B-32_datacomp_m_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_m_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp M (s128m_b4k)" } }
+# ViT-B-32_commonpool_m_clip_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_clip_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (clip_s128m_b4k)" } }
+# ViT-B-32_commonpool_m_laion_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_laion_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (laion_s128m_b4k)" } }
+# ViT-B-32_commonpool_m_image_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_image_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (image_s128m_b4k)" } }
+# ViT-B-32_commonpool_m_text_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_text_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (text_s128m_b4k)" } }
+# ViT-B-32_commonpool_m_basic_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_basic_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (basic_s128m_b4k)" } }
+# ViT-B-32_commonpool_m_s128m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_m_s128m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool M (s128m_b4k)" } }
+# ViT-B-32_datacomp_s_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_s_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp S (s13m_b4k)" } }
+# ViT-B-32_commonpool_s_clip_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_clip_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (clip_s13m_b4k)" } }
+# ViT-B-32_commonpool_s_laion_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_laion_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (laion_s13m_b4k)" } }
+# ViT-B-32_commonpool_s_image_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_image_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (image_s13m_b4k)" } }
+# ViT-B-32_commonpool_s_text_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_text_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (text_s13m_b4k)" } }
+# ViT-B-32_commonpool_s_basic_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_basic_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (basic_s13m_b4k)" } }
+# ViT-B-32_commonpool_s_s13m_b4k = { config = { model_name = "ViT-B-32", pretrained = "commonpool_s_s13m_b4k" }, metadata = { description = "ViT-B-32 model pretrained on CommonPool S (s13m_b4k)" } }
+# ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k)" } }
+# ViT-B-32-quickgelu_openai = { config = { model_name = "ViT-B-32-quickgelu", pretrained = "openai" }, metadata = { description = "ViT-B-32-quickgelu model trained by OpenAI" } }
+# ViT-B-32-quickgelu_laion400m_e31 = { config = { model_name = "ViT-B-32-quickgelu", pretrained = "laion400m_e31" }, metadata = { description = "ViT-B-32-quickgelu model pretrained on LAION400M (e31)" } }
+# ViT-B-32-quickgelu_laion400m_e32 = { config = { model_name = "ViT-B-32-quickgelu", pretrained = "laion400m_e32" }, metadata = { description = "ViT-B-32-quickgelu model pretrained on LAION400M (e32)" } }
+# ViT-B-32-quickgelu_metaclip_400m = { config = { model_name = "ViT-B-32-quickgelu", pretrained = "metaclip_400m" }, metadata = { description = "ViT-B-32-quickgelu model pretrained on MetaCLIP (400M)" } }
+# ViT-B-32-quickgelu_metaclip_fullcc = { config = { model_name = "ViT-B-32-quickgelu", pretrained = "metaclip_fullcc" }, metadata = { description = "ViT-B-32-quickgelu model pretrained on MetaCLIP FullCC" } }
+# ViT-B-16_openai = { config = { model_name = "ViT-B-16", pretrained = "openai" }, metadata = { description = "ViT-B-16 model trained by OpenAI" } }
+# ViT-B-16_laion400m_e31 = { config = { model_name = "ViT-B-16", pretrained = "laion400m_e31" }, metadata = { description = "ViT-B-16 model pretrained on LAION400M (e31)" } }
+# ViT-B-16_laion400m_e32 = { config = { model_name = "ViT-B-16", pretrained = "laion400m_e32" }, metadata = { description = "ViT-B-16 model pretrained on LAION400M (e32)" } }
+# ViT-B-16_laion2b_s34b_b88k = { config = { model_name = "ViT-B-16", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-B-16 model pretrained on LAION2B (s34b_b88k)" } }
+# ViT-B-16_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-16", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-16 model pretrained on DataComp XL (s13b_b90k)" } }
+# ViT-B-16_datacomp_l_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "datacomp_l_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on DataComp L (s1b_b8k)" } }
+# ViT-B-16_commonpool_l_clip_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_clip_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (clip_s1b_b8k)" } }
+# ViT-B-16_commonpool_l_laion_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_laion_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (laion_s1b_b8k)" } }
+# ViT-B-16_commonpool_l_image_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_image_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (image_s1b_b8k)" } }
+# ViT-B-16_commonpool_l_text_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_text_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (text_s1b_b8k)" } }
+# ViT-B-16_commonpool_l_basic_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_basic_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (basic_s1b_b8k)" } }
+# ViT-B-16_commonpool_l_s1b_b8k = { config = { model_name = "ViT-B-16", pretrained = "commonpool_l_s1b_b8k" }, metadata = { description = "ViT-B-16 model pretrained on CommonPool L (s1b_b8k)" } }
+# ViT-B-16_dfn2b = { config = { model_name = "ViT-B-16", pretrained = "dfn2b" }, metadata = { description = "ViT-B-16 model pretrained on DFN2B" } }
+# ViT-B-16-quickgelu_metaclip_400m = { config = { model_name = "ViT-B-16-quickgelu", pretrained = "metaclip_400m" }, metadata = { description = "ViT-B-16-quickgelu model pretrained on MetaCLIP (400M)" } }
+# ViT-B-16-quickgelu_metaclip_fullcc = { config = { model_name = "ViT-B-16-quickgelu", pretrained = "metaclip_fullcc" }, metadata = { description = "ViT-B-16-quickgelu model pretrained on MetaCLIP FullCC" } }
+# ViT-B-16-plus-240_laion400m_e31 = { config = { model_name = "ViT-B-16-plus-240", pretrained = "laion400m_e31" }, metadata = { description = "ViT-B-16-plus-240 model pretrained on LAION400M (e31)" } }
+# ViT-B-16-plus-240_laion400m_e32 = { config = { model_name = "ViT-B-16-plus-240", pretrained = "laion400m_e32" }, metadata = { description = "ViT-B-16-plus-240 model pretrained on LAION400M (e32)" } }
+# ViT-L-14_openai = { config = { model_name = "ViT-L-14", pretrained = "openai" }, metadata = { description = "ViT-L-14 model trained by OpenAI" } }
+# ViT-L-14_laion400m_e31 = { config = { model_name = "ViT-L-14", pretrained = "laion400m_e31" }, metadata = { description = "ViT-L-14 model pretrained on LAION400M (e31)" } }
+# ViT-L-14_laion400m_e32 = { config = { model_name = "ViT-L-14", pretrained = "laion400m_e32" }, metadata = { description = "ViT-L-14 model pretrained on LAION400M (e32)" } }
+# ViT-L-14_laion2b_s32b_b82k = { config = { model_name = "ViT-L-14", pretrained = "laion2b_s32b_b82k" }, metadata = { description = "ViT-L-14 model pretrained on LAION2B (s32b_b82k)" } }
+# ViT-L-14_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-L-14", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-L-14 model pretrained on DataComp XL (s13b_b90k)" } }
+# ViT-L-14_commonpool_xl_clip_s13b_b90k = { config = { model_name = "ViT-L-14", pretrained = "commonpool_xl_clip_s13b_b90k" }, metadata = { description = "ViT-L-14 model pretrained on CommonPool XL (clip_s13b_b90k)" } }
+# ViT-L-14_commonpool_xl_laion_s13b_b90k = { config = { model_name = "ViT-L-14", pretrained = "commonpool_xl_laion_s13b_b90k" }, metadata = { description = "ViT-L-14 model pretrained on CommonPool XL (laion_s13b_b90k)" } }
+# ViT-L-14_commonpool_xl_s13b_b90k = { config = { model_name = "ViT-L-14", pretrained = "commonpool_xl_s13b_b90k" }, metadata = { description = "ViT-L-14 model pretrained on CommonPool XL (s13b_b90k)" } }
+# ViT-L-14-quickgelu_metaclip_400m = { config = { model_name = "ViT-L-14-quickgelu", pretrained = "metaclip_400m" }, metadata = { description = "ViT-L-14-quickgelu model pretrained on MetaCLIP (400M)" } }
+# ViT-L-14-quickgelu_metaclip_fullcc = { config = { model_name = "ViT-L-14-quickgelu", pretrained = "metaclip_fullcc" }, metadata = { description = "ViT-L-14-quickgelu model pretrained on MetaCLIP FullCC" } }
+# ViT-L-14-quickgelu_dfn2b = { config = { model_name = "ViT-L-14-quickgelu", pretrained = "dfn2b" }, metadata = { description = "ViT-L-14-quickgelu model pretrained on DFN2B" } }
+# ViT-L-14-336_openai = { config = { model_name = "ViT-L-14-336", pretrained = "openai" }, metadata = { description = "ViT-L-14-336 model trained by OpenAI" } }
+# ViT-H-14_laion2b_s32b_b79k = { config = { model_name = "ViT-H-14", pretrained = "laion2b_s32b_b79k" }, metadata = { description = "ViT-H-14 model pretrained on LAION2B (s32b_b79k)" } }
+# ViT-H-14-quickgelu_metaclip_fullcc = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "metaclip_fullcc" }, metadata = { description = "ViT-H-14-quickgelu model pretrained on MetaCLIP FullCC" } }
+# ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14-quickgelu model pretrained on DFN5B" } }
+# ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14-378-quickgelu model pretrained on DFN5B" } }
+# ViT-g-14_laion2b_s12b_b42k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s12b_b42k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s12b_b42k)" } }
+# ViT-g-14_laion2b_s34b_b88k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s34b_b88k)" } }
+# ViT-bigG-14_laion2b_s39b_b160k = { config = { model_name = "ViT-bigG-14", pretrained = "laion2b_s39b_b160k" }, metadata = { description = "ViT-bigG-14 model pretrained on LAION2B (s39b_b160k)" } }
+# roberta-ViT-B-32_laion2b_s12b_b32k = { config = { model_name = "roberta-ViT-B-32", pretrained = "laion2b_s12b_b32k" }, metadata = { description = "roberta-ViT-B-32 model pretrained on LAION2B (s12b_b32k)" } }
+# xlm-roberta-base-ViT-B-32_laion5b_s13b_b90k = { config = { model_name = "xlm-roberta-base-ViT-B-32", pretrained = "laion5b_s13b_b90k" }, metadata = { description = "XLM-roberta-base-ViT-B-32 model pretrained on LAION5B (s13b_b90k)" } }
+# xlm-roberta-large-ViT-H-14_frozen_laion5b_s13b_b90k = { config = { model_name = "xlm-roberta-large-ViT-H-14", pretrained = "frozen_laion5b_s13b_b90k" }, metadata = { description = "XLM-roberta-large-ViT-H-14 model pretrained on Frozen LAION5B (s13b_b90k)" } }
+# convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
+# convnext_base_w_laion2b_s13b_b82k = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k)" } }
+# convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
+# convnext_base_w_laion_aesthetic_s13b_b82k = { config = { model_name = "convnext_base_w", pretrained = "laion_aesthetic_s13b_b82k" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION Aesthetic (s13b_b82k)" } }
+# convnext_base_w_320_laion_aesthetic_s13b_b82k = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k)" } }
+# convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
+# convnext_large_d_laion2b_s26b_b102k_augreg = { config = { model_name = "convnext_large_d", pretrained = "laion2b_s26b_b102k_augreg" }, metadata = { description = "ConvNeXT large d model pretrained on LAION2B (s26b_b102k_augreg)" } }
+# convnext_large_d_320_laion2b_s29b_b131k_ft = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft)" } }
+# convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft_soup" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)" } }
+# convnext_xxlarge_laion2b_s34b_b82k_augreg = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg)" } }
+# convnext_xxlarge_laion2b_s34b_b82k_augreg_rewind = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_rewind" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_rewind)" } }
+# convnext_xxlarge_laion2b_s34b_b82k_augreg_soup = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_soup" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)" } }
+# coca_ViT-B-32_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model pretrained on LAION2B (s13b_b90k)" } }
+# coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model fine-tuned on MSCOCO" } }
+# coca_ViT-L-14_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model pretrained on LAION2B (s13b_b90k)" } }
+# coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model fine-tuned on MSCOCO" } }
+# EVA01-g-14_laion400m_s11b_b41k = { config = { model_name = "EVA01-g-14", pretrained = "laion400m_s11b_b41k" }, metadata = { description = "EVA01-g-14 model pretrained on LAION400M (s11b_b41k)" } }
+# EVA01-g-14-plus_merged2b_s11b_b114k = { config = { model_name = "EVA01-g-14-plus", pretrained = "merged2b_s11b_b114k" }, metadata = { description = "EVA01-g-14-plus model pretrained on Merged2B (s11b_b114k)" } }
+# EVA02-B-16_merged2b_s8b_b131k = { config = { model_name = "EVA02-B-16", pretrained = "merged2b_s8b_b131k" }, metadata = { description = "EVA02-B-16 model pretrained on Merged2B (s8b_b131k)" } }
+# EVA02-L-14_merged2b_s4b_b131k = { config = { model_name = "EVA02-L-14", pretrained = "merged2b_s4b_b131k" }, metadata = { description = "EVA02-L-14 model pretrained on Merged2B (s4b_b131k)" } }
+# EVA02-L-14-336_merged2b_s6b_b61k = { config = { model_name = "EVA02-L-14-336", pretrained = "merged2b_s6b_b61k" }, metadata = { description = "EVA02-L-14-336 model pretrained on Merged2B (s6b_b61k)" } }
+# EVA02-E-14_laion2b_s4b_b115k = { config = { model_name = "EVA02-E-14", pretrained = "laion2b_s4b_b115k" }, metadata = { description = "EVA02-E-14 model pretrained on LAION2B (s4b_b115k)" } }
+# EVA02-E-14-plus_laion2b_s9b_b144k = { config = { model_name = "EVA02-E-14-plus", pretrained = "laion2b_s9b_b144k" }, metadata = { description = "EVA02-E-14-plus model pretrained on LAION2B (s9b_b144k)" } }
+# ViT-B-16-SigLIP_webli = { config = { model_name = "ViT-B-16-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-B-16-SigLIP model pretrained on WebLI" } }
+# ViT-B-16-SigLIP-256_webli = { config = { model_name = "ViT-B-16-SigLIP-256", pretrained = "webli" }, metadata = { description = "ViT-B-16-SigLIP-256 model pretrained on WebLI" } }
+# ViT-B-16-SigLIP-i18n-256_webli = { config = { model_name = "ViT-B-16-SigLIP-i18n-256", pretrained = "webli" }, metadata = { description = "ViT-B-16-SigLIP-i18n-256 model pretrained on WebLI" } }
+# ViT-B-16-SigLIP-384_webli = { config = { model_name = "ViT-B-16-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-B-16-SigLIP-384 model pretrained on WebLI" } }
+# ViT-B-16-SigLIP-512_webli = { config = { model_name = "ViT-B-16-SigLIP-512", pretrained = "webli" }, metadata = { description = "ViT-B-16-SigLIP-512 model pretrained on WebLI" } }
+# ViT-L-16-SigLIP-256_webli = { config = { model_name = "ViT-L-16-SigLIP-256", pretrained = "webli" }, metadata = { description = "ViT-L-16-SigLIP-256 model pretrained on WebLI" } }
+# ViT-L-16-SigLIP-384_webli = { config = { model_name = "ViT-L-16-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-L-16-SigLIP-384 model pretrained on WebLI" } }
+# ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP model pretrained on WebLI" } }
+# ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 model pretrained on WebLI" } }
+# ViT-L-14-CLIPA_datacomp1b = { config = { model_name = "ViT-L-14-CLIPA", pretrained = "datacomp1b" }, metadata = { description = "ViT-L-14-CLIPA model pretrained on DataComp1B" } }
+# ViT-L-14-CLIPA-336_datacomp1b = { config = { model_name = "ViT-L-14-CLIPA-336", pretrained = "datacomp1b" }, metadata = { description = "ViT-L-14-CLIPA-336 model pretrained on DataComp1B" } }
+# ViT-H-14-CLIPA_datacomp1b = { config = { model_name = "ViT-H-14-CLIPA", pretrained = "datacomp1b" }, metadata = { description = "ViT-H-14-CLIPA model pretrained on DataComp1B" } }
+# ViT-H-14-CLIPA-336_laion2b = { config = { model_name = "ViT-H-14-CLIPA-336", pretrained = "laion2b" }, metadata = { description = "ViT-H-14-CLIPA-336 model pretrained on LAION2B" } }
+# ViT-H-14-CLIPA-336_datacomp1b = { config = { model_name = "ViT-H-14-CLIPA-336", pretrained = "datacomp1b" }, metadata = { description = "ViT-H-14-CLIPA-336 model pretrained on DataComp1B" } }
+# ViT-bigG-14-CLIPA_datacomp1b = { config = { model_name = "ViT-bigG-14-CLIPA", pretrained = "datacomp1b" }, metadata = { description = "ViT-bigG-14-CLIPA model pretrained on DataComp1B" } }
+# ViT-bigG-14-CLIPA-336_datacomp1b = { config = { model_name = "ViT-bigG-14-CLIPA-336", pretrained = "datacomp1b" }, metadata = { description = "ViT-bigG-14-CLIPA-336 model pretrained on DataComp1B" } }
+# nllb-clip-base_v1 = { config = { model_name = "nllb-clip-base", pretrained = "v1" }, metadata = { description = "NLLB-CLIP base model pretrained on V1" } }
+# nllb-clip-large_v1 = { config = { model_name = "nllb-clip-large", pretrained = "v1" }, metadata = { description = "NLLB-CLIP large model pretrained on V1" } }
+# nllb-clip-base-siglip_v1 = { config = { model_name = "nllb-clip-base-siglip", pretrained = "v1" }, metadata = { description = "NLLB-CLIP base-siglip model pretrained on V1" } }
+# nllb-clip-base-siglip_mrl = { config = { model_name = "nllb-clip-base-siglip", pretrained = "mrl" }, metadata = { description = "NLLB-CLIP base-siglip model pretrained on MRL" } }
+# nllb-clip-large-siglip_v1 = { config = { model_name = "nllb-clip-large-siglip", pretrained = "v1" }, metadata = { description = "NLLB-CLIP large-siglip model pretrained on V1" } }
+# nllb-clip-large-siglip_mrl = { config = { model_name = "nllb-clip-large-siglip", pretrained = "mrl" }, metadata = { description = "NLLB-CLIP large-siglip model pretrained on MRL" } }
+# MobileCLIP-S1_datacompdr = { config = { model_name = "MobileCLIP-S1", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S1 model pretrained on DataCompDR" } }
+# MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
+# MobileCLIP-B_datacompdr = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR" } }
+# MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
+# ViTamin-S_datacomp1b = { config = { model_name = "ViTamin-S", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-S model pretrained on DataComp1B" } }
+# ViTamin-S-LTT_datacomp1b = { config = { model_name = "ViTamin-S-LTT", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-S-LTT model pretrained on DataComp1B" } }
+# ViTamin-B_datacomp1b = { config = { model_name = "ViTamin-B", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-B model pretrained on DataComp1B" } }
+# ViTamin-B-LTT_datacomp1b = { config = { model_name = "ViTamin-B-LTT", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-B-LTT model pretrained on DataComp1B" } }
+# ViTamin-L_datacomp1b = { config = { model_name = "ViTamin-L", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L model pretrained on DataComp1B" } }
+# ViTamin-L-256_datacomp1b = { config = { model_name = "ViTamin-L-256", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L-256 model pretrained on DataComp1B" } }
+# ViTamin-L-336_datacomp1b = { config = { model_name = "ViTamin-L-336", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L-336 model pretrained on DataComp1B" } }
+# ViTamin-L-384_datacomp1b = { config = { model_name = "ViTamin-L-384", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L-384 model pretrained on DataComp1B" } }
+# ViTamin-L2_datacomp1b = { config = { model_name = "ViTamin-L2", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2 model pretrained on DataComp1B" } }
+# ViTamin-L2-256_datacomp1b = { config = { model_name = "ViTamin-L2-256", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-256 model pretrained on DataComp1B" } }
+# ViTamin-L2-336_datacomp1b = { config = { model_name = "ViTamin-L2-336", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-336 model pretrained on DataComp1B" } }
+# ViTamin-L2-384_datacomp1b = { config = { model_name = "ViTamin-L2-384", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-384 model pretrained on DataComp1B" } }
