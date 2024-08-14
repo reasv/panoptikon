@@ -1,195 +1,122 @@
-import multiprocessing as mp
-import uuid
 from io import BytesIO
-from multiprocessing.queues import Queue
-from threading import Lock
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Sequence, Union
 
-import numpy as np
-import open_clip
-import torch
 from PIL import Image as PILImage
 
 from src.inference.impl.utils import clear_cache, get_device
 from src.inference.model import InferenceModel
+from src.inference.registry import ModelRegistry
 from src.inference.types import PredictionInput
-
-
-def worker_process(
-    model_name: str,
-    pretrained: Optional[str],
-    init_args: dict,
-    device_id: int,
-    task_queue: Queue,
-    result_queue: Queue,
-) -> None:
-    torch.cuda.set_device(device_id)
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name=model_name,
-        pretrained=pretrained,
-        **init_args,
-    )
-    model.eval().to(f"cuda:{device_id}")
-
-    assert not isinstance(preprocess, tuple), "Multiple preprocess functions"
-
-    while True:
-        task: Optional[
-            Tuple[str, str, Union[torch.Tensor, List[PILImage.Image]]]
-        ] = task_queue.get()
-        if task is None:  # Poison pill to stop the process
-            break
-
-        prediction_id, mode, batch = task
-        with torch.inference_mode():
-            if mode == "text":
-                tokens: torch.Tensor = torch.tensor(batch).to(
-                    f"cuda:{device_id}"
-                )
-                features: torch.Tensor = model.encode_text(tokens)
-            else:  # image
-                images: torch.Tensor = torch.stack(
-                    [preprocess(img).to(f"cuda:{device_id}") for img in batch]  # type: ignore
-                )
-                features: torch.Tensor = model.encode_image(images)
-
-            features /= features.norm(dim=-1, keepdim=True)
-            result_queue.put((prediction_id, features.cpu().numpy()))
-
-    del model
-    torch.cuda.empty_cache()
 
 
 class ClipModel(InferenceModel):
     def __init__(
         self,
         model_name: str,
-        pretrained: Optional[str] = None,
-        context_length: Optional[int] = None,
-        **kwargs: dict,
-    ) -> None:
+        pretrained: str | None = None,
+        context_length: int | None = None,
+        **kwargs,
+    ):
         self.model_name: str = model_name
-        self.pretrained: Optional[str] = pretrained
-        self.context_length: Optional[int] = context_length
-        self.init_args: dict = kwargs
+        self.pretrained: str | None = pretrained
+        self.context_length: int | None = context_length
+        self.init_args = kwargs
         self._model_loaded: bool = False
-        self.processes: List[mp.Process] = []
-        self.task_queues: List[Queue] = []
-        self.result_queues: List[Queue] = []
-        self.predict_lock = Lock()
-        self.devices
 
     def load(self) -> None:
         if self._model_loaded:
             return
+        import open_clip
+
+        self.model, _, preprocess = open_clip.create_model_and_transforms(
+            model_name=self.model_name,
+            pretrained=self.pretrained,
+            **self.init_args,
+        )
+        assert not isinstance(
+            preprocess, tuple
+        ), "Expected single preprocess function"
+        self.preprocess = preprocess
 
         self.devices = get_device()
-
-        num_gpus: int = len(self.devices)
-
-        for i in range(num_gpus):
-            task_queue: Queue = mp.Queue()
-            result_queue: Queue = mp.Queue()
-            process: mp.Process = mp.Process(
-                target=worker_process,
-                args=(
-                    self.model_name,
-                    self.pretrained,
-                    self.init_args,
-                    i,
-                    task_queue,
-                    result_queue,
-                ),
-            )
-            process.start()
-            self.processes.append(process)
-            self.task_queues.append(task_queue)
-            self.result_queues.append(result_queue)
-
+        self.device = (
+            self.devices[0] if isinstance(self.devices, list) else self.devices
+        )
+        self.model.eval().to(self.device)
         self.tokenizer = open_clip.get_tokenizer(
             model_name=self.model_name, context_length=self.context_length
         )
         self._model_loaded = True
 
+    def __del__(self):
+        self.unload()
+
     def predict(
         self, inputs: Sequence[PredictionInput]
     ) -> Sequence[Union[bytes, dict, list, str]]:
-        with self.predict_lock:
-            self.load()
-            prediction_id = str(uuid.uuid4())
-            text_inputs: List[Tuple[int, str]] = []
-            image_inputs: List[Tuple[int, PILImage.Image]] = []
-            results: List[Optional[bytes]] = [None] * len(inputs)
+        import torch
 
-            for idx, input_item in enumerate(inputs):
-                if isinstance(input_item.data, str):
-                    text_inputs.append((idx, input_item.data))
-                elif input_item.file:
-                    image: PILImage.Image = PILImage.open(
-                        BytesIO(input_item.file)
-                    ).convert("RGB")
-                    image_inputs.append((idx, image))
+        # Ensure the model is loaded
+        self.load()
 
-            num_gpus: int = len(self.devices)
+        text_inputs = []
+        image_inputs = []
+        results: List[None | bytes] = [None] * len(inputs)
 
+        # Separate text and image inputs, storing their original indices
+        for idx, input_item in enumerate(inputs):
+            if isinstance(input_item.data, str):
+                text_inputs.append((idx, input_item.data))
+            elif input_item.file:
+                image = PILImage.open(BytesIO(input_item.file)).convert("RGB")
+                image_inputs.append((idx, image))
+
+        # Use inference_mode for optimized inference
+        with torch.inference_mode():
+            # Process text inputs if any
             if text_inputs:
                 indices, texts = zip(*text_inputs)
-                tokens: torch.Tensor = self.tokenizer(list(texts))
-                text_batches: List[np.ndarray] = np.array_split(
-                    tokens, num_gpus
-                )
+                tokens = self.tokenizer(list(texts))
+                tokens = torch.tensor(tokens).to(self.device)
 
-                for i, batch in enumerate(text_batches):
-                    if batch.size > 0:
-                        self.task_queues[i].put((prediction_id, "text", batch))
+                text_features = self.model.encode_text(tokens)
+                text_features /= text_features.norm(
+                    dim=-1, keepdim=True
+                )  # Normalize the text features
 
-                text_features: List[np.ndarray] = []
-                for i in range(num_gpus):
-                    if text_batches[i].size > 0:
-                        result_id, features = self.result_queues[i].get()
-                        if result_id == prediction_id:
-                            text_features.extend(features)
+                # Convert text features to list and store them in the results list
+                for i, idx in enumerate(indices):
+                    results[idx] = text_features[i].cpu().numpy().tobytes()
 
-                for idx, feature in zip(indices, text_features):
-                    results[idx] = feature.tobytes()
-
+            # Process image inputs if any
             if image_inputs:
                 indices, images = zip(*image_inputs)
-                image_batches: Sequence[Sequence[PILImage.Image]] = [
-                    list(batch) for batch in np.array_split(images, num_gpus)
-                ]
+                processed_images = torch.stack(
+                    [
+                        self.preprocess(img).to(self.device)  # type: ignore
+                        for img in images
+                    ]
+                )
 
-                for i, batch in enumerate(image_batches):
-                    if len(batch) > 0:
-                        self.task_queues[i].put((prediction_id, "image", batch))
+                image_features = self.model.encode_image(processed_images)
+                image_features /= image_features.norm(
+                    dim=-1, keepdim=True
+                )  # Normalize the image features
 
-                image_features: List[np.ndarray] = []
-                for i in range(num_gpus):
-                    if len(image_batches[i]) > 0:
-                        result_id, features_img = self.result_queues[i].get()
-                        if result_id == prediction_id:
-                            image_features.extend(features_img)
+                # Convert image features to list and store them in the results list
+                for i, idx in enumerate(indices):
+                    results[idx] = image_features[i].cpu().numpy().tobytes()
 
-                for idx, feature in zip(indices, image_features):
-                    results[idx] = feature.tobytes()
-
-            output: List[bytes] = [res for res in results if res is not None]
-            assert len(output) == len(
-                inputs
-            ), "Mismatched output length and input length"
-            return output
+        output = [res for res in results if res is not None]
+        assert len(output) == len(
+            inputs
+        ), "Mismatched output length and input length"
+        return output
 
     def unload(self) -> None:
         if self._model_loaded:
-            for queue in self.task_queues:
-                queue.put(None)  # Send poison pill to stop the process
-            for process in self.processes:
-                process.join()
-            self.processes = []
-            self.task_queues = []
-            self.result_queues = []
+            del self.model
+            del self.tokenizer
+            del self.preprocess
             clear_cache()
             self._model_loaded = False
-
-    def __del__(self) -> None:
-        self.unload()

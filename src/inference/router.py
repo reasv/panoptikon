@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from src.inference.impl.clip import ClipModel
 from src.inference.impl.ocr import DoctrModel
 from src.inference.impl.sentence_transformers import SentenceTransformersModel
 from src.inference.impl.wd_tagger import WDTagger
@@ -32,6 +33,7 @@ registry.register_model("wd_tagger", WDTagger)
 registry.register_model("doctr", DoctrModel)
 registry.register_model("sentence_transformers", SentenceTransformersModel)
 registry.register_model("faster_whisper", FasterWhisperModel)
+registry.register_model("openclip", ClipModel)
 
 router = APIRouter(
     prefix="/inference",
