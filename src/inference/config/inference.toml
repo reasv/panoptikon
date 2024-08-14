@@ -31,3 +31,26 @@ metadata = { description = "Sentence Transformers Text Embeddings" }
 all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer" } }
 all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
 stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5" }, metadata = { description = "Stella English 400M Sentence Transformer" } }
+
+[group.whisper]
+model_class = "faster_whisper"
+config = {}
+metadata = { description = "Whisper models for speech recognition" }
+
+[group.whisper.inference_ids]
+"tiny.en" = { config = { model_name = "Systran/faster-whisper-tiny.en" }, metadata = { description = "Tiny English Whisper Model" } }
+tiny = { config = { model_name = "Systran/faster-whisper-tiny" }, metadata = { description = "Tiny Whisper Model" } }
+"base.en" = { config = { model_name = "Systran/faster-whisper-base.en" }, metadata = { description = "Base English Whisper Model" } }
+base = { config = { model_name = "Systran/faster-whisper-base" }, metadata = { description = "Base Whisper Model" } }
+"small.en" = { config = { model_name = "Systran/faster-whisper-small.en" }, metadata = { description = "Small English Whisper Model" } }
+small = { config = { model_name = "Systran/faster-whisper-small" }, metadata = { description = "Small Whisper Model" } }
+"medium.en" = { config = { model_name = "Systran/faster-whisper-medium.en" }, metadata = { description = "Medium English Whisper Model" } }
+medium = { config = { model_name = "Systran/faster-whisper-medium" }, metadata = { description = "Medium Whisper Model" } }
+large-v1 = { config = { model_name = "Systran/faster-whisper-large-v1" }, metadata = { description = "Large Whisper Model v1" } }
+large-v2 = { config = { model_name = "Systran/faster-whisper-large-v2" }, metadata = { description = "Large Whisper Model v2" } }
+large-v3 = { config = { model_name = "Systran/faster-whisper-large-v3" }, metadata = { description = "Large Whisper Model v3" } }
+large = { config = { model_name = "Systran/faster-whisper-large-v3" }, metadata = { description = "Large Whisper Model" } }
+distil-large-v2 = { config = { model_name = "Systran/faster-distil-whisper-large-v2" }, metadata = { description = "Distilled Large Whisper Model v2" } }
+"distil-medium.en" = { config = { model_name = "Systran/faster-distil-whisper-medium.en" }, metadata = { description = "Distilled Medium English Whisper Model" } }
+"distil-small.en" = { config = { model_name = "Systran/faster-distil-whisper-small.en" }, metadata = { description = "Distilled Small English Whisper Model" } }
+distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-large-v3" }, metadata = { description = "Distilled Large Whisper Model v3" } }

@@ -30,7 +30,7 @@ class FasterWhisperModel(InferenceModel):
 
         self.devices = get_device()
         self.model = WhisperModel(
-            model_name_or_path=self.model_name,
+            model_size_or_path=self.model_name,
             device="auto",
             device_index=[i for i in range(len(self.devices))],
             compute_type="float16",
@@ -63,7 +63,7 @@ class FasterWhisperModel(InferenceModel):
 
         audio_inputs: List[np.ndarray] = []
         for file in input_files:
-            audio: np.ndarray = np.load(BytesIO(file))
+            audio: np.ndarray = np.frombuffer(file, dtype=np.float32)
             audio_inputs.append(audio)
 
         num_devices = len(self.devices)

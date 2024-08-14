@@ -1,3 +1,4 @@
+import logging
 import os
 
 import gradio as gr
@@ -8,10 +9,11 @@ from src.api.app import app
 from src.db import get_database_connection, initialize_database
 from src.db.folders import get_folders_from_database
 from src.log import setup_logging
+from src.utils import add_cudnn_to_path
 
+add_cudnn_to_path()
 setup_logging()
 readonly_mode = os.environ.get("READONLY", "false").lower() == "true"
-import logging
 
 logger = logging.getLogger(__name__)
 

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from src.inference.impl.ocr import DoctrModel
 from src.inference.impl.sentence_transformers import SentenceTransformersModel
 from src.inference.impl.wd_tagger import WDTagger
+from src.inference.impl.whisper import FasterWhisperModel
 from src.inference.manager import InferenceModel, ModelManager
 from src.inference.registry import ModelRegistry, get_base_config_folder
 from src.inference.types import PredictionInput
@@ -30,6 +31,7 @@ registry = ModelRegistry(
 registry.register_model("wd_tagger", WDTagger)
 registry.register_model("doctr", DoctrModel)
 registry.register_model("sentence_transformers", SentenceTransformersModel)
+registry.register_model("faster_whisper", FasterWhisperModel)
 
 router = APIRouter(
     prefix="/inference",

@@ -44,6 +44,18 @@ def setup_logging():
                     "level": "WARNING",
                     "propagate": False,
                 },
+                "speechbrain": {
+                    "level": "WARNING",
+                    "propagate": False,
+                },
+                "torio._extension.utils": {
+                    "level": "WARNING",
+                    "propagate": False,
+                },
+                "faster_whisper": {
+                    "level": "DEBUG",
+                    "propagate": False,
+                },
             },
         }
     )
