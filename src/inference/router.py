@@ -23,7 +23,7 @@ ModelRegistry.register_model(FasterWhisperModel)
 ModelRegistry.register_model(ClipModel)
 
 router = APIRouter(
-    prefix="/inference",
+    prefix="/api/inference",
     tags=["inference"],
     responses={404: {"description": "Not found"}},
 )
