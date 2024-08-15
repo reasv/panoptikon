@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import defaultdict
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import PIL.Image
+from PIL import Image as PILImage
 
 from src.data_extractors.ai.wd_tagger import Predictor, mcut_threshold
-from src.data_extractors.data_loaders.images import item_image_loader_pillow
+from src.data_extractors.data_loaders.images import (
+    image_loader,
+    item_image_loader_pillow,
+)
 from src.data_extractors.extraction_jobs import run_extraction_job
-from src.data_extractors.models import TagsModel
+from src.data_extractors.models import TagsModel, TagsModelV2
 from src.db.extracted_text import insert_extracted_text
 from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath
@@ -163,6 +168,105 @@ def run_tag_extractor_job(conn: sqlite3.Connection, model: TagsModel):
         ],
     ):
         handle_individual_result(
+            conn, log_id, model.setter_name(), item, outputs
+        )
+
+    return run_extraction_job(
+        conn,
+        model,
+        load_images,
+        batch_inference_func,
+        handle_result,
+    )
+
+
+def combine_namespace(tags: Sequence[dict[str, float]]) -> dict[str, float]:
+    combined_result = dict()
+    for result in tags:
+        for tag, score in result.items():
+            if tag not in combined_result or score > combined_result[tag]:
+                combined_result[tag] = score
+    return combined_result
+
+
+def aggregate_tags(results: Sequence[dict]):
+    tag_results = defaultdict(default_factory=list)
+    for result in results:
+        for key, value in result["tags"].items():
+            tag_results[key].append(value)  # type: ignore
+
+    aggregated_tags = {}
+    for namespace, tags in tag_results.items():
+        aggregated_tags[namespace] = combine_namespace(tags)  # type: ignore
+
+    return aggregated_tags
+
+
+def handle_individual_resultV2(
+    conn: sqlite3.Connection,
+    log_id: int,
+    setter: str,
+    item: ItemWithPath,
+    results: Sequence[dict],
+):
+    main_namespace = results[0]["namespace"]
+    all_tags = aggregate_tags(list(results))
+
+    tags = []
+    for namespace, tag_scores in all_tags.items():
+        for tag, score in tag_scores.items():
+            tags.append((f"{main_namespace}:{namespace}", tag, score))
+
+    for namespace, tag, confidence in tags:
+        add_tag_to_item(
+            conn,
+            namespace=namespace,
+            name=tag,
+            sha256=item.sha256,
+            setter=setter,
+            confidence=confidence,
+            log_id=log_id,
+        )
+
+    all_tags_string = ", ".join([tag for __, tag, _ in tags])
+    min_confidence = min([confidence for __, _, confidence in tags])
+
+    insert_extracted_text(
+        conn,
+        item.sha256,
+        0,
+        log_id=log_id,
+        text=all_tags_string,
+        language=main_namespace,
+        language_confidence=1.0,
+        confidence=min_confidence,
+    )
+
+
+def run_tagv2_extractor_job(conn: sqlite3.Connection, model: TagsModelV2):
+    """
+    Run a job that processes items in the database using the given tagging model.
+    """
+    score_threshold = model.get_group_threshold(conn)
+    assert score_threshold is not None
+    logger.info(f"Using score threshold {score_threshold}")
+    model.load_model("batch", 1, 60)
+
+    def load_images(item: ItemWithPath):
+        return image_loader(conn, item)
+
+    def batch_inference_func(batch_images: Sequence[PIL.Image.Image | str]):
+        return model.run_batch_inference(
+            "batch", 1, 60, score_threshold, batch_images
+        )
+
+    def handle_result(
+        log_id: int,
+        item: ItemWithPath,
+        _: Sequence[PIL.Image.Image | str],
+        outputs: Sequence[dict],
+    ):
+        handle_individual_resultV2(
             conn, log_id, model.setter_name(), item, outputs
         )
 

@@ -101,6 +101,37 @@ def item_image_loader_pillow(
     return []
 
 
+def image_loader(
+    conn: sqlite3.Connection, item: ItemWithPath
+) -> List[PILImage.Image | str]:
+    if item.type.startswith("image/gif"):
+        return [frame for frame in gif_to_frames(item.path)]
+    if item.type.startswith("image"):
+        return [item.path]
+    if item.type.startswith("video"):
+        if frames := get_frames(conn, item.sha256):
+            logger.debug(f"Loaded {len(frames)} frames from database")
+        else:
+            frames = video_to_frames(item.path, num_frames=4)
+            store_frames(
+                conn,
+                item.sha256,
+                file_mime_type=item.type,
+                process_version=1,
+                frames=frames,
+            )
+        return [frame for frame in frames]
+    if item.type.startswith("application/pdf"):
+        return [PILImage.fromarray(page) for page in read_pdf(item.path)]
+    if item.type.startswith("text/html"):
+        from doctr.io.html import read_html
+
+        return [
+            PILImage.fromarray(page) for page in read_pdf(read_html(item.path))
+        ]
+    return []
+
+
 def get_pdf_image(file_path: str) -> PILImage.Image:
 
     return PILImage.fromarray(read_pdf(file_path)[0])

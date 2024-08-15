@@ -1,5 +1,9 @@
+import os
 import sqlite3
-from typing import Any, Dict, Generator, List, Tuple, Type
+from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
+
+import PIL
+import PIL.Image
 
 import src.data_extractors.extraction_jobs.types as job_types
 from src.db.group_settings import (
@@ -223,6 +227,105 @@ class TagsModel(ModelOpts):
     # Own methods
     def model_repo(self) -> str:
         return self._model_repo
+
+    def delete_extracted_data(self, conn: sqlite3.Connection):
+        msg = super().delete_extracted_data(conn)
+        orphans_deleted = delete_orphan_tags(conn)
+        msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
+        return msg
+
+
+class TagsModelV2(ModelOpts):
+    _inference_id: str
+
+    def _init(self, model_name: str):
+        self._inference_id = model_name
+
+    @classmethod
+    def data_type(cls) -> OutputDataType:
+        return get_inference_api_client().get_metadata()["tags"][
+            "group_metadata"
+        ]["output_type"]
+
+    @classmethod
+    def group_name(cls) -> str:
+        return "tags"
+
+    @classmethod
+    def name(cls) -> str:
+        return get_inference_api_client().get_metadata()["tags"][
+            "group_metadata"
+        ]["name"]
+
+    @classmethod
+    def default_threshold(cls) -> float | None:
+        return get_inference_api_client().get_metadata()["tags"][
+            "group_metadata"
+        ]["default_threshold"]
+
+    @classmethod
+    def description(cls) -> str:
+        return get_inference_api_client().get_metadata()["tags"][
+            "group_metadata"
+        ]["description"]
+
+    def setter_name(self) -> str:
+        return "tags/" + self._inference_id
+
+    @classmethod
+    def default_model(cls) -> str:
+        return get_inference_api_client().get_metadata()["tags"][
+            "group_metadata"
+        ]["default_inference_id"]
+
+    def run_extractor(self, conn: sqlite3.Connection):
+        from src.data_extractors.extraction_jobs.tags import (
+            run_tagv2_extractor_job,
+        )
+
+        return run_tagv2_extractor_job(conn, self)
+
+    @classmethod
+    def available_models(cls) -> List[str]:
+        return [
+            f"{option}"
+            for option in list(
+                get_inference_api_client()
+                .get_metadata()["tags"]["inference_ids"]
+                .keys()
+            )
+        ]
+
+    def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
+        get_inference_api_client().load_model(
+            "tags/" + self._inference_id, cache_key, lru_size, ttl_seconds
+        )
+
+    def unload_model(self, cache_key: str):
+        get_inference_api_client().unload_model(
+            "tags/" + self._inference_id, cache_key
+        )
+
+    def run_batch_inference(
+        self,
+        cache_key: str,
+        lru_size: int,
+        ttl_seconds: int,
+        threshold: float,
+        images: Sequence[str | PIL.Image.Image],
+    ) -> List[dict]:
+        imgs = [
+            (
+                ({"threshold": threshold}, img)
+                if isinstance(img, str)
+                else ({"threshold": threshold}, img.tobytes())
+            )
+            for img in images
+        ]
+        result = get_inference_api_client().predict(
+            "tags/" + self._inference_id, cache_key, lru_size, ttl_seconds, imgs
+        )
+        return result["outputs"]  # type: ignore
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
         msg = super().delete_extracted_data(conn)
@@ -552,6 +655,7 @@ class ModelOptsFactory:
     def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
         return [
             TagsModel,
+            # TagsModelV2,
             OCRModel,
             WhisperSTTModel,
             ImageEmbeddingModel,
@@ -569,3 +673,17 @@ class ModelOptsFactory:
     def get_model(cls, model_name: str) -> ModelOpts:
         model_opts = cls.get_model_opts(model_name)
         return model_opts(model_name)
+
+
+def get_inference_api_client():
+    from src.inference.client import InferenceAPIClient
+
+    if url := os.getenv("INFERENCE_API_URL"):
+        return InferenceAPIClient(url)
+    else:
+        hostname = os.getenv("HOST", "127.0.0.1")
+        port = int(os.getenv("PORT", 6342))
+        os.environ["INFERENCE_API_URL"] = (
+            f"http://{hostname}:{port}/api/inference"
+        )
+        return InferenceAPIClient(os.environ["INFERENCE_API_URL"])
