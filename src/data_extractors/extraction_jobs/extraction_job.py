@@ -58,7 +58,6 @@ def run_extraction_job(
             next(
                 get_items_missing_data_extraction(
                     conn,
-                    setter_id=setter_id,
                     model_opts=model_opts,
                 ),
                 [None, -1],
@@ -122,7 +121,6 @@ def run_extraction_job(
     for item, remaining, inputs, outputs in batch_items(
         get_items_missing_data_extraction(
             conn,
-            setter_id=setter_id,
             model_opts=model_opts,
         ),
         batch_size,

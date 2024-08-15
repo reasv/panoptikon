@@ -620,7 +620,7 @@ class ModelOptsFactory:
         group_metadata = cls.get_group_metadata(group_name)
         item_meta: Dict[str, Any] = cls.get_metadata()[group_name][
             "inference_ids"
-        ][inference_id]["metadata"]
+        ][inference_id]
         return {
             **group_metadata,
             **item_meta,

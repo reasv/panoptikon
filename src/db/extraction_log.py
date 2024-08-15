@@ -11,7 +11,7 @@ import logging
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_multirule_query
-from src.db.rules.rules import get_rules_for_setter_id
+from src.db.rules.rules import get_rules_for_setter, get_rules_for_setter_id
 from src.db.rules.types import combine_rule_item_filters
 from src.db.setters import upsert_setter
 from src.db.utils import pretty_print_SQL
@@ -169,7 +169,7 @@ def add_item_to_log(
 
 
 def get_items_missing_data_extraction(
-    conn: sqlite3.Connection, setter_id: int, model_opts: "models.ModelOpts"
+    conn: sqlite3.Connection, model_opts: "models.ModelOpts"
 ):
     """
     Get all items that should be processed by the given setter.
@@ -179,7 +179,9 @@ def get_items_missing_data_extraction(
     instead getting paths one by one.
     """
     model_filters = model_opts.item_extraction_rules()
-    user_rules = get_rules_for_setter_id(conn, setter_id)
+    user_rules = get_rules_for_setter(
+        conn, model_opts.data_type(), model_opts.setter_name()
+    )
     # Merge each user rule with the model's buit-in filters
     combined_filters = [
         combine_rule_item_filters(model_filters, user_rule.filters)
