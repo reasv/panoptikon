@@ -9,16 +9,23 @@ default_inference_id = "wd-swinv2-tagger-v3"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
 wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagger-v3" }, metadata = { description = "ConvNext Based Tagger" } }
 wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
 
+
 [group.doctr]
 config = { impl_class = "doctr" }
-metadata = { description = "DocTR OCR" }
-
+[group.doctr.metadata]
+description = "Extract text from images, videos, and documents through OCR"
+name = "DocTR V2"
+default_threshold = 0
+default_batch_size = 64
+default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
+target_entities = ["items"]
+output_type = "text"
+input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 [group.doctr.inference_ids]
 db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
 db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "CRNN MobileNet V3 Large" } }
@@ -28,19 +35,33 @@ db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recogni
 db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ViTSTR Base" } }
 db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "PARSEQ" } }
 
+
 [group.textembed]
 config = { impl_class = "sentence_transformers" }
-metadata = { description = "Sentence Transformers Text Embeddings" }
-
+[group.textembed.metadata]
+description = "Generate Text Embeddings from extracted text using Sentence Transformers. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
+name = "Text Embeddings V2"
+default_batch_size = 64
+default_inference_id = "all-mpnet-base-v2"
+target_entities = ["text", "tags"] # Tags are also stored as text
+output_type = "text-embedding"
 [group.textembed.inference_ids]
 all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer" } }
 all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
 stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5" }, metadata = { description = "Stella English 400M Sentence Transformer" } }
 
+
 [group.whisper]
 config = { impl_class = "faster_whisper" }
-metadata = { description = "Whisper models for speech recognition" }
-
+[group.whisper.metadata]
+description = "Extract text from audio using OpenAI's Whisper model"
+name = "Whisper Speech-to-Text V2"
+default_threshold = 0
+default_batch_size = 4
+default_inference_id = "distill-large-v3"
+target_entities = ["items"]
+output_type = "text"
+input_mime_types = ["video/", "audio/"]
 [group.whisper.inference_ids]
 "tiny.en" = { config = { model_name = "Systran/faster-whisper-tiny.en" }, metadata = { description = "Tiny English Whisper Model" } }
 tiny = { config = { model_name = "Systran/faster-whisper-tiny" }, metadata = { description = "Tiny Whisper Model" } }
@@ -59,10 +80,16 @@ distil-large-v2 = { config = { model_name = "Systran/faster-distil-whisper-large
 "distil-small.en" = { config = { model_name = "Systran/faster-distil-whisper-small.en" }, metadata = { description = "Distilled Small English Whisper Model" } }
 distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-large-v3" }, metadata = { description = "Distilled Large Whisper Model v3" } }
 
+
 [group.clip]
 config = { impl_class = "openclip" }
-metadata = { description = "OpenCLIP models for text and image embedding" }
-
+[group.clip.metadata]
+description = "Generate Text Embeddings from extracted text using Sentence Transformers. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
+name = "CLIP Image Embeddings V2"
+default_batch_size = 64
+default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
+target_entities = ["items"]
+output_type = "clip"
 [group.clip.inference_ids]
 ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
