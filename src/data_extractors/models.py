@@ -614,6 +614,19 @@ class ModelOptsFactory:
         return cls.get_metadata()[group_name]["group_metadata"]
 
     @classmethod
+    def get_inference_id_metadata(
+        cls, group_name, inference_id
+    ) -> Dict[str, Any]:
+        group_metadata = cls.get_group_metadata(group_name)
+        item_meta: Dict[str, Any] = cls.get_metadata()[group_name][
+            "inference_ids"
+        ][inference_id]["metadata"]
+        return {
+            **group_metadata,
+            **item_meta,
+        }
+
+    @classmethod
     def get_group_models(cls, group_name) -> Dict[str, Any]:
         return cls.get_metadata()[group_name]["inference_ids"]
 
@@ -646,6 +659,11 @@ class ModelGroup(ModelOpts):
     def _meta(cls):
         return ModelOptsFactory.get_group_metadata(cls._group)
 
+    def _id_meta(self):
+        return ModelOptsFactory.get_inference_id_metadata(
+            self._group, self._inference_id
+        )
+
     @classmethod
     def _models(cls):
         return ModelOptsFactory.get_group_models(cls._group)
@@ -665,6 +683,18 @@ class ModelGroup(ModelOpts):
     @classmethod
     def default_threshold(cls) -> float | None:
         return cls._meta().get("default_threshold")
+
+    def input_spec(self) -> Tuple[str, dict]:
+        spec = self._id_meta().get("input_spec", None)
+        assert (
+            spec is not None
+        ), f"Input spec not found for {self.setter_name()}"
+        handler_name = spec.get("handler", None)
+        assert (
+            handler_name is not None
+        ), f"Input handler not found for {self.setter_name()}"
+        opts = spec.get("opts", {})
+        return handler_name, opts
 
     @classmethod
     def default_model(cls) -> str:
@@ -711,18 +741,18 @@ class ModelGroup(ModelOpts):
         return msg
 
     def run_extractor(self, conn: sqlite3.Connection):
-        from src.data_extractors.extraction_jobs.tags import (
-            run_tagv2_extractor_job,
+        from src.data_extractors.extraction_jobs.dynamic_job import (
+            run_dynamic_extraction_job,
         )
 
-        return run_tagv2_extractor_job(conn, self)
+        return run_dynamic_extraction_job(conn, self)
 
     def run_batch_inference(
         self,
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-        inputs: Sequence[Tuple[dict, str | bytes]],
+        inputs: Sequence[Tuple[str | dict | None, str | bytes | None]],
     ):
         result = get_inference_api_client().predict(
             self.setter_name(), cache_key, lru_size, ttl_seconds, inputs

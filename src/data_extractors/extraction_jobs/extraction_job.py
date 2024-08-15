@@ -45,11 +45,33 @@ def run_extraction_job(
         [int, ItemWithPath, Sequence[I], Sequence[R]], None
     ],
     final_callback: Callable[[], None] = lambda: None,
+    load_callback: Callable[[], None] = lambda: None,
 ):
     """
     Run a job that processes items in the database
     using the given batch inference function and item extractor.
     """
+
+    def get_remaining():
+        # Get first item to obtain the total number of items remaining
+        return (
+            next(
+                get_items_missing_data_extraction(
+                    conn,
+                    setter_id=setter_id,
+                    model_opts=model_opts,
+                ),
+                [None, -1],
+            )[1]
+            + 1
+        )
+
+    if get_remaining() < 1:
+        logger.info(f"No items to process, aborting {model_opts.setter_name()}")
+        return
+
+    load_callback()
+
     start_time = datetime.now()
     scan_time = start_time.isoformat()
 
@@ -197,18 +219,7 @@ def run_extraction_job(
         + f" {images} images and {videos} videos "
         + f"totalling {total_processed_units} frames"
     )
-    # Get first item to obtain the total number of items remaining
-    remaining_paths = (
-        next(
-            get_items_missing_data_extraction(
-                conn,
-                setter_id=setter_id,
-                model_opts=model_opts,
-            ),
-            [None, -1],
-        )[1]
-        + 1
-    )
+    remaining_paths = get_remaining()
     if system_config.transaction_per_item:
         # Start a new transaction to update the log with the final results
         # The transaction will be committed by the caller

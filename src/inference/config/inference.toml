@@ -9,6 +9,9 @@ default_inference_id = "wd-swinv2-tagger-v3"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
+
+input_spec = { handler="image_frames", opts={ max_frames = 4 }} # { handler="image_frames", opts={ max_frames = 4 }}
+
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
 wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagger-v3" }, metadata = { description = "ConvNext Based Tagger" } }
@@ -26,6 +29,8 @@ default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
+input_spec = { handler="image_frames" }
+
 [group.doctr.inference_ids]
 db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
 db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "CRNN MobileNet V3 Large" } }
@@ -45,6 +50,7 @@ default_batch_size = 64
 default_inference_id = "all-mpnet-base-v2"
 target_entities = ["text", "tags"] # Tags are also stored as text
 output_type = "text-embedding"
+input_spec = { handler="extracted_text" }
 [group.textembed.inference_ids]
 all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer" } }
 all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
@@ -62,6 +68,7 @@ default_inference_id = "distill-large-v3"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["video/", "audio/"]
+input_spec = { handler="audio_tracks" } # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
 [group.whisper.inference_ids]
 "tiny.en" = { config = { model_name = "Systran/faster-whisper-tiny.en" }, metadata = { description = "Tiny English Whisper Model" } }
 tiny = { config = { model_name = "Systran/faster-whisper-tiny" }, metadata = { description = "Tiny Whisper Model" } }
@@ -90,6 +97,7 @@ default_batch_size = 64
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities = ["items"]
 output_type = "clip"
+input_spec = { handler="image_frames" }
 [group.clip.inference_ids]
 ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
