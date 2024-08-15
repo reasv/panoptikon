@@ -1,6 +1,11 @@
 [group.tags]
 config = { impl_class = "wd_tagger" }
-metadata = { description = "Danbooru style taggers" }
+[group.tags.metadata]
+description = "Danbooru style taggers"
+output_type = "tags"
+name = "Tags V2"
+default_threshold = 0.1
+default_inference_id = "wd-swinv2-tagger-v3"
 
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
