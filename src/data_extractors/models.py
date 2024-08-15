@@ -568,13 +568,13 @@ class ModelOptsFactory:
             api_modelopts = cls.get_api_model_opts()
         except Exception as e:
             logger.error(f"Failed to load API model opts: {e}", exc_info=True)
-        return api_modelopts + [
+        return [
             TagsModel,
             OCRModel,
             WhisperSTTModel,
             ImageEmbeddingModel,
             TextEmbeddingModel,
-        ]
+        ] + api_modelopts
 
     @classmethod
     def get_api_model_opts(cls) -> List[Type[ModelOpts]]:
@@ -597,6 +597,9 @@ class ModelOptsFactory:
 
     @classmethod
     def get_model(cls, setter_name: str) -> ModelOpts:
+        group_name, inference_id = setter_name.split("/", 1)
+        if group_name in cls._api_models:
+            return cls._api_models[group_name](model_name=inference_id)
         model_opts = cls.get_model_opts(setter_name)
         return model_opts(setter_name)
 
