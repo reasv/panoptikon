@@ -723,16 +723,9 @@ class ModelGroup(ModelOpts):
         lru_size: int,
         ttl_seconds: int,
         threshold: float,
-        images: Sequence[str | PIL.Image.Image],
+        images: Sequence[str | bytes],
     ) -> List[dict]:
-        imgs = [
-            (
-                ({"threshold": threshold}, img)
-                if isinstance(img, str)
-                else ({"threshold": threshold}, img.tobytes())
-            )
-            for img in images
-        ]
+        imgs = [({"threshold": threshold}, img) for img in images]
         result = get_inference_api_client().predict(
             self.setter_name(), cache_key, lru_size, ttl_seconds, imgs
         )

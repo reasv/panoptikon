@@ -7,7 +7,6 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import PIL.Image
-from PIL import Image as PILImage
 
 from src.data_extractors.ai.wd_tagger import Predictor, mcut_threshold
 from src.data_extractors.data_loaders.images import (
@@ -255,7 +254,7 @@ def run_tagv2_extractor_job(conn: sqlite3.Connection, model: ModelGroup):
     def load_images(item: ItemWithPath):
         return image_loader(conn, item)
 
-    def batch_inference_func(batch_images: Sequence[PIL.Image.Image | str]):
+    def batch_inference_func(batch_images: Sequence[bytes | str]):
         return model.run_batch_inference(
             "batch", 1, 60, score_threshold, batch_images
         )
@@ -263,7 +262,7 @@ def run_tagv2_extractor_job(conn: sqlite3.Connection, model: ModelGroup):
     def handle_result(
         log_id: int,
         item: ItemWithPath,
-        _: Sequence[PIL.Image.Image | str],
+        _: Sequence[bytes | str],
         outputs: Sequence[dict],
     ):
         handle_individual_resultV2(

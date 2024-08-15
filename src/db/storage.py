@@ -152,6 +152,10 @@ def store_frames(
     """,
         (sha256, process_version),
     )
+    encoded_frames = [
+        thumbnail_to_bytes(frame, get_thumb_format(file_mime_type))
+        for frame in frames
+    ]
     cursor.executemany(
         """
     INSERT INTO frames (item_sha256, idx, item_mime_type, width, height, version, frame)
@@ -165,11 +169,12 @@ def store_frames(
                 frame.width,
                 frame.height,
                 process_version,
-                thumbnail_to_bytes(frame, get_thumb_format(file_mime_type)),
+                encoded_frames[idx],
             )
             for idx, frame in enumerate(frames)
         ],
     )
+    return encoded_frames
 
 
 def has_frame(
@@ -192,6 +197,15 @@ def has_frame(
 
 
 def get_frames(conn: sqlite3.Connection, sha256: str) -> list[PILImage.Image]:
+    raw_frames = get_frames_bytes(conn, sha256)
+    frames = []
+    for frame_data in raw_frames:
+        frame = PILImage.open(io.BytesIO(frame_data))
+        frames.append(frame)
+    return frames
+
+
+def get_frames_bytes(conn: sqlite3.Connection, sha256: str) -> list[bytes]:
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -206,7 +220,7 @@ def get_frames(conn: sqlite3.Connection, sha256: str) -> list[PILImage.Image]:
     frames = []
     for result in results:
         frame_data = result[0]
-        frame = PILImage.open(io.BytesIO(frame_data))
+        frame = frame_data
         frames.append(frame)
     return frames
 

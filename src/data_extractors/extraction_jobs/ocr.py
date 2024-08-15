@@ -1,5 +1,4 @@
 import sqlite3
-from operator import index
 from typing import List, Sequence, Tuple
 
 import numpy as np

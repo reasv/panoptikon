@@ -1,7 +1,7 @@
 import logging
 import os
 import sqlite3
-from typing import List
+from typing import List, Sequence, Union
 
 import numpy as np
 from PIL import Image as PILImage
@@ -9,7 +9,12 @@ from PIL import ImageSequence
 
 from src.data_extractors.data_loaders.pdf import read_pdf
 from src.data_extractors.data_loaders.video import video_to_frames
-from src.db.storage import get_frames, store_frames
+from src.db.storage import (
+    get_frames,
+    get_frames_bytes,
+    store_frames,
+    thumbnail_to_bytes,
+)
 from src.types import ItemWithPath
 from src.utils import pil_ensure_rgb
 
@@ -103,31 +108,39 @@ def item_image_loader_pillow(
 
 def image_loader(
     conn: sqlite3.Connection, item: ItemWithPath
-) -> List[PILImage.Image | str]:
+) -> Sequence[Union[bytes, str]]:
     if item.type.startswith("image/gif"):
-        return [frame for frame in gif_to_frames(item.path)]
+        return [
+            thumbnail_to_bytes(frame, "JPEG")
+            for frame in gif_to_frames(item.path)
+        ]
     if item.type.startswith("image"):
         return [item.path]
     if item.type.startswith("video"):
-        if frames := get_frames(conn, item.sha256):
+        if frames := get_frames_bytes(conn, item.sha256):
             logger.debug(f"Loaded {len(frames)} frames from database")
         else:
-            frames = video_to_frames(item.path, num_frames=4)
-            store_frames(
+            pil_frames = video_to_frames(item.path, num_frames=4)
+            frames = store_frames(
                 conn,
                 item.sha256,
                 file_mime_type=item.type,
                 process_version=1,
-                frames=frames,
+                frames=pil_frames,
             )
-        return [frame for frame in frames]
+        return frames
+
     if item.type.startswith("application/pdf"):
-        return [PILImage.fromarray(page) for page in read_pdf(item.path)]
+        return [
+            thumbnail_to_bytes(PILImage.fromarray(page), "JPEG")
+            for page in read_pdf(item.path)
+        ]
     if item.type.startswith("text/html"):
         from doctr.io.html import read_html
 
         return [
-            PILImage.fromarray(page) for page in read_pdf(read_html(item.path))
+            thumbnail_to_bytes(PILImage.fromarray(page), "JPEG")
+            for page in read_pdf(read_html(item.path))
         ]
     return []
 
