@@ -15,7 +15,7 @@ from src.data_extractors.data_loaders.images import (
     item_image_loader_pillow,
 )
 from src.data_extractors.extraction_jobs import run_extraction_job
-from src.data_extractors.models import ModelGroup, TagsModel, TagsModelV2
+from src.data_extractors.models import ModelGroup, TagsModel
 from src.db.extracted_text import insert_extracted_text
 from src.db.tags import add_tag_to_item
 from src.types import ItemWithPath

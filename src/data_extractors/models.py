@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import sqlite3
@@ -21,6 +22,8 @@ from src.db.setters import delete_setter_by_name
 from src.db.tags import delete_orphan_tags
 from src.inference.client import api_client
 from src.types import OutputDataType, TargetEntityType
+
+logger = logging.getLogger(__name__)
 
 
 class ModelOpts:
@@ -555,19 +558,35 @@ class WhisperSTTModel(ModelOpts):
 
 class ModelOptsFactory:
     _group_metadata = {}
+    _api_models: Dict[str, Type["ModelGroup"]] = {}
 
     @classmethod
     def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
-        return [
+        cls.refetch_metadata()
+        api_modelopts = []
+        try:
+            api_modelopts = cls.get_api_model_opts()
+        except Exception as e:
+            logger.error(f"Failed to load API model opts: {e}", exc_info=True)
+        return api_modelopts + [
             TagsModel,
             OCRModel,
             WhisperSTTModel,
             ImageEmbeddingModel,
             TextEmbeddingModel,
-        ] + [
-            type(f"Group_{group_name}", (ModelGroup,), {"_group": group_name})
-            for group_name, _ in cls.get_metadata().items()
         ]
+
+    @classmethod
+    def get_api_model_opts(cls) -> List[Type[ModelOpts]]:
+        for group_name, _ in cls.get_metadata().items():
+            if group_name in cls._api_models:
+                continue
+            cls._api_models[group_name] = type(
+                f"Group_{group_name}",
+                (ModelGroup,),
+                {"_group": group_name},
+            )
+        return list(cls._api_models.values())
 
     @classmethod
     def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:
