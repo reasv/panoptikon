@@ -4,6 +4,7 @@ import logging
 from typing import List, Literal, Tuple, Type
 
 import gradio as gr
+from pyexpat import model
 
 from src.data_extractors import models
 from src.db import get_database_connection
@@ -157,10 +158,12 @@ def on_tab_load():
     rules = get_rules(conn)
     file_types = get_all_mime_types(conn)
     folders = get_folders_from_database(conn)
+    model_types = models.ModelOptsFactory.get_all_model_opts()
     conn.close()
     return rules, RuleStats(
         file_types=file_types,
         folders=folders,
+        model_types=model_types,
     )
 
 
@@ -209,7 +212,10 @@ def create_rule_builder_UI(app: gr.Blocks, tab: gr.Tab):
             """
             )
         with gr.Column():
-            create_add_rule(rules_state)
+
+            @gr.render(inputs=[context])
+            def add_rule_ui(context: RuleStats):
+                create_add_rule(rules_state, context)
 
     @gr.render(inputs=[rules_state, context])
     def builder(rules: List[StoredRule], context: RuleStats):
@@ -260,7 +266,7 @@ on the next scan.
                     )
 
 
-def create_add_rule(rules_state: gr.State):
+def create_add_rule(rules_state: gr.State, context: RuleStats):
 
     def create_model_type_tab(model_type: Type[models.ModelOpts]):
         with gr.TabItem(label=model_type.name()):
@@ -295,7 +301,7 @@ def create_add_rule(rules_state: gr.State):
 
     gr.Markdown("# Add New Rule")
     with gr.Tabs():
-        for model_type in models.ModelOptsFactory.get_all_model_opts():
+        for model_type in context.model_types:
             create_model_type_tab(model_type)
         create_file_type_tab(rules_state)
 
@@ -320,7 +326,7 @@ def create_rule_builder(
             with gr.Accordion(label="Remove Models", open=False):
                 create_remove_models(rule, rules_state)
             with gr.Accordion(label="Add Models", open=False):
-                create_add_models(rule, rules_state)
+                create_add_models(rule, rules_state, context)
         with gr.Column():
             gr.Markdown("## Item filters:")
             with gr.Accordion(label="Add New Filter", open=False):
@@ -374,7 +380,9 @@ def create_remove_models(rule: StoredRule, rules_state: gr.State):
         return remove_setters_from_rule(rule, to_remove)
 
 
-def create_add_models(rule: StoredRule, rules_state: gr.State):
+def create_add_models(
+    rule: StoredRule, rules_state: gr.State, context: RuleStats
+):
     def create_model_type_tab(model_type: Type[models.ModelOpts]):
         with gr.TabItem(label=model_type.name()) as extractor_tab:
             with gr.Group():
@@ -406,7 +414,7 @@ def create_add_models(rule: StoredRule, rules_state: gr.State):
                         )
 
     with gr.Tabs():
-        for model_type in models.ModelOptsFactory.get_all_model_opts():
+        for model_type in context.model_types:
             create_model_type_tab(model_type)
         create_file_type_tab(rules_state, rule)
 

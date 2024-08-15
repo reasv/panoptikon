@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
-from re import I
-from typing import List, Literal, Tuple, Union
+from typing import TYPE_CHECKING, List, Literal, Tuple, Type, Union
+
+if TYPE_CHECKING:
+    from src.data_extractors.models import ModelOpts
 
 
 @dataclass
@@ -127,6 +129,7 @@ class SearchStats:
 class RuleStats:
     folders: List[str] = field(default_factory=list)
     file_types: List[str] = field(default_factory=list)
+    model_types: List[Type["ModelOpts"]] = field(default_factory=list)
 
 
 @dataclass

@@ -188,7 +188,21 @@ def extraction_job_UI(
 
 
 def create_data_extraction_UI(app: gr.Blocks, tab: gr.Tab):
+    opts_state = gr.State([])
+
+    def retrieve_opts():
+        return models.ModelOptsFactory.get_all_model_opts()
+
     with gr.Row():
         with gr.Tabs():
-            for model_opts in models.ModelOptsFactory.get_all_model_opts():
-                extraction_job_UI(app, tab, model_opts)
+
+            @gr.render(inputs=[opts_state])
+            def extraction_tabs(all_opts: List[type[models.ModelOpts]]):
+                for model_opts in all_opts:
+                    extraction_job_UI(app, tab, model_opts)
+
+        gr.on(
+            triggers=[tab.select, app.load],
+            fn=retrieve_opts,
+            outputs=[opts_state],
+        )

@@ -52,8 +52,6 @@ def launch_app():
     mount_gradio_app(app, ui, path="/gradio")
     hostname = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", 6342))
-    if not os.getenv("INFERENCE_API_URL", None):
-        os.environ["INFERENCE_API_URL"] = f"http://{hostname}:{port}/api"
     uvicorn.run(
         app,
         host=hostname,

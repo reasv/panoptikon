@@ -562,9 +562,9 @@ class ModelOptsFactory:
 
     @classmethod
     def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
-        cls.refetch_metadata()
         api_modelopts = []
         try:
+            cls.refetch_metadata()
             api_modelopts = cls.get_api_model_opts()
         except Exception as e:
             logger.error(f"Failed to load API model opts: {e}", exc_info=True)
