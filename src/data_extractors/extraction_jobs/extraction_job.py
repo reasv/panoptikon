@@ -309,7 +309,11 @@ def minibatcher(
             start + batch_size, len(input_list)
         )  # Calculate end index for the current batch
         batch = input_list[start:end]  # Extract the current batch
+        logger.debug(f"Processing minibatch of size {len(batch)}")
         batch_result = run_minibatch(batch)  # Process the batch
+        assert len(batch_result) == len(
+            batch
+        ), f"Minibatch result length {len(batch_result)} does not match minibatch length {len(batch)}"
         result[start:end] = (
             batch_result  # Insert the batch result into the result list
         )
@@ -319,5 +323,5 @@ def minibatcher(
     ]  # Filter out the None values
     assert len(filtered_result) == len(
         input_list
-    ), "Result length does not match input length"
+    ), f"Result length {len(filtered_result)} does not match input length {len(input_list)}"
     return filtered_result

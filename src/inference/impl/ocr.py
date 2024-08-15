@@ -67,9 +67,11 @@ class DoctrModel(InferenceModel):
 
         result = self.model(image_inputs)
 
-        files_texts: List[str] = []
-        languages: List[dict[str, str | float | None]] = []
-        word_confidences: List[Sequence[float]] = []
+        assert len(result.pages) == len(
+            image_inputs
+        ), "Mismatch in input and output."
+
+        outputs: List[dict] = []
         for page, config in zip(result.pages, configs):
             threshold = config.get("threshold", None)
             assert (
@@ -77,7 +79,7 @@ class DoctrModel(InferenceModel):
             ), "Threshold must be a float."
 
             file_text = ""
-            languages.append(page.language)
+            language = page.language
             page_word_confidences = []
             for block in page.blocks:
                 for line in block.lines:
@@ -88,19 +90,12 @@ class DoctrModel(InferenceModel):
                         page_word_confidences.append(word.confidence)
                     file_text += "\n"
                 file_text += "\n"
-            files_texts.append(file_text)
-            word_confidences.append(page_word_confidences)
 
-        outputs: List[dict] = []
-
-        for file_text, language, word_confidence in zip(
-            files_texts, languages, word_confidences
-        ):
             file_text = file_text.strip()
             file_text = clean_whitespace(file_text)
-            if not file_text:
-                continue
-            avg_confidence = sum(word_confidence) / len(word_confidences)
+            avg_confidence = sum(page_word_confidences) / max(
+                len(page_word_confidences), 1
+            )
             assert (
                 isinstance(language["confidence"], float)
                 or language["confidence"] is None
@@ -116,6 +111,10 @@ class DoctrModel(InferenceModel):
                     "language_confidence": language["confidence"],
                 }
             )
+
+        assert len(outputs) == len(
+            inputs
+        ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
 
         return outputs
 
