@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import defaultdict
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import PIL.Image
