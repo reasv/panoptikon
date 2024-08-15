@@ -136,13 +136,19 @@ class WDTagger(InferenceModel):
             outputs.append(
                 {
                     "namespace": "danbooru",
-                    "tags": {
-                        "rating": tags.rating,
-                        "character": tags.character,
-                        "general": tags.general,
-                    },
+                    "tags": [
+                        ("rating", tags.rating),
+                        ("character", tags.character),
+                        ("general", tags.general),
+                    ],
                     "mcut": tags.general_mcut,
-                    "character_mcut": tags.general_mcut,
+                    "rating_severity": [
+                        "general",
+                        "safe",
+                        "sensitive",
+                        "questionable",
+                        "explicit",
+                    ],
                 }
             )
 

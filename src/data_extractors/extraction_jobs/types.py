@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List
+from typing import List, Tuple
 
+from src.db import tags
 from src.types import ItemWithPath
 
 
@@ -24,3 +25,11 @@ class ExtractorJobReport:
     total: int
     units: int
     failed_paths: List[str]
+
+
+@dataclass
+class TagResult:
+    namespace: str
+    tags: List[Tuple[str, dict[str, float]]]
+    mcut: float
+    rating_severity: List[str]
