@@ -93,7 +93,7 @@ class ModelOpts:
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
         delete_setter_by_name(conn, self.data_type(), self.setter_name())
-        return f"Deleted text extracted from items by model {self.setter_name()}.\n"
+        return f"Deleted data extracted from items by model {self.setter_name()}.\n"
 
     @classmethod
     def supported_mime_types(cls) -> List[str] | None:
@@ -722,11 +722,9 @@ class ModelGroup(ModelOpts):
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-        threshold: float,
-        images: Sequence[str | bytes],
-    ) -> List[dict]:
-        imgs = [({"threshold": threshold}, img) for img in images]
+        inputs: Sequence[Tuple[dict, str | bytes]],
+    ):
         result = get_inference_api_client().predict(
-            self.setter_name(), cache_key, lru_size, ttl_seconds, imgs
+            self.setter_name(), cache_key, lru_size, ttl_seconds, inputs
         )
-        return result["outputs"]  # type: ignore
+        return result

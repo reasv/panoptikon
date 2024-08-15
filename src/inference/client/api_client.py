@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Sequence, Union
 
 import requests as r
 from requests import Response
@@ -18,7 +18,7 @@ class InferenceAPIClient:
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-        inputs: list,
+        inputs: Sequence,
     ):
         url = f"{self.base_url}/predict/{inference_id}"
         # Prepare the query parameters
@@ -108,13 +108,15 @@ def handle_resp(response: Response):
 
 def handle_predict_resp(
     response: Response,
-) -> Union[Dict[str, Any], Dict[int, bytes]]:
+) -> Union[List[str | Dict[str, Any] | Sequence[Any]], List[bytes]]:
     try:
         content_type = response.headers.get("Content-Type", "")
 
         # Check if the response is JSON
         if "application/json" in content_type:
-            return response.json()  # Parse JSON response as a dictionary
+            return response.json()[
+                "outputs"
+            ]  # Parse JSON response as a dictionary
 
         # Check if the response is multipart
         elif "multipart/mixed" in content_type:
@@ -122,7 +124,7 @@ def handle_predict_resp(
 
         # Check if the response is a single binary output
         elif "application/octet-stream" in content_type and response.content:
-            return {0: response.content}
+            return [response.content]
         else:
             raise ValueError(f"Unexpected content type: {content_type}")
     except ValueError as e:
@@ -133,7 +135,7 @@ def handle_predict_resp(
         raise e
 
 
-def parse_multipart_response(response: Response) -> Dict[int, bytes]:
+def parse_multipart_response(response: Response) -> List[bytes]:
     cont_type = response.headers.get("Content-Type")
     assert cont_type, "Content-Type header not found in response"
     boundary = cont_type.split("boundary=")[1]
@@ -157,7 +159,8 @@ def parse_multipart_response(response: Response) -> Dict[int, bytes]:
             index = int(filename.replace("output", "").replace(".bin", ""))
             files[index] = content.rstrip(b"\r\n")
 
-    return files
+    files_list = [files[i] for i in range(len(files))]
+    return files_list
 
 
 def process_input_files(files: List[str | bytes]):
