@@ -320,10 +320,13 @@ def run_tagv2_extractor_job(conn: sqlite3.Connection, model: ModelGroup):
     def load_images(item: ItemWithPath):
         return image_loader(conn, item)
 
-    def batch_inference_func(batch_images: Sequence[bytes | str]):
+    def batch_inference_func(batch_images: Sequence[bytes | str]) -> List[dict]:
         return model.run_batch_inference(
-            "batch", 1, 60, score_threshold, batch_images
-        )
+            "batch",
+            1,
+            60,
+            [({"threshold": score_threshold}, frame) for frame in batch_images],
+        )  # type: ignore
 
     def handle_result(
         log_id: int,
