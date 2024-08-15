@@ -59,6 +59,7 @@ class InferenceAPIClient:
             )
             logger.debug("Response content:", response.content)
             response.raise_for_status()
+            raise ValueError("Unexpected response")
 
     def load_model(
         self,
