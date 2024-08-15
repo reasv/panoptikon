@@ -2,10 +2,13 @@
 config = { impl_class = "wd_tagger" }
 [group.tags.metadata]
 description = "Danbooru style taggers"
-output_type = "tags"
 name = "Tags V2"
 default_threshold = 0.1
+default_batch_size = 64
 default_inference_id = "wd-swinv2-tagger-v3"
+target_entities = ["items"]
+output_type = "tags"
+input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
