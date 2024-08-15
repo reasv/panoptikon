@@ -8,7 +8,7 @@ from src.data_extractors.data_handlers.text import handle_text
 from src.data_extractors.data_handlers.text_embeddings import (
     handle_text_embeddings,
 )
-from src.data_extractors.data_loaders.audio import load_audio
+from src.data_extractors.data_loaders.audio import load_audio, load_audio_single
 from src.data_extractors.data_loaders.images import image_loader
 from src.data_extractors.extraction_jobs.extraction_job import (
     run_extraction_job,
@@ -48,11 +48,11 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
 
     elif handler_name == "audio_tracks":
         sample_rate: int = handler_opts.get("sample_rate", 16000)
-        max_tracks: int = handler_opts.get("max_tracks", -1)
+        max_tracks: int = handler_opts.get("max_tracks", 4)
 
         def audio_loader(item: ItemWithPath) -> Sequence[bytes]:
             if item.type.startswith("video") or item.type.startswith("audio"):
-                audio = load_audio(item.path, sr=sample_rate)
+                audio = load_audio_single(item.path, sr=sample_rate)
                 return [track.tobytes() for track in audio[:max_tracks]]
             return []
 

@@ -31,6 +31,9 @@ class FasterWhisperModel(InferenceModel):
             return
 
         self.devices = get_device()
+        self.devices = [
+            self.devices[0]
+        ]  # Disable multi-GPU due to https://github.com/SYSTRAN/faster-whisper/issues/149
         self.model = WhisperModel(
             model_size_or_path=self.model_name,
             device="auto",
