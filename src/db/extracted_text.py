@@ -14,6 +14,7 @@ def insert_extracted_text(
     language: str | None,
     language_confidence: float | None,
     confidence: float | None,
+    source_extraction_id: int | None = None,
 ) -> int:
     """
     Insert extracted text into the database
@@ -32,12 +33,23 @@ def insert_extracted_text(
         else None
     )
     cursor = conn.cursor()
-
-    sql = """
-    INSERT INTO extracted_text (idx, item_id, log_id, setter_id, language, language_confidence, confidence, text)
-    SELECT ?, ?, ?, logs.setter_id, ?, ?, ?, ?
+    src_cond = (
+        "AND extractions.source_extraction_id = ?"
+        if source_extraction_id is not None
+        else "AND extractions.is_origin = 1"
+    )
+    src_params = (
+        (source_extraction_id,) if source_extraction_id is not None else ()
+    )
+    sql = f"""
+    INSERT INTO extracted_text (idx, item_id, log_id, setter_id, extraction_id, language, language_confidence, confidence, text)
+    SELECT ?, ?, ?, logs.setter_id, extractions.id, ?, ?, ?, ?
     FROM data_extraction_log AS logs
     WHERE logs.id = ?
+    JOIN items_extractions AS extractions
+    ON extractions.log_id = logs.id
+    AND extractions.item_id = ?
+    {src_cond}
     """
     cursor.execute(
         sql,
@@ -50,6 +62,8 @@ def insert_extracted_text(
             confidence,
             text,
             log_id,
+            item_id,
+            *src_params,
         ),
     )
     assert cursor.lastrowid is not None, "Last row ID is None"

@@ -18,13 +18,17 @@ def add_text_embedding(
     cursor.execute(
         """
         INSERT INTO text_embeddings 
-        (item_id, log_id, text_setter_id, text_id, setter_id, embedding)
+        (item_id, log_id, text_setter_id, text_id, setter_id, extraction_id, embedding)
         SELECT 
-        text.item_id, log.id, text.setter_id, text.id, log.setter_id, ?
+        text.item_id, log.id, text.setter_id, text.id, log.setter_id, extractions.id, ?
         FROM extracted_text AS text
         JOIN 
         data_extraction_log AS log ON log.id = ?
         WHERE text.id = ?
+        JOIN
+        items_extractions as extractions
+        ON extractions.source_extraction_id = text.extraction_id
+        AND extractions.log_id = log.id
         """,
         (embedding_bytes, log_id, text_id),
     )

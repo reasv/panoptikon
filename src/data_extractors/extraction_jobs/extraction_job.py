@@ -137,8 +137,6 @@ def run_extraction_job(
             continue
 
         try:
-            if len(inputs) > 0:
-                output_handler(log_id, item, inputs, outputs)
             if model_opts.target_entities() == ["items"]:
                 # If the model operates on individual items, add the item to the log
                 add_item_to_log(
@@ -175,7 +173,10 @@ def run_extraction_job(
                         previous_extraction_id=extraction_id,
                     )
 
-            if len(inputs) == 0:
+            if len(inputs) > 0:
+                output_handler(log_id, item, inputs, outputs)
+            else:
+                # Item yielded no data to process, skip and log as processed
                 if system_config.transaction_per_item:
                     conn.commit()
                 continue

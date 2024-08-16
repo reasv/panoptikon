@@ -37,19 +37,42 @@ def insert_tag_item(
     setter_id: int,
     confidence=1.0,
     log_id: int | None = None,
+    source_extraction_id: int | None = None,
 ):
-    # Round confidence to 3 decimal places
+    # Round confidence to 4 decimal places
     confidence_float = round(float(confidence), 4)
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO tags_items (item_id, tag_id, setter_id, log_id, confidence)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(item_id, tag_id, setter_id)
-        DO UPDATE SET confidence=excluded.confidence
-    """,
-        (item_id, tag_id, setter_id, log_id, confidence_float),
+    src_cond = (
+        "AND extractions.source_extraction_id = ?"
+        if source_extraction_id is not None
+        else "AND extractions.is_origin = 1"
     )
+    src_params = (
+        (source_extraction_id,) if source_extraction_id is not None else ()
+    )
+    cursor.execute(
+        f"""
+        INSERT INTO tags_items
+        (item_id, tag_id, setter_id, log_id, confidence, extraction_id)
+        SELECT ?, ?, ?, ?, ?, extractions.id
+        FROM items_extractions AS extractions
+        WHERE extractions.item_id = ?
+        AND extractions.log_id = ?
+        {src_cond}
+        """,
+        (
+            item_id,
+            tag_id,
+            setter_id,
+            log_id,
+            confidence_float,
+            item_id,
+            log_id,
+            *src_params,
+        ),
+    )
+    assert cursor.lastrowid is not None, "No tag item was inserted"
+    return cursor.lastrowid
 
 
 def add_tag_to_item(

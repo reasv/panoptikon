@@ -158,12 +158,14 @@ def initialize_database(conn: sqlite3.Connection):
         tag_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
         log_id INTEGER,
+        extraction_id INTEGER,
         confidence REAL DEFAULT 1.0,
         UNIQUE(item_id, tag_id, setter_id),  -- Unique constraint on item, tag and setter
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
         FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE
         FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+        FOREIGN KEY(extraction_id) REFERENCES items_extractions(id) ON DELETE CASCADE
     )
     """
     )
@@ -256,6 +258,7 @@ def initialize_database(conn: sqlite3.Connection):
         id INTEGER PRIMARY KEY,
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
+        extraction_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
         idx INTEGER NOT NULL,
         language TEXT,
@@ -266,7 +269,8 @@ def initialize_database(conn: sqlite3.Connection):
         UNIQUE(item_id, log_id, idx),
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
         FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
-        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
+        FOREIGN KEY(extraction_id) REFERENCES items_extractions(id) ON DELETE CASCADE
     )
     """
     )
@@ -378,10 +382,12 @@ def initialize_database(conn: sqlite3.Connection):
             item_id INTEGER NOT NULL,
             log_id INTEGER NOT NULL,
             setter_id INTEGER NOT NULL,
+            extraction_id INTEGER NOT NULL,
             embedding float[],
             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
             FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
-            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
+            FOREIGN KEY(extraction_id) REFERENCES items_extractions(id) ON DELETE CASCADE
         );
         """
     )
@@ -391,6 +397,7 @@ def initialize_database(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY,
             item_id INTEGER NOT NULL,
             log_id INTEGER NOT NULL,
+            extraction_id INTEGER NOT NULL,
             setter_id INTEGER NOT NULL,
             text_setter_id INTEGER NOT NULL,
             text_id INTEGER NOT NULL,
@@ -400,7 +407,8 @@ def initialize_database(conn: sqlite3.Connection):
             FOREIGN KEY(log_id) REFERENCES data_extraction_log(id) ON DELETE CASCADE,
             FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
             FOREIGN KEY(text_id) REFERENCES extracted_text(id) ON DELETE CASCADE,
-            FOREIGN KEY(text_setter_id) REFERENCES setters(id) ON DELETE CASCADE
+            FOREIGN KEY(text_setter_id) REFERENCES setters(id) ON DELETE CASCADE,
+            FOREIGN KEY(extraction_id) REFERENCES items_extractions(id) ON DELETE CASCADE
         );
         """
     )
@@ -513,6 +521,9 @@ def initialize_database(conn: sqlite3.Connection):
         ("items_extractions", ["item_id"]),
         ("items_extractions", ["log_id"]),
         ("items_extractions", ["setter_id"]),
+        ("items_extractions", ["source_extraction_id"]),
+        ("items_extractions", ["is_origin"]),
+        ("items_extractions", ["item_id", "log_id", "is_origin"]),
         ("tags_items", ["item_id"]),
         ("tags_items", ["tag_id"]),
         ("tags_items", ["confidence"]),
@@ -564,6 +575,11 @@ def initialize_database(conn: sqlite3.Connection):
         ("storage.frames", ["width"]),
         ("storage.frames", ["height"]),
         ("storage.frames", ["version"]),
+        # All extraction_id columns
+        ("tags_items", ["extraction_id"]),
+        ("extracted_text", ["extraction_id"]),
+        ("image_embeddings", ["extraction_id"]),
+        ("text_embeddings", ["extraction_id"]),
     ]
 
     for table, columns in indices:

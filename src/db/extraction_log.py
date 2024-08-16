@@ -159,13 +159,17 @@ def add_item_to_log(
 
     cursor.execute(
         """
-    INSERT INTO items_extractions (item_id, log_id, setter_id, is_origin, source_extraction_id)
+    INSERT INTO items_extractions
+    (item_id, log_id, setter_id, is_origin, source_extraction_id)
     SELECT ?, ?, log.setter_id, ?, ?
     FROM data_extraction_log AS log
     WHERE log.id = ?
     """,
         (item_id, log_id, is_origin, previous_extraction_id, log_id),
     )
+    # Return the ID of the new extraction
+    assert cursor.lastrowid is not None, "No extraction was inserted"
+    return cursor.lastrowid
 
 
 def get_items_missing_data_extraction(
