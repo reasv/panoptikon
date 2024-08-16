@@ -17,13 +17,13 @@ class DoctrModel(InferenceModel):
         recognition_model: str,
         detect_language: bool = True,
         pretrained: bool = True,
-        **kwargs,
+        init_args: dict = {},
     ):
         self.detection_model: str = detection_model
         self.recognition_model: str = recognition_model
         self.detect_language: bool = detect_language
         self.pretrained: bool = pretrained
-        self.init_args = kwargs
+        self.init_args = init_args
         self._model_loaded: bool = False
 
     @classmethod

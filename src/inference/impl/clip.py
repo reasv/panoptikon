@@ -14,12 +14,12 @@ class ClipModel(InferenceModel):
         model_name: str,
         pretrained: str | None = None,
         context_length: int | None = None,
-        **kwargs,
+        init_args: dict = {},
     ):
         self.model_name: str = model_name
         self.pretrained: str | None = pretrained
         self.context_length: int | None = context_length
-        self.init_args = kwargs
+        self.init_args = init_args
         self._model_loaded: bool = False
 
     @classmethod

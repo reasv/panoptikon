@@ -59,8 +59,9 @@ logger = logging.getLogger(__name__)
 
 
 class WDTagger(InferenceModel):
-    def __init__(self, model_repo: str):
+    def __init__(self, model_repo: str, init_args: dict = {}):
         self.model_repo = model_repo
+        self.init_args = init_args
         self._model_loaded = False
 
     @classmethod
@@ -76,7 +77,9 @@ class WDTagger(InferenceModel):
             return
         self.labels = load_labels(self.model_repo)
 
-        model: nn.Module = timm.create_model("hf-hub:" + self.model_repo).eval()
+        model: nn.Module = timm.create_model(
+            "hf-hub:" + self.model_repo, **self.init_args
+        ).eval()
         state_dict = timm.models.load_state_dict_from_hf(self.model_repo)
         model.load_state_dict(state_dict)
         transform = create_transform(

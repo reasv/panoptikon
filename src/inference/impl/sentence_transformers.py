@@ -10,11 +10,11 @@ class SentenceTransformersModel(InferenceModel):
         self,
         model_name: str,
         init_args: dict = {},
-        encode_args: dict = {},
+        inf_args: dict = {},
     ):
         self.model_name: str = model_name
         self.init_args = init_args
-        self.encode_args = encode_args
+        self.inf_args = inf_args
         self._model_loaded: bool = False
 
     @classmethod
@@ -59,10 +59,10 @@ class SentenceTransformersModel(InferenceModel):
         if self.pool:
             # Use multi-process pool for parallel inference
             embeddings = self.model.encode_multi_process(
-                input_strings, pool=self.pool, **self.encode_args
+                input_strings, pool=self.pool, **self.inf_args
             )
         else:
-            embeddings = self.model.encode(input_strings, **self.encode_args)
+            embeddings = self.model.encode(input_strings, **self.inf_args)
 
         assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
         # Convert embeddings to bytes

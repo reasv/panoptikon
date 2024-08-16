@@ -15,11 +15,11 @@ class FasterWhisperModel(InferenceModel):
         self,
         model_name: str,
         init_args: dict = {},
-        transcribe_args: dict = {},
+        inf_args: dict = {},
     ):
         self.model_name: str = model_name
         self.init_args = init_args
-        self.transcribe_args = transcribe_args
+        self.inf_args = inf_args
         self._model_loaded: bool = False
 
     @classmethod
@@ -76,7 +76,7 @@ class FasterWhisperModel(InferenceModel):
         num_devices = len(self.devices)
 
         def process_audio(audio):
-            return self.model.transcribe(audio=audio, **self.transcribe_args)
+            return self.model.transcribe(audio=audio, **self.inf_args)
 
         if num_devices > 1:
             with ThreadPoolExecutor(max_workers=num_devices) as executor:
