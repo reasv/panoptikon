@@ -71,19 +71,23 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
 
     if (
         handler_name == "extracted_text"
-        and model.data_type() == "text_embedding"
+        and model.data_type() == "text-embedding"
     ):
 
         def run_batch_emb(
             batch: Sequence[Tuple[int, str]],
         ) -> List[bytes]:
+            batch_text = [text for _, text in batch]
+            assert all(
+                isinstance(text, str) for text in batch_text
+            ), f"Embedding text must be str, got {batch_text}"
             return model.run_batch_inference(
-                *cache_args, [(text, None) for _, text in batch]
+                *cache_args, [(text, None) for text in batch_text]
             )  # type: ignore
 
         batch_inference_func = run_batch_emb
 
-    if handler_name == "image_frames" and model.data_type() == "clip":
+    elif handler_name == "image_frames" and model.data_type() == "clip":
 
         def run_batch_clip(
             batch: Sequence[bytes],
@@ -141,7 +145,7 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
 
         result_handler = clip_handler
 
-    elif model.data_type() == "text_embedding":
+    elif model.data_type() == "text-embedding":
 
         def text_emb_handler(
             log_id: int,

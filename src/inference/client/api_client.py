@@ -1,6 +1,7 @@
 import json
 import logging
-from typing import Any, Dict, List, Sequence, Union
+from re import T
+from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import requests as r
 from requests import Response
@@ -18,7 +19,7 @@ class InferenceAPIClient:
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-        inputs: Sequence,
+        inputs: Sequence[Tuple[str | dict | None, str | bytes | None]],
     ):
         url = f"{self.base_url}/predict/{inference_id}"
         # Prepare the query parameters
@@ -27,19 +28,6 @@ class InferenceAPIClient:
             "lru_size": lru_size,
             "ttl_seconds": ttl_seconds,
         }
-        # For each input, if it's not a tuple, convert it to a tuple
-        inputs = [
-            (
-                item
-                if isinstance(item, tuple)
-                else (
-                    (item, None)
-                    if not isinstance(item, bytes)
-                    else (None, item)
-                )
-            )
-            for item in inputs
-        ]
         # Prepare the JSON data payload
         json_data = {"inputs": [item[0] for item in inputs]}
         # Convert the JSON data to a string and add it to the form data
@@ -163,7 +151,7 @@ def parse_multipart_response(response: Response) -> List[bytes]:
     return files_list
 
 
-def process_input_files(files: List[str | bytes]):
+def process_input_files(files: List[str | bytes | None]):
     if not files:
         return None
     input_files = []

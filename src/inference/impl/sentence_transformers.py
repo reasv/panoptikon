@@ -47,9 +47,9 @@ class SentenceTransformersModel(InferenceModel):
         # Ensure the model is loaded
         self.load()
         input_strings: List[str] = [inp.data for inp in inputs]  # type: ignore
-        assert all(
-            isinstance(inp, str) for inp in input_strings
-        ), "Inputs must be strings"
+        for inp in input_strings:
+            assert isinstance(inp, str), f"Input must be string, got {inp}"
+
         if self.pool:
             # Use multi-process pool for parallel inference
             embeddings = self.model.encode_multi_process(
