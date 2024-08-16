@@ -1,7 +1,9 @@
+import io
 from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 import numpy as np
+import PIL.Image
 
 from src.data_extractors.ai.clip import CLIPEmbedder
 from src.data_extractors.ai.text_embed import TextEmbedder
@@ -11,6 +13,7 @@ from src.db.search.types import (
     SearchQuery,
 )
 from src.db.utils import serialize_f32
+from src.inference.impl.utils import deserialize_array
 from src.types import OutputDataType, SearchStats
 from src.ui.components.search.utils import AnyComponent
 
@@ -118,7 +121,7 @@ def create_vector_search_opts(query_state: gr.State):
                             key="clip_image_search",
                             label="Search for similar images",
                             scale=2,
-                            type="numpy",
+                            type="pil",
                         )
                         elements.append(clip_image_search)
 
@@ -162,7 +165,7 @@ def create_vector_search_opts(query_state: gr.State):
         language_confidence_val: float = args[language_confidence]
         clip_model_val: str | None = args[clip_model]
         clip_text_query_val: str | None = args[clip_text_query]
-        clip_image_search_val: np.ndarray | None = args[clip_image_search]
+        clip_image_search_val: PIL.Image.Image | None = args[clip_image_search]
 
         query.query.filters.extracted_text_embeddings = None
         query.query.filters.image_embeddings = None
@@ -198,7 +201,7 @@ def create_vector_search_opts(query_state: gr.State):
         elif vec_query_type_val == "CLIP Reverse Image Search":
             if clip_image_search_val is not None and clip_model_val:
                 assert isinstance(
-                    clip_image_search_val, np.ndarray
+                    clip_image_search_val, PIL.Image.Image
                 ), "Expected numpy array for image search"
                 if not final_query_build:
                     embedded_query = "placeholder".encode("utf-8")
@@ -263,6 +266,7 @@ last_used_model: str | None = None
 
 
 def get_embed(text: str, model_name: str) -> bytes:
+
     global last_embedded_text, last_embedded_text_embed, last_used_model
     if (
         text == last_embedded_text
@@ -270,30 +274,44 @@ def get_embed(text: str, model_name: str) -> bytes:
         and last_embedded_text_embed is not None
     ):
         return last_embedded_text_embed
+
+    from src.data_extractors.models import ModelOptsFactory
+
+    model = ModelOptsFactory.get_model(model_name)
+    embed_bytes: bytes = model.run_batch_inference(
+        "search", 1, 60, [({"text": text}, None)]
+    )[0]
+    text_embed = deserialize_array(embed_bytes)
+    assert isinstance(text_embed, np.ndarray)
     # Set as persistent so that the model is not reloaded every time the function is called
-    embedder = TextEmbedder(model_name=model_name, persistent=True)
-    text_embed = embedder.get_text_embeddings([text])[0]
     last_embedded_text = text
     last_used_model = model_name
-    last_embedded_text_embed = serialize_f32(text_embed)
+    last_embedded_text_embed = serialize_f32(text_embed.tolist())
     return last_embedded_text_embed
 
 
-def get_clip_embed(input: str | np.ndarray, model_name: str):
+def get_clip_embed(input: str | PIL.Image.Image, model_name: str):
 
-    from src.data_extractors.models import ImageEmbeddingModel
+    from src.data_extractors.models import ModelOptsFactory
 
-    model_opt = ImageEmbeddingModel(model_name)
-    name = model_opt.clip_model_name()
-    pretrained = model_opt.clip_model_checkpoint()
-    # Set as persistent so that the model is not reloaded every time the function is called
-    clip_model = CLIPEmbedder(name, pretrained, persistent=True)
-    clip_model.load_model()
+    model = ModelOptsFactory.get_model(model_name)
+
     if isinstance(input, str):
-        embed = clip_model.get_text_embeddings([input])[0]
+        embed_bytes: bytes = model.run_batch_inference(
+            "search", 1, 60, [({"text": input}, None)]
+        )[0]
+        embed = deserialize_array(embed_bytes)
         assert isinstance(embed, np.ndarray)
         return serialize_f32(embed.tolist())
     else:  # input is an image
-        embed = clip_model.get_image_embeddings([input])[0]
+        # Save image into a buffer
+        image_buffer = io.BytesIO()
+        input.save(image_buffer, format="PNG")
+        input_bytes = image_buffer.getvalue()
+
+        embed_bytes: bytes = model.run_batch_inference(
+            "search", 1, 60, [({}, input_bytes)]
+        )[0]
+        embed = deserialize_array(embed_bytes)
         assert isinstance(embed, np.ndarray)
         return serialize_f32(embed.tolist())

@@ -1,10 +1,10 @@
 import logging
 import os
-import re
 import sqlite3
+from io import BytesIO
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
-import PIL
+import numpy as np
 import PIL.Image
 
 import src.data_extractors.extraction_jobs.types as job_types
@@ -21,6 +21,7 @@ from src.db.rules.types import (
 from src.db.setters import delete_setter_by_name
 from src.db.tags import delete_orphan_tags
 from src.inference.client import api_client
+from src.inference.impl.utils import serialize_array
 from src.types import OutputDataType, TargetEntityType
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,18 @@ class ModelOpts:
 
     @classmethod
     def group_name(cls) -> str:
+        raise NotImplementedError
+
+    def run_batch_inference(
+        self,
+        cache_key: str,
+        lru_size: int,
+        ttl_seconds: int,
+        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
+    ):
+        raise NotImplementedError
+
+    def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
 
 
@@ -383,6 +396,45 @@ class ImageEmbeddingModel(ModelOpts):
     def clip_model_checkpoint(self) -> str:
         return self._checkpoint
 
+    def run_batch_inference(
+        self,
+        cache_key: str,
+        lru_size: int,
+        ttl_seconds: int,
+        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
+    ):
+        from src.data_extractors.ai.clip import CLIPEmbedder
+
+        clip_model = CLIPEmbedder(
+            self._model_name, self._checkpoint, persistent=True
+        )
+        clip_model.load_model()
+        outputs: List[bytes] = []
+        for data, file in inputs:
+            if file:
+                pilimage = PIL.Image.open(BytesIO(file)).convert("RGB")
+                embed = clip_model.get_image_embeddings([pilimage])[0]
+                assert isinstance(embed, np.ndarray)
+                outputs.append(serialize_array(embed))
+            else:
+                assert isinstance(data, dict)
+                text = data.get("text", None)
+                assert text is not None, "Text not found in input data"
+                embed = clip_model.get_text_embeddings([text])[0]
+                assert isinstance(
+                    embed, np.ndarray
+                ), f"Embedding is not an array: {type(embed)}"
+                outputs.append(serialize_array(embed))
+        return outputs
+
+    def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
+        from src.data_extractors.ai.clip import CLIPEmbedder
+
+        clip_model = CLIPEmbedder(
+            self._model_name, self._checkpoint, persistent=True
+        )
+        clip_model.load_model()
+
 
 class TextEmbeddingModel(ModelOpts):
     _model_name: str
@@ -452,7 +504,9 @@ class TextEmbeddingModel(ModelOpts):
         }
         return model_to_name[model_name]
 
-    def load_model(self):
+    def load_model(
+        self, cache_key: str = "", lru_size: int = 0, ttl_seconds: int = 0
+    ):
         from src.data_extractors.ai.text_embed import TextEmbedder
 
         TextEmbedder(self._model_name, persistent=True)
@@ -463,7 +517,28 @@ class TextEmbeddingModel(ModelOpts):
         embedder_model = TextEmbedder(self._model_name, load_model=False)
         embedder_model.unload_model()
 
-    def run_batch_inference(self, texts: List[str]) -> List[List[float]]:
+    def run_batch_inference(
+        self,
+        cache_key: str,
+        lru_size: int,
+        ttl_seconds: int,
+        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
+    ):
+        from src.data_extractors.ai.text_embed import TextEmbedder
+
+        embedder = TextEmbedder(self._model_name, persistent=True)
+
+        outputs: List[bytes] = []
+        for data, file in inputs:
+            assert isinstance(data, dict)
+            text = data.get("text", None)
+            assert text is not None, "Text not found in input data"
+            embed = np.array(embedder.get_text_embeddings([text])[0])
+            assert isinstance(embed, np.ndarray)
+            outputs.append(serialize_array(embed))
+        return outputs
+
+    def run_batch_inference_v1(self, texts: List[str]) -> List[List[float]]:
         from src.data_extractors.ai.text_embed import TextEmbedder
 
         embedder = TextEmbedder(self._model_name)
@@ -597,7 +672,11 @@ class ModelOptsFactory:
 
     @classmethod
     def get_model(cls, setter_name: str) -> ModelOpts:
-        group_name, inference_id = setter_name.split("/", 1)
+        s = setter_name.split("/", 1)
+        if len(s) == 2:
+            group_name, inference_id = s
+        else:
+            group_name, inference_id = None, None
         if group_name in cls._api_models:
             return cls._api_models[group_name](model_name=inference_id)
         model_opts = cls.get_model_opts(setter_name)

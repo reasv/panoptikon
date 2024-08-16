@@ -18,6 +18,7 @@ from src.data_extractors.extraction_jobs.extraction_job import (
 )
 from src.data_extractors.models import ModelGroup
 from src.db.text_embeddings import get_text_missing_embeddings
+from src.inference.impl.utils import serialize_array
 from src.types import ItemWithPath
 
 logger = logging.getLogger(__name__)
@@ -59,19 +60,15 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         sample_rate: int = handler_opts.get("sample_rate", 16000)
         max_tracks: int = handler_opts.get("max_tracks", 4)
 
-        def serialize(array: np.ndarray) -> bytes:
-            buffer = io.BytesIO()
-            np.save(buffer, array)
-            buffer.seek(0)
-            return buffer.read()
-
         def audio_loader(
             item: ItemWithPath,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             if item.type.startswith("video") or item.type.startswith("audio"):
                 audio = load_audio_single(item.path, sr=sample_rate)
 
-                return [({}, serialize(track)) for track in audio[:max_tracks]]
+                return [
+                    ({}, serialize_array(track)) for track in audio[:max_tracks]
+                ]
             return []
 
         data_loader = audio_loader

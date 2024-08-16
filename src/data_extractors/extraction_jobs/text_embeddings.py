@@ -23,7 +23,9 @@ def run_text_embedding_extractor_job(
     def process_batch(
         batch: Sequence[Tuple[int, str]]
     ) -> List[Tuple[int, List[float]]]:
-        embeddings = model_opt.run_batch_inference([text for _, text in batch])
+        embeddings = model_opt.run_batch_inference_v1(
+            [text for _, text in batch]
+        )
         return [
             (text_id, embedding)
             for (text_id, _), embedding in zip(batch, embeddings)
