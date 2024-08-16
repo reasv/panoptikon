@@ -75,13 +75,22 @@ class FasterWhisperModel(InferenceModel):
 
         num_devices = len(self.devices)
 
-        def process_audio(audio):
-            return self.model.transcribe(audio=audio, **self.inf_args)
+        def get_args(idx: int):
+            config = configs[idx]
+            if config is None:
+                return {}
+            assert isinstance(config, dict), "Config must be a dict"
+            return config.get("args", {})
+
+        def process_audio(audio, idx):
+            return self.model.transcribe(
+                audio=audio, **self.inf_args, **get_args(idx)
+            )
 
         if num_devices > 1:
             with ThreadPoolExecutor(max_workers=num_devices) as executor:
                 future_to_audio = {
-                    executor.submit(process_audio, audio): i
+                    executor.submit(process_audio, audio, i): i
                     for i, audio in enumerate(audio_inputs)
                 }
                 transcriptions: List[
@@ -93,7 +102,9 @@ class FasterWhisperModel(InferenceModel):
                     index = future_to_audio[future]
                     transcriptions[index] = future.result()
         else:
-            transcriptions = [process_audio(audio) for audio in audio_inputs]
+            transcriptions = [
+                process_audio(audio, i) for i, audio in enumerate(audio_inputs)
+            ]
         # Remove all None values
         initial_length = len(transcriptions)
         transcriptions = [

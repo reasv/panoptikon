@@ -1,4 +1,4 @@
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
@@ -9,12 +9,14 @@ class SentenceTransformersModel(InferenceModel):
     def __init__(
         self,
         model_name: str,
+        query_prompt_name_map: dict = {},
         init_args: dict = {},
         inf_args: dict = {},
     ):
         self.model_name: str = model_name
         self.init_args = init_args
         self.inf_args = inf_args
+        self.query_prompt_name = query_prompt_name_map
         self._model_loaded: bool = False
 
     @classmethod
@@ -56,13 +58,32 @@ class SentenceTransformersModel(InferenceModel):
             ), f"Input 'text' must be string, got {inp.data['text']}"
             input_strings.append(inp.data["text"])
 
+        batch_config = inputs[0].data
+        assert isinstance(batch_config, dict), "Batch config must be dict"
+
+        batch_args = batch_config.get("args", {})
+        assert isinstance(batch_args, dict), "Batch args must be dict"
+
+        if batch_config.get("query_type") in self.query_prompt_name:
+            query_type = batch_config.get("query_type")
+            batch_args["prompt_name"] = self.query_prompt_name[query_type]
+
         if self.pool:
             # Use multi-process pool for parallel inference
             embeddings = self.model.encode_multi_process(
-                input_strings, pool=self.pool, **self.inf_args
+                input_strings,
+                pool=self.pool,
+                batch_size=len(input_strings),
+                **self.inf_args,
+                **batch_args,
             )
         else:
-            embeddings = self.model.encode(input_strings, **self.inf_args)
+            embeddings = self.model.encode(
+                input_strings,
+                batch_size=len(input_strings),
+                **self.inf_args,
+                **batch_args,
+            )
 
         assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
         # Convert embeddings to bytes

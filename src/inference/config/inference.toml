@@ -52,10 +52,10 @@ target_entities = ["text", "tags"] # Tags are also stored as text
 output_type = "text-embedding"
 input_spec = { handler="extracted_text" }
 [group.textembed.inference_ids]
-all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer" } }
+all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer (Recommended)" } }
 all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
-stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5" }, metadata = { description = "Stella English 400M Sentence Transformer" } }
-
+stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query"} }, metadata = { description = "Stella English 400M Sentence Transformer" } }
+"stella_en_1.5B_v5" = { config = { model_name = "dunzhang/stella_en_1.5B_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query"} }, metadata = { description = "Stella English 1.5B Sentence Transformer" } }
 
 [group.whisper]
 config = { impl_class = "faster_whisper" }
