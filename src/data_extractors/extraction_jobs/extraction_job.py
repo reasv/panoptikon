@@ -83,7 +83,6 @@ def run_extraction_job(
         0,
     )
     data_load_time, inference_time = 0.0, 0.0
-    system_config = retrieve_system_config(conn)
     threshold = model_opts.get_group_threshold(conn)
     batch_size = model_opts.get_group_batch_size(conn)
     log_id, setter_id = add_data_extraction_log(
@@ -94,7 +93,8 @@ def run_extraction_job(
         threshold,
         batch_size,
     )
-    if system_config.transaction_per_item:
+    transaction_per_item = True  # Now hardcoded to True
+    if transaction_per_item:
         # Commit the current transaction after adding the log
         conn.commit()
 
@@ -127,12 +127,12 @@ def run_extraction_job(
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
-        if system_config.transaction_per_item:
+        if transaction_per_item:
             # Start a new transaction for each item
             conn.execute("BEGIN TRANSACTION")
         processed_items += 1
         if failed_items.get(item.sha256) is not None:
-            if system_config.transaction_per_item:
+            if transaction_per_item:
                 conn.commit()
             continue
 
@@ -177,13 +177,13 @@ def run_extraction_job(
                 output_handler(log_id, item, inputs, outputs)
             else:
                 # Item yielded no data to process, skip and log as processed
-                if system_config.transaction_per_item:
+                if transaction_per_item:
                     conn.commit()
                 continue
         except Exception as e:
             logger.error(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
-            if system_config.transaction_per_item:
+            if transaction_per_item:
                 conn.rollback()
             continue
         if item.type.startswith("video"):
@@ -212,7 +212,7 @@ def run_extraction_job(
             inference_time=inference_time,
             finished=False,
         )
-        if system_config.transaction_per_item:
+        if transaction_per_item:
             # Commit the transaction after updating the log
             conn.commit()
         yield ExtractorJobProgress(
@@ -225,7 +225,7 @@ def run_extraction_job(
         + f"totalling {total_processed_units} frames"
     )
     remaining_paths = get_remaining()
-    if system_config.transaction_per_item:
+    if transaction_per_item:
         # Start a new transaction to update the log with the final results
         # The transaction will be committed by the caller
         conn.execute("BEGIN TRANSACTION")
