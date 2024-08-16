@@ -259,15 +259,9 @@ def get_existing_setters(
         List[Tuple[str, str]]: A list of tuples containing (type, setter) pairs.
     """
     query = """
-    SELECT DISTINCT type, name
-    FROM setters
-    JOIN items_extractions
-    ON setters.id = items_extractions.setter_id
-    UNION
-    SELECT DISTINCT type, name
-    FROM setters
-    JOIN text_embeddings
-    ON setters.id = text_embeddings.setter_id
+    SELECT DISTINCT ie.data_type, s.name
+    FROM items_extractions ie
+    JOIN setters s ON ie.setter_id = s.id;
     """
 
     cursor = conn.cursor()
@@ -293,9 +287,8 @@ def get_unprocessed_extractions_for_item(
     query = f"""
         SELECT ie.id
         FROM items_extractions AS ie
-        JOIN setters AS s ON ie.setter_id = s.id
         WHERE ie.item_id = ?
-        AND s.type IN ({input_type_condition})
+        AND ie.data_type IN ({input_type_condition})
         AND NOT EXISTS (
             SELECT 1
             FROM items_extractions AS ie2
