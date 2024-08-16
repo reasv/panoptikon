@@ -3,18 +3,18 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
+from src.data_extractors.data_handlers.utils import deserialize_array
 from src.db.text_embeddings import add_text_embedding
 
 
 def handle_text_embeddings(
     conn: sqlite3.Connection,
     log_id: int,
-    inputs: Sequence[Tuple[int, str]],
+    input_ids: Sequence[int],
     embeddings: Sequence[bytes],
 ):
     embeddings_list: List[List[float]] = [
-        np.frombuffer(embedding, dtype=np.float32).tolist()
-        for embedding in embeddings
+        deserialize_array(embedding).tolist() for embedding in embeddings
     ]
-    for (text_id, _), embedding in zip(inputs, embeddings_list):
+    for text_id, embedding in zip(input_ids, embeddings_list):
         add_text_embedding(conn, text_id, log_id, embedding)

@@ -1,6 +1,9 @@
+import io
 import logging
 import sqlite3
 from typing import Any, Dict, List, Sequence, Tuple
+
+import numpy as np
 
 from src.data_extractors.data_handlers.clip import handle_clip
 from src.data_extractors.data_handlers.tags import handle_tag_result
@@ -29,20 +32,26 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         logger.info(f"Using score threshold {score_threshold}")
     else:
         logger.info("No score threshold set")
+    inference_opts = {"threshold": score_threshold} if score_threshold else {}
 
     cache_args = "batch", 1, 60
 
     def load_model():
         model.load_model(*cache_args)
 
+    def cleanup():
+        model.unload_model("batch")
+
     handler_name, handler_opts = model.input_spec()
 
     if handler_name == "image_frames":
 
-        def frame_loader(item: ItemWithPath):
+        def frame_loader(
+            item: ItemWithPath,
+        ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             max_frames = handler_opts.get("max_frames", 4)
             frames = image_loader(conn, item)
-            return frames[:max_frames]
+            return [({}, frame) for frame in frames[:max_frames]]
 
         data_loader = frame_loader
 
@@ -50,83 +59,65 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         sample_rate: int = handler_opts.get("sample_rate", 16000)
         max_tracks: int = handler_opts.get("max_tracks", 4)
 
-        def audio_loader(item: ItemWithPath) -> Sequence[bytes]:
+        def serialize(array: np.ndarray) -> bytes:
+            buffer = io.BytesIO()
+            np.save(buffer, array)
+            buffer.seek(0)
+            return buffer.read()
+
+        def audio_loader(
+            item: ItemWithPath,
+        ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             if item.type.startswith("video") or item.type.startswith("audio"):
                 audio = load_audio_single(item.path, sr=sample_rate)
-                return [track.tobytes() for track in audio[:max_tracks]]
+
+                return [({}, serialize(track)) for track in audio[:max_tracks]]
             return []
 
         data_loader = audio_loader
 
     elif handler_name == "extracted_text":
 
-        def get_item_text(item: ItemWithPath) -> List[Tuple[int, str]]:
-            return get_text_missing_embeddings(
-                conn, item.sha256, model.data_type(), model.setter_name()
-            )
+        def get_item_text(
+            item: ItemWithPath,
+        ) -> Sequence[Tuple[Dict[str, Any], None]]:
+            return [
+                ({"text_id": text_id, "text": text}, None)
+                for text_id, text in get_text_missing_embeddings(
+                    conn, item.sha256, model.data_type(), model.setter_name()
+                )
+            ]
 
         data_loader = get_item_text
     else:
         raise ValueError(f"Data loader {handler_name} not found")
 
-    if (
-        handler_name == "extracted_text"
-        and model.data_type() == "text-embedding"
-    ):
-
-        def run_batch_emb(
-            batch: Sequence[Tuple[int, str]],
-        ) -> List[bytes]:
-            batch_text = [text for _, text in batch]
-            assert all(
-                isinstance(text, str) for text in batch_text
-            ), f"Embedding text must be str, got {batch_text}"
-            return model.run_batch_inference(
-                *cache_args, [(text, None) for text in batch_text]
-            )  # type: ignore
-
-        batch_inference_func = run_batch_emb
-
-    elif handler_name == "image_frames" and model.data_type() == "clip":
-
-        def run_batch_clip(
-            batch: Sequence[bytes],
-        ) -> List[bytes]:
-            return model.run_batch_inference(
-                *cache_args, [(None, frame) for frame in batch]
-            )  # type: ignore
-
-        batch_inference_func = run_batch_clip
-    else:
-
-        def run_batch(
-            batch: Sequence[bytes | str],
-        ) -> List[Dict[str, Any]]:
-            opts = {"threshold": score_threshold} if score_threshold else None
-            return model.run_batch_inference(
-                *cache_args,
-                [(opts, frame) for frame in batch],
-            )  # type: ignore
-
-        batch_inference_func = run_batch
+    def batch_inference_func(
+        batch: Sequence[Tuple[Dict[str, Any], bytes | None]],
+    ) -> List[Dict[str, Any]] | List[bytes]:
+        return model.run_batch_inference(
+            *cache_args,
+            [({**data, **inference_opts}, file) for data, file in batch],
+        )
 
     if model.data_type() == "tags":
 
         def tag_handler(
             log_id: int,
             item: ItemWithPath,
-            _: Sequence[bytes | str],
+            _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
             handle_tag_result(conn, log_id, model.setter_name(), item, outputs)
 
         result_handler = tag_handler
+
     elif model.data_type() == "text":
 
         def text_handler(
             log_id: int,
             item: ItemWithPath,
-            _: Sequence[bytes | str],
+            _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
             handle_text(conn, log_id, item, outputs)
@@ -138,7 +129,7 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         def clip_handler(
             log_id: int,
             item: ItemWithPath,
-            _: Sequence[bytes],
+            _: Sequence[Any],
             embeddings: Sequence[bytes],  # bytes
         ):
             handle_clip(conn, log_id, item, embeddings)
@@ -150,23 +141,21 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         def text_emb_handler(
             log_id: int,
             _: ItemWithPath,
-            inputs: Sequence[Tuple[int, str]],
+            inputs: Sequence[Tuple[Dict[str, Any], Any]],
             embeddings: Sequence[bytes],
         ):
-            handle_text_embeddings(conn, log_id, inputs, embeddings)
+            input_ids = [data["text_id"] for data, _ in inputs]
+            handle_text_embeddings(conn, log_id, input_ids, embeddings)
 
         result_handler = text_emb_handler
     else:
         raise ValueError(f"Data handler not found for {model.data_type()}")
 
-    def cleanup():
-        model.unload_model("batch")
-
     return run_extraction_job(
         conn,
         model,
         data_loader,
-        batch_inference_func,  # type: ignore
+        batch_inference_func,
         result_handler,  # type: ignore
         cleanup,
         load_callback=load_model,

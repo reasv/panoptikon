@@ -96,7 +96,7 @@ def handle_resp(response: Response):
 
 def handle_predict_resp(
     response: Response,
-) -> Union[List[str | Dict[str, Any] | Sequence[Any]], List[bytes]]:
+) -> Union[List[Dict[str, Any]], List[bytes]]:
     try:
         content_type = response.headers.get("Content-Type", "")
 

@@ -108,14 +108,16 @@ def item_image_loader_pillow(
 
 def image_loader(
     conn: sqlite3.Connection, item: ItemWithPath
-) -> Sequence[Union[bytes, str]]:
+) -> Sequence[bytes]:
     if item.type.startswith("image/gif"):
         return [
             thumbnail_to_bytes(frame, "JPEG")
             for frame in gif_to_frames(item.path)
         ]
     if item.type.startswith("image"):
-        return [item.path]
+        # Load image as bytes
+        with open(item.path, "rb") as f:
+            return [f.read()]
     if item.type.startswith("video"):
         if frames := get_frames_bytes(conn, item.sha256):
             logger.debug(f"Loaded {len(frames)} frames from database")

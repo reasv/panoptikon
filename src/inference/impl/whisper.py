@@ -1,8 +1,10 @@
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
+from src.data_extractors.data_handlers.utils import deserialize_array
 from src.inference.impl.utils import clear_cache, get_device
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
@@ -68,7 +70,7 @@ class FasterWhisperModel(InferenceModel):
 
         audio_inputs: List[np.ndarray] = []
         for file in input_files:
-            audio: np.ndarray = np.frombuffer(file, dtype=np.float32)
+            audio: np.ndarray = deserialize_array(file)
             audio_inputs.append(audio)
 
         num_devices = len(self.devices)
@@ -105,7 +107,9 @@ class FasterWhisperModel(InferenceModel):
         for (segments, info), config in zip(transcriptions, configs):
             if isinstance(config, dict):
                 threshold = config.get("threshold")
-                assert isinstance(threshold, float), "Threshold must be a float"
+                assert (
+                    isinstance(threshold, float) or threshold is None
+                ), f"Threshold must be a float, got {threshold} ({type(threshold)})"
             else:
                 threshold = None
 

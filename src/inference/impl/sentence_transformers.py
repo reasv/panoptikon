@@ -1,6 +1,6 @@
 from typing import List, Sequence
 
-from src.inference.impl.utils import clear_cache, get_device
+from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
 
@@ -38,17 +38,23 @@ class SentenceTransformersModel(InferenceModel):
             self.pool = None
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def predict(self, inputs: Sequence[PredictionInput]) -> List[bytes]:
         import numpy as np
 
         # Ensure the model is loaded
         self.load()
-        input_strings: List[str] = [inp.data for inp in inputs]  # type: ignore
-        for inp in input_strings:
-            assert isinstance(inp, str), f"Input must be string, got {inp}"
+        input_strings: List[str] = []
+        for inp in inputs:
+            assert isinstance(
+                inp.data, dict
+            ), f"Input must be dict, got {inp.data}"
+            assert (
+                "text" in inp.data
+            ), f"Input dict must have 'text' key, got {inp.data}"
+            assert isinstance(
+                inp.data["text"], str
+            ), f"Input 'text' must be string, got {inp.data['text']}"
+            input_strings.append(inp.data["text"])
 
         if self.pool:
             # Use multi-process pool for parallel inference
@@ -60,7 +66,7 @@ class SentenceTransformersModel(InferenceModel):
 
         assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
         # Convert embeddings to bytes
-        return [emb.tobytes() for emb in embeddings]
+        return [serialize_array(emb) for emb in embeddings]
 
     def unload(self) -> None:
         if self._model_loaded:
@@ -70,3 +76,6 @@ class SentenceTransformersModel(InferenceModel):
             del self.pool
             clear_cache()
             self._model_loaded = False
+
+    def __del__(self):
+        self.unload()

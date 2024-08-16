@@ -752,7 +752,7 @@ class ModelGroup(ModelOpts):
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-        inputs: Sequence[Tuple[str | dict | None, str | bytes | None]],
+        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
     ):
         result = get_inference_api_client().predict(
             self.setter_name(), cache_key, lru_size, ttl_seconds, inputs

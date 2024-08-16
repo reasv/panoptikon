@@ -3,7 +3,7 @@ from typing import List, Sequence, Union
 
 from PIL import Image as PILImage
 
-from src.inference.impl.utils import clear_cache, get_device
+from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
 
@@ -68,8 +68,9 @@ class ClipModel(InferenceModel):
 
         # Separate text and image inputs, storing their original indices
         for idx, input_item in enumerate(inputs):
-            if isinstance(input_item.data, str):
-                text_inputs.append((idx, input_item.data))
+            if isinstance(input_item.data, dict):
+                assert "text" in input_item.data, "Input must have 'text' key"
+                text_inputs.append((idx, input_item.data["text"]))
             elif input_item.file:
                 image = PILImage.open(BytesIO(input_item.file)).convert("RGB")
                 image_inputs.append((idx, image))
@@ -89,7 +90,9 @@ class ClipModel(InferenceModel):
 
                 # Convert text features to list and store them in the results list
                 for i, idx in enumerate(indices):
-                    results[idx] = text_features[i].cpu().numpy().tobytes()
+                    results[idx] = serialize_array(
+                        text_features[i].cpu().numpy()
+                    )
 
             # Process image inputs if any
             if image_inputs:
@@ -108,7 +111,9 @@ class ClipModel(InferenceModel):
 
                 # Convert image features to list and store them in the results list
                 for i, idx in enumerate(indices):
-                    results[idx] = image_features[i].cpu().numpy().tobytes()
+                    results[idx] = serialize_array(
+                        image_features[i].cpu().numpy()
+                    )
 
         output = [res for res in results if res is not None]
         assert len(output) == len(
