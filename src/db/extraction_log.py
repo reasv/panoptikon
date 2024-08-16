@@ -148,6 +148,7 @@ def add_item_to_log(
     conn: sqlite3.Connection,
     item: str,
     log_id: int,
+    data_type: str,
     previous_extraction_id: int | None = None,
 ):
     cursor = conn.cursor()
@@ -160,12 +161,12 @@ def add_item_to_log(
     cursor.execute(
         """
     INSERT INTO items_extractions
-    (item_id, log_id, setter_id, is_origin, source_extraction_id)
-    SELECT ?, ?, log.setter_id, ?, ?
+    (item_id, log_id, setter_id, data_type, is_origin, source_extraction_id)
+    SELECT ?, ?, log.setter_id, ?, ?, ?
     FROM data_extraction_log AS log
     WHERE log.id = ?
     """,
-        (item_id, log_id, is_origin, previous_extraction_id, log_id),
+        (item_id, log_id, data_type, is_origin, previous_extraction_id, log_id),
     )
     # Return the ID of the new extraction
     assert cursor.lastrowid is not None, "No extraction was inserted"

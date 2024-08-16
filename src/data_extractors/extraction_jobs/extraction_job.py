@@ -19,7 +19,6 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
 )
-from src.db.config import retrieve_system_config
 from src.db.extraction_log import (
     add_data_extraction_log,
     add_item_to_log,
@@ -143,6 +142,7 @@ def run_extraction_job(
                     conn,
                     item=item.sha256,
                     log_id=log_id,
+                    data_type=model_opts.data_type(),
                 )
             else:
                 # This model operates not on the original items, but on the extracted data
@@ -171,6 +171,7 @@ def run_extraction_job(
                         item=item.sha256,
                         log_id=log_id,
                         previous_extraction_id=extraction_id,
+                        data_type=model_opts.data_type(),
                     )
 
             if len(inputs) > 0:

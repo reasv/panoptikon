@@ -237,6 +237,7 @@ def initialize_database(conn: sqlite3.Connection):
         item_id INTEGER NOT NULL,
         log_id INTEGER NOT NULL,
         setter_id INTEGER NOT NULL,
+        data_type TEXT NOT NULL,                          -- Type of data extracted (e.g. text, image, etc.)
         source_extraction_id INTEGER,                     -- Reference to a previous extraction from which data was further processed
         is_origin BOOLEAN,                                -- Indicates if the extraction is the original extraction. True if it is, NULL if not
         UNIQUE(item_id, log_id, is_origin),               -- Origin extractions should be unique per item (and job)
@@ -523,6 +524,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("items_extractions", ["setter_id"]),
         ("items_extractions", ["source_extraction_id"]),
         ("items_extractions", ["is_origin"]),
+        ("items_extractions", ["data_type"]),
         ("items_extractions", ["item_id", "log_id", "is_origin"]),
         ("tags_items", ["item_id"]),
         ("tags_items", ["tag_id"]),
