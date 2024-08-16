@@ -132,6 +132,8 @@ def run_extraction_job(
             conn.execute("BEGIN TRANSACTION")
         processed_items += 1
         if failed_items.get(item.sha256) is not None:
+            if system_config.transaction_per_item:
+                conn.commit()
             continue
 
         try:
@@ -174,10 +176,14 @@ def run_extraction_job(
                     )
 
             if len(inputs) == 0:
+                if system_config.transaction_per_item:
+                    conn.commit()
                 continue
         except Exception as e:
             logger.error(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
+            if system_config.transaction_per_item:
+                conn.rollback()
             continue
         if item.type.startswith("video"):
             videos += 1
