@@ -2,10 +2,13 @@ from io import BytesIO
 from typing import List, Sequence, Union
 
 from PIL import Image as PILImage
+from PIL import ImageFile
 
 from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class ClipModel(InferenceModel):
@@ -68,12 +71,15 @@ class ClipModel(InferenceModel):
 
         # Separate text and image inputs, storing their original indices
         for idx, input_item in enumerate(inputs):
-            if isinstance(input_item.data, dict):
-                assert "text" in input_item.data, "Input must have 'text' key"
-                text_inputs.append((idx, input_item.data["text"]))
-            elif input_item.file:
+            if input_item.file:
                 image = PILImage.open(BytesIO(input_item.file)).convert("RGB")
                 image_inputs.append((idx, image))
+            else:
+                assert isinstance(
+                    input_item.data, dict
+                ), "Input must be a dictionary"
+                assert "text" in input_item.data, "Input must have 'text' key"
+                text_inputs.append((idx, input_item.data["text"]))
 
         # Use inference_mode for optimized inference
         with torch.inference_mode():
