@@ -81,7 +81,6 @@ def get_extracted_text_for_item(
         """
         SELECT
             items.sha256,
-            setters.type,
             setters.name,
             language,
             text,
@@ -101,12 +100,11 @@ def get_extracted_text_for_item(
     extracted_texts = [
         ExtractedText(
             item_sha256=row[0],
-            model_type=row[1],
-            setter_name=row[2],
-            language=row[3],
-            text=row[4],
-            confidence=row[5],
-            language_confidence=row[6],
+            setter_name=row[1],
+            language=row[2],
+            text=row[3],
+            confidence=row[4],
+            language_confidence=row[5],
         )
         for row in rows
     ]

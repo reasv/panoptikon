@@ -67,7 +67,7 @@ def create_extracted_text_fts_opts(
         final_query_build: bool = False,
     ) -> SearchQuery:
         text_query_val: str | None = args[text_query]
-        query_targets: List[Tuple[OutputDataType, str]] | None = args[targets]
+        query_targets: List[str] | None = args[targets]
         confidence_val: float = args[confidence]
         languages_val: List[str] | None = args[languages]
         language_confidence_val: float = args[language_confidence]

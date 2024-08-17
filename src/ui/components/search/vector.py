@@ -1,12 +1,10 @@
 import io
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import gradio as gr
 import numpy as np
 import PIL.Image
 
-from src.data_extractors.ai.clip import CLIPEmbedder
-from src.data_extractors.ai.text_embed import TextEmbedder
 from src.db.search.types import (
     ExtractedTextEmbeddingsFilter,
     ImageEmbeddingFilter,
@@ -14,7 +12,7 @@ from src.db.search.types import (
 )
 from src.db.utils import serialize_f32
 from src.inference.impl.utils import deserialize_array
-from src.types import OutputDataType, SearchStats
+from src.types import SearchStats
 from src.ui.components.search.utils import AnyComponent
 
 
@@ -157,9 +155,7 @@ def create_vector_search_opts(query_state: gr.State):
         vec_query_type_val: str | None = args[vec_query_type]
         te_embedding_model_val: str | None = args[te_embedding_model]
         te_text_query_val: str | None = args[te_text_query]
-        te_text_targets_val: List[Tuple[OutputDataType, str]] | None = args[
-            te_text_targets
-        ]
+        te_text_targets_val: List[str] | None = args[te_text_targets]
         confidence_val: float = args[confidence]
         languages_val: List[str] | None = args[languages]
         language_confidence_val: float = args[language_confidence]
@@ -177,7 +173,7 @@ def create_vector_search_opts(query_state: gr.State):
                 query.query.filters.extracted_text_embeddings = (
                     ExtractedTextEmbeddingsFilter(
                         query=embedded_query,
-                        model=("text-embedding", te_embedding_model_val),
+                        model=te_embedding_model_val,
                         targets=te_text_targets_val or [],
                         min_confidence=confidence_val or None,
                         languages=languages_val or [],
@@ -195,7 +191,7 @@ def create_vector_search_opts(query_state: gr.State):
                     )
                 query.query.filters.image_embeddings = ImageEmbeddingFilter(
                     query=embedded_query,
-                    target=("clip", clip_model_val),
+                    model=clip_model_val,
                 )
                 query.order_args.order_by = "image_vec_distance"
         elif vec_query_type_val == "CLIP Reverse Image Search":
@@ -211,7 +207,7 @@ def create_vector_search_opts(query_state: gr.State):
                     )
                 query.query.filters.image_embeddings = ImageEmbeddingFilter(
                     query=embedded_query,
-                    target=("clip", clip_model_val),
+                    model=clip_model_val,
                 )
                 query.order_args.order_by = "image_vec_distance"
 

@@ -41,7 +41,6 @@ class ItemWithPath:
 @dataclass
 class ExtractedText:
     item_sha256: str
-    model_type: str
     setter_name: str
     language: str
     language_confidence: float | None
@@ -113,7 +112,7 @@ class ExtractedTextStats:
 @dataclass
 class SearchStats:
     all_setters: List[Tuple[str, str]] = field(default_factory=list)
-    et_setters: List[Tuple[str, Tuple[str, str]]] = field(default_factory=list)
+    et_setters: List[str] = field(default_factory=list)
     et_stats: ExtractedTextStats = field(default_factory=ExtractedTextStats)
     clip_setters: List[str] = field(default_factory=list)
     te_setters: List[str] = field(default_factory=list)

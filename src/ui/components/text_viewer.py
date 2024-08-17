@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import gradio as gr
 
@@ -20,9 +20,7 @@ def on_item_change(selected_files: List[FileSearchResult]):
     )
     setters_pairs = get_existing_setters(conn)
     choices = [
-        (f"{model_type}|{setter}", (model_type, setter))
-        for model_type, setter in setters_pairs
-        if model_type == "text" or model_type == "tags"
+        setter for data_type, setter in setters_pairs if data_type == "text"
     ]
     conn.close()
     return extracted_texts, gr.update(choices=choices)
@@ -48,14 +46,13 @@ def create_text_viewer(selected_items: gr.State):
 
         @gr.render(inputs=[text_picker, texts_state])
         def show_text(
-            text_picker: List[Tuple[str, str]] | None,
+            text_picker: List[str] | None,
             texts_state: List[ExtractedText],
         ):
             if text_picker is None:
                 return
-            setters = [setter for _, setter in text_picker]
             for text in texts_state:
-                if text.setter_name in setters:
+                if text.setter_name in text_picker:
                     with gr.Row():
                         gr.Textbox(
                             label=f"Source: {text.setter_name}, Language: {text.language}, Confidence: {text.confidence}",
