@@ -20,7 +20,7 @@ def run_cronjob():
     setters = []
     for rule in rules:
         setters.extend(
-            [setter for type, setter in rule.setters if type != "files"]
+            [setter for setter in rule.setters if setter != "file_scan"]
         )
     setters = list(set(setters))
     logger.info(f"Found {len(setters)} models to run ({','.join(setters)})")

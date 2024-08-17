@@ -30,7 +30,7 @@ def add_data_extraction_log(
 ):
     # Remove any incomplete logs before starting a new one
     remove_incomplete_logs(conn)
-    setter_id = upsert_setter(conn, type, setter)
+    setter_id = upsert_setter(conn, setter)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -184,9 +184,7 @@ def get_items_missing_data_extraction(
     instead getting paths one by one.
     """
     model_filters = model_opts.item_extraction_rules()
-    user_rules = get_rules_for_setter(
-        conn, model_opts.data_type(), model_opts.setter_name()
-    )
+    user_rules = get_rules_for_setter(conn, model_opts.setter_name())
     # Merge each user rule with the model's buit-in filters
     combined_filters = [
         combine_rule_item_filters(model_filters, user_rule.filters)

@@ -93,7 +93,7 @@ class ModelOpts:
         return cls.available_models()[0]
 
     def delete_extracted_data(self, conn: sqlite3.Connection):
-        delete_setter_by_name(conn, self.data_type(), self.setter_name())
+        delete_setter_by_name(conn, self.setter_name())
         return f"Deleted data extracted from items by model {self.setter_name()}.\n"
 
     @classmethod

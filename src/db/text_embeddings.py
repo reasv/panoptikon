@@ -2,9 +2,8 @@ import sqlite3
 from typing import List, Tuple
 
 from src.db import get_item_id
-from src.db.setters import get_setter
+from src.db.setters import get_setter_id
 from src.db.utils import serialize_f32
-from src.types import OutputDataType
 
 
 def add_text_embedding(
@@ -39,11 +38,10 @@ def add_text_embedding(
 def get_text_missing_embeddings(
     conn: sqlite3.Connection,
     item: str,
-    setter_type: OutputDataType,
     setter_name: str,
 ) -> List[Tuple[int, str]]:
     item_id = get_item_id(conn, item)
-    setter_id = get_setter(conn, setter_type, setter_name)
+    setter_id = get_setter_id(conn, setter_name)
     assert item_id is not None, "Item ID is None"
     assert setter_id is not None, "Setter ID is None"
     cursor = conn.cursor()

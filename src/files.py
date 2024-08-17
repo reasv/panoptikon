@@ -98,7 +98,7 @@ def scan_files(
         + include_html * get_html_extensions()
         + include_pdf * get_pdf_extensions()
     )
-    user_rules = get_rules_for_setter(conn, "files", "file_scan")
+    user_rules = get_rules_for_setter(conn, "file_scan")
     for file_path in get_files_by_extension(
         starting_points=starting_points,
         excluded_paths=excluded_paths,

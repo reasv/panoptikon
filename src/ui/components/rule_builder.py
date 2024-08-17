@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Literal, Tuple, Type
+from typing import List, Literal, Type
 
 import gradio as gr
-from pyexpat import model
 
 from src.data_extractors import models
 from src.db import get_database_connection
@@ -34,6 +33,16 @@ from src.types import RuleStats
 logger = logging.getLogger(__name__)
 
 
+def rule_update_txn(rule_id, setters, filters):
+    conn = get_database_connection(write_lock=True)
+    conn.execute("BEGIN TRANSACTION")
+    update_rule(conn, rule_id, setters, filters)
+    conn.commit()
+    rules = get_rules(conn)
+    conn.close()
+    return rules
+
+
 def update_filter(
     rule: StoredRule,
     dir: Literal["pos", "neg"],
@@ -44,13 +53,7 @@ def update_filter(
         rule.filters.positive[filter_idx] = filter
     else:
         rule.filters.negative[filter_idx] = filter
-    conn = get_database_connection(write_lock=True)
-    conn.execute("BEGIN TRANSACTION")
-    update_rule(conn, rule.id, rule.setters, rule.filters)
-    conn.commit()
-    rules = get_rules(conn)
-    conn.close()
-    return rules
+    return rule_update_txn(rule.id, rule.setters, rule.filters)
 
 
 def add_filter(
@@ -62,13 +65,7 @@ def add_filter(
         rule.filters.positive.append(filter)
     else:
         rule.filters.negative.append(filter)
-    conn = get_database_connection(write_lock=True)
-    conn.execute("BEGIN TRANSACTION")
-    update_rule(conn, rule.id, rule.setters, rule.filters)
-    conn.commit()
-    rules = get_rules(conn)
-    conn.close()
-    return rules
+    return rule_update_txn(rule.id, rule.setters, rule.filters)
 
 
 def remove_filter(
@@ -80,13 +77,7 @@ def remove_filter(
         del rule.filters.positive[filter_idx]
     else:
         del rule.filters.negative[filter_idx]
-    conn = get_database_connection(write_lock=True)
-    conn.execute("BEGIN TRANSACTION")
-    update_rule(conn, rule.id, rule.setters, rule.filters)
-    conn.commit()
-    rules = get_rules(conn)
-    conn.close()
-    return rules
+    return rule_update_txn(rule.id, rule.setters, rule.filters)
 
 
 def delete_entire_rule(rule: StoredRule):
@@ -99,34 +90,17 @@ def delete_entire_rule(rule: StoredRule):
     return rules
 
 
-def remove_setters_from_rule(
-    rule: StoredRule, to_remove: List[Tuple[str, str]]
-):
-    # Convert to_remove to a list of tuples
-    to_remove = [(type, setter) for type, setter in to_remove]
+def remove_setters_from_rule(rule: StoredRule, to_remove: List[str]):
     logger.debug(rule.setters, to_remove)
     new_setters = [setter for setter in rule.setters if setter not in to_remove]
-    conn = get_database_connection(write_lock=True)
-    conn.execute("BEGIN TRANSACTION")
-    update_rule(conn, rule.id, new_setters, rule.filters)
-    conn.commit()
-    rules = get_rules(conn)
-    conn.close()
-    return rules
+    return rule_update_txn(rule.id, new_setters, rule.filters)
 
 
 def add_setters_to_rule(
-    rule: StoredRule, to_add: List[Tuple[str, str]]
+    rule: StoredRule, to_add: List[str]
 ) -> List[StoredRule]:
-    to_add = [(type, setter) for type, setter in to_add]
     new_setters = list(set(rule.setters + to_add))
-    conn = get_database_connection(write_lock=True)
-    conn.execute("BEGIN TRANSACTION")
-    update_rule(conn, rule.id, new_setters, rule.filters)
-    conn.commit()
-    rules = get_rules(conn)
-    conn.close()
-    return rules
+    return rule_update_txn(rule.id, new_setters, rule.filters)
 
 
 def toggle_rule_enabled(rule: StoredRule) -> List[StoredRule]:
@@ -142,7 +116,7 @@ def toggle_rule_enabled(rule: StoredRule) -> List[StoredRule]:
     return rules
 
 
-def create_new_rule(setters: List[Tuple[str, str]]):
+def create_new_rule(setters: List[str]):
     conn = get_database_connection(write_lock=True)
     filters = RuleItemFilters([], [])
     conn.execute("BEGIN TRANSACTION")
@@ -247,11 +221,7 @@ on the next scan.
 
                 @add_models_btn.click(outputs=[rules_state])
                 def add_rule():
-                    return create_new_rule(
-                        [
-                            ("files", "file_scan"),
-                        ]
-                    )
+                    return create_new_rule(["file_scan"])
 
             else:
                 add_models_btn = gr.Button("Add File Scanning")
@@ -260,9 +230,7 @@ on the next scan.
                 def add_models():
                     return add_setters_to_rule(
                         rule,
-                        [
-                            ("files", "file_scan"),
-                        ],
+                        ["file_scan"],
                     )
 
 
@@ -276,10 +244,12 @@ def create_add_rule(rules_state: gr.State, context: RuleStats):
                         label="Model(s):",
                         multiselect=True,
                         value=[
-                            model_type.default_model(),
+                            model_type(
+                                model_type.default_model()
+                            ).setter_name(),
                         ],
                         choices=[
-                            (name, name)
+                            (name, model_type(name).setter_name())
                             for name in model_type.available_models()
                         ],
                     )
@@ -292,12 +262,7 @@ def create_add_rule(rules_state: gr.State, context: RuleStats):
                         inputs=[model_choice], outputs=[rules_state]
                     )
                     def add_models(chosen_models: List[str]):
-                        return create_new_rule(
-                            [
-                                (model_type.data_type(), model_name)
-                                for model_name in chosen_models
-                            ]
-                        )
+                        return create_new_rule(chosen_models)
 
     gr.Markdown("# Add New Rule")
     with gr.Tabs():
@@ -371,12 +336,12 @@ def create_remove_models(rule: StoredRule, rules_state: gr.State):
         label="Remove the following models from the rule",
         value=[],
         multiselect=True,
-        choices=[(f"{st}|{sn}", (st, sn)) for st, sn in rule.setters],  # type: ignore
+        choices=rule.setters,
     )
     remove_models_btn = gr.Button("Remove Selected Model(s)")
 
     @remove_models_btn.click(inputs=[to_remove_select], outputs=[rules_state])
-    def remove_models(to_remove: List[Tuple[str, str]]):
+    def remove_models(to_remove: List[str]):
         return remove_setters_from_rule(rule, to_remove)
 
 
@@ -384,17 +349,19 @@ def create_add_models(
     rule: StoredRule, rules_state: gr.State, context: RuleStats
 ):
     def create_model_type_tab(model_type: Type[models.ModelOpts]):
-        with gr.TabItem(label=model_type.name()) as extractor_tab:
+        with gr.TabItem(label=model_type.name()):
             with gr.Group():
                 with gr.Row():
                     model_choice = gr.Dropdown(
                         label="Model(s):",
                         multiselect=True,
                         value=[
-                            model_type.default_model(),
+                            model_type(
+                                model_type.default_model()
+                            ).setter_name(),
                         ],
                         choices=[
-                            (name, name)
+                            (name, model_type(name).setter_name())
                             for name in model_type.available_models()
                         ],
                     )
@@ -404,14 +371,8 @@ def create_add_models(
                     @add_models_btn.click(
                         inputs=[model_choice], outputs=[rules_state]
                     )
-                    def add_models(chosen_model: List[str]):
-                        return add_setters_to_rule(
-                            rule,
-                            [
-                                (model_type.data_type(), model_name)
-                                for model_name in chosen_model
-                            ],
-                        )
+                    def add_models(chosen_models: List[str]):
+                        return add_setters_to_rule(rule, chosen_models)
 
     with gr.Tabs():
         for model_type in context.model_types:

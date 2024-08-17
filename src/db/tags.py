@@ -86,7 +86,7 @@ def add_tag_to_item(
 ):
     item_id = get_item_id(conn, sha256)
     assert item_id is not None, f"Item with sha256 {sha256} not found"
-    setter_id = upsert_setter(conn, setter_type="tags", setter_name=setter)
+    setter_id = upsert_setter(conn, setter_name=setter)
     tag_id = upsert_tag(conn, namespace, name)
     insert_tag_item(conn, item_id, tag_id, setter_id, confidence, log_id)
 

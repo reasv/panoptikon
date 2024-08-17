@@ -353,7 +353,7 @@ def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
 
 
 def delete_files_not_allowed(conn: sqlite3.Connection):
-    user_rules = get_rules_for_setter(conn, "files", "file_scan")
+    user_rules = get_rules_for_setter(conn, "file_scan")
     if not user_rules:
         logger.debug("No rules for files, skipping deletion")
         return 0

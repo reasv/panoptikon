@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Literal, Sequence, Tuple, Union
+from typing import List, Literal, Sequence, Union
 
 from src.types import OutputDataType
 
@@ -83,7 +83,7 @@ class RuleItemFilters:
 class StoredRule:
     id: int
     enabled: bool
-    setters: List[Tuple[str, str]]
+    setters: List[str]
     filters: RuleItemFilters
 
 

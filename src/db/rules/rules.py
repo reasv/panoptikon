@@ -11,7 +11,7 @@ from src.db.rules.types import RuleItemFilters, StoredRule
 
 def add_rule(
     conn: sqlite3.Connection,
-    setters: List[Tuple[str, str]],
+    setters: List[str],
     filters: RuleItemFilters,
 ):
     cursor = conn.cursor()
@@ -27,11 +27,8 @@ def add_rule(
 
     # Insert the setters
     cursor.executemany(
-        "INSERT INTO extraction_rules_setters (rule_id, setter_type, setter_name) VALUES (?, ?, ?)",
-        [
-            (rule_id, setter_type, setter_name)
-            for setter_type, setter_name in setters
-        ],
+        "INSERT INTO extraction_rules_setters (rule_id, setter_name) VALUES (?, ?)",
+        [(rule_id, setter_name) for setter_name in setters],
     )
 
     return rule_id
@@ -40,32 +37,16 @@ def add_rule(
 def get_rule(
     conn: sqlite3.Connection,
     rule_id: int,
-) -> StoredRule:
-    cursor = conn.cursor()
-
-    # Get the rule
-    cursor.execute(
-        "SELECT rule, enabled FROM extraction_rules WHERE id = ?", (rule_id,)
+    include_disabled: bool = False,
+) -> StoredRule | None:
+    rules_list = get_rules_by_ids(
+        conn, [rule_id], include_disabled=include_disabled
     )
-    rule_data = cursor.fetchone()
 
-    if rule_data is None:
-        raise ValueError(f"No rule found with id {rule_id}")
-
-    # Get the setters
-    cursor.execute(
-        "SELECT setter_type, setter_name FROM extraction_rules_setters WHERE rule_id = ?",
-        (rule_id,),
-    )
-    setters = cursor.fetchall()
-
-    # Deserialize the filters
-    filters = deserialize_rule_item_filters(rule_data[0])
-    enabled = bool(rule_data[1])
-
-    return StoredRule(
-        id=rule_id, enabled=enabled, setters=setters, filters=filters
-    )
+    if not rules_list:
+        return None
+    else:
+        return rules_list[0]
 
 
 def get_rules(
@@ -81,10 +62,10 @@ def get_rules(
     for rule_id, rule_data, enabled in rules_data:
         # Get the setters for each rule
         cursor.execute(
-            "SELECT setter_type, setter_name FROM extraction_rules_setters WHERE rule_id = ?",
+            "SELECT setter_name FROM extraction_rules_setters WHERE rule_id = ?",
             (rule_id,),
         )
-        setters = cursor.fetchall()
+        setters = [row[0] for row in cursor.fetchall()]
 
         # Deserialize the filters
         filters = deserialize_rule_item_filters(rule_data)
@@ -114,7 +95,7 @@ def delete_rule(
 def update_rule(
     conn: sqlite3.Connection,
     rule_id: int,
-    setters: List[Tuple[str, str]],
+    setters: List[str],
     filters: RuleItemFilters,
 ):
     cursor = conn.cursor()
@@ -135,16 +116,13 @@ def update_rule(
 
     # Insert new setters
     cursor.executemany(
-        "INSERT INTO extraction_rules_setters (rule_id, setter_type, setter_name) VALUES (?, ?, ?)",
-        [
-            (rule_id, setter_type, setter_name)
-            for setter_type, setter_name in setters
-        ],
+        "INSERT INTO extraction_rules_setters (rule_id, setter_name) VALUES (?, ?)",
+        [(rule_id, setter_name) for setter_name in setters],
     )
 
 
 def get_rules_for_setter(
-    conn: sqlite3.Connection, setter_type: str, setter_name: str
+    conn: sqlite3.Connection, setter_name: str
 ) -> List[StoredRule]:
     cursor = conn.cursor()
 
@@ -153,9 +131,9 @@ def get_rules_for_setter(
         """
         SELECT DISTINCT rule_id 
         FROM extraction_rules_setters 
-        WHERE setter_type = ? AND setter_name = ?
+        WHERE setter_name = ?
     """,
-        (setter_type, setter_name),
+        (setter_name),
     )
 
     rule_ids = [row[0] for row in cursor.fetchall()]
@@ -163,12 +141,24 @@ def get_rules_for_setter(
     if not rule_ids:
         return []  # No rules found for this setter
 
+    return get_rules_by_ids(conn, rule_ids)
+
+
+def get_rules_by_ids(
+    conn: sqlite3.Connection, rule_ids: List[int], include_disabled: bool = True
+) -> List[StoredRule]:
+    cursor = conn.cursor()
     # Now, get the details for these rules
     stored_rules = []
     for rule_id in rule_ids:
         # Get the rule data
         cursor.execute(
-            "SELECT rule, enabled FROM extraction_rules WHERE id = ? AND enabled = 1",
+            f"""
+            SELECT rule, enabled
+            FROM extraction_rules
+            WHERE id = ?
+            {'AND enabled = 1' if not include_disabled else ''}
+            """,
             (rule_id,),
         )
         rule_data = cursor.fetchone()
@@ -179,13 +169,13 @@ def get_rules_for_setter(
         # Get all setters for this rule
         cursor.execute(
             """
-            SELECT setter_type, setter_name 
+            SELECT setter_name 
             FROM extraction_rules_setters 
             WHERE rule_id = ?
         """,
             (rule_id,),
         )
-        setters = cursor.fetchall()
+        setters = [row[0] for row in cursor.fetchall()]
 
         # Deserialize the filters
         filters = deserialize_rule_item_filters(rule_data[0])
@@ -207,17 +197,24 @@ def get_rules_for_setter_id(
 ) -> List[StoredRule]:
     cursor = conn.cursor()
 
-    # First, get the setter type and name
-    cursor.execute("SELECT type, name FROM setters WHERE id = ?", (setter_id,))
-    setter_data = cursor.fetchone()
+    # Join on name to go from setter_id to rule_ids
+    cursor.execute(
+        """
+        SELECT DISTINCT rule_id 
+        FROM extraction_rules_setters 
+        JOIN setters
+        ON extraction_rules_setters.setter_name = setters.name
+        WHERE setters.id = ?
+        """,
+        (setter_id,),
+    )
+    rule_ids = [row[0] for row in cursor.fetchall()]
 
-    if setter_data is None:
-        return []  # No setter found with this id
-
-    setter_type, setter_name = setter_data
+    if not rule_ids:
+        return []
 
     # Use the existing function to get the rules
-    return get_rules_for_setter(conn, setter_type, setter_name)
+    return get_rules_by_ids(conn, rule_ids)
 
 
 def disable_rule(

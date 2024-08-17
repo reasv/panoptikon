@@ -198,9 +198,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
         CREATE TABLE IF NOT EXISTS setters (
             id INTEGER PRIMARY KEY,
-            type TEXT NOT NULL,
-            name TEXT NOT NULL,
-            UNIQUE(type, name)
+            name TEXT NOT NULL UNIQUE,
         )
         """
     )
@@ -427,10 +425,9 @@ def initialize_database(conn: sqlite3.Connection):
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules_setters (
                 rule_id INTEGER NOT NULL,
-                setter_type TEXT NOT NULL,
                 setter_name TEXT NOT NULL,
                 FOREIGN KEY(rule_id) REFERENCES extraction_rules(id) ON DELETE CASCADE
-                UNIQUE(rule_id, setter_type, setter_name)
+                UNIQUE(rule_id, setter_name)
             );
         """
     )
@@ -550,9 +547,7 @@ def initialize_database(conn: sqlite3.Connection):
         ("text_embeddings", ["text_setter_id"]),
         ("text_embeddings", ["text_id"]),
         ("extraction_rules_setters", ["rule_id"]),
-        ("extraction_rules_setters", ["setter_type"]),
         ("extraction_rules_setters", ["setter_name"]),
-        ("setters", ["type"]),
         ("setters", ["name"]),
         ("items", ["width"]),
         ("items", ["height"]),
