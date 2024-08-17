@@ -52,13 +52,11 @@ class MinMaxFilter:
 
 @dataclass
 class ProcessedItemsFilter:
-    setter_type: OutputDataType
     setter_name: str
 
 
 @dataclass
 class ProcessedExtractedDataFilter:
-    setter_type: OutputDataType
     setter_name: str
     data_types: Sequence[OutputDataType]
 

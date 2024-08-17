@@ -23,8 +23,8 @@ def build_processed_items_filter_cte(
         ON items.id = items_extractions.item_id
         JOIN setters 
         ON items_extractions.setter_id = setters.id
-        WHERE setters.type = ? AND setters.name = ?
+        WHERE setters.name = ?
         GROUP BY items.id
     )
     """
-    return cte, [filter.setter_type, filter.setter_name]
+    return cte, [filter.setter_name]

@@ -104,15 +104,10 @@ class ModelOpts:
         rules = []
         target_entities = self.target_entities()
         if "items" in target_entities:
-            rules.append(
-                ProcessedItemsFilter(
-                    setter_type=self.data_type(), setter_name=self.setter_name()
-                )
-            )
+            rules.append(ProcessedItemsFilter(setter_name=self.setter_name()))
         else:
             rules.append(
                 ProcessedExtractedDataFilter(
-                    setter_type=self.data_type(),
                     setter_name=self.setter_name(),
                     data_types=target_entities,  # type: ignore
                 )
