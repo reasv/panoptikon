@@ -87,7 +87,7 @@ class LogRecord:
     id: int
     start_time: str
     end_time: str | None
-    setter_id: int | None
+    items_in_db: int
     type: str
     setter: str
     threshold: float | None

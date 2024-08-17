@@ -11,50 +11,46 @@ import logging
 from src.db import get_item_id
 from src.db.files import get_existing_file_for_sha256
 from src.db.rules.build_filters import build_multirule_query
-from src.db.rules.rules import get_rules_for_setter, get_rules_for_setter_id
+from src.db.rules.rules import get_rules_for_setter
 from src.db.rules.types import combine_rule_item_filters
-from src.db.setters import upsert_setter
 from src.db.utils import pretty_print_SQL
 from src.types import ItemWithPath, LogRecord
 
 logger = logging.getLogger(__name__)
 
 
-def add_data_extraction_log(
+def add_data_log(
     conn: sqlite3.Connection,
     scan_time: str,
-    type: str,
-    setter: str,
     threshold: float | None,
+    types: List[str],
+    setter: str,
     batch_size: int,
 ):
     # Remove any incomplete logs before starting a new one
     remove_incomplete_logs(conn)
-    setter_id = upsert_setter(conn, setter)
     cursor = conn.cursor()
     cursor.execute(
         """
-    INSERT INTO data_extraction_log (
+    INSERT INTO data_log (
         start_time,
-        setter_id,
         type,
         setter,
         threshold,
         batch_size
     )
-    VALUES (?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?)
     """,
         (
             scan_time,
-            setter_id,
-            type,
+            ", ".join(types),
             setter,
             threshold,
             batch_size,
         ),
     )
     assert cursor.lastrowid is not None
-    return cursor.lastrowid, setter_id
+    return cursor.lastrowid
 
 
 def update_log(
@@ -73,17 +69,17 @@ def update_log(
     cursor = conn.cursor()
     cursor.execute(
         """
-    UPDATE data_extraction_log
-    SET end_time = ?,
-    image_files = ?,
-    video_files = ?,
-    other_files = ?,
-    total_segments = ?,
-    errors = ?,
-    total_remaining = ?,
-    data_load_time = ?,
-    inference_time = ?
-    WHERE id = ?
+        UPDATE data_log
+        SET end_time = ?,
+        image_files = ?,
+        video_files = ?,
+        other_files = ?,
+        total_segments = ?,
+        errors = ?,
+        total_remaining = ?,
+        data_load_time = ?,
+        inference_time = ?
+        WHERE id = ?
     """,
         (
             datetime.now().isoformat() if finished else None,
@@ -110,63 +106,74 @@ def remove_incomplete_logs(conn: sqlite3.Connection):
     cursor = conn.cursor()
     cursor.execute(
         """
-        DELETE FROM data_extraction_log
+        DELETE FROM data_log
         WHERE end_time IS NULL
     """
     )
 
 
-def get_all_data_extraction_logs(conn: sqlite3.Connection) -> List[LogRecord]:
+def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
     cursor = conn.cursor()
     cursor.execute(
-        """SELECT
-        id,
-        start_time,
-        end_time,
-        setter_id,
-        type,
-        setter,
-        threshold,
-        batch_size,
-        image_files,
-        video_files,
-        other_files,
-        total_segments,
-        errors,
-        total_remaining,
-        data_load_time,
-        inference_time
-        FROM data_extraction_log
-        ORDER BY start_time DESC
+        """
+        SELECT
+            id,
+            start_time,
+            end_time,
+            COALESCE(COUNT(DISTINCT item_data.item_id), 0) AS distinct_item_count,
+            type,
+            setter,
+            threshold,
+            batch_size,
+            image_files,
+            video_files,
+            other_files,
+            total_segments,
+            errors,
+            total_remaining,
+            data_load_time,
+            inference_time
+        FROM data_log
+        LEFT JOIN item_data 
+        ON item_data.log_id = data_log.id
+        GROUP BY id
+        ORDER BY start_time DESC;
         """
     )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
 
 
-def add_item_to_log(
+def add_item_data(
     conn: sqlite3.Connection,
     item: str,
+    setter_id: int,
     log_id: int,
     data_type: str,
-    previous_extraction_id: int | None = None,
+    source_item_data_id: int | None = None,
 ):
     cursor = conn.cursor()
     item_id = get_item_id(conn, item)
-    if previous_extraction_id is None:
+    if source_item_data_id is None:
         is_origin = True
     else:
         is_origin = None
 
     cursor.execute(
         """
-    INSERT INTO items_extractions
-    (item_id, log_id, setter_id, data_type, is_origin, source_extraction_id)
-    SELECT ?, ?, log.setter_id, ?, ?, ?
-    FROM data_extraction_log AS log
-    WHERE log.id = ?
+    INSERT INTO item_data
+    (item_id, log_id, setter_id, data_type, is_origin, source_id)
+    SELECT ?, ?, ?, ?, ?, ?
     """,
-        (item_id, log_id, data_type, is_origin, previous_extraction_id, log_id),
+        (
+            item_id,
+            log_id,
+            setter_id,
+            data_type,
+            is_origin,
+            source_item_data_id,
+            log_id,
+        ),
     )
     # Return the ID of the new extraction
     assert cursor.lastrowid is not None, "No extraction was inserted"
@@ -258,7 +265,7 @@ def get_existing_setters(
     """
     query = """
     SELECT DISTINCT ie.data_type, s.name
-    FROM items_extractions ie
+    FROM item_data ie
     JOIN setters s ON ie.setter_id = s.id;
     """
 
@@ -270,31 +277,31 @@ def get_existing_setters(
     return results
 
 
-def get_unprocessed_extractions_for_item(
+def get_unprocessed_item_data_for_item(
     conn: sqlite3.Connection,
     item: str,
-    input_type: Sequence[str],
+    data_types: Sequence[str],
     setter_id: int,
 ) -> List[int]:
     """
-    Find all extractions of the specified input_type for this item
+    Find all item associated data of the specified data_types for this item
     that have not yet been processed by the specified setter.
     """
     item_id = get_item_id(conn, item)
-    input_type_condition = ", ".join(["?" for _ in input_type])
+    data_type_condition = ", ".join(["?" for _ in data_types])
     query = f"""
         SELECT ie.id
-        FROM items_extractions AS ie
+        FROM item_data AS ie
         WHERE ie.item_id = ?
-        AND ie.data_type IN ({input_type_condition})
+        AND ie.data_type IN ({data_type_condition})
         AND NOT EXISTS (
             SELECT 1
-            FROM items_extractions AS ie2
-            WHERE ie2.source_extraction_id = ie.id
+            FROM item_data AS ie2
+            WHERE ie2.source_id = ie.id
             AND ie2.setter_id = ?
         )
     """
-    params = (item_id, *input_type, setter_id)
+    params = (item_id, *data_types, setter_id)
 
     cursor = conn.cursor()
     cursor.execute(query, params)

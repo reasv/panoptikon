@@ -3,7 +3,7 @@ import datetime
 import gradio as gr
 
 from src.db import get_database_connection
-from src.db.extraction_log import get_all_data_extraction_logs
+from src.db.extraction_log import get_all_data_logs
 from src.db.files import get_all_file_scans
 from src.utils import (
     estimate_eta,
@@ -75,7 +75,7 @@ def create_job_dataset(samples=[]):
             "Inference Time",
             "Type",
             "Model",
-            "Data Deleted",
+            "DB Items",
             "Batch Size",
             "Threshold",
             "Image Files",
@@ -94,7 +94,7 @@ def create_job_dataset(samples=[]):
             "textbox",
             "textbox",
             "textbox",
-            "checkbox",
+            "number",
             "number",
             "number",
             "number",
@@ -140,7 +140,7 @@ def fetch_scan_history():
 
 def fetch_extraction_logs():
     conn = get_database_connection(write_lock=False)
-    log_records = get_all_data_extraction_logs(conn)
+    log_records = get_all_data_logs(conn)
     conn.close()
     now_str = datetime.datetime.now().isoformat()
     log_rows = [
@@ -168,7 +168,7 @@ def fetch_extraction_logs():
             seconds_to_hms(t.inference_time),
             t.type,
             t.setter,
-            t.setter_id is None,
+            t.items_in_db,
             t.batch_size,
             t.threshold,
             t.image_files,

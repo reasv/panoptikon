@@ -1,7 +1,7 @@
 from src.db.rules.types import ProcessedExtractedDataFilter
 
 
-def build_processed_extracted_data_filter_cte(
+def build_processed_item_data_filter_cte(
     filter: ProcessedExtractedDataFilter, filter_on: str | None, name: str
 ):
     if filter_on:
@@ -15,14 +15,14 @@ def build_processed_extracted_data_filter_cte(
     cte = f"""
     {name} AS (
         SELECT DISTINCT ie.item_id AS id
-        FROM items_extractions AS ie
+        FROM item_data AS ie
         {prev_cte_join_clause}
         WHERE ie.data_type IN ({target_type_conditions})
         AND NOT EXISTS (
             SELECT 1
-            FROM items_extractions AS ie2
+            FROM item_data AS ie2
             JOIN setters AS s2 ON ie2.setter_id = s2.id
-            WHERE ie2.source_extraction_id = ie.id
+            WHERE ie2.source_id = ie.id
             AND s2.name = ?
         )
     )

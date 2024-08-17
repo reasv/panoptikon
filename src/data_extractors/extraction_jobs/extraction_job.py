@@ -20,12 +20,13 @@ from src.data_extractors.extraction_jobs.types import (
     ExtractorJobReport,
 )
 from src.db.extraction_log import (
-    add_data_extraction_log,
-    add_item_to_log,
+    add_data_log,
+    add_item_data,
     get_items_missing_data_extraction,
-    get_unprocessed_extractions_for_item,
+    get_unprocessed_item_data_for_item,
     update_log,
 )
+from src.db.setters import upsert_setter
 from src.types import ItemWithPath
 from src.utils import estimate_eta
 
@@ -84,13 +85,17 @@ def run_extraction_job(
     data_load_time, inference_time = 0.0, 0.0
     threshold = model_opts.get_group_threshold(conn)
     batch_size = model_opts.get_group_batch_size(conn)
-    log_id, setter_id = add_data_extraction_log(
+    log_id = add_data_log(
         conn,
         scan_time,
-        model_opts.data_type(),
-        model_opts.setter_name(),
         threshold,
+        [model_opts.data_type()],
+        model_opts.setter_name(),
         batch_size,
+    )
+    setter_id = upsert_setter(
+        conn,
+        model_opts.setter_name(),
     )
     transaction_per_item = True  # Now hardcoded to True
     if transaction_per_item:
@@ -138,10 +143,11 @@ def run_extraction_job(
         try:
             if model_opts.target_entities() == ["items"]:
                 # If the model operates on individual items, add the item to the log
-                add_item_to_log(
+                add_item_data(
                     conn,
                     item=item.sha256,
                     log_id=log_id,
+                    setter_id=setter_id,
                     data_type=model_opts.data_type(),
                 )
             else:
@@ -151,10 +157,10 @@ def run_extraction_job(
                 # We're going to assume it has processed all such data not yet processed
                 # and record it as such, so until new data of this type
                 # is produced for this item, it will not be processed again.
-                items_extractions = get_unprocessed_extractions_for_item(
+                item_data = get_unprocessed_item_data_for_item(
                     conn,
                     item=item.sha256,
-                    input_type=model_opts.target_entities(),
+                    data_types=model_opts.target_entities(),
                     setter_id=setter_id,
                 )
                 # Each of these represents an instance of data being previously extracted
@@ -162,15 +168,14 @@ def run_extraction_job(
                 # and the idea is this model is now
                 # processing that data, and should not process it again.
                 # We record it so the model's filters can filter this item out next run.
-                logger.debug(
-                    f"Adding {len(items_extractions)} extractions to log"
-                )
-                for extraction_id in items_extractions:
-                    add_item_to_log(
+                logger.debug(f"Adding {len(item_data)} extractions to log")
+                for item_data_id in item_data:
+                    add_item_data(
                         conn,
                         item=item.sha256,
                         log_id=log_id,
-                        previous_extraction_id=extraction_id,
+                        setter_id=setter_id,
+                        source_item_data_id=item_data_id,
                         data_type=model_opts.data_type(),
                     )
 

@@ -7,7 +7,7 @@ from src.db.rules.path_filter import (
     build_path_filter_cte,
 )
 from src.db.rules.processed_extracted_data_filter import (
-    build_processed_extracted_data_filter_cte,
+    build_processed_item_data_filter_cte,
 )
 from src.db.rules.processed_items_filter import build_processed_items_filter_cte
 from src.db.rules.types import (
@@ -40,7 +40,7 @@ def get_filter_builder(filter: FilterType):
         return build_mime_type_filter_cte
     elif isinstance(filter, ProcessedExtractedDataFilter):
 
-        return build_processed_extracted_data_filter_cte
+        return build_processed_item_data_filter_cte
     else:
         raise NotImplementedError(
             f"Filter type {type(filter)} is not implemented"
