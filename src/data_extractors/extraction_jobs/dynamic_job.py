@@ -81,7 +81,7 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
             return [
                 ({"text_id": text_id, "text": text}, None)
                 for text_id, text in get_text_missing_embeddings(
-                    conn, item.sha256, model.data_type(), model.setter_name()
+                    conn, item.sha256, model.setter_name()
                 )
             ]
 

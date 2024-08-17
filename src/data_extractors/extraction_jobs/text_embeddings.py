@@ -17,7 +17,7 @@ def run_text_embedding_extractor_job(
 
     def get_item_text(item: ItemWithPath) -> List[Tuple[int, str]]:
         return get_text_missing_embeddings(
-            conn, item.sha256, model_opt.data_type(), model_opt.setter_name()
+            conn, item.sha256, model_opt.setter_name()
         )
 
     def process_batch(
