@@ -1,6 +1,5 @@
 from typing import List
 
-from src.db.search.clauses.utils import should_include_subclause
 from src.db.search.types import (
     ExtractedTextEmbeddingsFilter,
     ExtractedTextFilter,
@@ -54,36 +53,24 @@ def build_extracted_text_search_subclause(
     extracted_text_subclause = ""
     params: List[str | float | bytes] = []
 
-    should_include, type_setter_pairs = should_include_subclause(
-        args.targets,  # type: ignore
-        # Tags are also stored as text in the extracted_text table
-        ["text", "tags"],
-    )
-    if not should_include:
-        return extracted_text_subclause, params
-
+    where_conditions = []
     if is_vector_query:
         # If the query is a vector query, we need to match on the text embeddings model
-        params.extend(args.model)
-        where_conditions = [
-            "et.setter_id = text_setters.id",
-        ]
+        params = [args.model]
     else:
         where_conditions = ["et_fts.text MATCH ?"]
-        params.append(args.query)
+        params = [args.query]
 
-    if type_setter_pairs:
-        include_pairs_conditions = " OR ".join(
-            ["(text_setters.type = ? AND text_setters.name = ?)"]
-            * len(type_setter_pairs)
+    if args.targets:
+        # Text setter names must be one of the given targets, use IN clause
+        where_conditions.append(
+            f"text_setters.name IN ({','.join(['?']*len(args.targets))})"
         )
-        where_conditions.append(f"({include_pairs_conditions})")
-        for type, setter in type_setter_pairs:
-            params.extend([type, setter])
+        params.extend(args.targets)
 
     if args.languages:
         where_conditions.append(
-            "et.language IN ({','.join(['?']*len(languages))})"
+            f"et.language IN ({','.join(['?']*len(args.languages))})"
         )
         params.extend(args.languages)
         if args.language_min_confidence:
@@ -100,19 +87,21 @@ def build_extracted_text_search_subclause(
             ON et_vec.item_id = files.item_id
             JOIN setters as vec_setters
             ON et_vec.setter_id = vec_setters.id
-            AND vec_setters.type = ?
             AND vec_setters.name = ?
             JOIN extracted_text AS et
             ON et_vec.text_id = et.id
             JOIN setters AS text_setters
-            ON {" AND ".join(where_conditions)}
+            ON et.setter_id = text_setters.id
+            {" AND ".join(where_conditions)}
         """
     else:
         extracted_text_subclause = f"""
             SELECT et.item_id AS item_id, MAX(et_fts.rank) AS max_rank
             FROM extracted_text_fts AS et_fts
-            JOIN extracted_text AS et ON et_fts.rowid = et.id
-            JOIN setters AS text_setters ON et.setter_id = text_setters.id
+            JOIN extracted_text AS et
+            ON et_fts.rowid = et.id
+            JOIN setters AS text_setters
+            ON et.setter_id = text_setters.id
             WHERE {" AND ".join(where_conditions)}
             GROUP BY et.item_id
         """

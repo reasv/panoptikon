@@ -1,9 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Literal, Tuple, TypeVar, Union
-
-from typeguard import typechecked
-
-from src.types import OutputDataType
+from typing import List, Literal, Union
 
 # Search Query Types
 OrderByType = Union[
@@ -32,7 +28,7 @@ class FileFilters:
 @dataclass
 class ExtractedTextFilter:
     query: str
-    targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
+    targets: List[str] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     language_min_confidence: Union[float, None] = None
     min_confidence: Union[float, None] = None
@@ -41,8 +37,8 @@ class ExtractedTextFilter:
 @dataclass
 class ExtractedTextEmbeddingsFilter:
     query: bytes
-    model: Tuple[OutputDataType, str]
-    targets: List[Tuple[OutputDataType, str]] = field(default_factory=list)
+    model: str
+    targets: List[str] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     language_min_confidence: Union[float, None] = None
     min_confidence: Union[float, None] = None
@@ -62,14 +58,14 @@ class PathTextFilter:
 
 @dataclass
 class AnyTextFilter:
-    query: str
-    targets: List[Tuple[str, str]] = field(default_factory=list)
+    path: Union[PathTextFilter, None] = None
+    extracted_text: Union[ExtractedTextFilter, None] = None
 
 
 @dataclass
 class ImageEmbeddingFilter:
     query: bytes
-    target: Tuple[OutputDataType, str]
+    model: str
 
 
 @dataclass
