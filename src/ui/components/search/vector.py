@@ -298,7 +298,7 @@ def get_embed(text: str, model_name: str) -> bytes:
 
     model = ModelOptsFactory.get_model(model_name)
     embed_bytes: bytes = model.run_batch_inference(
-        "search", 1, 60, [({"text": text}, None)]
+        "search", 1, 60, [({"text": text, "task": "s2s"}, None)]
     )[0]
     text_embed = deserialize_array(embed_bytes)[0]
     assert isinstance(text_embed, np.ndarray)

@@ -63,9 +63,9 @@ class SentenceTransformersModel(InferenceModel):
         batch_args = batch_config.get("args", {})
         assert isinstance(batch_args, dict), "Batch args must be dict"
 
-        if batch_config.get("query_type") in self.query_prompt_name:
-            query_type = batch_config.get("query_type")
-            batch_args["prompt_name"] = self.query_prompt_name[query_type]
+        if batch_config.get("task") in self.query_prompt_name:
+            task = batch_config.get("task")
+            batch_args["prompt_name"] = self.query_prompt_name[task]
 
         if self.pool:
             # Use multi-process pool for parallel inference
