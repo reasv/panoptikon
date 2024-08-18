@@ -56,14 +56,13 @@ def handle_text(
     if len(data_ids) == 0:
         # Add a dummy item_data entry to indicate that the item was processed
         # but no text was extracted
-        data_ids.append(
-            add_item_data(
-                conn,
-                item=item.sha256,
-                setter_name=setter_name,
-                job_id=job_id,
-                data_type="text",
-                index=0,
-            )
+        add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="text",
+            index=0,
+            is_placeholder=True,
         )
     return data_ids

@@ -16,7 +16,7 @@ from src.db.rules.build_filters import build_multirule_query
 from src.db.rules.rules import get_rules_for_setter
 from src.db.rules.types import combine_rule_item_filters
 from src.db.utils import pretty_print_SQL
-from src.types import ItemData, ItemWithPath, LogRecord, OutputDataType
+from src.types import ItemData, LogRecord, OutputDataType
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,7 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
         LEFT JOIN item_data 
             ON item_data.job_id = data_log.job_id
             AND item_data.job_id IS NOT NULL
+            AND item_data.is_placeholder = 0
         LEFT JOIN data_jobs
             ON data_log.job_id = data_jobs.id
         GROUP BY data_log.id
@@ -193,6 +194,7 @@ def add_item_data(
     data_type: OutputDataType,
     index: int,
     src_data_id: int | None = None,
+    is_placeholder: bool = False,
 ):
     cursor = conn.cursor()
     item_id = get_item_id(conn, item)
@@ -205,8 +207,8 @@ def add_item_data(
     cursor.execute(
         """
     INSERT INTO item_data
-    (job_id, item_id, setter_id, data_type, idx, is_origin, source_id)
-    SELECT ?, ?, setters.id, ?, ?, ?, ?
+    (job_id, item_id, setter_id, data_type, idx, is_origin, source_id, is_placeholder)
+    SELECT ?, ?, setters.id, ?, ?, ?, ?, ?
     FROM setters
     WHERE setters.name = ?;
     """,
@@ -217,6 +219,7 @@ def add_item_data(
             index,
             is_origin,
             src_data_id,
+            is_placeholder,
             setter_name,
         ),
     )
@@ -350,6 +353,7 @@ def get_unprocessed_item_data_for_item(
         FROM item_data AS data_src
         WHERE data_src.item_id = ?
         AND data_src.data_type IN ({data_type_condition})
+        AND data_src.is_placeholder = 0
         AND NOT EXISTS (
             SELECT 1
             FROM item_data AS data_derived

@@ -79,6 +79,10 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
                 text_id: et.text
                 for text_id, et in get_text_by_ids(conn, item.item_data_ids)
             }
+            assert len(ids_to_text) == len(item.item_data_ids), (
+                f"Text ids {item.item_data_ids} not found in "
+                f"extracted text {ids_to_text.keys()}"
+            )
             # Ensure that the text is in the same order as the item_data_ids
             return [
                 ({"text": ids_to_text[text_id]}, None)

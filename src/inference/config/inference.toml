@@ -48,7 +48,7 @@ description = "Generate Text Embeddings from extracted text using Sentence Trans
 name = "Text Embeddings"
 default_batch_size = 64
 default_inference_id = "all-mpnet-base-v2"
-target_entities = ["text", "tags"] # Tags are also stored as text
+target_entities = ["text"]
 output_type = "text-embedding"
 input_spec = { handler="extracted_text" }
 [group.textembed.inference_ids]

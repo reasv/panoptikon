@@ -242,6 +242,7 @@ def initialize_database(conn: sqlite3.Connection):
         idx INTEGER NOT NULL,             -- Index of the data in the item (page number, frame number, etc.)
         source_id INTEGER,                -- Reference to a previous item_data from which data was further processed
         is_origin BOOLEAN,                -- Whether the data is from the item directly or derived from other data. True if it is, NULL if not
+        is_placeholder BOOLEAN,           -- Whether the data is a placeholder (e.g. no data extracted) Needed to mark an item as processed
         UNIQUE(item_id, setter_id, data_type, idx, is_origin),            -- Origin data should be unique per item, setter, datatype and index
         UNIQUE(item_id, setter_id, data_type, idx, source_id),            -- Derived extractions should be unique per data they are derived from (and setter, datatype, index)
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,

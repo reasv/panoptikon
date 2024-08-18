@@ -18,6 +18,7 @@ def build_processed_item_data_filter_cte(
         FROM item_data AS src
         {prev_cte_join_clause}
         WHERE src.data_type IN ({target_type_conditions})
+        AND src.is_placeholder = 0
         AND NOT EXISTS (
             SELECT 1
             FROM item_data AS derived

@@ -1,5 +1,5 @@
 import sqlite3
-from typing import List, Tuple
+from typing import List
 
 # Assuming we have the serialization functions from before
 from src.db.rules.serializer import (
@@ -133,7 +133,7 @@ def get_rules_for_setter(
         FROM extraction_rules_setters 
         WHERE setter_name = ?
     """,
-        (setter_name),
+        (setter_name,),
     )
 
     rule_ids = [row[0] for row in cursor.fetchall()]

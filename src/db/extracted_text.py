@@ -95,25 +95,24 @@ def get_text_by_ids(
     """
     cursor = conn.cursor()
     cursor.execute(
-        """
+        f"""
         SELECT
             items.sha256,
             setters.name,
             language,
             text,
             confidence,
-            language_confidence
+            language_confidence,
             extracted_text.id
         FROM extracted_text
         JOIN item_data
-        ON extracted_text.id = item_data.id
+            ON extracted_text.id = item_data.id
         JOIN setters AS setters
-        ON item_data.setter_id = setters.id
-        JOIN items ON item_data.item_id = items.id
-        WHERE extracted_text.id IN ({})
-    """.format(
-            ", ".join("?" * len(text_ids))
-        ),
+            ON item_data.setter_id = setters.id
+        JOIN items
+            ON item_data.item_id = items.id
+        WHERE extracted_text.id IN ({', '.join('?' * len(text_ids))})
+    """,
         text_ids,
     )
     rows = cursor.fetchall()

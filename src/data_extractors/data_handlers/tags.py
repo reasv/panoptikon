@@ -93,6 +93,17 @@ def handle_tag_result(
     item: ItemData,
     results: Sequence[Dict[str, Any]],
 ):
+    if len(results) == 0:
+        add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="tags",
+            index=0,
+            is_placeholder=True,
+        )
+        return []
     tag_results = [from_dict(TagResult, tag_result) for tag_result in results]
     main_namespace = tag_results[0].namespace
     rating_severity = tag_results[0].rating_severity
@@ -110,6 +121,7 @@ def handle_tag_result(
         job_id=job_id,
         data_type="tags",
         index=0,
+        is_placeholder=len(tags) == 0,
     )
     for namespace, tag, confidence in tags:
         add_tag_to_item(
@@ -120,6 +132,8 @@ def handle_tag_result(
             confidence=confidence,
         )
 
+    if len(tags) == 0:
+        return []
     all_tags_string = ", ".join([tag for __, tag, _ in tags])
     min_confidence = min([confidence for __, _, confidence in tags])
 
@@ -171,3 +185,4 @@ def handle_tag_result(
         language_confidence=1.0,
         confidence=m_thresh,
     )
+    return [tags_data_id, text_data_id, mcut_text_data_id]

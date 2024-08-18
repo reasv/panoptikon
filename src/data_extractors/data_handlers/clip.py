@@ -27,4 +27,14 @@ def handle_clip(
         )
         add_embedding(conn, data_id, "clip", embedding)
         data_ids.append(data_id)
+    if not data_ids:
+        add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="clip",
+            index=0,
+            is_placeholder=True,
+        )
     return data_ids

@@ -10,9 +10,11 @@ def upsert_setter(
         """
         INSERT INTO setters (name)
         VALUES (?)
+        ON CONFLICT(name)
+        DO UPDATE SET name = excluded.name
         RETURNING id
         """,
-        (setter_name),
+        (setter_name,),
     )
     return cursor.fetchone()[0]
 
@@ -26,9 +28,9 @@ def get_setter_id(
         """
         SELECT id
         FROM setters
-        AND name = ?
+        WHERE name = ?
         """,
-        (setter_name),
+        (setter_name,),
     )
     # Handle case where setter does not exist
     if res := cursor.fetchone():
@@ -44,9 +46,9 @@ def delete_setter_by_name(
     cursor.execute(
         """
         DELETE FROM setters
-        AND name = ?
+        WHERE name = ?
         """,
-        (setter_name),
+        (setter_name,),
     )
     return cursor.rowcount
 

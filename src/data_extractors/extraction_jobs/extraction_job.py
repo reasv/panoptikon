@@ -114,7 +114,9 @@ def run_extraction_job(
             data_load_time += (datetime.now() - load_start).total_seconds()
             return o
         except Exception as e:
-            logger.error(f"Error processing item {item.path}: {e}")
+            logger.error(
+                f"Error processing item {item.path}: {e}", exc_info=True
+            )
             failed_items[item.sha256] = item
             return []
 

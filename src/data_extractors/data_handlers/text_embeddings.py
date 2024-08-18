@@ -17,6 +17,7 @@ def handle_text_embeddings(
     embeddings: Sequence[bytes],
 ):
     data_ids = []
+    assert len(item.item_data_ids) == len(embeddings), "Mismatch in data ids"
     for text_id, embedding_set in zip(item.item_data_ids, embeddings):
         text_embeddings = deserialize_array(embedding_set)
         # assert that the array is two-dimensional (i.e. a list of embeddings)
@@ -40,4 +41,14 @@ def handle_text_embeddings(
             )
             add_embedding(conn, data_id, "text-embedding", embedding.tolist())
             data_ids.append(data_id)
+    if not data_ids:
+        add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="text-embedding",
+            index=0,
+            is_placeholder=True,
+        )
     return data_ids
