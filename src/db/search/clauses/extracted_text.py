@@ -82,6 +82,9 @@ def build_extracted_text_search_subclause(
         params.append(args.min_confidence)
 
     if is_vector_query:
+        join_condition = (
+            "AND " + " AND ".join(where_conditions) if where_conditions else ""
+        )
         extracted_text_subclause = f"""
             JOIN item_data AS vec_data
                 ON vec_data.data_type = 'text-embedding'
@@ -97,7 +100,7 @@ def build_extracted_text_search_subclause(
                 ON et_data.id = et.id
             JOIN setters AS text_setters
                 ON et_data.setter_id = text_setters.id
-            {" AND ".join(where_conditions)}
+                {join_condition}
         """
     else:
         extracted_text_subclause = f"""
@@ -112,6 +115,6 @@ def build_extracted_text_search_subclause(
             JOIN setters AS text_setters
                 ON et_data.setter_id = text_setters.id
             WHERE {" AND ".join(where_conditions)}
-            GROUP BY et.item_id
+            GROUP BY et_data.item_id
         """
     return extracted_text_subclause, params

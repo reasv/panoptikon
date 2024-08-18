@@ -277,7 +277,7 @@ def get_embed(text: str, model_name: str) -> bytes:
     embed_bytes: bytes = model.run_batch_inference(
         "search", 1, 60, [({"text": text}, None)]
     )[0]
-    text_embed = deserialize_array(embed_bytes)
+    text_embed = deserialize_array(embed_bytes)[0]
     assert isinstance(text_embed, np.ndarray)
     # Set as persistent so that the model is not reloaded every time the function is called
     last_embedded_text = text
@@ -296,7 +296,7 @@ def get_clip_embed(input: str | PIL.Image.Image, model_name: str):
         embed_bytes: bytes = model.run_batch_inference(
             "search", 1, 60, [({"text": input}, None)]
         )[0]
-        embed = deserialize_array(embed_bytes)
+        embed = deserialize_array(embed_bytes)[0]
         assert isinstance(embed, np.ndarray)
         return serialize_f32(embed.tolist())
     else:  # input is an image
