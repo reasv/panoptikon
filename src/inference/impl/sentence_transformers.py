@@ -1,5 +1,5 @@
 import logging
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
@@ -13,6 +13,7 @@ class SentenceTransformersModel(InferenceModel):
         self,
         model_name: str,
         query_prompt_name_map: dict = {},
+        combine_threshold: int = 4,
         init_args: dict = {},
         inf_args: dict = {},
     ):
@@ -20,6 +21,7 @@ class SentenceTransformersModel(InferenceModel):
         self.init_args = init_args
         self.inf_args = inf_args
         self.query_prompt_name = query_prompt_name_map
+        self.combine_threshold = combine_threshold
         self._model_loaded: bool = False
 
     @classmethod
@@ -70,10 +72,33 @@ class SentenceTransformersModel(InferenceModel):
             task = batch_config.get("task")
             batch_args["prompt_name"] = self.query_prompt_name[task]
 
+        # Retrieve tokenizer and max sequence length from the model
+
+        tokenizer = self.model.tokenizer
+        max_seq_length = self.model.max_seq_length
+
+        final_embeddings = []
+
+        all_chunks = []
+        chunk_map = (
+            []
+        )  # Keeps track of which original text each chunk belongs to
+
+        # Split texts that exceed the max_seq_length into chunks
+        for idx, text in enumerate(input_strings):
+            tokens = tokenizer.encode(text, truncation=False)
+            if len(tokens) <= max_seq_length:
+                all_chunks.append(text)
+                chunk_map.append(idx)
+            else:
+                chunks = split_text_by_tokens(text, tokenizer, max_seq_length)
+                all_chunks.extend(chunks)
+                chunk_map.extend([idx] * len(chunks))
+
+        # Batch encode the chunks
         if self.pool:
-            # Use multi-process pool for parallel inference
             embeddings = self.model.encode_multi_process(
-                input_strings,
+                all_chunks,
                 normalize_embeddings=False,
                 pool=self.pool,
                 batch_size=len(input_strings),
@@ -82,16 +107,41 @@ class SentenceTransformersModel(InferenceModel):
             )
         else:
             embeddings = self.model.encode(
-                input_strings,
+                all_chunks,
                 normalize_embeddings=False,
                 batch_size=len(input_strings),
                 **self.inf_args,
                 **batch_args,
             )
 
-        assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
-        # Convert embeddings to bytes
-        return [serialize_array(np.array([emb])) for emb in embeddings]
+        # Initialize a list of lists to collect embeddings for each input text
+        aggregated_embeddings = [[] for _ in input_strings]
+
+        # Aggregate embeddings back to their corresponding original input
+        for embedding, original_idx in zip(embeddings, chunk_map):
+            aggregated_embeddings[original_idx].append(embedding)
+
+        # Wrap embeddings for each input text into 2D arrays
+        for idx, emb_list in enumerate(aggregated_embeddings):
+            input_config = inputs[idx].data
+            assert isinstance(input_config, dict), "Input config must be dict"
+            combine_at = input_config.get(
+                "combine_threshold", self.combine_threshold
+            )
+
+            # If the text was split into more than combine_at chunks, combine the embeddings
+            if len(emb_list) >= combine_at and combine_at != -1:
+                combined_embedding = np.mean(emb_list, axis=0)
+                # The extra combined embedding encodes the average meaning of the text
+                emb_list.append(combined_embedding)
+
+            # Ensure the embedding is wrapped as a two-dimensional array
+            final_embeddings.append(serialize_array(np.array(emb_list)))
+
+        assert len(final_embeddings) == len(
+            input_strings
+        ), "Mismatch in input and output sizes"
+        return final_embeddings
 
     def unload(self) -> None:
         if self._model_loaded:
@@ -104,3 +154,30 @@ class SentenceTransformersModel(InferenceModel):
 
     def __del__(self):
         self.unload()
+
+
+def split_text_by_tokens(text, tokenizer, max_tokens):
+    # Tokenize the entire text
+    tokens = tokenizer.encode(text, truncation=False)
+
+    # Split tokens into chunks of max_tokens size
+    chunks = [
+        tokens[i : i + max_tokens] for i in range(0, len(tokens), max_tokens)
+    ]
+
+    # Define the minimum chunk size threshold (e.g., one-third of max_tokens)
+    min_chunk_size = max_tokens // 3
+
+    # If the last chunk is smaller than the minimum threshold, rebalance it
+    if len(chunks) > 1 and len(chunks[-1]) < min_chunk_size:
+        # Calculate how many tokens are needed to meet the minimum size
+        tokens_needed = min_chunk_size - len(chunks[-1])
+
+        # Move tokens from the second-to-last chunk to the last chunk
+        chunks[-1] = chunks[-2][-tokens_needed:] + chunks[-1]
+        chunks[-2] = chunks[-2][:-tokens_needed]
+
+    # Decode the token chunks back into text
+    return [
+        tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks
+    ]
