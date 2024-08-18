@@ -137,9 +137,7 @@ def run_extraction_job(
             # Start a new transaction for each item
             conn.execute("BEGIN TRANSACTION")
         try:
-            # If the inputs are empty, it means the item yielded no data to be processed
-            if len(inputs) > 0:
-                output_handler(job_id, item, inputs, outputs)
+            output_handler(job_id, item, inputs, outputs)
         except Exception as e:
             logger.error(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
