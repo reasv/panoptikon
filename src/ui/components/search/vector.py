@@ -196,6 +196,12 @@ def create_vector_search_opts(query_state: gr.State):
             if clip_text_query_val and clip_model_val:
                 if not final_query_build:
                     embedded_query = clip_text_query_val.encode("utf-8")
+                    model = ModelOptsFactory.get_model(clip_model_val)
+                    model.load_model(
+                        "search",
+                        1,
+                        60,
+                    )
                 else:
                     embedded_query = get_clip_embed(
                         clip_text_query_val, clip_model_val
@@ -313,7 +319,7 @@ def get_clip_embed(input: str | PIL.Image.Image, model_name: str):
         embed_bytes: bytes = model.run_batch_inference(
             "search", 1, 60, [({"text": input}, None)]
         )[0]
-        embed = deserialize_array(embed_bytes)[0]
+        embed = deserialize_array(embed_bytes)
         assert isinstance(embed, np.ndarray)
         return serialize_f32(embed.tolist())
     else:  # input is an image
