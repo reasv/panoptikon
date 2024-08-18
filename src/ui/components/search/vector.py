@@ -152,6 +152,8 @@ def create_vector_search_opts(query_state: gr.State):
         args: dict[AnyComponent, Any],
         final_query_build: bool = False,
     ) -> SearchQuery:
+        from src.data_extractors.models import ModelOptsFactory
+
         vec_query_type_val: str | None = args[vec_query_type]
         te_embedding_model_val: str | None = args[te_embedding_model]
         te_text_query_val: str | None = args[te_text_query]
@@ -167,9 +169,18 @@ def create_vector_search_opts(query_state: gr.State):
         query.query.filters.image_embeddings = None
         if vec_query_type_val == "Text Vector Search":
             if te_text_query_val and te_embedding_model_val:
-                embedded_query = get_embed(
-                    te_text_query_val, te_embedding_model_val
-                )
+                if not final_query_build:
+                    embedded_query = te_text_query_val.encode("utf-8")
+                    model = ModelOptsFactory.get_model(te_embedding_model_val)
+                    model.load_model(
+                        "search",
+                        1,
+                        60,
+                    )
+                else:
+                    embedded_query = get_embed(
+                        te_text_query_val, te_embedding_model_val
+                    )
                 query.query.filters.extracted_text_embeddings = (
                     ExtractedTextEmbeddingsFilter(
                         query=embedded_query,
@@ -201,6 +212,12 @@ def create_vector_search_opts(query_state: gr.State):
                 ), "Expected numpy array for image search"
                 if not final_query_build:
                     embedded_query = "placeholder".encode("utf-8")
+                    model = ModelOptsFactory.get_model(clip_model_val)
+                    model.load_model(
+                        "search",
+                        1,
+                        60,
+                    )
                 else:
                     embedded_query = get_clip_embed(
                         clip_image_search_val, clip_model_val
