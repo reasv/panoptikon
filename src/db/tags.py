@@ -32,41 +32,26 @@ def upsert_tag(
 
 def insert_tag_item(
     conn: sqlite3.Connection,
-    item_id: int,
+    data_id: int,
     tag_id: int,
-    setter_id: int,
     confidence=1.0,
-    log_id: int | None = None,
-    source_id: int | None = None,
 ):
     # Round confidence to 4 decimal places
     confidence_float = round(float(confidence), 4)
     cursor = conn.cursor()
-    src_cond = (
-        "AND item_data.source_id = ?"
-        if source_id is not None
-        else "AND item_data.is_origin = 1"
-    )
-    src_params = (source_id,) if source_id is not None else ()
     cursor.execute(
         f"""
         INSERT INTO tags_items
-        (item_id, tag_id, setter_id, log_id, confidence, item_data_id)
-        SELECT ?, ?, ?, ?, ?, item_data.id
+        (item_data_id, tag_id, confidence)
+        SELECT item_data.id, ?, ?
         FROM item_data
-        WHERE item_data.item_id = ?
-        AND item_data.log_id = ?
-        {src_cond}
+        WHERE item_data.id = ?
+        AND item_data.data_type = 'tags'
         """,
         (
-            item_id,
             tag_id,
-            setter_id,
-            log_id,
             confidence_float,
-            item_id,
-            log_id,
-            *src_params,
+            data_id,
         ),
     )
     assert cursor.lastrowid is not None, "No tag item was inserted"
@@ -75,18 +60,13 @@ def insert_tag_item(
 
 def add_tag_to_item(
     conn: sqlite3.Connection,
+    data_id: int,
     namespace: str,
     name: str,
-    setter: str,
-    sha256: str,
     confidence: float = 1.0,
-    log_id: int | None = None,
 ):
-    item_id = get_item_id(conn, sha256)
-    assert item_id is not None, f"Item with sha256 {sha256} not found"
-    setter_id = upsert_setter(conn, setter_name=setter)
     tag_id = upsert_tag(conn, namespace, name)
-    insert_tag_item(conn, item_id, tag_id, setter_id, confidence, log_id)
+    insert_tag_item(conn, data_id, tag_id, confidence)
 
 
 def delete_orphan_tags(conn: sqlite3.Connection):
@@ -123,10 +103,15 @@ def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
         """
     SELECT tags.namespace, tags.name, tags_items.confidence, setters.name
     FROM items
-    JOIN tags_items ON items.id = tags_items.item_id
-    AND items.sha256 = ?
-    JOIN tags ON tags_items.tag_id = tags.id
-    JOIN setters ON tags_items.setter_id = setters.id
+    JOIN item_data
+        ON items.id = item_data.item_id
+    JOIN tags_items
+        ON tags_items.item_data_id = item_data.id
+    JOIN tags
+        ON tags_items.tag_id = tags.id        
+    JOIN setters 
+        ON item_data.setter_id = setters.id
+    WHERE items.sha256 = ?
     """,
         (sha256,),
     )

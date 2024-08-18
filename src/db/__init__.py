@@ -365,19 +365,9 @@ def initialize_database(conn: sqlite3.Connection):
         END;
     """
     )
-
     cursor.execute(
         f"""
-        CREATE TABLE IF NOT EXISTS image_embeddings (
-            id INTEGER PRIMARY KEY,
-            embedding float[],
-            FOREIGN KEY(id) REFERENCES item_data(id) ON DELETE CASCADE
-        );
-        """
-    )
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS text_embeddings (
+        CREATE TABLE IF NOT EXISTS embeddings (
             id INTEGER PRIMARY KEY,
             embedding float[],
             FOREIGN KEY(id) REFERENCES item_data(id) ON DELETE CASCADE

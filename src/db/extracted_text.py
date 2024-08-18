@@ -1,30 +1,20 @@
 import sqlite3
-from typing import List
+from typing import List, Tuple
 
-from src.db import get_item_id
 from src.types import ExtractedText, ExtractedTextStats
 
 
-def insert_extracted_text(
+def add_extracted_text(
     conn: sqlite3.Connection,
-    item_sha256: str,
-    index: int,
-    log_id: int,
+    data_id: int,
     text: str,
     language: str | None,
     language_confidence: float | None,
     confidence: float | None,
-    source_id: int | None = None,
 ) -> int:
     """
     Insert extracted text into the database
     """
-    text = text.strip()
-    if len(text) < 3:
-        return -1
-
-    item_id = get_item_id(conn, item_sha256)
-    assert item_id is not None, f"Item with SHA256 {item_sha256} not found"
 
     confidence = round(float(confidence), 4) if confidence is not None else None
     language_confidence = (
@@ -33,33 +23,21 @@ def insert_extracted_text(
         else None
     )
     cursor = conn.cursor()
-    src_cond = (
-        "AND item_data.source_id = ?"
-        if source_id is not None
-        else "AND item_data.is_origin = 1"
-    )
-    src_params = (source_id,) if source_id is not None else ()
-    sql = f"""
-    INSERT INTO extracted_text (idx, item_id, log_id, setter_id, item_data_id, language, language_confidence, confidence, text)
-    SELECT ?, ?, ?, item_data.setter_id, item_data.id, ?, ?, ?, ?
-    FROM item_data
-    WHERE item_data.log_id = logs.id
-    AND item_data.item_id = ?
-    {src_cond}
-    """
     cursor.execute(
-        sql,
+        """
+        INSERT INTO extracted_text
+            (id, language, language_confidence, confidence, text)
+        SELECT item_data.id, ?, ?, ?, ?
+        FROM item_data
+        WHERE item_data.id = ?
+        AND item_data.data_type = 'text'
+        """,
         (
-            index,
-            item_id,
-            log_id,
             language,
             language_confidence,
             confidence,
             text,
-            log_id,
-            item_id,
-            *src_params,
+            data_id,
         ),
     )
     assert cursor.lastrowid is not None, "Last row ID is None"
@@ -83,9 +61,11 @@ def get_extracted_text_for_item(
             confidence,
             language_confidence
         FROM extracted_text
-        JOIN setters AS setters 
-        ON extracted_text.setter_id = setters.id
-        JOIN items ON extracted_text.item_id = items.id
+        JOIN item_data
+        ON extracted_text.id = item_data.id
+        JOIN setters AS setters
+        ON item_data.setter_id = setters.id
+        JOIN items ON item_data.item_id = items.id
         WHERE items.sha256 = ?
     """,
         (item_sha256,),
@@ -101,6 +81,55 @@ def get_extracted_text_for_item(
             text=row[3],
             confidence=row[4],
             language_confidence=row[5],
+        )
+        for row in rows
+    ]
+    return extracted_texts
+
+
+def get_text_by_ids(
+    conn: sqlite3.Connection, text_ids: List[int]
+) -> List[Tuple[int, ExtractedText]]:
+    """
+    Get extracted text by their IDs
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT
+            items.sha256,
+            setters.name,
+            language,
+            text,
+            confidence,
+            language_confidence
+            extracted_text.id
+        FROM extracted_text
+        JOIN item_data
+        ON extracted_text.id = item_data.id
+        JOIN setters AS setters
+        ON item_data.setter_id = setters.id
+        JOIN items ON item_data.item_id = items.id
+        WHERE extracted_text.id IN ({})
+    """.format(
+            ", ".join("?" * len(text_ids))
+        ),
+        text_ids,
+    )
+    rows = cursor.fetchall()
+
+    # Map each row to an ExtractedText dataclass instance
+    extracted_texts = [
+        (
+            row[6],
+            ExtractedText(
+                item_sha256=row[0],
+                setter_name=row[1],
+                language=row[2],
+                text=row[3],
+                confidence=row[4],
+                language_confidence=row[5],
+            ),
         )
         for row in rows
     ]

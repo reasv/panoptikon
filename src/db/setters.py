@@ -10,7 +10,6 @@ def upsert_setter(
         """
         INSERT INTO setters (name)
         VALUES (?)
-        ON CONFLICT(name)
         RETURNING id
         """,
         (setter_name),

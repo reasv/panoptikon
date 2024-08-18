@@ -1,15 +1,16 @@
 import sqlite3
 from collections import defaultdict
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
 from src.data_extractors.ai.wd_tagger import mcut_threshold
 from src.data_extractors.extraction_jobs.types import TagResult
-from src.db.extracted_text import insert_extracted_text
+from src.db.extracted_text import add_extracted_text
+from src.db.extraction_log import add_item_data
 from src.db.search.utils import from_dict
 from src.db.tags import add_tag_to_item
-from src.types import ItemWithPath
+from src.types import ItemData
 
 
 def mcut_threshold(probs: np.ndarray) -> float:
@@ -87,10 +88,10 @@ def aggregate_tags(
 
 def handle_tag_result(
     conn: sqlite3.Connection,
-    log_id: int,
-    setter: str,
-    item: ItemWithPath,
-    results: Sequence[dict],
+    job_id: int,
+    setter_name: str,
+    item: ItemData,
+    results: Sequence[Dict[str, Any]],
 ):
     tag_results = [from_dict(TagResult, tag_result) for tag_result in results]
     main_namespace = tag_results[0].namespace
@@ -102,26 +103,38 @@ def handle_tag_result(
             rating_severity,
         )
     ]
-
+    tags_data_id = add_item_data(
+        conn,
+        item=item.sha256,
+        setter_name=setter_name,
+        job_id=job_id,
+        data_type="tags",
+        index=0,
+    )
     for namespace, tag, confidence in tags:
         add_tag_to_item(
             conn,
+            data_id=tags_data_id,
             namespace=f"{main_namespace}:{namespace}",
             name=tag,
-            sha256=item.sha256,
-            setter=setter,
             confidence=confidence,
-            log_id=log_id,
         )
 
     all_tags_string = ", ".join([tag for __, tag, _ in tags])
     min_confidence = min([confidence for __, _, confidence in tags])
 
-    insert_extracted_text(
+    text_data_id = add_item_data(
         conn,
-        item.sha256,
-        0,
-        log_id=log_id,
+        item=item.sha256,
+        setter_name=setter_name,
+        job_id=job_id,
+        data_type="text",
+        src_data_id=tags_data_id,
+        index=0,
+    )
+    add_extracted_text(
+        conn,
+        data_id=text_data_id,
         text=all_tags_string,
         language=main_namespace,
         language_confidence=1.0,
@@ -141,11 +154,18 @@ def handle_tag_result(
         ]
     )
     # During search, we can filter by this confidence value
-    insert_extracted_text(
+    mcut_text_data_id = add_item_data(
         conn,
-        item.sha256,
-        1,
-        log_id=log_id,
+        item=item.sha256,
+        setter_name=setter_name,
+        job_id=job_id,
+        data_type="text",
+        src_data_id=tags_data_id,
+        index=1,
+    )
+    add_extracted_text(
+        conn,
+        data_id=mcut_text_data_id,
         text=mcut_tags_string,
         language=f"{main_namespace}-mcut",
         language_confidence=1.0,

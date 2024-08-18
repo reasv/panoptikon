@@ -15,7 +15,7 @@ from src.db.storage import (
     store_frames,
     thumbnail_to_bytes,
 )
-from src.types import ItemWithPath
+from src.types import ItemData, ItemWithPath
 from src.utils import pil_ensure_rgb
 
 logger = logging.getLogger(__name__)
@@ -106,9 +106,7 @@ def item_image_loader_pillow(
     return []
 
 
-def image_loader(
-    conn: sqlite3.Connection, item: ItemWithPath
-) -> Sequence[bytes]:
+def image_loader(conn: sqlite3.Connection, item: ItemData) -> Sequence[bytes]:
     if item.type.startswith("image/gif"):
         return [
             thumbnail_to_bytes(frame, "JPEG")

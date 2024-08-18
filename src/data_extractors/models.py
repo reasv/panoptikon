@@ -639,11 +639,11 @@ class ModelOptsFactory:
         except Exception as e:
             logger.error(f"Failed to load API model opts: {e}", exc_info=True)
         return [
-            TagsModel,
-            OCRModel,
-            WhisperSTTModel,
-            ImageEmbeddingModel,
-            TextEmbeddingModel,
+            # TagsModel,
+            # OCRModel,
+            # WhisperSTTModel,
+            # ImageEmbeddingModel,
+            # TextEmbeddingModel,
         ] + api_modelopts
 
     @classmethod

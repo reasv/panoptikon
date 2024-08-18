@@ -1,9 +1,6 @@
-import io
 import logging
 import sqlite3
 from typing import Any, Dict, List, Sequence, Tuple
-
-import numpy as np
 
 from src.data_extractors.data_handlers.clip import handle_clip
 from src.data_extractors.data_handlers.tags import handle_tag_result
@@ -17,9 +14,9 @@ from src.data_extractors.extraction_jobs.extraction_job import (
     run_extraction_job,
 )
 from src.data_extractors.models import ModelGroup
-from src.db.text_embeddings import get_text_missing_embeddings
+from src.db.extracted_text import get_text_by_ids
 from src.inference.impl.utils import serialize_array
-from src.types import ItemWithPath
+from src.types import ItemData
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +45,7 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
     if handler_name == "image_frames":
 
         def frame_loader(
-            item: ItemWithPath,
+            item: ItemData,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             max_frames = handler_opts.get("max_frames", 4)
             frames = image_loader(conn, item)
@@ -61,7 +58,7 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
         max_tracks: int = handler_opts.get("max_tracks", 4)
 
         def audio_loader(
-            item: ItemWithPath,
+            item: ItemData,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             if item.type.startswith("video") or item.type.startswith("audio"):
                 audio = load_audio_single(item.path, sr=sample_rate)
@@ -76,13 +73,16 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
     elif handler_name == "extracted_text":
 
         def get_item_text(
-            item: ItemWithPath,
+            item: ItemData,
         ) -> Sequence[Tuple[Dict[str, Any], None]]:
+            ids_to_text = {
+                text_id: et.text
+                for text_id, et in get_text_by_ids(conn, item.item_data_ids)
+            }
+            # Ensure that the text is in the same order as the item_data_ids
             return [
-                ({"text_id": text_id, "text": text}, None)
-                for text_id, text in get_text_missing_embeddings(
-                    conn, item.sha256, model.setter_name()
-                )
+                ({"text": ids_to_text[text_id]}, None)
+                for text_id in item.item_data_ids
             ]
 
         data_loader = get_item_text
@@ -100,49 +100,50 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
     if model.data_type() == "tags":
 
         def tag_handler(
-            log_id: int,
-            item: ItemWithPath,
+            job_id: int,
+            item: ItemData,
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
-            handle_tag_result(conn, log_id, model.setter_name(), item, outputs)
+            handle_tag_result(conn, job_id, model.setter_name(), item, outputs)
 
         result_handler = tag_handler
 
     elif model.data_type() == "text":
 
         def text_handler(
-            log_id: int,
-            item: ItemWithPath,
+            job_id: int,
+            item: ItemData,
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
-            handle_text(conn, log_id, item, outputs)
+            handle_text(conn, job_id, model.setter_name(), item, outputs)
 
         result_handler = text_handler
 
     elif model.data_type() == "clip":
 
         def clip_handler(
-            log_id: int,
-            item: ItemWithPath,
+            job_id: int,
+            item: ItemData,
             _: Sequence[Any],
-            embeddings: Sequence[bytes],  # bytes
+            embeddings: Sequence[bytes],
         ):
-            handle_clip(conn, log_id, item, embeddings)
+            handle_clip(conn, job_id, model.setter_name(), item, embeddings)
 
         result_handler = clip_handler
 
     elif model.data_type() == "text-embedding":
 
         def text_emb_handler(
-            log_id: int,
-            _: ItemWithPath,
-            inputs: Sequence[Tuple[Dict[str, Any], Any]],
+            job_id: int,
+            item: ItemData,
+            _: Sequence[Any],
             embeddings: Sequence[bytes],
         ):
-            input_ids = [data["text_id"] for data, _ in inputs]
-            handle_text_embeddings(conn, log_id, input_ids, embeddings)
+            handle_text_embeddings(
+                conn, job_id, model.setter_name(), item, embeddings
+            )
 
         result_handler = text_emb_handler
     else:

@@ -1,6 +1,5 @@
 import sqlite3
-from dataclasses import asdict, dataclass, fields
-from typing import Any
+from dataclasses import fields
 
 from src.types import SystemConfig
 

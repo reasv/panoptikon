@@ -30,10 +30,14 @@ def get_most_common_tags(
     query = f"""
     SELECT tags.namespace, tags.name, COUNT(*) as count
     FROM tags
-    JOIN tags_items ON tags.id = tags_items.tag_id
+    JOIN tags_items
+        ON tags.id = tags_items.tag_id
     {namespace_clause}
     {confidence_clause}
-    JOIN setters ON tags_items.setter_id = setters.id
+    JOIN item_data
+        ON tags_items.item_data_id = item_data.id
+    JOIN setters
+        ON item_data.setter_id = setters.id
     {setters_clause}
     GROUP BY tags.namespace, tags.name
     ORDER BY count DESC
@@ -69,11 +73,13 @@ def get_most_common_tags_frequency(
     cursor.execute(
         f"""
         SELECT COUNT(
-            DISTINCT tags_items.item_id || '-' || tags_items.setter_id
+            DISTINCT item_data.item_id || '-' || item_data.setter_id
         ) AS distinct_count
         FROM tags_items
+        JOIN item_data
+            ON tags_items.item_data_id = item_data.id
         JOIN setters
-        ON tags_items.setter_id = setters.id
+            ON item_data.setter_id = setters.id
         {setters_clause}""",
         setters if setters else (),
     )

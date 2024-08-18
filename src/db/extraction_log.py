@@ -196,6 +196,7 @@ def add_item_data(
 ):
     cursor = conn.cursor()
     item_id = get_item_id(conn, item)
+    assert item_id is not None, "Item does not exist in the database"
     if src_data_id is None:
         is_origin = True
     else:
@@ -298,6 +299,7 @@ def get_items_missing_data_extraction(
                     data_types=model_opts.target_entities(),
                     setter_name=model_opts.setter_name(),
                 )
+                item.item_data_ids.sort()
             yield item, remaining_count
         else:
             # If no working path is found, skip this item

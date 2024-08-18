@@ -1,20 +1,43 @@
 import sqlite3
-from typing import List, Sequence, Tuple
+from typing import Sequence
 
 import numpy as np
 
 from src.data_extractors.data_handlers.utils import deserialize_array
-from src.db.text_embeddings import add_text_embedding
+from src.db.embeddings import add_embedding
+from src.db.extraction_log import add_item_data
+from src.types import ItemData
 
 
 def handle_text_embeddings(
     conn: sqlite3.Connection,
-    log_id: int,
-    input_ids: Sequence[int],
+    job_id: int,
+    setter_name: str,
+    item: ItemData,
     embeddings: Sequence[bytes],
 ):
-    embeddings_list: List[List[float]] = [
-        deserialize_array(embedding).tolist() for embedding in embeddings
-    ]
-    for text_id, embedding in zip(input_ids, embeddings_list):
-        add_text_embedding(conn, text_id, log_id, embedding)
+    data_ids = []
+    for text_id, embedding_set in zip(item.item_data_ids, embeddings):
+        text_embeddings = deserialize_array(embedding_set)
+        # assert that the array is two-dimensional (i.e. a list of embeddings)
+        assert (
+            text_embeddings.ndim == 2
+        ), "Embeddings are not a list of embeddings"
+        # Iterate over each row of the numpy array (each row is an embedding)
+        for idx, embedding in enumerate(text_embeddings):
+            assert isinstance(
+                embedding, np.ndarray
+            ), "Embedding is not a numpy array"
+
+            data_id = add_item_data(
+                conn,
+                item=item.sha256,
+                setter_name=setter_name,
+                job_id=job_id,
+                data_type="text-embedding",
+                src_data_id=text_id,
+                index=idx,
+            )
+            add_embedding(conn, data_id, "text-embedding", embedding.tolist())
+            data_ids.append(data_id)
+    return data_ids
