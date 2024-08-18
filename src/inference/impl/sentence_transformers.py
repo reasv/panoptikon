@@ -1,6 +1,5 @@
 import logging
 from typing import List, Sequence
-from venv import logger
 
 from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
