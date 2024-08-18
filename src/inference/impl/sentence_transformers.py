@@ -34,10 +34,9 @@ class SentenceTransformersModel(InferenceModel):
             model_name_or_path=self.model_name,
             **self.init_args,
         )
-        if len(self.devices) > 1:
-            self.pool = self.model.start_multi_process_pool()
-        else:
-            self.pool = None
+        self.pool = None
+        # if len(self.devices) > 1:
+        #     self.pool = self.model.start_multi_process_pool()
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[bytes]:
@@ -87,7 +86,7 @@ class SentenceTransformersModel(InferenceModel):
 
         assert isinstance(embeddings, np.ndarray), "Embeddings not numpy array"
         # Convert embeddings to bytes
-        return [serialize_array(emb) for emb in embeddings]
+        return [serialize_array(np.array([emb])) for emb in embeddings]
 
     def unload(self) -> None:
         if self._model_loaded:
