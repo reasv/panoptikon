@@ -13,7 +13,7 @@ class SentenceTransformersModel(InferenceModel):
         self,
         model_name: str,
         query_prompt_name_map: dict = {},
-        combine_threshold: int = 4,
+        combine_threshold: int = -1,
         init_args: dict = {},
         inf_args: dict = {},
     ):
