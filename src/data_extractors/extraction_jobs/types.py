@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import List, Tuple
 
 from src.db import tags
-from src.types import ItemWithPath
+from src.types import ItemData
 
 
 @dataclass
@@ -12,7 +12,7 @@ class ExtractorJobProgress:
     processed_items: int
     total_items: int
     eta_string: str
-    item: ItemWithPath
+    item: ItemData
 
 
 @dataclass

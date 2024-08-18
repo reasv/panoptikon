@@ -3,6 +3,8 @@ from datetime import datetime
 from time import time
 from typing import TYPE_CHECKING, List, Sequence, Tuple
 
+from src.db.setters import get_setter_id
+
 if TYPE_CHECKING:
     import src.data_extractors.models as models
 
@@ -14,7 +16,7 @@ from src.db.rules.build_filters import build_multirule_query
 from src.db.rules.rules import get_rules_for_setter
 from src.db.rules.types import combine_rule_item_filters
 from src.db.utils import pretty_print_SQL
-from src.types import ItemWithPath, LogRecord
+from src.types import ItemData, ItemWithPath, LogRecord, OutputDataType
 
 logger = logging.getLogger(__name__)
 
@@ -186,14 +188,15 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
 def add_item_data(
     conn: sqlite3.Connection,
     item: str,
-    setter_id: int,
+    setter_name: str,
     job_id: int,
-    data_type: str,
-    source_item_data_id: int | None = None,
+    data_type: OutputDataType,
+    index: int,
+    src_data_id: int | None = None,
 ):
     cursor = conn.cursor()
     item_id = get_item_id(conn, item)
-    if source_item_data_id is None:
+    if src_data_id is None:
         is_origin = True
     else:
         is_origin = None
@@ -201,16 +204,19 @@ def add_item_data(
     cursor.execute(
         """
     INSERT INTO item_data
-    (item_id, job_id, setter_id, data_type, is_origin, source_id)
-    SELECT ?, ?, ?, ?, ?, ?
+    (job_id, item_id, setter_id, data_type, idx, is_origin, source_id)
+    SELECT ?, ?, setters.id, ?, ?, ?, ?
+    FROM setters
+    WHERE setters.name = ?;
     """,
         (
-            item_id,
             job_id,
-            setter_id,
+            item_id,
             data_type,
+            index,
             is_origin,
-            source_item_data_id,
+            src_data_id,
+            setter_name,
         ),
     )
     # Return the ID of the new extraction
@@ -279,10 +285,19 @@ def get_items_missing_data_extraction(
 
     remaining_count: int = total_count
     while row := cursor.fetchone():
-        item = ItemWithPath(*row, "")  # type: ignore
+        item = ItemData(*row, path="", item_data_ids=[])
         remaining_count -= 1
         if file := get_existing_file_for_sha256(conn, item.sha256):
             item.path = file.path
+
+            if model_opts.target_entities() != ["items"]:
+                # This model operates on derived data, not the items themselves
+                item.item_data_ids = get_unprocessed_item_data_for_item(
+                    conn,
+                    item=item.sha256,
+                    data_types=model_opts.target_entities(),
+                    setter_name=model_opts.setter_name(),
+                )
             yield item, remaining_count
         else:
             # If no working path is found, skip this item
@@ -319,24 +334,25 @@ def get_unprocessed_item_data_for_item(
     conn: sqlite3.Connection,
     item: str,
     data_types: Sequence[str],
-    setter_id: int,
+    setter_name: str,
 ) -> List[int]:
     """
     Find all item associated data of the specified data_types for this item
     that have not yet been processed by the specified setter.
     """
     item_id = get_item_id(conn, item)
+    setter_id = get_setter_id(conn, setter_name)
     data_type_condition = ", ".join(["?" for _ in data_types])
     query = f"""
-        SELECT ie.id
-        FROM item_data AS ie
-        WHERE ie.item_id = ?
-        AND ie.data_type IN ({data_type_condition})
+        SELECT data_src.id
+        FROM item_data AS data_src
+        WHERE data_src.item_id = ?
+        AND data_src.data_type IN ({data_type_condition})
         AND NOT EXISTS (
             SELECT 1
-            FROM item_data AS ie2
-            WHERE ie2.source_id = ie.id
-            AND ie2.setter_id = ?
+            FROM item_data AS data_derived
+            WHERE data_derived.source_id = data_src.id
+            AND data_derived.setter_id = ?
         )
     """
     params = (item_id, *data_types, setter_id)

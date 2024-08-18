@@ -21,13 +21,11 @@ from src.data_extractors.extraction_jobs.types import (
 )
 from src.db.extraction_log import (
     add_data_log,
-    add_item_data,
     get_items_missing_data_extraction,
-    get_unprocessed_item_data_for_item,
     update_log,
 )
 from src.db.setters import upsert_setter
-from src.types import ItemWithPath
+from src.types import ItemData
 from src.utils import estimate_eta
 
 logger = logging.getLogger(__name__)
@@ -39,11 +37,9 @@ I = TypeVar("I")
 def run_extraction_job(
     conn: sqlite3.Connection,
     model_opts: models.ModelOpts,
-    input_transform: Callable[[ItemWithPath], Sequence[I]],
+    input_transform: Callable[[ItemData], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
-    output_handler: Callable[
-        [int, ItemWithPath, Sequence[I], Sequence[R]], None
-    ],
+    output_handler: Callable[[int, ItemData, Sequence[I], Sequence[R]], None],
     final_callback: Callable[[], None] = lambda: None,
     load_callback: Callable[[], None] = lambda: None,
 ):
@@ -74,7 +70,7 @@ def run_extraction_job(
     start_time = datetime.now()
     scan_time = start_time.isoformat()
 
-    failed_items: Dict[str, ItemWithPath] = {}
+    failed_items: Dict[str, ItemData] = {}
     processed_items, videos, images, other, total_processed_units = (
         0,
         0,
@@ -93,7 +89,7 @@ def run_extraction_job(
         model_opts.setter_name(),
         batch_size,
     )
-    setter_id = upsert_setter(
+    upsert_setter(
         conn,
         model_opts.setter_name(),
     )
@@ -110,7 +106,7 @@ def run_extraction_job(
         inference_time += (datetime.now() - inf_start).total_seconds()
         return o
 
-    def transform_input_handle_error(item: ItemWithPath):
+    def transform_input_handle_error(item: ItemData):
         try:
             nonlocal data_load_time
             load_start = datetime.now()
@@ -131,61 +127,17 @@ def run_extraction_job(
         transform_input_handle_error,
         run_batch_inference_with_counter,
     ):
+        processed_items += 1
+        if failed_items.get(item.sha256) is not None:
+            # Skip items that have already failed
+            continue
         if transaction_per_item:
             # Start a new transaction for each item
             conn.execute("BEGIN TRANSACTION")
-        processed_items += 1
-        if failed_items.get(item.sha256) is not None:
-            if transaction_per_item:
-                conn.commit()
-            continue
-
         try:
-            if model_opts.target_entities() == ["items"]:
-                # If the model operates on individual items, add the item to the log
-                add_item_data(
-                    conn,
-                    item=item.sha256,
-                    job_id=job_id,
-                    setter_id=setter_id,
-                    data_type=model_opts.data_type(),
-                )
-            else:
-                # This model operates not on the original items, but on the extracted data
-                # Specifically, data extracted by a previous model,
-                # and more specifically, data of type model_opts.target_entities()
-                # We're going to assume it has processed all such data not yet processed
-                # and record it as such, so until new data of this type
-                # is produced for this item, it will not be processed again.
-                item_data = get_unprocessed_item_data_for_item(
-                    conn,
-                    item=item.sha256,
-                    data_types=model_opts.target_entities(),
-                    setter_id=setter_id,
-                )
-                # Each of these represents an instance of data being previously extracted
-                # from this item, by a different model,
-                # and the idea is this model is now
-                # processing that data, and should not process it again.
-                # We record it so the model's filters can filter this item out next run.
-                logger.debug(f"Adding {len(item_data)} extractions to log")
-                for item_data_id in item_data:
-                    add_item_data(
-                        conn,
-                        item=item.sha256,
-                        job_id=job_id,
-                        setter_id=setter_id,
-                        source_item_data_id=item_data_id,
-                        data_type=model_opts.data_type(),
-                    )
-
+            # If the inputs are empty, it means the item yielded no data to be processed
             if len(inputs) > 0:
                 output_handler(job_id, item, inputs, outputs)
-            else:
-                # Item yielded no data to process, skip and log as processed
-                if transaction_per_item:
-                    conn.commit()
-                continue
         except Exception as e:
             logger.error(f"Error handling item {item.path}: {e}")
             failed_items[item.sha256] = item
@@ -265,9 +217,9 @@ def run_extraction_job(
 
 
 def batch_items(
-    items_generator: Generator[Tuple[ItemWithPath, int], Any, None],
+    items_generator: Generator[Tuple[ItemData, int], Any, None],
     batch_size: int,
-    input_transform_func: Callable[[ItemWithPath], Sequence[I]],
+    input_transform_func: Callable[[ItemData], Sequence[I]],
     process_batch_func: Callable[[Sequence[I]], Sequence[R]],
 ):
     """
@@ -275,7 +227,7 @@ def batch_items(
     item extractor and batch processing functions.
     """
     while True:
-        batch: List[Tuple[ItemWithPath, int]] = []
+        batch: List[Tuple[ItemData, int]] = []
         work_units: List[I] = []
         batch_index_to_work_units: dict[int, List[int]] = {}
         for item, remaining in items_generator:

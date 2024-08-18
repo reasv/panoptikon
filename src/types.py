@@ -39,6 +39,17 @@ class ItemWithPath:
 
 
 @dataclass
+class ItemData:
+    sha256: str
+    md5: str
+    type: str
+    size: int
+    time_added: str
+    path: str
+    item_data_ids: List[int]
+
+
+@dataclass
 class ExtractedText:
     item_sha256: str
     setter_name: str
