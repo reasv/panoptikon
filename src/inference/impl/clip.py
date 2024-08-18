@@ -89,10 +89,7 @@ class ClipModel(InferenceModel):
                 tokens = self.tokenizer(list(texts))
                 tokens = torch.tensor(tokens).to(self.device)
 
-                text_features = self.model.encode_text(tokens)
-                text_features /= text_features.norm(
-                    dim=-1, keepdim=True
-                )  # Normalize the text features
+                text_features = self.model.encode_text(tokens, normalize=False)
 
                 # Convert text features to list and store them in the results list
                 for i, idx in enumerate(indices):
@@ -110,10 +107,9 @@ class ClipModel(InferenceModel):
                     ]
                 )
 
-                image_features = self.model.encode_image(processed_images)
-                image_features /= image_features.norm(
-                    dim=-1, keepdim=True
-                )  # Normalize the image features
+                image_features = self.model.encode_image(
+                    processed_images, normalize=False
+                )
 
                 # Convert image features to list and store them in the results list
                 for i, idx in enumerate(indices):

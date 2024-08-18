@@ -1,8 +1,12 @@
-from typing import Dict, List, Sequence
+import logging
+from typing import List, Sequence
+from venv import logger
 
 from src.inference.impl.utils import clear_cache, get_device, serialize_array
 from src.inference.model import InferenceModel
 from src.inference.types import PredictionInput
+
+logger = logging.getLogger(__name__)
 
 
 class SentenceTransformersModel(InferenceModel):
@@ -71,6 +75,7 @@ class SentenceTransformersModel(InferenceModel):
             # Use multi-process pool for parallel inference
             embeddings = self.model.encode_multi_process(
                 input_strings,
+                normalize_embeddings=False,
                 pool=self.pool,
                 batch_size=len(input_strings),
                 **self.inf_args,
@@ -79,6 +84,7 @@ class SentenceTransformersModel(InferenceModel):
         else:
             embeddings = self.model.encode(
                 input_strings,
+                normalize_embeddings=False,
                 batch_size=len(input_strings),
                 **self.inf_args,
                 **batch_args,
