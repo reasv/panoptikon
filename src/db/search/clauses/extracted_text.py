@@ -22,14 +22,14 @@ def build_extracted_text_search_clause(
     if len(subclause) == 0:
         return "", [], ""
     if is_vector_query:
-        extracted_text_condition = f"""
+        cond = f"""
             {subclause}
         """
         additional_columns = (
             ",\n MIN(vec_distance_L2(et_vec.embedding, ?)) AS text_vec_distance"
         )
     else:
-        extracted_text_condition = f"""
+        cond = f"""
             JOIN (
                 {subclause}
             ) AS extracted_text_matches
@@ -37,7 +37,7 @@ def build_extracted_text_search_clause(
         """
         additional_columns = ",\n extracted_text_matches.max_rank AS rank_fts"
 
-    return extracted_text_condition, params, additional_columns
+    return cond, params, additional_columns
 
 
 def build_extracted_text_search_subclause(
@@ -83,25 +83,34 @@ def build_extracted_text_search_subclause(
 
     if is_vector_query:
         extracted_text_subclause = f"""
-            JOIN text_embeddings AS et_vec
-            ON et_vec.item_id = files.item_id
-            JOIN setters as vec_setters
-            ON et_vec.setter_id = vec_setters.id
-            AND vec_setters.name = ?
+            JOIN item_data AS vec_data
+                ON vec_data.data_type = 'text-embedding'
+                AND vec_data.item_id = files.item_id
+            JOIN setters AS vec_setters
+                ON vec_data.setter_id = vec_setters.id
+                AND vec_setters.name = ?
+            JOIN embeddings AS et_vec
+                ON et_vec.id = vec_data.id
             JOIN extracted_text AS et
-            ON et_vec.text_id = et.id
+                ON vec_data.source_id = et.id
+            JOIN item_data AS et_data
+                ON et_data.id = et.id
             JOIN setters AS text_setters
-            ON et.setter_id = text_setters.id
+                ON et_data.setter_id = text_setters.id
             {" AND ".join(where_conditions)}
         """
     else:
         extracted_text_subclause = f"""
-            SELECT et.item_id AS item_id, MAX(et_fts.rank) AS max_rank
+            SELECT
+                et_data.item_id AS item_id,
+                MAX(et_fts.rank) AS max_rank
             FROM extracted_text_fts AS et_fts
             JOIN extracted_text AS et
-            ON et_fts.rowid = et.id
+                ON et_fts.rowid = et.id
+            JOIN item_data AS et_data
+                ON et_data.id = et.id
             JOIN setters AS text_setters
-            ON et.setter_id = text_setters.id
+                ON et_data.setter_id = text_setters.id
             WHERE {" AND ".join(where_conditions)}
             GROUP BY et.item_id
         """

@@ -13,11 +13,14 @@ def build_image_embedding_clause(args: ImageEmbeddingFilter | None):
     params: List[str] = [args.model]
 
     subclause = f"""
-        JOIN image_embeddings
-        ON image_embeddings.item_id = files.item_id
-        JOIN setters AS image_setters
-        ON image_embeddings.setter_id = image_setters.id
-        AND image_setters.name = ?
+        JOIN item_data AS clip_data
+            ON clip_data.data_type = 'clip'
+            AND clip_data.item_id = files.item_id 
+        JOIN setters AS clip_setters
+            ON clip_data.setter_id = clip_setters.id
+            AND clip_setters.name = ?
+        JOIN embeddings AS image_embeddings
+            ON image_embeddings.id = clip_data.id
     """
     add_column = ",\n MIN(vec_distance_L2(image_embeddings.embedding, ?)) AS image_vec_distance"
     return subclause, params, add_column
