@@ -1,7 +1,7 @@
 import logging
 import os
 import sqlite3
-from typing import List, Sequence, Union
+from typing import Any, List, Sequence
 
 import numpy as np
 from PIL import Image as PILImage
@@ -136,11 +136,11 @@ def image_loader(conn: sqlite3.Connection, item: ItemData) -> Sequence[bytes]:
             for page in read_pdf(item.path)
         ]
     if item.type.startswith("text/html"):
-        from doctr.io.html import read_html
-
+        res = read_html(item.path)
+        assert res is not None, "Failed to read HTML file"
         return [
             thumbnail_to_bytes(PILImage.fromarray(page), "JPEG")
-            for page in read_pdf(read_html(item.path))
+            for page in read_pdf(res)
         ]
     return []
 
@@ -150,10 +150,30 @@ def get_pdf_image(file_path: str) -> PILImage.Image:
     return PILImage.fromarray(read_pdf(file_path)[0])
 
 
-def get_html_image(file_path: str) -> PILImage.Image:
-    from doctr.io.html import read_html
+def read_html(url: str, **kwargs: Any) -> bytes | None:
+    from weasyprint import HTML
 
-    return PILImage.fromarray(read_pdf(read_html(file_path))[0])
+    """Read a PDF file and convert it into an image in numpy format
+
+    >>> from doctr.io import read_html
+    >>> doc = read_html("https://www.yoursite.com")
+
+    Args:
+    ----
+        url: URL of the target web page
+        **kwargs: keyword arguments from `weasyprint.HTML`
+
+    Returns:
+    -------
+        decoded PDF file as a bytes stream
+    """
+    return HTML(url, **kwargs).write_pdf()
+
+
+def get_html_image(file_path: str) -> PILImage.Image:
+    res = read_html(file_path)
+    assert res is not None, "Failed to read HTML file"
+    return PILImage.fromarray(read_pdf(res)[0])
 
 
 def generate_thumbnail(
