@@ -2,7 +2,7 @@
 config = { impl_class = "wd_tagger" }
 [group.tags.metadata]
 description = "Danbooru style taggers"
-name = "Tags V2"
+name = "Tags"
 default_threshold = 0.1
 default_batch_size = 64
 default_inference_id = "wd-swinv2-tagger-v3"
@@ -22,7 +22,7 @@ wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, m
 config = { impl_class = "doctr" }
 [group.doctr.metadata]
 description = "Extract text from images, videos, and documents through OCR"
-name = "DocTR V2"
+name = "DocTR"
 default_threshold = 0
 default_batch_size = 64
 default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
@@ -45,7 +45,7 @@ db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_m
 config = { impl_class = "sentence_transformers" }
 [group.textembed.metadata]
 description = "Generate Text Embeddings from extracted text using Sentence Transformers. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
-name = "Text Embeddings V2"
+name = "Text Embeddings"
 default_batch_size = 64
 default_inference_id = "all-mpnet-base-v2"
 target_entities = ["text", "tags"] # Tags are also stored as text
@@ -61,7 +61,7 @@ stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5", quer
 config = { impl_class = "faster_whisper" }
 [group.whisper.metadata]
 description = "Extract text from audio using OpenAI's Whisper model"
-name = "Whisper Speech-to-Text V2"
+name = "Whisper Speech-to-Text"
 default_threshold = 0
 default_batch_size = 4
 default_inference_id = "distill-large-v3"
@@ -92,7 +92,7 @@ distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-larg
 config = { impl_class = "openclip" }
 [group.clip.metadata]
 description = "Generate Image Embeddings using OpenAI's CLIP model for semantic image search"
-name = "CLIP Image Embeddings V2"
+name = "CLIP Image Embeddings"
 default_batch_size = 64
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities = ["items"]
