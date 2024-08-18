@@ -168,7 +168,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     CREATE TABLE IF NOT EXISTS data_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        completed BOOLEAN NOT NULL DEFAULT 0,
+        completed BOOLEAN NOT NULL DEFAULT 0
     )
     """
     )
@@ -201,7 +201,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
         CREATE TABLE IF NOT EXISTS setters (
             id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL UNIQUE
         )
         """
     )
