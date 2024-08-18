@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import gradio as gr
 
-import src.data_extractors.models as models
 from src.db import get_database_connection
+from src.db.extraction_log import get_existing_setters
 from src.db.tagstats import get_most_common_tags_frequency
 
 
@@ -42,6 +42,16 @@ def get_labels(setters=None, confidence_threshold=None):
     return labels_rating, labels_character, labels_general
 
 
+def on_tab_load():
+    conn = get_database_connection(write_lock=False)
+    setters = get_existing_setters(conn)
+    conn.close()
+
+    tag_setters = [s for t, s in setters if t == "tags"]
+
+    return gr.update(choices=tag_setters)
+
+
 def create_toptags_UI():
     with gr.TabItem(label="Tag Frequency") as tab:
         with gr.Column(elem_classes="centered-content", scale=0):
@@ -53,10 +63,7 @@ def create_toptags_UI():
                         label="Only include tags from model(s)",
                         value=[],
                         multiselect=True,
-                        choices=[
-                            (name, name)
-                            for name in models.TagsModel.available_models()
-                        ],
+                        choices=[],
                     )
                     confidence_threshold = gr.Slider(
                         label="Confidence threshold",
@@ -78,4 +85,8 @@ def create_toptags_UI():
         inputs=[include_from_models, confidence_threshold],
         fn=get_labels,
         outputs=[top_tags_rating, top_tags_characters, top_tags_general],
+    )
+    tab.select(
+        fn=on_tab_load,
+        outputs=[include_from_models],
     )
