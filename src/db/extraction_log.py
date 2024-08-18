@@ -147,10 +147,10 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
     cursor.execute(
         """
         SELECT
-            id,
+            data_log.id,
             start_time,
             end_time,
-            COALESCE(COUNT(DISTINCT item_data.item_id), 0) AS distinct_item_count,
+            COALESCE(COUNT(DISTINCT item_data.id), 0) AS distinct_item_count,
             type,
             setter,
             threshold,
@@ -164,9 +164,9 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
             data_load_time,
             inference_time,
             CASE 
-                WHEN job_id IS NULL THEN 1
+                WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
-            END AS failed
+            END AS failed,
             CASE
                 WHEN data_jobs.completed = 1 THEN 1
                 ELSE 0
@@ -177,7 +177,7 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
             AND item_data.job_id IS NOT NULL
         LEFT JOIN data_jobs
             ON data_log.job_id = data_jobs.id
-        GROUP BY id
+        GROUP BY data_log.id
         ORDER BY start_time DESC;
         """
     )

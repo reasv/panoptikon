@@ -75,7 +75,7 @@ def create_job_dataset(samples=[]):
             "Inference Time",
             "Type",
             "Model",
-            "DB Items",
+            "DB Data",
             "Batch Size",
             "Threshold",
             "Image Files",
