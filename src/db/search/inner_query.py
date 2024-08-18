@@ -56,14 +56,18 @@ def build_inner_query(
     negative_tags_condition = (
         f"""
         WHERE files.item_id NOT IN (
-            SELECT tags_items.item_id
+            SELECT item_data.item_id
             FROM tags
-            JOIN tags_items ON tags.id = tags_items.tag_id
-            AND tags.name IN ({','.join(['?']*len(tags.negative))})
-            {tag_namespace_condition}
-            {min_confidence_condition}
-            JOIN setters ON tags_items.setter_id = setters.id
-            {tag_setters_condition}
+            JOIN tags_items
+                ON tags.id = tags_items.tag_id
+                AND tags.name IN ({','.join(['?']*len(tags.negative))})
+                {tag_namespace_condition}
+                {min_confidence_condition}
+            JOIN item_data
+                ON tags_items.item_data_id = item_data.id
+            JOIN setters
+                ON item_data.setter_id = setters.id
+                {tag_setters_condition}
         )
     """
         if tags.negative
@@ -84,7 +88,7 @@ def build_inner_query(
         having_clause = (
             "HAVING COUNT(DISTINCT tags.name) = ?"
             if not tags.all_setters_required
-            else "HAVING COUNT(DISTINCT tags_items.setter_id || '-' || tags.name) = ?"
+            else "HAVING COUNT(DISTINCT tags_item_data.setter_id || '-' || tags.name) = ?"
         )
     else:
         having_clause = ""
@@ -171,14 +175,19 @@ def build_inner_query(
             items.type
             {additional_select_columns}
         FROM tags
-        JOIN tags_items ON tags.id = tags_items.tag_id
-        AND tags.name IN ({','.join(['?']*len(tags.positive))})
-        {min_confidence_condition}
-        {tag_namespace_condition}
-        JOIN setters ON tags_items.setter_id = setters.id
-        {tag_setters_condition}
-        JOIN files ON tags_items.item_id = files.item_id
-        {path_condition}
+        JOIN tags_items 
+            ON tags.id = tags_items.tag_id
+            AND tags.name IN ({','.join(['?']*len(tags.positive))})
+            {min_confidence_condition}
+            {tag_namespace_condition}
+        JOIN item_data AS tags_item_data
+            ON tags_items.item_data_id = tags_item_data.id
+        JOIN setters
+            ON tags_item_data.setter_id = setters.id
+            {tag_setters_condition}
+        JOIN files
+            ON tags_item_data.item_id = files.item_id
+            {path_condition}
         JOIN items ON files.item_id = items.id
         {item_type_condition}
         {path_match_condition}
