@@ -85,7 +85,7 @@ def run_extraction_job(
     data_load_time, inference_time = 0.0, 0.0
     threshold = model_opts.get_group_threshold(conn)
     batch_size = model_opts.get_group_batch_size(conn)
-    log_id = add_data_log(
+    job_id = add_data_log(
         conn,
         scan_time,
         threshold,
@@ -146,7 +146,7 @@ def run_extraction_job(
                 add_item_data(
                     conn,
                     item=item.sha256,
-                    log_id=log_id,
+                    job_id=job_id,
                     setter_id=setter_id,
                     data_type=model_opts.data_type(),
                 )
@@ -173,14 +173,14 @@ def run_extraction_job(
                     add_item_data(
                         conn,
                         item=item.sha256,
-                        log_id=log_id,
+                        job_id=job_id,
                         setter_id=setter_id,
                         source_item_data_id=item_data_id,
                         data_type=model_opts.data_type(),
                     )
 
             if len(inputs) > 0:
-                output_handler(log_id, item, inputs, outputs)
+                output_handler(job_id, item, inputs, outputs)
             else:
                 # Item yielded no data to process, skip and log as processed
                 if transaction_per_item:
@@ -207,7 +207,7 @@ def run_extraction_job(
         )
         update_log(
             conn,
-            log_id,
+            job_id,
             image_files=images,
             video_files=videos,
             other_files=other,
@@ -237,7 +237,7 @@ def run_extraction_job(
         conn.execute("BEGIN TRANSACTION")
     update_log(
         conn,
-        log_id,
+        job_id,
         image_files=images,
         video_files=videos,
         other_files=other,

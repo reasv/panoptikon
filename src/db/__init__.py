@@ -154,18 +154,21 @@ def initialize_database(conn: sqlite3.Connection):
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS tags_items (
-        item_id INTEGER NOT NULL,
+        item_data_id INTEGER NOT NULL,
         tag_id INTEGER NOT NULL,
-        setter_id INTEGER NOT NULL,
-        log_id INTEGER,
-        item_data_id INTEGER,
         confidence REAL DEFAULT 1.0,
-        UNIQUE(item_id, tag_id, setter_id),  -- Unique constraint on item, tag and setter
-        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
-        FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
-        FOREIGN KEY(log_id) REFERENCES data_log(id) ON DELETE CASCADE
-        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE
+        UNIQUE(item_data_id, tag_id),
         FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE
+        FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+    )
+    """
+    )
+
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS data_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        completed BOOLEAN NOT NULL DEFAULT 0,
     )
     """
     )
@@ -174,8 +177,9 @@ def initialize_database(conn: sqlite3.Connection):
         """
     CREATE TABLE IF NOT EXISTS data_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER,                 -- Foreign key to data_jobs table
         start_time TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
-        end_time TEXT DEFAULT NULL,             -- Using TEXT to store ISO-8601 formatted datetime
+        end_time TEXT NOT NULL,                 -- Using TEXT to store ISO-8601 formatted datetime
         type TEXT NOT NULL,
         setter TEXT NOT NULL,
         threshold REAL DEFAULT NULL,
@@ -188,6 +192,7 @@ def initialize_database(conn: sqlite3.Connection):
         total_remaining INTEGER NOT NULL DEFAULT 0,
         data_load_time REAL DEFAULT 0,
         inference_time REAL DEFAULT 0,
+        FOREIGN KEY(job_id) REFERENCES data_jobs(id) ON DELETE SET NULL
     )
     """
     )
@@ -230,18 +235,17 @@ def initialize_database(conn: sqlite3.Connection):
         """
     CREATE TABLE IF NOT EXISTS item_data (
         id INTEGER PRIMARY KEY,
-        item_id INTEGER NOT NULL,
-        log_id INTEGER NOT NULL,
-        setter_id INTEGER NOT NULL,
-        data_type TEXT NOT NULL,                          -- Type of data extracted (e.g. text, image, etc.)
-        source_id INTEGER,                     -- Reference to a previous extraction from which data was further processed
-        is_origin BOOLEAN,                                -- Indicates if the extraction is the original extraction. True if it is, NULL if not
-        UNIQUE(item_id, log_id, is_origin),               -- Origin extractions should be unique per item (and job)
-        UNIQUE(item_id, setter_id, is_origin),            -- Origin extractions should be unique per item (and setter)
-        UNIQUE(item_id, log_id, source_id),    -- Derived extractions should be unique per extraction they are derived from (and job)
-        UNIQUE(item_id, setter_id, source_id), -- Derived extractions should be unique per extraction they are derived from (and setter)
+        item_id INTEGER NOT NULL,         -- Reference to the item that the data is extracted from
+        job_id INTEGER,                   -- Reference to the job that extracted the data
+        setter_id INTEGER NOT NULL,       -- Reference to the setter that extracted the data from the item
+        data_type TEXT NOT NULL,          -- Type of data extracted (e.g. text, image, etc.)
+        idx INTEGER NOT NULL,             -- Index of the data in the item (page number, frame number, etc.)
+        source_id INTEGER,                -- Reference to a previous item_data from which data was further processed
+        is_origin BOOLEAN,                -- Whether the data is from the item directly or derived from other data. True if it is, NULL if not
+        UNIQUE(item_id, setter_id, data_type, idx, is_origin),            -- Origin data should be unique per item, setter, datatype and index
+        UNIQUE(item_id, setter_id, data_type, idx, source_id),            -- Derived extractions should be unique per data they are derived from (and setter, datatype, index)
         FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-        FOREIGN KEY(log_id) REFERENCES data_log(id) ON DELETE CASCADE,
+        FOREIGN KEY(job_id) REFERENCES data_jobs(id) ON DELETE CASCADE,
         FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
         FOREIGN KEY(source_id) REFERENCES item_data(id) ON DELETE CASCADE,
         CHECK ((is_origin = TRUE AND source_id IS NULL) OR (is_origin IS NULL AND source_id IS NOT NULL))
@@ -253,21 +257,11 @@ def initialize_database(conn: sqlite3.Connection):
         """
     CREATE TABLE IF NOT EXISTS extracted_text (
         id INTEGER PRIMARY KEY,
-        item_id INTEGER NOT NULL,
-        log_id INTEGER NOT NULL,
-        item_data_id INTEGER NOT NULL,
-        setter_id INTEGER NOT NULL,
-        idx INTEGER NOT NULL,
         language TEXT,
         language_confidence REAL,
         confidence REAL,
         text TEXT NOT NULL,
-        UNIQUE(item_id, setter_id, idx),
-        UNIQUE(item_id, log_id, idx),
-        FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-        FOREIGN KEY(log_id) REFERENCES data_log(id) ON DELETE CASCADE,
-        FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
-        FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE
+        FOREIGN KEY(id) REFERENCES item_data(id) ON DELETE CASCADE
     )
     """
     )
@@ -376,15 +370,8 @@ def initialize_database(conn: sqlite3.Connection):
         f"""
         CREATE TABLE IF NOT EXISTS image_embeddings (
             id INTEGER PRIMARY KEY,
-            item_id INTEGER NOT NULL,
-            log_id INTEGER NOT NULL,
-            setter_id INTEGER NOT NULL,
-            item_data_id INTEGER NOT NULL,
             embedding float[],
-            FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-            FOREIGN KEY(log_id) REFERENCES data_log(id) ON DELETE CASCADE,
-            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
-            FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE
+            FOREIGN KEY(id) REFERENCES item_data(id) ON DELETE CASCADE
         );
         """
     )
@@ -392,20 +379,8 @@ def initialize_database(conn: sqlite3.Connection):
         f"""
         CREATE TABLE IF NOT EXISTS text_embeddings (
             id INTEGER PRIMARY KEY,
-            item_id INTEGER NOT NULL,
-            log_id INTEGER NOT NULL,
-            item_data_id INTEGER NOT NULL,
-            setter_id INTEGER NOT NULL,
-            text_setter_id INTEGER NOT NULL,
-            text_id INTEGER NOT NULL,
             embedding float[],
-            UNIQUE(setter_id, text_id),
-            FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
-            FOREIGN KEY(log_id) REFERENCES data_log(id) ON DELETE CASCADE,
-            FOREIGN KEY(setter_id) REFERENCES setters(id) ON DELETE CASCADE,
-            FOREIGN KEY(text_id) REFERENCES extracted_text(id) ON DELETE CASCADE,
-            FOREIGN KEY(text_setter_id) REFERENCES setters(id) ON DELETE CASCADE,
-            FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE
+            FOREIGN KEY(id) REFERENCES item_data(id) ON DELETE CASCADE
         );
         """
     )
@@ -505,6 +480,15 @@ def initialize_database(conn: sqlite3.Connection):
         ("data_log", ["setter"]),
         ("data_log", ["type"]),
         ("data_log", ["batch_size"]),
+        ("data_log", ["image_files"]),
+        ("data_log", ["video_files"]),
+        ("data_log", ["other_files"]),
+        ("data_log", ["total_segments"]),
+        ("data_log", ["errors"]),
+        ("data_log", ["total_remaining"]),
+        ("data_log", ["data_load_time"]),
+        ("data_log", ["inference_time"]),
+        ("data_log", ["job_id"]),
         ("folders", ["time_added"]),
         ("folders", ["path"]),
         ("folders", ["included"]),
@@ -514,35 +498,20 @@ def initialize_database(conn: sqlite3.Connection):
         ("user_data.bookmarks", ["namespace"]),
         ("user_data.bookmarks", ["user"]),
         ("item_data", ["item_id"]),
-        ("item_data", ["log_id"]),
+        ("item_data", ["job_id"]),
         ("item_data", ["setter_id"]),
         ("item_data", ["source_id"]),
         ("item_data", ["is_origin"]),
         ("item_data", ["data_type"]),
-        ("item_data", ["item_id", "log_id", "is_origin"]),
-        ("tags_items", ["item_id"]),
         ("tags_items", ["tag_id"]),
+        ("tags_items", ["item_data_id"]),
         ("tags_items", ["confidence"]),
-        ("tags_items", ["setter_id"]),
-        ("tags_items", ["log_id"]),
-        ("tags_items", ["item_id", "tag_id"]),
-        ("tags_items", ["tag_id", "item_id"]),
         ("tags", ["namespace"]),
         ("tags", ["name"]),
         ("tags", ["namespace", "name"]),
-        ("extracted_text", ["item_id"]),
-        ("extracted_text", ["log_id"]),
         ("extracted_text", ["language"]),
         ("extracted_text", ["confidence"]),
-        ("extracted_text", ["setter_id"]),
-        ("image_embeddings", ["item_id"]),
-        ("image_embeddings", ["log_id"]),
-        ("image_embeddings", ["setter_id"]),
-        ("text_embeddings", ["item_id"]),
-        ("text_embeddings", ["log_id"]),
-        ("text_embeddings", ["setter_id"]),
-        ("text_embeddings", ["text_setter_id"]),
-        ("text_embeddings", ["text_id"]),
+        ("extracted_text", ["language_confidence"]),
         ("extraction_rules_setters", ["rule_id"]),
         ("extraction_rules_setters", ["setter_name"]),
         ("setters", ["name"]),
@@ -569,11 +538,6 @@ def initialize_database(conn: sqlite3.Connection):
         ("storage.frames", ["width"]),
         ("storage.frames", ["height"]),
         ("storage.frames", ["version"]),
-        # All item_data_id columns
-        ("tags_items", ["item_data_id"]),
-        ("extracted_text", ["item_data_id"]),
-        ("image_embeddings", ["item_data_id"]),
-        ("text_embeddings", ["item_data_id"]),
     ]
 
     for table, columns in indices:

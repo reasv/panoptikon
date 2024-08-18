@@ -86,7 +86,7 @@ class FileRecord:
 class LogRecord:
     id: int
     start_time: str
-    end_time: str | None
+    end_time: str
     items_in_db: int
     type: str
     setter: str
@@ -100,6 +100,8 @@ class LogRecord:
     total_remaining: int
     data_load_time: float
     inference_time: float
+    failed: bool
+    completed: bool
 
 
 @dataclass

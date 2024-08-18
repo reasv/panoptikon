@@ -28,34 +28,52 @@ def add_data_log(
     batch_size: int,
 ):
     # Remove any incomplete logs before starting a new one
-    remove_incomplete_logs(conn)
+    remove_incomplete_jobs(conn)
     cursor = conn.cursor()
+    cursor.execute(
+        """
+            INSERT INTO data_jobs (completed)
+            VALUES (0)
+        """
+    )
+    # get job id
+    job_id = cursor.lastrowid
+    assert job_id is not None, "No job was inserted"
+
     cursor.execute(
         """
     INSERT INTO data_log (
         start_time,
+        end_time,
         type,
         setter,
         threshold,
-        batch_size
+        batch_size,
+        job_id
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     """,
         (
             scan_time,
+            datetime.now().isoformat(),
             ", ".join(types),
             setter,
             threshold,
             batch_size,
+            job_id,
         ),
     )
-    assert cursor.lastrowid is not None
-    return cursor.lastrowid
+    assert cursor.lastrowid is not None, "No log was inserted"
+    # We refer to the job id instead of the log id
+    # That way, we can delete the job, and rely on foreign key constraints
+    # to delete all associated data, while keeping the log entry
+    # as the log entry has SET NULL constraints on the job_id
+    return job_id
 
 
 def update_log(
     conn: sqlite3.Connection,
-    log_id: int,
+    job_id: int,
     image_files: int,
     video_files: int,
     other_files: int,
@@ -79,10 +97,10 @@ def update_log(
         total_remaining = ?,
         data_load_time = ?,
         inference_time = ?
-        WHERE id = ?
+        WHERE job_id = ?
     """,
         (
-            datetime.now().isoformat() if finished else None,
+            datetime.now().isoformat(),
             image_files,
             video_files,
             other_files,
@@ -91,23 +109,33 @@ def update_log(
             total_remaining,
             data_load_time,
             inference_time,
-            log_id,
+            job_id,
         ),
     )
+    if finished:
+        cursor.execute(
+            """
+            UPDATE data_jobs
+            SET completed = 1
+            WHERE id = ?
+        """,
+            (job_id,),
+        )
 
 
-def remove_incomplete_logs(conn: sqlite3.Connection):
+def remove_incomplete_jobs(conn: sqlite3.Connection):
     """
-    Remove any logs that have a start time but no end time.
+    Remove any jobs that are incomplete.
     This is done to ensure that the database does not contain
-    any incomplete logs. As a result of foreign key constraints,
-    any data extracted for these logs will also be deleted.
+    any incomplete jobs. As a result of foreign key constraints,
+    any data extracted for these jobs will also be deleted.
+    This ensures that jobs are atomic.
     """
     cursor = conn.cursor()
     cursor.execute(
         """
-        DELETE FROM data_log
-        WHERE end_time IS NULL
+        DELETE FROM data_jobs
+        WHERE completed = 0
     """
     )
 
@@ -132,10 +160,21 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
             errors,
             total_remaining,
             data_load_time,
-            inference_time
+            inference_time,
+            CASE 
+                WHEN job_id IS NULL THEN 1
+                ELSE 0
+            END AS failed
+            CASE
+                WHEN data_jobs.completed = 1 THEN 1
+                ELSE 0
+            END AS completed
         FROM data_log
         LEFT JOIN item_data 
-        ON item_data.log_id = data_log.id
+            ON item_data.job_id = data_log.job_id
+            AND item_data.job_id IS NOT NULL
+        LEFT JOIN data_jobs
+            ON data_log.job_id = data_jobs.id
         GROUP BY id
         ORDER BY start_time DESC;
         """
@@ -148,7 +187,7 @@ def add_item_data(
     conn: sqlite3.Connection,
     item: str,
     setter_id: int,
-    log_id: int,
+    job_id: int,
     data_type: str,
     source_item_data_id: int | None = None,
 ):
@@ -162,17 +201,16 @@ def add_item_data(
     cursor.execute(
         """
     INSERT INTO item_data
-    (item_id, log_id, setter_id, data_type, is_origin, source_id)
+    (item_id, job_id, setter_id, data_type, is_origin, source_id)
     SELECT ?, ?, ?, ?, ?, ?
     """,
         (
             item_id,
-            log_id,
+            job_id,
             setter_id,
             data_type,
             is_origin,
             source_item_data_id,
-            log_id,
         ),
     )
     # Return the ID of the new extraction

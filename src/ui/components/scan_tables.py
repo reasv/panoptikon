@@ -148,16 +148,20 @@ def fetch_extraction_logs():
             t.id,
             pretty_print_isodate(t.start_time),
             (
-                pretty_print_isodate(t.end_time)
-                if t.end_time
-                else "ETA: "
-                + estimate_eta(
-                    t.start_time,
-                    items_processed=(
-                        t.video_files + t.image_files + t.other_files
-                    ),
-                    remaining_items=t.total_remaining,
+                (
+                    pretty_print_isodate(t.end_time)
+                    if t.completed
+                    else "ETA: "
+                    + estimate_eta(
+                        t.start_time,
+                        items_processed=(
+                            t.video_files + t.image_files + t.other_files
+                        ),
+                        remaining_items=t.total_remaining,
+                    )
                 )
+                if not t.failed
+                else "(Failed) " + pretty_print_isodate(t.end_time)
             ),
             (
                 isodate_minutes_diff(t.end_time, t.start_time)
