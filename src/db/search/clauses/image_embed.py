@@ -22,5 +22,5 @@ def build_image_embedding_clause(args: ImageEmbeddingFilter | None):
         JOIN embeddings AS image_embeddings
             ON image_embeddings.id = clip_data.id
     """
-    add_column = ",\n MIN(vec_distance_L2(image_embeddings.embedding, ?)) AS image_vec_distance"
+    add_column = ",\n MIN(vec_distance_cosine(vec_normalize(image_embeddings.embedding), vec_normalize(?))) AS image_vec_distance"
     return subclause, params, add_column
