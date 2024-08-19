@@ -4,13 +4,9 @@ from typing import List, Sequence, Union
 from PIL import Image as PILImage
 from PIL import ImageFile
 
-from panoptikon.inferio.impl.utils import (
-    clear_cache,
-    get_device,
-    serialize_array,
-)
-from panoptikon.inferio.model import InferenceModel
-from panoptikon.inferio.types import PredictionInput
+from inferio.impl.utils import clear_cache, get_device, serialize_array
+from inferio.model import InferenceModel
+from inferio.types import PredictionInput
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 

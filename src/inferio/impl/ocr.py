@@ -5,9 +5,9 @@ from typing import List, Sequence
 import numpy as np
 from PIL import Image as PILImage
 
-from panoptikon.inferio.impl.utils import clear_cache, get_device
-from panoptikon.inferio.model import InferenceModel
-from panoptikon.inferio.types import PredictionInput
+from inferio.impl.utils import clear_cache, get_device
+from inferio.model import InferenceModel
+from inferio.types import PredictionInput
 
 
 class DoctrModel(InferenceModel):

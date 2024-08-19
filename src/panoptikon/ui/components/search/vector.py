@@ -5,13 +5,13 @@ import gradio as gr
 import numpy as np
 import PIL.Image
 
+from inferio.impl.utils import deserialize_array
 from panoptikon.db.search.types import (
     ExtractedTextEmbeddingsFilter,
     ImageEmbeddingFilter,
     SearchQuery,
 )
 from panoptikon.db.utils import serialize_f32
-from panoptikon.inferio.impl.utils import deserialize_array
 from panoptikon.types import SearchStats
 from panoptikon.ui.components.search.utils import AnyComponent
 

@@ -4,10 +4,10 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
+from inferio.impl.utils import clear_cache, get_device
+from inferio.model import InferenceModel
+from inferio.types import PredictionInput
 from panoptikon.data_extractors.data_handlers.utils import deserialize_array
-from panoptikon.inferio.impl.utils import clear_cache, get_device
-from panoptikon.inferio.model import InferenceModel
-from panoptikon.inferio.types import PredictionInput
 
 
 class FasterWhisperModel(InferenceModel):

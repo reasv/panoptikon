@@ -7,15 +7,15 @@ import pandas as pd
 from PIL import Image
 from PIL import Image as PILImage
 
-from panoptikon.inferio.impl.utils import (
+from inferio.impl.utils import (
     clear_cache,
     get_device,
     mcut_threshold,
     pil_ensure_rgb,
     pil_pad_square,
 )
-from panoptikon.inferio.model import InferenceModel
-from panoptikon.inferio.types import PredictionInput
+from inferio.model import InferenceModel
+from inferio.types import PredictionInput
 
 LABEL_FILENAME = "selected_tags.csv"
 

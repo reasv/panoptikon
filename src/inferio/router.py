@@ -4,16 +4,14 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi_utilities.repeat.repeat_every import repeat_every
 
-from panoptikon.inferio.impl.clip import ClipModel
-from panoptikon.inferio.impl.ocr import DoctrModel
-from panoptikon.inferio.impl.sentence_transformers import (
-    SentenceTransformersModel,
-)
-from panoptikon.inferio.impl.wd_tagger import WDTagger
-from panoptikon.inferio.impl.whisper import FasterWhisperModel
-from panoptikon.inferio.manager import InferenceModel, ModelManager
-from panoptikon.inferio.registry import ModelRegistry
-from panoptikon.inferio.utils import encode_output_response, parse_input_request
+from inferio.impl.clip import ClipModel
+from inferio.impl.ocr import DoctrModel
+from inferio.impl.sentence_transformers import SentenceTransformersModel
+from inferio.impl.wd_tagger import WDTagger
+from inferio.impl.whisper import FasterWhisperModel
+from inferio.manager import InferenceModel, ModelManager
+from inferio.registry import ModelRegistry
+from inferio.utils import encode_output_response, parse_input_request
 
 logger = logging.getLogger(__name__)
 

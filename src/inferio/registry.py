@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Type
 
 import tomlkit
 
-from panoptikon.inferio.model import InferenceModel
+from inferio.model import InferenceModel
 
 logger = logging.getLogger(__name__)
 

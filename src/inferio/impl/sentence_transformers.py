@@ -1,13 +1,9 @@
 import logging
 from typing import Dict, List, Sequence
 
-from panoptikon.inferio.impl.utils import (
-    clear_cache,
-    get_device,
-    serialize_array,
-)
-from panoptikon.inferio.model import InferenceModel
-from panoptikon.inferio.types import PredictionInput
+from inferio.impl.utils import clear_cache, get_device, serialize_array
+from inferio.model import InferenceModel
+from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
 

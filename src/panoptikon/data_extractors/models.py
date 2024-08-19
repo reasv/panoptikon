@@ -8,6 +8,7 @@ import numpy as np
 import PIL.Image
 
 import panoptikon.data_extractors.extraction_jobs.types as job_types
+from inferio.impl.utils import serialize_array
 from panoptikon.db.group_settings import (
     retrieve_model_group_settings,
     save_model_group_settings,
@@ -20,8 +21,6 @@ from panoptikon.db.rules.types import (
 )
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
-from panoptikon.inferio.client import api_client
-from panoptikon.inferio.impl.utils import serialize_array
 from panoptikon.types import OutputDataType, TargetEntityType
 
 logger = logging.getLogger(__name__)
@@ -712,7 +711,7 @@ class ModelOptsFactory:
 
 
 def get_inference_api_client():
-    from panoptikon.inferio.client import InferenceAPIClient
+    from inferio.client import InferenceAPIClient
 
     if url := os.getenv("INFERENCE_API_URL"):
         return InferenceAPIClient(url)

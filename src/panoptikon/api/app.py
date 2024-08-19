@@ -15,7 +15,7 @@ from fastapi.responses import (
 from fastapi.templating import Jinja2Templates
 from fastapi_utilities.repeat.repeat_at import repeat_at
 
-from panoptikon import inferio
+import inferio
 from panoptikon.api.job import try_cronjob
 from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_bookmarks

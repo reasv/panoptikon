@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 from fastapi import HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from panoptikon.inferio.types import PredictionInput
+from inferio.types import PredictionInput
 
 
 def extract_index_from_content_disposition(header: str) -> Optional[int]:
