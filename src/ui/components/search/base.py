@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Tuple
 
 import gradio as gr
 
@@ -13,7 +13,10 @@ def create_basic_search_opts(
     query_state: gr.State,
 ):
     elements: List[AnyComponent] = []
-    default_order_by_choices: List[OrderByType] = ["last_modified", "path"]
+    default_order_by_choices: List[Tuple[str, OrderByType]] = [
+        ("File Time", "last_modified"),
+        ("File Path", "path"),
+    ]
     with gr.Tab(label="Options"):
         with gr.Group():
             with gr.Row():
@@ -111,30 +114,32 @@ def create_basic_search_opts(
 
     def on_query_change(query_state_dict: dict, order_by_current: str):
         query = from_dict(SearchQuery, query_state_dict)
-        order_by_opts: List[OrderByType] = [x for x in default_order_by_choices]
+        order_by_opts: List[Tuple[str, OrderByType]] = [
+            x for x in default_order_by_choices
+        ]
         vec = False
         if query.query.filters.any_text:
-            order_by_opts.append("rank_any_text")
+            order_by_opts.append(("Text Search Match", "rank_any_text"))
         if query.query.filters.extracted_text:
-            order_by_opts.append("rank_fts")
+            order_by_opts.append(("Extracted Text Match", "rank_fts"))
         if query.query.filters.bookmarks:
-            order_by_opts.append("time_added")
+            order_by_opts.append(("Time Bookmarked", "time_added"))
         if query.query.filters.path:
-            order_by_opts.append("rank_path_fts")
+            order_by_opts.append(("Path Text Match", "rank_path_fts"))
         if query.query.filters.extracted_text_embeddings:
-            order_by_opts = ["text_vec_distance"]
+            order_by_opts = [("Text Semantic Match", "text_vec_distance")]
             vec = True
         if query.query.filters.image_embeddings:
-            order_by_opts = ["image_vec_distance"]
+            order_by_opts = [("CLIP Semantic Match", "image_vec_distance")]
             vec = True
 
         order_by_update = gr.update(choices=order_by_opts)
         if vec:
-            query.order_args.order_by = order_by_opts[0]
+            query.order_args.order_by = order_by_opts[0][1]
 
-        if order_by_current not in order_by_opts:
+        if order_by_current not in [value for _, value in order_by_opts]:
             order_by_update = gr.update(
-                choices=order_by_opts, value=order_by_opts[0]
+                choices=order_by_opts, value=order_by_opts[0][1]
             )
 
         return {
