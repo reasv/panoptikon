@@ -157,19 +157,6 @@ def upgrade() -> None:
 
     op.execute(
         """
-    CREATE TABLE IF NOT EXISTS user_data.bookmarks (
-        user TEXT NOT NULL, -- User who created the bookmark
-        namespace TEXT NOT NULL, -- Namespace for the bookmark
-        sha256 TEXT NOT NULL, -- SHA256 of the item
-        time_added TEXT NOT NULL, -- Using TEXT to store ISO-8601 formatted datetime
-        metadata TEXT, -- JSON string to store additional metadata
-        PRIMARY KEY(user, namespace, sha256)
-    )
-    """
-    )
-
-    op.execute(
-        """
     CREATE TABLE IF NOT EXISTS item_data (
         id INTEGER PRIMARY KEY,
         item_id INTEGER NOT NULL,         -- Reference to the item that the data is extracted from
@@ -336,38 +323,6 @@ def upgrade() -> None:
         """
     )
 
-    op.execute(
-        f"""
-            CREATE TABLE IF NOT EXISTS storage.thumbnails (
-                id INTEGER PRIMARY KEY,
-                item_sha256 TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                item_mime_type TEXT NOT NULL,        -- MIME type of the source file
-                width INTEGER NOT NULL,              -- Width of the thumbnail in pixels
-                height INTEGER NOT NULL,             -- Height of the thumbnail in pixels
-                version INTEGER NOT NULL,            -- Version of the thumbnail creation process
-                thumbnail BLOB NOT NULL,             -- The thumbnail image data (stored as a BLOB)
-                UNIQUE(item_sha256, idx)
-            );
-        """
-    )
-
-    op.execute(
-        f"""
-            CREATE TABLE IF NOT EXISTS storage.frames (
-                id INTEGER PRIMARY KEY,
-                item_sha256 TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                item_mime_type TEXT NOT NULL,        -- MIME type of the source file
-                width INTEGER NOT NULL,              -- Width of the frame in pixels
-                height INTEGER NOT NULL,             -- Height of the frame in pixels
-                version INTEGER NOT NULL,            -- Version of the frame extraction process
-                frame BLOB NOT NULL,                 -- The extracted frame image data (stored as a BLOB)
-                UNIQUE(item_sha256, idx)
-            );
-        """
-    )
-
     # Create indexes
     # Tuples are table name, followed by a list of columns
     indices = [
@@ -403,11 +358,6 @@ def upgrade() -> None:
         ("folders", ["time_added"]),
         ("folders", ["path"]),
         ("folders", ["included"]),
-        ("user_data.bookmarks", ["time_added"]),
-        ("user_data.bookmarks", ["sha256"]),
-        ("user_data.bookmarks", ["metadata"]),
-        ("user_data.bookmarks", ["namespace"]),
-        ("user_data.bookmarks", ["user"]),
         ("item_data", ["item_id"]),
         ("item_data", ["job_id"]),
         ("item_data", ["setter_id"]),
@@ -439,18 +389,6 @@ def upgrade() -> None:
         ("model_group_settings", ["name"]),
         ("model_group_settings", ["batch_size"]),
         ("model_group_settings", ["threshold"]),
-        ("storage.thumbnails", ["item_sha256"]),
-        ("storage.thumbnails", ["idx"]),
-        ("storage.thumbnails", ["item_mime_type"]),
-        ("storage.thumbnails", ["width"]),
-        ("storage.thumbnails", ["height"]),
-        ("storage.thumbnails", ["version"]),
-        ("storage.frames", ["item_sha256"]),
-        ("storage.frames", ["idx"]),
-        ("storage.frames", ["item_mime_type"]),
-        ("storage.frames", ["width"]),
-        ("storage.frames", ["height"]),
-        ("storage.frames", ["version"]),
     ]
 
     for table, columns in indices:

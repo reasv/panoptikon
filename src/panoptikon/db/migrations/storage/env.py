@@ -15,11 +15,11 @@ def run_migrations_online():
     logger.info("Migrations are running in 'online' mode")
 
     db_file, user_db_file, storage_db_file = get_db_paths()
-    index_db_url = f"sqlite:///{db_file}"
+    # index_db_url = f"sqlite:///{db_file}"
     # user_data_db_url = f"sqlite:///{user_db_file}"
-    # storage_db_url = f"sqlite:///{storage_db_file}"
+    storage_db_url = f"sqlite:///{storage_db_file}"
     # Create SQLAlchemy engines for the databases
-    index_engine = create_engine(index_db_url)
+    index_engine = create_engine(storage_db_url)
 
     # Get a connection from the main database engine
     with index_engine.connect() as connection:
