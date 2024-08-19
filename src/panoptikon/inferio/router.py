@@ -4,19 +4,16 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi_utilities.repeat.repeat_every import repeat_every
 
-from panoptikon.inference.impl.clip import ClipModel
-from panoptikon.inference.impl.ocr import DoctrModel
-from panoptikon.inference.impl.sentence_transformers import (
+from panoptikon.inferio.impl.clip import ClipModel
+from panoptikon.inferio.impl.ocr import DoctrModel
+from panoptikon.inferio.impl.sentence_transformers import (
     SentenceTransformersModel,
 )
-from panoptikon.inference.impl.wd_tagger import WDTagger
-from panoptikon.inference.impl.whisper import FasterWhisperModel
-from panoptikon.inference.manager import InferenceModel, ModelManager
-from panoptikon.inference.registry import ModelRegistry
-from panoptikon.inference.utils import (
-    encode_output_response,
-    parse_input_request,
-)
+from panoptikon.inferio.impl.wd_tagger import WDTagger
+from panoptikon.inferio.impl.whisper import FasterWhisperModel
+from panoptikon.inferio.manager import InferenceModel, ModelManager
+from panoptikon.inferio.registry import ModelRegistry
+from panoptikon.inferio.utils import encode_output_response, parse_input_request
 
 logger = logging.getLogger(__name__)
 

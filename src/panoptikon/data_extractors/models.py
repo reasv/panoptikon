@@ -20,8 +20,8 @@ from panoptikon.db.rules.types import (
 )
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
-from panoptikon.inference.client import api_client
-from panoptikon.inference.impl.utils import serialize_array
+from panoptikon.inferio.client import api_client
+from panoptikon.inferio.impl.utils import serialize_array
 from panoptikon.types import OutputDataType, TargetEntityType
 
 logger = logging.getLogger(__name__)
@@ -712,7 +712,7 @@ class ModelOptsFactory:
 
 
 def get_inference_api_client():
-    from panoptikon.inference.client import InferenceAPIClient
+    from panoptikon.inferio.client import InferenceAPIClient
 
     if url := os.getenv("INFERENCE_API_URL"):
         return InferenceAPIClient(url)

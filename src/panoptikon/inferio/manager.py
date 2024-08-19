@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Set
 
-from panoptikon.inference.model import InferenceModel
-from panoptikon.inference.registry import ModelRegistry
+from panoptikon.inferio.model import InferenceModel
+from panoptikon.inferio.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
 

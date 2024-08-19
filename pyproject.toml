@@ -28,6 +28,9 @@ fastapi-utilities = "^0.2.0"
 mutagen = "^1.47.0"
 toml = "^0.10.2"
 
+[tool.poetry.scripts]
+panoptikon = "panoptikon.__main__:launch_app"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

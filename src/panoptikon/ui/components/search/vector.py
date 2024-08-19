@@ -11,7 +11,7 @@ from panoptikon.db.search.types import (
     SearchQuery,
 )
 from panoptikon.db.utils import serialize_f32
-from panoptikon.inference.impl.utils import deserialize_array
+from panoptikon.inferio.impl.utils import deserialize_array
 from panoptikon.types import SearchStats
 from panoptikon.ui.components.search.utils import AnyComponent
 

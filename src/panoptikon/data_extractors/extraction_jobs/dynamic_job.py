@@ -18,7 +18,7 @@ from panoptikon.data_extractors.extraction_jobs.extraction_job import (
 )
 from panoptikon.data_extractors.models import ModelGroup
 from panoptikon.db.extracted_text import get_text_by_ids
-from panoptikon.inference.impl.utils import serialize_array
+from panoptikon.inferio.impl.utils import serialize_array
 from panoptikon.types import ItemData
 
 logger = logging.getLogger(__name__)

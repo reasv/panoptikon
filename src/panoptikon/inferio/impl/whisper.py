@@ -5,9 +5,9 @@ from typing import Iterable, List, Sequence, Tuple
 import numpy as np
 
 from panoptikon.data_extractors.data_handlers.utils import deserialize_array
-from panoptikon.inference.impl.utils import clear_cache, get_device
-from panoptikon.inference.model import InferenceModel
-from panoptikon.inference.types import PredictionInput
+from panoptikon.inferio.impl.utils import clear_cache, get_device
+from panoptikon.inferio.model import InferenceModel
+from panoptikon.inferio.types import PredictionInput
 
 
 class FasterWhisperModel(InferenceModel):

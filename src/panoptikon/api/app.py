@@ -15,7 +15,7 @@ from fastapi.responses import (
 from fastapi.templating import Jinja2Templates
 from fastapi_utilities.repeat.repeat_at import repeat_at
 
-from panoptikon import inference
+from panoptikon import inferio
 from panoptikon.api.job import try_cronjob
 from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_bookmarks
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cronjob()
-    inference.check_ttl()
+    inferio.check_ttl()
     yield
 
 
@@ -55,7 +55,7 @@ def cronjob():
 app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
-app.include_router(inference.router)
+app.include_router(inferio.router)
 
 
 def get_all_bookmarks_in_folder(
