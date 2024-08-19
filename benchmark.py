@@ -2,8 +2,8 @@ import random
 from time import time
 from typing import List, Tuple
 
-import src.data_extractors.models as models
-from src.db import (
+import panoptikon.data_extractors.models as models
+from panoptikon.db import (
     get_database_connection,
     get_folders_from_database,
     get_most_common_tags,
