@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from panoptikon.data_extractors.ai.wd_tagger import mcut_threshold
 from panoptikon.data_extractors.extraction_jobs.types import TagResult
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
