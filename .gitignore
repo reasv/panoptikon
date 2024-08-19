@@ -166,6 +166,11 @@ scripts/
 
 .DS_Store
 data/
-cudnn/
 *.woff
 static/
+
+# Ignore everything in the folder
+/cudnn/*
+
+# But don't ignore the .gitpreserve file
+!/cudnn/.gitpreserve
