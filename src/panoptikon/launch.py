@@ -6,11 +6,7 @@ import uvicorn
 from gradio.routes import mount_gradio_app
 
 from panoptikon.api.app import app
-from panoptikon.db import (
-    get_database_connection,
-    initialize_database,
-    run_migrations,
-)
+from panoptikon.db import get_database_connection, run_migrations
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.log import setup_logging
 from panoptikon.utils import add_cudnn_to_path
