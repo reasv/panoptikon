@@ -12,9 +12,6 @@ def read_pdf(
 ) -> List[np.ndarray]:
     """Read a PDF file and convert it into an image in numpy format
 
-    >>> from doctr.io import read_pdf
-    >>> doc = read_pdf("path/to/your/doc.pdf")
-
     Args:
     ----
         file: the path to the PDF file

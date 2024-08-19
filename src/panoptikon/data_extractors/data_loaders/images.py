@@ -43,69 +43,6 @@ def gif_to_frames(path: str) -> List[PILImage.Image]:
     return frames
 
 
-def item_image_loader_numpy(
-    conn: sqlite3.Connection, item: ItemWithPath
-) -> List[np.ndarray]:
-    if item.type.startswith("image/gif"):
-        return [
-            np.array(pil_ensure_rgb(frame))
-            for frame in gif_to_frames(item.path)
-        ]
-    if item.type.startswith("image"):
-        return [np.array(pil_ensure_rgb(PILImage.open(item.path)))]
-    if item.type.startswith("video"):
-        if frames := get_frames(conn, item.sha256):
-            logger.debug(f"Loaded {len(frames)} frames from database")
-        else:
-            frames = video_to_frames(item.path, num_frames=4)
-            store_frames(
-                conn,
-                item.sha256,
-                file_mime_type=item.type,
-                process_version=1,
-                frames=frames,
-            )
-        return [np.array(pil_ensure_rgb(frame)) for frame in frames]
-    if item.type.startswith("application/pdf"):
-        return read_pdf(item.path)
-    if item.type.startswith("text/html"):
-        from doctr.io.html import read_html
-
-        return read_pdf(read_html(item.path))
-    return []
-
-
-def item_image_loader_pillow(
-    conn: sqlite3.Connection, item: ItemWithPath
-) -> List[PILImage.Image]:
-    if item.type.startswith("image/gif"):
-        return [frame for frame in gif_to_frames(item.path)]
-    if item.type.startswith("image"):
-        return [PILImage.open(item.path)]
-    if item.type.startswith("video"):
-        if frames := get_frames(conn, item.sha256):
-            logger.debug(f"Loaded {len(frames)} frames from database")
-        else:
-            frames = video_to_frames(item.path, num_frames=4)
-            store_frames(
-                conn,
-                item.sha256,
-                file_mime_type=item.type,
-                process_version=1,
-                frames=frames,
-            )
-        return [frame for frame in frames]
-    if item.type.startswith("application/pdf"):
-        return [PILImage.fromarray(page) for page in read_pdf(item.path)]
-    if item.type.startswith("text/html"):
-        from doctr.io.html import read_html
-
-        return [
-            PILImage.fromarray(page) for page in read_pdf(read_html(item.path))
-        ]
-    return []
-
-
 def image_loader(conn: sqlite3.Connection, item: ItemData) -> Sequence[bytes]:
     if item.type.startswith("image/gif"):
         return [
@@ -154,10 +91,7 @@ def read_html(url: str, **kwargs: Any) -> bytes | None:
     from weasyprint import HTML
 
     """Read a PDF file and convert it into an image in numpy format
-
-    >>> from doctr.io import read_html
-    >>> doc = read_html("https://www.yoursite.com")
-
+    
     Args:
     ----
         url: URL of the target web page

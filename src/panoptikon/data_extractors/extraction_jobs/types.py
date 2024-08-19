@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple
 
-from panoptikon.db import tags
 from panoptikon.types import ItemData
 
 
