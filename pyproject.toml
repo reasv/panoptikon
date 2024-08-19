@@ -26,6 +26,7 @@ mutagen = "^1.47.0"
 toml = "^0.10.2"
 weasyprint = "^62.3"
 pypdfium2 = "^4.30.0"
+alembic = "^1.13.2"
 
 [tool.poetry.group.inference]
 optional = true
