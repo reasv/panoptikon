@@ -168,101 +168,6 @@ class ModelOpts(ABC):
     def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
 
-
-class ModelOptsFactory:
-    _group_metadata = {}
-    _api_models: Dict[str, Type["ModelGroup"]] = {}
-
-    @classmethod
-    def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
-        api_modelopts = []
-        try:
-            cls.refetch_metadata()
-            api_modelopts = cls.get_api_model_opts()
-        except Exception as e:
-            logger.error(f"Failed to load API model opts: {e}", exc_info=True)
-        return [
-            # TagsModel,
-            # OCRModel,
-            # WhisperSTTModel,
-            # ImageEmbeddingModel,
-            # TextEmbeddingModel,
-        ] + api_modelopts
-
-    @classmethod
-    def get_api_model_opts(cls) -> List[Type[ModelOpts]]:
-        for group_name, _ in cls.get_metadata().items():
-            if group_name in cls._api_models:
-                continue
-            cls._api_models[group_name] = type(
-                f"Group_{group_name}",
-                (ModelGroup,),
-                {"_group": group_name},
-            )
-        return list(cls._api_models.values())
-
-    @classmethod
-    def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:
-        for model_opts in cls.get_all_model_opts():
-            if model_opts.valid_model(setter_name):
-                return model_opts
-        raise ValueError(f"Invalid model name {setter_name}")
-
-    @classmethod
-    def get_model(cls, setter_name: str) -> ModelOpts:
-        s = setter_name.split("/", 1)
-        if len(s) == 2:
-            group_name, inference_id = s
-        else:
-            group_name, inference_id = None, None
-        if group_name in cls._api_models:
-            return cls._api_models[group_name](model_name=inference_id)
-        model_opts = cls.get_model_opts(setter_name)
-        return model_opts(setter_name)
-
-    @classmethod
-    def get_metadata(cls) -> Dict[str, Any]:
-        if not cls._group_metadata:
-            cls._group_metadata = get_inference_api_client().get_metadata()
-        return cls._group_metadata
-
-    @classmethod
-    def get_group_metadata(cls, group_name) -> Dict[str, Any]:
-        return cls.get_metadata()[group_name]["group_metadata"]
-
-    @classmethod
-    def get_inference_id_metadata(
-        cls, group_name, inference_id
-    ) -> Dict[str, Any]:
-        group_metadata = cls.get_group_metadata(group_name)
-        item_meta: Dict[str, Any] = cls.get_metadata()[group_name][
-            "inference_ids"
-        ][inference_id]
-        return {
-            **group_metadata,
-            **item_meta,
-        }
-
-    @classmethod
-    def get_group_models(cls, group_name) -> Dict[str, Any]:
-        return cls.get_metadata()[group_name]["inference_ids"]
-
-    @classmethod
-    def refetch_metadata(cls):
-        cls._group_metadata = get_inference_api_client().get_metadata()
-
-
-def get_inference_api_client():
-    from inferio.client import InferenceAPIClient
-    if not os.getenv("INFERENCE_API_URL"):
-        hostname = os.getenv("HOST", "127.0.0.1")
-        port = int(os.getenv("PORT", 6342))
-        os.environ["INFERENCE_API_URL"] = (
-            f"http://{hostname}:{port}"
-        )
-    return InferenceAPIClient(f"{os.environ['INFERENCE_API_URL']}/api/inference")
-
-
 class ModelGroup(ModelOpts):
     _group: str
 
@@ -372,3 +277,96 @@ class ModelGroup(ModelOpts):
             self.setter_name(), cache_key, lru_size, ttl_seconds, inputs
         )
         return result
+
+class ModelOptsFactory:
+    _group_metadata = {}
+    _api_models: Dict[str, Type["ModelGroup"]] = {}
+
+    @classmethod
+    def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
+        api_modelopts = []
+        try:
+            cls.refetch_metadata()
+            api_modelopts = cls.get_api_model_opts()
+        except Exception as e:
+            logger.error(f"Failed to load API model opts: {e}", exc_info=True)
+        return [
+            # TagsModel,
+            # OCRModel,
+            # WhisperSTTModel,
+            # ImageEmbeddingModel,
+            # TextEmbeddingModel,
+        ] + api_modelopts
+
+    @classmethod
+    def get_api_model_opts(cls) -> List[Type[ModelOpts]]:
+        for group_name, _ in cls.get_metadata().items():
+            if group_name in cls._api_models:
+                continue
+            cls._api_models[group_name] = type(
+                f"Group_{group_name}",
+                (ModelGroup,),
+                {"_group": group_name},
+            )
+        return list(cls._api_models.values())
+
+    @classmethod
+    def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:
+        for model_opts in cls.get_all_model_opts():
+            if model_opts.valid_model(setter_name):
+                return model_opts
+        raise ValueError(f"Invalid model name {setter_name}")
+
+    @classmethod
+    def get_model(cls, setter_name: str) -> ModelOpts:
+        s = setter_name.split("/", 1)
+        if len(s) == 2:
+            group_name, inference_id = s
+        else:
+            group_name, inference_id = None, None
+        if group_name in cls._api_models:
+            return cls._api_models[group_name](model_name=inference_id)
+        model_opts = cls.get_model_opts(setter_name)
+        return model_opts(setter_name)
+
+    @classmethod
+    def get_metadata(cls) -> Dict[str, Any]:
+        if not cls._group_metadata:
+            cls._group_metadata = get_inference_api_client().get_metadata()
+        return cls._group_metadata
+
+    @classmethod
+    def get_group_metadata(cls, group_name) -> Dict[str, Any]:
+        return cls.get_metadata()[group_name]["group_metadata"]
+
+    @classmethod
+    def get_inference_id_metadata(
+        cls, group_name, inference_id
+    ) -> Dict[str, Any]:
+        group_metadata = cls.get_group_metadata(group_name)
+        item_meta: Dict[str, Any] = cls.get_metadata()[group_name][
+            "inference_ids"
+        ][inference_id]
+        return {
+            **group_metadata,
+            **item_meta,
+        }
+
+    @classmethod
+    def get_group_models(cls, group_name) -> Dict[str, Any]:
+        return cls.get_metadata()[group_name]["inference_ids"]
+
+    @classmethod
+    def refetch_metadata(cls):
+        cls._group_metadata = get_inference_api_client().get_metadata()
+
+
+def get_inference_api_client():
+    from inferio.client import InferenceAPIClient
+    if not os.getenv("INFERENCE_API_URL"):
+        hostname = os.getenv("HOST", "127.0.0.1")
+        port = int(os.getenv("PORT", 6342))
+        os.environ["INFERENCE_API_URL"] = (
+            f"http://{hostname}:{port}"
+        )
+    return InferenceAPIClient(f"{os.environ['INFERENCE_API_URL']}/api/inference")
