@@ -20,6 +20,7 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 poetry install --with inference
 ```
 To install the full system including the inference server dependencies.
+If you're running the inference server on a different machine, you can omit the `--with inference` flag, and set the `INFERENCE_API_URL` environment variable to point to the URL of the inference server (see below).
 ### CUDA on Windows
 If you're on windows and want CUDA GPU acceleration, you have to uninstall the default pytorch and install the correct version after running `poetry install`:
 ```
@@ -69,4 +70,71 @@ Without any other search criteria, this is effectively just another way to brows
 ## Adding more models
 See `config/inference/example.toml` for examples on how to add custom models from Hugging Face to Panoptikon.
 
+## Environment variables and config
+Aside from the inference config, which uses TOML, and the configuration saved in the SQLite database, which can be modified through the UI, Panoptikon accepts environment variables as config options.
+Panoptikon uses dotenv, so you can create a file called `.env` in this directory with all the environment variables and their values and it will be automatically applied at runtime.
 
+### HOST and PORT
+Default:
+```
+HOST="127.0.0.1"
+PORT="6342"
+```
+These determine where to bind the Panoptikon server which delivers both the inference API and the search and configuration UI.
+### INFERIO_HOST, INFERIO_PORT
+Default
+```
+INFERIO_HOST="127.0.0.1"
+INFERIO_PORT="7777"
+```
+These **ONLY** apply when the inference server (inferio) is run separately as standalone without Panoptikon.
+These determine where to bind the inference server which runs the models.
+To run the inference server separately, you can run `poetry run inferio`.
+### INFERENCE_API_URL
+Default: Not set.
+
+If you're running the inference server separately, you can point this to the URL of the inference server to allow Panoptikon to use it.
+
+By default, a Panoptikon instance will run its own inference server, which also means that you can point INFERENCE_API_URL to another Panoptikon instance to leverage its inference server.
+For example, you might have a full Panoptikon instance running on your desktop or workstation, and another instance running on your laptop without a GPU, and you can point the laptop instance to the desktop instance's inference server to leverage the GPU.
+Simply configure the desktop instance to run the inference server on an IP reachable from the laptop, and set INFERENCE_API_URL to the URL of the desktop instance's inference server, for example `http://192.168.1.16:6342`. Don't add a trailing slash.
+
+### DATA_FOLDER
+Default:
+```
+DATA_FOLDER="data"
+```
+Where to store the databases and logs. Defaults to "data" inside the current directory.
+### LOGLEVEL
+Default
+```
+LOGLEVEL="INFO"
+```
+The loglevel for the logger. You can find the log files under `[DATA_FOLDER]/logs`
+
+### INDEX_DB, USER_DATA_DB, STORAGE_DB
+
+Default:
+```
+INDEX_DB="default"
+STORAGE_DB=[Automatically set to the same value as INDEX_DB]
+USER_DATA_DB="default"
+```
+These are the names of the SQLite databases used by Panoptikon. You can set them to different values to have multiple independent Panoptikon instances running on the same machine, or to have different dataesets or configurations.
+The actual databases are stored under `[DATA_FOLDER]`.
+
+INDEX_DB is used to store the index data, such as file hashes and paths, and the extracted data from the models, as well as the related configuration such as which paths to index, excluded paths, cronjob settings, rule settings, etc.
+STORAGE_DB is used to store thumbnails. If you set INDEX_DB to a different value, STORAGE_DB will be set to the same value by default, so there is no need to manually specify a different name for STORAGE_DB.
+
+The USER_DATA_DB is used to store user-specific data such as bookmarks. You can use the same USER_DATA_DB for multiple INDEX_DBs if you want to share bookmarks between them. In fact, this is what you're intended to do. There's no need to have separate sets of bookmarks for different datasets. Keep a single USER_DATA_DB and set INDEX_DB to different values to separate your indexed files.
+However, only bookmarks related to files that are indexed in the current INDEX_DB will be shown in the UI. If a file is bookmarked and not present in the current INDEX_DB, it will not be shown in the bookmarks tab, nor will it be findable by search but it's still present in the USER_DATA_DB, so if you switch back to the INDEX_DB where the file is indexed, you will see the bookmark again.
+Bookmarks are by hash, not by path, so if the same file is indexed in multiple INDEX_DBs, it will have the same bookmark in all of them.
+
+You should not run multiple Panoptikon instances with the same INDEX_DB at the same time, as they will try to write to the same database file and will simply fail.
+The USER_DATA_DB can be shared between two running Panoptikon instances, but if you were setting a bookmark on both at the same time, as unlikely as that is, one of the two actions would error out.
+
+### TEMP_DIR
+```
+TEMP_DIR="./data/tmp"
+```
+Where to store temporary files. Defaults to `./data/tmp`. These files are generally short-lived and are cleaned up automatically, but if you're running out of space on `./data/tmp` you can set this to a different location.
