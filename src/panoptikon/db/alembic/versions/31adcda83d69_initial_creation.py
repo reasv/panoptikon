@@ -18,9 +18,8 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-def initialize_database(conn: sqlite3.Connection):
-    cursor = conn.cursor()
-    cursor.execute(
+def upgrade() -> None:
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY,
@@ -39,7 +38,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY,
@@ -56,7 +55,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS file_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +77,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS tags (
         id INTEGER PRIMARY KEY,
@@ -89,7 +88,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS tags_items (
         item_data_id INTEGER NOT NULL,
@@ -102,7 +101,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS data_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +110,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS data_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +134,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
         CREATE TABLE IF NOT EXISTS setters (
             id INTEGER PRIMARY KEY,
@@ -144,7 +143,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +155,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS user_data.bookmarks (
         user TEXT NOT NULL, -- User who created the bookmark
@@ -169,7 +168,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS item_data (
         id INTEGER PRIMARY KEY,
@@ -192,7 +191,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
     # Create table for extracted text
-    cursor.execute(
+    op.execute(
         """
     CREATE TABLE IF NOT EXISTS extracted_text (
         id INTEGER PRIMARY KEY,
@@ -205,7 +204,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    cursor.execute(
+    op.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS extracted_text_fts
         USING fts5(
@@ -216,10 +215,8 @@ def initialize_database(conn: sqlite3.Connection):
         )
         """
     )
-    if trigger_exists(conn, "extracted_text_ai"):
-        cursor.execute("DROP TRIGGER extracted_text_ai")
     # Triggers to keep the FTS index up to date.
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER extracted_text_ai AFTER INSERT ON extracted_text BEGIN
             INSERT INTO extracted_text_fts(rowid, text)
@@ -227,11 +224,7 @@ def initialize_database(conn: sqlite3.Connection):
         END;
     """
     )
-
-    if trigger_exists(conn, "extracted_text_ad"):
-        cursor.execute("DROP TRIGGER extracted_text_ad")
-
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER extracted_text_ad AFTER DELETE ON extracted_text BEGIN
             INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text)
@@ -240,10 +233,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    if trigger_exists(conn, "extracted_text_au"):
-        cursor.execute("DROP TRIGGER extracted_text_au")
-
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER extracted_text_au AFTER UPDATE ON extracted_text BEGIN
             INSERT INTO extracted_text_fts(extracted_text_fts, rowid, text)
@@ -255,7 +245,7 @@ def initialize_database(conn: sqlite3.Connection):
     )
 
     # Create FTS table for files
-    cursor.execute(
+    op.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS files_path_fts
         USING fts5(
@@ -268,10 +258,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    if trigger_exists(conn, "files_path_ai"):
-        cursor.execute("DROP TRIGGER files_path_ai")
-
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER files_path_ai AFTER INSERT ON files BEGIN
             INSERT INTO files_path_fts(rowid, path, filename)
@@ -280,10 +267,7 @@ def initialize_database(conn: sqlite3.Connection):
     """
     )
 
-    if trigger_exists(conn, "files_path_ad"):
-        cursor.execute("DROP TRIGGER files_path_ad")
-
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER files_path_ad AFTER DELETE ON files BEGIN
             INSERT INTO files_path_fts(files_path_fts, rowid, path, filename)
@@ -292,9 +276,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    if trigger_exists(conn, "files_path_au"):
-        cursor.execute("DROP TRIGGER files_path_au")
-    cursor.execute(
+    op.execute(
         """
         CREATE TRIGGER files_path_au AFTER UPDATE ON files BEGIN
             INSERT INTO files_path_fts(files_path_fts, rowid, path, filename)
@@ -304,7 +286,7 @@ def initialize_database(conn: sqlite3.Connection):
         END;
     """
     )
-    cursor.execute(
+    op.execute(
         f"""
         CREATE TABLE IF NOT EXISTS embeddings (
             id INTEGER PRIMARY KEY,
@@ -314,7 +296,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -323,7 +305,7 @@ def initialize_database(conn: sqlite3.Connection):
             );
         """
     )
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS extraction_rules_setters (
                 rule_id INTEGER NOT NULL,
@@ -334,7 +316,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS system_config (
                 k string NOT NULL UNIQUE,
@@ -343,7 +325,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS model_group_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,7 +336,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS storage.thumbnails (
                 id INTEGER PRIMARY KEY,
@@ -370,7 +352,7 @@ def initialize_database(conn: sqlite3.Connection):
         """
     )
 
-    cursor.execute(
+    op.execute(
         f"""
             CREATE TABLE IF NOT EXISTS storage.frames (
                 id INTEGER PRIMARY KEY,
@@ -432,6 +414,8 @@ def initialize_database(conn: sqlite3.Connection):
         ("item_data", ["source_id"]),
         ("item_data", ["is_origin"]),
         ("item_data", ["data_type"]),
+        ("item_data", ["idx"]),
+        ("item_data", ["is_placeholder"]),
         ("tags_items", ["tag_id"]),
         ("tags_items", ["item_data_id"]),
         ("tags_items", ["confidence"]),
@@ -480,8 +464,4 @@ def initialize_database(conn: sqlite3.Connection):
             CREATE INDEX IF NOT EXISTS
             {index_name} ON {table}({', '.join(columns)})
             """
-        try:
-            cursor.execute(sql)
-        except sqlite3.OperationalError as e:
-            logger.error(sql)
-            raise e
+        op.execute(sql)
