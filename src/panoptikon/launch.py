@@ -25,16 +25,6 @@ else:
     logger.info("Running in read-write mode")
 
 
-def run_database_migrations():
-    # conn = get_database_connection(write_lock=True, user_data_wl=True)
-    # cursor = conn.cursor()
-    # cursor.execute("BEGIN")
-    # initialize_database(conn)
-    # conn.commit()
-    # conn.close()
-    run_migrations()
-
-
 def launch_app():
     index = os.getenv("INDEX_DB", "default")
     user_data = os.getenv("USER_DATA_DB", "default")
@@ -42,7 +32,7 @@ def launch_app():
     logger.info(f"Index DB: {index}")
     logger.info(f"User Data DB: {user_data}")
     if not readonly_mode:
-        run_database_migrations()
+        run_migrations()
     conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn, included=True)
     conn.close()
