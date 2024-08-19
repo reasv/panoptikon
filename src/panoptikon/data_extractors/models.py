@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+from abc import ABC, abstractmethod
 from io import BytesIO
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
@@ -26,7 +27,7 @@ from panoptikon.types import OutputDataType, TargetEntityType
 logger = logging.getLogger(__name__)
 
 
-class ModelOpts:
+class ModelOpts(ABC):
 
     def __init__(self, model_name: str | None = None):
         if model_name is None:
@@ -122,9 +123,11 @@ class ModelOpts:
         return RuleItemFilters(positive=rules, negative=[])
 
     @classmethod
+    @abstractmethod
     def data_type(cls) -> OutputDataType:
         raise NotImplementedError
 
+    @abstractmethod
     def run_extractor(
         self, conn: sqlite3.Connection
     ) -> Generator[
@@ -132,28 +135,35 @@ class ModelOpts:
     ]:
         raise NotImplementedError
 
+    @abstractmethod
     def setter_name(self) -> str:
         raise NotImplementedError
 
     @classmethod
+    @abstractmethod
     def _available_models_mapping(cls) -> Dict[str, Any]:
         raise NotImplementedError
 
+    @abstractmethod
     def _init(self, model_name: str):
         raise NotImplementedError
 
     @classmethod
+    @abstractmethod
     def name(cls) -> str:
         raise NotImplementedError
 
     @classmethod
+    @abstractmethod
     def description(cls) -> str:
         raise NotImplementedError
 
     @classmethod
+    @abstractmethod
     def group_name(cls) -> str:
         raise NotImplementedError
 
+    @abstractmethod
     def run_batch_inference(
         self,
         cache_key: str,
@@ -163,6 +173,7 @@ class ModelOpts:
     ):
         raise NotImplementedError
 
+    @abstractmethod
     def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
 
