@@ -8,7 +8,7 @@ from inferio.router import check_ttl, router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    check_ttl()
+    await check_ttl()
     yield
 
 

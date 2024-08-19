@@ -115,7 +115,7 @@ async def get_metadata() -> Dict[str, Dict[str, Any]]:
 
 
 @repeat_every(seconds=10, logger=logger)
-def check_ttl():
+async def check_ttl():
     """Check the TTL of all loaded models and unload expired ones.
     Should be called periodically to ensure that models are not kept in memory indefinitely.
     """
