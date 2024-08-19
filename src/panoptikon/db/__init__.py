@@ -3,6 +3,8 @@ import os
 import sqlite3
 
 import sqlite_vec
+from alembic import command
+from alembic.config import Config
 
 from panoptikon.db.utils import trigger_exists
 
@@ -78,6 +80,11 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     return conn
+
+
+def run_migrations():
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "alembic.ini"))
+    command.upgrade(alembic_cfg, "head")
 
 
 def initialize_database(conn: sqlite3.Connection):

@@ -6,7 +6,11 @@ import uvicorn
 from gradio.routes import mount_gradio_app
 
 from panoptikon.api.app import app
-from panoptikon.db import get_database_connection, initialize_database
+from panoptikon.db import (
+    get_database_connection,
+    initialize_database,
+    run_migrations,
+)
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.log import setup_logging
 from panoptikon.utils import add_cudnn_to_path
@@ -28,12 +32,13 @@ else:
 
 
 def run_database_migrations():
-    conn = get_database_connection(write_lock=True, user_data_wl=True)
-    cursor = conn.cursor()
-    cursor.execute("BEGIN")
-    initialize_database(conn)
-    conn.commit()
-    conn.close()
+    # conn = get_database_connection(write_lock=True, user_data_wl=True)
+    # cursor = conn.cursor()
+    # cursor.execute("BEGIN")
+    # initialize_database(conn)
+    # conn.commit()
+    # conn.close()
+    run_migrations()
 
 
 def launch_app():
