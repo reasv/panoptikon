@@ -167,6 +167,11 @@ class ModelOpts(ABC):
     @abstractmethod
     def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
+    
+    @classmethod
+    @abstractmethod
+    def model_metadata(cls, model_name) -> Sequence[str]:
+        raise NotImplementedError
 
 class ModelGroup(ModelOpts):
     _group: str
@@ -187,6 +192,13 @@ class ModelGroup(ModelOpts):
     def _models(cls):
         return ModelOptsFactory.get_group_models(cls._group)
 
+    @classmethod
+    def model_metadata(cls, model_name) -> Sequence[str]:
+        meta = ModelOptsFactory.get_inference_id_metadata(
+            cls._group, model_name
+        )
+        return meta.get("description", ""), meta.get("link", {})
+    
     @classmethod
     def target_entities(cls) -> List[TargetEntityType]:
         return cls._meta().get("target_entities", ["items"])

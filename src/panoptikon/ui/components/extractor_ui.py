@@ -166,6 +166,24 @@ def extraction_job_UI(
                     outputs=[batch_size, threshold],
                 )
         with gr.Row():
+            def change_model_list(models: List[str]):
+                full_desc = ""
+                for model_name in models:
+                    description, link = model_type.model_metadata(model_name)
+                    full_desc += f"### {model_name}\n"
+                    full_desc += f"{description} "
+                    if len(link) > 0:
+                        full_desc += f"[More Info]({link})\n\n"
+                    else:
+                        full_desc += "\n\n"
+                return full_desc
+            model_desc = gr.Markdown(change_model_list([model_type.default_model()]))
+            model_choice.change(
+                fn=change_model_list,
+                inputs=[model_choice],
+                outputs=[model_desc],
+            )
+        with gr.Row():
             run_button = gr.Button("Run Batch Job")
             delete_button = gr.Button(
                 "Delete All Data Extracted by Selected Model(s)"
