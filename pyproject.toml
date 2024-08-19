@@ -21,18 +21,24 @@ python = "^3.12"
 gradio = "^4.38.0"
 pillow = "^10.4.0"
 imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
-open-clip-torch = "^2.26.1"
-python-doctr = {extras = ["torch"], version = "^0.8.1"}
-timm = "^1.0.7"
 python-dotenv = "^1.0.1"
-faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
 sqlite-vec = "^0.0.1a36"
-sqlite-path = "^0.2.1"
-sentence-transformers = "^3.0.1"
-typeguard = "^4.3.0"
 fastapi-utilities = "^0.2.0"
 mutagen = "^1.47.0"
 toml = "^0.10.2"
+weasyprint = "^62.3"
+pypdfium2 = "^4.30.0"
+
+[tool.poetry.group.inference]
+optional = true
+
+[tool.poetry.group.inference.dependencies]
+open-clip-torch = "^2.26.1"
+python-doctr = {extras = ["torch"], version = "^0.8.1"}
+timm = "^1.0.7"
+faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
+sentence-transformers = "^3.0.1"
+
 
 [tool.poetry.scripts]
 panoptikon = "panoptikon.__main__:launch_app"

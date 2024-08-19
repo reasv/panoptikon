@@ -167,3 +167,5 @@ scripts/
 .DS_Store
 data/
 cudnn/
+*.woff
+static/

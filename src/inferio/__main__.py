@@ -12,7 +12,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-if __name__ == "__main__":
+def launch_app():
     app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     import uvicorn
@@ -20,3 +20,7 @@ if __name__ == "__main__":
     host = os.getenv("INFERIO_HOST", "127.0.0.1")
     port = int(os.getenv("INFERIO_PORT", "7777"))
     uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    launch_app()

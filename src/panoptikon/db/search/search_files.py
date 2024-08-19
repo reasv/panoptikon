@@ -1,8 +1,6 @@
 import os
 import sqlite3
 
-from typeguard import typechecked
-
 from panoptikon.db.search.clauses.order import build_order_by_clause
 from panoptikon.db.search.search_query import build_search_query
 from panoptikon.db.search.types import SearchQuery
@@ -11,7 +9,6 @@ from panoptikon.db.utils import pretty_print_SQL
 from panoptikon.types import FileSearchResult
 
 
-@typechecked
 def search_files(
     conn: sqlite3.Connection,
     args: SearchQuery,

@@ -14,20 +14,17 @@ from typing import (
 )
 
 import numpy as np
-from typeguard import typechecked
 
 from panoptikon.db.search.types import QueryTagFilters, SearchQuery
 
 logger = logging.getLogger(__name__)
 
 
-@typechecked
 def clean_input(args: SearchQuery) -> SearchQuery:
     args.query.tags = clean_tag_params(args.query.tags)
     return args
 
 
-@typechecked
 def clean_tag_params(args: QueryTagFilters):
     # Normalize/clean/deduplicate the inputs
     def clean_tag_list(tag_list: List[str] | None) -> List[str]:
