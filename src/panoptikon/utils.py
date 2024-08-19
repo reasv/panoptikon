@@ -247,20 +247,3 @@ def parse_tags(tags_str: str):
     tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
     tags, tags_match_any = extract_tags_subtype(tags, "*")
     return tags, tags_match_any, negative_tags, negative_tags_match_all
-
-
-def add_cudnn_to_path():
-    # Get the absolute path to the project's root directory
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    # Go up one directory to get to the project root
-    project_root = os.path.dirname(project_root)
-    # Define the path to the cudnn directory within the project
-    cudnn_path = os.path.join(project_root, "cudnn")
-    print(cudnn_path)
-    # Add cudnn/bin directory to the PATH environment variable
-    cudnn_bin_path = os.path.join(cudnn_path, "bin")
-    os.environ["PATH"] = cudnn_bin_path + os.pathsep + os.environ["PATH"]
-
-    # If you have other directories like include or lib that need to be added, you can add them similarly.
-    # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
-    os.environ["CUDA_PATH"] = cudnn_path

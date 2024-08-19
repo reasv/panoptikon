@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from io import BytesIO
 from typing import List, Optional, Union
 
@@ -100,3 +101,19 @@ def parse_input_request(data: str, files: List[UploadFile]):
                 detail=f"Invalid index {index} in Content-Disposition header",
             )
     return prediction_inputs
+
+
+def add_cudnn_to_path():
+    # Get the absolute path to the project's root directory
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    # Go up one directory to get to the project root
+    project_root = os.path.dirname(project_root)
+    # Define the path to the cudnn directory within the project
+    cudnn_path = os.path.join(project_root, "cudnn")
+    # Add cudnn/bin directory to the PATH environment variable
+    cudnn_bin_path = os.path.join(cudnn_path, "bin")
+    os.environ["PATH"] = cudnn_bin_path + os.pathsep + os.environ["PATH"]
+
+    # If you have other directories like include or lib that need to be added, you can add them similarly.
+    # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
+    os.environ["CUDA_PATH"] = cudnn_path

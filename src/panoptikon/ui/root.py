@@ -11,6 +11,7 @@ from panoptikon.ui.query_db import create_query_UI
 from panoptikon.ui.rule_config import create_rule_config_UI
 from panoptikon.ui.scan import create_scan_UI
 from panoptikon.ui.search import create_search_UI
+
 # from panoptikon.ui.test_models import create_model_demo
 from panoptikon.ui.toptags import create_toptags_UI
 

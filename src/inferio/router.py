@@ -11,8 +11,13 @@ from inferio.impl.wd_tagger import WDTagger
 from inferio.impl.whisper import FasterWhisperModel
 from inferio.manager import InferenceModel, ModelManager
 from inferio.registry import ModelRegistry
-from inferio.utils import encode_output_response, parse_input_request
+from inferio.utils import (
+    add_cudnn_to_path,
+    encode_output_response,
+    parse_input_request,
+)
 
+add_cudnn_to_path()
 logger = logging.getLogger(__name__)
 
 ModelRegistry.set_user_folder("config/inference")

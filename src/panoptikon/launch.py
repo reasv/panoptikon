@@ -9,9 +9,7 @@ from panoptikon.api.app import app
 from panoptikon.db import get_database_connection, run_migrations
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.log import setup_logging
-from panoptikon.utils import add_cudnn_to_path
 
-add_cudnn_to_path()
 setup_logging()
 readonly_mode = os.environ.get("READONLY", "false").lower() == "true"
 
