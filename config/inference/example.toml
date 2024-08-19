@@ -1,7 +1,15 @@
 [group.clip]
 [group.clip.inference_ids]
 # Add new models to a group like this
+# see src/inferio/config/inference.toml for reference on the config structure
 ViT-bigG-14-CLIPA_datacomp1b = { config = { model_name = "ViT-bigG-14-CLIPA", pretrained = "datacomp1b" }, metadata = { description = "ViT-bigG-14-CLIPA model pretrained on DataComp1B" } }
+# Hugging Face models can be referenced by their repo name, though the exact syntax varies depending on the underlying implementation, this works for CLIP:
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
+# Again, see src/inferio/config/inference.toml for reference on the config structure
 
-# see src/inferio/config/inference.toml for reference
+# Each inference_id represents a model and its related configuration, and becomes selectable as an option in the UI
+# Individual Inference IDs inherit from the group config, and can override any of the group settings.
+# You can have different inference_ids for the same model with different configurations
+# Almost anything about the model's configuration can be overridden here.
+# See `src/inferio/impl/` for the available implementation classes and how they use the configuration you pass to them.
+# The object in the `config` field is passed to the implementation class's constructor directly as **kwargs.

@@ -66,4 +66,7 @@ You can also search inside your bookmarks using the regular search UI, by checki
 
 Without any other search criteria, this is effectively just another way to browse your bookmarks, but it's a lot more flexible since you can use any of the regular search criteria along with being able to optionally select which specific groups to include.
 
-## 
+## Adding more models
+See `config/inference/example.toml` for examples on how to add custom models from Hugging Face to Panoptikon.
+
+
