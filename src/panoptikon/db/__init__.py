@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+from typing import Literal
 
 import sqlite_vec
 from alembic import command
@@ -86,11 +87,15 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
 
 
 def run_migrations():
-    alembic_path = os.path.join(os.path.dirname(__file__), "alembic.ini")
+    for db in ["index", "user_data", "storage"]:
+        run_migrations_for_db(db)
+
+
+def run_migrations_for_db(db: str):
+    alembic_path = os.path.join(os.path.dirname(__file__), "migrations", db)
     logger.debug(f"Running migrations using {alembic_path}")
-    script_location = os.path.join(os.path.dirname(__file__), "alembic")
-    alembic_cfg = Config(alembic_path)
-    alembic_cfg.set_main_option("script_location", script_location)
+    alembic_cfg = Config(os.path.join(alembic_path, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", alembic_path)
     command.upgrade(alembic_cfg, "head")
 
 
