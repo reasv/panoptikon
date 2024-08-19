@@ -7,9 +7,7 @@ license = "AGPL"
 readme = "README.md"
 packages = [
     { include = "panoptikon", from="src" },
-    { include = "panoptikon.*", from="src" },
     { include = "inferio", from="src" },
-    { include = "inferio.*", from="src" },
 ]
 include = [
     "src/panoptikon/ui/static/**/*",
@@ -22,7 +20,7 @@ gradio = "^4.38.0"
 pillow = "^10.4.0"
 imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
 python-dotenv = "^1.0.1"
-sqlite-vec = "^0.0.1a36"
+sqlite-vec = "^0.1.1"
 fastapi-utilities = "^0.2.0"
 mutagen = "^1.47.0"
 toml = "^0.10.2"
@@ -38,7 +36,6 @@ python-doctr = {extras = ["torch"], version = "^0.8.1"}
 timm = "^1.0.7"
 faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
 sentence-transformers = "^3.0.1"
-
 
 [tool.poetry.scripts]
 panoptikon = "panoptikon.__main__:launch_app"
