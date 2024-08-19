@@ -11,6 +11,10 @@ packages = [
     { include = "inferio", from="src" },
     { include = "inferio.*", from="src" },
 ]
+include = [
+    "src/panoptikon/ui/static/**/*",
+    "src/panoptikon/api/templates/**/*"
+]
 
 [tool.poetry.dependencies]
 python = "^3.12"

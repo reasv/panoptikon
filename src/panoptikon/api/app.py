@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 from contextlib import asynccontextmanager
+from importlib.resources import files
 from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, Query, Request
@@ -16,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi_utilities.repeat.repeat_at import repeat_at
 
 import inferio
+import panoptikon
 from panoptikon.api.job import try_cronjob
 from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_bookmarks
@@ -53,7 +55,9 @@ def cronjob():
 
 
 app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
+
+templates_path = files(panoptikon) / "api" / "templates"
+templates = Jinja2Templates(directory=str(templates_path))
 
 app.include_router(inferio.router)
 
