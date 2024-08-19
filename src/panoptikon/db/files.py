@@ -199,7 +199,29 @@ def get_file_scan_by_id(
 def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
     cursor = conn.cursor()
     # Order by start_time in descending order
-    cursor.execute("SELECT * FROM file_scans ORDER BY start_time DESC")
+    cursor.execute(
+        """
+        SELECT
+        id,
+        start_time,        
+        end_time,
+        path,
+        total_available,
+        new_items,
+        unchanged_files,
+        new_files,
+        modified_files,
+        marked_unavailable,
+        errors,
+        false_changes,
+        metadata_time,
+        hashing_time,
+        thumbgen_time
+        FROM file_scans
+        ORDER BY start_time
+        DESC
+        """
+    )
     scan_records = cursor.fetchall()
     return [FileScanRecord(*scan_record) for scan_record in scan_records]
 
