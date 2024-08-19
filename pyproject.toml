@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "panoptikon"
-version = "0.1.0"
+version = "1.0.0"
 description = "AI-based media indexing, tagging, and semantic search engine for local files"
 authors = ["reasv"]
 license = "AGPL"
@@ -32,7 +32,7 @@ toml = "^0.10.2"
 
 [tool.poetry.scripts]
 panoptikon = "panoptikon.__main__:launch_app"
-
+inferio = "inferio.__main__:launch_app"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
