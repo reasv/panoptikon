@@ -7,7 +7,9 @@ license = "AGPL"
 readme = "README.md"
 packages = [
     { include = "panoptikon", from="src" },
-    { include = "panoptikon.*", from="src" }
+    { include = "panoptikon.*", from="src" },
+    { include = "inferio", from="src" },
+    { include = "inferio.*", from="src" },
 ]
 
 [tool.poetry.dependencies]
