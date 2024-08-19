@@ -60,6 +60,35 @@ def create_scan_dataset(samples=[]):
     return scan_history
 
 
+def fetch_scan_history():
+    conn = get_database_connection(write_lock=False)
+    file_scans = get_all_file_scans(conn)
+    conn.close()
+    file_scans = [
+        [
+            f.id,
+            pretty_print_isodate(f.start_time),
+            pretty_print_isodate(f.end_time),
+            isodate_minutes_diff(f.end_time, f.start_time),
+            f.path,
+            f.total_available,
+            f.marked_unavailable,
+            f.errors,
+            f.new_items,
+            f.new_files,
+            f.unchanged_files,
+            f.modified_files,
+            f.false_changes,
+            seconds_to_hms(f.metadata_time),
+            seconds_to_hms(f.hashing_time),
+            seconds_to_hms(f.thumbgen_time),
+        ]
+        for f in file_scans
+    ]
+
+    return gr.Dataset(samples=file_scans)
+
+
 def create_job_dataset(samples=[]):
     job_history = gr.Dataset(
         label="Data Extraction Log",
@@ -107,35 +136,6 @@ def create_job_dataset(samples=[]):
         scale=1,
     )
     return job_history
-
-
-def fetch_scan_history():
-    conn = get_database_connection(write_lock=False)
-    file_scans = get_all_file_scans(conn)
-    conn.close()
-    file_scans = [
-        [
-            f.id,
-            pretty_print_isodate(f.start_time),
-            pretty_print_isodate(f.end_time),
-            isodate_minutes_diff(f.end_time, f.start_time),
-            f.path,
-            f.total_available,
-            f.marked_unavailable,
-            f.errors,
-            f.new_items,
-            f.new_files,
-            f.unchanged_files,
-            f.modified_files,
-            f.false_changes,
-            seconds_to_hms(f.metadata_time),
-            seconds_to_hms(f.hashing_time),
-            seconds_to_hms(f.thumbgen_time),
-        ]
-        for f in file_scans
-    ]
-
-    return gr.Dataset(samples=file_scans)
 
 
 def fetch_extraction_logs():
