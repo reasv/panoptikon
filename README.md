@@ -28,7 +28,7 @@ If you're running the inference server on a different machine, you can omit the 
 ### CUDA on Windows
 If you're on windows and want CUDA GPU acceleration, you have to uninstall the default pytorch and install the correct version after running `poetry install`:
 ```
-pip3 uninstall torch torchvision torchaudio
+pip3 uninstall torch torchvision torchaudio -y
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 You may have to repeat this after updates.
