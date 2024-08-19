@@ -723,16 +723,13 @@ class ModelOptsFactory:
 
 def get_inference_api_client():
     from inferio.client import InferenceAPIClient
-
-    if url := os.getenv("INFERENCE_API_URL"):
-        return InferenceAPIClient(url)
-    else:
+    if not os.getenv("INFERENCE_API_URL"):
         hostname = os.getenv("HOST", "127.0.0.1")
         port = int(os.getenv("PORT", 6342))
         os.environ["INFERENCE_API_URL"] = (
-            f"http://{hostname}:{port}/api/inference"
+            f"http://{hostname}:{port}"
         )
-        return InferenceAPIClient(os.environ["INFERENCE_API_URL"])
+    return InferenceAPIClient(f"{os.environ['INFERENCE_API_URL']}/api/inference")
 
 
 class ModelGroup(ModelOpts):
