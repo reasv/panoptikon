@@ -1,0 +1,7 @@
+[group.clip]
+[group.clip.inference_ids]
+# Add new models to a group like this
+ViT-bigG-14-CLIPA_datacomp1b = { config = { model_name = "ViT-bigG-14-CLIPA", pretrained = "datacomp1b" }, metadata = { description = "ViT-bigG-14-CLIPA model pretrained on DataComp1B" } }
+# apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
+
+# see src/inferio/config/inference.toml for reference
