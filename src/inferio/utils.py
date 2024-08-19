@@ -104,9 +104,11 @@ def parse_input_request(data: str, files: List[UploadFile]):
 
 
 def add_cudnn_to_path():
-    # Get the absolute path to the project's root directory
+    # Get the absolute path to the inferio directory
     project_root = os.path.dirname(os.path.abspath(__file__))
-    # Go up one directory to get to the project root
+    # Go up one directory to get to the src directory
+    project_root = os.path.dirname(project_root)
+    # Go up another directory to get to the project root
     project_root = os.path.dirname(project_root)
     # Define the path to the cudnn directory within the project
     cudnn_path = os.path.join(project_root, "cudnn")
