@@ -161,10 +161,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-venv/
-thumbs/
 scripts/
-db/**
 .vscode/
 
 .DS_Store
