@@ -88,7 +88,9 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
 def run_migrations():
     alembic_path = os.path.join(os.path.dirname(__file__), "alembic.ini")
     logger.debug(f"Running migrations using {alembic_path}")
+    script_location = os.path.join(os.path.dirname(__file__), "alembic")
     alembic_cfg = Config(alembic_path)
+    alembic_cfg.set_main_option("script_location", script_location)
     command.upgrade(alembic_cfg, "head")
 
 
