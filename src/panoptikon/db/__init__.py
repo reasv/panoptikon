@@ -14,20 +14,7 @@ logger = logging.getLogger(__name__)
 def get_database_connection(
     write_lock: bool, user_data_wl: bool = False
 ) -> sqlite3.Connection:
-    data_dir = os.getenv("DATA_FOLDER", "data")
-    index_db_dir = os.path.join(data_dir, "index")
-    user_data_db_dir = os.path.join(data_dir, "user_data")
-    storage_db_dir = os.path.join(data_dir, "storage")
-    # Ensure the directory exists
-    os.makedirs(index_db_dir, exist_ok=True)
-    os.makedirs(user_data_db_dir, exist_ok=True)
-    os.makedirs(storage_db_dir, exist_ok=True)
-
-    index, user_data, storage = get_db_names()
-
-    db_file = os.path.join(index_db_dir, f"{index}.db")
-    user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
-    storage_db_file = os.path.join(storage_db_dir, f"{storage}.db")
+    db_file, user_db_file, storage_db_file = get_db_paths()
 
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
     # Attach index database
@@ -66,6 +53,24 @@ def get_database_connection(
     cursor.execute("PRAGMA foreign_keys = ON")
     load_sqlite_vec(conn)
     return conn
+
+
+def get_db_paths():
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    index_db_dir = os.path.join(data_dir, "index")
+    user_data_db_dir = os.path.join(data_dir, "user_data")
+    storage_db_dir = os.path.join(data_dir, "storage")
+    # Ensure the directory exists
+    os.makedirs(index_db_dir, exist_ok=True)
+    os.makedirs(user_data_db_dir, exist_ok=True)
+    os.makedirs(storage_db_dir, exist_ok=True)
+
+    index, user_data, storage = get_db_names()
+
+    db_file = os.path.join(index_db_dir, f"{index}.db")
+    user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
+    storage_db_file = os.path.join(storage_db_dir, f"{storage}.db")
+    return db_file, user_db_file, storage_db_file
 
 
 def get_db_names():
