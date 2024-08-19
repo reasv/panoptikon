@@ -15,6 +15,10 @@ The intended use of Panoptikon is for power users and more technically minded en
 Unlike tools such as Hydrus, Panoptikon will never copy, move or otherwise touch your files. Simply add your directories to the list of allowed paths, and run the indexing jobs.
 Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them, so long as they remain within one of the directory trees Panoptikon has access to, and so long as you run the File Scan job regularly, or enable the scheduled cronjob.
 
+### Warning
+Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any security features, and currently exposes, among other things, an API to access *all* your files, even outside of explicitly indexed directories. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
+In the future, Panoptikon will feature a more secure API, authentication, and a React-based client that can be publicly exposed.
+
 ## Installation
 ```
 poetry install --with inference
@@ -81,6 +85,8 @@ HOST="127.0.0.1"
 PORT="6342"
 ```
 These determine where to bind the Panoptikon server which delivers both the inference API and the search and configuration UI.
+Warning: Do not expose Panoptikon to the internet without a reverse proxy and authentication. It is designed as a local service and does not have any security features.
+
 ### INFERIO_HOST, INFERIO_PORT
 Default
 ```
