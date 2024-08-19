@@ -28,7 +28,6 @@ from panoptikon.db.rules.types import (
 )
 from panoptikon.db.storage import (
     get_frames,
-    has_frame,
     has_thumbnail,
     store_frames,
     store_thumbnails,
