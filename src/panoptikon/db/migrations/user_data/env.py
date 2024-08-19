@@ -7,12 +7,9 @@ from panoptikon.db import get_db_paths
 
 logger = logging.getLogger(__name__)
 
-logger.info("env.py is being run")
-
 
 def run_migrations_online():
     """Run migrations in 'online' mode using SQLAlchemy's create_engine."""
-    logger.info("Migrations are running in 'online' mode")
 
     db_file, user_db_file, storage_db_file = get_db_paths()
     # index_db_url = f"sqlite:///{db_file}"
