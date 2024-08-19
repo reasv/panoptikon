@@ -152,7 +152,6 @@ class SystemConfig:
     scan_audio: bool = False
     scan_html: bool = False
     scan_pdf: bool = False
-    transaction_per_item: bool = True
     enable_cron_job: bool = False
     cron_schedule: str = "0 3 * * *"
 
