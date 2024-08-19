@@ -22,6 +22,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
 from panoptikon.db.extraction_log import (
     add_data_log,
     get_items_missing_data_extraction,
+    remove_incomplete_jobs,
     update_log,
 )
 from panoptikon.db.setters import upsert_setter
@@ -47,6 +48,7 @@ def run_extraction_job(
     Run a job that processes items in the database
     using the given batch inference function and item extractor.
     """
+    remove_incomplete_jobs(conn)
 
     def get_remaining():
         # Get first item to obtain the total number of items remaining
