@@ -1,5 +1,5 @@
-# Panoptikon
-
+![Panoptikon Logo](https://raw.githubusercontent.com/reasv/panoptikon/master/static/banner_transparent.png
+)
 ## State of the art, local, multimodal, multimedia search engine
 Panoptikon indexes your local files using state-of-the-art AI and Machine learning models and makes difficult-to-search media such as images and videos easily findable.
 
