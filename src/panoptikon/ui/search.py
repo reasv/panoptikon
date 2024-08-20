@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from time import time
 from typing import Any, List, Tuple
 
@@ -32,8 +33,12 @@ def create_search_UI(
                 with gr.Row():
                     results_str = gr.Markdown("# 0 Results")
                 with gr.Row():
+                    gallery_enabled = (
+                        os.getenv("LEGACY_GALLERY", "false").lower() == "true"
+                    )
                     link = gr.Markdown(
-                        "## [View Results in Gallery](/search/tags)"
+                        "## [View Results in Gallery](/search/tags)",
+                        visible=gallery_enabled,
                     )
                 with gr.Row():
                     submit_button = gr.Button("Search", scale=1)

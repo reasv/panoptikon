@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List
 
 import gradio as gr
@@ -96,7 +97,12 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
     with gr.TabItem(label="Bookmarks") as bookmarks_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
-                link = gr.Markdown(bookmark_query_text("default"))
+                gallery_enabled = (
+                    os.getenv("LEGACY_GALLERY", "false").lower() == "true"
+                )
+                link = gr.Markdown(
+                    bookmark_query_text("default"), visible=gallery_enabled
+                )
                 create_bookmark_folder_chooser(
                     parent_tab=bookmarks_tab,
                     bookmarks_namespace=bookmarks_namespace,
