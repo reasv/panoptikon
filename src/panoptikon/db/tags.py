@@ -1,4 +1,5 @@
 import sqlite3
+from typing import List, Tuple
 
 from panoptikon.db import get_item_id
 from panoptikon.db.setters import upsert_setter
@@ -97,7 +98,9 @@ def get_tag_names_list(conn: sqlite3.Connection):
     return [tag[0] for tag in tag_names]
 
 
-def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
+def get_all_tags_for_item(
+    conn: sqlite3.Connection, sha256
+) -> List[Tuple[str, str, float, str]]:
     cursor = conn.cursor()
     cursor.execute(
         """

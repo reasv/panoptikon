@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 import gradio as gr
 
 from panoptikon.db import get_database_connection
-from panoptikon.db.tags import get_all_tags_for_item_name_confidence
+from panoptikon.db.tags import (
+    get_all_tags_for_item,
+    get_all_tags_for_item_name_confidence,
+)
 from panoptikon.types import FileSearchResult
 from panoptikon.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
@@ -35,6 +38,29 @@ def on_files_change(files: List[FileSearchResult]):
     )
 
 
+def get_tag_data(conn, sha256):
+    rating_tags = {}
+    character_tags = {}
+    general_tags = {}
+    tags_tuples = get_all_tags_for_item(conn, sha256)
+    for namespace, name, confidence, setter_name in tags_tuples:
+        if namespace.endswith("rating"):
+            if rating_tags.get(name, 0) < confidence:
+                rating_tags[name] = confidence
+        elif namespace.endswith("character"):
+            if character_tags.get(name, 0) < confidence:
+                character_tags[name] = confidence
+        else:
+            if general_tags.get(name, 0) < confidence:
+                general_tags[name] = confidence
+    text = ", ".join(
+        list(rating_tags.keys())
+        + list(character_tags.keys())
+        + list(general_tags.keys())
+    )
+    return rating_tags, character_tags, general_tags, text
+
+
 def on_selected_files_change_extra_actions(extra_actions: List[str]):
     def on_selected_files_change(
         selected_files: List[FileSearchResult], selected_image_path: str
@@ -43,9 +69,10 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
         if len(selected_files) == 0:
             interactive = False
             path = None
-            tags = None
             text = None
             updates = (
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
                 None,
                 None,
                 None,
@@ -63,19 +90,20 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
             thumbnail = get_item_thumbnail(conn, selected_file, True)
             if path != selected_image_path:
 
-                tags = {
-                    t[0]: t[1]
-                    for t in get_all_tags_for_item_name_confidence(conn, sha256)
-                }
-                # Tags in the format "tag1 tag2 tag3"
-                text = ", ".join(tags.keys())
+                rating_tags, character_tags, general_tags, text = get_tag_data(
+                    conn, sha256
+                )
 
                 if path.strip() == "":
                     interactive = False
                     path = None
 
                 updates = (
-                    tags,
+                    gr.update(value=rating_tags, visible=rating_tags != {}),
+                    gr.update(
+                        value=character_tags, visible=character_tags != {}
+                    ),
+                    general_tags,
                     text,
                     path,
                     thumbnail,
@@ -85,6 +113,8 @@ def on_selected_files_change_extra_actions(extra_actions: List[str]):
                 )
             else:
                 updates = (
+                    gr.update(),
+                    gr.update(),
                     gr.update(),
                     gr.update(),
                     gr.update(),
@@ -166,7 +196,70 @@ def create_image_list(
                         lines=5,
                     )
                 with gr.Tab(label="Tags Confidence"):
-                    tag_list = gr.Label(label="Tags", show_label=False)
+                    max_labels = gr.Slider(
+                        label="Display Top N (0 for max)",
+                        minimum=0,
+                        maximum=100,
+                        step=1,
+                        value=5,
+                        interactive=True,
+                    )
+                    tag_rating = gr.Label(
+                        label="Rating", show_label=True, visible=False
+                    )
+                    tag_characters = gr.Label(
+                        label="Characters", show_label=True, visible=False
+                    )
+                    tag_list = gr.Label(
+                        label="Tags", show_label=False, num_top_classes=5
+                    )
+
+                    def on_max_labels_change(
+                        value: int,
+                        selected: List[FileSearchResult],
+                    ):
+                        n_top = value if value > 0 else 999
+                        conn = get_database_connection(write_lock=False)
+                        if len(selected) > 0:
+                            rating_tags, character_tags, general_tags, text = (
+                                get_tag_data(conn, selected[0].sha256)
+                            )
+                            return {
+                                tag_rating: gr.update(
+                                    value=rating_tags,
+                                    num_top_classes=n_top,
+                                    visible=rating_tags != {},
+                                ),
+                                tag_characters: gr.update(
+                                    value=character_tags,
+                                    num_top_classes=n_top,
+                                    visible=character_tags != {},
+                                ),
+                                tag_list: gr.update(
+                                    value=general_tags, num_top_classes=n_top
+                                ),
+                            }
+                        else:
+                            return {
+                                tag_rating: gr.update(
+                                    value=None, num_top_classes=n_top
+                                ),
+                                tag_characters: gr.update(
+                                    value=None, num_top_classes=n_top
+                                ),
+                                tag_list: gr.update(
+                                    value=None, num_top_classes=n_top
+                                ),
+                            }
+
+                    max_labels.release(
+                        fn=on_max_labels_change,
+                        inputs=[
+                            max_labels,
+                            selected_files,
+                        ],
+                        outputs=[tag_list, tag_rating, tag_characters],
+                    )
             selected_image_path = gr.Textbox(
                 value="",
                 label="Last Selected Image",
@@ -214,6 +307,8 @@ def create_image_list(
         fn=on_selected_files_change_extra_actions(extra_actions),
         inputs=[selected_files, selected_image_path],
         outputs=[
+            tag_rating,
+            tag_characters,
             tag_list,
             tag_text,
             selected_image_path,
