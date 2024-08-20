@@ -89,3 +89,17 @@ def get_most_common_tags_frequency(
         (tag[0], tag[1], tag[2], tag[2] / (total_items_setters)) for tag in tags
     ]
     return tags
+
+
+def get_min_tag_confidence(conn: sqlite3.Connection) -> float:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT MIN(confidence) FROM tags_items
+        """
+    )
+    # If there are no tags, return 0
+    if res := cursor.fetchone():
+        return res[0]
+    else:
+        return 0.0

@@ -443,3 +443,25 @@ def delete_files_not_allowed(conn: sqlite3.Connection):
         logger.debug("No items deleted")
 
     return files_deleted
+
+
+def get_file_stats(
+    conn: sqlite3.Connection,
+) -> tuple[int, int]:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM files
+        """
+    )
+    total_files = cursor.fetchone()[0]
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM items
+        """
+    )
+    total_items = cursor.fetchone()[0]
+
+    return total_files, total_items

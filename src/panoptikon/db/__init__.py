@@ -11,9 +11,15 @@ logger = logging.getLogger(__name__)
 
 
 def get_database_connection(
-    write_lock: bool, user_data_wl: bool = False
+    write_lock: bool,
+    user_data_wl: bool = False,
+    index_db: str | None = None,
+    user_data_db: str | None = None,
 ) -> sqlite3.Connection:
-    db_file, user_db_file, storage_db_file = get_db_paths()
+    db_file, user_db_file, storage_db_file = get_db_paths(
+        index_db=index_db,
+        user_data_db=user_data_db,  # Overwrite the default database names
+    )
 
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
     # Attach index database
@@ -54,7 +60,7 @@ def get_database_connection(
     return conn
 
 
-def get_db_paths():
+def get_db_paths(index_db: str | None = None, user_data_db: str | None = None):
     data_dir = os.getenv("DATA_FOLDER", "data")
     index_db_dir = os.path.join(data_dir, "index")
     user_data_db_dir = os.path.join(data_dir, "user_data")
@@ -65,6 +71,13 @@ def get_db_paths():
     os.makedirs(storage_db_dir, exist_ok=True)
 
     index, user_data, storage = get_db_names()
+
+    # Override the database names if provided
+    if index_db:
+        index = index_db
+        storage = index_db
+    if user_data_db:
+        user_data = user_data_db
 
     db_file = os.path.join(index_db_dir, f"{index}.db")
     user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
@@ -77,6 +90,25 @@ def get_db_names():
     user_data = os.getenv("USER_DATA_DB", "default")
     storage = os.getenv("STORAGE_DB", index)  # Default to same name as index
     return index, user_data, storage
+
+
+def get_db_lists():
+    db_file, user_db_file, _ = get_db_paths()
+    # Get the folders containing the databases
+    index_db_dir = os.path.dirname(db_file)
+    user_data_db_dir = os.path.dirname(user_db_file)
+    # Get the list of databases in the folders
+    index_dbs = [
+        os.path.splitext(f)[0]
+        for f in os.listdir(index_db_dir)
+        if f.endswith(".db")
+    ]
+    user_data_dbs = [
+        os.path.splitext(f)[0]
+        for f in os.listdir(user_data_db_dir)
+        if f.endswith(".db")
+    ]
+    return index_dbs, user_data_dbs
 
 
 def load_sqlite_vec(conn: sqlite3.Connection) -> sqlite3.Connection:
