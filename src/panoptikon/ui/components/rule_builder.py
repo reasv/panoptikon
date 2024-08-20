@@ -285,9 +285,7 @@ def create_rule_builder(
         with gr.Column():
             gr.Markdown("## Models:")
             gr.Markdown("### Rule applies when running the following models:")
-            gr.Markdown(
-                f"### {', '.join([f'{setter} ({type})' for type, setter in rule.setters])}"
-            )
+            gr.Markdown(f"### {', '.join(rule.setters)}")
             with gr.Accordion(label="Remove Models", open=False):
                 create_remove_models(rule, rules_state)
             with gr.Accordion(label="Add Models", open=False):
