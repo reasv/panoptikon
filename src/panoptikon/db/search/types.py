@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from typing import List, Literal, Union
 
+from pydantic import Field
+from pydantic.dataclasses import dataclass as pydantic_dataclass
+
 # Search Query Types
 OrderByType = Union[
     Literal[
@@ -126,5 +129,13 @@ class OrderParams:
 class SearchQuery:
     query: QueryParams = field(default_factory=QueryParams)
     order_args: OrderParams = field(default_factory=OrderParams)
+    count: bool = True
+    check_path: bool = False
+
+
+@pydantic_dataclass
+class SearchQueryModel:
+    query: QueryParams = Field(default_factory=QueryParams)
+    order_args: OrderParams = Field(default_factory=OrderParams)
     count: bool = True
     check_path: bool = False

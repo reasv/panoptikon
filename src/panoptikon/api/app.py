@@ -8,6 +8,7 @@ from fastapi_utilities.repeat.repeat_at import repeat_at
 
 import inferio
 import panoptikon.api.routers.legacy as legacy
+import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ app = FastAPI(lifespan=lifespan)
 
 
 app.include_router(inferio.router)
+app.include_router(search.router)
+
 if os.getenv("LEGACY_GALLERY", "false").lower() == "true":
     app.include_router(legacy.router)
 
