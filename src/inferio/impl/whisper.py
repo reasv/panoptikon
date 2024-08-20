@@ -39,9 +39,9 @@ class FasterWhisperModel(InferenceModel):
         self.model = WhisperModel(
             model_size_or_path=self.model_name,
             device="auto",
-            device_index=[i for i in range(len(self.devices))],
+            # device_index=[i for i in range(len(self.devices))],
             compute_type="float16",
-            num_workers=len(self.devices),
+            # num_workers=len(self.devices),
             **self.init_args,
         )
         self._model_loaded = True
