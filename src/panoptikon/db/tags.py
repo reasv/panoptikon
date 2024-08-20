@@ -112,6 +112,7 @@ def get_all_tags_for_item(conn: sqlite3.Connection, sha256):
     JOIN setters 
         ON item_data.setter_id = setters.id
     WHERE items.sha256 = ?
+    ORDER BY tags_items.rowid
     """,
         (sha256,),
     )
