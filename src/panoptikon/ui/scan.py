@@ -121,7 +121,7 @@ def fetch_all_history():
 
 
 def create_scan_UI(app: gr.Blocks):
-    with gr.TabItem(label="File Scan & Tagging") as scan_tab:
+    with gr.TabItem(label="File Scan & Indexing") as scan_tab:
         with gr.Column(elem_classes="centered-content", scale=0):
             with gr.Row():
                 included_directory_list = gr.Textbox(
