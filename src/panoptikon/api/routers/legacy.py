@@ -35,7 +35,6 @@ templates = Jinja2Templates(directory=str(templates_path))
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
-    prefix="/",
     responses={404: {"description": "Not found"}},
 )
 

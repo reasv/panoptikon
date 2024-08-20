@@ -412,7 +412,7 @@ Or, in order to run it every hour, use `0 * * * *`, every four hours: `0 */4 * *
                 models.extend(rule.setters)
         if models:
             model_list_str = ", ".join(
-                [f"{name}" for type, name in models if type != "files"]
+                [name for name in models if name != "file_scan"]
             )
         else:
             model_list_str = "No models scheduled. Go to the rules tab and create rules for the models you want to schedule."
