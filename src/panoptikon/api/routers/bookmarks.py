@@ -40,7 +40,12 @@ class Items(BaseModel):
     "/{namespace}",
     summary="Get all bookmarks in a namespace",
     description="""
-    Get all bookmarks in a namespace.
+    Get all items bookmarked in namespace.
+    Note that unlike the search API, this returns unique items, not files.
+    This has two implications:
+    1. Results are unique by `sha256` value.
+    2. Even if multiple files have the same `sha256` value, they will only appear once in the results, with the path of the first reachable file found.
+
     The `order_by` parameter can be used to sort the results by `last_modified`, `path`, or `time_added`.
     The `order` parameter can be used to sort the results in ascending or descending order.
     The `include_wildcard` parameter can be used to include bookmarks with the `*` user value.
