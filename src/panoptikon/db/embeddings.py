@@ -60,8 +60,12 @@ def find_similar_items(
     item_id, setter_id, data_type = result
 
     # Step 2: If setter_names is provided, retrieve the corresponding setter_ids
-    setter_ids = None
+    main_setter_ids_clause = ""
+    other_setter_ids_clause = ""
+    parameters = [item_id, setter_id]  # Base parameters for the query
+
     if src_setter_names:
+        # Retrieve setter_ids from setter_names
         placeholder = ",".join(
             "?" for _ in src_setter_names
         )  # Create placeholders for IN clause
@@ -69,13 +73,30 @@ def find_similar_items(
         cursor = conn.execute(query, tuple(src_setter_names))
         setter_ids = [row[0] for row in cursor.fetchall()]
 
-    # Step 2: Choose the appropriate distance function based on the data_type
+        if setter_ids:
+            # Build the filtering clause for derived data based on setter_ids
+            setter_ids_placeholder = ",".join("?" for _ in setter_ids)
+            main_setter_ids_clause = f"""
+            JOIN item_data AS derived_main_item_data
+                ON main_item_data.source_id = derived_main_item_data.id
+                AND derived_main_item_data.setter_id IN ({setter_ids_placeholder})
+            """
+            other_setter_ids_clause = f"""
+            JOIN item_data AS derived_other_item_data
+                ON other_item_data.source_id = derived_other_item_data.id
+                AND derived_other_item_data.setter_id IN ({setter_ids_placeholder})
+            """
+            # Add setter_ids to the query parameters
+            parameters.extend(setter_ids)  # For filtering `main_item_data`
+            parameters.extend(setter_ids)  # For filtering `other_item_data`
+
+    # Step 3: Choose the appropriate distance function based on the data_type
     if data_type == "clip":
         distance_function = "vec_distance_cosine(vec_normalize(other_embeddings.embedding), vec_normalize(main_embeddings.embedding))"
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
-    # Step 2: Find the top N most similar items by comparing all embeddings in one query
+    # Step 4: Construct the main query with dynamic filtering
     query = f"""
     SELECT 
         other_item_data.item_id AS similar_item_id,
@@ -85,9 +106,11 @@ def find_similar_items(
         ON main_embeddings.id = main_item_data.id
         AND main_item_data.item_id = ?
         AND main_item_data.setter_id = ?
+    {main_setter_ids_clause}
     JOIN item_data AS other_item_data
-        ON other_item_data.item_id != ?
-        AND other_item_data.setter_id = ?
+        ON other_item_data.item_id != main_item_data.item_id
+        AND other_item_data.setter_id = main_item_data.setter_id
+    {other_setter_ids_clause}
     JOIN embeddings AS other_embeddings
         ON other_item_data.id = other_embeddings.id
         AND other_embeddings.id != main_embeddings.id
@@ -96,9 +119,10 @@ def find_similar_items(
     LIMIT ?;
     """
 
-    cursor = conn.execute(
-        query, (item_id, setter_id, item_id, setter_id, limit)
-    )
+    parameters.append(limit)
+
+    # Step 5: Execute the query
+    cursor = conn.execute(query, tuple(parameters))
 
     similar_items = cursor.fetchall()
 
