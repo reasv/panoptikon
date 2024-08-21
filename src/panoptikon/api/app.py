@@ -10,6 +10,8 @@ from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 
 import inferio
+import panoptikon.api.routers.bookmarks as bookmarks
+import panoptikon.api.routers.items as items
 import panoptikon.api.routers.legacy as legacy
 import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
@@ -37,10 +39,6 @@ def cronjob():
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-app.include_router(inferio.router)
-app.include_router(search.router)
 
 if os.getenv("LEGACY_GALLERY", "false").lower() == "true":
     app.include_router(legacy.router)
@@ -147,3 +145,9 @@ def show_in_file_manager(
     msg = open_in_explorer(path)
 
     return OpenResponse(path=path, message=msg)
+
+
+app.include_router(search.router)
+app.include_router(items.router)
+app.include_router(bookmarks.router)
+app.include_router(inferio.router)
