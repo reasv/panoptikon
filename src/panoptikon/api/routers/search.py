@@ -218,7 +218,7 @@ def get_top_tags(
 
 @router.get(
     "/tags",
-    summary="Find a tag from a substring for autocompletion",
+    summary="Search tag names for autocompletion",
     description="""
     Given a string, finds tags whose names contain the string.
     Meant to be used for autocompletion in the search bar.
