@@ -74,6 +74,12 @@ Without any other search criteria, this is effectively just another way to brows
 ## Adding more models
 See `config/inference/example.toml` for examples on how to add custom models from Hugging Face to Panoptikon.
 
+## REST API
+Panoptikon has a REST API that can be used to interact with the search and bookmarking functionality programmatically, as well as to retrieve the indexed data and its associated metadata.
+The API is documented in the OpenAPI format. The interactive documentation can be accessed at `/docs` when running Panoptikon, for example `http://127.0.0.1:6342/docs` by default.
+API endpoints support specifying the name of the index and user_data databases to use, regardless of what databases are specified in environment variables (see below).
+This is done through the `index_db` and `user_data_db` query parameters. If not specified, the databases specified in environment variables are used by default.
+
 ## Environment variables and config
 Aside from the inference config, which uses TOML, and the configuration saved in the SQLite database, which can be modified through the UI, Panoptikon accepts environment variables as config options.
 Panoptikon uses dotenv, so you can create a file called `.env` in this directory with all the environment variables and their values and it will be automatically applied at runtime.
