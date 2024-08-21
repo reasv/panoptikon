@@ -1,13 +1,18 @@
 import logging
 import os
 import sqlite3
-from typing import List
+from typing import List, Tuple
 
 from panoptikon.db import get_item_id
 from panoptikon.db.rules.build_filters import build_multirule_query
 from panoptikon.db.rules.rules import get_rules_for_setter
 from panoptikon.db.utils import pretty_print_SQL
-from panoptikon.types import FileRecord, FileScanData, FileScanRecord
+from panoptikon.types import (
+    FileRecord,
+    FileScanData,
+    FileScanRecord,
+    ItemRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -465,3 +470,68 @@ def get_file_stats(
     total_items = cursor.fetchone()[0]
 
     return total_files, total_items
+
+
+def get_item_metadata_by_sha256(
+    conn: sqlite3.Connection, sha256: str
+) -> Tuple[ItemRecord, List[FileRecord]] | Tuple[None, None]:
+    cursor = conn.cursor()
+    # SQL query to retrieve the item by sha256
+    query = """
+    SELECT
+        id,
+        sha256,
+        md5,
+        type,
+        size,
+        width,
+        height,
+        duration,
+        audio_tracks,
+        video_tracks,
+        subtitle_tracks,
+        time_added
+    FROM items
+    WHERE sha256 = ?
+    """
+    cursor.execute(query, (sha256,))
+    row = cursor.fetchone()
+
+    # Close the database connection
+    conn.close()
+
+    # If the row exists, convert it to a dataclass
+    if not row:
+        return None, None
+
+    item_record = ItemRecord(
+        id=row[0],
+        sha256=row[1],
+        md5=row[2],
+        type=row[3],
+        size=row[4],
+        width=row[5],
+        height=row[6],
+        duration=row[7],
+        audio_tracks=row[8],
+        video_tracks=row[9],
+        subtitle_tracks=row[10],
+        time_added=row[11],
+    )
+
+    cursor.execute(
+        """
+    SELECT path, last_modified
+    FROM files
+    WHERE sha256 = ?
+    ORDER BY available DESC
+    """,
+        (sha256,),
+    )
+    files: List[FileRecord] = []
+    while row := cursor.fetchone():
+        path, last_modified = row
+        if os.path.exists(path):
+            files.append(FileRecord(sha256, path, last_modified))
+
+    return item_record, files

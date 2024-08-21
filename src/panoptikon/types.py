@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
     from panoptikon.data_extractors.models import ModelOpts
@@ -16,6 +16,22 @@ class ItemScanMeta:
     audio_tracks: int | None = None
     video_tracks: int | None = None
     subtitle_tracks: int | None = None
+
+
+@dataclass
+class ItemRecord:
+    id: int
+    sha256: str
+    md5: str
+    type: str
+    size: Optional[int]
+    width: Optional[int]
+    height: Optional[int]
+    duration: Optional[float]
+    audio_tracks: Optional[int]
+    video_tracks: Optional[int]
+    subtitle_tracks: Optional[int]
+    time_added: str
 
 
 @dataclass
