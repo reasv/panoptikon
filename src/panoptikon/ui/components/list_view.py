@@ -7,10 +7,9 @@ from typing import Dict, List
 import gradio as gr
 
 from panoptikon.db import get_database_connection
-from panoptikon.db.tags import (
-    get_all_tags_for_item,
-    get_all_tags_for_item_name_confidence,
-)
+from panoptikon.db.embeddings import find_similar_items
+from panoptikon.db.extraction_log import get_existing_setters
+from panoptikon.db.tags import get_all_tags_for_item
 from panoptikon.types import FileSearchResult
 from panoptikon.ui.components.bookmark_folder_selector import (
     create_bookmark_folder_chooser,
@@ -260,6 +259,83 @@ def create_image_list(
                         ],
                         outputs=[tag_list, tag_rating, tag_characters],
                     )
+                with gr.Tab(label="Similar Items") as tab_similar_images:
+                    embedding_model = gr.Dropdown(
+                        label="Embedding Model (Similarity)",
+                        choices=[],
+                        multiselect=False,
+                        interactive=True,
+                    )
+
+                    def get_embedding_models():
+                        conn = get_database_connection(write_lock=False)
+                        setters = get_existing_setters(conn)
+                        conn.close()
+                        return gr.Dropdown(
+                            choices=[
+                                setter
+                                for type, setter in setters
+                                if type in ["clip", "text-embedding"]
+                            ]
+                        )
+
+                    tab_similar_images.select(
+                        fn=get_embedding_models,
+                        outputs=[embedding_model],
+                    )
+
+                    max_results = gr.Slider(
+                        label="Max Results",
+                        minimum=1,
+                        maximum=100,
+                        step=1,
+                        value=5,
+                        interactive=True,
+                    )
+
+                    @gr.render(
+                        triggers=[
+                            selected_files.change,
+                            embedding_model.select,
+                            max_results.release,
+                        ],
+                        inputs=[selected_files, embedding_model, max_results],
+                    )
+                    def render_similar_items(
+                        selected_files: List[FileSearchResult],
+                        embedding_model: str,
+                        max_results: int,
+                    ):
+                        if len(selected_files) == 0 or not embedding_model:
+                            return
+                        selected_file = selected_files[0]
+                        conn = get_database_connection(write_lock=False)
+                        similar_items = find_similar_items(
+                            conn,
+                            selected_file.sha256,
+                            setter_name=embedding_model,
+                            limit=max_results,
+                        )
+
+                        for result in similar_items:
+                            res_img = gr.Image(
+                                key=result.sha256,
+                                value=result.path,
+                                label=result.path,
+                            )
+                            open_in_fm = gr.Button(
+                                "Open in File Manager",
+                                key=f"open_in_fm_{result.sha256}",
+                                interactive=True,
+                                scale=3,
+                            )
+
+                            @open_in_fm.click
+                            def open_in_file_manager():
+                                open_in_explorer(result.path)
+
+                        conn.close()
+
             selected_image_path = gr.Textbox(
                 value="",
                 label="Last Selected Image",
