@@ -101,7 +101,13 @@ def get_correct_path(conn: sqlite3.Connection, sha256: str, path: str):
         path = path.strip()
         _, files = get_item_metadata_by_sha256(conn, sha256)
         if not files or not any(f.path == path for f in files):
-            raise HTTPException(status_code=404, detail="File not found")
+            logger.debug(
+                f"File {path} not found in {', '.join([f.path for f in (files or [])])}"
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=f"File {path} not found in {', '.join([f.path for f in (files or [])])}",
+            )
     return path
 
 
