@@ -1,9 +1,9 @@
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from regex import B
 
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import get_database_connection
@@ -20,7 +20,7 @@ from panoptikon.db.tagstats import (
     get_min_tag_confidence,
     get_most_common_tags_frequency,
 )
-from panoptikon.types import FileSearchResult
+from panoptikon.types import ExtractedTextStats, FileSearchResult
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -114,24 +114,34 @@ class SearchQueryModel(BaseModel):
     check_path: bool = False
 
 
-def process_results(results: List[Tuple[FileSearchResult, int]]):
+@dataclass
+class FileSearchResultModel:
+    count: int
+    results: List[FileSearchResult]
+
+
+def process_results(
+    results: List[Tuple[FileSearchResult, int]]
+) -> FileSearchResultModel:
     if len(results) == 0:
-        return {"count": 0, "results": []}
-    return {
-        "count": results[0][1],
-        "results": [res for res, _ in results if res],
-    }
+        return FileSearchResultModel(count=0, results=[])
+    return FileSearchResultModel(
+        count=results[0][1], results=[r[0] for r in results]
+    )
 
 
 @router.get(
     "/",
     summary="Search for files in the database",
     description="""
-    Search for files in the database based on the provided query parameters.
-    The search query takes a `SearchQuery` object as input, which contains all the parameters supported by search.
-    Search operates on `files`, which means that results are not unique by `sha256` value.
+Search for files in the database based on the provided query parameters.
+The search query takes a `SearchQuery` object as input, which contains all the parameters supported by search.
+Search operates on `files`, which means that results are not unique by `sha256` value.
+The `count` returned in the response is the total number of unique files that match the query.
+There could be zero results even if the `count` is higher than zero,
+if the `page` parameter is set beyond the number of pages available.
     """,
-    response_model=Dict[str, Union[int, List[FileSearchResult]]],
+    response_model=FileSearchResultModel,
 )
 def search(data: SearchQueryModel = Depends()):
     conn = get_database_connection(write_lock=False)
@@ -139,15 +149,39 @@ def search(data: SearchQueryModel = Depends()):
     return process_results(results)
 
 
+@dataclass
+class TagStats:
+    namespaces: List[str]
+    min_confidence: float
+
+
+@dataclass
+class FileStats:
+    total: int
+    unique: int
+    mime_types: List[str]
+
+
+@dataclass
+class APISearchStats:
+    setters: List[Tuple[str, str]]
+    bookmarks: List[str]
+    files: FileStats
+    tags: TagStats
+    folders: List[str]
+    text_stats: ExtractedTextStats
+
+
 @router.get(
     "/stats",
     summary="Get statistics on the searchable data",
     description="""
-    Get statistics on the data indexed in the database.
-    This includes information about the tag namespaces, bookmark namespaces, file types, and folders present.
-    Most importantly, it includes the list of currently existing setters for each data type.
-    This information is relevant for building search queries.
+Get statistics on the data indexed in the database.
+This includes information about the tag namespaces, bookmark namespaces, file types, and folders present.
+Most importantly, it includes the list of currently existing setters for each data type.
+This information is relevant for building search queries.
     """,
+    response_model=APISearchStats,
 )
 def get_stats(conn=Depends(get_db_readonly), user: Optional[str] = Query(None)):
     setters = get_existing_setters(conn)
@@ -165,38 +199,38 @@ def get_stats(conn=Depends(get_db_readonly), user: Optional[str] = Query(None)):
     min_tags_threshold = get_min_tag_confidence(conn)
     text_stats = get_text_stats(conn)
     files, items = get_file_stats(conn)
-    return {
-        "setters": setters,
-        "bookmarks": bookmark_namespaces,
-        "files": {
-            "total": files,
-            "unique": items,
-            "mime_types": file_types,
-        },
-        "tags": {
-            "namespaces": tag_namespaces,
-            "min_confidence": min_tags_threshold,
-        },
-        "folders": folders,
-        "text_stats": text_stats,
-    }
+    return APISearchStats(
+        setters=setters,
+        bookmarks=bookmark_namespaces,
+        files=FileStats(total=items, unique=files, mime_types=file_types),
+        tags=TagStats(
+            namespaces=tag_namespaces, min_confidence=min_tags_threshold
+        ),
+        folders=folders,
+        text_stats=text_stats,
+    )
+
+
+@dataclass
+class TagFrequency:
+    tags: List[Tuple[str, str, int, float]]
 
 
 @router.get(
     "/tags/top",
     summary="Get the most common tags in the database",
     description="""
-    Get the most common tags in the database, based on the provided query parameters.
-    The result is a list of tuples, where each tuple contains the namespace, tag name, 
-    occurrences count, and relative frequency % (occurrences / total item_setter pairs).
-    The latter value is expressed as a float between 0 and 1.
-    The tags are returned in descending order of frequency.
-    The `limit` parameter can be used to control the number of tags to return.
-    The `namespace` parameter can be used to restrict the search to a specific tag namespace.
-    The `setters` parameter can be used to restrict the search to specific setters.
-    The `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.
+Get the most common tags in the database, based on the provided query parameters.
+The result is a list of tuples, where each tuple contains the namespace, tag name, 
+occurrences count, and relative frequency % (occurrences / total item_setter pairs).
+The latter value is expressed as a float between 0 and 1.
+The tags are returned in descending order of frequency.
+The `limit` parameter can be used to control the number of tags to return.
+The `namespace` parameter can be used to restrict the search to a specific tag namespace.
+The `setters` parameter can be used to restrict the search to specific setters.
+The `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.
     """,
-    response_model=Dict[str, List[Tuple[str, str, int, float]]],
+    response_model=TagFrequency,
 )
 def get_top_tags(
     conn=Depends(get_db_readonly),
@@ -205,28 +239,34 @@ def get_top_tags(
     confidence_threshold: Optional[float] = Query(None),
     limit: int = Query(10),
 ):
-    return {
-        "tags": get_most_common_tags_frequency(
+    return TagFrequency(
+        tags=get_most_common_tags_frequency(
             conn,
             namespace=namespace,
             setters=setters,
             confidence_threshold=confidence_threshold,
             limit=limit,
         )
-    }
+    )
+
+
+@dataclass
+class TagSearchResults:
+    tags: List[Tuple[str, str, int]]
 
 
 @router.get(
     "/tags",
     summary="Search tag names for autocompletion",
     description="""
-    Given a string, finds tags whose names contain the string.
-    Meant to be used for autocompletion in the search bar.
-    The `limit` parameter can be used to control the number of tags to return.
-    Returns a list of tuples, where each tuple contains the namespace, name, 
-    and the number of unique items tagged with the tag.
-    The tags are returned in descending order of the number of items tagged.
+Given a string, finds tags whose names contain the string.
+Meant to be used for autocompletion in the search bar.
+The `limit` parameter can be used to control the number of tags to return.
+Returns a list of tuples, where each tuple contains the namespace, name, 
+and the number of unique items tagged with the tag.
+The tags are returned in descending order of the number of items tagged.
     """,
+    response_model=TagSearchResults,
 )
 def get_tags(
     name: str = Query(...),
@@ -235,4 +275,4 @@ def get_tags(
 ):
     tags = find_tags(conn, name, limit)
     tags.sort(key=lambda x: x[2], reverse=True)
-    return {"tags": tags}
+    return TagSearchResults(tags)
