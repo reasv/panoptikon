@@ -4,6 +4,7 @@ import logging
 from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
+from click import File
 from fastapi import APIRouter, Body, Depends, Query
 from librosa import ex
 from pydantic import BaseModel, Field
@@ -13,6 +14,7 @@ from inferio.impl.utils import deserialize_array
 from panoptikon.api.routers.search_types import SearchQueryModel
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db.bookmarks import get_all_bookmark_namespaces
+from panoptikon.db.embeddings import find_similar_items
 from panoptikon.db.extracted_text import get_text_stats
 from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
@@ -235,3 +237,40 @@ def get_tags(
     tags = find_tags(conn, name, limit)
     tags.sort(key=lambda x: x[2], reverse=True)
     return TagSearchResults(tags)
+
+
+@router.get(
+    "/similar/{sha256}",
+    summary="Find similar items in the database",
+    description="""
+Find similar items in the database based on the provided SHA256 and setter name.
+The search is based on the image or text embeddings of the provided item.
+
+The count value in the response is equal to the number of items returned, rather than the total number of similar items in the database.
+This is because there is no way to define what constitutes a "similar" item in a general sense. We just return the top N items that are most similar to the provided item.
+
+The setter name refers to the model that produced the embeddings.
+You can find a list of available values for this parameter using the /api/search/stats endpoint.
+Any setters of type "text-embedding" or "clip" can be used for this search.
+
+The `limit` parameter can be used to control the number of similar items to return.
+
+"text" embeddings are derived from text produced by another model, such as an OCR model or a tagger.
+You can restrict the search to embeddings derived from text that was produced by one of a list of specific models by providing the `src_setter_names` parameter.
+You can find a list of available values for this parameter using the /api/search/stats endpoint, specifically any setter of type "text" will work.
+Remember that tagging models also produce text by concatenating the tags, and are therefore also returned as "text" models by the stats endpoint.
+Restricting similarity to a tagger model or a set of tagger models is recommended for item similarity search based on text embeddings.
+    """,
+    response_model=FileSearchResultModel,
+)
+def find_similar(
+    sha256: str,
+    setter_name: str,
+    src_setter_names: Optional[List[str]] = Query(None),
+    limit: int = Query(10),
+    conn=Depends(get_db_readonly),
+):
+    results = list(
+        find_similar_items(conn, sha256, setter_name, src_setter_names, limit)
+    )
+    return FileSearchResultModel(count=len(results), results=results)
