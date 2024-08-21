@@ -497,9 +497,6 @@ def get_item_metadata_by_sha256(
     cursor.execute(query, (sha256,))
     row = cursor.fetchone()
 
-    # Close the database connection
-    conn.close()
-
     # If the row exists, convert it to a dataclass
     if not row:
         return None, None

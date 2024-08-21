@@ -113,14 +113,14 @@ def get_tag_frequency_by_ids(
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT tag_id, COUNT(DICTINCT item_id)
+        SELECT tag_id, COUNT(DISTINCT item_id)
         FROM tags_items
         JOIN item_data
             ON tags_items.item_data_id = item_data.id
         WHERE tag_id IN ({', '.join(['?'] * len(ids))})
         GROUP BY tag_id
         """,
-        (ids,),
+        (ids),
     )
     # Return a mapping from tag_id to frequency
     return dict(cursor.fetchall())
