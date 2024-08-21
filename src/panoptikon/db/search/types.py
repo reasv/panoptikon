@@ -131,11 +131,3 @@ class SearchQuery:
     order_args: OrderParams = field(default_factory=OrderParams)
     count: bool = True
     check_path: bool = False
-
-
-@pydantic_dataclass
-class SearchQueryModel:
-    query: QueryParams = Field(default_factory=QueryParams)
-    order_args: OrderParams = Field(default_factory=OrderParams)
-    count: bool = True
-    check_path: bool = False
