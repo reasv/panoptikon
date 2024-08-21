@@ -111,7 +111,7 @@ def get_correct_path(conn: sqlite3.Connection, sha256: str, path: str):
     return path
 
 
-@app.get(
+@app.post(
     "/api/open/file/{sha256}",
     summary="Open a file in the default application",
     description="""
@@ -131,7 +131,7 @@ def open_file_on_host(
     return OpenResponse(path=path, message=msg)
 
 
-@app.get(
+@app.post(
     "/api/open/folder/{sha256}",
     summary="Show a file in the host system's file manager",
     description="""
