@@ -2,7 +2,7 @@ import sqlite3
 from typing import List, Optional
 
 from panoptikon.db.utils import serialize_f32
-from panoptikon.types import OutputDataType
+from panoptikon.types import FileSearchResult, OutputDataType
 
 
 def add_embedding(
@@ -38,7 +38,7 @@ def find_similar_items(
     setter_name: str,
     src_setter_names: Optional[List[str]] = None,
     limit: int = 10,
-) -> List[int]:
+) -> List[FileSearchResult]:
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
     query = """
     SELECT 
@@ -96,11 +96,12 @@ def find_similar_items(
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
-    # Step 4: Construct the main query with dynamic filtering
     query = f"""
     SELECT 
-        other_item_data.item_id AS similar_item_id,
-        MIN({distance_function}) AS min_distance
+        files.path AS path,
+        items.sha256 AS sha256,
+        items.time_added AS last_modified,
+        items.type AS type
     FROM embeddings AS main_embeddings
     JOIN item_data AS main_item_data
         ON main_embeddings.id = main_item_data.id
@@ -114,8 +115,10 @@ def find_similar_items(
     JOIN embeddings AS other_embeddings
         ON other_item_data.id = other_embeddings.id
         AND other_embeddings.id != main_embeddings.id
+    JOIN items ON other_item_data.item_id = items.id
+    JOIN files ON files.item_id = items.id
     GROUP BY other_item_data.item_id
-    ORDER BY min_distance ASC
+    ORDER BY MIN({distance_function}) ASC
     LIMIT ?;
     """
 
@@ -124,7 +127,13 @@ def find_similar_items(
     # Step 5: Execute the query
     cursor = conn.execute(query, tuple(parameters))
 
-    similar_items = cursor.fetchall()
+    # Step 6: Fetch results and create a list of FileSearchResult objects
+    results = cursor.fetchall()
+    file_search_results = [
+        FileSearchResult(
+            path=row[0], sha256=row[1], last_modified=row[2], type=row[3]
+        )
+        for row in results
+    ]
 
-    # Extract and return the item_ids
-    return [item_id for item_id, _ in similar_items]
+    return file_search_results
