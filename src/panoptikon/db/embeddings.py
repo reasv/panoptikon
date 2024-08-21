@@ -1,6 +1,8 @@
+import os
 import sqlite3
 from typing import List, Optional
 
+from panoptikon.db.files import get_existing_file_for_sha256
 from panoptikon.db.utils import serialize_f32
 from panoptikon.types import FileSearchResult, OutputDataType
 
@@ -100,7 +102,7 @@ def find_similar_items(
     SELECT 
         files.path AS path,
         items.sha256 AS sha256,
-        items.time_added AS last_modified,
+        files.last_modified,
         items.type AS type
     FROM embeddings AS main_embeddings
     JOIN item_data AS main_item_data
@@ -135,5 +137,15 @@ def find_similar_items(
         )
         for row in results
     ]
+    existing_results = []
+    for result in file_search_results:
+        if not os.path.exists(result.path):
+            file_record = get_existing_file_for_sha256(conn, result.sha256)
+            if file_record:
+                result.path = file_record.path
+                result.last_modified = file_record.last_modified
+                existing_results.append(result)
+        else:
+            existing_results.append(result)
 
     return file_search_results
