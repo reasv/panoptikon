@@ -100,6 +100,16 @@ def has_thumbnail(
 def get_thumbnail(
     conn: sqlite3.Connection, sha256: str, idx: int
 ) -> PILImage.Image | None:
+    thumbnail_data = get_thumbnail_bytes(conn, sha256, idx)
+    if not thumbnail_data:
+        return None
+    thumbnail = PILImage.open(io.BytesIO(thumbnail_data))
+    return thumbnail
+
+
+def get_thumbnail_bytes(
+    conn: sqlite3.Connection, sha256: str, idx: int
+) -> bytes | None:
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -112,8 +122,7 @@ def get_thumbnail(
     result = cursor.fetchone()
     if result:
         thumbnail_data = result[0]
-        thumbnail = PILImage.open(io.BytesIO(thumbnail_data))
-        return thumbnail
+        return thumbnail_data
     else:
         return None
 
