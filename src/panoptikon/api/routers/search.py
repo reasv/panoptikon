@@ -1,26 +1,30 @@
+import base64
+import io
 import logging
 from typing import List, Literal, Optional, Tuple, Union
 
+import numpy as np
 from fastapi import APIRouter, Body, Depends, Query
+from librosa import ex
 from pydantic import BaseModel, Field
 from pydantic.dataclasses import dataclass
 
+from inferio.impl.utils import deserialize_array
 from panoptikon.api.routers.search_types import SearchQueryModel
 from panoptikon.api.routers.utils import get_db_readonly
-from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_all_bookmark_namespaces
 from panoptikon.db.extracted_text import get_text_stats
 from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.db.search import search_files
-from panoptikon.db.search.types import OrderByType, OrderType, SearchQuery
-from panoptikon.db.search.utils import from_dict
+from panoptikon.db.search.types import SearchQuery
 from panoptikon.db.tags import find_tags, get_all_tag_namespaces
 from panoptikon.db.tagstats import (
     get_min_tag_confidence,
     get_most_common_tags_frequency,
 )
+from panoptikon.db.utils import serialize_f32
 from panoptikon.types import ExtractedTextStats, FileSearchResult
 
 logger = logging.getLogger(__name__)
@@ -47,16 +51,43 @@ def process_results(
     )
 
 
+def deserialize_array(buffer: bytes) -> np.ndarray:
+    bio = io.BytesIO(buffer)
+    bio.seek(0)
+    return np.load(bio, allow_pickle=False)
+
+
+def extract_embeddings(buffer: bytes) -> bytes:
+    numpy_array = deserialize_array(base64.b64decode(buffer))
+    assert isinstance(
+        numpy_array, np.ndarray
+    ), "Expected a numpy array for embeddings"
+    # Check the number of dimensions
+    if len(numpy_array.shape) == 1:
+        # If it is a 1D array, it is a single embedding
+        return serialize_f32(numpy_array.tolist())
+    # If it is a 2D array, it is a list of embeddings, get the first one
+    return serialize_f32(numpy_array[0].tolist())
+
+
 @router.post(
     "/",
     summary="Search for files in the database",
     description="""
 Search for files in the database based on the provided query parameters.
+
 The search query takes a `SearchQuery` object as input, which contains all the parameters supported by search.
 Search operates on `files`, which means that results are not unique by `sha256` value.
 The `count` returned in the response is the total number of unique files that match the query.
 There could be zero results even if the `count` is higher than zero,
 if the `page` parameter is set beyond the number of pages available.
+
+For semantic search, embeddings should be provided as base64-encoded byte strings in npy format.
+To get the correct embeddings, use the /api/inference/predict endpoint with the correct inference_id.
+
+It will return an application/octet-stream response with the embeddings in the correct format, which can be base64-encoded and used in the search query.
+
+To get the list of embedding models the data is indexed with, use /api/search/stats and look for setters with "text-embedding" or "clip" type.
     """,
     response_model=FileSearchResultModel,
 )
@@ -65,6 +96,14 @@ def search(
     conn=Depends(get_db_readonly),
 ):
     logger.debug(f"Searching for files with query: {data}")
+    if data.query.filters.image_embeddings:
+        query = data.query.filters.image_embeddings.query
+        data.query.filters.image_embeddings.query = extract_embeddings(query)
+    if data.query.filters.extracted_text_embeddings:
+        query = data.query.filters.extracted_text_embeddings.query
+        data.query.filters.extracted_text_embeddings.query = extract_embeddings(
+            query
+        )
     results = list(search_files(conn, data))
     return process_results(results)
 
