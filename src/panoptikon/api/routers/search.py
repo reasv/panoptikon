@@ -27,7 +27,11 @@ from panoptikon.db.tagstats import (
     get_most_common_tags_frequency,
 )
 from panoptikon.db.utils import serialize_f32
-from panoptikon.types import ExtractedTextStats, FileSearchResult
+from panoptikon.types import (
+    ExtractedTextStats,
+    FileSearchResult,
+    OutputDataType,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -125,7 +129,7 @@ class FileStats:
 
 @dataclass
 class APISearchStats:
-    setters: List[Tuple[str, str]]
+    setters: List[Tuple[OutputDataType, str]]
     bookmarks: List[str]
     files: FileStats
     tags: TagStats

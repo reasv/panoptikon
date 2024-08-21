@@ -311,7 +311,7 @@ def get_items_missing_data_extraction(
 
 def get_existing_setters(
     conn: sqlite3.Connection,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[OutputDataType, str]]:
     """
     Returns all the currently existing (type, setter) pairs
 
