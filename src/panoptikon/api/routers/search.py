@@ -1,9 +1,9 @@
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
+from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import get_database_connection
@@ -143,7 +143,7 @@ if the `page` parameter is set beyond the number of pages available.
     """,
     response_model=FileSearchResultModel,
 )
-def search(data: SearchQueryModel = Depends()):
+def search(data: SearchQueryModel = Body(...)):
     conn = get_database_connection(write_lock=False)
     results = list(search_files(conn, from_dict(SearchQuery, data.__dict__)))
     return process_results(results)

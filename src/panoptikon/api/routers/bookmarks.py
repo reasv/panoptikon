@@ -1,11 +1,10 @@
 import logging
 import sqlite3
-from dataclasses import dataclass
-from re import M
 from typing import Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel
+from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly, get_db_user_data_wl
 from panoptikon.db.bookmarks import (

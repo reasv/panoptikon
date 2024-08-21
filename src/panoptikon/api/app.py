@@ -4,10 +4,10 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import List
 
-from attr import dataclass
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
+from pydantic.dataclasses import dataclass
 
 import inferio
 import panoptikon.api.routers.bookmarks as bookmarks

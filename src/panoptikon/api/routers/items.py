@@ -1,13 +1,13 @@
 import io
 import logging
 import sqlite3
-from dataclasses import dataclass
 from typing import List, Tuple
 
 import PIL
 import PIL.Image
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
+from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db.extracted_text import get_extracted_text_for_item
