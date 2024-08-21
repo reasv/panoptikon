@@ -64,7 +64,7 @@ def get_item_by_sha256(
 
 
 @router.get(
-    "/from_path/{path}",
+    "/from-path/{path}",
     summary="Get item metadata from a path",
     description="""
 Returns metadata for a given item from its original file path.
