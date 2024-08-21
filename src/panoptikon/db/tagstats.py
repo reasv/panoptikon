@@ -1,5 +1,7 @@
 import sqlite3
-from typing import List
+from typing import Dict, List
+
+from regex import D
 
 
 def get_most_common_tags(
@@ -103,3 +105,22 @@ def get_min_tag_confidence(conn: sqlite3.Connection) -> float:
         return res[0]
     else:
         return 0.0
+
+
+def get_tag_frequency_by_ids(
+    conn: sqlite3.Connection, ids: List[int]
+) -> Dict[int, int]:
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT tag_id, COUNT(DICTINCT item_id)
+        FROM tags_items
+        JOIN item_data
+            ON tags_items.item_data_id = item_data.id
+        WHERE tag_id IN ({', '.join(['?'] * len(ids))})
+        GROUP BY tag_id
+        """,
+        (ids,),
+    )
+    # Return a mapping from tag_id to frequency
+    return dict(cursor.fetchall())

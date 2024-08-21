@@ -1,8 +1,7 @@
 import sqlite3
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
-from panoptikon.db import get_item_id
-from panoptikon.db.setters import upsert_setter
+from panoptikon.db.tagstats import get_tag_frequency_by_ids
 
 
 def upsert_tag(
@@ -138,3 +137,34 @@ def get_all_tag_namespaces(conn: sqlite3.Connection):
     namespaces += list(namespace_prefixes)
     namespaces.sort()
     return namespaces
+
+
+def find_tags(
+    conn: sqlite3.Connection,
+    name: str,
+    limit: int = 10,
+) -> List[Tuple[str, str, int]]:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT id, namespace, name
+    FROM tags
+    WHERE name LIKE ?
+    LIMIT ?
+    """,
+        (f"%{name}%", limit),
+    )
+    # Generate a mapping from tag ID to namespace, name
+    tags = cursor.fetchall()
+    id_to_tag: Dict[int, Tuple[str, str]] = {
+        tag[0]: (tag[1], tag[2]) for tag in tags
+    }
+    tags_with_frequency = get_tag_frequency_by_ids(conn, list(id_to_tag.keys()))
+    return [
+        (
+            id_to_tag[tag_id][0],
+            id_to_tag[tag_id][1],
+            tags_with_frequency[tag_id],
+        )
+        for tag_id in tags_with_frequency
+    ]

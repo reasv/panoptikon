@@ -1,22 +1,13 @@
 import logging
-import sqlite3
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
-from fastapi import APIRouter, Body, Depends, Query
-from httpx import delete
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from pydantic.dataclasses import dataclass as pydantic_dataclass
 from regex import B
 
-from panoptikon.api.routers.utils import get_db_readonly, get_db_user_data_wl
-from panoptikon.db import get_database_connection, get_db_lists, get_db_names
-from panoptikon.db.bookmarks import (
-    add_bookmark,
-    delete_bookmarks_exclude_last_n,
-    get_all_bookmark_namespaces,
-    get_bookmarks,
-    remove_bookmark,
-)
+from panoptikon.api.routers.utils import get_db_readonly
+from panoptikon.db import get_database_connection
+from panoptikon.db.bookmarks import get_all_bookmark_namespaces
 from panoptikon.db.extracted_text import get_text_stats
 from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
@@ -24,7 +15,7 @@ from panoptikon.db.folders import get_folders_from_database
 from panoptikon.db.search import search_files
 from panoptikon.db.search.types import OrderByType, OrderType, SearchQuery
 from panoptikon.db.search.utils import from_dict
-from panoptikon.db.tags import get_all_tag_namespaces
+from panoptikon.db.tags import find_tags, get_all_tag_namespaces
 from panoptikon.db.tagstats import (
     get_min_tag_confidence,
     get_most_common_tags_frequency,
@@ -150,10 +141,10 @@ def search(data: SearchQueryModel = Depends()):
 
 @router.get(
     "/stats",
-    summary="Get statistics about the searchable data",
+    summary="Get statistics on the searchable data",
     description="""
-    Get statistics about the searchable data in the database.
-    This includes information about the tag namespaces, bookmark namespaces, file types, and folders in the database.
+    Get statistics on the data indexed in the database.
+    This includes information about the tag namespaces, bookmark namespaces, file types, and folders present.
     Most importantly, it includes the list of currently existing setters for each data type.
     This information is relevant for building search queries.
     """,
@@ -225,6 +216,23 @@ def get_top_tags(
     }
 
 
-@router.get("/tags")
-def get_tags(conn=Depends(get_db_readonly)):
-    return get_existing_setters(conn)
+@router.get(
+    "/tags",
+    summary="Find a tag from a substring for autocompletion",
+    description="""
+    Given a string, finds tags whose names contain the string.
+    Meant to be used for autocompletion in the search bar.
+    The `limit` parameter can be used to control the number of tags to return.
+    Returns a list of tuples, where each tuple contains the namespace, name, 
+    and the number of unique items tagged with the tag.
+    The tags are returned in descending order of the number of items tagged.
+    """,
+)
+def get_tags(
+    name: str = Query(...),
+    limit: int = Query(10),
+    conn=Depends(get_db_readonly),
+):
+    tags = find_tags(conn, name, limit)
+    tags.sort(key=lambda x: x[2], reverse=True)
+    return {"tags": tags}
