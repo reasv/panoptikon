@@ -76,8 +76,11 @@ See `config/inference/example.toml` for examples on how to add custom models fro
 
 ## REST API
 Panoptikon has a REST API that can be used to interact with the search and bookmarking functionality programmatically, as well as to retrieve the indexed data and its associated metadata.
+
 The API is documented in the OpenAPI format. The interactive documentation can be accessed at `/docs` when running Panoptikon, for example `http://127.0.0.1:6342/docs` by default.
+
 API endpoints support specifying the name of the index and user_data databases to use, regardless of what databases are specified in environment variables (see below).
+
 This is done through the `index_db` and `user_data_db` query parameters. If not specified, the databases specified in environment variables are used by default.
 
 ## Environment variables and config
