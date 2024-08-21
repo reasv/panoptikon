@@ -2,7 +2,7 @@ import io
 import logging
 import sqlite3
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import PIL
 import PIL.Image
@@ -10,12 +10,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 
 from panoptikon.api.routers.utils import get_db_readonly
+from panoptikon.db.extracted_text import get_extracted_text_for_item
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
 )
 from panoptikon.db.storage import get_thumbnail_bytes
-from panoptikon.types import FileRecord, ItemRecord
+from panoptikon.db.tags import get_all_tags_for_item
+from panoptikon.types import ExtractedText, FileRecord, ItemRecord
 from panoptikon.ui.components.utils import (
     create_placeholder_image_with_gradient,
 )
@@ -123,3 +125,55 @@ def get_thumbnail_by_sha256(
     gradient.save(img_byte_array, format="PNG")
     img_byte_array = img_byte_array.getvalue()
     return Response(content=img_byte_array, media_type="image/png")
+
+
+@dataclass
+class TextResponse:
+    text: List[ExtractedText]
+
+
+@router.get(
+    "/text/{sha256}",
+    summary="Get text extracted from an item by its sha256",
+    description="""
+Returns the text extracted from a given item by its sha256 hash.
+""",
+    response_model=TextResponse,
+)
+def get_text_by_sha256(
+    sha256: str,
+    setters: List[str] = Query([]),
+    conn: sqlite3.Connection = Depends(get_db_readonly),
+):
+    text = get_extracted_text_for_item(conn, sha256)
+    if setters:
+        text = [t for t in text if t.setter_name in setters]
+    return TextResponse(text=text)
+
+
+@dataclass
+class TagResponse:
+    tags: List[Tuple[str, str, float, str]]
+
+
+@router.get(
+    "/tags/{sha256}",
+    summary="Get tags for an item by its sha256",
+    description="""
+Returns the tags associated with a given item by its sha256 hash.
+The response contains a list of tuples, where each tuple contains
+the tag namespace, tag name, confidence, and setter name.
+The `setters` parameter can be used to filter tags by the setter name.
+The `confidence_threshold` parameter can be used to filter tags based on
+the minimum confidence threshold
+""",
+    response_model=TagResponse,
+)
+def get_tags_by_sha256(
+    sha256: str,
+    setters: List[str] = Query([]),
+    confidence_threshold: float = Query(0.0),
+    conn: sqlite3.Connection = Depends(get_db_readonly),
+):
+    tags = get_all_tags_for_item(conn, sha256, setters, confidence_threshold)
+    return TagResponse(tags=tags)

@@ -98,11 +98,24 @@ def get_tag_names_list(conn: sqlite3.Connection):
 
 
 def get_all_tags_for_item(
-    conn: sqlite3.Connection, sha256
+    conn: sqlite3.Connection,
+    sha256: str,
+    setters: List[str] = [],
+    confidence_threshold: float = 0.0,
 ) -> List[Tuple[str, str, float, str]]:
     cursor = conn.cursor()
+    setters_clause = (
+        f"AND setters.name IN ({','.join(['?']*len(setters))})"
+        if setters
+        else ""
+    )
+    confidence_clause = (
+        f"AND tags_items.confidence >= {confidence_threshold}"
+        if confidence_threshold
+        else ""
+    )
     cursor.execute(
-        """
+        f"""
     SELECT tags.namespace, tags.name, tags_items.confidence, setters.name
     FROM items
     JOIN item_data
@@ -114,9 +127,15 @@ def get_all_tags_for_item(
     JOIN setters 
         ON item_data.setter_id = setters.id
     WHERE items.sha256 = ?
+    {setters_clause}
+    {confidence_clause}
     ORDER BY tags_items.rowid
     """,
-        (sha256,),
+        (
+            sha256,
+            *(setters if setters else ()),
+            *((confidence_threshold,) if confidence_threshold else ()),
+        ),
     )
     tags = cursor.fetchall()
     return tags
