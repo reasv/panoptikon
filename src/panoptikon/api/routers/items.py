@@ -13,6 +13,7 @@ from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db.extracted_text import get_extracted_text_for_item
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
+    get_file_by_path,
     get_item_metadata_by_sha256,
 )
 from panoptikon.db.storage import get_thumbnail_bytes
@@ -45,6 +46,9 @@ Returns metadata for a given item by its sha256 hash.
 This includes the item metadata and a list of all files associated with the item.
 Files that do not exist on disk will not be included in the response.
 This means the file list may be empty.
+
+An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
+Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
     """,
     response_model=ItemMetadata,
 )
@@ -52,6 +56,32 @@ def get_item_by_sha256(
     sha256: str,
     conn: sqlite3.Connection = Depends(get_db_readonly),
 ):
+    item, files = get_item_metadata_by_sha256(conn, sha256)
+    if item is None or files is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return ItemMetadata(item=item, files=files)
+
+
+@router.get(
+    "/from_path/{path}",
+    summary="Get item metadata from a path",
+    description="""
+Returns metadata for a given item from its original file path.
+This includes the item metadata and a list of all files associated with the item.
+Files that do not exist on disk will not be included in the response.
+This means the file list may be empty.
+    """,
+    response_model=ItemMetadata,
+)
+def get_item_by_path(
+    path: str,
+    conn: sqlite3.Connection = Depends(get_db_readonly),
+):
+    file_record = get_file_by_path(conn, path)
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    sha256 = file_record.sha256
     item, files = get_item_metadata_by_sha256(conn, sha256)
     if item is None or files is None:
         raise HTTPException(status_code=404, detail="Item not found")
