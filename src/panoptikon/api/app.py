@@ -44,12 +44,6 @@ if os.getenv("LEGACY_GALLERY", "false").lower() == "true":
     app.include_router(legacy.router)
 
 
-# Redirect / to /gradio
-@app.get("/")
-async def redirect_to_gradio():
-    return RedirectResponse(url="/gradio/")
-
-
 @dataclass
 class SingleDBInfo:
     current: str
@@ -157,3 +151,9 @@ app.include_router(search.router)
 app.include_router(items.router)
 app.include_router(bookmarks.router)
 app.include_router(inferio.router)
+
+
+# Redirect / to /gradio
+@app.get("/")
+async def redirect_to_gradio():
+    return RedirectResponse(url="/gradio/")
