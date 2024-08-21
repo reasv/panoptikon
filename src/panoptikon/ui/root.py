@@ -36,5 +36,5 @@ def create_root_UI():
             create_scan_UI(ui)
             create_rule_config_UI(ui)
             # create_model_demo()
-            # create_query_UI()
+            create_query_UI()
     return ui
