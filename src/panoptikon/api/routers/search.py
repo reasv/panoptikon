@@ -5,6 +5,7 @@ from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
 from pydantic.dataclasses import dataclass
 
+from panoptikon.api.routers.search_types import SearchQueryModel
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_all_bookmark_namespaces
@@ -30,90 +31,6 @@ router = APIRouter(
 )
 
 
-class QueryTagFiltersModel(BaseModel):
-    pos_match_all: List[str] = Field(default_factory=list)
-    pos_match_any: List[str] = Field(default_factory=list)
-    neg_match_any: List[str] = Field(default_factory=list)
-    neg_match_all: List[str] = Field(default_factory=list)
-    all_setters_required: bool = False
-    setters: List[str] = Field(default_factory=list)
-    namespaces: List[str] = Field(default_factory=list)
-    min_confidence: Union[float, None] = None
-
-
-class OrderParamsModel(BaseModel):
-    order_by: OrderByType = "last_modified"
-    order: OrderType = None
-    page: int = 1
-    page_size: int = 10
-
-
-class ExtractedTextFilterModel(BaseModel):
-    query: str
-    targets: List[str] = Field(default_factory=list)
-    languages: List[str] = Field(default_factory=list)
-    language_min_confidence: Union[float, None] = None
-    min_confidence: Union[float, None] = None
-
-
-class ExtractedTextEmbeddingsFilterModel(BaseModel):
-    query: bytes
-    model: str
-    targets: List[str] = Field(default_factory=list)
-    languages: List[str] = Field(default_factory=list)
-    language_min_confidence: Union[float, None] = None
-    min_confidence: Union[float, None] = None
-
-
-class BookmarksFilterModel(BaseModel):
-    restrict_to_bookmarks: Literal[True] = True
-    namespaces: List[str] = Field(default_factory=list)
-
-
-class PathTextFilterModel(BaseModel):
-    query: str
-    only_match_filename: bool = False
-
-
-class AnyTextFilterModel(BaseModel):
-    path: Union[PathTextFilterModel, None] = None
-    extracted_text: Union[ExtractedTextFilterModel, None] = None
-
-
-class ImageEmbeddingFilterModel(BaseModel):
-    query: bytes
-    model: str
-
-
-class FileFiltersModel(BaseModel):
-    item_types: List[str] = Field(default_factory=list)
-    include_path_prefixes: List[str] = Field(default_factory=list)
-
-
-class QueryFiltersModel(BaseModel):
-    files: Union[FileFiltersModel, None] = None
-    path: Union[PathTextFilterModel, None] = None
-    extracted_text: Union[ExtractedTextFilterModel, None] = None
-    extracted_text_embeddings: Union[
-        ExtractedTextEmbeddingsFilterModel, None
-    ] = None
-    image_embeddings: Union[ImageEmbeddingFilterModel, None] = None
-    any_text: Union[AnyTextFilterModel, None] = None
-    bookmarks: Union[BookmarksFilterModel, None] = None
-
-
-class QueryParamsModel(BaseModel):
-    tags: QueryTagFiltersModel = Field(default_factory=QueryTagFiltersModel)
-    filters: QueryFiltersModel = Field(default_factory=QueryFiltersModel)
-
-
-class SearchQueryModel(BaseModel):
-    query: QueryParamsModel = Field(default_factory=QueryParamsModel)
-    order_args: OrderParamsModel = Field(default_factory=OrderParamsModel)
-    count: bool = True
-    check_path: bool = False
-
-
 @dataclass
 class FileSearchResultModel:
     count: int
@@ -130,7 +47,7 @@ def process_results(
     )
 
 
-@router.get(
+@router.post(
     "/",
     summary="Search for files in the database",
     description="""
@@ -143,9 +60,12 @@ if the `page` parameter is set beyond the number of pages available.
     """,
     response_model=FileSearchResultModel,
 )
-def search(data: SearchQueryModel = Body(...)):
-    conn = get_database_connection(write_lock=False)
-    results = list(search_files(conn, from_dict(SearchQuery, data.__dict__)))
+def search(
+    data: SearchQuery = Body(SearchQuery),
+    conn=Depends(get_db_readonly),
+):
+    logger.debug(f"Searching for files with query: {data}")
+    results = list(search_files(conn, data))
     return process_results(results)
 
 
