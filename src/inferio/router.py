@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi_utilities.repeat.repeat_every import repeat_every
+from pydantic.dataclasses import dataclass
 
 from inferio.impl.clip import ClipModel
 from inferio.impl.ocr import DoctrModel
@@ -34,7 +35,30 @@ router = APIRouter(
 )
 
 
-@router.post("/predict/{group}/{inference_id}")
+@router.post(
+    "/predict/{group}/{inference_id}",
+    summary="Run batch inference on a model by its `inference_id`",
+    description="""
+Runs batch inference on a model by its `inference_id` with the given inputs.
+
+Before inference, the model is loaded using the specified `cache_key`, LRU size, and TTL (in seconds).
+This is identical to calling `PUT /load/{group}/{inference_id}`, see the documentation on that endpoint for more details.
+
+Binary inputs are provided as multipart form data, structured inputs as JSON, the JSON string must be in the `data` form field.
+The JSON in the data field must be an object with an `inputs` key containing an array with the number of elements matching the size of the batch.
+Each element in the array can be a string, a dictionary, or null (in case that batch element only has binary input).
+
+A batch consists of multiple inputs, each of which can be a binary file or a structured input or both.
+Binary files are mapped to the structured input by their filename which must be an index corresponding to the index of a structured input in the JSON array.
+The exact format depends on the specific model being used.
+The output can be either a JSON object containing an array under the key "outputs", a multipart/mixed response for binary data,
+or a single application/octet-stream for a single binary output.
+
+Binary outputs are usually embeddings, which are provided in the npy format and can be loaded with numpy.load.
+
+See `inferio.client` for an example of how to use this endpoint, which is non-trivial due to the multipart form data input and output.
+""",
+)
 def predict(
     group: str,
     inference_id: str,
@@ -72,14 +96,40 @@ def predict(
     return encode_output_response(outputs)
 
 
-@router.put("/load/{group}/{inference_id}")
+@dataclass
+class StatusResponse:
+    status: str
+
+
+@router.put(
+    "/load/{group}/{inference_id}",
+    summary="Ensure a model is loaded into memory",
+    description="""
+Loads a model into memory with the specified `cache_key`, LRU size, and TTL (in seconds).
+As long as the model is present in at least one LRU cache, it will be kept in memory.
+
+Models are evicted from an LRU in four cases:
+
+- The LRU's size is exceeded when another load is attempted, causing the least recently used model(s) to be evicted
+- The model's TTL expires
+- The LRU is explicitly cleared by `cache_key` (see DELETE /cache/{cache_key})
+- The model is explicitly removed from the LRU (see DELETE /cache/{cache_key}/{group}/{inference_id})
+
+The model will be loaded into memory only if it is not already loaded.
+If the model is already loaded, the cache key, LRU size, and TTL will be updated.
+The LRU size is overridden any time a load request is made, which may evict models from the LRU when it is resized.
+
+A TTL of -1 means the model will never be unloaded due to TTL expiration. Other conditions still apply.
+    """,
+    response_model=StatusResponse,
+)
 def load_model(
     group: str,
     inference_id: str,
     cache_key: str,
     lru_size: int,
     ttl_seconds: int,
-) -> Dict[str, str]:
+):
     try:
         ModelManager().load_model(
             f"{group}/{inference_id}",
@@ -87,34 +137,65 @@ def load_model(
             lru_size,
             ttl_seconds,
         )
-        return {"status": "loaded"}
+        return StatusResponse(status="loaded")
     except Exception as e:
         logger.error(f"Failed to load model {inference_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to load model")
 
 
-@router.delete("/cache/{cache_key}/{group}/{inference_id}")
+@router.delete(
+    "/cache/{cache_key}/{group}/{inference_id}",
+    summary="Unload a model from memory",
+    description="""
+Removes a model from the LRU cache `cache_key`.
+Once a model is removed from all caches, it will be unloaded from memory.
+    """,
+    response_model=StatusResponse,
+)
 def unload_model(
     group: str,
     inference_id: str,
     cache_key: str,
-) -> Dict[str, str]:
+):
     ModelManager().unload_model(cache_key, f"{group}/{inference_id}")
-    return {"status": "unloaded"}
+    return StatusResponse(status="unloaded")
 
 
-@router.delete("/cache/{cache_key}")
-def clear_cache(cache_key: str) -> Dict[str, str]:
+@router.delete(
+    "/cache/{cache_key}",
+    summary="Clear the cache",
+    description="""
+Clears the LRU cache with key `cache_key`.
+If the models in it are not referenced by any other cache, they will be unloaded from memory.
+    """,
+    response_model=StatusResponse,
+)
+def clear_cache(cache_key: str):
     ModelManager().clear_cache(cache_key)
-    return {"status": "cache cleared"}
+    return StatusResponse(status="cleared")
 
 
-@router.get("/cache")
-async def get_cached_models() -> Dict[str, List[str]]:
-    return ModelManager().list_loaded_models()
+@dataclass
+class CacheListResponse:
+    cache: Dict[str, List[str]]
 
 
-@router.get("/metadata")
+@router.get(
+    "/cache",
+    summary="Get the list of loaded models",
+    description="Returns a mapping of `inference_id`s for all loaded models to the lists of `cache_key`s that reference them.",
+    response_model=CacheListResponse,
+)
+async def get_cached_models():
+    return CacheListResponse(cache=ModelManager().list_loaded_models())
+
+
+@router.get(
+    "/metadata",
+    summary="Get a mapping of all available models and their metadata",
+    description="Returns metadata for all available `inference_id`s, divided by group.",
+    response_model=Dict[str, Dict[str, Any]],
+)
 async def get_metadata() -> Dict[str, Dict[str, Any]]:
     return ModelRegistry().list_inference_ids()
 
