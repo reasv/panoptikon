@@ -61,7 +61,7 @@ if the `page` parameter is set beyond the number of pages available.
     response_model=FileSearchResultModel,
 )
 def search(
-    data: SearchQuery = Body(SearchQuery),
+    data: SearchQuery = Body(default_factory=lambda: SearchQuery()),
     conn=Depends(get_db_readonly),
 ):
     logger.debug(f"Searching for files with query: {data}")
