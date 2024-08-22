@@ -3,19 +3,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
-       @font-face {
-            font-family: 'Helvetica Rounded Bold';
-            font-style: normal;
-            font-weight: normal;
-            src: local('Helvetica Rounded Bold'), url('helvetica-rounded-bold-5871d05ead8de.woff') format('woff');
-            }
-
         @font-face {
-    font-family: 'Helvetica';
-    font-style: normal;
-    font-weight: normal;
-    src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
-    }
+          font-family: 'Helvetica';
+          font-style: normal;
+          font-weight: normal;
+          src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
+        }
     </style>
   </defs>
 <g transform="translate(50, 50)">
