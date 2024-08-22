@@ -46,7 +46,7 @@ def launch_app():
         mount_gradio_app(app, ui, path="/gradio")
 
     app = get_app(hostname, port, gradio_mount)
-
+    logger.info(f"Starting server at http://{hostname}:{port}/gradio/")
     uvicorn.run(
         app,
         host=hostname,

@@ -81,6 +81,7 @@ def run_node_client(hostname: str, port: int):
         npx(
             ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
+            stdout=subprocess.DEVNULL,
         )
 
     # Start the server in a new thread
