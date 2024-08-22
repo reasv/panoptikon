@@ -1,0 +1,45 @@
+@keyframes spin {
+    0% { fill: black; } /* Start at white */
+    12.5% { fill: white; } /* Back to default */
+    100% { fill: black; } /* Ensure the end matches the start */
+}
+@keyframes blink {
+0% { fill: black; } /* Start at white */
+0.5% { fill: white; } /* Back to default */
+4% { fill: white; } /* Back to default */
+4.5% { fill: black; } /* Ensure the end matches the start */
+100% { fill: black; } /* Ensure the end matches the start */
+}
+@keyframes flash {
+0% { fill: black; } /* Start at white */
+10% { fill: white; } /* Back to default */
+25% { fill: white; } /* Ensure the end matches the start */
+100% { fill: black; } /* Ensure the end matches the start */
+}
+@keyframes lightup {
+0% { fill: black; } /* Start at white */
+1.5% { fill: white; } /* Back to default */
+50% { fill: white; } /* Ensure the end matches the start */
+51.5% { fill: black; } /* Ensure the end matches the start */
+100% { fill: black; } /* Ensure the end matches the start */
+}
+.w-outer.cwise-0 { animation: spin 2s linear infinite; animation-delay: 0s; }
+.w-outer.cwise-1 { animation: spin 2s linear infinite; animation-delay: 0.25s; }
+.w-outer.cwise-2 { animation: spin 2s linear infinite; animation-delay: 0.5s; }
+.w-outer.cwise-3 { animation: spin 2s linear infinite; animation-delay: 0.75s; }
+
+.w-outer.cwise-4 { animation: spin 2s linear infinite; animation-delay: 1s; }
+.w-outer.cwise-5 { animation: spin 2s linear infinite; animation-delay: 1.25s; }
+.w-outer.cwise-6 { animation: spin 2s linear infinite; animation-delay: 1.5s; }
+.w-outer.cwise-7 { animation: spin 2s linear infinite; animation-delay: 1.75s; }
+.w-outer.window { animation: spin 2s linear infinite; animation-delay: 1.9s; }
+
+.w-inner.ccwise-0 { animation: lightup 32s linear infinite; animation-delay: 2s; }
+.w-inner.ccwise-1 { animation: lightup 32s linear infinite; animation-delay: 4s; }
+.w-inner.ccwise-2 { animation: lightup 32s linear infinite; animation-delay: 6s; }
+.w-inner.ccwise-3 { animation: lightup 32s linear infinite; animation-delay: 8s; }
+.w-inner.ccwise-4 { animation: lightup 32s linear infinite; animation-delay: 10s; }
+.w-inner.ccwise-5 { animation: lightup 32s linear infinite; animation-delay: 12s; }
+.w-inner.ccwise-6 { animation: lightup 32s linear infinite; animation-delay: 14s; }
+.w-inner.ccwise-7 { animation: lightup 32s linear infinite; animation-delay: 16s; }
+.eye { animation: blink 16s linear infinite; animation-delay: 17s; }

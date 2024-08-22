@@ -166,8 +166,7 @@ scripts/
 
 .DS_Store
 data/
-*.woff
-/static/*.css
+/static/*.woff
 # Ignore everything in the folder
 /cudnn/*
 

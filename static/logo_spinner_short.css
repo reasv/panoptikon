@@ -1,0 +1,29 @@
+@keyframes spin {
+    0% { fill: black; } /* Start at white */
+    12.5% { fill: white; } /* Back to default */
+    100% { fill: black; } /* Ensure the end matches the start */
+  }
+  @keyframes blink {
+    0% { fill: black; } /* Start at white */
+    1% { fill: white; } /* Back to default */
+    10% { fill: white; } /* Back to default */
+    11% { fill: black; } /* Ensure the end matches the start */
+    100% { fill: black; } /* Ensure the end matches the start */
+  }
+  @keyframes flash {
+    0% { fill: black; } /* Start at white */
+    10% { fill: white; } /* Back to default */
+    25% { fill: white; } /* Ensure the end matches the start */
+    100% { fill: black; } /* Ensure the end matches the start */
+  }
+  .cwise-0 { animation: spin 2s linear infinite; animation-delay: 0s; }
+  .cwise-1 { animation: spin 2s linear infinite; animation-delay: 0.25s; }
+  .cwise-2 { animation: spin 2s linear infinite; animation-delay: 0.5s; }
+  .cwise-3 { animation: spin 2s linear infinite; animation-delay: 0.75s; }
+  .eye { animation: blink 2s linear infinite; animation-delay: 0.9s; }
+  .cwise-4 { animation: spin 2s linear infinite; animation-delay: 1s; }
+  .cwise-5 { animation: spin 2s linear infinite; animation-delay: 1.25s; }
+  .cwise-6 { animation: spin 2s linear infinite; animation-delay: 1.5s; }
+  .cwise-7 { animation: spin 2s linear infinite; animation-delay: 1.75s; }
+  .window { animation: spin 2s linear infinite; animation-delay: 1.9s; }
+  
