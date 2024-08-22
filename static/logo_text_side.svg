@@ -9,17 +9,30 @@
           font-weight: normal;
           src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
         }
-        :root {
+        /* Dark mode */
+        /* :root {
           --background-color: #22292d;
           --fill-color: #22292d;
           --line-color: #f0ece0;
+        } */
+         /* Light mode */
+        /* :root {
+          --background-color: #f0ece0;
+          --fill-color: #f0ece0;
+          --line-color: #22292d;
+        } */
+        /* Dark mode fully transparent */
+        :root {
+          --background-color: transparent;
+          --fill-color: transparent;
+          --line-color: #f0ece0;
         }
-        @media (prefers-color-scheme: dark) {
-          :root {
-            --background-color: transparent;
-            --fill-color: transparent;
-          }
-        }
+        /* Dark mode semi transparent */
+        /* :root {
+          --background-color: transparent;
+          --fill-color: #22292d;
+          --line-color: #f0ece0;
+        } */
         svg {
           background-color: var(--background-color);
         }
