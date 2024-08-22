@@ -13,7 +13,6 @@ from panoptikon.ui.components.bookmark_folder_selector import (
 from panoptikon.ui.components.multi_view import create_multiview
 from panoptikon.ui.components.utils import (
     delete_bookmark,
-    delete_bookmarks_except_last_n,
     get_all_bookmarks_in_folder,
 )
 
@@ -32,20 +31,6 @@ def get_bookmarks_paths(
     )
     logger.debug(
         f"Bookmarks fetched from {bookmarks_namespace} folder. Total: {total_bookmarks}, Displayed: {len(bookmarks)}"
-    )
-    return bookmarks
-
-
-def erase_bookmarks_fn(
-    bookmarks_namespace: str,
-    keep_last_n: int,
-    order_by: str = "time_added",
-    order: str | None = None,
-):
-    delete_bookmarks_except_last_n(bookmarks_namespace, keep_last_n)
-    logger.debug("Bookmarks erased")
-    bookmarks = get_bookmarks_paths(
-        bookmarks_namespace, order_by=order_by, order=order
     )
     return bookmarks
 
@@ -118,15 +103,6 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
                         value="default",
                         show_label=False,
                     )
-                # erase_bookmarks = gr.Button("Erase bookmarks")
-                # keep_last_n = gr.Slider(
-                #     minimum=0,
-                #     maximum=100,
-                #     value=0,
-                #     step=1,
-                #     label="Keep last N items on erase",
-                # )
-
         multi_view = create_multiview(
             bookmarks_namespace=secondary_namespace,
             extra_actions=["Remove From Current Group"],
@@ -161,12 +137,6 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
         inputs=[bookmarks_namespace, order_by, order],
         outputs=[link],
     )
-
-    # erase_bookmarks.click(
-    #     fn=erase_bookmarks_fn,
-    #     inputs=[bookmarks_namespace, keep_last_n, order_by, order],
-    #     outputs=[multi_view.files],
-    # )
 
     multi_view.list_view.extra[0].click(
         fn=delete_bookmark_fn,

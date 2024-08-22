@@ -92,15 +92,6 @@ def get_all_bookmarks_in_folder(
     return bookmarks, total_bookmarks
 
 
-def delete_bookmarks_except_last_n(bookmarks_namespace: str, keep_last_n: int):
-    conn = get_database_connection(write_lock=False, user_data_wl=True)
-    delete_bookmarks_exclude_last_n(
-        conn, namespace=bookmarks_namespace, n=keep_last_n
-    )
-    conn.commit()
-    conn.close()
-
-
 def delete_bookmark(bookmarks_namespace: str, sha256: str):
     conn = get_database_connection(write_lock=True)
     remove_bookmark(conn, namespace=bookmarks_namespace, sha256=sha256)
