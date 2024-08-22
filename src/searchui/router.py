@@ -48,24 +48,19 @@ def run_node_client(hostname: str, port: int):
     # The client is in the folder this file is in, under "panoptikon-ui"
     client_dir = os.path.join(os.path.dirname(__file__), "panoptikon-ui")
     logger.debug(f"Client directory: {client_dir}")
-    # Save current working directory
-    cwd = os.getcwd()
-    # Change cwd to the client directory
-    os.chdir(client_dir)
     # Install dependencies
-    npm("install", stdout=subprocess.DEVNULL)
+    npm("install", stdout=subprocess.DEVNULL, cwd=client_dir)
     # Start the client
-    npx(["--yes", "next", "build"], stdout=subprocess.DEVNULL)
+    npx(["--yes", "next", "build"], stdout=subprocess.DEVNULL, cwd=client_dir)
 
     # Function to start the server in a separate thread
     def start_server():
         npx(
             ["--yes", "next", "start", "-p", str(port), "-H", hostname],
             stdout=subprocess.DEVNULL,
+            cwd=client_dir,
         )
 
     # Start the server in a new thread
     server_thread = threading.Thread(target=start_server)
     server_thread.start()
-
-    os.chdir(cwd)
