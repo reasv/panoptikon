@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 480 598" width="1024.0pt" height="1024.0pt">
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 598" width="540.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
        @font-face {
@@ -43,5 +43,5 @@
 <path d="M 603.33 491.29 C 612.42 500.15 621.22 509.36 630.53 517.99 C 600.13 546.12 560.32 563.50 518.84 565.35 C 518.89 552.39 518.77 539.44 518.89 526.48 C 526.20 526.39 533.36 524.99 540.52 523.42 C 556.96 519.61 572.66 513.01 586.78 503.77 C 592.60 499.98 597.86 495.52 603.33 491.29 Z" fill="#22292d" />
 </g>
 </g>
-<text x="12" y="575" font-family="Helvetica" font-size="80" fill="#f0ece0">PANOPTIKON</text>
+<text x="11" y="580" font-family="Helvetica" font-size="80" fill="#f0ece0">PANOPTIKON</text>
 </svg>
