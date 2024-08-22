@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Callable, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic.dataclasses import dataclass
 
@@ -153,18 +154,19 @@ app.include_router(bookmarks.router)
 app.include_router(inferio.router)
 
 
-# Redirect / to /gradio
-# @app.get("/")
-# async def redirect_to_gradio():
-#     return RedirectResponse(url="/gradio/")
-
-
 def get_app(
     hostname: str, port: int, callback: Callable[[FastAPI], None]
 ) -> FastAPI:
     # Add the reverse HTTP and WebSocket routers
     callback(app)
-    reverse_http_router, reverse_ws_router = get_routers(hostname, port)
-    app.include_router(reverse_http_router)
-    app.include_router(reverse_ws_router)
+    if os.getenv("ENABLE_CLIENT", "false").lower() == "true":
+        reverse_http_router, reverse_ws_router = get_routers(hostname, port)
+        app.include_router(reverse_http_router)
+        app.include_router(reverse_ws_router)
+    else:
+
+        @app.get("/")
+        async def redirect_to_gradio():
+            return RedirectResponse(url="/gradio/")
+
     return app
