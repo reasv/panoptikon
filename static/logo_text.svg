@@ -25,7 +25,7 @@
         }
         .text {
           font-family: 'Helvetica';
-          font-size: 80px;
+          
           fill: var(--line-color);
         }
         #wheel {
@@ -68,5 +68,5 @@
 </g>
 </g>
 
-<text id="logo-text" class="text" x="10" y="607">PANOPTIKON</text>
+<text id="logo-text" font-size="80px" class="text" x="10" y="607">PANOPTIKON</text>
 </svg>
