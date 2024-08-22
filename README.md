@@ -58,10 +58,10 @@ poetry run panoptikon
 ```
 Will start panoptikon along with its inference server, listening by default at http://127.0.0.1:6342/
 
-Everything except for adding and customizing the AI models used can be done through the gradio UI available at `/gradio`
+Everything except for adding and customizing the AI models used can be done through the gradio UI available at `/gradio/`
 
 ## First steps
-Open http://127.0.0.1:6342/gradio, click on the File Scan & Indexing tab, and start by adding the directories you want to index, one path per line, in the `Include Directories` field. If you want to exclude some subdirectories, these go in the `Exclude Directories` field.
+Open http://127.0.0.1:6342/gradio/, click on the File Scan & Indexing tab, and start by adding the directories you want to index, one path per line, in the `Include Directories` field. If you want to exclude some subdirectories, these go in the `Exclude Directories` field.
 After setting the directories, Click on `Update Directory Lists and Scan New Entries`.
 This will run a job to hash and index all files of eligible file types.
 Whenever there are file changes you should run `Rescan All Directories` or set up the regular cronjob as explained in the UI in order to have this done automatically.

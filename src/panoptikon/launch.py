@@ -3,9 +3,10 @@ import os
 
 import gradio as gr
 import uvicorn
+from fastapi import FastAPI
 from gradio.routes import mount_gradio_app
 
-from panoptikon.api.app import app
+from panoptikon.api.app import get_app
 from panoptikon.db import get_database_connection, run_migrations
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.log import setup_logging
@@ -38,9 +39,14 @@ def launch_app():
     conn.close()
     # gr.set_static_paths(folders)
     ui = root.create_root_UI()
-    mount_gradio_app(app, ui, path="/gradio")
     hostname = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", 6342))
+
+    def gradio_mount(app: FastAPI):
+        mount_gradio_app(app, ui, path="/gradio")
+
+    app = get_app(hostname, port, gradio_mount)
+
     uvicorn.run(
         app,
         host=hostname,

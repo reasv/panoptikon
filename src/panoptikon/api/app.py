@@ -2,10 +2,9 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import List
+from typing import Callable, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic.dataclasses import dataclass
 
@@ -22,6 +21,7 @@ from panoptikon.db.files import (
     get_item_metadata_by_sha256,
 )
 from panoptikon.utils import open_file, open_in_explorer
+from searchui.router import get_routers
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,17 @@ app.include_router(inferio.router)
 
 
 # Redirect / to /gradio
-@app.get("/")
-async def redirect_to_gradio():
-    return RedirectResponse(url="/gradio/")
+# @app.get("/")
+# async def redirect_to_gradio():
+#     return RedirectResponse(url="/gradio/")
+
+
+def get_app(
+    hostname: str, port: int, callback: Callable[[FastAPI], None]
+) -> FastAPI:
+    # Add the reverse HTTP and WebSocket routers
+    callback(app)
+    reverse_http_router, reverse_ws_router = get_routers(hostname, port)
+    app.include_router(reverse_http_router)
+    app.include_router(reverse_ws_router)
+    return app

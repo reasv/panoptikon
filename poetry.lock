@@ -851,6 +851,27 @@ all = ["email_validator (>=2.0.0)", "fastapi-cli[standard] (>=0.0.5)", "httpx (>
 standard = ["email_validator (>=2.0.0)", "fastapi-cli[standard] (>=0.0.5)", "httpx (>=0.23.0)", "jinja2 (>=2.11.2)", "python-multipart (>=0.0.7)", "uvicorn[standard] (>=0.12.0)"]
 
 [[package]]
+name = "fastapi-proxy-lib"
+version = "0.1.0"
+description = "HTTP/WebSocket proxy for starlette/FastAPI."
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "fastapi_proxy_lib-0.1.0-py3-none-any.whl", hash = "sha256:8cc729f1d45a765fab7eaabf09b70a1c83b77cd886e97413a53f5ae2164bf2ef"},
+    {file = "fastapi_proxy_lib-0.1.0.tar.gz", hash = "sha256:574c48298a2444b34ea2daae6d19b0aaccb303fca0c9a6d3797fbf131ec3e62a"},
+]
+
+[package.dependencies]
+httpx = "*"
+httpx-ws = ">=0.4.2"
+starlette = "*"
+typing-extensions = ">=4.5.0"
+
+[package.extras]
+all = ["fastapi-proxy-lib[standard]"]
+standard = ["fastapi"]
+
+[[package]]
 name = "fastapi-utilities"
 version = "0.2.0"
 description = "Reusable utilities for FastAPI"
@@ -1389,6 +1410,23 @@ brotli = ["brotli", "brotlicffi"]
 cli = ["click (==8.*)", "pygments (==2.*)", "rich (>=10,<14)"]
 http2 = ["h2 (>=3,<5)"]
 socks = ["socksio (==1.*)"]
+
+[[package]]
+name = "httpx-ws"
+version = "0.6.0"
+description = "WebSockets support for HTTPX"
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "httpx_ws-0.6.0-py3-none-any.whl", hash = "sha256:437cfca94519a4e6ae06eb5573192df6c0da85c22b1a19cc1ea0b02b05a51d25"},
+    {file = "httpx_ws-0.6.0.tar.gz", hash = "sha256:60218f531fb474a2143af38568f4b7d94ba356780973443365c8e2c87882bb8c"},
+]
+
+[package.dependencies]
+anyio = ">=4"
+httpcore = ">=1.0.4"
+httpx = ">=0.23.1"
+wsproto = "*"
 
 [[package]]
 name = "huggingface-hub"
@@ -5323,6 +5361,20 @@ files = [
 ]
 
 [[package]]
+name = "wsproto"
+version = "1.2.0"
+description = "WebSockets state-machine based protocol implementation"
+optional = false
+python-versions = ">=3.7.0"
+files = [
+    {file = "wsproto-1.2.0-py3-none-any.whl", hash = "sha256:b9acddd652b585d75b20477888c56642fdade28bdfd3579aa24a4d2c037dd736"},
+    {file = "wsproto-1.2.0.tar.gz", hash = "sha256:ad565f26ecb92588a3e43bc3d96164de84cd9902482b130d0ddbaa9664a85065"},
+]
+
+[package.dependencies]
+h11 = ">=0.9.0,<1"
+
+[[package]]
 name = "yarl"
 version = "1.9.4"
 description = "Yet another URL library"
@@ -5516,4 +5568,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "c764da5a332e9623ede2da2be9906116adb0d1e1b3332e9789a3d64691ec76a8"
+content-hash = "517ad0ef722405341d6816006ff21abb8934f8e164a0d0fa9c8915013a37be4e"

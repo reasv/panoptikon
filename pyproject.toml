@@ -8,10 +8,12 @@ readme = "README.md"
 packages = [
     { include = "panoptikon", from="src" },
     { include = "inferio", from="src" },
+    { include = "searchui", from="src" },
 ]
 include = [
     "src/panoptikon/ui/static/**/*",
-    "src/panoptikon/api/templates/**/*"
+    "src/panoptikon/api/templates/**/*",
+    "src/inferio/config/**/*",
 ]
 
 [tool.poetry.dependencies]
@@ -27,6 +29,7 @@ toml = "^0.10.2"
 weasyprint = "^62.3"
 pypdfium2 = "^4.30.0"
 alembic = "^1.13.2"
+fastapi-proxy-lib = "^0.1.0"
 
 [tool.poetry.group.inference]
 optional = true
