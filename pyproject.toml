@@ -30,6 +30,7 @@ weasyprint = "^62.3"
 pypdfium2 = "^4.30.0"
 alembic = "^1.13.2"
 fastapi-proxy-lib = "^0.1.0"
+nodejs-wheel = "^20.17.0"
 
 [tool.poetry.group.inference]
 optional = true
