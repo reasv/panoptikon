@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 import threading
 from typing import Tuple
@@ -61,6 +62,7 @@ def run_node_client(hostname: str, port: int):
     if is_build_needed(build_dir, client_dir):
         logger.info("Building the Next.js application...")
         # Install dependencies
+        delete_build_directory(build_dir)
         npm(
             ["install", "--include=dev"],
             cwd=client_dir,
@@ -86,6 +88,15 @@ def run_node_client(hostname: str, port: int):
     server_thread.start()
 
     logger.info(f"Node.js client started on {hostname}:{port}")
+
+
+def delete_build_directory(build_dir):
+    """
+    Delete the .next build directory to ensure a fresh build.
+    """
+    if os.path.exists(build_dir):
+        logger.info(f"Deleting existing build directory: {build_dir}")
+        shutil.rmtree(build_dir)
 
 
 def get_latest_commit_timestamp(repo_dir):
