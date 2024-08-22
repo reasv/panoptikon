@@ -25,16 +25,16 @@ def create_root_UI():
         select_history = gr.State(value=[])
         bookmarks_namespace = gr.State(value="default")
         with gr.Tabs():
-            create_search_UI(
-                ui, select_history, bookmarks_namespace=bookmarks_namespace
-            )
+            # create_search_UI(
+            #     ui, select_history, bookmarks_namespace=bookmarks_namespace
+            # )
             create_bookmarks_UI(bookmarks_namespace=bookmarks_namespace)
-            create_history_UI(
-                select_history, bookmarks_namespace=bookmarks_namespace
-            )
-            create_toptags_UI()
-            create_scan_UI(ui)
-            create_rule_config_UI(ui)
+            # create_history_UI(
+            #     select_history, bookmarks_namespace=bookmarks_namespace
+            # )
+            # create_toptags_UI()
+            # create_scan_UI(ui)
+            # create_rule_config_UI(ui)
             # create_model_demo()
-            create_query_UI()
+            # create_query_UI()
     return ui

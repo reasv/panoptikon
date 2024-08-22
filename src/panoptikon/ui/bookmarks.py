@@ -118,15 +118,6 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
                         value="default",
                         show_label=False,
                     )
-                # erase_bookmarks = gr.Button("Erase bookmarks")
-                # keep_last_n = gr.Slider(
-                #     minimum=0,
-                #     maximum=100,
-                #     value=0,
-                #     step=1,
-                #     label="Keep last N items on erase",
-                # )
-
         multi_view = create_multiview(
             bookmarks_namespace=secondary_namespace,
             extra_actions=["Remove From Current Group"],
@@ -162,22 +153,16 @@ def create_bookmarks_UI(bookmarks_namespace: gr.State):
         outputs=[link],
     )
 
-    # erase_bookmarks.click(
-    #     fn=erase_bookmarks_fn,
-    #     inputs=[bookmarks_namespace, keep_last_n, order_by, order],
+    # multi_view.list_view.extra[0].click(
+    #     fn=delete_bookmark_fn,
+    #     inputs=[
+    #         bookmarks_namespace,
+    #         multi_view.selected_files,
+    #         order_by,
+    #         order,
+    #     ],
     #     outputs=[multi_view.files],
     # )
-
-    multi_view.list_view.extra[0].click(
-        fn=delete_bookmark_fn,
-        inputs=[
-            bookmarks_namespace,
-            multi_view.selected_files,
-            order_by,
-            order,
-        ],
-        outputs=[multi_view.files],
-    )
 
     multi_view.gallery_view.extra[0].click(
         fn=delete_bookmark_fn,
