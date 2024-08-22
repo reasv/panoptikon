@@ -3,18 +3,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 625" width="540.0pt" height="625.0pt">
 <defs>
     <style type="text/css">
-        @font-face {
-          font-family: 'Helvetica';
-          font-style: normal;
-          font-weight: normal;
-          src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
-        }
         /* Dark mode */
-        /* :root {
+        :root {
           --background-color: #22292d;
           --fill-color: #22292d;
           --line-color: #f0ece0;
-        } */
+        }
          /* Light mode */
         /* :root {
           --background-color: #f0ece0;
@@ -22,11 +16,11 @@
           --line-color: #22292d;
         } */
         /* Dark mode fully transparent */
-        :root {
+        /* :root {
           --background-color: transparent;
           --fill-color: transparent;
           --line-color: #f0ece0;
-        }
+        } */
         /* Dark mode semi transparent */
         /* :root {
           --background-color: transparent;
@@ -35,10 +29,6 @@
         } */
         svg {
           background-color: var(--background-color);
-        }
-        .svg-logo-text {
-          font-family: 'Helvetica';
-          fill: var(--line-color);
         }
         .wheel {
           fill: var(--line-color);
@@ -50,7 +40,7 @@
           fill: black;
         }
     </style>
-  </defs>
+</defs>
 <g transform="translate(25, 25)">
 <g transform="translate(-265, -133)">
 <circle class="wheel-background" cx="509" cy="383" r="205" />
@@ -79,6 +69,4 @@
 </mask>
 </g>
 </g>
-
-<text font-size="80px" class="svg-logo-text" x="10" y="607">PANOPTIKON</text>
 </svg>
