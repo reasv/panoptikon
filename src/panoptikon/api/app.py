@@ -167,23 +167,20 @@ def get_app(
     # Add the reverse HTTP and WebSocket routers
     callback(app)
     if os.getenv("ENABLE_CLIENT", "false").lower() == "true":
-        reverse_http_router, reverse_ws_router, client_url = get_routers(
-            hostname, port
-        )
-        app.include_router(reverse_http_router)
-        app.include_router(reverse_ws_router)
-        allowed_origins = [
-            client_url[:-1],
-        ]
-        logger.debug(f"Allowed origins: {allowed_origins}")
-        # Add CORS middleware to allow requests from the specific origin
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=allowed_origins,  # Allow requests from this list of origins
-            allow_credentials=True,
-            allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
-            allow_headers=["*"],  # Allow all headers
-        )
+        client_redirect_router, client_url = get_routers(hostname, port)
+        app.include_router(client_redirect_router)
+        # allowed_origins = [
+        #     client_url[:-1],
+        # ]
+        # logger.debug(f"Allowed origins: {allowed_origins}")
+        # # Add CORS middleware to allow requests from the specific origin
+        # app.add_middleware(
+        #     CORSMiddleware,
+        #     allow_origins=allowed_origins,  # Allow requests from this list of origins
+        #     allow_credentials=True,
+        #     allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+        #     allow_headers=["*"],  # Allow all headers
+        # )
     else:
 
         @app.get("/")

@@ -7,6 +7,7 @@ from typing import Tuple
 from venv import logger
 
 from fastapi import APIRouter
+from fastapi.responses import RedirectResponse
 from fastapi_proxy_lib.core.http import ReverseHttpProxy
 from fastapi_proxy_lib.core.websocket import ReverseWebSocketProxy
 from fastapi_proxy_lib.fastapi.router import RouterHelper
@@ -28,25 +29,24 @@ def get_client_url(parent_hostname: str, parent_port: int) -> str:
 
 def get_routers(
     parent_hostname: str, parent_port: int
-) -> Tuple[APIRouter, APIRouter, str]:
+) -> Tuple[APIRouter, str]:
     client_url = get_client_url(parent_hostname, parent_port)
 
     logger.info(f"Client URL: {client_url}")
-    reverse_http_proxy = ReverseHttpProxy(base_url=client_url)
-    reverse_ws_proxy = ReverseWebSocketProxy(base_url=client_url)
-
-    helper = RouterHelper()
-
-    reverse_http_router = helper.register_router(
-        reverse_http_proxy,
-        APIRouter(tags=["client"]),
+    router = APIRouter(
+        tags=["client"],
     )
 
-    reverse_ws_router = helper.register_router(
-        reverse_ws_proxy, APIRouter(tags=["client"])
-    )
+    # Redirect to client
+    @router.get("/")
+    async def root():
+        return RedirectResponse(url=client_url)
 
-    return reverse_http_router, reverse_ws_router, client_url
+    @router.get("/search")
+    async def search():
+        return RedirectResponse(url=client_url)
+
+    return router, client_url
 
 
 REPO_URL = "https://github.com/reasv/panoptikon-ui.git"
