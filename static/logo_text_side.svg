@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
+<svg class="light wheel-border transparent-background" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
         /* Dark mode (default) */
@@ -47,8 +47,8 @@
         .wheel {
           fill: var(--line-color);
         }
-        .wheel-border {
-          stroke: var(--fill-color);
+        .wheel-border .wheel {
+          stroke: white;
           stroke-width: 2;
         }
         .halo-border {
@@ -79,7 +79,10 @@
       .svg-logo-text {
           font-family: 'Helvetica';
           fill: var(--line-color);
-        }
+      }
+      .light.transparent-background .svg-logo-text {
+        fill: white;
+      }
     </style>
   </defs>
 <g transform="translate(50, 50)">
