@@ -1,39 +1,54 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg class="light wheel-border transparent-background" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
+<svg class="background-transparent text-dark" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
-        /* Dark mode (default) */
+        /* Default */
         :root {
-          --background-color: #22292d;
-          --fill-color: #22292d;
-          --line-color: #f0ece0;
+          /* --light-color: #f0ece0;
+          --dark-color: #22292d; */
+          /* github palette */
+          --light-color: white;
+          --dark-color: #161b22;
+          --background-color: var(--light-color);
+          --fill-color: var(--light-color);
+          --line-color: var(--dark-color);
+          --text-color: var(--dark-color);
+          --text-border-color: var(--light-color);
         }
-        /* Light mode */
-        @media (prefers-color-scheme: light) {
-          :root {
-            --background-color: #f0ece0;
-            --fill-color: #f0ece0;
-            --line-color: #22292d;
-          }
+        .background-light {
+          --background-color: var(--light-color);
         }
+        .background-dark {
+          --background-color: var(--dark-color);
+        }
+        .background-transparent {
+          --background-color: transparent;
+        }
+
         /* Light mode override */
-        .light {
-          --background-color: #f0ece0;
-          --fill-color: #f0ece0;
-          --line-color: #22292d;
+        .lines-light {
+          --fill-color: var(--dark-color);
+          --line-color: var(--light-color);
         }
 
         /* Dark mode override */
-        .dark {
-          --background-color: #22292d;
-          --fill-color: #22292d;
-          --line-color: #f0ece0;
+        .lines-dark {
+          --fill-color: var(--light-color);
+          --line-color: var(--dark-color);
         }
 
-        /* Opaque with transparent background */
-        .transparent-background {
-          --background-color: transparent;
+        .text-light {
+          --text-color: var(--light-color);
+          --text-border-color: var(--dark-color);
+        }
+        .text-dark {
+          --text-color: var(--dark-color);
+          --text-border-color: var(--light-color);
+        }
+        .text-border .svg-logo-text {
+          stroke: var(--text-border-color);
+          stroke-width: 5;
         }
 
         /* Fully transparent */
@@ -41,6 +56,7 @@
           --background-color: transparent;
           --fill-color: transparent;
         }
+
         svg {
           background-color: var(--background-color);
         }
@@ -48,8 +64,20 @@
           fill: var(--line-color);
         }
         .wheel-border .wheel {
-          stroke: white;
+          stroke: var(--fill-color);
           stroke-width: 2;
+        }
+        .wheel-border.transparent .wheel {
+          stroke: none;
+          stroke-width: 0;
+        }
+        .wheel-border-thick .wheel {
+          stroke: var(--fill-color);
+          stroke-width: 5;
+        }
+        .wheel-border-thick.transparent .wheel {
+          stroke: none;
+          stroke-width: 0;
         }
         .halo-border {
           fill: var(--fill-color);
@@ -78,10 +106,7 @@
         }
       .svg-logo-text {
           font-family: 'Helvetica';
-          fill: var(--line-color);
-      }
-      .light.transparent-background .svg-logo-text {
-        fill: white;
+          fill: var(--text-color);
       }
     </style>
   </defs>

@@ -1,8 +1,8 @@
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_white.png">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_dark.png">
-  <img alt="Panoptikon" src="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_outline.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/gh_banner_darkmode.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/gh_banner_lightmode.png">
+  <img alt="Panoptikon" src="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/gh_banner_fallback.png">
 </picture>
 
 ## State of the art, local, multimodal, multimedia search engine
