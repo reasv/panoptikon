@@ -9,6 +9,27 @@
           --fill-color: #22292d;
           --line-color: #f0ece0;
         }
+        /* Light mode */
+        @media (prefers-color-scheme: light) {
+          :root {
+            --background-color: #f0ece0;
+            --fill-color: #f0ece0;
+            --line-color: #22292d;
+          }
+        }
+        /* Light mode override */
+        .light {
+          --background-color: #f0ece0;
+          --fill-color: #f0ece0;
+          --line-color: #22292d;
+        }
+
+        /* Dark mode override */
+        .dark {
+          --background-color: #22292d;
+          --fill-color: #22292d;
+          --line-color: #f0ece0;
+        }
 
         /* Opaque with transparent background */
         .transparent-background {
@@ -21,21 +42,9 @@
           --fill-color: transparent;
         }
 
-        /* Light mode */
-        @media (prefers-color-scheme: light) {
-          :root {
-            --background-color: #f0ece0;
-            --fill-color: #f0ece0;
-            --line-color: #22292d;
-          }
-          .transparent-background {
-            --background-color: transparent;
-          }
-          .transparent {
-            --background-color: transparent;
-            --fill-color: transparent;
-          }
-        }
+        
+
+        
         svg {
           background-color: var(--background-color);
         }
