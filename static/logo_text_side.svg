@@ -1,101 +1,152 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg class="background-transparent text-dark" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
+<svg class="" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
-        /* Default */
+      :root {
+        --light-color: #f0ece0;
+        --dark-color: #22292d;
+        --background-color: transparent;
+        --fill-color: var(--light-color);
+        --line-color: var(--dark-color);
+        --text-color: var(--light-color);
+        --text-border-color: var(--light-color);
+        --wheel-border-width: 5;
+      }
+      .def-palette {
+        --light-color: #f0ece0;
+        --dark-color: #22292d;
+        --background-color: transparent;
+        --fill-color: var(--light-color);
+        --line-color: var(--dark-color);
+        --text-color: var(--light-color);
+        --text-border-color: var(--light-color);
+        --wheel-border-width: 5;
+      }
+      .gh-palette {
+        --light-color: white;
+        --dark-color: #161b22;
+        --background-color: transparent;
+        --fill-color: var(--light-color);
+        --line-color: var(--dark-color);
+        --text-color: var(--light-color);
+        --text-border-color: var(--light-color);
+        --wheel-border-width: 5;
+      }
+      @media (prefers-color-scheme: light) {
         :root {
-          /* --light-color: #f0ece0;
-          --dark-color: #22292d; */
-          /* github palette */
+          --light-color: #f0ece0;
+          --dark-color: #22292d;
+          --background-color: transparent;
+          --fill-color: var(--light-color);
+          --line-color: var(--dark-color);
+          --text-color: var(--dark-color);
+          --text-border-color: var(--light-color);
+          --wheel-border-width: 0;
+        }
+        .def-palette {
+          --light-color: #f0ece0;
+          --dark-color: #22292d;
+          --background-color: transparent;
+          --fill-color: var(--light-color);
+          --line-color: var(--dark-color);
+          --text-color: var(--dark-color);
+          --text-border-color: var(--light-color);
+          --wheel-border-width: 0;
+        }
+        .gh-palette {
           --light-color: white;
           --dark-color: #161b22;
-          --background-color: var(--light-color);
+          --background-color: transparent;
           --fill-color: var(--light-color);
           --line-color: var(--dark-color);
           --text-color: var(--dark-color);
           --text-border-color: var(--light-color);
+          --wheel-border-width: 0;
         }
-        .background-light {
-          --background-color: var(--light-color);
-        }
-        .background-dark {
-          --background-color: var(--dark-color);
-        }
-        .background-transparent {
-          --background-color: transparent;
-        }
+      }
+      .background-light {
+        --background-color: var(--light-color);
+      }
+      .background-dark {
+        --background-color: var(--dark-color);
+      }
+      .background-transparent {
+        --background-color: transparent;
+      }
 
-        /* Light mode override */
-        .lines-light {
-          --fill-color: var(--dark-color);
-          --line-color: var(--light-color);
-        }
+      /* Light mode override */
+      .lines-light {
+        --fill-color: var(--dark-color);
+        --line-color: var(--light-color);
+      }
 
-        /* Dark mode override */
-        .lines-dark {
-          --fill-color: var(--light-color);
-          --line-color: var(--dark-color);
-        }
+      /* Dark mode override */
+      .lines-dark {
+        --fill-color: var(--light-color);
+        --line-color: var(--dark-color);
+      }
 
-        .text-light {
-          --text-color: var(--light-color);
-          --text-border-color: var(--dark-color);
-        }
-        .text-dark {
-          --text-color: var(--dark-color);
-          --text-border-color: var(--light-color);
-        }
-        .text-border .svg-logo-text {
-          stroke: var(--text-border-color);
-          stroke-width: 5;
-        }
+      .text-light {
+        --text-color: var(--light-color);
+        --text-border-color: var(--dark-color);
+      }
+      .text-dark {
+        --text-color: var(--dark-color);
+        --text-border-color: var(--light-color);
+      }
+      .text-border .svg-logo-text {
+        stroke: var(--text-border-color);
+        stroke-width: 5;
+      }
 
-        /* Fully transparent */
-        .transparent {
-          --background-color: transparent;
-          --fill-color: transparent;
-        }
+      /* Fully transparent */
+      .transparent {
+        --background-color: transparent;
+        --fill-color: transparent;
+      }
 
-        svg {
-          background-color: var(--background-color);
-        }
-        .wheel {
-          fill: var(--line-color);
-        }
-        .wheel-border .wheel {
-          stroke: var(--fill-color);
-          stroke-width: 2;
-        }
-        .wheel-border.transparent .wheel {
-          stroke: none;
-          stroke-width: 0;
-        }
-        .wheel-border-thick .wheel {
-          stroke: var(--fill-color);
-          stroke-width: 5;
-        }
-        .wheel-border-thick.transparent .wheel {
-          stroke: none;
-          stroke-width: 0;
-        }
-        .halo-border {
-          fill: var(--fill-color);
-          display: none;
-        }
-        .with-halo .halo-border {
-          display: block;
-        }
-        .wheel-background {
-          fill: var(--fill-color);
-        }
-        .w-msk {
-          fill: black;
-        }
-        .thick-lines .w-msk {
-          stroke: white;
-          stroke-width: 5;
-        }
+      svg {
+        background-color: var(--background-color);
+      }
+      .wheel {
+        fill: var(--line-color);
+        stroke: var(--fill-color);
+        stroke-width: var(--wheel-border-width);
+      }
+      .wheel-border-thin .wheel {
+        stroke: var(--fill-color);
+        stroke-width: 2;
+      }
+      .wheel-border-thick .wheel {
+        stroke: var(--fill-color);
+        stroke-width: 5;
+      }
+      .transparent .wheel {
+        stroke: none;
+        stroke-width: 0;
+      }
+      .no-wheel-border .wheel {
+        stroke: none;
+        stroke-width: 0;
+      }
+      .halo-border {
+        fill: var(--fill-color);
+        display: none;
+      }
+      .with-halo .halo-border {
+        display: block;
+      }
+      .wheel-background {
+        fill: var(--fill-color);
+      }
+      .w-msk {
+        fill: black;
+      }
+      .thick-lines .w-msk {
+        stroke: white;
+        stroke-width: 5;
+      }
     </style>
     <style type="text/css">
         @font-face {
