@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Callable, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic.dataclasses import dataclass
@@ -160,9 +161,23 @@ def get_app(
     # Add the reverse HTTP and WebSocket routers
     callback(app)
     if os.getenv("ENABLE_CLIENT", "false").lower() == "true":
-        reverse_http_router, reverse_ws_router = get_routers(hostname, port)
+        reverse_http_router, reverse_ws_router, client_url = get_routers(
+            hostname, port
+        )
         app.include_router(reverse_http_router)
         app.include_router(reverse_ws_router)
+        allowed_origins = [
+            client_url[:-1],
+        ]
+        logger.debug(f"Allowed origins: {allowed_origins}")
+        # Add CORS middleware to allow requests from the specific origin
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,  # Allow requests from this list of origins
+            allow_credentials=True,
+            allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+            allow_headers=["*"],  # Allow all headers
+        )
     else:
 
         @app.get("/")

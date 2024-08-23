@@ -15,16 +15,20 @@ from nodejs_wheel import npm, npx
 logger = logging.getLogger(__name__)
 
 
-def get_routers(
-    parent_hostname: str, parent_port: int
-) -> Tuple[APIRouter, APIRouter]:
+def get_client_url(parent_hostname: str) -> str:
     if url := os.getenv("CLIENT_URL"):
-        client_url = url
+        return url
     else:
         client_hostname = os.getenv("CLIENT_HOST", parent_hostname)
         client_port = int(os.getenv("CLIENT_PORT", 6339))
-        client_url = f"http://{client_hostname}:{client_port}/"
         run_node_client(client_hostname, client_port)
+        return f"http://{client_hostname}:{client_port}/"
+
+
+def get_routers(
+    parent_hostname: str, parent_port: int
+) -> Tuple[APIRouter, APIRouter, str]:
+    client_url = get_client_url(parent_hostname)
 
     logger.info(f"Client URL: {client_url}")
     reverse_http_proxy = ReverseHttpProxy(base_url=client_url)
@@ -41,7 +45,7 @@ def get_routers(
         reverse_ws_proxy, APIRouter(tags=["client"])
     )
 
-    return reverse_http_router, reverse_ws_router
+    return reverse_http_router, reverse_ws_router, client_url
 
 
 REPO_URL = "https://github.com/reasv/panoptikon-ui.git"
