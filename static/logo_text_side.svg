@@ -3,12 +3,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2304 598" width="2304.0pt" height="598.0pt">
 <defs>
     <style type="text/css">
-        @font-face {
-          font-family: 'Helvetica';
-          font-style: normal;
-          font-weight: normal;
-          src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
-        }
         /* Dark mode (default) */
         :root {
           --background-color: #22292d;
@@ -50,18 +44,41 @@
         svg {
           background-color: var(--background-color);
         }
-        .svg-logo-text {
-          font-family: 'Helvetica';
-          fill: var(--line-color);
-        }
         .wheel {
           fill: var(--line-color);
+        }
+        .wheel-border {
+          stroke: var(--fill-color);
+          stroke-width: 2;
+        }
+        .halo-border {
+          fill: var(--fill-color);
+          display: none;
+        }
+        .with-halo .halo-border {
+          display: block;
         }
         .wheel-background {
           fill: var(--fill-color);
         }
         .w-msk {
           fill: black;
+        }
+        .thick-lines .w-msk {
+          stroke: white;
+          stroke-width: 5;
+        }
+    </style>
+    <style type="text/css">
+        @font-face {
+          font-family: 'Helvetica';
+          font-style: normal;
+          font-weight: normal;
+          src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
+        }
+      .svg-logo-text {
+          font-family: 'Helvetica';
+          fill: var(--line-color);
         }
     </style>
   </defs>
