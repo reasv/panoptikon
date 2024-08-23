@@ -22,7 +22,7 @@
         }
 
         /* Light mode */
-        @media (prefers-color-scheme: dark) {
+        @media (prefers-color-scheme: light) {
           :root {
             --background-color: #f0ece0;
             --fill-color: #f0ece0;
