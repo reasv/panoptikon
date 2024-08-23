@@ -90,7 +90,7 @@ def run_node_client(hostname: str, port: int, parent_url: str):
             ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
             stdout=subprocess.DEVNULL,
-            env={"NEXT_PUBLIC_API_URL": panoptikon_public_url},
+            env={"API_URL": panoptikon_public_url},
         )
 
     # Start the server in a new thread
