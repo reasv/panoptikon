@@ -1,7 +1,7 @@
 import io
 import logging
 import sqlite3
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import PIL
 import PIL.Image
@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly
+from panoptikon.db import get_database_connection
 from panoptikon.db.extracted_text import get_extracted_text_for_item
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
@@ -54,8 +55,9 @@ Files are unique by `path`. If all files associated with an `item` are deleted, 
 )
 def get_item_by_sha256(
     sha256: str,
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     item, files = get_item_metadata_by_sha256(conn, sha256)
     if item is None or files is None:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -76,8 +78,9 @@ This means the file list may be empty.
 )
 def get_item_by_path(
     path: str,
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     file_record = get_file_by_path(conn, path)
     if file_record is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -100,8 +103,9 @@ Content type is determined by the file extension.
 )
 def get_file_by_sha256(
     sha256: str,
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     # Get the file path from the database
     file_record = get_existing_file_for_sha256(conn, sha256)
 
@@ -129,8 +133,9 @@ select between the 2x2 frame grid (big=True) or the first frame from the grid (b
 def get_thumbnail_by_sha256(
     sha256: str,
     big: bool = Query(True),
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     file = get_existing_file_for_sha256(conn, sha256)
     if not file:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -173,8 +178,9 @@ Returns the text extracted from a given item by its sha256 hash.
 def get_text_by_sha256(
     sha256: str,
     setters: List[str] = Query([]),
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     text = get_extracted_text_for_item(conn, sha256)
     if setters:
         text = [t for t in text if t.setter_name in setters]
@@ -203,7 +209,8 @@ def get_tags_by_sha256(
     sha256: str,
     setters: List[str] = Query([]),
     confidence_threshold: float = Query(0.0),
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     tags = get_all_tags_for_item(conn, sha256, setters, confidence_threshold)
     return TagResponse(tags=tags)

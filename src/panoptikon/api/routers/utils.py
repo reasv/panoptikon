@@ -1,4 +1,5 @@
-from typing import Optional
+from operator import index
+from typing import Dict, Optional
 
 from fastapi import HTTPException, Query
 
@@ -22,21 +23,24 @@ def check_dbs(index_db: Optional[str], user_data_db: Optional[str]):
 def get_db_readonly(
     index_db: Optional[str] = Query(None),
     user_data_db: Optional[str] = Query(None),
-):
+) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    return get_database_connection(
-        write_lock=False, index_db=index_db, user_data_db=user_data_db
-    )
+
+    return {
+        "write_lock": False,
+        "index_db": index_db,
+        "user_data_db": user_data_db,
+    }
 
 
 def get_db_user_data_wl(
     index_db: Optional[str] = Query(None),
     user_data_db: Optional[str] = Query(None),
-):
+) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    return get_database_connection(
-        write_lock=False,
-        user_data_wl=True,
-        index_db=index_db,
-        user_data_db=user_data_db,
-    )
+    return {
+        "write_lock": False,
+        "user_data_wl": True,
+        "index_db": index_db,
+        "user_data_db": user_data_db,
+    }

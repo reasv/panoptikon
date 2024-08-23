@@ -2,7 +2,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Callable, List
+from typing import Any, Callable, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,7 @@ import panoptikon.api.routers.legacy as legacy
 import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
 from panoptikon.api.routers.utils import get_db_readonly
-from panoptikon.db import get_db_lists, get_db_names
+from panoptikon.db import get_database_connection, get_db_lists, get_db_names
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
@@ -119,8 +119,11 @@ This is a potentially dangerous operation, as it can execute arbitrary code.
     response_model=OpenResponse,
 )
 def open_file_on_host(
-    sha256: str, path: str = Query(None), conn=Depends(get_db_readonly)
+    sha256: str,
+    path: str = Query(None),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     path = get_correct_path(conn, sha256, path)
     msg = open_file(path)
 
@@ -141,8 +144,11 @@ This is a potentially dangerous operation.
     response_model=OpenResponse,
 )
 def show_in_file_manager(
-    sha256: str, path: str = Query(None), conn=Depends(get_db_readonly)
+    sha256: str,
+    path: str = Query(None),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     path = get_correct_path(conn, sha256, path)
     msg = open_in_explorer(path)
 

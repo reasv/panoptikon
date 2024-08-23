@@ -1,7 +1,7 @@
 import base64
 import io
 import logging
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 from click import File
@@ -13,6 +13,7 @@ from pydantic.dataclasses import dataclass
 from inferio.impl.utils import deserialize_array
 from panoptikon.api.routers.search_types import SearchQueryModel
 from panoptikon.api.routers.utils import get_db_readonly
+from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_all_bookmark_namespaces
 from panoptikon.db.embeddings import find_similar_items
 from panoptikon.db.extracted_text import get_text_stats
@@ -99,8 +100,9 @@ To get the list of embedding models the data is indexed with, use /api/search/st
 )
 def search(
     data: SearchQuery = Body(default_factory=lambda: SearchQuery()),
-    conn=Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     logger.debug(f"Searching for files with query: {data}")
     if data.query.filters.image_embeddings:
         query = data.query.filters.image_embeddings.query
@@ -148,7 +150,11 @@ This information is relevant for building search queries.
     """,
     response_model=APISearchStats,
 )
-def get_stats(conn=Depends(get_db_readonly), user: Optional[str] = Query(None)):
+def get_stats(
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+    user: Optional[str] = Query(None),
+):
+    conn = get_database_connection(**conn_args)
     setters = get_existing_setters(conn)
     if not user:
         bookmark_namespaces = get_all_bookmark_namespaces(
@@ -198,12 +204,13 @@ The `confidence_threshold` parameter can be used to filter tags based on the min
     response_model=TagFrequency,
 )
 def get_top_tags(
-    conn=Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
     namespace: Optional[str] = Query(None),
     setters: List[str] = Query([]),
     confidence_threshold: Optional[float] = Query(None),
     limit: int = Query(10),
 ):
+    conn = get_database_connection(**conn_args)
     return TagFrequency(
         tags=get_most_common_tags_frequency(
             conn,
@@ -236,8 +243,9 @@ The tags are returned in descending order of the number of items tagged.
 def get_tags(
     name: str = Query(...),
     limit: int = Query(10),
-    conn=Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     tags = find_tags(conn, name, limit)
     tags.sort(key=lambda x: x[2], reverse=True)
     return TagSearchResults(tags)
@@ -272,8 +280,9 @@ def find_similar(
     setter_name: str,
     src_setter_names: Optional[List[str]] = Query(None),
     limit: int = Query(10),
-    conn=Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     results = list(
         find_similar_items(conn, sha256, setter_name, src_setter_names, limit)
     )

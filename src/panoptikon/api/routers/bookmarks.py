@@ -1,12 +1,13 @@
 import logging
 import sqlite3
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly, get_db_user_data_wl
+from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import (
     add_bookmark,
     delete_bookmarks_exclude_last_n,
@@ -38,8 +39,9 @@ class BookmarkNamespaces:
     response_model=BookmarkNamespaces,
 )
 def get_ns_list(
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     return BookmarkNamespaces(namespaces=get_all_bookmark_namespaces(conn))
 
 
@@ -79,8 +81,9 @@ def get_bookmarks_by_namespace(
     ),
     order: OrderType = Query(None),
     include_wildcard: bool = Query(True),
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     files, count = get_bookmarks(
         conn,
         namespace=namespace,
@@ -113,8 +116,9 @@ def delete_bookmarks_by_namespace(
     user: str = Query("user"),
     exclude_last_n: int = Query(0),
     items: Optional[Items] = Body(None),
-    conn: sqlite3.Connection = Depends(get_db_user_data_wl),
+    conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    conn = get_database_connection(**conn_args)
     if items:
         c = 0
         for s in items.sha256:
@@ -174,8 +178,9 @@ def add_bookmarks_by_sha256(
     namespace: str,
     items: ItemsMeta = Body(...),
     user: str = Query("user"),
-    conn: sqlite3.Connection = Depends(get_db_user_data_wl),
+    conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    conn = get_database_connection(**conn_args)
     c = 0
     for s in items.sha256:
         if items.metadata:
@@ -198,8 +203,9 @@ def delete_bookmark_by_sha256(
     namespace: str,
     sha256: str,
     user: str = Query("user"),
-    conn: sqlite3.Connection = Depends(get_db_user_data_wl),
+    conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    conn = get_database_connection(**conn_args)
     remove_bookmark(conn, sha256, namespace=namespace, user=user)
     return MessageResult(message="Deleted bookmark")
 
@@ -219,8 +225,9 @@ def add_bookmark_by_sha256(
     sha256: str,
     user: str = Query("user"),
     metadata: Optional[Dict] = Body(None),
-    conn: sqlite3.Connection = Depends(get_db_user_data_wl),
+    conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    conn = get_database_connection(**conn_args)
     add_bookmark(
         conn, sha256, namespace=namespace, user=user, metadata=metadata
     )
@@ -246,8 +253,9 @@ def get_bookmark(
     namespace: str,
     sha256: str,
     user: str = Query("user"),
-    conn: sqlite3.Connection = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
+    conn = get_database_connection(**conn_args)
     exists, metadata = get_bookmark_metadata(
         conn, sha256, namespace=namespace, user=user
     )
