@@ -1,47 +1,44 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 540" width="540.0pt" height="540.0pt">
+<svg class="transparent-background" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 540" width="540.0pt" height="540.0pt">
 <defs>
     <style type="text/css">
         /* Dark mode (default) */
         /* Opaque with background */
-        /* :root {
+        :root {
           --background-color: #22292d;
           --fill-color: #22292d;
           --line-color: #f0ece0;
-        } */
+        }
         /* Opaque with transparent background */
-        :root {
+        .transparent-background {
           --background-color: transparent;
           --fill-color: #22292d;
           --line-color: #f0ece0;
         }
         /* Fully transparent */
-        /* :root {
+        .transparent {
           --background-color: transparent;
           --fill-color: transparent;
           --line-color: #f0ece0;
-        } */
+        }
         /* Light mode */
         @media (prefers-color-scheme: light) {
-          /* Opaque with background */
-          /* :root {
+          :root {
             --background-color: #f0ece0;
             --fill-color: #f0ece0;
             --line-color: #22292d;
-          } */
-          /* Opaque with transparent background */
-          :root {
+          }
+          .transparent-background {
             --background-color: transparent;
             --fill-color: #f0ece0;
             --line-color: #22292d;
           }
-          /* Fully transparent */
-          /* :root {
+          .transparent {
             --background-color: transparent;
             --fill-color: transparent;
             --line-color: #22292d;
-          } */
+          }
         }
         svg {
           background-color: var(--background-color);
