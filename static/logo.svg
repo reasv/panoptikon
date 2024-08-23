@@ -41,10 +41,6 @@
           --background-color: transparent;
           --fill-color: transparent;
         }
-
-        
-
-        
         svg {
           background-color: var(--background-color);
         }

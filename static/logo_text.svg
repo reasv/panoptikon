@@ -9,30 +9,44 @@
           font-weight: normal;
           src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
         }
-        /* Dark mode */
-        /* :root {
+        /* Dark mode (default) */
+        :root {
           --background-color: #22292d;
           --fill-color: #22292d;
           --line-color: #f0ece0;
-        } */
-         /* Light mode */
-        /* :root {
+        }
+        /* Light mode */
+        @media (prefers-color-scheme: light) {
+          :root {
+            --background-color: #f0ece0;
+            --fill-color: #f0ece0;
+            --line-color: #22292d;
+          }
+        }
+        /* Light mode override */
+        .light {
           --background-color: #f0ece0;
           --fill-color: #f0ece0;
           --line-color: #22292d;
-        } */
-        /* Dark mode fully transparent */
-        :root {
-          --background-color: transparent;
-          --fill-color: transparent;
-          --line-color: #f0ece0;
         }
-        /* Dark mode semi transparent */
-        /* :root {
-          --background-color: transparent;
+
+        /* Dark mode override */
+        .dark {
+          --background-color: #22292d;
           --fill-color: #22292d;
           --line-color: #f0ece0;
-        } */
+        }
+
+        /* Opaque with transparent background */
+        .transparent-background {
+          --background-color: transparent;
+        }
+
+        /* Fully transparent */
+        .transparent {
+          --background-color: transparent;
+          --fill-color: transparent;
+        }
         svg {
           background-color: var(--background-color);
         }
