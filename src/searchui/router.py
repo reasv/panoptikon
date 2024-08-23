@@ -15,20 +15,21 @@ from nodejs_wheel import npm, npx
 logger = logging.getLogger(__name__)
 
 
-def get_client_url(parent_hostname: str) -> str:
+def get_client_url(parent_hostname: str, parent_port: int) -> str:
     if url := os.getenv("CLIENT_URL"):
         return url
     else:
         client_hostname = os.getenv("CLIENT_HOST", parent_hostname)
         client_port = int(os.getenv("CLIENT_PORT", 6339))
-        run_node_client(client_hostname, client_port)
+        parent_url = f"http://{parent_hostname}:{parent_port}/"
+        run_node_client(client_hostname, client_port, parent_url)
         return f"http://{client_hostname}:{client_port}/"
 
 
 def get_routers(
     parent_hostname: str, parent_port: int
 ) -> Tuple[APIRouter, APIRouter, str]:
-    client_url = get_client_url(parent_hostname)
+    client_url = get_client_url(parent_hostname, parent_port)
 
     logger.info(f"Client URL: {client_url}")
     reverse_http_proxy = ReverseHttpProxy(base_url=client_url)
@@ -51,7 +52,7 @@ def get_routers(
 REPO_URL = "https://github.com/reasv/panoptikon-ui.git"
 
 
-def run_node_client(hostname: str, port: int):
+def run_node_client(hostname: str, port: int, parent_url: str):
     logger.info("Running Node.js client")
 
     client_dir = os.path.join(os.path.dirname(__file__), "panoptikon-ui")
@@ -61,6 +62,9 @@ def run_node_client(hostname: str, port: int):
 
     # Fetch the repository or pull the latest changes
     fetch_or_pull_repo(REPO_URL, client_dir)
+
+    # Set in case panoptikon is running somewhere else
+    panoptikon_public_url = os.getenv("PANOPTIKON_PUBLIC_URL", parent_url)
 
     # Check if build is needed based on the latest commit timestamp
     if is_build_needed(build_dir, client_dir):
@@ -86,6 +90,7 @@ def run_node_client(hostname: str, port: int):
             ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
             stdout=subprocess.DEVNULL,
+            env={"NEXT_PUBLIC_API_URL": panoptikon_public_url},
         )
 
     # Start the server in a new thread
