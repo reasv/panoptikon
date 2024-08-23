@@ -148,18 +148,6 @@
         stroke-width: 5;
       }
     </style>
-    <style type="text/css">
-        @font-face {
-          font-family: 'Helvetica';
-          font-style: normal;
-          font-weight: normal;
-          src: local('Helvetica'), url('Helvetica-Bold.woff') format('woff');
-        }
-      .svg-logo-text {
-          font-family: 'Helvetica';
-          fill: var(--text-color);
-      }
-    </style>
 </defs>
 <g transform="translate(25, 22)">
 <g transform="translate(-265, -133)">
