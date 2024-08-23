@@ -1,4 +1,10 @@
-![Panoptikon Logo](https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_fixed.png)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_white.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_outline.png">
+  <img alt="Panoptikon" src="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/banner_transparent_background_gh_colors_text_outline.png">
+</picture>
+
 ## State of the art, local, multimodal, multimedia search engine
 Panoptikon indexes your local files using state-of-the-art AI and Machine learning models and makes difficult-to-search media such as images and videos easily findable.
 
