@@ -159,11 +159,13 @@ def delete_bookmarks_by_namespace(
 ):
     conn = get_database_connection(**conn_args)
     try:
-        if items:
+        conn.execute("BEGIN TRANSACTION")
+        if items and items.sha256:
             c = 0
             for s in items.sha256:
                 remove_bookmark(conn, s, namespace=namespace, user=user)
                 c += 1
+            conn.commit()
             return MessageResult(message=f"Deleted {c} bookmarks")
         elif items is None:
             delete_bookmarks_exclude_last_n(
@@ -172,9 +174,15 @@ def delete_bookmarks_by_namespace(
                 namespace=namespace,
                 user=user,
             )
+            conn.commit()
             return MessageResult(message="Deleted bookmarks")
         else:
+            conn.rollback()
             return MessageResult(message="No items provided")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error deleting bookmarks: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting bookmarks")
     finally:
         conn.close()
 
@@ -235,6 +243,7 @@ def add_bookmarks_by_sha256(
         )
     conn = get_database_connection(**conn_args)
     try:
+        conn.execute("BEGIN TRANSACTION")
         c = 0
         for s in items.sha256:
             if items.metadata:
@@ -247,7 +256,12 @@ def add_bookmarks_by_sha256(
                 conn, s, namespace=namespace, user=user, metadata=metadata
             )
             c += 1
+        conn.commit()
         return MessageResult(message=f"Added {c} bookmarks")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error adding bookmarks: {e}")
+        raise HTTPException(status_code=500, detail="Error adding bookmarks")
     finally:
         conn.close()
 
@@ -270,8 +284,14 @@ def delete_bookmark_by_sha256(
 ):
     conn = get_database_connection(**conn_args)
     try:
+        conn.execute("BEGIN TRANSACTION")
         remove_bookmark(conn, sha256, namespace=namespace, user=user)
+        conn.commit()
         return MessageResult(message="Deleted bookmark")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error deleting bookmark: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting bookmark")
     finally:
         conn.close()
 
@@ -306,10 +326,16 @@ def add_bookmark_by_sha256(
         )
     conn = get_database_connection(**conn_args)
     try:
+        conn.execute("BEGIN TRANSACTION")
         add_bookmark(
             conn, sha256, namespace=namespace, user=user, metadata=metadata
         )
+        conn.commit()
         return MessageResult(message="Added bookmark")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error adding bookmark: {e}")
+        raise HTTPException(status_code=500, detail="Error adding bookmark")
     finally:
         conn.close()
 
