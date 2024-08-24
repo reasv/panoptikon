@@ -3,7 +3,7 @@ from typing import Dict, Optional
 
 from fastapi import HTTPException, Query
 
-from panoptikon.db import get_database_connection, get_db_lists
+from panoptikon.db import get_db_lists
 
 
 def check_dbs(index_db: Optional[str], user_data_db: Optional[str]):
@@ -21,8 +21,14 @@ def check_dbs(index_db: Optional[str], user_data_db: Optional[str]):
 
 
 def get_db_readonly(
-    index_db: Optional[str] = Query(None),
-    user_data_db: Optional[str] = Query(None),
+    index_db: Optional[str] = Query(
+        None,
+        description="The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
+    user_data_db: Optional[str] = Query(
+        None,
+        description="The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
 
@@ -34,8 +40,14 @@ def get_db_readonly(
 
 
 def get_db_user_data_wl(
-    index_db: Optional[str] = Query(None),
-    user_data_db: Optional[str] = Query(None),
+    index_db: Optional[str] = Query(
+        None,
+        description="The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
+    user_data_db: Optional[str] = Query(
+        None,
+        description="The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
     return {
