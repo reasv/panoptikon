@@ -4,6 +4,7 @@ from typing import List
 from panoptikon.data_extractors.models import ModelOpts, ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.rules.rules import get_rules
+from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders
 
 logger = logging.getLogger(__name__)
@@ -33,5 +34,7 @@ def run_cronjob():
         conn.execute("BEGIN TRANSACTION")
         model_opt.run_extractor(conn)
         conn.commit()
+
+    vacuum_database(conn)
     conn.close()
     logger.info("Cronjob finished")
