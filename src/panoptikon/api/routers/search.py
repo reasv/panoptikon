@@ -1,17 +1,13 @@
 import base64
 import io
 import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from click import File
-from fastapi import APIRouter, Body, Depends, Query
-from librosa import ex
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, Path, Query
 from pydantic.dataclasses import dataclass
 
 from inferio.impl.utils import deserialize_array
-from panoptikon.api.routers.search_types import SearchQueryModel
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import get_database_connection
 from panoptikon.db.bookmarks import get_all_bookmark_namespaces
@@ -99,20 +95,25 @@ To get the list of embedding models the data is indexed with, use /api/search/st
     response_model=FileSearchResultModel,
 )
 def search(
-    data: SearchQuery = Body(default_factory=lambda: SearchQuery()),
+    search_query: SearchQuery = Body(
+        default_factory=lambda: SearchQuery(),
+        description="The search query to execute",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    logger.debug(f"Searching for files with query: {data}")
-    if data.query.filters.image_embeddings:
-        query = data.query.filters.image_embeddings.query
-        data.query.filters.image_embeddings.query = extract_embeddings(query)
-    if data.query.filters.extracted_text_embeddings:
-        query = data.query.filters.extracted_text_embeddings.query
-        data.query.filters.extracted_text_embeddings.query = extract_embeddings(
+    logger.debug(f"Searching for files with query: {search_query}")
+    if search_query.query.filters.image_embeddings:
+        query = search_query.query.filters.image_embeddings.query
+        search_query.query.filters.image_embeddings.query = extract_embeddings(
             query
         )
-    results = list(search_files(conn, data))
+    if search_query.query.filters.extracted_text_embeddings:
+        query = search_query.query.filters.extracted_text_embeddings.query
+        search_query.query.filters.extracted_text_embeddings.query = (
+            extract_embeddings(query)
+        )
+    results = list(search_files(conn, search_query))
     return process_results(results)
 
 
@@ -152,18 +153,20 @@ This information is relevant for building search queries.
 )
 def get_stats(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-    user: Optional[str] = Query(None),
+    user: str = Query(
+        "user",
+        description="The bookmarks user to get the bookmark namespaces for",
+    ),
+    include_wildcard: bool = Query(
+        True,
+        description="Include namespaces from bookmarks with the * user value",
+    ),
 ):
     conn = get_database_connection(**conn_args)
     setters = get_existing_setters(conn)
-    if not user:
-        bookmark_namespaces = get_all_bookmark_namespaces(
-            conn, include_wildcard=True
-        )
-    else:
-        bookmark_namespaces = get_all_bookmark_namespaces(
-            conn, include_wildcard=False, user=user
-        )
+    bookmark_namespaces = get_all_bookmark_namespaces(
+        conn, include_wildcard=include_wildcard, user=user
+    )
     file_types = get_all_mime_types(conn)
     tag_namespaces = get_all_tag_namespaces(conn)
     folders = get_folders_from_database(conn)
@@ -205,9 +208,19 @@ The `confidence_threshold` parameter can be used to filter tags based on the min
 )
 def get_top_tags(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-    namespace: Optional[str] = Query(None),
-    setters: List[str] = Query([]),
-    confidence_threshold: Optional[float] = Query(None),
+    namespace: Optional[str] = Query(
+        None, description="The tag namespace to search in"
+    ),
+    setters: List[str] = Query(
+        [],
+        description="The tag setter names to restrict the search to. Default is all",
+    ),
+    confidence_threshold: Optional[float] = Query(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="The minimum confidence threshold for tags",
+    ),
     limit: int = Query(10),
 ):
     conn = get_database_connection(**conn_args)
@@ -241,7 +254,7 @@ The tags are returned in descending order of the number of items tagged.
     response_model=TagSearchResults,
 )
 def get_tags(
-    name: str = Query(...),
+    name: str = Query(..., description="The (partial) tag name to search for"),
     limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
@@ -277,8 +290,14 @@ Restricting similarity to a tagger model or a set of tagger models is recommende
 )
 def find_similar(
     sha256: str,
-    setter_name: str,
-    src_setter_names: Optional[List[str]] = Query(None),
+    setter_name: str = Path(
+        ...,
+        description="The name of the embedding model use for similarity search",
+    ),
+    src_setter_names: Optional[List[str]] = Query(
+        None,
+        description="The source model names to restrict the search to. These are the models that produced the text for the items from which the text embeddings were produced.",
+    ),
     limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):

@@ -80,7 +80,10 @@ def get_bookmarks_by_namespace(
         "time_added"
     ),
     order: OrderType = Query(None),
-    include_wildcard: bool = Query(True),
+    include_wildcard: bool = Query(
+        True,
+        description="Whether or not to include bookmarks set under the wildcard user.",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
@@ -113,7 +116,9 @@ Alternatively, a list of `sha256` values can be provided in the request body to 
 )
 def delete_bookmarks_by_namespace(
     namespace: str,
-    user: str = Query("user"),
+    user: str = Query(
+        "user", description="The user to delete the bookmarks from."
+    ),
     exclude_last_n: int = Query(0),
     items: Optional[Items] = Body(None),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
@@ -177,7 +182,10 @@ Example request body:
 def add_bookmarks_by_sha256(
     namespace: str,
     items: ItemsMeta = Body(...),
-    user: str = Query("user"),
+    user: str = Query(
+        "user",
+        description="The user to save the bookmark under. The wildcard '*' can be used to set `wildcard user` bookmarks that apply to all users.",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
     conn = get_database_connection(**conn_args)
@@ -202,7 +210,9 @@ def add_bookmarks_by_sha256(
 def delete_bookmark_by_sha256(
     namespace: str,
     sha256: str,
-    user: str = Query("user"),
+    user: str = Query(
+        "user", description="The user to delete the bookmark from."
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
     conn = get_database_connection(**conn_args)
@@ -223,7 +233,10 @@ Metadata should be a dictionary of key-value pairs.
 def add_bookmark_by_sha256(
     namespace: str,
     sha256: str,
-    user: str = Query("user"),
+    user: str = Query(
+        "user",
+        description="The user to save the bookmark under. The wildcard '*' can be used to set `wildcard user` bookmarks that apply to all users.",
+    ),
     metadata: Optional[Dict] = Body(None),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
@@ -252,7 +265,10 @@ Returns whether the bookmark exists and the metadata.
 def get_bookmark(
     namespace: str,
     sha256: str,
-    user: str = Query("user"),
+    user: str = Query(
+        "user",
+        description="The user to get the bookmark from. The wildcard '*' can be used to get `wildcard user` bookmarks that apply to all users.",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)

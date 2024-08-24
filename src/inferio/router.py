@@ -65,8 +65,47 @@ def predict(
     cache_key: str = Query(...),
     lru_size: int = Query(...),
     ttl_seconds: int = Query(...),
-    data: str = Form(...),  # The JSON data as a string
-    files: List[UploadFile] = File([]),  # The binary files
+    data: str = Form(
+        ...,
+        description="""
+A JSON string containing the list of inputs to the batch prediction function, with the following structure:
+```json
+{
+    "inputs": [
+        {"input2": "value"},
+        null,
+        ...
+    ]
+}
+```
+The array must have the same length as the number of inputs in the batch.
+This means that each file you include in the request must have a corresponding entry in the array.
+Entries can be JSON objects or null. For example, text embeddings expect objects with the following structure:
+```json
+{
+    "inputs": [
+        {"text": "This is a sentence."},
+        {"text": "Another sentence."},
+        ...
+    ]
+}
+```
+For some models, the inputs can be null, in which case the corresponding file will be the only input.
+
+Often, when not required, the input object will be used to pass optional inference-time parameters, such as "confidence" for confidence thresholds.
+In that case, null would result in default values being used.
+
+Filenames for files in the files parameter must be integers starting from 0, representing the index in the batch, matching an element in the `inputs` array.
+""",
+    ),  # The JSON data as a string
+    files: List[UploadFile] = File(
+        [],
+        description="""
+A list of binary files to include in the batch prediction.
+Each file must have a filename that is an integer starting from 0, representing the index in the batch, matching an element in the `inputs` array in the `data` field.
+Files may be optional depending on the model, some do not operate on binary data. 
+""",
+    ),  # The binary files
 ):
     inputs = parse_input_request(data, files)
     logger.debug(
