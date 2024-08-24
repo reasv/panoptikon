@@ -118,7 +118,12 @@ def get_file_by_sha256(
         raise HTTPException(status_code=404, detail="File not found")
     path = file_record.path
     mime = get_mime_type(path)
-    return FileResponse(path, media_type=mime, filename=os.path.basename(path))
+    return FileResponse(
+        path,
+        media_type=mime,
+        filename=os.path.basename(path),
+        content_disposition_type="inline",
+    )
 
 
 @router.get(
@@ -151,9 +156,16 @@ def get_thumbnail_by_sha256(
     if not file:
         raise HTTPException(status_code=404, detail="Item not found")
     mime = get_mime_type(file.path)
+    original_filename = os.path.basename(file.path)
+    original_filename_no_ext, _ = os.path.splitext(original_filename)
 
     if mime is None or mime.startswith("image/gif"):
-        return FileResponse(file.path, media_type=mime)
+        return FileResponse(
+            file.path,
+            media_type=mime,
+            filename=original_filename,
+            content_disposition_type="inline",
+        )
 
     index = 0
     if mime.startswith("video"):
@@ -161,16 +173,33 @@ def get_thumbnail_by_sha256(
 
     buffer = get_thumbnail_bytes(conn, file.sha256, index)
     if buffer:
-        return Response(content=buffer, media_type="image/jpeg")
+        return Response(
+            content=buffer,
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"'
+            },
+        )
 
     if mime.startswith("image"):
-        return FileResponse(file.path, media_type=mime)
+        return FileResponse(
+            file.path,
+            media_type=mime,
+            filename=original_filename,
+            content_disposition_type="inline",
+        )
     gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
     # Convert the PIL image to bytes
     img_byte_array = io.BytesIO()
     gradient.save(img_byte_array, format="PNG")
     img_byte_array = img_byte_array.getvalue()
-    return Response(content=img_byte_array, media_type="image/png")
+    return Response(
+        content=img_byte_array,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
+        },
+    )
 
 
 @dataclass
