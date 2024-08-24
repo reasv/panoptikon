@@ -124,10 +124,13 @@ def open_file_on_host(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    path = get_correct_path(conn, sha256, path)
-    msg = open_file(path)
+    try:
+        path = get_correct_path(conn, sha256, path)
+        msg = open_file(path)
 
-    return OpenResponse(path=path, message=msg)
+        return OpenResponse(path=path, message=msg)
+    finally:
+        conn.close()
 
 
 @app.post(
@@ -149,10 +152,13 @@ def show_in_file_manager(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    path = get_correct_path(conn, sha256, path)
-    msg = open_in_explorer(path)
+    try:
+        path = get_correct_path(conn, sha256, path)
+        msg = open_in_explorer(path)
 
-    return OpenResponse(path=path, message=msg)
+        return OpenResponse(path=path, message=msg)
+    finally:
+        conn.close()
 
 
 app.include_router(search.router)
