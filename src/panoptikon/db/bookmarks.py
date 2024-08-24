@@ -144,6 +144,22 @@ def get_all_bookmark_namespaces(
     return [namespace[0] for namespace in namespaces]
 
 
+def get_all_bookmark_users(
+    conn: sqlite3.Connection,
+) -> List[str]:
+    cursor = conn.cursor()
+    # Get all bookmark users, order by user name
+    cursor.execute(
+        f"""
+        SELECT DISTINCT user
+        FROM user_data.bookmarks
+        ORDER BY user
+        """,
+    )
+    users = cursor.fetchall()
+    return [user[0] for user in users]
+
+
 def get_bookmarks(
     conn: sqlite3.Connection,
     namespace: str = "default",

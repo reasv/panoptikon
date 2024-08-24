@@ -12,6 +12,7 @@ from panoptikon.db.bookmarks import (
     add_bookmark,
     delete_bookmarks_exclude_last_n,
     get_all_bookmark_namespaces,
+    get_all_bookmark_users,
     get_bookmark_metadata,
     get_bookmarks,
     remove_bookmark,
@@ -34,7 +35,7 @@ class BookmarkNamespaces:
 
 
 @router.get(
-    "/",
+    "/namespaces",
     summary="Get all bookmark namespaces",
     response_model=BookmarkNamespaces,
 )
@@ -47,6 +48,23 @@ def get_ns_list(
 
 class Items(BaseModel):
     sha256: List[str]
+
+
+@dataclass
+class BookmarkUsers:
+    users: List[str]
+
+
+@router.get(
+    "/users",
+    summary="Get all users with bookmarks",
+    response_model=BookmarkUsers,
+)
+def get_user_list(
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+):
+    conn = get_database_connection(**conn_args)
+    return BookmarkUsers(users=get_all_bookmark_users(conn))
 
 
 @dataclass
