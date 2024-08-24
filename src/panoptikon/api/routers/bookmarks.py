@@ -1,8 +1,8 @@
 import logging
-import sqlite3
+from os import name
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
@@ -15,6 +15,7 @@ from panoptikon.db.bookmarks import (
     get_all_bookmark_users,
     get_bookmark_metadata,
     get_bookmarks,
+    get_bookmarks_item,
     remove_bookmark,
 )
 from panoptikon.db.search.types import OrderType
@@ -35,7 +36,7 @@ class BookmarkNamespaces:
 
 
 @router.get(
-    "/namespaces",
+    "/ns",
     summary="Get all bookmark namespaces",
     response_model=BookmarkNamespaces,
 )
@@ -74,7 +75,7 @@ class Results:
 
 
 @router.get(
-    "/{namespace}",
+    "/ns/{namespace}",
     summary="Get all bookmarks in a namespace",
     description="""
 Get all items bookmarked in namespace.
@@ -90,7 +91,10 @@ The `include_wildcard` parameter can be used to include bookmarks with the `*` u
     response_model=Results,
 )
 def get_bookmarks_by_namespace(
-    namespace: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to get the bookmarks from. Wildcard ('*') results in getting bookmarks from all namespaces.",
+    ),
     user: str = Query("user"),
     page_size: int = Query(1000),
     page: int = Query(1),
@@ -124,8 +128,8 @@ class MessageResult:
 
 
 @router.delete(
-    "/{namespace}",
-    summary="Delete multiple bookmarks in a namespace",
+    "/ns/{namespace}",
+    summary="Delete all/many bookmarks in a namespace",
     description="""
 Delete all bookmarks in a namespace. If `exclude_last_n` is provided, the last `n` added bookmarks will be kept.
 Alternatively, a list of `sha256` values can be provided in the request body to only delete specific bookmarks.
@@ -133,7 +137,10 @@ Alternatively, a list of `sha256` values can be provided in the request body to 
     response_model=MessageResult,
 )
 def delete_bookmarks_by_namespace(
-    namespace: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to delete the bookmarks from. Wildcard ('*') results in deleting bookmarks from all namespaces.",
+    ),
     user: str = Query(
         "user", description="The user to delete the bookmarks from."
     ),
@@ -166,7 +173,7 @@ class ItemsMeta(BaseModel):
 
 
 @router.post(
-    "/{namespace}",
+    "/ns/{namespace}",
     summary="Add multiple bookmarks to a namespace",
     description="""
 Add multiple bookmarks to a namespace.
@@ -198,7 +205,10 @@ Example request body:
     response_model=MessageResult,
 )
 def add_bookmarks_by_sha256(
-    namespace: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to save the bookmarks under. Wildcard is not allowed here.",
+    ),
     items: ItemsMeta = Body(...),
     user: str = Query(
         "user",
@@ -206,6 +216,11 @@ def add_bookmarks_by_sha256(
     ),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    if namespace == "*":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot add bookmarks to wildcard namespace",
+        )
     conn = get_database_connection(**conn_args)
     c = 0
     for s in items.sha256:
@@ -221,13 +236,16 @@ def add_bookmarks_by_sha256(
 
 
 @router.delete(
-    "/{namespace}/{sha256}",
-    summary="Delete a bookmark by namespace and sha256",
+    "/ns/{namespace}/{sha256}",
+    summary="Delete a specific bookmark by namespace and sha256",
     response_model=MessageResult,
 )
 def delete_bookmark_by_sha256(
-    namespace: str,
-    sha256: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to delete the bookmark from. Wildcard ('*') results in deleting bookmarks for an item from all namespaces.",
+    ),
+    sha256: str = Path(..., description="The sha256 of the item"),
     user: str = Query(
         "user", description="The user to delete the bookmark from."
     ),
@@ -239,7 +257,7 @@ def delete_bookmark_by_sha256(
 
 
 @router.put(
-    "/{namespace}/{sha256}",
+    "/ns/{namespace}/{sha256}",
     summary="Add a bookmark by namespace and sha256",
     description="""
 Add a bookmark by namespace and sha256.
@@ -249,8 +267,11 @@ Metadata should be a dictionary of key-value pairs.
     response_model=MessageResult,
 )
 def add_bookmark_by_sha256(
-    namespace: str,
-    sha256: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to save the bookmark under. Wildcard is not allowed here.",
+    ),
+    sha256: str = Path(..., description="The sha256 of the item"),
     user: str = Query(
         "user",
         description="The user to save the bookmark under. The wildcard '*' can be used to set `wildcard user` bookmarks that apply to all users.",
@@ -258,6 +279,11 @@ def add_bookmark_by_sha256(
     metadata: Optional[Dict] = Body(None),
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
+    if namespace == "*":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot add bookmarks to wildcard namespace",
+        )
     conn = get_database_connection(**conn_args)
     add_bookmark(
         conn, sha256, namespace=namespace, user=user, metadata=metadata
@@ -268,11 +294,12 @@ def add_bookmark_by_sha256(
 @dataclass
 class BookmarkMetadata:
     exists: bool
+    namespace: Optional[str] = None
     metadata: Optional[Dict] = None
 
 
 @router.get(
-    "/{namespace}/{sha256}",
+    "/ns/{namespace}/{sha256}",
     summary="Get a bookmark by namespace and sha256",
     description="""
 Get a bookmark by namespace and sha256.
@@ -281,8 +308,11 @@ Returns whether the bookmark exists and the metadata.
     response_model=BookmarkMetadata,
 )
 def get_bookmark(
-    namespace: str,
-    sha256: str,
+    namespace: str = Path(
+        ...,
+        description="The namespace to get the bookmark from. Use '*' wildcard to mean 'any namespace', in which case it will return the first result found.",
+    ),
+    sha256: str = Path(..., description="The sha256 of the item"),
     user: str = Query(
         "user",
         description="The user to get the bookmark from. The wildcard '*' can be used to get `wildcard user` bookmarks that apply to all users.",
@@ -290,7 +320,44 @@ def get_bookmark(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    exists, metadata = get_bookmark_metadata(
+    exists, ns, metadata = get_bookmark_metadata(
         conn, sha256, namespace=namespace, user=user
     )
-    return BookmarkMetadata(exists=exists, metadata=metadata)
+    return BookmarkMetadata(exists=exists, namespace=ns, metadata=metadata)
+
+
+@dataclass
+class ExistingBookmarkMetadata:
+    namespace: Optional[str] = None
+    metadata: Optional[Dict] = None
+
+
+@dataclass
+class ItemBookmarks:
+    bookmarks: List[ExistingBookmarkMetadata]
+
+
+@router.get(
+    "/item/{sha256}",
+    summary="Get all bookmarks for an item",
+    description="""
+Get all bookmarks for an item.
+Returns a list of namespaces and metadata for each bookmark.
+    """,
+    response_model=ItemBookmarks,
+)
+def get_bookmarks_for_item(
+    sha256: str,
+    user: str = Query(
+        "user",
+        description="The user to get the bookmark from. The wildcard '*' can be used to get `wildcard user` bookmarks that apply to all users.",
+    ),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> ItemBookmarks:
+    conn = get_database_connection(**conn_args)
+    return ItemBookmarks(
+        bookmarks=[
+            ExistingBookmarkMetadata(namespace=ns, metadata=metadata)
+            for ns, metadata in get_bookmarks_item(conn, sha256, user=user)
+        ]
+    )

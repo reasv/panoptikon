@@ -56,7 +56,7 @@ def on_selected_image_get_bookmark_state(
         return gr.update(value="Bookmark")
     sha256 = selected_files[0].sha256
     conn = get_database_connection(write_lock=False)
-    is_bookmarked, _ = get_bookmark_metadata(
+    is_bookmarked, __, _ = get_bookmark_metadata(
         conn, namespace=bookmarks_namespace, sha256=sha256
     )
     conn.commit()
