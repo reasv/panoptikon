@@ -173,7 +173,7 @@ def get_stats(
     return APISearchStats(
         setters=setters,
         bookmarks=bookmark_namespaces,
-        files=FileStats(total=items, unique=files, mime_types=file_types),
+        files=FileStats(total=files, unique=items, mime_types=file_types),
         tags=TagStats(
             namespaces=tag_namespaces, min_confidence=min_tags_threshold
         ),
