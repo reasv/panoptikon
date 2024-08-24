@@ -58,11 +58,13 @@ def get_item_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    item, files = get_item_metadata_by_sha256(conn, sha256)
-    if item is None or files is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    return ItemMetadata(item=item, files=files)
+    try:
+        item, files = get_item_metadata_by_sha256(conn, sha256)
+        if item is None or files is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return ItemMetadata(item=item, files=files)
+    finally:
+        conn.close()
 
 
 @router.get(
@@ -81,15 +83,17 @@ def get_item_by_path(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    file_record = get_file_by_path(conn, path)
-    if file_record is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    sha256 = file_record.sha256
-    item, files = get_item_metadata_by_sha256(conn, sha256)
-    if item is None or files is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    return ItemMetadata(item=item, files=files)
+    try:
+        file_record = get_file_by_path(conn, path)
+        if file_record is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        sha256 = file_record.sha256
+        item, files = get_item_metadata_by_sha256(conn, sha256)
+        if item is None or files is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return ItemMetadata(item=item, files=files)
+    finally:
+        conn.close()
 
 
 @router.get(
@@ -112,18 +116,21 @@ def get_file_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> FileResponse:
     conn = get_database_connection(**conn_args)
-    file_record = get_existing_file_for_sha256(conn, sha256)
+    try:
+        file_record = get_existing_file_for_sha256(conn, sha256)
 
-    if file_record is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    path = file_record.path
-    mime = get_mime_type(path)
-    return FileResponse(
-        path,
-        media_type=mime,
-        filename=os.path.basename(path),
-        content_disposition_type="inline",
-    )
+        if file_record is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        path = file_record.path
+        mime = get_mime_type(path)
+        return FileResponse(
+            path,
+            media_type=mime,
+            filename=os.path.basename(path),
+            content_disposition_type="inline",
+        )
+    finally:
+        conn.close()
 
 
 @router.get(
@@ -152,54 +159,57 @@ def get_thumbnail_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> Response:
     conn = get_database_connection(**conn_args)
-    file = get_existing_file_for_sha256(conn, sha256)
-    if not file:
-        raise HTTPException(status_code=404, detail="Item not found")
-    mime = get_mime_type(file.path)
-    original_filename = os.path.basename(file.path)
-    original_filename_no_ext, _ = os.path.splitext(original_filename)
+    try:
+        file = get_existing_file_for_sha256(conn, sha256)
+        if not file:
+            raise HTTPException(status_code=404, detail="Item not found")
+        mime = get_mime_type(file.path)
+        original_filename = os.path.basename(file.path)
+        original_filename_no_ext, _ = os.path.splitext(original_filename)
 
-    if mime is None or mime.startswith("image/gif"):
-        return FileResponse(
-            file.path,
-            media_type=mime,
-            filename=original_filename,
-            content_disposition_type="inline",
-        )
+        if mime is None or mime.startswith("image/gif"):
+            return FileResponse(
+                file.path,
+                media_type=mime,
+                filename=original_filename,
+                content_disposition_type="inline",
+            )
 
-    index = 0
-    if mime.startswith("video"):
-        index = 0 if big else 1
+        index = 0
+        if mime.startswith("video"):
+            index = 0 if big else 1
 
-    buffer = get_thumbnail_bytes(conn, file.sha256, index)
-    if buffer:
+        buffer = get_thumbnail_bytes(conn, file.sha256, index)
+        if buffer:
+            return Response(
+                content=buffer,
+                media_type="image/jpeg",
+                headers={
+                    "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"'
+                },
+            )
+
+        if mime.startswith("image"):
+            return FileResponse(
+                file.path,
+                media_type=mime,
+                filename=original_filename,
+                content_disposition_type="inline",
+            )
+        gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
+        # Convert the PIL image to bytes
+        img_byte_array = io.BytesIO()
+        gradient.save(img_byte_array, format="PNG")
+        img_byte_array = img_byte_array.getvalue()
         return Response(
-            content=buffer,
-            media_type="image/jpeg",
+            content=img_byte_array,
+            media_type="image/png",
             headers={
-                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"'
+                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
             },
         )
-
-    if mime.startswith("image"):
-        return FileResponse(
-            file.path,
-            media_type=mime,
-            filename=original_filename,
-            content_disposition_type="inline",
-        )
-    gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
-    # Convert the PIL image to bytes
-    img_byte_array = io.BytesIO()
-    gradient.save(img_byte_array, format="PNG")
-    img_byte_array = img_byte_array.getvalue()
-    return Response(
-        content=img_byte_array,
-        media_type="image/png",
-        headers={
-            "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
-        },
-    )
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -221,10 +231,13 @@ def get_text_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    text = get_extracted_text_for_item(conn, sha256)
-    if setters:
-        text = [t for t in text if t.setter_name in setters]
-    return TextResponse(text=text)
+    try:
+        text = get_extracted_text_for_item(conn, sha256)
+        if setters:
+            text = [t for t in text if t.setter_name in setters]
+        return TextResponse(text=text)
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -252,5 +265,10 @@ def get_tags_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    tags = get_all_tags_for_item(conn, sha256, setters, confidence_threshold)
-    return TagResponse(tags=tags)
+    try:
+        tags = get_all_tags_for_item(
+            conn, sha256, setters, confidence_threshold
+        )
+        return TagResponse(tags=tags)
+    finally:
+        conn.close()

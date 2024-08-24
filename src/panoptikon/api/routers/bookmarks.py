@@ -44,7 +44,10 @@ def get_ns_list(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    return BookmarkNamespaces(namespaces=get_all_bookmark_namespaces(conn))
+    try:
+        return BookmarkNamespaces(namespaces=get_all_bookmark_namespaces(conn))
+    finally:
+        conn.close()
 
 
 class Items(BaseModel):
@@ -65,7 +68,10 @@ def get_user_list(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    return BookmarkUsers(users=get_all_bookmark_users(conn))
+    try:
+        return BookmarkUsers(users=get_all_bookmark_users(conn))
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -109,17 +115,20 @@ def get_bookmarks_by_namespace(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    files, count = get_bookmarks(
-        conn,
-        namespace=namespace,
-        user=user,
-        page_size=page_size,
-        page=page,
-        order_by=order_by,
-        order=order,
-        include_wildcard=include_wildcard,
-    )
-    return Results(count=count, results=files)
+    try:
+        files, count = get_bookmarks(
+            conn,
+            namespace=namespace,
+            user=user,
+            page_size=page_size,
+            page=page,
+            order_by=order_by,
+            order=order,
+            include_wildcard=include_wildcard,
+        )
+        return Results(count=count, results=files)
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -149,22 +158,25 @@ def delete_bookmarks_by_namespace(
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
     conn = get_database_connection(**conn_args)
-    if items:
-        c = 0
-        for s in items.sha256:
-            remove_bookmark(conn, s, namespace=namespace, user=user)
-            c += 1
-        return MessageResult(message=f"Deleted {c} bookmarks")
-    elif items is None:
-        delete_bookmarks_exclude_last_n(
-            conn,
-            exclude_last_n,
-            namespace=namespace,
-            user=user,
-        )
-        return MessageResult(message="Deleted bookmarks")
-    else:
-        return MessageResult(message="No items provided")
+    try:
+        if items:
+            c = 0
+            for s in items.sha256:
+                remove_bookmark(conn, s, namespace=namespace, user=user)
+                c += 1
+            return MessageResult(message=f"Deleted {c} bookmarks")
+        elif items is None:
+            delete_bookmarks_exclude_last_n(
+                conn,
+                exclude_last_n,
+                namespace=namespace,
+                user=user,
+            )
+            return MessageResult(message="Deleted bookmarks")
+        else:
+            return MessageResult(message="No items provided")
+    finally:
+        conn.close()
 
 
 class ItemsMeta(BaseModel):
@@ -222,17 +234,22 @@ def add_bookmarks_by_sha256(
             detail="Cannot add bookmarks to wildcard namespace",
         )
     conn = get_database_connection(**conn_args)
-    c = 0
-    for s in items.sha256:
-        if items.metadata:
-            metadata = items.metadata
-            if item_meta := metadata.get(s):
-                metadata = item_meta
-        else:
-            metadata = None
-        add_bookmark(conn, s, namespace=namespace, user=user, metadata=metadata)
-        c += 1
-    return MessageResult(message=f"Added {c} bookmarks")
+    try:
+        c = 0
+        for s in items.sha256:
+            if items.metadata:
+                metadata = items.metadata
+                if item_meta := metadata.get(s):
+                    metadata = item_meta
+            else:
+                metadata = None
+            add_bookmark(
+                conn, s, namespace=namespace, user=user, metadata=metadata
+            )
+            c += 1
+        return MessageResult(message=f"Added {c} bookmarks")
+    finally:
+        conn.close()
 
 
 @router.delete(
@@ -252,8 +269,11 @@ def delete_bookmark_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_user_data_wl),
 ):
     conn = get_database_connection(**conn_args)
-    remove_bookmark(conn, sha256, namespace=namespace, user=user)
-    return MessageResult(message="Deleted bookmark")
+    try:
+        remove_bookmark(conn, sha256, namespace=namespace, user=user)
+        return MessageResult(message="Deleted bookmark")
+    finally:
+        conn.close()
 
 
 @router.put(
@@ -285,10 +305,13 @@ def add_bookmark_by_sha256(
             detail="Cannot add bookmarks to wildcard namespace",
         )
     conn = get_database_connection(**conn_args)
-    add_bookmark(
-        conn, sha256, namespace=namespace, user=user, metadata=metadata
-    )
-    return MessageResult(message="Added bookmark")
+    try:
+        add_bookmark(
+            conn, sha256, namespace=namespace, user=user, metadata=metadata
+        )
+        return MessageResult(message="Added bookmark")
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -320,10 +343,13 @@ def get_bookmark(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    exists, ns, metadata = get_bookmark_metadata(
-        conn, sha256, namespace=namespace, user=user
-    )
-    return BookmarkMetadata(exists=exists, namespace=ns, metadata=metadata)
+    try:
+        exists, ns, metadata = get_bookmark_metadata(
+            conn, sha256, namespace=namespace, user=user
+        )
+        return BookmarkMetadata(exists=exists, namespace=ns, metadata=metadata)
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -355,9 +381,12 @@ def get_bookmarks_for_item(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> ItemBookmarks:
     conn = get_database_connection(**conn_args)
-    return ItemBookmarks(
-        bookmarks=[
-            ExistingBookmarkMetadata(namespace=ns, metadata=metadata)
-            for ns, metadata in get_bookmarks_item(conn, sha256, user=user)
-        ]
-    )
+    try:
+        return ItemBookmarks(
+            bookmarks=[
+                ExistingBookmarkMetadata(namespace=ns, metadata=metadata)
+                for ns, metadata in get_bookmarks_item(conn, sha256, user=user)
+            ]
+        )
+    finally:
+        conn.close()

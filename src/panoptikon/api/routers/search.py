@@ -103,21 +103,24 @@ def search(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    logger.debug(
-        f"Searching for files with query: {pprint_dataclass(search_query)}"
-    )
-    if search_query.query.filters.image_embeddings:
-        query = search_query.query.filters.image_embeddings.query
-        search_query.query.filters.image_embeddings.query = extract_embeddings(
-            query
+    try:
+        logger.debug(
+            f"Searching for files with query: {pprint_dataclass(search_query)}"
         )
-    if search_query.query.filters.extracted_text_embeddings:
-        query = search_query.query.filters.extracted_text_embeddings.query
-        search_query.query.filters.extracted_text_embeddings.query = (
-            extract_embeddings(query)
-        )
-    results = list(search_files(conn, search_query))
-    return process_results(results)
+        if search_query.query.filters.image_embeddings:
+            query = search_query.query.filters.image_embeddings.query
+            search_query.query.filters.image_embeddings.query = (
+                extract_embeddings(query)
+            )
+        if search_query.query.filters.extracted_text_embeddings:
+            query = search_query.query.filters.extracted_text_embeddings.query
+            search_query.query.filters.extracted_text_embeddings.query = (
+                extract_embeddings(query)
+            )
+        results = list(search_files(conn, search_query))
+        return process_results(results)
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -166,26 +169,29 @@ def get_stats(
     ),
 ):
     conn = get_database_connection(**conn_args)
-    setters = get_existing_setters(conn)
-    bookmark_namespaces = get_all_bookmark_namespaces(
-        conn, include_wildcard=include_wildcard, user=user
-    )
-    file_types = get_all_mime_types(conn)
-    tag_namespaces = get_all_tag_namespaces(conn)
-    folders = get_folders_from_database(conn)
-    min_tags_threshold = get_min_tag_confidence(conn)
-    text_stats = get_text_stats(conn)
-    files, items = get_file_stats(conn)
-    return APISearchStats(
-        setters=setters,
-        bookmarks=bookmark_namespaces,
-        files=FileStats(total=files, unique=items, mime_types=file_types),
-        tags=TagStats(
-            namespaces=tag_namespaces, min_confidence=min_tags_threshold
-        ),
-        folders=folders,
-        text_stats=text_stats,
-    )
+    try:
+        setters = get_existing_setters(conn)
+        bookmark_namespaces = get_all_bookmark_namespaces(
+            conn, include_wildcard=include_wildcard, user=user
+        )
+        file_types = get_all_mime_types(conn)
+        tag_namespaces = get_all_tag_namespaces(conn)
+        folders = get_folders_from_database(conn)
+        min_tags_threshold = get_min_tag_confidence(conn)
+        text_stats = get_text_stats(conn)
+        files, items = get_file_stats(conn)
+        return APISearchStats(
+            setters=setters,
+            bookmarks=bookmark_namespaces,
+            files=FileStats(total=files, unique=items, mime_types=file_types),
+            tags=TagStats(
+                namespaces=tag_namespaces, min_confidence=min_tags_threshold
+            ),
+            folders=folders,
+            text_stats=text_stats,
+        )
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -227,15 +233,18 @@ def get_top_tags(
     limit: int = Query(10),
 ):
     conn = get_database_connection(**conn_args)
-    return TagFrequency(
-        tags=get_most_common_tags_frequency(
-            conn,
-            namespace=namespace,
-            setters=setters,
-            confidence_threshold=confidence_threshold,
-            limit=limit,
+    try:
+        return TagFrequency(
+            tags=get_most_common_tags_frequency(
+                conn,
+                namespace=namespace,
+                setters=setters,
+                confidence_threshold=confidence_threshold,
+                limit=limit,
+            )
         )
-    )
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -262,9 +271,12 @@ def get_tags(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    tags = find_tags(conn, name, limit)
-    tags.sort(key=lambda x: x[2], reverse=True)
-    return TagSearchResults(tags)
+    try:
+        tags = find_tags(conn, name, limit)
+        tags.sort(key=lambda x: x[2], reverse=True)
+        return TagSearchResults(tags)
+    finally:
+        conn.close()
 
 
 @router.get(
@@ -305,7 +317,12 @@ def find_similar(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    results = list(
-        find_similar_items(conn, sha256, setter_name, src_setter_names, limit)
-    )
-    return FileSearchResultModel(count=len(results), results=results)
+    try:
+        results = list(
+            find_similar_items(
+                conn, sha256, setter_name, src_setter_names, limit
+            )
+        )
+        return FileSearchResultModel(count=len(results), results=results)
+    finally:
+        conn.close()
