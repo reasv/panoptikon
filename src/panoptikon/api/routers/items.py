@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic.dataclasses import dataclass
 
-from panoptikon.api.routers.utils import get_db_readonly
+from panoptikon.api.routers.utils import get_db_readonly, strip_non_latin1_chars
 from panoptikon.db import get_database_connection
 from panoptikon.db.extracted_text import get_extracted_text_for_item
 from panoptikon.db.files import (
@@ -164,7 +164,7 @@ def get_thumbnail_by_sha256(
         if not file:
             raise HTTPException(status_code=404, detail="Item not found")
         mime = get_mime_type(file.path)
-        original_filename = os.path.basename(file.path)
+        original_filename = strip_non_latin1_chars(os.path.basename(file.path))
         original_filename_no_ext, _ = os.path.splitext(original_filename)
 
         if mime is None or mime.startswith("image/gif"):

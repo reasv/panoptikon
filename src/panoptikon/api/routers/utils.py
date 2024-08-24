@@ -56,3 +56,9 @@ def get_db_user_data_wl(
         "index_db": index_db,
         "user_data_db": user_data_db,
     }
+
+
+def strip_non_latin1_chars(input_string):
+    return "".join(
+        char for char in input_string if char.encode("latin-1", errors="ignore")
+    )
