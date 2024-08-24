@@ -43,6 +43,7 @@ def vacuum_database(conn: sqlite3.Connection):
     """
     conn.execute("VACUUM")
     conn.execute("ANALYZE")
+    conn.execute("PRAGMA optimize")
 
 
 def pretty_print_SQL(query_str: str, params: List[str | float | int]):
