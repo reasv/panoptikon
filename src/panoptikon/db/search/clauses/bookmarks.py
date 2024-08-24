@@ -10,19 +10,21 @@ def build_bookmarks_clause(
     """
     if not args or not args.restrict_to_bookmarks:
         return "", [], ""
-    bookmarks_condition = """
+    if args.include_wildcard:
+        user_condition = "AND (bookmarks.user = ? OR bookmarks.user = '*')"
+    else:
+        user_condition = "AND bookmarks.user = ?"
+    params = [args.user]
+    bookmarks_condition = f"""
         JOIN bookmarks
         ON files.sha256 = bookmarks.sha256
+        {user_condition}
         """
+
     if args.namespaces:
-        bookmarks_condition += " AND bookmarks.namespace IN ("
-        for i, _ in enumerate(args.namespaces):
-            if i == 0:
-                bookmarks_condition += "?"
-            else:
-                bookmarks_condition += ", ?"
-        bookmarks_condition += ")"
+        bookmarks_condition += f" AND bookmarks.namespace IN ({', '.join('?' for _ in args.namespaces)})"
+        params.extend(args.namespaces)
 
     additional_columns = ",\n bookmarks.time_added AS time_added"
 
-    return bookmarks_condition, args.namespaces, additional_columns
+    return bookmarks_condition, params, additional_columns

@@ -51,6 +51,8 @@ class ExtractedTextEmbeddingsFilter:
 class BookmarksFilter:
     restrict_to_bookmarks: Literal[True] = True
     namespaces: List[str] = field(default_factory=list)
+    user: str = "user"
+    include_wildcard: bool = True
 
 
 @dataclass
