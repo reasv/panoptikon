@@ -78,7 +78,7 @@ def extract_embeddings(buffer: bytes) -> bytes:
 
 
 @router.post(
-    "/",
+    "",
     summary="Search for files in the database",
     description="""
 Search for files in the database based on the provided query parameters.
