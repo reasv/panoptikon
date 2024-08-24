@@ -1,6 +1,6 @@
 import io
 import logging
-import sqlite3
+import os
 from typing import Any, Dict, List, Tuple
 
 import PIL
@@ -99,22 +99,26 @@ def get_item_by_path(
 Returns the actual file contents for a given sha256 hash.
 Content type is determined by the file extension.
     """,
-    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "Arbitrary binary data",
+            "content": {"*/*": {}},  # Accepts any MIME type
+        },
+        404: {"description": "Item not found"},
+    },
 )
 def get_file_by_sha256(
     sha256: str,
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
+) -> FileResponse:
     conn = get_database_connection(**conn_args)
-    # Get the file path from the database
     file_record = get_existing_file_for_sha256(conn, sha256)
 
     if file_record is None:
         raise HTTPException(status_code=404, detail="File not found")
     path = file_record.path
     mime = get_mime_type(path)
-    # Use FileResponse to serve the file, FastAPI will handle the correct content type
-    return FileResponse(path, media_type=mime)
+    return FileResponse(path, media_type=mime, filename=os.path.basename(path))
 
 
 @router.get(
@@ -129,12 +133,19 @@ GIFs are always returned as the original file.
 For video thumbnails, the `big` parameter can be used to
 select between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).
     """,
+    responses={
+        200: {
+            "description": "Image file binary",
+            "content": {"*/*": {}},  # Accepts any MIME type
+        },
+        404: {"description": "Item not found"},
+    },
 )
 def get_thumbnail_by_sha256(
     sha256: str,
     big: bool = Query(True),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
+) -> Response:
     conn = get_database_connection(**conn_args)
     file = get_existing_file_for_sha256(conn, sha256)
     if not file:
