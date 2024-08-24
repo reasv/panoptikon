@@ -18,6 +18,7 @@ from panoptikon.db.files import get_all_mime_types, get_file_stats
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.db.search import search_files
 from panoptikon.db.search.types import SearchQuery
+from panoptikon.db.search.utils import pprint_dataclass
 from panoptikon.db.tags import find_tags, get_all_tag_namespaces
 from panoptikon.db.tagstats import (
     get_min_tag_confidence,
@@ -102,7 +103,9 @@ def search(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
-    logger.debug(f"Searching for files with query: {search_query}")
+    logger.debug(
+        f"Searching for files with query: {pprint_dataclass(search_query)}"
+    )
     if search_query.query.filters.image_embeddings:
         query = search_query.query.filters.image_embeddings.query
         search_query.query.filters.image_embeddings.query = extract_embeddings(
