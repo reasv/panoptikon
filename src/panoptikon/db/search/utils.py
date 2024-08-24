@@ -15,13 +15,58 @@ from typing import (
 
 import numpy as np
 
-from panoptikon.db.search.types import QueryTagFilters, SearchQuery
+from panoptikon.db.search.types import (
+    QueryFilters,
+    QueryTagFilters,
+    SearchQuery,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def clean_input(args: SearchQuery) -> SearchQuery:
     args.query.tags = clean_tag_params(args.query.tags)
+    args.query.filters = clean_filter_params(args.query.filters)
+    return args
+
+
+def clean_filter_params(args: QueryFilters) -> QueryFilters:
+    # Remove filters with emtpy query values
+    if args.extracted_text:
+        if not args.extracted_text.query:
+            args.extracted_text = None
+
+    if args.extracted_text_embeddings:
+        if (
+            not args.extracted_text_embeddings.query
+            or len(args.extracted_text_embeddings.query) == 0
+            or not args.extracted_text_embeddings.model
+            or len(args.extracted_text_embeddings.model) == 0
+        ):
+            args.extracted_text_embeddings = None
+
+    if args.image_embeddings:
+        if (
+            not args.image_embeddings.query
+            or len(args.image_embeddings.query) == 0
+            or not args.image_embeddings.model
+            or len(args.image_embeddings.model) == 0
+        ):
+            args.image_embeddings = None
+
+    any_text = args.any_text
+    if any_text is not None:
+        if not any_text.extracted_text and not any_text.path:
+            args.any_text = None
+
+        if any_text.extracted_text and not any_text.extracted_text.query:
+            any_text.extracted_text = None
+
+        if any_text.path and not any_text.path.query:
+            any_text.path = None
+
+    args.any_text = any_text
+
     return args
 
 
