@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 def clean_input(args: SearchQuery) -> SearchQuery:
     args.query.tags = clean_tag_params(args.query.tags)
     args.query.filters = clean_filter_params(args.query.filters)
-    args.query.filters = clean_filter_params(args.query.filters)
+    args.query.filters = parse_fts_queries(args.query.filters)
     return args
 
 
@@ -126,7 +126,7 @@ def parse_and_escape_query(user_input: str) -> str:
     escaped_tokens = [re.sub(r'"', r'""', token) for token in tokens]
 
     # Step 5: Join the escaped tokens back into a single string
-    return " ".join([f"%{token}%" for token in escaped_tokens])
+    return " ".join([f'"{token}"' for token in escaped_tokens])
 
 
 def clean_tag_params(args: QueryTagFilters):
