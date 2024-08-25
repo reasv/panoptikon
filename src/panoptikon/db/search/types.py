@@ -35,6 +35,7 @@ class ExtractedTextFilter:
     languages: List[str] = field(default_factory=list)
     language_min_confidence: Union[float, None] = None
     min_confidence: Union[float, None] = None
+    raw_fts5_match: bool = True
 
 
 @dataclass
@@ -59,6 +60,7 @@ class BookmarksFilter:
 class PathTextFilter:
     query: str
     only_match_filename: bool = False
+    raw_fts5_match: bool = True
 
 
 @dataclass

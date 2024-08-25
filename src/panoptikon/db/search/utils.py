@@ -1,4 +1,6 @@
 import logging
+import re
+import shlex
 from dataclasses import asdict, fields, is_dataclass
 from pprint import pformat
 from typing import (
@@ -27,6 +29,31 @@ logger = logging.getLogger(__name__)
 def clean_input(args: SearchQuery) -> SearchQuery:
     args.query.tags = clean_tag_params(args.query.tags)
     args.query.filters = clean_filter_params(args.query.filters)
+    args.query.filters = clean_filter_params(args.query.filters)
+    return args
+
+
+def parse_fts_queries(args: QueryFilters):
+    """
+    Parse and escape the query strings in the filters if they are not raw FTS5 queries.
+    """
+    if args.extracted_text and not args.extracted_text.raw_fts5_match:
+        args.extracted_text.query = parse_and_escape_query(
+            args.extracted_text.query
+        )
+    any_text = args.any_text
+    if any_text is not None:
+        if (
+            any_text.extracted_text
+            and not any_text.extracted_text.raw_fts5_match
+        ):
+            any_text.extracted_text.query = parse_and_escape_query(
+                any_text.extracted_text.query
+            )
+
+        if any_text.path and not any_text.path.raw_fts5_match:
+            any_text.path.query = parse_and_escape_query(any_text.path.query)
+
     return args
 
 
@@ -68,6 +95,38 @@ def clean_filter_params(args: QueryFilters) -> QueryFilters:
     args.any_text = any_text
 
     return args
+
+
+def parse_and_escape_query(user_input: str) -> str:
+    """
+    Parse and escape a query string for use in FTS5 MATCH statements.
+    """
+    original_str = user_input
+    # Replace escaped double quotes with a double double quote
+    user_input = re.sub(r'\\"', r'""', user_input)
+    # Step 1: Count the number of double quotes
+    double_quote_count = user_input.count('"')
+
+    # Step 2: If the number of double quotes is odd, add a closing quote
+    if double_quote_count % 2 != 0:
+        user_input += '"'
+    # Escape for shlex
+    user_input = re.sub(r"'", r"\'", user_input)
+    # Convert SQL escape sequence to shlex accepted escape sequence
+    user_input = re.sub(r'""', r"\"", user_input)
+    # Step 3: Split the string into tokens
+    try:
+        tokens = shlex.split(user_input)
+    except ValueError:
+        logger.error(
+            f"Shlex failed to parse query: '{user_input}' (from '{original_str}')"
+        )
+        tokens = user_input.split()
+    # # Step 4: Escape double quotes in each token using the SQL escape sequence
+    escaped_tokens = [re.sub(r'"', r'""', token) for token in tokens]
+
+    # Step 5: Join the escaped tokens back into a single string
+    return " ".join([f"%{token}%" for token in escaped_tokens])
 
 
 def clean_tag_params(args: QueryTagFilters):
