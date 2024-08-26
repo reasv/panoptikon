@@ -167,7 +167,8 @@ def build_inner_query(
         group_by = "GROUP BY files.path"
     if args.image_embeddings and image_embeddings_clause:
         group_by = "GROUP BY files.path"
-
+    if args.bookmarks and bookmarks_condition:
+        group_by = "GROUP BY files.path"
     main_query = (
         f"""
         SELECT
