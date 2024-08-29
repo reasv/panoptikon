@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from panoptikon.db.tagstats import get_tag_frequency_by_ids
 
@@ -102,6 +102,7 @@ def get_all_tags_for_item(
     sha256: str,
     setters: List[str] = [],
     confidence_threshold: float = 0.0,
+    limit_per_namespace: Optional[int] = None,
 ) -> List[Tuple[str, str, float, str]]:
     cursor = conn.cursor()
     setters_clause = (
@@ -138,7 +139,25 @@ def get_all_tags_for_item(
         ),
     )
     tags = cursor.fetchall()
+    if limit_per_namespace:
+        tags = limit_tags_by_namespace(tags, limit_per_namespace)
     return tags
+
+
+def limit_tags_by_namespace(
+    tags: List[Tuple[str, str, float, str]], limit: int
+):
+    namespace_counts = {}
+    limited_tags = []
+    for tag in tags:
+        namespace = tag[0]
+        if namespace in namespace_counts:
+            namespace_counts[namespace] += 1
+        else:
+            namespace_counts[namespace] = 1
+        if namespace_counts[namespace] <= limit:
+            limited_tags.append(tag)
+    return limited_tags
 
 
 def get_all_tag_namespaces(conn: sqlite3.Connection):

@@ -1,7 +1,7 @@
 import io
 import logging
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import PIL
 import PIL.Image
@@ -264,14 +264,30 @@ the minimum confidence threshold
 )
 def get_tags_by_sha256(
     sha256: str,
-    setters: List[str] = Query([]),
-    confidence_threshold: float = Query(0.0),
+    setters: List[str] = Query(
+        [],
+        description="List of models that set the tags to filter by (default: all)",
+    ),
+    confidence_threshold: float = Query(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence threshold, between 0 and 1 (default: 0.0)",
+    ),
+    limit_per_namespace: Optional[int] = Query(
+        None,
+        description="Maximum number of tags to return *for each namespace* (default: all)",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
     try:
         tags = get_all_tags_for_item(
-            conn, sha256, setters, confidence_threshold
+            conn,
+            sha256,
+            setters,
+            confidence_threshold,
+            limit_per_namespace,
         )
         return TagResponse(tags=tags)
     finally:
