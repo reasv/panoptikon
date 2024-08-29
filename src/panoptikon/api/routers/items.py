@@ -228,11 +228,12 @@ Returns the text extracted from a given item by its sha256 hash.
 def get_text_by_sha256(
     sha256: str,
     setters: List[str] = Query([]),
+    max_length: int | None = Query(None),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
     try:
-        text = get_extracted_text_for_item(conn, sha256)
+        text = get_extracted_text_for_item(conn, sha256, max_length)
         if setters:
             text = [t for t in text if t.setter_name in setters]
         return TextResponse(text=text)

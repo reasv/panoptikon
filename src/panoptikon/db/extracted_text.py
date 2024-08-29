@@ -1,5 +1,5 @@
 import sqlite3
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from panoptikon.types import ExtractedText, ExtractedTextStats
 
@@ -45,10 +45,10 @@ def add_extracted_text(
 
 
 def get_extracted_text_for_item(
-    conn: sqlite3.Connection, item_sha256: str
+    conn: sqlite3.Connection, item_sha256: str, max_length: Optional[int] = None
 ) -> List[ExtractedText]:
     """
-    Get all extracted text for an item
+    Get all extracted text for an item, with an optional maximum text length.
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -74,17 +74,26 @@ def get_extracted_text_for_item(
     rows = cursor.fetchall()
 
     # Map each row to an ExtractedText dataclass instance
-    extracted_texts = [
-        ExtractedText(
+    extracted_texts = []
+    for row in rows:
+        original_text = row[3]
+        original_length = len(original_text)
+        if max_length is not None and original_length > max_length:
+            text = original_text[:max_length]
+        else:
+            text = original_text
+
+        extracted_text = ExtractedText(
             item_sha256=row[0],
             setter_name=row[1],
             language=row[2],
-            text=row[3],
+            text=text,
             confidence=row[4],
             language_confidence=row[5],
+            length=original_length,
         )
-        for row in rows
-    ]
+        extracted_texts.append(extracted_text)
+
     return extracted_texts
 
 
@@ -129,6 +138,7 @@ def get_text_by_ids(
                 text=row[3],
                 confidence=row[4],
                 language_confidence=row[5],
+                length=len(row[3]),
             ),
         )
         for row in rows

@@ -73,6 +73,7 @@ class ExtractedText:
     language_confidence: float | None
     text: str
     confidence: float | None
+    length: int
 
 
 @dataclass
