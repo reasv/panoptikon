@@ -102,6 +102,7 @@ def get_all_tags_for_item(
     sha256: str,
     setters: List[str] = [],
     confidence_threshold: float = 0.0,
+    namespaces: List[str] = [],
     limit_per_namespace: Optional[int] = None,
 ) -> List[Tuple[str, str, float, str]]:
     cursor = conn.cursor()
@@ -110,11 +111,20 @@ def get_all_tags_for_item(
         if setters
         else ""
     )
+
     confidence_clause = (
         f"AND tags_items.confidence >= {confidence_threshold}"
         if confidence_threshold
         else ""
     )
+    # Namespace must start with any of the given namespace prefixes
+    tag_namespace_condition = ""
+    if namespaces:
+        or_cond = " OR ".join(
+            ["tags.namespace LIKE ? || '%'"] * len(namespaces)
+        )
+        tag_namespace_condition = f"AND ({or_cond})"
+
     cursor.execute(
         f"""
     SELECT tags.namespace, tags.name, tags_items.confidence, setters.name
@@ -130,12 +140,14 @@ def get_all_tags_for_item(
     WHERE items.sha256 = ?
     {setters_clause}
     {confidence_clause}
+    {tag_namespace_condition}
     ORDER BY tags_items.rowid
     """,
         (
             sha256,
             *(setters if setters else ()),
             *((confidence_threshold,) if confidence_threshold else ()),
+            *(namespaces if namespaces else ()),
         ),
     )
     tags = cursor.fetchall()

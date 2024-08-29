@@ -268,6 +268,10 @@ def get_tags_by_sha256(
         [],
         description="List of models that set the tags to filter by (default: all)",
     ),
+    namespaces: List[str] = Query(
+        [],
+        description="List of namespaces to filter by (default: all). A namespace includes all namespaces that start with the namespace string.",
+    ),
     confidence_threshold: float = Query(
         0.0,
         ge=0.0,
@@ -287,6 +291,7 @@ def get_tags_by_sha256(
             sha256,
             setters,
             confidence_threshold,
+            namespaces,
             limit_per_namespace,
         )
         return TagResponse(tags=tags)
