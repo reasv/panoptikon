@@ -228,7 +228,10 @@ Returns the text extracted from a given item by its sha256 hash.
 def get_text_by_sha256(
     sha256: str,
     setters: List[str] = Query([]),
-    max_length: int | None = Query(None),
+    max_length: int | None = Query(
+        None,
+        description="Text will be truncated to this length, if set. The `length` field will contain the original length.",
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
