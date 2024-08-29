@@ -67,6 +67,7 @@ def get_extracted_text_for_item(
         ON item_data.setter_id = setters.id
         JOIN items ON item_data.item_id = items.id
         WHERE items.sha256 = ?
+        ORDER BY setters.name, item_data.idx, item_data.source_id
     """,
         (item_sha256,),
     )
