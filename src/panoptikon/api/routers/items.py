@@ -276,7 +276,7 @@ def get_tags_by_sha256(
     ),
     limit_per_namespace: Optional[int] = Query(
         None,
-        description="Maximum number of tags to return *for each namespace* (default: all)",
+        description="Maximum number of tags to return for each *setter, namespace pair* (default: all). Higher confidence tags are given priority.",
     ),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):

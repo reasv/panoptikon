@@ -146,18 +146,26 @@ def get_all_tags_for_item(
 
 def limit_tags_by_namespace(
     tags: List[Tuple[str, str, float, str]], limit: int
-):
-    namespace_counts = {}
-    limited_tags = []
-    for tag in tags:
-        namespace = tag[0]
-        if namespace in namespace_counts:
-            namespace_counts[namespace] += 1
+) -> List[Tuple[str, str, float, str]]:
+    # Save the original index of each tag
+    tags_with_index = [(rowid, tag) for rowid, tag in enumerate(tags)]
+    # Sort tags by confidence, descending
+    ordered_tags = sorted(tags_with_index, key=lambda x: x[1][2], reverse=True)
+
+    ns_setter_counts = {}
+    limited_tags: List[Tuple[int, Tuple[str, str, float, str]]] = []
+    for index, tag in ordered_tags:
+        ns_setter = f"{tag[3]}:{tag[0]}"
+        if ns_setter in ns_setter_counts:
+            ns_setter_counts[ns_setter] += 1
         else:
-            namespace_counts[namespace] = 1
-        if namespace_counts[namespace] <= limit:
-            limited_tags.append(tag)
-    return limited_tags
+            ns_setter_counts[ns_setter] = 1
+        if ns_setter_counts[ns_setter] <= limit:
+            limited_tags.append((index, tag))
+
+    # Sort the limited tags by their original index
+    limited_tags.sort(key=lambda x: x[0])
+    return [tag for _, tag in limited_tags]
 
 
 def get_all_tag_namespaces(conn: sqlite3.Connection):
