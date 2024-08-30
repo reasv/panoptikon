@@ -280,7 +280,7 @@ def get_tags(
 
 
 @router.get(
-    "/similar/{sha256}/{setter_name}",
+    "/similar/{sha256}/{setter_name:path}",
     summary="Find similar items in the database",
     description="""
 Find similar items in the database based on the provided SHA256 and setter name.
