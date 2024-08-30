@@ -6,6 +6,7 @@ from typing import List, Tuple
 from panoptikon.db import get_item_id
 from panoptikon.db.rules.build_filters import build_multirule_query
 from panoptikon.db.rules.rules import get_rules_for_setter
+from panoptikon.db.rules.types import RuleItemFilters
 from panoptikon.db.utils import pretty_print_SQL
 from panoptikon.types import (
     FileRecord,
@@ -379,12 +380,19 @@ def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
     return mime_types
 
 
+def isFiltersEmpty(filters: List[RuleItemFilters]) -> bool:
+    for rule in filters:
+        if len(rule.positive) > 0 or len(rule.negative) > 0:
+            return False
+    return True
+
+
 def delete_files_not_allowed(conn: sqlite3.Connection):
     user_rules = get_rules_for_setter(conn, "file_scan")
-    if not user_rules:
+    filters = [rule.filters for rule in user_rules]
+    if not user_rules or isFiltersEmpty(filters):
         logger.debug("No rules for files, skipping deletion")
         return 0
-    filters = [rule.filters for rule in user_rules]
     query, params = build_multirule_query(
         filters,
     )
