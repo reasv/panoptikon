@@ -107,7 +107,7 @@ def find_similar_items(
         parameters.extend(src_languages)
         if src_min_text_length > 0:
             main_extracted_text_clause += (
-                " AND LENGTH(main_source_text.text) >= ?"
+                " AND main_source_text.text_length >= ?"
             )
             parameters.append(src_min_text_length)
         other_extracted_text_clause = f"""
@@ -118,7 +118,7 @@ def find_similar_items(
         parameters.extend(src_languages)
         if src_min_text_length > 0:
             other_extracted_text_clause += (
-                " AND LENGTH(other_source_text.text) >= ?"
+                " AND other_source_text.text_length >= ?"
             )
             parameters.append(src_min_text_length)
 
@@ -126,13 +126,13 @@ def find_similar_items(
         main_extracted_text_clause = f"""
         JOIN extracted_text AS main_source_text
             ON main_item_data.source_id = main_source_text.id
-            AND LENGTH(main_source_text.text) >= ?
+            AND main_source_text.text_length >= ?
         """
         parameters.append(src_min_text_length)
         other_extracted_text_clause = f"""
         JOIN extracted_text AS other_source_text
             ON other_item_data.source_id = other_source_text.id
-            AND LENGTH(other_source_text.text) >= ?
+            AND other_source_text.text_length >= ?
         """
         parameters.append(src_min_text_length)
 
