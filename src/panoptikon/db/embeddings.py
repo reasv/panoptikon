@@ -155,6 +155,15 @@ def find_similar_items(
 
     # Step 4: Build the query for the cross-comparison
     if clip_cross_modal_compare and text_setter_id:
+        if not clip_cross_modal_compare_text_to_text:
+            remove_text_to_text_condition = "AND (main_item_data.data_type != 'text-embedding' OR other_item_data.data_type != 'text-embedding')"
+        else:
+            remove_text_to_text_condition = ""
+        if not clip_cross_modal_compare_image_to_image:
+            remove_image_to_image_condition = "AND (main_item_data.data_type != 'clip' OR other_item_data.data_type != 'clip')"
+        else:
+            remove_image_to_image_condition = ""
+
         query = f"""
         SELECT 
             files.path AS path,
@@ -204,6 +213,8 @@ def find_similar_items(
                     OR
                     (other_item_data.data_type = 'clip')
                 )
+                {remove_text_to_text_condition}
+                {remove_image_to_image_condition}
             )
         GROUP BY other_item_data.item_id
         ORDER BY MIN({distance_function}) ASC
