@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -356,6 +357,7 @@ When using CLIP cross-modal similarity, whether to use image-to-image similarity
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
+    start_time = time.time()
     try:
         results = list(
             find_similar_items(
@@ -372,6 +374,9 @@ When using CLIP cross-modal similarity, whether to use image-to-image similarity
                 clip_cross_modal_compare_image_to_image=cross_modal_image_to_image,
                 limit=limit,
             )
+        )
+        logger.debug(
+            f"Found {len(results)} similar items in {time.time() - start_time:.2f}s"
         )
         return FileSearchResultModel(count=len(results), results=results)
     finally:
