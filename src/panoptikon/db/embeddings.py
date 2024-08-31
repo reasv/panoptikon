@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from panoptikon.db.files import get_existing_file_for_sha256
 from panoptikon.db.utils import serialize_f32
@@ -43,10 +43,13 @@ def find_similar_items(
     src_min_text_length: int = 0,
     src_min_confidence: float = 0.0,
     src_min_language_confidence: float = 0.0,
+    clip_xmodal: bool = False,
+    xmodal_t2t: bool = True,
+    xmodal_i2i: bool = True,
+    distance_aggregation_func: Literal["MIN", "MAX", "AVG"] = "MIN",
+    confidence_weight: float = 0,
+    language_confidence_weight: float = 0,
     limit: int = 10,
-    clip_cross_modal_compare: bool = False,
-    clip_cross_modal_compare_text_to_text: bool = True,
-    clip_cross_modal_compare_image_to_image: bool = True,
 ) -> List[FileSearchResult]:
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
     query = """
@@ -70,7 +73,7 @@ def find_similar_items(
 
     # Check if cross-comparison is enabled and retrieve the text embedding setter_id
     text_setter_id = None
-    if clip_cross_modal_compare:
+    if clip_xmodal:
         tclip_setter_name = f"t{setter_name}"
         cursor = conn.execute(
             "SELECT id FROM setters WHERE name = ? LIMIT 1;",
@@ -153,13 +156,27 @@ def find_similar_items(
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
+    confidence_weight_clause = f"POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), {confidence_weight})"
+    language_confidence_weight_clause = f"POW((COALESCE(main_source_text.language_confidence, 1) * COALESCE(other_source_text.language_confidence, 1)), {language_confidence_weight})"
+
+    if confidence_weight > 0 and language_confidence_weight > 0:
+        distance_function = f"({distance_function} * {confidence_weight_clause} * {language_confidence_weight_clause})"
+    elif confidence_weight > 0:
+        distance_function = (
+            f"({distance_function} * {confidence_weight_clause})"
+        )
+    elif language_confidence_weight > 0:
+        distance_function = (
+            f"({distance_function} * {language_confidence_weight_clause})"
+        )
+
     # Step 4: Build the query for the cross-comparison
-    if clip_cross_modal_compare and text_setter_id:
-        if not clip_cross_modal_compare_text_to_text:
+    if clip_xmodal and text_setter_id:
+        if not xmodal_t2t:
             remove_text_to_text_condition = "AND (main_item_data.data_type != 'text-embedding' OR other_item_data.data_type != 'text-embedding')"
         else:
             remove_text_to_text_condition = ""
-        if not clip_cross_modal_compare_image_to_image:
+        if not xmodal_i2i:
             remove_image_to_image_condition = "AND (main_item_data.data_type != 'clip' OR other_item_data.data_type != 'clip')"
         else:
             remove_image_to_image_condition = ""
@@ -217,9 +234,10 @@ def find_similar_items(
                 {remove_image_to_image_condition}
             )
         GROUP BY other_item_data.item_id
-        ORDER BY MIN({distance_function}) ASC
+        ORDER BY {distance_aggregation_func}({distance_function}) ASC
         LIMIT ?;
         """
+
         parameters = [item_id, main_setter_id, text_setter_id]
         src_parameters = []
         if src_setter_names:
@@ -238,6 +256,11 @@ def find_similar_items(
         parameters = parameters + [limit]
 
     else:
+        require_text_left_join = False # Flag to determine if we need to left join the extracted_text table
+        if (confidence_weight > 0 or language_confidence_weight > 0) and not extracted_text_clause:
+            # If confidence_weight or language_confidence_weight is set, we need to left join the extracted_text table
+            # If the extracted_text_clause is set, then we have already joined the extracted_text table
+            require_text_left_join = True
         query = f"""
         SELECT 
             files.path AS path,
@@ -258,10 +281,18 @@ def find_similar_items(
         JOIN embeddings AS other_embeddings
             ON other_item_data.id = other_embeddings.id
             AND other_embeddings.id != main_embeddings.id
+        {"""
+        LEFT JOIN extracted_text AS main_source_text
+            ON main_item_data.source_id = main_source_text.id
+        LEFT JOIN extracted_text AS other_source_text
+            ON other_item_data.source_id = other_source_text.id
+        """
+         if require_text_left_join
+         else ""}
         JOIN items ON other_item_data.item_id = items.id
         JOIN files ON files.item_id = items.id
         GROUP BY other_item_data.item_id
-        ORDER BY MIN({distance_function}) ASC
+        ORDER BY {distance_aggregation_func}({distance_function}) ASC
         LIMIT ?;
         """
         parameters.append(limit)

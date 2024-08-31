@@ -2,10 +2,11 @@ import base64
 import io
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, Body, Depends, Path, Query
+from pydantic import BaseModel, Field
 from pydantic.dataclasses import dataclass
 
 from inferio.impl.utils import deserialize_array
@@ -280,8 +281,103 @@ def get_tags(
         conn.close()
 
 
-@router.get(
-    "/similar/{sha256}/{setter_name:path}",
+class TextFilter(BaseModel):
+    setter_names: Optional[List[str]] = Field(
+        None,
+        description="The source model names to restrict the search to. These are the models that produced the text.",
+    )
+    languages: Optional[List[str]] = Field(
+        None,
+        description="The source languages to restrict the search to. These are the languages of the text produced by the source models.",
+    )
+    min_confidence: float = Field(
+        0.0,
+        description="The minimum confidence of the text as given by its source model",
+    )
+    min_language_confidence: float = Field(
+        0.0,
+        description="The minimum confidence for language detection in the text",
+    )
+    min_length: int = Field(
+        0,
+        description="The minimum length of the text in characters",
+    )
+
+
+class SimilarItemsRequest(BaseModel):
+    setter_name: str = Field(
+        ...,
+        description="The name of the embedding model used for similarity search",
+    )
+    distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
+        "AVG",
+        description="The method to aggregate distances when an item has multiple embeddings. Default is AVG.",
+    )
+    src_text: Optional[TextFilter] = Field(
+        None,
+        description="Filters to apply on source text. If not provided, all text embeddings are considered. The source text is the text which was used to produce the text embeddings.",
+    )
+    src_confidence_weight: float = Field(
+        0.0,
+        description="""
+The weight to apply to the confidence of the source text
+on the embedding distance aggregation.
+Default is 0.0, which means that the confidence of the source text
+does not affect the distance calculation.
+This parameter is only relevant when the source text has a confidence value.
+The confidence of the source text is multiplied by the confidence of the other
+source text when calculating the distance between two items.
+The formula for the distance calculation is as follows:
+```
+distance = distance * POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), src_confidence_weight)
+```
+So this weight is the exponent to which the confidence is raised, which means that it can be greater than 1.
+""",
+    )
+    src_language_confidence_weight: float = Field(
+        0.0,
+        description="""
+The weight to apply to the confidence of the source text language
+on the embedding distance aggregation.
+Default is 0.0, which means that the confidence of the source text language detection
+does not affect the distance calculation.
+Totally analogous to `src_confidence_weight`, but for the language confidence.
+When both are present, the results of the POW() functions for both are multiplied together before being multiplied by the distance.
+```
+distance = distance * POW(..., src_confidence_weight) * POW(..., src_language_confidence_weight)
+```
+""",
+    )
+    clip_xmodal: bool = Field(
+        False,
+        description="""
+Whether to use cross-modal similarity for CLIP models.
+Default is False. What this means is that the similarity is calculated between image and text embeddings,
+rather than just between image embeddings. By default will also use text-to-text similarity.
+
+Note that you must have both image and text embeddings with the same CLIP model for this setting to work.
+Text embeddings are derived from text which must have been already previously produced by another model, such as an OCR model or a tagger.
+They are generated *separately* from the image embeddings, using a different job (Under 'CLIP Text Embeddings').
+Run a batch job with the same clip model for both image and text embeddings to use this setting.
+        """,
+    )
+    xmodal_t2t: bool = Field(
+        True,
+        description="""
+When using CLIP cross-modal similarity, whether to use text-to-text similarity as well or just image-to-text and image-to-image.
+        """,
+    )
+    xmodal_i2i: bool = Field(
+        False,
+        description="""
+When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
+        """,
+    )
+    limit: int = Field(10, description="The number of similar items to return")
+
+
+@router.post(
+    "/similar/{sha256}",
     summary="Find similar items in the database",
     description="""
 Find similar items in the database based on the provided SHA256 and setter name.
@@ -297,8 +393,8 @@ Any setters of type "text-embedding" or "clip" can be used for this search.
 The `limit` parameter can be used to control the number of similar items to return.
 
 "text" embeddings are derived from text produced by another model, such as an OCR model or a tagger.
-You can restrict the search to embeddings derived from text that was produced by one of a list of specific models by providing the `src_setter_names` parameter.
-You can find a list of available values for this parameter using the /api/search/stats endpoint, specifically any setter of type "text" will work.
+You can restrict the search to embeddings derived from text that was produced by one of a list of specific models by providing the appropriate filter.
+You can find a list of available values for text sources using the /api/search/stats endpoint, specifically any setter of type "text" will apply.
 Remember that tagging models also produce text by concatenating the tags, and are therefore also returned as "text" models by the stats endpoint.
 Restricting similarity to a tagger model or a set of tagger models is recommended for item similarity search based on text embeddings.
     """,
@@ -306,54 +402,10 @@ Restricting similarity to a tagger model or a set of tagger models is recommende
 )
 def find_similar(
     sha256: str,
-    setter_name: str = Path(
+    body: SimilarItemsRequest = Body(
         ...,
-        description="The name of the embedding model use for similarity search",
+        description="JSON body with the similarity search parameters",
     ),
-    src_setter_names: Optional[List[str]] = Query(
-        None,
-        description="The source model names to restrict the search to. These are the models that produced the text for the items from which the text embeddings were produced.",
-    ),
-    src_languages: Optional[List[str]] = Query(
-        None,
-        description="The source languages to restrict the search to. These are the languages of the text produced by the source models.",
-    ),
-    src_text_min_length: int = Query(
-        0,
-        description="The minimum length of the text produced by the source models to consider for similarity search",
-    ),
-    src_min_confidence: float = Query(
-        0.0,
-        description="The minimum confidence of the text produced by the source models to consider for similarity search",
-    ),
-    src_min_language_confidence: float = Query(
-        0.0,
-        description="The minimum language confidence of the text produced by the source models to consider for similarity search",
-    ),
-    clip_cross_modal: bool = Query(
-        False,
-        description="""
-Whether to use cross-modal similarity for CLIP models.
-Default is False. What this means is that the similarity is calculated between the image and text embeddings,
-rather than just the image embeddings, as well as between the text embeddings and the image embeddings.
-Note that you must have both image and text embeddings with the same CLIP model for this to work.
-Text embeddings are derived from text produced by another model, such as an OCR model or a tagger.
-They are generated *separately* from the image embeddings, using a different job (Under 'CLIP Text Embeddings').
-            """,
-    ),
-    cross_modal_text_to_text: bool = Query(
-        True,
-        description="""
-When using CLIP cross-modal similarity, whether to use text-to-text similarity as well or just image-to-text and image-to-image.
-""",
-    ),
-    cross_modal_image_to_image: bool = Query(
-        False,
-        description="""
-When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
-""",
-    ),
-    limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
     conn = get_database_connection(**conn_args)
@@ -363,16 +415,31 @@ When using CLIP cross-modal similarity, whether to use image-to-image similarity
             find_similar_items(
                 conn,
                 sha256,
-                setter_name,
-                src_setter_names,
-                src_languages,
-                src_text_min_length,
-                src_min_confidence,
-                src_min_language_confidence,
-                clip_cross_modal_compare=clip_cross_modal,
-                clip_cross_modal_compare_text_to_text=cross_modal_text_to_text,
-                clip_cross_modal_compare_image_to_image=cross_modal_image_to_image,
-                limit=limit,
+                body.setter_name,
+                src_setter_names=(
+                    body.src_text.setter_names if body.src_text else None
+                ),
+                src_languages=(
+                    body.src_text.languages if body.src_text else None
+                ),
+                src_min_confidence=(
+                    body.src_text.min_confidence if body.src_text else 0
+                ),
+                src_min_language_confidence=(
+                    body.src_text.min_language_confidence
+                    if body.src_text
+                    else 0
+                ),
+                src_min_text_length=(
+                    body.src_text.min_length if body.src_text else 0
+                ),
+                distance_aggregation_func=body.distance_aggregation,
+                confidence_weight=body.src_confidence_weight,
+                language_confidence_weight=body.src_language_confidence_weight,
+                clip_xmodal=body.clip_xmodal,
+                xmodal_t2t=body.xmodal_t2t,
+                xmodal_i2i=body.xmodal_i2i,
+                limit=body.limit,
             )
         )
         logger.debug(
