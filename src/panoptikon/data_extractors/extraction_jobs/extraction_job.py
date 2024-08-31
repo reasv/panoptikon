@@ -18,6 +18,7 @@ import panoptikon.data_extractors.models as models
 from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractorJobProgress,
     ExtractorJobReport,
+    ExtractorJobStart,
 )
 from panoptikon.db.extraction_log import (
     add_data_log,
@@ -63,7 +64,8 @@ def run_extraction_job(
             + 1
         )
 
-    if get_remaining() < 1:
+    initial_remaining = get_remaining()
+    if initial_remaining < 1:
         logger.info(f"No items to process, aborting {model_opts.setter_name()}")
         return
 
@@ -99,6 +101,12 @@ def run_extraction_job(
     if transaction_per_item:
         # Commit the current transaction after adding the log
         conn.commit()
+
+    yield ExtractorJobStart(
+        start_time,
+        initial_remaining,
+        job_id,
+    )
 
     def run_batch_inference_with_counter(work_units: Sequence):
         nonlocal total_processed_units, inference_time
@@ -176,7 +184,7 @@ def run_extraction_job(
             # Commit the transaction after updating the log
             conn.commit()
         yield ExtractorJobProgress(
-            start_time, processed_items, total_items, eta_str, item
+            start_time, processed_items, total_items, eta_str, item, job_id
         )
 
     logger.info(

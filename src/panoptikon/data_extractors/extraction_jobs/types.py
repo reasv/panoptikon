@@ -6,12 +6,20 @@ from panoptikon.types import ItemData
 
 
 @dataclass
+class ExtractorJobStart:
+    start_time: datetime
+    total_items: int
+    job_id: int
+
+
+@dataclass
 class ExtractorJobProgress:
     start_time: datetime
     processed_items: int
     total_items: int
     eta_string: str
     item: ItemData
+    job_id: int
 
 
 @dataclass

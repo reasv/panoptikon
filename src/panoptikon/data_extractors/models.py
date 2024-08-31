@@ -45,7 +45,7 @@ class ModelOpts(ABC):
     @abstractmethod
     def available_models(cls) -> List[str]:
         raise NotImplementedError
-    
+
     @classmethod
     def default_batch_size(cls) -> int:
         return 64
@@ -124,10 +124,12 @@ class ModelOpts(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def run_extractor(
-        self, conn: sqlite3.Connection
-    ) -> Generator[
-        job_types.ExtractorJobProgress | job_types.ExtractorJobReport, Any, None
+    def run_extractor(self, conn: sqlite3.Connection) -> Generator[
+        job_types.ExtractorJobProgress
+        | job_types.ExtractorJobReport
+        | job_types.ExtractorJobStart,
+        Any,
+        None,
     ]:
         raise NotImplementedError
 
@@ -167,11 +169,12 @@ class ModelOpts(ABC):
     @abstractmethod
     def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
-    
+
     @classmethod
     @abstractmethod
     def model_metadata(cls, model_name) -> Sequence[str]:
         raise NotImplementedError
+
 
 class ModelGroup(ModelOpts):
     _group: str
@@ -198,7 +201,7 @@ class ModelGroup(ModelOpts):
             cls._group, model_name
         )
         return meta.get("description", ""), meta.get("link", {})
-    
+
     @classmethod
     def target_entities(cls) -> List[TargetEntityType]:
         return cls._meta().get("target_entities", ["items"])
@@ -290,6 +293,7 @@ class ModelGroup(ModelOpts):
         )
         return result
 
+
 class ModelOptsFactory:
     _group_metadata = {}
     _api_models: Dict[str, Type["ModelGroup"]] = {}
@@ -375,10 +379,11 @@ class ModelOptsFactory:
 
 def get_inference_api_client():
     from inferio.client import InferenceAPIClient
+
     if not os.getenv("INFERENCE_API_URL"):
         hostname = os.getenv("HOST", "127.0.0.1")
         port = int(os.getenv("PORT", 6342))
-        os.environ["INFERENCE_API_URL"] = (
-            f"http://{hostname}:{port}"
-        )
-    return InferenceAPIClient(f"{os.environ['INFERENCE_API_URL']}/api/inference")
+        os.environ["INFERENCE_API_URL"] = f"http://{hostname}:{port}"
+    return InferenceAPIClient(
+        f"{os.environ['INFERENCE_API_URL']}/api/inference"
+    )
