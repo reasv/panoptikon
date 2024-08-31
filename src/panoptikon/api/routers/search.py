@@ -329,6 +329,26 @@ def find_similar(
         0.0,
         description="The minimum language confidence of the text produced by the source models to consider for similarity search",
     ),
+    clip_cross_modal: bool = Query(
+        False,
+        description="""
+Whether to use cross-modal similarity for CLIP models.
+Default is False. What this means is that the similarity is calculated between the image and text embeddings,
+rather than just the image embeddings, as well as between the text embeddings and the image embeddings. 
+            """,
+    ),
+    cross_modal_text_to_text: bool = Query(
+        True,
+        description="""
+When using CLIP cross-modal similarity, whether to use text-to-text similarity as well or just image-to-text and image-to-image.
+""",
+    ),
+    cross_modal_image_to_image: bool = Query(
+        False,
+        description="""
+When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
+""",
+    ),
     limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
@@ -344,7 +364,10 @@ def find_similar(
                 src_text_min_length,
                 src_min_confidence,
                 src_min_language_confidence,
-                limit,
+                clip_cross_modal_compare=clip_cross_modal,
+                clip_cross_modal_compare_text_to_text=cross_modal_text_to_text,
+                clip_cross_modal_compare_image_to_image=cross_modal_image_to_image,
+                limit=limit,
             )
         )
         return FileSearchResultModel(count=len(results), results=results)

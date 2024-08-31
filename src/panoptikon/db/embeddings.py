@@ -44,7 +44,9 @@ def find_similar_items(
     src_min_confidence: float = 0.0,
     src_min_language_confidence: float = 0.0,
     limit: int = 10,
-    clip_cross_text_compare: bool = False,  # New argument
+    clip_cross_modal_compare: bool = False,
+    clip_cross_modal_compare_text_to_text: bool = True,
+    clip_cross_modal_compare_image_to_image: bool = True,
 ) -> List[FileSearchResult]:
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
     query = """
@@ -68,7 +70,7 @@ def find_similar_items(
 
     # Check if cross-comparison is enabled and retrieve the text embedding setter_id
     text_setter_id = None
-    if clip_cross_text_compare:
+    if clip_cross_modal_compare:
         tclip_setter_name = f"t{setter_name}"
         cursor = conn.execute(
             "SELECT id FROM setters WHERE name = ? LIMIT 1;",
@@ -152,7 +154,7 @@ def find_similar_items(
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
     # Step 4: Build the query for the cross-comparison
-    if clip_cross_text_compare and text_setter_id:
+    if clip_cross_modal_compare and text_setter_id:
         query = f"""
         SELECT 
             files.path AS path,
