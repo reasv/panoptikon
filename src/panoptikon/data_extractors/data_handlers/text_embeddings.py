@@ -20,10 +20,16 @@ def handle_text_embeddings(
     assert len(item.item_data_ids) == len(embeddings), "Mismatch in data ids"
     for text_id, embedding_set in zip(item.item_data_ids, embeddings):
         text_embeddings = deserialize_array(embedding_set)
-        # assert that the array is two-dimensional (i.e. a list of embeddings)
+
+        # Check if the embedding is a single-dimensional array and reshape if necessary
+        if text_embeddings.ndim == 1:
+            text_embeddings = text_embeddings.reshape(1, -1)
+
+        # Ensure that the array is now two-dimensional (i.e., a list of embeddings)
         assert (
             text_embeddings.ndim == 2
         ), "Embeddings are not a list of embeddings"
+
         # Iterate over each row of the numpy array (each row is an embedding)
         for idx, embedding in enumerate(text_embeddings):
             assert isinstance(
@@ -41,6 +47,7 @@ def handle_text_embeddings(
             )
             add_embedding(conn, data_id, "text-embedding", embedding.tolist())
             data_ids.append(data_id)
+
     if not data_ids:
         add_item_data(
             conn,
@@ -51,4 +58,5 @@ def handle_text_embeddings(
             index=0,
             is_placeholder=True,
         )
+
     return data_ids
