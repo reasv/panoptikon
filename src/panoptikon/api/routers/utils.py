@@ -62,3 +62,22 @@ def strip_non_latin1_chars(input_string):
     return "".join(
         char for char in input_string if char.encode("latin-1", errors="ignore")
     )
+
+
+def get_db_system_wl(
+    index_db: Optional[str] = Query(
+        None,
+        description="The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
+    user_data_db: Optional[str] = Query(
+        None,
+        description="The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+    ),
+) -> Dict[str, str | bool | None]:
+    check_dbs(index_db, user_data_db)
+    return {
+        "write_lock": True,
+        "user_data_wl": False,
+        "index_db": index_db,
+        "user_data_db": user_data_db,
+    }
