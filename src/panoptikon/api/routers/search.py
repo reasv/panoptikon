@@ -334,7 +334,10 @@ def find_similar(
         description="""
 Whether to use cross-modal similarity for CLIP models.
 Default is False. What this means is that the similarity is calculated between the image and text embeddings,
-rather than just the image embeddings, as well as between the text embeddings and the image embeddings. 
+rather than just the image embeddings, as well as between the text embeddings and the image embeddings.
+Note that you must have both image and text embeddings with the same CLIP model for this to work.
+Text embeddings are derived from text produced by another model, such as an OCR model or a tagger.
+They are generated *separately* from the image embeddings, using a different job (Under 'CLIP Text Embeddings').
             """,
     ),
     cross_modal_text_to_text: bool = Query(
