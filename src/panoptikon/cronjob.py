@@ -29,6 +29,14 @@ def run_cronjob():
     for setter in setters:
         model_opts.append(ModelOptsFactory.get_model(setter))
 
+    src_model_opts = [
+        model for model in model_opts if model.target_entities() == ["items"]
+    ]
+    derived_model_opts = [
+        model for model in model_opts if model.target_entities() != ["items"]
+    ]
+    # Run source models first
+    model_opts = src_model_opts + derived_model_opts
     for model_opt in model_opts:
         logger.info(f"Running model {model_opt}")
         conn.execute("BEGIN TRANSACTION")
