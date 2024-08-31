@@ -10,7 +10,7 @@ target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
-input_spec = { handler="image_frames", opts={ max_frames = 4 }} # { handler="image_frames", opts={ max_frames = 4 }}
+input_spec = { handler = "image_frames", opts = { max_frames = 4 } } # { handler="image_frames", opts={ max_frames = 4 }}
 
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "SwinV2 Based Tagger" } }
@@ -29,7 +29,7 @@ default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler="image_frames" }
+input_spec = { handler = "image_frames" }
 
 [group.doctr.inference_ids]
 db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
@@ -50,12 +50,12 @@ default_batch_size = 64
 default_inference_id = "all-mpnet-base-v2"
 target_entities = ["text"]
 output_type = "text-embedding"
-input_spec = { handler="extracted_text" }
+input_spec = { handler = "extracted_text" }
 [group.textembed.inference_ids]
 all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer (Recommended)" } }
 all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
-stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query"} }, metadata = { description = "Stella English 400M Sentence Transformer" } }
-"stella_en_1.5B_v5" = { config = { model_name = "dunzhang/stella_en_1.5B_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query"} }, metadata = { description = "Stella English 1.5B Sentence Transformer" } }
+stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" } }, metadata = { description = "Stella English 400M Sentence Transformer" } }
+"stella_en_1.5B_v5" = { config = { model_name = "dunzhang/stella_en_1.5B_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" } }, metadata = { description = "Stella English 1.5B Sentence Transformer" } }
 
 [group.whisper]
 config = { impl_class = "faster_whisper" }
@@ -68,7 +68,7 @@ default_inference_id = "distill-large-v3"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["video/", "audio/"]
-input_spec = { handler="audio_tracks" } # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
+input_spec = { handler = "audio_tracks" }                            # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
 [group.whisper.inference_ids]
 "tiny.en" = { config = { model_name = "Systran/faster-whisper-tiny.en" }, metadata = { description = "Tiny English Whisper Model" } }
 tiny = { config = { model_name = "Systran/faster-whisper-tiny" }, metadata = { description = "Tiny Whisper Model" } }
@@ -97,14 +97,14 @@ default_batch_size = 64
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities = ["items"]
 output_type = "clip"
-input_spec = { handler="image_frames" }
+input_spec = { handler = "image_frames" }
 [group.clip.inference_ids]
 ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
-apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link="https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
-apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link="https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
-apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link="https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
+apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
+apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
 ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
 ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
 ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
@@ -121,13 +121,55 @@ convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "con
 convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
 convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
 convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
-mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link="https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link="https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link="https://huggingface.co/Marqo/marqo-fashionCLIP" } }
-marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link="https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
-open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link="https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
-imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link="https://huggingface.co/imageomics/bioclip" } }
-microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" }, metadata = { description = "BiomedCLIP is a biomedical vision-language foundation model that is pretrained on PMC-15M, a dataset of 15 million figure-caption pairs extracted from biomedical research articles in PubMed Central, using contrastive learning. It uses PubMedBERT as the text encoder and Vision Transformer as the image encoder, with domain-specific adaptations. It can perform various vision-language processing (VLP) tasks such as cross-modal retrieval, image classification, and visual question answering.", link="https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" } }
+mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link = "https://huggingface.co/Marqo/marqo-fashionCLIP" } }
+marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link = "https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
+open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
+imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link = "https://huggingface.co/imageomics/bioclip" } }
+microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" }, metadata = { description = "BiomedCLIP is a biomedical vision-language foundation model that is pretrained on PMC-15M, a dataset of 15 million figure-caption pairs extracted from biomedical research articles in PubMed Central, using contrastive learning. It uses PubMedBERT as the text encoder and Vision Transformer as the image encoder, with domain-specific adaptations. It can perform various vision-language processing (VLP) tasks such as cross-modal retrieval, image classification, and visual question answering.", link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" } }
+
+
+[group.tclip]
+config = { impl_class = "openclip" }
+[group.tclip.metadata]
+description = "Generate Text Embeddings from extracted text using OpenAI's CLIP model for semantic image search. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
+name = "CLIP Text Embeddings"
+default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
+default_batch_size = 64
+target_entities = ["text"]
+output_type = "text-embedding"
+input_spec = { handler = "extracted_text" }
+[group.tclip.inference_ids]
+ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
+ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
+# apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
+apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
+apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
+apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
+ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
+ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
+ViT-B-32_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp XL (s13b_b90k). ViT-B-32 are the least resource intensive ViT model type." } }
+ViT-g-14_laion2b_s34b_b88k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s34b_b88k). ViT-G-14 are the largest ViT model type, however not currently the best performing." } }
+ViT-L-14_openai = { config = { model_name = "ViT-L-14", pretrained = "openai" }, metadata = { description = "Original CLIP model trained by OpenAI" } }
+ViT-B-32_openai = { config = { model_name = "ViT-B-32", pretrained = "openai" }, metadata = { description = "ViT-B-32 model trained by OpenAI. ViT-B-32 are the least resource intensive ViT model type." } }
+# MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
+# MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
+coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model fine-tuned on MSCOCO" } }
+coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model fine-tuned on MSCOCO" } }
+convnext_xxlarge_laion2b_s34b_b82k_augreg_soup = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_soup" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)" } }
+convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft_soup" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)" } }
+convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
+convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
+convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
+mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
+marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link = "https://huggingface.co/Marqo/marqo-fashionCLIP" } }
+marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link = "https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
+open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
+imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link = "https://huggingface.co/imageomics/bioclip" } }
+microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" }, metadata = { description = "BiomedCLIP is a biomedical vision-language foundation model that is pretrained on PMC-15M, a dataset of 15 million figure-caption pairs extracted from biomedical research articles in PubMed Central, using contrastive learning. It uses PubMedBERT as the text encoder and Vision Transformer as the image encoder, with domain-specific adaptations. It can perform various vision-language processing (VLP) tasks such as cross-modal retrieval, image classification, and visual question answering.", link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" } }
 
 # More CLIP models
 # RN50_openai = { config = { model_name = "RN50", pretrained = "openai" }, metadata = { description = "RN50 model trained by OpenAI" } }
