@@ -313,6 +313,14 @@ def find_similar(
         None,
         description="The source model names to restrict the search to. These are the models that produced the text for the items from which the text embeddings were produced.",
     ),
+    src_languages: Optional[List[str]] = Query(
+        None,
+        description="The source languages to restrict the search to. These are the languages of the text produced by the source models.",
+    ),
+    src_text_min_length: int = Query(
+        0,
+        description="The minimum length of the text produced by the source models to consider for similarity search",
+    ),
     limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
@@ -320,7 +328,13 @@ def find_similar(
     try:
         results = list(
             find_similar_items(
-                conn, sha256, setter_name, src_setter_names, limit
+                conn,
+                sha256,
+                setter_name,
+                src_setter_names,
+                src_languages,
+                src_text_min_length,
+                limit,
             )
         )
         return FileSearchResultModel(count=len(results), results=results)
