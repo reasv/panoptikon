@@ -22,12 +22,14 @@ def add_extracted_text(
         if language_confidence is not None
         else None
     )
+    text_length = len(text)  # Calculate the length of the text
+
     cursor = conn.cursor()
     cursor.execute(
         """
         INSERT INTO extracted_text
-            (id, language, language_confidence, confidence, text)
-        SELECT item_data.id, ?, ?, ?, ?
+            (id, language, language_confidence, confidence, text, text_length)
+        SELECT item_data.id, ?, ?, ?, ?, ?
         FROM item_data
         WHERE item_data.id = ?
         AND item_data.data_type = 'text'
@@ -37,6 +39,7 @@ def add_extracted_text(
             language_confidence,
             confidence,
             text,
+            text_length,  # Include the text length in the insert
             data_id,
         ),
     )
