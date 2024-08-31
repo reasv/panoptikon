@@ -321,6 +321,14 @@ def find_similar(
         0,
         description="The minimum length of the text produced by the source models to consider for similarity search",
     ),
+    src_min_confidence: float = Query(
+        0.0,
+        description="The minimum confidence of the text produced by the source models to consider for similarity search",
+    ),
+    src_min_language_confidence: float = Query(
+        0.0,
+        description="The minimum language confidence of the text produced by the source models to consider for similarity search",
+    ),
     limit: int = Query(10),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ):
@@ -334,6 +342,8 @@ def find_similar(
                 src_setter_names,
                 src_languages,
                 src_text_min_length,
+                src_min_confidence,
+                src_min_language_confidence,
                 limit,
             )
         )

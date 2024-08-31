@@ -41,6 +41,8 @@ def find_similar_items(
     src_setter_names: Optional[List[str]] = None,
     src_languages: Optional[List[str]] = None,
     src_min_text_length: int = 0,
+    src_min_confidence: float = 0.0,
+    src_min_language_confidence: float = 0.0,
     limit: int = 10,
 ) -> List[FileSearchResult]:
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
@@ -95,46 +97,43 @@ def find_similar_items(
             """
             parameters.extend(setter_ids)  # For filtering `other_item_data`
 
-    main_extracted_text_clause = ""
-    other_extracted_text_clause = ""
-    if src_languages:
-        lang_placeholder = ",".join("?" for _ in src_languages)
-        main_extracted_text_clause = f"""
-        JOIN extracted_text AS main_source_text
-            ON main_item_data.source_id = main_source_text.id
-            AND main_source_text.language IN ({lang_placeholder})
+    extracted_text_clause = ""
+    if src_languages or src_min_text_length > 0:
+        extracted_text_clause = f"""
+            JOIN extracted_text AS main_source_text
+                ON main_item_data.source_id = main_source_text.id
+            JOIN extracted_text AS other_source_text
+                ON other_item_data.source_id = other_source_text.id
         """
-        parameters.extend(src_languages)
-        if src_min_text_length > 0:
-            main_extracted_text_clause += (
-                " AND main_source_text.text_length >= ?"
+        if src_languages:
+            lang_placeholder = ",".join("?" for _ in src_languages)
+            extracted_text_clause += (
+                f" AND main_source_text.language IN ({lang_placeholder})"
             )
-            parameters.append(src_min_text_length)
-        other_extracted_text_clause = f"""
-        JOIN extracted_text AS other_source_text
-            ON other_item_data.source_id = other_source_text.id
-            AND other_source_text.language IN ({lang_placeholder})
-        """
-        parameters.extend(src_languages)
-        if src_min_text_length > 0:
-            other_extracted_text_clause += (
-                " AND other_source_text.text_length >= ?"
+            parameters.extend(src_languages)
+            extracted_text_clause += (
+                f" AND other_source_text.language IN ({lang_placeholder})"
             )
+            parameters.extend(src_languages)
+        if src_min_text_length > 0:
+            extracted_text_clause += " AND main_source_text.text_length >= ?"
             parameters.append(src_min_text_length)
-
-    if not src_languages and src_min_text_length > 0:
-        main_extracted_text_clause = f"""
-        JOIN extracted_text AS main_source_text
-            ON main_item_data.source_id = main_source_text.id
-            AND main_source_text.text_length >= ?
-        """
-        parameters.append(src_min_text_length)
-        other_extracted_text_clause = f"""
-        JOIN extracted_text AS other_source_text
-            ON other_item_data.source_id = other_source_text.id
-            AND other_source_text.text_length >= ?
-        """
-        parameters.append(src_min_text_length)
+            extracted_text_clause += " AND other_source_text.text_length >= ?"
+            parameters.append(src_min_text_length)
+        if src_min_confidence > 0:
+            extracted_text_clause += " AND main_source_text.confidence >= ?"
+            parameters.append(src_min_confidence)
+            extracted_text_clause += " AND other_source_text.confidence >= ?"
+            parameters.append(src_min_confidence)
+        if src_min_language_confidence > 0:
+            extracted_text_clause += (
+                " AND main_source_text.language_confidence >= ?"
+            )
+            parameters.append(src_min_language_confidence)
+            extracted_text_clause += (
+                " AND other_source_text.language_confidence >= ?"
+            )
+            parameters.append(src_min_language_confidence)
 
     # Step 3: Choose the appropriate distance function based on the data_type
     if data_type == "clip":
@@ -154,12 +153,11 @@ def find_similar_items(
         AND main_item_data.item_id = ?
         AND main_item_data.setter_id = ?
     {main_setter_ids_clause}
-    {main_extracted_text_clause}
     JOIN item_data AS other_item_data
         ON other_item_data.item_id != main_item_data.item_id
         AND other_item_data.setter_id = main_item_data.setter_id
     {other_setter_ids_clause}
-    {other_extracted_text_clause}
+    {extracted_text_clause}
     JOIN embeddings AS other_embeddings
         ON other_item_data.id = other_embeddings.id
         AND other_embeddings.id != main_embeddings.id
