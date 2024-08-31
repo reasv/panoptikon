@@ -125,9 +125,9 @@ class ModelOpts(ABC):
 
     @abstractmethod
     def run_extractor(self, conn: sqlite3.Connection) -> Generator[
-        job_types.ExtractorJobProgress
-        | job_types.ExtractorJobReport
-        | job_types.ExtractorJobStart,
+        job_types.ExtractionJobProgress
+        | job_types.ExtractionJobReport
+        | job_types.ExtractionJobStart,
         Any,
         None,
     ]:

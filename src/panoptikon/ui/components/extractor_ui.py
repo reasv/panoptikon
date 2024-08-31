@@ -6,8 +6,8 @@ import gradio as gr
 
 import panoptikon.data_extractors.models as models
 from panoptikon.data_extractors.extraction_jobs.types import (
-    ExtractorJobProgress,
-    ExtractorJobReport,
+    ExtractionJobProgress,
+    ExtractionJobReport,
 )
 from panoptikon.db import get_database_connection
 from panoptikon.db.utils import vacuum_database
@@ -27,7 +27,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
     failed, images, videos, other, units = [], 0, 0, 0, 0
     start_time = datetime.datetime.now()
     for progress in model_opt.run_extractor(conn):
-        if type(progress) == ExtractorJobProgress:
+        if type(progress) == ExtractionJobProgress:
             # Job is in progress
             progress_tracker(
                 (progress.processed_items, progress.total_items),
@@ -37,7 +37,7 @@ def run_model_job(model_opt: models.ModelOpts, progress_tracker=gr.Progress()):
                 ),
                 unit="files",
             )
-        elif type(progress) == ExtractorJobReport:
+        elif type(progress) == ExtractionJobReport:
             # Job is complete
             images = progress.images
             videos = progress.videos
@@ -166,6 +166,7 @@ def extraction_job_UI(
                     outputs=[batch_size, threshold],
                 )
         with gr.Row():
+
             def change_model_list(models: List[str]):
                 full_desc = ""
                 for model_name in models:
@@ -177,7 +178,10 @@ def extraction_job_UI(
                     else:
                         full_desc += "\n\n"
                 return full_desc
-            model_desc = gr.Markdown(change_model_list([model_type.default_model()]))
+
+            model_desc = gr.Markdown(
+                change_model_list([model_type.default_model()])
+            )
             model_choice.change(
                 fn=change_model_list,
                 inputs=[model_choice],

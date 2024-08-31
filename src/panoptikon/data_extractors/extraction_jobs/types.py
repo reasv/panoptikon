@@ -6,14 +6,14 @@ from panoptikon.types import ItemData
 
 
 @dataclass
-class ExtractorJobStart:
+class ExtractionJobStart:
     start_time: datetime
     total_items: int
     job_id: int
 
 
 @dataclass
-class ExtractorJobProgress:
+class ExtractionJobProgress:
     start_time: datetime
     processed_items: int
     total_items: int
@@ -23,7 +23,7 @@ class ExtractorJobProgress:
 
 
 @dataclass
-class ExtractorJobReport:
+class ExtractionJobReport:
     start_time: datetime
     end_time: datetime
     images: int

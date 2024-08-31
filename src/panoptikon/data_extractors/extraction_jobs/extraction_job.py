@@ -16,9 +16,9 @@ from typing import (
 
 import panoptikon.data_extractors.models as models
 from panoptikon.data_extractors.extraction_jobs.types import (
-    ExtractorJobProgress,
-    ExtractorJobReport,
-    ExtractorJobStart,
+    ExtractionJobProgress,
+    ExtractionJobReport,
+    ExtractionJobStart,
 )
 from panoptikon.db.extraction_log import (
     add_data_log,
@@ -102,7 +102,7 @@ def run_extraction_job(
         # Commit the current transaction after adding the log
         conn.commit()
 
-    yield ExtractorJobStart(
+    yield ExtractionJobStart(
         start_time,
         initial_remaining,
         job_id,
@@ -183,7 +183,7 @@ def run_extraction_job(
         if transaction_per_item:
             # Commit the transaction after updating the log
             conn.commit()
-        yield ExtractorJobProgress(
+        yield ExtractionJobProgress(
             start_time, processed_items, total_items, eta_str, item, job_id
         )
 
@@ -214,7 +214,7 @@ def run_extraction_job(
 
     failed_paths = [item.path for item in failed_items.values()]
     final_callback()
-    yield ExtractorJobReport(
+    yield ExtractionJobReport(
         start_time=start_time,
         end_time=datetime.now(),
         images=images,
