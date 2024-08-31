@@ -44,6 +44,7 @@ def find_similar_items(
     src_min_confidence: float = 0.0,
     src_min_language_confidence: float = 0.0,
     limit: int = 10,
+    clip_cross_text_compare: bool = False,  # New argument
 ) -> List[FileSearchResult]:
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
     query = """
@@ -63,39 +64,48 @@ def find_similar_items(
     if not result:
         return []  # No item or setter found, return empty list
 
-    item_id, setter_id, data_type = result
+    item_id, main_setter_id, data_type = result
 
-    # Step 2: If setter_names is provided, retrieve the corresponding setter_ids
+    # Check if cross-comparison is enabled and retrieve the text embedding setter_id
+    text_setter_id = None
+    if clip_cross_text_compare:
+        tclip_setter_name = f"t{setter_name}"
+        cursor = conn.execute(
+            "SELECT id FROM setters WHERE name = ? LIMIT 1;",
+            (tclip_setter_name,),
+        )
+        text_setter_id_result = cursor.fetchone()
+        if text_setter_id_result:
+            text_setter_id = text_setter_id_result[0]
+
+    # Step 2: Prepare the filtering clauses
     main_setter_ids_clause = ""
     other_setter_ids_clause = ""
-    parameters = [item_id, setter_id]  # Base parameters for the query
+    parameters = [item_id, main_setter_id]  # Base parameters for the query
 
     if src_setter_names:
-        # Retrieve setter_ids from setter_names
-        placeholder = ",".join(
-            "?" for _ in src_setter_names
-        )  # Create placeholders for IN clause
+        placeholder = ",".join("?" for _ in src_setter_names)
         query = f"SELECT id FROM setters WHERE name IN ({placeholder})"
         cursor = conn.execute(query, tuple(src_setter_names))
         setter_ids = [row[0] for row in cursor.fetchall()]
 
         if setter_ids:
-            # Build the filtering clause for derived data based on setter_ids
             setter_ids_placeholder = ",".join("?" for _ in setter_ids)
             main_setter_ids_clause = f"""
             JOIN item_data AS derived_main_item_data
                 ON main_item_data.source_id = derived_main_item_data.id
                 AND derived_main_item_data.setter_id IN ({setter_ids_placeholder})
             """
-            # Add setter_ids to the query parameters
-            parameters.extend(setter_ids)  # For filtering `main_item_data`
+            parameters.extend(setter_ids)
 
             other_setter_ids_clause = f"""
             JOIN item_data AS derived_other_item_data
                 ON other_item_data.source_id = derived_other_item_data.id
                 AND derived_other_item_data.setter_id IN ({setter_ids_placeholder})
             """
-            parameters.extend(setter_ids)  # For filtering `other_item_data`
+            parameters.extend(setter_ids)
+    else:
+        setter_ids = []
 
     extracted_text_clause = ""
     if src_languages or src_min_text_length > 0:
@@ -141,34 +151,107 @@ def find_similar_items(
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
-    query = f"""
-    SELECT 
-        files.path AS path,
-        items.sha256 AS sha256,
-        files.last_modified,
-        items.type AS type
-    FROM embeddings AS main_embeddings
-    JOIN item_data AS main_item_data
-        ON main_embeddings.id = main_item_data.id
-        AND main_item_data.item_id = ?
-        AND main_item_data.setter_id = ?
-    {main_setter_ids_clause}
-    JOIN item_data AS other_item_data
-        ON other_item_data.item_id != main_item_data.item_id
-        AND other_item_data.setter_id = main_item_data.setter_id
-    {other_setter_ids_clause}
-    {extracted_text_clause}
-    JOIN embeddings AS other_embeddings
-        ON other_item_data.id = other_embeddings.id
-        AND other_embeddings.id != main_embeddings.id
-    JOIN items ON other_item_data.item_id = items.id
-    JOIN files ON files.item_id = items.id
-    GROUP BY other_item_data.item_id
-    ORDER BY MIN({distance_function}) ASC
-    LIMIT ?;
-    """
+    # Step 4: Build the query for the cross-comparison
+    if clip_cross_text_compare and text_setter_id:
+        query = f"""
+        SELECT 
+            files.path AS path,
+            items.sha256 AS sha256,
+            files.last_modified,
+            items.type AS type
+        FROM embeddings AS main_embeddings
+        JOIN item_data AS main_item_data
+            ON main_embeddings.id = main_item_data.id
+            AND main_item_data.item_id = ?
+            AND (main_item_data.setter_id = ? OR main_item_data.setter_id = ?)
+        LEFT JOIN item_data AS derived_main_item_data
+            ON main_item_data.source_id = derived_main_item_data.id
+            {"AND derived_main_item_data.setter_id IN (" + ",".join("?" for _ in src_setter_names) + ")" if src_setter_names else ""}
+        LEFT JOIN extracted_text AS main_source_text
+            ON main_item_data.source_id = main_source_text.id
+            {"AND main_source_text.language IN (" + ",".join("?" for _ in src_languages) + ")" if src_languages else ""}
+            {"AND main_source_text.text_length >= ?" if src_min_text_length > 0 else ""}
+            {"AND main_source_text.confidence >= ?" if src_min_confidence > 0 else ""}
+            {"AND main_source_text.language_confidence >= ?" if src_min_language_confidence > 0 else ""}
+        JOIN item_data AS other_item_data
+            ON other_item_data.item_id != main_item_data.item_id
+            AND (other_item_data.setter_id = ? OR other_item_data.setter_id = ?)
+        LEFT JOIN item_data AS derived_other_item_data
+            ON other_item_data.source_id = derived_other_item_data.id
+            {"AND derived_other_item_data.setter_id IN (" + ",".join("?" for _ in src_setter_names) + ")" if src_setter_names else ""}
+        LEFT JOIN extracted_text AS other_source_text
+            ON other_item_data.source_id = other_source_text.id
+            {"AND other_source_text.language IN (" + ",".join("?" for _ in src_languages) + ")" if src_languages else ""}
+            {"AND other_source_text.text_length >= ?" if src_min_text_length > 0 else ""}
+            {"AND other_source_text.confidence >= ?" if src_min_confidence > 0 else ""}
+            {"AND other_source_text.language_confidence >= ?" if src_min_language_confidence > 0 else ""}
+        JOIN embeddings AS other_embeddings
+            ON other_item_data.id = other_embeddings.id
+            AND other_embeddings.id != main_embeddings.id
+        JOIN items ON other_item_data.item_id = items.id
+        JOIN files ON files.item_id = items.id
+        WHERE (
+                (
+                    (derived_main_item_data.id IS NOT NULL AND main_source_text.id IS NOT NULL)
+                    OR
+                    (main_item_data.data_type = 'clip')
+                )
+                AND
+                (
+                    (derived_other_item_data.id IS NOT NULL AND other_source_text.id IS NOT NULL)
+                    OR
+                    (other_item_data.data_type = 'clip')
+                )
+            )
+        GROUP BY other_item_data.item_id
+        ORDER BY MIN({distance_function}) ASC
+        LIMIT ?;
+        """
+        parameters = [item_id, main_setter_id, text_setter_id]
+        src_parameters = []
+        if src_setter_names:
+            src_parameters = src_parameters + setter_ids
+        if src_languages:
+            src_parameters = src_parameters + src_languages
+        if src_min_text_length > 0:
+            src_parameters = src_parameters + [src_min_text_length]
+        if src_min_confidence > 0:
+            src_parameters = src_parameters + [src_min_confidence]
+        if src_min_language_confidence > 0:
+            src_parameters = src_parameters + [src_min_language_confidence]
+        parameters = parameters + src_parameters
+        parameters = parameters + [main_setter_id, text_setter_id]
+        parameters = parameters + src_parameters
+        parameters = parameters + [limit]
 
-    parameters.append(limit)
+    else:
+        query = f"""
+        SELECT 
+            files.path AS path,
+            items.sha256 AS sha256,
+            files.last_modified,
+            items.type AS type
+        FROM embeddings AS main_embeddings
+        JOIN item_data AS main_item_data
+            ON main_embeddings.id = main_item_data.id
+            AND main_item_data.item_id = ?
+            AND main_item_data.setter_id = ?
+        {main_setter_ids_clause}
+        JOIN item_data AS other_item_data
+            ON other_item_data.item_id != main_item_data.item_id
+            AND other_item_data.setter_id = main_item_data.setter_id
+        {other_setter_ids_clause}
+        {extracted_text_clause}
+        JOIN embeddings AS other_embeddings
+            ON other_item_data.id = other_embeddings.id
+            AND other_embeddings.id != main_embeddings.id
+        JOIN items ON other_item_data.item_id = items.id
+        JOIN files ON files.item_id = items.id
+        GROUP BY other_item_data.item_id
+        ORDER BY MIN({distance_function}) ASC
+        LIMIT ?;
+        """
+        parameters.append(limit)
 
     # Step 5: Execute the query
     cursor = conn.execute(query, tuple(parameters))
@@ -192,4 +275,4 @@ def find_similar_items(
         else:
             existing_results.append(result)
 
-    return file_search_results
+    return existing_results
