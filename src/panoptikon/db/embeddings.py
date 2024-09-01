@@ -1,11 +1,14 @@
+import logging
 import os
 import sqlite3
-from typing import List, Literal, Optional
+import time
+from typing import List, Literal, Optional, Tuple
 
 from panoptikon.db.files import get_existing_file_for_sha256
 from panoptikon.db.utils import serialize_f32
 from panoptikon.types import FileSearchResult, OutputDataType
 
+logger = logging.getLogger(__name__)
 
 def add_embedding(
     conn: sqlite3.Connection,
@@ -51,7 +54,8 @@ def find_similar_items(
     language_confidence_weight: float = 0,
     page_size: int = 10,
     page_number: int = 1,
-) -> List[FileSearchResult]:
+    full_count: bool = False,
+) -> Tuple[List[FileSearchResult], Optional[int]]:
     if page_number < 1:
         page_number = 1
     offset = (page_number - 1) * page_size
@@ -72,7 +76,7 @@ def find_similar_items(
     result = cursor.fetchone()
     
     if not result:
-        return []  # No item or setter found, return empty list
+        return [], None  # No item or setter found, return empty list and None for the count
 
     item_id, main_setter_id, data_type = result
 
@@ -185,12 +189,7 @@ def find_similar_items(
         else:
             remove_image_to_image_condition = ""
 
-        query = f"""
-        SELECT 
-            files.path AS path,
-            items.sha256 AS sha256,
-            files.last_modified,
-            items.type AS type
+        base_query = f"""
         FROM embeddings AS main_embeddings
         JOIN item_data AS main_item_data
             ON main_embeddings.id = main_item_data.id
@@ -237,10 +236,21 @@ def find_similar_items(
                 {remove_text_to_text_condition}
                 {remove_image_to_image_condition}
             )
+        """
+
+        query = f"""
+        SELECT 
+            files.path AS path,
+            items.sha256 AS sha256,
+            files.last_modified,
+            items.type AS type
+        {base_query}
         GROUP BY other_item_data.item_id
         ORDER BY {order_by_clause} ASC
         LIMIT ? OFFSET ?;
         """
+
+        count_query = f"SELECT COUNT(DISTINCT other_item_data.item_id) {base_query}"
 
         parameters = [item_id, main_setter_id, text_setter_id]
         src_parameters = []
@@ -260,17 +270,13 @@ def find_similar_items(
         parameters = parameters + [page_size, offset]
 
     else:
-        require_text_left_join = False # Flag to determine if we need to left join the extracted_text table
+        require_text_left_join = False  # Flag to determine if we need to left join the extracted_text table
         if (confidence_weight > 0 or language_confidence_weight > 0) and not extracted_text_clause:
             # If confidence_weight or language_confidence_weight is set, we need to left join the extracted_text table
             # If the extracted_text_clause is set, then we have already joined the extracted_text table
             require_text_left_join = True
-        query = f"""
-        SELECT 
-            files.path AS path,
-            items.sha256 AS sha256,
-            files.last_modified,
-            items.type AS type
+
+        base_query = f"""
         FROM embeddings AS main_embeddings
         JOIN item_data AS main_item_data
             ON main_embeddings.id = main_item_data.id
@@ -295,17 +301,35 @@ def find_similar_items(
          else ""}
         JOIN items ON other_item_data.item_id = items.id
         JOIN files ON files.item_id = items.id
+        """
+
+        query = f"""
+        SELECT 
+            files.path AS path,
+            items.sha256 AS sha256,
+            files.last_modified,
+            items.type AS type
+        {base_query}
         GROUP BY other_item_data.item_id
         ORDER BY {order_by_clause} ASC
         LIMIT ? OFFSET ?;
         """
-        parameters.append(page_size)
-        parameters.append(offset)
+        count_query = f"SELECT COUNT(DISTINCT other_item_data.item_id) {base_query}"
 
-    # Step 5: Execute the query
+        parameters.extend([page_size, offset])
+
+    # Step 5: Execute the count query if full_count is True
+    total_count = None
+    if full_count:
+        start_time = time.time()
+        cursor = conn.execute(count_query, tuple(parameters[:-2]))  # Exclude LIMIT and OFFSET parameters for the count query
+        total_count = cursor.fetchone()[0]
+        logger.debug(f"Count query took {time.time() - start_time:.2f} seconds")
+
+    # Step 6: Execute the main query
     cursor = conn.execute(query, tuple(parameters))
 
-    # Step 6: Fetch results and create a list of FileSearchResult objects
+    # Step 7: Fetch results and create a list of FileSearchResult objects
     results = cursor.fetchall()
     file_search_results = [
         FileSearchResult(
@@ -324,4 +348,4 @@ def find_similar_items(
         else:
             existing_results.append(result)
 
-    return existing_results
+    return existing_results, total_count

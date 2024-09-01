@@ -379,6 +379,10 @@ When using CLIP cross-modal similarity, whether to use image-to-image similarity
     page_size: int = Field(
         10, description="The number of similar items to return"
     )
+    full_count: bool = Field(
+        False,
+        description="Whether to return the full count of resulting items in the database",
+    )
 
 
 @router.post(
@@ -390,6 +394,7 @@ The search is based on the image or text embeddings of the provided item.
 
 The count value in the response is equal to the number of items returned (+ (page_size - 1) * page for page > 1), rather than the total number of similar items in the database.
 This is because there is no way to define what constitutes a "similar" item in a general sense. We just return the top N items that are most similar to the provided item.
+If you still need the total number of "similar" items in the database, set the `full_count` parameter to true.
 
 The setter name refers to the model that produced the embeddings.
 You can find a list of available values for this parameter using the /api/search/stats endpoint.
@@ -416,44 +421,39 @@ def find_similar(
     conn = get_database_connection(**conn_args)
     start_time = time.time()
     try:
-        results = list(
-            find_similar_items(
-                conn,
-                sha256,
-                body.setter_name,
-                src_setter_names=(
-                    body.src_text.setter_names if body.src_text else None
-                ),
-                src_languages=(
-                    body.src_text.languages if body.src_text else None
-                ),
-                src_min_confidence=(
-                    body.src_text.min_confidence if body.src_text else 0
-                ),
-                src_min_language_confidence=(
-                    body.src_text.min_language_confidence
-                    if body.src_text
-                    else 0
-                ),
-                src_min_text_length=(
-                    body.src_text.min_length if body.src_text else 0
-                ),
-                distance_aggregation_func=body.distance_aggregation,
-                confidence_weight=body.src_confidence_weight,
-                language_confidence_weight=body.src_language_confidence_weight,
-                clip_xmodal=body.clip_xmodal,
-                xmodal_t2t=body.xmodal_t2t,
-                xmodal_i2i=body.xmodal_i2i,
-                page_size=body.page_size,
-                page_number=body.page,
-            )
+        results, count = find_similar_items(
+            conn,
+            sha256,
+            body.setter_name,
+            src_setter_names=(
+                body.src_text.setter_names if body.src_text else None
+            ),
+            src_languages=(body.src_text.languages if body.src_text else None),
+            src_min_confidence=(
+                body.src_text.min_confidence if body.src_text else 0
+            ),
+            src_min_language_confidence=(
+                body.src_text.min_language_confidence if body.src_text else 0
+            ),
+            src_min_text_length=(
+                body.src_text.min_length if body.src_text else 0
+            ),
+            distance_aggregation_func=body.distance_aggregation,
+            confidence_weight=body.src_confidence_weight,
+            language_confidence_weight=body.src_language_confidence_weight,
+            clip_xmodal=body.clip_xmodal,
+            xmodal_t2t=body.xmodal_t2t,
+            xmodal_i2i=body.xmodal_i2i,
+            page_size=body.page_size,
+            page_number=body.page,
+            full_count=body.full_count,
         )
         logger.debug(
-            f"Found {len(results)} similar items in {time.time() - start_time:.2f}s"
+            f"Found {len(results)} similar items in {time.time() - start_time:.2f}s (total count: {count})"
         )
         offset = (body.page - 1) * body.page_size
         return FileSearchResultModel(
-            count=len(results) + offset, results=results
+            count=count or (len(results) + offset), results=results
         )
     finally:
         conn.close()
