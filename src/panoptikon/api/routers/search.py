@@ -321,17 +321,19 @@ class SimilarItemsRequest(BaseModel):
         0.0,
         description="""
 The weight to apply to the confidence of the source text
-on the embedding distance aggregation.
+on the embedding distance aggregation for individual items with multiple embeddings.
 Default is 0.0, which means that the confidence of the source text
-does not affect the distance calculation.
+does not affect the distance aggregation.
 This parameter is only relevant when the source text has a confidence value.
 The confidence of the source text is multiplied by the confidence of the other
 source text when calculating the distance between two items.
 The formula for the distance calculation is as follows:
 ```
-distance = distance * POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), src_confidence_weight)
+weights = POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), src_confidence_weight)
+distance = SUM(distance * weights) / SUM(weights)
 ```
 So this weight is the exponent to which the confidence is raised, which means that it can be greater than 1.
+When confidence weights are set, the distance_aggregation setting is ignored.
 """,
     )
     src_language_confidence_weight: float = Field(
@@ -342,9 +344,9 @@ on the embedding distance aggregation.
 Default is 0.0, which means that the confidence of the source text language detection
 does not affect the distance calculation.
 Totally analogous to `src_confidence_weight`, but for the language confidence.
-When both are present, the results of the POW() functions for both are multiplied together before being multiplied by the distance.
+When both are present, the results of the POW() functions for both are multiplied together before being applied to the distance.
 ```
-distance = distance * POW(..., src_confidence_weight) * POW(..., src_language_confidence_weight)
+weights = POW(..., src_confidence_weight) * POW(..., src_language_confidence_weight)
 ```
 """,
     )
