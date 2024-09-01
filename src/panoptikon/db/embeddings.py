@@ -161,21 +161,20 @@ def find_similar_items(
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
+    order_by_clause = f"{distance_aggregation_func}({distance_function}) ASC"
+
     confidence_weight_clause = f"POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), {confidence_weight})"
     language_confidence_weight_clause = f"POW((COALESCE(main_source_text.language_confidence, 1) * COALESCE(other_source_text.language_confidence, 1)), {language_confidence_weight})"
 
     if confidence_weight > 0 and language_confidence_weight > 0:
-        distance_function = f"({distance_function} * {confidence_weight_clause} * {language_confidence_weight_clause})"
+        weights = f"({confidence_weight_clause} * {language_confidence_weight_clause})"
+        # Normalize the distance function by the sum of the weights
+        order_by_clause = f"(SUM({distance_function} * {weights}) / SUM ({weights})) ASC"
     elif confidence_weight > 0:
-        distance_function = (
-            f"({distance_function} * {confidence_weight_clause})"
-        )
+        order_by_clause = f"(SUM({distance_function} * {confidence_weight_clause}) / SUM ({confidence_weight_clause})) ASC"
     elif language_confidence_weight > 0:
-        distance_function = (
-            f"({distance_function} * {language_confidence_weight_clause})"
-        )
+        order_by_clause = f"(SUM({distance_function} * {language_confidence_weight_clause}) / SUM ({language_confidence_weight_clause})) ASC"
 
-    # Step 4: Build the query for the cross-comparison
     if clip_xmodal and text_setter_id:
         if not xmodal_t2t:
             remove_text_to_text_condition = "AND (main_item_data.data_type != 'text-embedding' OR other_item_data.data_type != 'text-embedding')"
@@ -239,7 +238,7 @@ def find_similar_items(
                 {remove_image_to_image_condition}
             )
         GROUP BY other_item_data.item_id
-        ORDER BY {distance_aggregation_func}({distance_function}) ASC
+        ORDER BY {order_by_clause} ASC
         LIMIT ? OFFSET ?;
         """
 
@@ -297,7 +296,7 @@ def find_similar_items(
         JOIN items ON other_item_data.item_id = items.id
         JOIN files ON files.item_id = items.id
         GROUP BY other_item_data.item_id
-        ORDER BY {distance_aggregation_func}({distance_function}) ASC
+        ORDER BY {order_by_clause} ASC
         LIMIT ? OFFSET ?;
         """
         parameters.append(page_size)
