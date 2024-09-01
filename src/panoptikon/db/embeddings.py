@@ -161,7 +161,7 @@ def find_similar_items(
     else:
         distance_function = "vec_distance_L2(other_embeddings.embedding, main_embeddings.embedding)"
 
-    order_by_clause = f"{distance_aggregation_func}({distance_function}) ASC"
+    order_by_clause = f"{distance_aggregation_func}({distance_function})"
 
     confidence_weight_clause = f"POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), {confidence_weight})"
     language_confidence_weight_clause = f"POW((COALESCE(main_source_text.language_confidence, 1) * COALESCE(other_source_text.language_confidence, 1)), {language_confidence_weight})"
@@ -169,11 +169,11 @@ def find_similar_items(
     if confidence_weight > 0 and language_confidence_weight > 0:
         weights = f"({confidence_weight_clause} * {language_confidence_weight_clause})"
         # Normalize the distance function by the sum of the weights
-        order_by_clause = f"(SUM({distance_function} * {weights}) / SUM ({weights})) ASC"
+        order_by_clause = f"(SUM({distance_function} * {weights}) / SUM ({weights}))"
     elif confidence_weight > 0:
-        order_by_clause = f"(SUM({distance_function} * {confidence_weight_clause}) / SUM ({confidence_weight_clause})) ASC"
+        order_by_clause = f"(SUM({distance_function} * {confidence_weight_clause}) / SUM ({confidence_weight_clause}))"
     elif language_confidence_weight > 0:
-        order_by_clause = f"(SUM({distance_function} * {language_confidence_weight_clause}) / SUM ({language_confidence_weight_clause})) ASC"
+        order_by_clause = f"(SUM({distance_function} * {language_confidence_weight_clause}) / SUM ({language_confidence_weight_clause}))"
 
     if clip_xmodal and text_setter_id:
         if not xmodal_t2t:
