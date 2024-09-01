@@ -373,7 +373,10 @@ When using CLIP cross-modal similarity, whether to use text-to-text similarity a
 When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
         """,
     )
-    limit: int = Field(10, description="The number of similar items to return")
+    page: int = Field(1, description="The page number to return")
+    page_size: int = Field(
+        10, description="The number of similar items to return"
+    )
 
 
 @router.post(
@@ -439,7 +442,8 @@ def find_similar(
                 clip_xmodal=body.clip_xmodal,
                 xmodal_t2t=body.xmodal_t2t,
                 xmodal_i2i=body.xmodal_i2i,
-                limit=body.limit,
+                page_size=body.page_size,
+                page_number=body.page,
             )
         )
         logger.debug(

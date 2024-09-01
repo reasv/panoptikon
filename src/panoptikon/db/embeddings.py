@@ -49,8 +49,13 @@ def find_similar_items(
     distance_aggregation_func: Literal["MIN", "MAX", "AVG"] = "MIN",
     confidence_weight: float = 0,
     language_confidence_weight: float = 0,
-    limit: int = 10,
+    page_size: int = 10,
+    page_number: int = 1,
 ) -> List[FileSearchResult]:
+    if page_number < 1:
+        page_number = 1
+    offset = (page_number - 1) * page_size
+
     # Step 1: Retrieve item_id, setter_id, and data_type from the provided sha256 and setter_name
     query = """
     SELECT 
@@ -65,7 +70,7 @@ def find_similar_items(
     """
     cursor = conn.execute(query, (sha256, setter_name))
     result = cursor.fetchone()
-
+    
     if not result:
         return []  # No item or setter found, return empty list
 
@@ -235,7 +240,7 @@ def find_similar_items(
             )
         GROUP BY other_item_data.item_id
         ORDER BY {distance_aggregation_func}({distance_function}) ASC
-        LIMIT ?;
+        LIMIT ? OFFSET ?;
         """
 
         parameters = [item_id, main_setter_id, text_setter_id]
@@ -253,7 +258,7 @@ def find_similar_items(
         parameters = parameters + src_parameters
         parameters = parameters + [main_setter_id, text_setter_id]
         parameters = parameters + src_parameters
-        parameters = parameters + [limit]
+        parameters = parameters + [page_size, offset]
 
     else:
         require_text_left_join = False # Flag to determine if we need to left join the extracted_text table
@@ -293,9 +298,10 @@ def find_similar_items(
         JOIN files ON files.item_id = items.id
         GROUP BY other_item_data.item_id
         ORDER BY {distance_aggregation_func}({distance_function}) ASC
-        LIMIT ?;
+        LIMIT ? OFFSET ?;
         """
-        parameters.append(limit)
+        parameters.append(page_size)
+        parameters.append(offset)
 
     # Step 5: Execute the query
     cursor = conn.execute(query, tuple(parameters))
