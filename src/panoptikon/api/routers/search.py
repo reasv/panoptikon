@@ -388,7 +388,7 @@ When using CLIP cross-modal similarity, whether to use image-to-image similarity
 Find similar items in the database based on the provided SHA256 and setter name.
 The search is based on the image or text embeddings of the provided item.
 
-The count value in the response is equal to the number of items returned, rather than the total number of similar items in the database.
+The count value in the response is equal to the number of items returned (+ (page_size - 1) * page for page > 1), rather than the total number of similar items in the database.
 This is because there is no way to define what constitutes a "similar" item in a general sense. We just return the top N items that are most similar to the provided item.
 
 The setter name refers to the model that produced the embeddings.
@@ -451,6 +451,9 @@ def find_similar(
         logger.debug(
             f"Found {len(results)} similar items in {time.time() - start_time:.2f}s"
         )
-        return FileSearchResultModel(count=len(results), results=results)
+        offset = (body.page - 1) * body.page_size
+        return FileSearchResultModel(
+            count=len(results) + offset, results=results
+        )
     finally:
         conn.close()
