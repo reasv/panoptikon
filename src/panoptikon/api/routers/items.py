@@ -159,6 +159,7 @@ def get_thumbnail_by_sha256(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> Response:
     conn = get_database_connection(**conn_args)
+    resp_type = "default"
     try:
         file = get_existing_file_for_sha256(conn, sha256)
         if not file:
@@ -168,6 +169,8 @@ def get_thumbnail_by_sha256(
         original_filename_no_ext, _ = os.path.splitext(original_filename)
 
         if mime is None or mime.startswith("image/gif"):
+            resp_type = "file/gif"
+            logger.debug(f"{resp_type} for {sha256}: ")
             return FileResponse(
                 file.path,
                 media_type=mime,
@@ -181,6 +184,8 @@ def get_thumbnail_by_sha256(
 
         buffer = get_thumbnail_bytes(conn, file.sha256, index)
         if buffer:
+            resp_type = "thumbnail/buffer"
+            logger.debug(f"{resp_type} for {sha256}: ")
             return Response(
                 content=buffer,
                 media_type="image/jpeg",
@@ -190,6 +195,8 @@ def get_thumbnail_by_sha256(
             )
 
         if mime.startswith("image"):
+            resp_type = "file/image"
+            logger.debug(f"{resp_type} for {sha256}: ")
             return FileResponse(
                 file.path,
                 media_type=mime,
@@ -201,6 +208,8 @@ def get_thumbnail_by_sha256(
         img_byte_array = io.BytesIO()
         gradient.save(img_byte_array, format="PNG")
         img_byte_array = img_byte_array.getvalue()
+        resp_type = "file/generated"
+        logger.debug(f"{resp_type} for {sha256}: ")
         return Response(
             content=img_byte_array,
             media_type="image/png",
@@ -208,6 +217,9 @@ def get_thumbnail_by_sha256(
                 "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
             },
         )
+    except Exception as e:
+        logger.error(f"Error generating thumbnail ({resp_type}): {e}")
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
     finally:
         conn.close()
 
