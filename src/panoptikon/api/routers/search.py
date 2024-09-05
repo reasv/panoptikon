@@ -5,7 +5,7 @@ import time
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
 from pydantic.dataclasses import dataclass
 

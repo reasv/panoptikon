@@ -59,6 +59,7 @@ def pretty_print_SQL(query_str: str, params: List[str | float | int]):
             [line for line in formatted_query.split("\n") if line.strip() != ""]
         )
         logger.debug(formatted_query)
+        logger.debug(params)
     except Exception as e:
         logger.error(f"Error formatting query: {e}")
         logger.error(query_str, params)

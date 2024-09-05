@@ -147,7 +147,7 @@ def clean_tag_params(args: QueryTagFilters):
         all_setters_required=args.all_setters_required,
         setters=args.setters,
         namespaces=args.namespaces,
-        min_confidence=args.min_confidence,
+        min_confidence=args.min_confidence if args.min_confidence else None,
     )
     if len(tag_args.pos_match_any) == 1:
         # If only one tag is provided for "match any",
