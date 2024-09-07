@@ -150,16 +150,20 @@ class TypeFilterModel(Filter):
     mime_types: List[str] = Field(default_factory=list)
 
 
+class Operator(BaseModel):
+    pass
+
+
 # Define operators
-class AndOperator(BaseModel):
+class AndOperator(Operator):
     and_: List["QueryElement"]
 
 
-class OrOperator(BaseModel):
+class OrOperator(Operator):
     or_: List["QueryElement"]
 
 
-class NotOperator(BaseModel):
+class NotOperator(Operator):
     not_: "QueryElement"
 
 
