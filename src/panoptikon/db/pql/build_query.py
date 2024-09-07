@@ -248,7 +248,9 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     # Sort order_list by priority
     state.order_list.sort(key=lambda x: x.priority, reverse=True)
 
-    full_order_list = state.order_list + input_query.order_args
+    full_order_list = combine_order_lists(
+        state.order_list, input_query.order_args
+    )
 
     for ospec in full_order_list:
         if isinstance(ospec, OrderArgs):
@@ -278,6 +280,23 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     offset = (page - 1) * page_size
     full_query = full_query.limit(page_size).offset(offset)
     return full_query
+
+
+def combine_order_lists(
+    order_list: List[OrderByFilter], order_args: List[OrderArgs]
+) -> List[OrderArgs | OrderByFilter]:
+
+    # order_list has priority over order_args by default
+    combined = [(obj, idx, 0) for idx, obj in enumerate(order_list)] + [
+        (obj, idx, 1) for idx, obj in enumerate(order_args)
+    ]
+
+    # Sort by priority, then by index, then by order_args vs order_list
+    sorted_combined = sorted(
+        combined, key=lambda x: (-x[0].priority, x[2], x[1])
+    )
+    final_order = [item[0] for item in sorted_combined]
+    return final_order
 
 
 def get_order_by_and_direction(order_args: OrderArgs) -> Tuple[str, Order]:
