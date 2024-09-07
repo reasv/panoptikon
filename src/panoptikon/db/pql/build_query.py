@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, final
 
-from pypika import AliasedQuery, Criterion, QmarkParameter
+from pypika import AliasedQuery, Criterion, Field, QmarkParameter
 from pypika import SQLLiteQuery as Query
 from pypika import Table
 from pypika.queries import QueryBuilder, Selectable
@@ -52,10 +52,13 @@ class QueryState:
         self.root_query = None  # The main query that uses CTE names
 
 
+def wrap_select(selectable: Selectable) -> QueryBuilder:
+    return Query.from_(selectable).select("file_id", "item_id")
+
+
 def path_in(filter: PathFilterModel, context: Selectable) -> Selectable:
     query = (
-        Query.from_(context)
-        .select("file_id", "item_id")
+        wrap_select(context)
         .join(files_table)
         .on(files_table.id == context.file_id)
         .where(
@@ -69,8 +72,7 @@ def path_in(filter: PathFilterModel, context: Selectable) -> Selectable:
 
 def type_in(filter: TypeFilterModel, context: Selectable) -> Selectable:
     query = (
-        Query.from_(context)
-        .select("file_id", "item_id")
+        wrap_select(context)
         .join(items_table)
         .on(context.item_id == items_table.id)
         .where(
@@ -89,8 +91,7 @@ def path_text_filter(
     filter: PathTextFilterModel, context: Selectable
 ) -> Selectable:
     query = (
-        Query.from_(context)
-        .select("file_id", "item_id")
+        wrap_select(context)
         .join(files_path_fts_table)
         .on(context.file_id == files_path_fts_table.rowid)
     )
@@ -149,18 +150,16 @@ def process_query(
                 q = process_query(sub_element, context, state)
                 # Combine the subqueries using UNION (OR logic)
                 union_query = (
-                    Query.from_(q).select("file_id", "item_id")
+                    wrap_select(q)
                     if union_query is None
-                    else union_query.union(
-                        Query.from_(q).select("file_id", "item_id")
-                    )
+                    else union_query.union(wrap_select(q))
                 )
             assert union_query is not None, "No subqueries generated"
             cte_name = f"n_{state.cte_counter}_or"
             state.cte_counter += 1
             state.cte_list.append(
                 CTE(
-                    Query.from_(union_query).select("file_id", "item_id"),
+                    union_query,
                     cte_name,
                 )
             )
@@ -168,11 +167,7 @@ def process_query(
         elif isinstance(el, NotOperator):
             subquery: AliasedQuery = process_query(el.not_, context, state)
 
-            not_query = (
-                Query.from_(context)
-                .select("file_id", "item_id")
-                .except_of(Query.from_(subquery).select("file_id", "item_id"))
-            )
+            not_query = wrap_select(context).except_of(wrap_select(subquery))
 
             cte_name = f"n_{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
@@ -188,42 +183,74 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     state = QueryState()
 
     # Start the recursive processing
-    initial_select = Query.from_(files_table).select(
-        files_table.id.as_("file_id"), "item_id"
+    initial_select = (
+        Query.from_(files_table)
+        .join(items_table)
+        .on(files_table.item_id == items_table.id)
+        .select(files_table.id.as_("file_id"), "item_id")
     )
     if input_query.query:
-        root_query = process_query(
+        root_cte = process_query(
             input_query.query, AliasedQuery("root_files"), state
         )
 
         # Add all CTEs to the final query
-        final_query: QueryBuilder = Query.with_(initial_select, "root_files")
+        full_query: QueryBuilder = Query.with_(initial_select, "root_files")
         for cte in state.cte_list:
-            final_query = final_query.with_(cte.query, cte.name)
-        assert final_query is not None, "No CTEs generated"
+            full_query = full_query.with_(cte.query, cte.name)
+        assert full_query is not None, "No CTEs generated"
 
-        final_query = final_query.from_(root_query).select("file_id")
+        full_query = (
+            full_query.from_(root_cte)
+            .join(files_table)
+            .on(files_table.id == root_cte.file_id)
+            .join(items_table)
+            .on(root_cte.item_id == items_table.id)
+            .select(
+                root_cte.file_id,
+                root_cte.item_id,
+                files_table.path,
+                files_table.last_modified,
+                items_table.type,
+            )
+        )
     else:
-        final_query = initial_select
+        full_query = (
+            Query.from_(files_table)
+            .join(items_table)
+            .on(files_table.item_id == items_table.id)
+            .select(
+                files_table.id.as_("file_id"),
+                "item_id",
+                files_table.path,
+                files_table.last_modified,
+                items_table.type,
+            )
+        )
 
     # Apply ORDER BY if needed
     if state.order_list:
         for order in state.order_list:
-            final_query = final_query.orderby(order.column, order.direction)
+            full_query = full_query.orderby(order.column, order.direction)
 
     if input_query.order_args.order_by:
-        final_query = final_query.orderby(
-            input_query.order_args.order_by, input_query.order_args.order
+        full_query = full_query.orderby(
+            Field(input_query.order_args.order_by, table=files_table),
+            input_query.order_args.order,
         )
 
-    # Apply pagination
-    final_query = final_query.limit(input_query.order_args.page_size).offset(
-        (input_query.order_args.page - 1) * input_query.order_args.page_size
+    offset = (
+        max((input_query.order_args.page - 1), 0)
+        * input_query.order_args.page_size
     )
-    return final_query
+    # Apply pagination
+    full_query = full_query.limit(input_query.order_args.page_size).offset(
+        offset
+    )
+    return full_query
 
 
-# # Example usage
+# Example usage
 # example_query = AndOperator(
 #     and_=[
 #         PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
