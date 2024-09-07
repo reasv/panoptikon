@@ -249,7 +249,6 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     if state.order_list:
         for order in state.order_list:
             direction = Order.asc if order.direction == "asc" else Order.desc
-            # field = Field("order_rank", table=order.cte)
             full_query = (
                 full_query.left_join(order.cte)
                 .on_field("file_id")

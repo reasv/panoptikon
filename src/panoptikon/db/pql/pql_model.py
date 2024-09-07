@@ -8,6 +8,7 @@ OrderByType = Union[
 ]
 
 OrderType = Union[Literal["asc", "desc"], None]
+OrderTypeNN = Literal["asc", "desc"]
 
 
 # Filter arguments
@@ -90,9 +91,9 @@ def get_order_by_field(default: bool):
     )
 
 
-def get_order_direction_field(default: OrderType):
+def get_order_direction_field(default: OrderTypeNN):
     return Field(
-        default=None,
+        default=default,
         title="Order Direction",
         description="The order direction for this filter. If not set, the default order direction is used",
     )
@@ -100,7 +101,7 @@ def get_order_direction_field(default: OrderType):
 
 def get_order_priority_field(default: int):
     return Field(
-        default=0,
+        default=default,
         title="Order By Priority",
         description="The priority of this filter in the order by clause. If there are multiple filters with order_by set to True, the priority is used to determine the order.",
     )
@@ -108,7 +109,7 @@ def get_order_priority_field(default: int):
 
 class SortableFilter(Filter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderType = get_order_direction_field(None)
+    order_direction: OrderTypeNN = get_order_direction_field("desc")
     order_priority: int = get_order_priority_field(0)
 
 
@@ -150,39 +151,39 @@ class TagFilterModel(Filter):
 
 class BookmarksFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderType = get_order_direction_field("desc")
+    order_direction: OrderTypeNN = get_order_direction_field("desc")
     bookmarks: BookmarksFilter
 
 
 class PathTextFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderType = get_order_direction_field("desc")
+    order_direction: OrderTypeNN = get_order_direction_field("desc")
     path_text: PathTextFilter
 
 
 class ExtractedTextFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderType = get_order_direction_field("asc")
+    order_direction: OrderTypeNN = get_order_direction_field("asc")
     extracted_text: ExtractedTextFilter
 
 
 class ExtractedTextEmbeddingsFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(True)
-    order_direction: OrderType = get_order_direction_field("asc")
+    order_direction: OrderTypeNN = get_order_direction_field("asc")
     order_priority: int = get_order_priority_field(105)
     extracted_text_embeddings: ExtractedTextEmbeddingsFilter
 
 
 class ImageEmbeddingFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(True)
-    order_direction: OrderType = get_order_direction_field("asc")
+    order_direction: OrderTypeNN = get_order_direction_field("asc")
     order_priority: int = get_order_priority_field(100)
     image_embeddings: ImageEmbeddingFilter
 
 
 class AnyTextFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderType = get_order_direction_field("desc")
+    order_direction: OrderTypeNN = get_order_direction_field("desc")
     any_text: AnyTextFilter
 
 
