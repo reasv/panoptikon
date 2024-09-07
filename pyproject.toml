@@ -6,9 +6,9 @@ authors = ["reasv"]
 license = "AGPL"
 readme = "README.md"
 packages = [
-    { include = "panoptikon", from="src" },
-    { include = "inferio", from="src" },
-    { include = "searchui", from="src" },
+    { include = "panoptikon", from = "src" },
+    { include = "inferio", from = "src" },
+    { include = "searchui", from = "src" },
 ]
 include = [
     "src/panoptikon/ui/static/**/*",
@@ -20,7 +20,7 @@ include = [
 python = "^3.12"
 gradio = "^4.38.0"
 pillow = "^10.4.0"
-imageio-ffmpeg = {extras = ["ffmpeg"], version = "^0.5.1"}
+imageio-ffmpeg = { extras = ["ffmpeg"], version = "^0.5.1" }
 python-dotenv = "^1.0.1"
 sqlite-vec = "^0.1.1"
 fastapi-utilities = "^0.2.0"
@@ -31,15 +31,16 @@ pypdfium2 = "^4.30.0"
 alembic = "^1.13.2"
 fastapi-proxy-lib = "^0.1.0"
 nodejs-wheel = "^20.17.0"
+pypika = { git = "https://github.com/mvanderlee/pypika.git", branch = "mvanderlee/parametized_query" }
 
 [tool.poetry.group.inference]
 optional = true
 
 [tool.poetry.group.inference.dependencies]
 open-clip-torch = "^2.26.1"
-python-doctr = {extras = ["torch"], version = "^0.8.1"}
+python-doctr = { extras = ["torch"], version = "^0.8.1" }
 timm = "^1.0.7"
-faster-whisper = {git = "https://github.com/SYSTRAN/faster-whisper.git"}
+faster-whisper = { git = "https://github.com/SYSTRAN/faster-whisper.git" }
 sentence-transformers = "^3.0.1"
 
 [tool.poetry.scripts]
