@@ -108,8 +108,8 @@ def get_order_priority_field(default: int):
 
 class SortableFilter(Filter):
     order_by: bool = get_order_by_field(False)
-    direction: OrderType = get_order_direction_field(None)
-    priority: int = get_order_priority_field(0)
+    order_direction: OrderType = get_order_direction_field(None)
+    order_priority: int = get_order_priority_field(0)
 
 
 class EqualsFilterModel(Filter):
@@ -149,24 +149,27 @@ class TagFilterModel(Filter):
 
 
 class BookmarksFilterModel(SortableFilter):
+    order_by: bool = get_order_by_field(False)
     order_direction: OrderType = get_order_direction_field("desc")
     bookmarks: BookmarksFilter
 
 
 class PathTextFilterModel(SortableFilter):
+    order_by: bool = get_order_by_field(False)
     order_direction: OrderType = get_order_direction_field("desc")
     path_text: PathTextFilter
 
 
 class ExtractedTextFilterModel(SortableFilter):
-    order_direction: OrderType = get_order_direction_field("desc")
+    order_by: bool = get_order_by_field(False)
+    order_direction: OrderType = get_order_direction_field("asc")
     extracted_text: ExtractedTextFilter
 
 
 class ExtractedTextEmbeddingsFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(True)
     order_direction: OrderType = get_order_direction_field("asc")
-    order_priority: int = get_order_priority_field(101)
+    order_priority: int = get_order_priority_field(105)
     extracted_text_embeddings: ExtractedTextEmbeddingsFilter
 
 
@@ -178,6 +181,7 @@ class ImageEmbeddingFilterModel(SortableFilter):
 
 
 class AnyTextFilterModel(SortableFilter):
+    order_by: bool = get_order_by_field(False)
     order_direction: OrderType = get_order_direction_field("desc")
     any_text: AnyTextFilter
 

@@ -1,11 +1,19 @@
 from dataclasses import dataclass
 from typing import List, final
 
-from pypika import AliasedQuery, Criterion, Field, Order, QmarkParameter
+from pypika import Table  # Query,
+from pypika import (
+    AliasedQuery,
+    Criterion,
+    Field,
+    Order,
+    QmarkParameter,
+)  # Query,
 from pypika import SQLLiteQuery as Query
-from pypika import Table
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import BasicCriterion, Comparator, Term
+
+from panoptikon.db.search.types import OrderType
 
 
 class Match(Comparator):
@@ -23,6 +31,7 @@ from panoptikon.db.pql.pql_model import (
     PathTextFilterModel,
     QueryElement,
     SearchQuery,
+    SortableFilter,
     TypeFilterModel,
 )
 
@@ -39,8 +48,8 @@ class CTE:
 
 @dataclass
 class OrderByColumn:
-    column: str
-    direction: str
+    cte: AliasedQuery
+    direction: OrderType
     priority: int = 0
 
 
@@ -136,14 +145,24 @@ def process_query(
 ) -> AliasedQuery:
     # Process primitive filters
     if isinstance(el, Filter):
-        return filter_function(el, context, state)
+        cte = filter_function(el, context, state)
+        if isinstance(el, SortableFilter):
+            if el.order_by:
+                state.order_list.append(
+                    OrderByColumn(
+                        cte=cte,
+                        direction=el.order_direction,
+                        priority=el.order_priority,
+                    )
+                )
+        return cte
     elif isinstance(el, Operator):
         if isinstance(el, AndOperator):
             for sub_element in el.and_:
                 context = process_query(sub_element, context, state)
             cte_name = f"n_{state.cte_counter}_and"
             state.cte_counter += 1
-            state.cte_list.append(CTE(context, cte_name))
+            state.cte_list.append(CTE(wrap_select(context), cte_name))
             return AliasedQuery(cte_name)
         elif isinstance(el, OrOperator):
             union_query = None
@@ -160,7 +179,7 @@ def process_query(
             state.cte_counter += 1
             state.cte_list.append(
                 CTE(
-                    union_query,
+                    wrap_select(union_query),
                     cte_name,
                 )
             )
@@ -168,7 +187,9 @@ def process_query(
         elif isinstance(el, NotOperator):
             subquery: AliasedQuery = process_query(el.not_, context, state)
 
-            not_query = wrap_select(context).except_of(wrap_select(subquery))
+            not_query = wrap_select(
+                wrap_select(context).except_of(wrap_select(subquery))
+            )
 
             cte_name = f"n_{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
@@ -228,11 +249,26 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
                 items_table.type,
             )
         )
-
+    # Sort order_list by priority
+    state.order_list.sort(key=lambda x: x.priority, reverse=True)
     # Apply ORDER BY if needed
     if state.order_list:
         for order in state.order_list:
-            full_query = full_query.orderby(order.column, order.direction)
+            direction = Order.asc if order.direction == "asc" else Order.desc
+            # field = Field("order_rank", table=order.cte)
+            full_query = (
+                full_query.left_join(order.cte)
+                .on_field("file_id")
+                .orderby(
+                    (  # Ensure that NULL values are at the end
+                        order.cte.order_rank.isnotnull()
+                        if direction == Order.desc
+                        else order.cte.order_rank.isnull()
+                    ),
+                    order.cte.order_rank,
+                    order=direction,
+                )
+            )
 
     if input_query.order_args.order_by:
         full_query = full_query.orderby(
@@ -256,7 +292,11 @@ example_query = AndOperator(
     and_=[
         PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
         NotOperator(
-            not_=PathTextFilterModel(path_text=PathTextFilter(query="example"))
+            not_=PathTextFilterModel(
+                path_text=PathTextFilter(query="example"),
+                order_by=True,
+                order_direction="desc",
+            )
         ),
         OrOperator(
             or_=[
@@ -269,8 +309,9 @@ example_query = AndOperator(
     ]
 )
 
-search_query = SearchQuery(query=example_query)
-parameters = QmarkParameter()
-final_query = build_final_query(search_query)
-print(final_query.get_sql(parameter=parameters))
-print(parameters.get_parameters())
+# search_query = SearchQuery(query=example_query)
+# print(build_final_query(search_query).get_sql())
+# # parameters = QmarkParameter()
+# # final_query = build_final_query(search_query)
+# # print(final_query.get_sql(parameter=parameters))
+# # print(parameters.get_parameters())
