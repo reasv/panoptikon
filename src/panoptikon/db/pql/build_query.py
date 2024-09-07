@@ -1,8 +1,16 @@
 from dataclasses import dataclass
 from typing import List
 
-from pypika import AliasedQuery, Criterion, Query, Table
+from pypika import AliasedQuery, Criterion, QmarkParameter
+from pypika import SQLLiteQuery as Query
+from pypika import Table
 from pypika.queries import QueryBuilder, Selectable
+from pypika.terms import BasicCriterion, Comparator, Term
+
+
+class Match(Comparator):
+    match_ = " MATCH "
+
 
 from panoptikon.db.pql.pql_model import (
     AndOperator,
@@ -11,6 +19,7 @@ from panoptikon.db.pql.pql_model import (
     Operator,
     OrOperator,
     PathFilterModel,
+    PathTextFilter,
     PathTextFilterModel,
     QueryElement,
     SearchQuery,
@@ -89,11 +98,19 @@ def path_text_filter(
     )
     if filter.path_text.only_match_filename:
         query = query.where(
-            files_path_fts_table.filename.match(filter.path_text.query)
+            BasicCriterion(
+                Match.match_,
+                files_path_fts_table.filename,
+                Term.wrap_constant(filter.path_text.query),  # type: ignore
+            )
         )
     else:
         query = query.where(
-            files_path_fts_table.path.match(filter.path_text.query)
+            BasicCriterion(
+                Match.match_,
+                files_path_fts_table.filename,
+                Term.wrap_constant(filter.path_text.query),  # type: ignore
+            )
         )
     return query
 
@@ -114,7 +131,9 @@ def filter_function(filter: Filter, context: Selectable, state: QueryState):
     return AliasedQuery(cte_name)
 
 
-def process_query(el: QueryElement, context: Selectable, state: QueryState):
+def process_query(
+    el: QueryElement, context: Selectable, state: QueryState
+) -> AliasedQuery:
     # Process primitive filters
     if isinstance(el, Filter):
         return filter_function(el, context, state)
@@ -122,25 +141,38 @@ def process_query(el: QueryElement, context: Selectable, state: QueryState):
         if isinstance(el, AndOperator):
             for sub_element in el.and_:
                 context = process_query(sub_element, context, state)
-            return context
+            cte_name = f"n_{state.cte_counter}_and"
+            state.cte_counter += 1
+            state.cte_list.append(CTE(context, cte_name))
+            return AliasedQuery(cte_name)
         elif isinstance(el, OrOperator):
             union_query = None
             for sub_element in el.or_:
                 q = process_query(sub_element, context, state)
                 # Combine the subqueries using UNION (OR logic)
                 union_query = (
-                    q
+                    Query.from_(q).select("file_id")
                     if union_query is None
-                    else union_query.union(Query.select("file_id").from_(q))
+                    else union_query.union(Query.from_(q).select("file_id"))
                 )
-            return union_query
+            assert union_query is not None, "No subqueries generated"
+            cte_name = f"n_{state.cte_counter}_or"
+            state.cte_counter += 1
+            state.cte_list.append(
+                CTE(Query.from_(union_query).select("file_id"), cte_name)
+            )
+            return AliasedQuery(cte_name)
         elif isinstance(el, NotOperator):
             subquery: AliasedQuery = process_query(el.not_, context, state)
-            return (
-                Query.select("file_id")
-                .from_(context)
-                .except_of(Query.select("file_id").from_(subquery))
+            not_query = (
+                Query.from_(context)
+                .select("file_id")
+                .except_of(Query.from_(subquery).select("file_id"))
             )
+            cte_name = f"n_{state.cte_counter}_not_{subquery.name}"
+            state.cte_counter += 1
+            state.cte_list.append(CTE(not_query, cte_name))
+            return AliasedQuery(cte_name)
     else:
         raise ValueError("Unknown query element type")
 
@@ -150,20 +182,23 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     state = QueryState()
 
     # Start the recursive processing
-
-    context = Query.from_(files_table).select("id").as_("file_id")
+    initial_select = Query.from_(files_table).select(
+        files_table.id.as_("file_id")
+    )
     if input_query.query:
-        root_query = process_query(input_query.query, context, state)
+        root_query = process_query(
+            input_query.query, AliasedQuery("n_0_files"), state
+        )
 
         # Add all CTEs to the final query
-        final_query: QueryBuilder | None = None
+        final_query: QueryBuilder = Query.with_(initial_select, "n_0_files")
         for cte in state.cte_list:
-            final_query = (final_query or Query).with_(cte.query, cte.name)
+            final_query = final_query.with_(cte.query, cte.name)
         assert final_query is not None, "No CTEs generated"
 
-        final_query = final_query.select("file_id").from_(root_query)
+        final_query = final_query.from_(root_query).select("file_id")
     else:
-        final_query = Query.from_(context).select("file_id")
+        final_query = initial_select
 
     # Apply ORDER BY if needed
     if state.order_list:
@@ -185,14 +220,23 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
 # # Example usage
 # example_query = AndOperator(
 #     and_=[
-#         BookmarksFilterModel(
-#             bookmarks=BookmarksFilter(namespaces=["namespace1"])
-#         ),
+#         PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
 #         NotOperator(
 #             not_=PathTextFilterModel(path_text=PathTextFilter(query="example"))
 #         ),
+#         OrOperator(
+#             or_=[
+#                 TypeFilterModel(
+#                     mime_types=["application/pdf", "image/jpeg", "image/png"]
+#                 ),
+#                 TypeFilterModel(mime_types=["text/plain"]),
+#             ]
+#         ),
 #     ]
 # )
+
 # search_query = SearchQuery(query=example_query)
+# parameters = QmarkParameter()
 # final_query = build_final_query(search_query)
-# print(final_query.get_sql())
+# print(final_query.get_sql(parameter=parameters))
+# print(parameters.get_parameters())
