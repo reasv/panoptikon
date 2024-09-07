@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, final
 
-from pypika import AliasedQuery, Criterion, Field, QmarkParameter
+from pypika import AliasedQuery, Criterion, Field, Order, QmarkParameter
 from pypika import SQLLiteQuery as Query
 from pypika import Table
 from pypika.queries import QueryBuilder, Selectable
@@ -236,7 +236,7 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     if input_query.order_args.order_by:
         full_query = full_query.orderby(
             Field(input_query.order_args.order_by, table=files_table),
-            input_query.order_args.order,
+            order=Order.asc if input_query.order_args == "asc" else Order.desc,
         )
 
     offset = (
