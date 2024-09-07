@@ -247,34 +247,31 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
         )
     # Sort order_list by priority
     state.order_list.sort(key=lambda x: x.priority, reverse=True)
-    # Apply ORDER BY in the correct order
-    if state.order_list:
-        for order in state.order_list:
-            direction = Order.asc if order.direction == "asc" else Order.desc
+
+    full_order_list = state.order_list + input_query.order_args
+
+    for ospec in full_order_list:
+        if isinstance(ospec, OrderArgs):
+            order_by, direction = get_order_by_and_direction(ospec)
+            full_query = full_query.orderby(
+                Field(order_by),
+                order=direction,
+            )
+        elif isinstance(ospec, OrderByFilter):
+            direction = Order.asc if ospec.direction == "asc" else Order.desc
             full_query = (
-                full_query.left_join(order.cte)
+                full_query.left_join(ospec.cte)
                 .on_field("file_id")
                 .orderby(
                     (  # Ensure that NULL values are at the end
-                        order.cte.order_rank.isnotnull()
+                        ospec.cte.order_rank.isnotnull()
                         if direction == Order.desc
-                        else order.cte.order_rank.isnull()
+                        else ospec.cte.order_rank.isnull()
                     ),
-                    order.cte.order_rank,
+                    ospec.cte.order_rank,
                     order=direction,
                 )
             )
-    # if len(input_query.order_args) == 0:
-    #     input_query.order_args.append(
-    #         OrderArgs(order_by="last_modified", order="desc")
-    #     )  # Default order by last_modified desc
-
-    for order_args in input_query.order_args:
-        order_by, direction = get_order_by_and_direction(order_args)
-        full_query = full_query.orderby(
-            Field(order_by),
-            order=direction,
-        )
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size

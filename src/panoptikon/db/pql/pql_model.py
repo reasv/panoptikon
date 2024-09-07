@@ -243,6 +243,7 @@ QueryElement = Union[
 class OrderArgs(BaseModel):
     order_by: OrderByType = "last_modified"
     order: OrderType = None
+    priority: int = 0
 
 
 AndOperator.model_rebuild()
