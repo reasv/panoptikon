@@ -107,7 +107,7 @@ def path_text_filter(
         query = query.where(
             BasicCriterion(
                 Match.match_,
-                files_path_fts_table.filename,
+                files_path_fts_table.path,
                 Term.wrap_constant(filter.path_text.query),  # type: ignore
             )
         )
