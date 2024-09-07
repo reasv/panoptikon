@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 from pypika import AliasedQuery, Criterion, Field, Order, QmarkParameter
 from pypika import SQLLiteQuery as Query
@@ -19,6 +19,7 @@ from panoptikon.db.pql.pql_model import (
     Filter,
     NotOperator,
     Operator,
+    OrderParams,
     OrderTypeNN,
     OrOperator,
     PathFilterModel,
@@ -246,7 +247,7 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
         )
     # Sort order_list by priority
     state.order_list.sort(key=lambda x: x.priority, reverse=True)
-    # Apply ORDER BY if needed
+    # Apply ORDER BY in the correct order
     if state.order_list:
         for order in state.order_list:
             direction = Order.asc if order.direction == "asc" else Order.desc
@@ -265,20 +266,32 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
             )
 
     if input_query.order_args.order_by:
+        order_by, direction = get_order_by_and_direction(input_query.order_args)
         full_query = full_query.orderby(
-            Field(input_query.order_args.order_by, table=files_table),
-            order=Order.asc if input_query.order_args == "asc" else Order.desc,
+            Field(order_by, table=files_table),
+            order=direction,
         )
 
-    offset = (
-        max((input_query.order_args.page - 1), 0)
-        * input_query.order_args.page_size
-    )
-    # Apply pagination
-    full_query = full_query.limit(input_query.order_args.page_size).offset(
-        offset
-    )
+    page = max(input_query.order_args.page, 1)
+    page_size = input_query.order_args.page_size
+    offset = max((page - 1), 0) * page_size
+    full_query = full_query.limit(page_size).offset(offset)
     return full_query
+
+
+def get_order_by_and_direction(order_args: OrderParams) -> Tuple[str, Order]:
+    order_by = order_args.order_by
+    if order_by is None:
+        order_by = "last_modified"
+    direction = order_args.order
+    if direction is None:
+        if order_args.order_by == "last_modified":
+            direction = Order.desc
+        else:
+            direction = Order.asc
+    else:
+        direction = Order.asc if direction == "asc" else Order.desc
+    return (order_by, direction)
 
 
 # Example usage
