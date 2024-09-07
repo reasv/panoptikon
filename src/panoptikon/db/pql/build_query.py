@@ -19,7 +19,7 @@ from panoptikon.db.pql.pql_model import (
     Filter,
     NotOperator,
     Operator,
-    OrderParams,
+    OrderArgs,
     OrderTypeNN,
     OrOperator,
     PathFilterModel,
@@ -43,7 +43,7 @@ class CTE:
 
 
 @dataclass
-class OrderByColumn:
+class OrderByFilter:
     cte: AliasedQuery
     direction: OrderTypeNN
     priority: int = 0
@@ -52,7 +52,7 @@ class OrderByColumn:
 class QueryState:
     def __init__(self):
         self.cte_list: List[CTE] = []  # Holds all generated CTEs
-        self.order_list: List[OrderByColumn] = []  # Holds order_by clauses
+        self.order_list: List[OrderByFilter] = []  # Holds order_by clauses
         self.cte_counter = 0  # Counter to generate unique CTE names
         self.root_query = None  # The main query that uses CTE names
 
@@ -145,7 +145,7 @@ def process_query(
         if isinstance(el, SortableFilter):
             if el.order_by:
                 state.order_list.append(
-                    OrderByColumn(
+                    OrderByFilter(
                         cte=cte,
                         direction=el.order_direction,
                         priority=el.order_priority,
@@ -264,22 +264,26 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
                     order=direction,
                 )
             )
+    # if len(input_query.order_args) == 0:
+    #     input_query.order_args.append(
+    #         OrderArgs(order_by="last_modified", order="desc")
+    #     )  # Default order by last_modified desc
 
-    if input_query.order_args.order_by:
-        order_by, direction = get_order_by_and_direction(input_query.order_args)
+    for order_args in input_query.order_args:
+        order_by, direction = get_order_by_and_direction(order_args)
         full_query = full_query.orderby(
-            Field(order_by, table=files_table),
+            Field(order_by),
             order=direction,
         )
 
-    page = max(input_query.order_args.page, 1)
-    page_size = input_query.order_args.page_size
-    offset = max((page - 1), 0) * page_size
+    page = max(input_query.page, 1)
+    page_size = input_query.page_size
+    offset = (page - 1) * page_size
     full_query = full_query.limit(page_size).offset(offset)
     return full_query
 
 
-def get_order_by_and_direction(order_args: OrderParams) -> Tuple[str, Order]:
+def get_order_by_and_direction(order_args: OrderArgs) -> Tuple[str, Order]:
     order_by = order_args.order_by
     if order_by is None:
         order_by = "last_modified"
@@ -295,34 +299,34 @@ def get_order_by_and_direction(order_args: OrderParams) -> Tuple[str, Order]:
 
 
 # Example usage
-# example_query = AndOperator(
-#     and_=[
-#         PathFilterModel(in_paths=[r"Z:\archive\new\archive\42"]),
-#         NotOperator(
-#             not_=TypeFilterModel(mime_types=["image/png"]),
-#         ),
-#         OrOperator(
-#             or_=[
-#                 TypeFilterModel(mime_types=["image/jpeg", "image/png"]),
-#                 PathTextFilterModel(
-#                     path_text=PathTextFilter(query="ryuko"),
-#                     order_by=True,
-#                     order_direction="asc",
-#                     order_priority=100,
-#                 ),
-#                 PathTextFilterModel(
-#                     path_text=PathTextFilter(query="megumin"),
-#                     order_by=True,
-#                     order_direction="asc",
-#                     order_priority=99,
-#                 ),
-#             ]
-#         ),
-#     ]
-# )
+example_query = AndOperator(
+    and_=[
+        PathFilterModel(in_paths=[r"Z:\archive\new\archive\42"]),
+        NotOperator(
+            not_=TypeFilterModel(mime_types=["image/png"]),
+        ),
+        OrOperator(
+            or_=[
+                TypeFilterModel(mime_types=["image/jpeg", "image/png"]),
+                PathTextFilterModel(
+                    path_text=PathTextFilter(query="ryuko"),
+                    order_by=True,
+                    order_direction="asc",
+                    order_priority=100,
+                ),
+                PathTextFilterModel(
+                    path_text=PathTextFilter(query="megumin"),
+                    order_by=True,
+                    order_direction="asc",
+                    order_priority=99,
+                ),
+            ]
+        ),
+    ]
+)
 
-# search_query = SearchQuery(query=example_query)
-# print(build_final_query(search_query).get_sql())
+search_query = SearchQuery(query=example_query)
+print(build_final_query(search_query).get_sql())
 # parameters = QmarkParameter()
 # final_query = build_final_query(search_query)
 # print(final_query.get_sql(parameter=parameters))

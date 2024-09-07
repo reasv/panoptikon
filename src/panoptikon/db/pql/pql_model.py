@@ -240,14 +240,11 @@ QueryElement = Union[
 ]
 
 
-class OrderParams(BaseModel):
+class OrderArgs(BaseModel):
     order_by: OrderByType = "last_modified"
     order: OrderType = None
-    page: int = 1
-    page_size: int = 10
 
 
-# Use model_rebuild for Pydantic v2
 AndOperator.model_rebuild()
 OrOperator.model_rebuild()
 NotOperator.model_rebuild()
@@ -255,7 +252,13 @@ NotOperator.model_rebuild()
 
 class SearchQuery(BaseModel):
     query: Optional[QueryElement] = None
-    order_args: OrderParams = Field(default_factory=OrderParams)
+    order_args: List[OrderArgs] = Field(
+        default_factory=lambda: [
+            OrderArgs(order_by="last_modified", order="desc")
+        ]
+    )
+    page: int = 1
+    page_size: int = 10
     count: bool = True
     check_path: bool = False
 
