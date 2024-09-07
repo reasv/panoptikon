@@ -19,6 +19,7 @@ from panoptikon.db.pql.pql_model import (
     Filter,
     NotOperator,
     Operator,
+    OrderTypeNN,
     OrOperator,
     PathFilterModel,
     PathTextFilter,
@@ -43,7 +44,7 @@ class CTE:
 @dataclass
 class OrderByColumn:
     cte: AliasedQuery
-    direction: OrderType
+    direction: OrderTypeNN
     priority: int = 0
 
 
