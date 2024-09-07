@@ -94,6 +94,7 @@ def path_text_filter(
         wrap_select(context)
         .join(files_path_fts_table)
         .on(context.file_id == files_path_fts_table.rowid)
+        .select(Field("rank").as_("order_rank"))
     )
     if filter.path_text.only_match_filename:
         query = query.where(
@@ -251,25 +252,25 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
 
 
 # Example usage
-# example_query = AndOperator(
-#     and_=[
-#         PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
-#         NotOperator(
-#             not_=PathTextFilterModel(path_text=PathTextFilter(query="example"))
-#         ),
-#         OrOperator(
-#             or_=[
-#                 TypeFilterModel(
-#                     mime_types=["application/pdf", "image/jpeg", "image/png"]
-#                 ),
-#                 TypeFilterModel(mime_types=["text/plain"]),
-#             ]
-#         ),
-#     ]
-# )
+example_query = AndOperator(
+    and_=[
+        PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
+        NotOperator(
+            not_=PathTextFilterModel(path_text=PathTextFilter(query="example"))
+        ),
+        OrOperator(
+            or_=[
+                TypeFilterModel(
+                    mime_types=["application/pdf", "image/jpeg", "image/png"]
+                ),
+                TypeFilterModel(mime_types=["text/plain"]),
+            ]
+        ),
+    ]
+)
 
-# search_query = SearchQuery(query=example_query)
-# parameters = QmarkParameter()
-# final_query = build_final_query(search_query)
-# print(final_query.get_sql(parameter=parameters))
-# print(parameters.get_parameters())
+search_query = SearchQuery(query=example_query)
+parameters = QmarkParameter()
+final_query = build_final_query(search_query)
+print(final_query.get_sql(parameter=parameters))
+print(parameters.get_parameters())
