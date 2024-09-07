@@ -55,7 +55,7 @@ class QueryState:
 def path_in(filter: PathFilterModel, context: Selectable) -> Selectable:
     query = (
         Query.from_(context)
-        .select("file_id")
+        .select("file_id", "item_id")
         .join(files_table)
         .on(files_table.id == context.file_id)
         .where(
@@ -70,11 +70,9 @@ def path_in(filter: PathFilterModel, context: Selectable) -> Selectable:
 def type_in(filter: TypeFilterModel, context: Selectable) -> Selectable:
     query = (
         Query.from_(context)
-        .select("file_id")
-        .join(files_table)
-        .on(files_table.id == context.file_id)
+        .select("file_id", "item_id")
         .join(items_table)
-        .on(files_table.item_id == items_table.id)
+        .on(context.item_id == items_table.id)
         .where(
             Criterion.any(
                 [
@@ -92,7 +90,7 @@ def path_text_filter(
 ) -> Selectable:
     query = (
         Query.from_(context)
-        .select("file_id")
+        .select("file_id", "item_id")
         .join(files_path_fts_table)
         .on(context.file_id == files_path_fts_table.rowid)
     )
@@ -151,27 +149,35 @@ def process_query(
                 q = process_query(sub_element, context, state)
                 # Combine the subqueries using UNION (OR logic)
                 union_query = (
-                    Query.from_(q).select("file_id")
+                    Query.from_(q).select("file_id", "item_id")
                     if union_query is None
-                    else union_query.union(Query.from_(q).select("file_id"))
+                    else union_query.union(
+                        Query.from_(q).select("file_id", "item_id")
+                    )
                 )
             assert union_query is not None, "No subqueries generated"
             cte_name = f"n_{state.cte_counter}_or"
             state.cte_counter += 1
             state.cte_list.append(
-                CTE(Query.from_(union_query).select("file_id"), cte_name)
+                CTE(
+                    Query.from_(union_query).select("file_id", "item_id"),
+                    cte_name,
+                )
             )
             return AliasedQuery(cte_name)
         elif isinstance(el, NotOperator):
             subquery: AliasedQuery = process_query(el.not_, context, state)
+
             not_query = (
                 Query.from_(context)
-                .select("file_id")
-                .except_of(Query.from_(subquery).select("file_id"))
+                .select("file_id", "item_id")
+                .except_of(Query.from_(subquery).select("file_id", "item_id"))
             )
+
             cte_name = f"n_{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
             state.cte_list.append(CTE(not_query, cte_name))
+
             return AliasedQuery(cte_name)
     else:
         raise ValueError("Unknown query element type")
@@ -183,15 +189,15 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
 
     # Start the recursive processing
     initial_select = Query.from_(files_table).select(
-        files_table.id.as_("file_id")
+        files_table.id.as_("file_id"), "item_id"
     )
     if input_query.query:
         root_query = process_query(
-            input_query.query, AliasedQuery("n_0_files"), state
+            input_query.query, AliasedQuery("root_files"), state
         )
 
         # Add all CTEs to the final query
-        final_query: QueryBuilder = Query.with_(initial_select, "n_0_files")
+        final_query: QueryBuilder = Query.with_(initial_select, "root_files")
         for cte in state.cte_list:
             final_query = final_query.with_(cte.query, cte.name)
         assert final_query is not None, "No CTEs generated"
