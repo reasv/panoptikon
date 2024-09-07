@@ -1,15 +1,9 @@
 from dataclasses import dataclass
-from typing import List, final
+from typing import List
 
-from pypika import Table  # Query,
-from pypika import (
-    AliasedQuery,
-    Criterion,
-    Field,
-    Order,
-    QmarkParameter,
-)  # Query,
+from pypika import AliasedQuery, Criterion, Field, Order, QmarkParameter
 from pypika import SQLLiteQuery as Query
+from pypika import Table
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import BasicCriterion, Comparator, Term
 
@@ -288,30 +282,35 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
 
 
 # Example usage
-example_query = AndOperator(
-    and_=[
-        PathFilterModel(in_paths=["/home/user1", "/home/user2", "/home/user3"]),
-        NotOperator(
-            not_=PathTextFilterModel(
-                path_text=PathTextFilter(query="example"),
-                order_by=True,
-                order_direction="desc",
-            )
-        ),
-        OrOperator(
-            or_=[
-                TypeFilterModel(
-                    mime_types=["application/pdf", "image/jpeg", "image/png"]
-                ),
-                TypeFilterModel(mime_types=["text/plain"]),
-            ]
-        ),
-    ]
-)
+# example_query = AndOperator(
+#     and_=[
+#         PathFilterModel(in_paths=[r"Z:\archive\new\archive\42"]),
+#         NotOperator(
+#             not_=TypeFilterModel(mime_types=["image/png"]),
+#         ),
+#         OrOperator(
+#             or_=[
+#                 TypeFilterModel(mime_types=["image/jpeg", "image/png"]),
+#                 PathTextFilterModel(
+#                     path_text=PathTextFilter(query="ryuko"),
+#                     order_by=True,
+#                     order_direction="asc",
+#                     order_priority=100,
+#                 ),
+#                 PathTextFilterModel(
+#                     path_text=PathTextFilter(query="megumin"),
+#                     order_by=True,
+#                     order_direction="asc",
+#                     order_priority=99,
+#                 ),
+#             ]
+#         ),
+#     ]
+# )
 
 # search_query = SearchQuery(query=example_query)
 # print(build_final_query(search_query).get_sql())
-# # parameters = QmarkParameter()
-# # final_query = build_final_query(search_query)
-# # print(final_query.get_sql(parameter=parameters))
-# # print(parameters.get_parameters())
+# parameters = QmarkParameter()
+# final_query = build_final_query(search_query)
+# print(final_query.get_sql(parameter=parameters))
+# print(parameters.get_parameters())
