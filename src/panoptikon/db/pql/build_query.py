@@ -269,8 +269,14 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
     for ospec in full_order_list:
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
+            field = Field(order_by)
             full_query = full_query.orderby(
-                Field(order_by),
+                (
+                    field.isnotnull()
+                    if direction == Order.desc
+                    else field.isnull()
+                ),
+                field,
                 order=direction,
             )
         elif isinstance(ospec, OrderByFilter):
