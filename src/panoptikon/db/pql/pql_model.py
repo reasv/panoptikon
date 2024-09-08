@@ -3,7 +3,17 @@ from typing import List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 OrderByType = Union[
-    Literal["last_modified", "path"],
+    Literal[
+        "last_modified",
+        "path",
+        "type",
+        "size",
+        "filename",
+        "width",
+        "height",
+        "duration",
+        "time_added",
+    ],
     None,
 ]
 
