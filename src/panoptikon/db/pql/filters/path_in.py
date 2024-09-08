@@ -10,7 +10,10 @@ from panoptikon.db.pql.utils import wrap_select
 
 
 class InPaths(Filter):
-    in_paths: List[str] = Field(default_factory=list)
+    in_paths: List[str] = Field(
+        default_factory=list,
+        title="Path must begin with one of the given strings",
+    )
 
     def build_query(self, context: Selectable) -> Selectable:
         paths = self.in_paths

@@ -10,7 +10,10 @@ from panoptikon.db.pql.utils import wrap_select
 
 
 class TypeIn(Filter):
-    type_in: List[str] = Field(default_factory=list)
+    type_in: List[str] = Field(
+        default_factory=list,
+        title="MIME Type must begin with one of the given strings",
+    )
 
     def build_query(self, context: Selectable) -> Selectable:
         mime_types = self.type_in
