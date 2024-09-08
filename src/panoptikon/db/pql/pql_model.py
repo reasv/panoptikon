@@ -1,6 +1,17 @@
 from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+from pypika.queries import Selectable
+
+from panoptikon.db.pql.filters.bookmarks import InBookmarks
+from panoptikon.db.pql.filters.path_in import InPaths
+from panoptikon.db.pql.filters.path_text import MatchPath, MatchPathArgs
+from panoptikon.db.pql.filters.type_in import TypeIn
+from panoptikon.db.pql.utils import (
+    get_order_by_field,
+    get_order_direction_field,
+    get_order_priority_field,
+)
 
 OrderByType = Literal[
     "last_modified",
@@ -20,18 +31,6 @@ OrderTypeNN = Literal["asc", "desc"]
 
 
 # Filter arguments
-class BookmarksFilter(BaseModel):
-    require: bool = True
-    namespaces: List[str] = Field(default_factory=list)
-    sub_ns: bool = False
-    user: str = "user"
-    include_wildcard: bool = True
-
-
-class PathTextFilter(BaseModel):
-    query: str
-    filename_only: bool = False
-    raw_fts5_match: bool = True
 
 
 class ExtractedTextFilter(BaseModel):
@@ -69,7 +68,7 @@ class ImageEmbeddingFilter(BaseModel):
 
 
 class AnyTextFilter(BaseModel):
-    path_text: Union[PathTextFilter, None] = None
+    path_text: Union[MatchPathArgs, None] = None
     extracted_text: Union[ExtractedTextFilter, None] = None
 
 
@@ -89,40 +88,8 @@ class KVInFilter(BaseModel):
 
 # Define filters
 class Filter(BaseModel):
-    pass
-
-
-def get_order_by_field(default: bool):
-    return Field(
-        default=default,
-        title="Order by this filter's rank output",
-        description="This filter generates a value that can be used for ordering.",
-    )
-
-
-def get_order_direction_field(default: OrderTypeNN):
-    return Field(
-        default=default,
-        title="Order Direction",
-        description="""
-The order direction for this filter.
-If not set, the default order direction for this field is used.
-""",
-    )
-
-
-def get_order_priority_field(default: int):
-    return Field(
-        default=default,
-        title="Order By Priority",
-        description="""
-The priority of this filter in the order by clause.
-If there are multiple filters with order_by set to True,
-the priority is used to determine the order.
-If two filter order bys have the same priority,
-their values are coalesced into a single column to order by
-""",
-    )
+    def build_query(self, context: Selectable) -> Selectable:
+        raise NotImplementedError("build_query not implemented")
 
 
 class SortableFilter(Filter):
@@ -167,18 +134,6 @@ class TagFilterModel(Filter):
     tags: TagFilter
 
 
-class BookmarksFilterModel(SortableFilter):
-    order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("desc")
-    bookmarks: BookmarksFilter
-
-
-class PathTextFilterModel(SortableFilter):
-    order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("desc")
-    path_text: PathTextFilter
-
-
 class ExtractedTextFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(False)
     order_direction: OrderTypeNN = get_order_direction_field("asc")
@@ -205,14 +160,6 @@ class AnyTextFilterModel(SortableFilter):
     any_text: AnyTextFilter
 
 
-class PathFilterModel(Filter):
-    in_paths: List[str] = Field(default_factory=list)
-
-
-class TypeFilterModel(Filter):
-    mime_types: List[str] = Field(default_factory=list)
-
-
 class Operator(BaseModel):
     pass
 
@@ -231,31 +178,14 @@ class NotOperator(Operator):
 
 
 Filters = Union[
-    BookmarksFilterModel,
-    PathTextFilterModel,
-    ExtractedTextFilterModel,
-    ExtractedTextEmbeddingsFilterModel,
-    ImageEmbeddingFilterModel,
-    TagFilterModel,
-    AnyTextFilterModel,
-    PathFilterModel,
-    TypeFilterModel,
-    EqualsFilterModel,
-    NotEqualsFilterModel,
-    InFilterModel,
-    NotInFilterModel,
-    GreaterThanFilterModel,
-    GreaterThanOrEqualFilterModel,
-    LessThanFilterModel,
-    LessThanOrEqualFilterModel,
+    InPaths,
+    InBookmarks,
+    TypeIn,
+    MatchPath,
 ]
 
-QueryElement = Union[
-    Filters,
-    AndOperator,
-    OrOperator,
-    NotOperator,
-]
+Operators = Union[AndOperator, OrOperator, NotOperator]
+QueryElement = Union[Filters, Operators]
 
 
 class OrderArgs(BaseModel):

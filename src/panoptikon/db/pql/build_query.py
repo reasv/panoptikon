@@ -14,14 +14,8 @@ from panoptikon.db.pql.pql_model import (
     SearchQuery,
     SortableFilter,
 )
-from panoptikon.db.pql.utils import (
-    CTE,
-    OrderByFilter,
-    QueryState,
-    files_table,
-    items_table,
-    wrap_select,
-)
+from panoptikon.db.pql.tables import files, items
+from panoptikon.db.pql.utils import CTE, OrderByFilter, QueryState, wrap_select
 
 
 def build_query(input_query: SearchQuery) -> QueryBuilder:
@@ -30,13 +24,13 @@ def build_query(input_query: SearchQuery) -> QueryBuilder:
 
     # Start the recursive processing
     initial_select = (
-        Query.from_(files_table)
-        .join(items_table)
-        .on(files_table.item_id == items_table.id)
+        Query.from_(files)
+        .join(items)
+        .on(files.item_id == items.id)
         .select(
-            files_table.id.as_("file_id"),
+            files.id.as_("file_id"),
             "item_id",
-            files_table.sha256.as_("sha256"),
+            files.sha256.as_("sha256"),
         )
     )
     if input_query.query:
@@ -52,31 +46,31 @@ def build_query(input_query: SearchQuery) -> QueryBuilder:
 
         full_query = (
             full_query.from_(root_cte)
-            .join(files_table)
-            .on(files_table.id == root_cte.file_id)
-            .join(items_table)
-            .on(root_cte.item_id == items_table.id)
+            .join(files)
+            .on(files.id == root_cte.file_id)
+            .join(items)
+            .on(root_cte.item_id == items.id)
             .select(
                 root_cte.file_id,
                 root_cte.item_id,
                 root_cte.sha256,
-                files_table.path,
-                files_table.last_modified,
-                items_table.type,
+                files.path,
+                files.last_modified,
+                items.type,
             )
         )
     else:
         full_query = (
-            Query.from_(files_table)
-            .join(items_table)
-            .on(files_table.item_id == items_table.id)
+            Query.from_(files)
+            .join(items)
+            .on(files.item_id == items.id)
             .select(
-                files_table.id.as_("file_id"),
+                files.id.as_("file_id"),
                 "item_id",
-                files_table.sha256.as_("sha256"),
-                files_table.path,
-                files_table.last_modified,
-                items_table.type,
+                files.sha256.as_("sha256"),
+                files.path,
+                files.last_modified,
+                items.type,
             )
         )
 
