@@ -340,7 +340,6 @@ def group_order_list(
 
         if (
             is_order_by_filter
-            and priority > 0
             and len(group_list) > 1
             and all(isinstance(obj, OrderByFilter) for obj in group_list)
         ):
