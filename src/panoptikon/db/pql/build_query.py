@@ -117,22 +117,18 @@ def path_text_filter(
         .on(context.file_id == files_path_fts_table.rowid)
         .select(Field("rank").as_("order_rank"))
     )
-    if filter.path_text.filename_only:
-        query = query.where(
-            BasicCriterion(
-                Match.match_,
-                files_path_fts_table.filename,
-                Term.wrap_constant(filter.path_text.query),  # type: ignore
-            )
+    column = (
+        files_path_fts_table.filename
+        if filter.path_text.filename_only
+        else files_path_fts_table.path
+    )
+    query = query.where(
+        BasicCriterion(
+            Match.match_,
+            column,
+            Term.wrap_constant(filter.path_text.query),  # type: ignore
         )
-    else:
-        query = query.where(
-            BasicCriterion(
-                Match.match_,
-                files_path_fts_table.path,
-                Term.wrap_constant(filter.path_text.query),  # type: ignore
-            )
-        )
+    )
     return query
 
 

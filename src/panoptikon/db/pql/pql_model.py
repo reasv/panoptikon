@@ -293,19 +293,3 @@ Results can be ordered by multiple fields by adding multiple objects.
     page_size: int = 10
     count: bool = True
     check_path: bool = False
-
-
-# # Example usage
-# example_query = AndOperator(
-#     and_=[
-#         BookmarksFilterModel(
-#             bookmarks=BookmarksFilter(namespaces=["namespace1"])
-#         ),
-#         NotOperator(
-#             not_=PathTextFilterModel(path_text=PathTextFilter(query="example"))
-#         ),
-#     ]
-# )
-
-# model_dict = example_query.model_dump_json(indent=2)
-# print(model_dict)
