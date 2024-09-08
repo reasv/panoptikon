@@ -1,17 +1,8 @@
-from dataclasses import dataclass
-from itertools import groupby
-from typing import List, Tuple, Union
+from pypika import Criterion, Table
+from pypika.queries import Selectable
 
-from pypika import AliasedQuery, Case, Criterion, Field, Order, QmarkParameter
-from pypika import SQLLiteQuery as Query
-from pypika import Table
-from pypika import functions as fn
-from pypika.functions import Function
-from pypika.queries import QueryBuilder, Selectable
-from pypika.terms import BasicCriterion, Comparator, Term
-
-from panoptikon.db.pql.build_query import wrap_select
 from panoptikon.db.pql.pql_model import BookmarksFilterModel
+from panoptikon.db.pql.utils import wrap_select
 
 bookmarks = Table("bookmarks")
 
