@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from itertools import groupby
+from typing import List, Tuple, Union
 
-from pypika import AliasedQuery, Criterion, Field, Order, QmarkParameter
+from pypika import AliasedQuery, Case, Criterion, Field, Order, QmarkParameter
 from pypika import SQLLiteQuery as Query
 from pypika import Table
+from pypika import functions as fn
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import BasicCriterion, Comparator, Term
 
@@ -245,8 +247,6 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
                 items_table.type,
             )
         )
-    # Sort order_list by priority
-    state.order_list.sort(key=lambda x: x.priority, reverse=True)
 
     full_order_list = combine_order_lists(
         state.order_list, input_query.order_args
@@ -274,6 +274,29 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
                     order=direction,
                 )
             )
+        elif isinstance(ospec, list):
+            assert all(
+                isinstance(f, OrderByFilter) for f in ospec
+            ), "Received non-OrderByFilter in list"
+
+            coalesced_column = None  # Initialize variable for coalesced column
+
+            for spec in ospec:
+                full_query = full_query.left_join(spec.cte).on_field("file_id")
+                if coalesced_column is None:
+                    coalesced_column = spec.cte.order_rank
+                else:
+                    coalesced_column = fn.Coalesce(
+                        coalesced_column, spec.cte.order_rank
+                    )
+
+            # Apply the order by the coalesced rank column
+            direction = Order.asc if ospec[0].direction == "asc" else Order.desc
+            full_query = full_query.orderby(
+                coalesced_column,
+                order=direction,
+                nulls_last=True,  # Ensures NULLs come last for ascending
+            )
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size
@@ -284,7 +307,7 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
 
 def combine_order_lists(
     order_list: List[OrderByFilter], order_args: List[OrderArgs]
-) -> List[OrderArgs | OrderByFilter]:
+) -> List[Union[OrderArgs, OrderByFilter, List[OrderByFilter]]]:
 
     # order_list has priority over order_args by default
     combined = [(obj, idx, 0) for idx, obj in enumerate(order_list)] + [
@@ -296,7 +319,38 @@ def combine_order_lists(
         combined, key=lambda x: (-x[0].priority, x[2], x[1])
     )
     final_order = [item[0] for item in sorted_combined]
-    return final_order
+    return group_order_list(final_order)
+
+
+# Assuming OrderArgs and OrderByFilter are defined elsewhere
+def group_order_list(
+    final_order: list[Union[OrderArgs, OrderByFilter]]
+) -> List[Union[OrderArgs, OrderByFilter, List[OrderByFilter]]]:
+    # Group elements from final_order by their priority if they are OrderByFilter
+    grouped_order: List[
+        Union[OrderArgs, OrderByFilter, List[OrderByFilter]]
+    ] = []
+
+    for key, group in groupby(
+        final_order,
+        key=lambda obj: (obj.priority, isinstance(obj, OrderByFilter)),
+    ):
+        group_list = list(group)
+        priority, is_order_by_filter = key
+
+        if (
+            is_order_by_filter
+            and priority > 0
+            and len(group_list) > 1
+            and all(isinstance(obj, OrderByFilter) for obj in group_list)
+        ):
+            grouped_order.append(
+                group_list  # type: ignore
+            )  # group_list is List[OrderByFilter]
+        else:
+            grouped_order.extend(group_list)
+
+    return grouped_order
 
 
 def get_order_by_and_direction(order_args: OrderArgs) -> Tuple[str, Order]:
@@ -334,7 +388,13 @@ example_query = AndOperator(
                     path_text=PathTextFilter(query="megumin"),
                     order_by=True,
                     order_direction="asc",
-                    order_priority=99,
+                    order_priority=100,
+                ),
+                PathTextFilterModel(
+                    path_text=PathTextFilter(query="bebe"),
+                    order_by=True,
+                    order_direction="asc",
+                    order_priority=100,
                 ),
             ]
         ),
