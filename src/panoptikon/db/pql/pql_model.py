@@ -23,6 +23,7 @@ OrderTypeNN = Literal["asc", "desc"]
 class BookmarksFilter(BaseModel):
     require: bool = True
     namespaces: List[str] = Field(default_factory=list)
+    sub_ns: bool = False
     user: str = "user"
     include_wildcard: bool = True
 

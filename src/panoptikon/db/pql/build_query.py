@@ -10,8 +10,6 @@ from pypika.functions import Function
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import BasicCriterion, Comparator, Term
 
-from panoptikon.db.search.types import OrderType
-
 VERY_LARGE_NUMBER = 9223372036854775805
 VERY_SMALL_NUMBER = -9223372036854775805
 
@@ -74,7 +72,7 @@ class QueryState:
 
 
 def wrap_select(selectable: Selectable) -> QueryBuilder:
-    return Query.from_(selectable).select("file_id", "item_id")
+    return Query.from_(selectable).select("file_id", "item_id", "sha256")
 
 
 def path_in(filter: PathFilterModel, context: Selectable) -> Selectable:
@@ -148,7 +146,7 @@ def filter_function(filter: Filter, context: Selectable, state: QueryState):
     return AliasedQuery(cte_name)
 
 
-def process_query(
+def process_query_element(
     el: QueryElement, context: Selectable, state: QueryState
 ) -> AliasedQuery:
     # Process primitive filters
@@ -167,7 +165,7 @@ def process_query(
     elif isinstance(el, Operator):
         if isinstance(el, AndOperator):
             for sub_element in el.and_:
-                context = process_query(sub_element, context, state)
+                context = process_query_element(sub_element, context, state)
             cte_name = f"n_{state.cte_counter}_and"
             state.cte_counter += 1
             state.cte_list.append(CTE(wrap_select(context), cte_name))
@@ -175,7 +173,7 @@ def process_query(
         elif isinstance(el, OrOperator):
             union_query = None
             for sub_element in el.or_:
-                q = process_query(sub_element, context, state)
+                q = process_query_element(sub_element, context, state)
                 # Combine the subqueries using UNION (OR logic)
                 union_query = (
                     wrap_select(q)
@@ -193,7 +191,9 @@ def process_query(
             )
             return AliasedQuery(cte_name)
         elif isinstance(el, NotOperator):
-            subquery: AliasedQuery = process_query(el.not_, context, state)
+            subquery: AliasedQuery = process_query_element(
+                el.not_, context, state
+            )
 
             not_query = wrap_select(
                 wrap_select(context).except_of(wrap_select(subquery))
@@ -208,7 +208,7 @@ def process_query(
         raise ValueError("Unknown query element type")
 
 
-def build_final_query(input_query: SearchQuery) -> QueryBuilder:
+def build_query(input_query: SearchQuery) -> QueryBuilder:
     # Initialize the state object
     state = QueryState()
 
@@ -217,10 +217,14 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
         Query.from_(files_table)
         .join(items_table)
         .on(files_table.item_id == items_table.id)
-        .select(files_table.id.as_("file_id"), "item_id")
+        .select(
+            files_table.id.as_("file_id"),
+            "item_id",
+            files_table.sha256.as_("sha256"),
+        )
     )
     if input_query.query:
-        root_cte = process_query(
+        root_cte = process_query_element(
             input_query.query, AliasedQuery("root_files"), state
         )
 
@@ -239,6 +243,7 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
             .select(
                 root_cte.file_id,
                 root_cte.item_id,
+                root_cte.sha256,
                 files_table.path,
                 files_table.last_modified,
                 items_table.type,
@@ -252,6 +257,7 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
             .select(
                 files_table.id.as_("file_id"),
                 "item_id",
+                files_table.sha256.as_("sha256"),
                 files_table.path,
                 files_table.last_modified,
                 items_table.type,
