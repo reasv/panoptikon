@@ -4,18 +4,14 @@ from pypika import AliasedQuery
 from pypika.queries import Selectable
 
 from panoptikon.db.pql.filters.bookmarks import InBookmarks, InBookmarksArgs
+from panoptikon.db.pql.filters.extracted_text import MatchText, MatchTextArgs
 from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.path_text import MatchPath, MatchPathArgs
 from panoptikon.db.pql.filters.type_in import TypeIn
 from panoptikon.db.pql.types import Filter
 from panoptikon.db.pql.utils import CTE, QueryState
 
-Filters = Union[
-    InPaths,
-    InBookmarks,
-    TypeIn,
-    MatchPath,
-]
+Filters = Union[InPaths, InBookmarks, TypeIn, MatchPath, MatchText]
 
 
 def filter_function(filter: Filter, context: Selectable, state: QueryState):

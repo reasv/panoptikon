@@ -64,16 +64,6 @@ class SortableFilter(Filter):
     order_priority: int = get_order_priority_field(0)
 
 
-# # Filter arguments
-# class ExtractedTextFilter(BaseModel):
-#     query: str
-#     targets: List[str] = Field(default_factory=list)
-#     languages: List[str] = Field(default_factory=list)
-#     language_min_confidence: Optional[float] = None
-#     min_confidence: Optional[float] = None
-#     raw_fts5_match: bool = True
-
-
 # class ExtractedTextEmbeddingsFilter(BaseModel):
 #     query: bytes
 #     model: str
