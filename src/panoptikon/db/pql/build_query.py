@@ -6,15 +6,14 @@ from panoptikon.db.pql.filters import filter_function
 from panoptikon.db.pql.order_by import build_order_by
 from panoptikon.db.pql.pql_model import (
     AndOperator,
-    Filter,
     NotOperator,
     Operator,
     OrOperator,
     QueryElement,
     SearchQuery,
-    SortableFilter,
 )
 from panoptikon.db.pql.tables import files, items
+from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import CTE, OrderByFilter, QueryState, wrap_select
 
 

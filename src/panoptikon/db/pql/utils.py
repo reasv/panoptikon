@@ -4,7 +4,6 @@ from typing import List
 from pydantic import Field
 from pypika import AliasedQuery
 from pypika import SQLLiteQuery as Query
-from pypika import Table
 from pypika.functions import Function
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import Comparator
@@ -52,36 +51,3 @@ class QueryState:
         self.order_list: List[OrderByFilter] = []  # Holds order_by clauses
         self.cte_counter = 0  # Counter to generate unique CTE names
         self.root_query = None  # The main query that uses CTE names
-
-
-def get_order_by_field(default: bool):
-    return Field(
-        default=default,
-        title="Order by this filter's rank output",
-        description="This filter generates a value that can be used for ordering.",
-    )
-
-
-def get_order_direction_field(default: OrderTypeNN):
-    return Field(
-        default=default,
-        title="Order Direction",
-        description="""
-The order direction for this filter.
-If not set, the default order direction for this field is used.
-""",
-    )
-
-
-def get_order_priority_field(default: int):
-    return Field(
-        default=default,
-        title="Order By Priority",
-        description="""
-The priority of this filter in the order by clause.
-If there are multiple filters with order_by set to True,
-the priority is used to determine the order.
-If two filter order bys have the same priority,
-their values are coalesced into a single column to order by
-""",
-    )

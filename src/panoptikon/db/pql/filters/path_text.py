@@ -3,15 +3,14 @@ from pypika import Field
 from pypika.queries import Selectable
 from pypika.terms import BasicCriterion, Term
 
-from panoptikon.db.pql.pql_model import SortableFilter
 from panoptikon.db.pql.tables import files_path_fts
-from panoptikon.db.pql.types import OrderTypeNN
-from panoptikon.db.pql.utils import (
-    Match,
+from panoptikon.db.pql.types import (
+    OrderTypeNN,
+    SortableFilter,
     get_order_by_field,
     get_order_direction_field,
-    wrap_select,
 )
+from panoptikon.db.pql.utils import Match, wrap_select
 
 
 class MatchPathArgs(BaseModel):

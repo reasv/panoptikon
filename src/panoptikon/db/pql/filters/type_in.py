@@ -4,8 +4,8 @@ from pydantic import Field
 from pypika import Criterion
 from pypika.queries import Selectable
 
-from panoptikon.db.pql.pql_model import Filter
 from panoptikon.db.pql.tables import items
+from panoptikon.db.pql.types import Filter
 from panoptikon.db.pql.utils import wrap_select
 
 
