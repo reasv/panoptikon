@@ -170,7 +170,7 @@ class ExtractedTextFilterModel(SortableFilter):
 class ExtractedTextEmbeddingsFilterModel(SortableFilter):
     order_by: bool = get_order_by_field(True)
     order_direction: OrderTypeNN = get_order_direction_field("asc")
-    order_priority: int = get_order_priority_field(105)
+    order_priority: int = get_order_priority_field(100)
     extracted_text_embeddings: ExtractedTextEmbeddingsFilter
 
 
