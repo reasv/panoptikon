@@ -48,7 +48,11 @@ If empty, all bookmarks will be included.
 class InBookmarks(SortableFilter):
     order_by: bool = get_order_by_field(False)
     order_direction: OrderTypeNN = get_order_direction_field("desc")
-    in_bookmarks: InBookmarksArgs
+    in_bookmarks: InBookmarksArgs = Field(
+        ...,
+        title="Restrict search to Bookmarks",
+        description="Only include items that are bookmarked.",
+    )
 
     def build_query(self, context: Selectable) -> Selectable:
         args = self.in_bookmarks
