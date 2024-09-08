@@ -15,11 +15,34 @@ from panoptikon.db.pql.utils import wrap_select
 
 
 class InBookmarksArgs(BaseModel):
-    enable: bool = True
-    namespaces: List[str] = Field(default_factory=list)
-    sub_ns: bool = False
+    enable: bool = Field(
+        default=True,
+        title="Enable the filter",
+        description="""
+Must be set to True, this option only exists to make sure the filter is not empty,
+given that that all fields are optional.
+""",
+    )
+    namespaces: List[str] = Field(
+        default_factory=list,
+        title="Bookmark Namespaces",
+        description="""
+List of bookmark namespaces to filter by. If sub_ns is set to True, the filter will also
+include all sub-namespaces of the given namespaces (ie, namespace.*).
+If empty, all bookmarks will be included.
+""",
+    )
+    sub_ns: bool = Field(
+        default=False,
+        title="Include Sub-namespaces",
+        description="Include all sub-namespaces of the given namespaces (namespace.*).",
+    )
     user: str = "user"
-    include_wildcard: bool = True
+    include_wildcard: bool = Field(
+        default=True,
+        title="Include Wildcard User",
+        description="Include bookmarks set to the wildcard user ('*').",
+    )
 
 
 class InBookmarks(SortableFilter):
