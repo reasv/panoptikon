@@ -2,20 +2,18 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
-OrderByType = Union[
-    Literal[
-        "last_modified",
-        "path",
-        "type",
-        "size",
-        "filename",
-        "width",
-        "height",
-        "duration",
-        "time_added",
-    ],
-    None,
+OrderByType = Literal[
+    "last_modified",
+    "path",
+    "type",
+    "size",
+    "filename",
+    "width",
+    "height",
+    "duration",
+    "time_added",
 ]
+
 
 OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
