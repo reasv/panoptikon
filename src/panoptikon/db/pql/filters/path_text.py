@@ -3,8 +3,9 @@ from pypika import Field
 from pypika.queries import Selectable
 from pypika.terms import BasicCriterion, Term
 
-from panoptikon.db.pql.pql_model import OrderTypeNN, SortableFilter
+from panoptikon.db.pql.pql_model import SortableFilter
 from panoptikon.db.pql.tables import files_path_fts
+from panoptikon.db.pql.types import OrderTypeNN
 from panoptikon.db.pql.utils import (
     Match,
     get_order_by_field,

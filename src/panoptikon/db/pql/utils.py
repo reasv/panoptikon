@@ -9,7 +9,7 @@ from pypika.functions import Function
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import Comparator
 
-from panoptikon.db.pql.pql_model import OrderTypeNN
+from panoptikon.db.pql.types import OrderTypeNN
 
 VERY_LARGE_NUMBER = 9223372036854775805
 VERY_SMALL_NUMBER = -9223372036854775805

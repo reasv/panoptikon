@@ -4,8 +4,9 @@ from pydantic import BaseModel, Field
 from pypika import Criterion
 from pypika.queries import Selectable
 
-from panoptikon.db.pql.pql_model import OrderTypeNN, SortableFilter
+from panoptikon.db.pql.pql_model import SortableFilter
 from panoptikon.db.pql.tables import bookmarks
+from panoptikon.db.pql.types import OrderTypeNN
 from panoptikon.db.pql.utils import (
     get_order_by_field,
     get_order_direction_field,
@@ -14,7 +15,7 @@ from panoptikon.db.pql.utils import (
 
 
 class InBookmarksArgs(BaseModel):
-    require: bool = True
+    enable: bool = True
     namespaces: List[str] = Field(default_factory=list)
     sub_ns: bool = False
     user: str = "user"

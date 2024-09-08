@@ -7,32 +7,15 @@ from panoptikon.db.pql.filters.bookmarks import InBookmarks
 from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.path_text import MatchPath, MatchPathArgs
 from panoptikon.db.pql.filters.type_in import TypeIn
+from panoptikon.db.pql.types import OrderByType, OrderType, OrderTypeNN
 from panoptikon.db.pql.utils import (
     get_order_by_field,
     get_order_direction_field,
     get_order_priority_field,
 )
 
-OrderByType = Literal[
-    "last_modified",
-    "path",
-    "type",
-    "size",
-    "filename",
-    "width",
-    "height",
-    "duration",
-    "time_added",
-]
-
-
-OrderType = Union[Literal["asc", "desc"], None]
-OrderTypeNN = Literal["asc", "desc"]
-
 
 # Filter arguments
-
-
 class ExtractedTextFilter(BaseModel):
     query: str
     targets: List[str] = Field(default_factory=list)
