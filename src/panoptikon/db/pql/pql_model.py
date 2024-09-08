@@ -23,7 +23,7 @@ OrderTypeNN = Literal["asc", "desc"]
 
 # Filter arguments
 class BookmarksFilter(BaseModel):
-    enable: bool = True
+    require: bool = True
     namespaces: List[str] = Field(default_factory=list)
     user: str = "user"
     include_wildcard: bool = True
@@ -31,7 +31,7 @@ class BookmarksFilter(BaseModel):
 
 class PathTextFilter(BaseModel):
     query: str
-    only_match_filename: bool = False
+    filename_only: bool = False
     raw_fts5_match: bool = True
 
 
@@ -105,7 +105,10 @@ def get_order_direction_field(default: OrderTypeNN):
     return Field(
         default=default,
         title="Order Direction",
-        description="The order direction for this filter. If not set, the default order direction is used",
+        description="""
+The order direction for this filter.
+If not set, the default order direction for this field is used.
+""",
     )
 
 
@@ -113,7 +116,13 @@ def get_order_priority_field(default: int):
     return Field(
         default=default,
         title="Order By Priority",
-        description="The priority of this filter in the order by clause. If there are multiple filters with order_by set to True, the priority is used to determine the order.",
+        description="""
+The priority of this filter in the order by clause.
+If there are multiple filters with order_by set to True,
+the priority is used to determine the order.
+If two filter order bys have the same priority,
+their values are coalesced into a single column to order by
+""",
     )
 
 
@@ -253,7 +262,15 @@ QueryElement = Union[
 class OrderArgs(BaseModel):
     order_by: OrderByType = "last_modified"
     order: OrderType = None
-    priority: int = 0
+    priority: int = Field(
+        default=0,
+        title="Order Priority",
+        description="""
+The priority of this order by field. If multiple fields are ordered by,
+the priority is used to determine the order they are applied in.
+The order in the list is used if the priority is the same.
+""",
+    )
 
 
 AndOperator.model_rebuild()
@@ -266,7 +283,13 @@ class SearchQuery(BaseModel):
     order_args: List[OrderArgs] = Field(
         default_factory=lambda: [
             OrderArgs(order_by="last_modified", order="desc")
-        ]
+        ],
+        title="Values to order results by",
+        description="""
+The order_args field is a list of { order_by: [field name], order: ["asc" or "desc"] }
+objects that define how the results should be ordered.
+Results can be ordered by multiple fields by adding multiple objects.
+        """,
     )
     page: int = 1
     page_size: int = 10
