@@ -32,6 +32,7 @@ alembic = "^1.13.2"
 fastapi-proxy-lib = "^0.1.0"
 nodejs-wheel = "^20.17.0"
 pypika = { git = "https://github.com/reasv/pypika.git" }
+sqlalchemy = "^2.0.34"
 
 [tool.poetry.group.inference]
 optional = true
