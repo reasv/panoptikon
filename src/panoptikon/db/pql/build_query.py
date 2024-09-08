@@ -6,10 +6,24 @@ from pypika import AliasedQuery, Case, Criterion, Field, Order, QmarkParameter
 from pypika import SQLLiteQuery as Query
 from pypika import Table
 from pypika import functions as fn
+from pypika.functions import Function
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import BasicCriterion, Comparator, Term
 
 from panoptikon.db.search.types import OrderType
+
+VERY_LARGE_NUMBER = 9223372036854775805
+VERY_SMALL_NUMBER = -9223372036854775805
+
+
+class Max(Function):
+    def __init__(self, term, *default_values, **kwargs):
+        super(Max, self).__init__("MAX", term, *default_values, **kwargs)
+
+
+class Min(Function):
+    def __init__(self, term, *default_values, **kwargs):
+        super(Min, self).__init__("MIN", term, *default_values, **kwargs)
 
 
 class Match(Comparator):
@@ -275,27 +289,35 @@ def build_final_query(input_query: SearchQuery) -> QueryBuilder:
                 )
             )
         elif isinstance(ospec, list):
-            assert all(
-                isinstance(f, OrderByFilter) for f in ospec
-            ), "Received non-OrderByFilter in list"
-
-            coalesced_column = None  # Initialize variable for coalesced column
+            # Coalesce filter order by columns with the same priority
+            columns = []  # Initialize variable for coalesced column
+            direction = Order.asc if ospec[0].direction == "asc" else Order.desc
 
             for spec in ospec:
+                assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
                 full_query = full_query.left_join(spec.cte).on_field("file_id")
-                if coalesced_column is None:
-                    coalesced_column = spec.cte.order_rank
-                else:
-                    coalesced_column = fn.Coalesce(
-                        coalesced_column, spec.cte.order_rank
-                    )
+                columns.append(spec.cte.order_rank)
 
-            # Apply the order by the coalesced rank column
-            direction = Order.asc if ospec[0].direction == "asc" else Order.desc
+            # For ascending order, use MIN to get the smallest non-null value
+            if direction == Order.asc:
+                coalesced_column = Min(
+                    *[
+                        fn.Coalesce(column, VERY_LARGE_NUMBER)
+                        for column in columns
+                    ]
+                )
+            # For descending order, use MAX to get the largest non-null value
+            else:
+                coalesced_column = Max(
+                    *[
+                        fn.Coalesce(column, VERY_SMALL_NUMBER)
+                        for column in columns
+                    ]
+                )
+
             full_query = full_query.orderby(
                 coalesced_column,
                 order=direction,
-                nulls_last=True,  # Ensures NULLs come last for ascending
             )
 
     page = max(input_query.page, 1)
@@ -365,44 +387,3 @@ def get_order_by_and_direction(order_args: OrderArgs) -> Tuple[str, Order]:
     else:
         direction = Order.asc if direction == "asc" else Order.desc
     return (order_by, direction)
-
-
-# Example usage
-example_query = AndOperator(
-    and_=[
-        PathFilterModel(in_paths=[r"Z:\archive\new\archive\42"]),
-        NotOperator(
-            not_=TypeFilterModel(mime_types=["image/png"]),
-        ),
-        OrOperator(
-            or_=[
-                TypeFilterModel(mime_types=["image/jpeg", "image/png"]),
-                PathTextFilterModel(
-                    path_text=PathTextFilter(query="ryuko"),
-                    order_by=True,
-                    order_direction="asc",
-                    order_priority=100,
-                ),
-                PathTextFilterModel(
-                    path_text=PathTextFilter(query="megumin"),
-                    order_by=True,
-                    order_direction="asc",
-                    order_priority=100,
-                ),
-                PathTextFilterModel(
-                    path_text=PathTextFilter(query="bebe"),
-                    order_by=True,
-                    order_direction="asc",
-                    order_priority=100,
-                ),
-            ]
-        ),
-    ]
-)
-
-search_query = SearchQuery(query=example_query)
-print(build_final_query(search_query).get_sql())
-# parameters = QmarkParameter()
-# final_query = build_final_query(search_query)
-# print(final_query.get_sql(parameter=parameters))
-# print(parameters.get_parameters())
