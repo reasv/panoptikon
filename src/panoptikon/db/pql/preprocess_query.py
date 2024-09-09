@@ -33,6 +33,8 @@ def preprocess_query(el: QueryElement) -> QueryElement | None:
                     element_list.append(subquery)
             if not element_list:
                 return None
+            if len(element_list) == 1:
+                return element_list[0]
             return AndOperator(and_=element_list)
 
         elif isinstance(el, OrOperator):
@@ -43,6 +45,8 @@ def preprocess_query(el: QueryElement) -> QueryElement | None:
                     element_list.append(subq)
             if not element_list:
                 return None
+            if len(element_list) == 1:
+                return element_list[0]
             return OrOperator(or_=element_list)
 
         elif isinstance(el, NotOperator):
