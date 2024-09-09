@@ -50,9 +50,9 @@ def build_query(input_query: SearchQuery) -> Select:
         ).join(items, items.c.id == files.c.item_id)
 
     # Add order by clauses
-    # full_query = build_order_by(
-    #     full_query, state.order_list, input_query.order_args
-    # )
+    full_query = build_order_by(
+        full_query, state.order_list, input_query.order_args
+    )
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size

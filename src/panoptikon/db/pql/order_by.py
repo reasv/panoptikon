@@ -1,22 +1,28 @@
 from itertools import groupby
-from typing import List, Tuple, Union
+from typing import List, Tuple, Type, Union
 
-from pypika import Field, Order
-from pypika import functions as fn
-from pypika.queries import QueryBuilder
+from sqlalchemy import (
+    Select,
+    asc,
+    desc,
+    func,
+    literal,
+    literal_column,
+    nulls_last,
+    text,
+)
 
 from panoptikon.db.pql.pql_model import OrderArgs
+from panoptikon.db.pql.tables import files
 from panoptikon.db.pql.utils import (
     VERY_LARGE_NUMBER,
     VERY_SMALL_NUMBER,
-    Max,
-    Min,
     OrderByFilter,
 )
 
 
 def build_order_by(
-    query: QueryBuilder,
+    query: Select,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
@@ -25,61 +31,46 @@ def build_order_by(
     for ospec in full_order_list:
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
-            field = Field(order_by)
-            query = query.orderby(
-                (
-                    field.isnotnull()
-                    if direction == Order.desc
-                    else field.isnull()
-                ),
-                field,
-                order=direction,
-            )
+            field = literal_column(order_by)
+            query = query.order_by(nulls_last(direction(field)))
         elif isinstance(ospec, OrderByFilter):
-            direction = Order.asc if ospec.direction == "asc" else Order.desc
-            query = (
-                query.left_join(ospec.cte)
-                .on_field("file_id")
-                .orderby(
-                    (  # Ensure that NULL values are at the end
-                        ospec.cte.order_rank.isnotnull()
-                        if direction == Order.desc
-                        else ospec.cte.order_rank.isnull()
-                    ),
-                    ospec.cte.order_rank,
-                    order=direction,
-                )
-            )
+            direction = asc if ospec.direction == "asc" else desc
+            field = ospec.cte.c.order_rank
+            query = query.join(
+                ospec.cte,
+                ospec.cte.c.file_id == files.c.id,
+                isouter=True,
+            ).order_by(nulls_last(direction(field)))
         elif isinstance(ospec, list):
             # Coalesce filter order by columns with the same priority
             columns = []  # Initialize variable for coalesced column
-            direction = Order.asc if ospec[0].direction == "asc" else Order.desc
+            direction = asc if ospec[0].direction == "asc" else desc
 
             for spec in ospec:
                 assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
-                query = query.left_join(spec.cte).on_field("file_id")
-                columns.append(spec.cte.order_rank)
+                query = query.join(
+                    spec.cte,
+                    spec.cte.c.file_id == files.c.id,
+                )
+                columns.append(spec.cte.c.order_rank)
 
             # For ascending order, use MIN to get the smallest non-null value
-            if direction == Order.asc:
-                coalesced_column = Min(
+            if direction == asc:
+                coalesced_column = func.min(
                     *[
-                        fn.Coalesce(column, VERY_LARGE_NUMBER)
+                        func.coalesce(column, literal(VERY_LARGE_NUMBER))
                         for column in columns
                     ]
                 )
             # For descending order, use MAX to get the largest non-null value
             else:
-                coalesced_column = Max(
+                coalesced_column = func.max(
                     *[
-                        fn.Coalesce(column, VERY_SMALL_NUMBER)
+                        func.coalesce(column, literal(VERY_SMALL_NUMBER))
                         for column in columns
                     ]
                 )
-            query = query.orderby(
-                coalesced_column,
-                order=direction,
-            )
+            query = query.order_by(direction(coalesced_column))
     return query
 
 
@@ -130,16 +121,18 @@ def group_order_list(
     return grouped_order
 
 
-def get_order_by_and_direction(order_args: OrderArgs) -> Tuple[str, Order]:
+def get_order_by_and_direction(
+    order_args: OrderArgs,
+) -> Tuple[str, Type[asc] | Type[desc]]:
     order_by = order_args.order_by
     if order_by is None:
         order_by = "last_modified"
     direction = order_args.order
     if direction is None:
         if order_args.order_by == "last_modified":
-            direction = Order.desc
+            direction = desc
         else:
-            direction = Order.asc
+            direction = asc
     else:
-        direction = Order.asc if direction == "asc" else Order.desc
+        direction = asc if direction == "asc" else desc
     return (order_by, direction)
