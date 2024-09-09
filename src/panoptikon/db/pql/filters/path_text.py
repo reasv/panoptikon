@@ -1,7 +1,6 @@
 from pydantic import BaseModel, Field
-from pypika import Field as SQLField
-from pypika.queries import Selectable
-from pypika.terms import BasicCriterion, Term
+from sqlalchemy import Select, or_, text
+from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import files_path_fts
 from panoptikon.db.pql.types import (
@@ -36,24 +35,22 @@ class MatchPath(SortableFilter):
         description="Match a query against file paths",
     )
 
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         args = self.match_path
-        query = (
-            wrap_select(context)
-            .join(files_path_fts)
-            .on(context.file_id == files_path_fts.rowid)
-            .select(SQLField("rank").as_("order_rank"))
-        )
         column = (
-            files_path_fts.filename
+            files_path_fts.c.filename
             if args.filename_only
-            else files_path_fts.path
+            else files_path_fts.c.path
         )
-        query = query.where(
-            BasicCriterion(
-                Match.match_,
-                column,
-                Term.wrap_constant(args.match),  # type: ignore
+        return (
+            select(
+                context.c.file_id,
+                context.c.item_id,
+                text("files_path_fts.rank AS order_rank"),
             )
+            .join(
+                files_path_fts,
+                text("files_path_fts.rowid") == context.c.file_id,
+            )
+            .where(column.match(args.match))
         )
-        return query
