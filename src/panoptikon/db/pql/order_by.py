@@ -4,7 +4,6 @@ from typing import List, Tuple, Type, Union
 from sqlalchemy import Select, asc, desc, func, literal_column, nulls_last
 
 from panoptikon.db.pql.pql_model import OrderArgs
-from panoptikon.db.pql.tables import files
 from panoptikon.db.pql.utils import (
     VERY_LARGE_NUMBER,
     VERY_SMALL_NUMBER,
@@ -18,6 +17,8 @@ def build_order_by(
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
+    from panoptikon.db.pql.tables import files
+
     full_order_list = combine_order_lists(order_list, order_args)
 
     for ospec in full_order_list:

@@ -4,7 +4,6 @@ from pydantic import Field
 from sqlalchemy import Select, or_
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.tables import files
 from panoptikon.db.pql.types import Filter
 
 
@@ -15,6 +14,8 @@ class InPaths(Filter):
     )
 
     def build_query(self, context: CTE) -> Select:
+        from panoptikon.db.pql.tables import files
+
         paths = self.in_paths
         return (
             select(context.c.file_id, context.c.item_id)

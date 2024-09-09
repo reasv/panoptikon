@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Select, and_, asc, desc, func, or_
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.tables import bookmarks, files
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     SortableFilter,
@@ -58,6 +57,8 @@ class InBookmarks(SortableFilter):
     )
 
     def build_query(self, context: CTE) -> Select:
+        from panoptikon.db.pql.tables import bookmarks, files
+
         args = self.in_bookmarks
         criterions = []
         if args.namespaces:

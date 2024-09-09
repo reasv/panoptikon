@@ -4,12 +4,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Select, and_, asc, desc, func, literal_column, or_, text
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.tables import (
-    extracted_text,
-    extracted_text_fts,
-    item_data,
-    setters,
-)
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     SortableFilter,
@@ -82,6 +76,13 @@ including tags and OCR text
     )
 
     def build_query(self, context: CTE) -> Select:
+        from panoptikon.db.pql.tables import (
+            extracted_text,
+            extracted_text_fts,
+            item_data,
+            setters,
+        )
+
         args = self.match_text
         criteria = [extracted_text_fts.c.text.match(args.match)]
         if args.targets:

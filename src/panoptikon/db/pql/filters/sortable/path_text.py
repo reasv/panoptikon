@@ -2,7 +2,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Select, asc, desc, func, literal_column, or_, text
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.tables import files_path_fts
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     SortableFilter,
@@ -35,6 +34,8 @@ class MatchPath(SortableFilter):
     )
 
     def build_query(self, context: CTE) -> Select:
+        from panoptikon.db.pql.tables import files_path_fts
+
         args = self.match_path
         column = (
             files_path_fts.c.filename

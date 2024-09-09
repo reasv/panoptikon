@@ -12,12 +12,13 @@ from panoptikon.db.pql.pql_model import (
     QueryElement,
     SearchQuery,
 )
-from panoptikon.db.pql.tables import files, items
 from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
 def build_query(input_query: SearchQuery) -> Select:
+    from panoptikon.db.pql.tables import files, items
+
     # Initialize the state object
     state = QueryState()
 
