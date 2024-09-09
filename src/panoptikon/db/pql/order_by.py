@@ -65,7 +65,7 @@ def build_order_by(
             if direction == asc:
                 coalesced_column = func.min(
                     *[
-                        func.coalesce(column, literal(VERY_LARGE_NUMBER))
+                        func.coalesce(column, VERY_LARGE_NUMBER)
                         for column in columns
                     ]
                 )
@@ -73,7 +73,7 @@ def build_order_by(
             else:
                 coalesced_column = func.max(
                     *[
-                        func.coalesce(column, literal(VERY_SMALL_NUMBER))
+                        func.coalesce(column, VERY_SMALL_NUMBER)
                         for column in columns
                     ]
                 )
