@@ -12,6 +12,7 @@ from panoptikon.db.pql.pql_model import (
     QueryElement,
     SearchQuery,
 )
+from panoptikon.db.pql.preprocess_query import preprocess_query
 from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
@@ -19,14 +20,15 @@ from panoptikon.db.pql.utils import OrderByFilter, QueryState
 def build_query(input_query: SearchQuery) -> Select:
     from panoptikon.db.pql.tables import files, items
 
+    # Preprocess the query to remove empty filters and validate args
+    query_root = preprocess_query(input_query.query)
     # Initialize the state object
     state = QueryState()
-
     root_cte_name: str | None = None
     # Start the recursive processing
-    if input_query.query:
+    if query_root:
         root_cte = process_query_element(
-            input_query.query,
+            query_root,
             select(files.c.id.label("file_id"), files.c.item_id).cte(
                 "files_cte"
             ),
@@ -48,6 +50,8 @@ def build_query(input_query: SearchQuery) -> Select:
         )
     else:
         full_query = select(
+            files.c.id.label("file_id"),
+            files.c.item_id,
             files.c.sha256,
             files.c.path,
             files.c.last_modified,
