@@ -21,13 +21,17 @@ def build_query(input_query: SearchQuery) -> Select:
     # Initialize the state object
     state = QueryState()
 
+    root_cte_name: str | None = None
     # Start the recursive processing
     if input_query.query:
         root_cte = process_query_element(
             input_query.query,
-            select(files.c.id.label("file_id"), files.c.item_id).cte("root"),
+            select(files.c.id.label("file_id"), files.c.item_id).cte(
+                "files_cte"
+            ),
             state,
         )
+        root_cte_name = root_cte.name
 
         full_query = (
             select(
@@ -51,7 +55,7 @@ def build_query(input_query: SearchQuery) -> Select:
 
     # Add order by clauses
     full_query = build_order_by(
-        full_query, state.order_list, input_query.order_args
+        full_query, root_cte_name, state.order_list, input_query.order_args
     )
 
     page = max(input_query.page, 1)

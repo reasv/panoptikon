@@ -23,6 +23,7 @@ from panoptikon.db.pql.utils import (
 
 def build_order_by(
     query: Select,
+    root_cte_name: str | None,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
@@ -36,11 +37,14 @@ def build_order_by(
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
             field = ospec.cte.c.order_rank
-            query = query.join(
-                ospec.cte,
-                ospec.cte.c.file_id == files.c.id,
-                isouter=True,
-            ).order_by(nulls_last(direction(field)))
+            # If this is not the last CTE in the chain, we have to LEFT JOIN it
+            if ospec.cte.name != root_cte_name:
+                query = query.join(
+                    ospec.cte,
+                    ospec.cte.c.file_id == files.c.id,
+                    isouter=True,
+                )
+            query = query.order_by(nulls_last(direction(field)))
         elif isinstance(ospec, list):
             # Coalesce filter order by columns with the same priority
             columns = []  # Initialize variable for coalesced column
@@ -48,10 +52,13 @@ def build_order_by(
 
             for spec in ospec:
                 assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
-                query = query.join(
-                    spec.cte,
-                    spec.cte.c.file_id == files.c.id,
-                )
+                # If this is not the last CTE in the chain, we have to LEFT JOIN it
+                if spec.cte.name != root_cte_name:
+                    query = query.join(
+                        spec.cte,
+                        spec.cte.c.file_id == files.c.id,
+                        isouter=True,
+                    )
                 columns.append(spec.cte.c.order_rank)
 
             # For ascending order, use MIN to get the smallest non-null value
