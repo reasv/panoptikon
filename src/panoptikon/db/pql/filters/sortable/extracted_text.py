@@ -13,7 +13,6 @@ from panoptikon.db.pql.types import (
 from panoptikon.db.search.utils import parse_and_escape_query
 
 
-# # Filter arguments
 class MatchTextArgs(BaseModel):
     match: str = Field(
         ...,
