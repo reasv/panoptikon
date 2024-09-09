@@ -52,14 +52,6 @@ def build_order_by(
                         isouter=True,
                     )
 
-                # name = f"{spec.cte.name}_rownum"
-                # column = (
-                #     func.row_number()
-                #     .over(order_by=nulls_last(direction(spec.cte.c.order_rank)))
-                #     .label(name)
-                # )
-                # query = query.add_columns(column)
-                # columns.append(literal_column(name))
                 columns.append(spec.cte.c.order_rank)
 
             # For ascending order, use MIN to get the smallest non-null value
