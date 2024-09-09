@@ -107,7 +107,8 @@ including tags and OCR text
             .join(extracted_text, item_data.c.id == extracted_text.c.id)
             .join(
                 extracted_text_fts,
-                text("extracted_text_fts.rowid") == extracted_text.c.id,
+                literal_column("extracted_text_fts.rowid")
+                == extracted_text.c.id,
             )
             .where(and_(*criteria))
             .group_by(context.c.file_id)
