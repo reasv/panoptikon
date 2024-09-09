@@ -1,10 +1,10 @@
 from typing import List
 
 from pydantic import BaseModel, Field
-from pypika import Criterion
-from pypika.queries import Selectable
+from sqlalchemy import Select, and_, or_
+from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.tables import bookmarks
+from panoptikon.db.pql.tables import bookmarks, files
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     SortableFilter,
@@ -54,20 +54,22 @@ class InBookmarks(SortableFilter):
         description="Only include items that are bookmarked.",
     )
 
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         args = self.in_bookmarks
         criterions = []
         if args.namespaces:
             ns = args.namespaces
-            in_condition = bookmarks.namespace.isin(ns)
+            in_condition = bookmarks.c.namespace.in_(ns)
             if args.sub_ns:
                 criterions.append(
-                    Criterion.any(
-                        [in_condition]
-                        + [
-                            bookmarks.namespace.like(f"{namespace}.%")
-                            for namespace in ns
-                        ]
+                    or_(
+                        *(
+                            [in_condition]
+                            + [
+                                bookmarks.c.namespace.like(f"{namespace}.%")
+                                for namespace in ns
+                            ]
+                        )
                     )
                 )
             else:
@@ -75,17 +77,20 @@ class InBookmarks(SortableFilter):
 
         if args.include_wildcard:
             criterions.append(
-                (bookmarks.user == args.user) | (bookmarks.user == "*")
+                (bookmarks.c.user == args.user) | (bookmarks.c.user == "*")
             )
         else:
-            criterions.append(bookmarks.user == args.user)
+            criterions.append(bookmarks.c.user == args.user)
 
         return (
-            wrap_select(context)
-            .inner_join(bookmarks)
-            .on_field("sha256")
-            .select(bookmarks.time_added.as_("order_rank"))
+            select(
+                context.c.file_id,
+                context.c.item_id,
+                bookmarks.c.time_added.label("order_rank"),
+            )
+            .join(files, files.c.id == context.c.file_id)
+            .join(bookmarks, bookmarks.c.sha256 == files.c.sha256)
             .where(
-                Criterion.all(criterions),
+                and_(*criterions),
             )
         )
