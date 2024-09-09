@@ -1,6 +1,6 @@
-from typing import List
+from typing import List, Tuple
 
-from sqlalchemy import CTE, Select, except_, select, union
+from sqlalchemy import CTE, Select, except_, func, select, union
 
 from panoptikon.db.pql.filters import filter_function
 from panoptikon.db.pql.order_by import build_order_by
@@ -17,7 +17,7 @@ from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
-def build_query(input_query: SearchQuery) -> Select:
+def build_query(input_query: SearchQuery) -> Tuple[Select, Select]:
     from panoptikon.db.pql.tables import files, items
 
     # Preprocess the query to remove empty filters and validate args
@@ -58,6 +58,9 @@ def build_query(input_query: SearchQuery) -> Select:
             items.c.type,
         ).join(items, items.c.id == files.c.item_id)
 
+    count_query: Select = full_query.with_only_columns(
+        func.count().label("total")
+    )
     # Add order by clauses
     full_query = build_order_by(
         full_query, root_cte_name, state.order_list, input_query.order_args
@@ -67,7 +70,7 @@ def build_query(input_query: SearchQuery) -> Select:
     page_size = input_query.page_size
     offset = (page - 1) * page_size
     full_query = full_query.limit(page_size).offset(offset)
-    return full_query
+    return full_query, count_query
 
 
 def process_query_element(
