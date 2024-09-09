@@ -1,11 +1,8 @@
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
-from pypika import Criterion
-from pypika import Field as SQLField
-from pypika.functions import Max
-from pypika.queries import Selectable
-from pypika.terms import BasicCriterion, Term
+from sqlalchemy import Select, and_, or_, text
+from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import (
     extracted_text,
@@ -85,39 +82,33 @@ including tags and OCR text
 """,
     )
 
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         args = self.match_text
-        query = (
-            wrap_select(context)
-            .join(item_data)
-            .on_field("item_id")
-            .join(setters)
-            .on(item_data.setter_id == setters.id)
-            .join(extracted_text)
-            .on(item_data.id == extracted_text.id)
-            .join(extracted_text_fts)
-            .on(extracted_text.id == extracted_text_fts.rowid)
-            .select(Max(SQLField("rank")).as_("order_rank"))
-        )
-        criteria = [
-            BasicCriterion(
-                Match.match_,
-                extracted_text_fts.text,
-                Term.wrap_constant(args.match),  # type: ignore
-            )
-        ]
+        criteria = [extracted_text_fts.c.text.match(args.match)]
         if args.targets:
-            criteria.append(setters.name.isin(args.targets))
+            criteria.append(setters.c.name.in_(args.targets))
         if args.languages:
-            criteria.append(extracted_text.language.isin(args.languages))
+            criteria.append(extracted_text.c.language.in_(args.languages))
         if args.language_min_confidence:
             criteria.append(
-                extracted_text.language_confidence
+                extracted_text.c.language_confidence
                 >= args.language_min_confidence
             )
         if args.min_confidence:
-            criteria.append(extracted_text.confidence >= args.min_confidence)
-
-        query = query.where(Criterion.all(criteria))
-        query.groupby(context.file_id)
-        return query
+            criteria.append(extracted_text.c.confidence >= args.min_confidence)
+        return (
+            select(
+                context.c.file_id,
+                context.c.item_id,
+                text("extracted_text_fts.rank AS order_rank"),
+            )
+            .join(item_data, item_data.c.item_id == context.c.item_id)
+            .join(setters, setters.c.id == item_data.c.setter_id)
+            .join(extracted_text, item_data.c.id == extracted_text.c.id)
+            .join(
+                extracted_text_fts,
+                text("extracted_text_fts.rowid") == extracted_text.c.id,
+            )
+            .where(and_(*criteria))
+            .group_by(context.c.file_id)
+        )
