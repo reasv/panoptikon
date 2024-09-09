@@ -16,7 +16,6 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
-from panoptikon.db.pql.utils import Match, wrap_select
 
 
 # # Filter arguments
