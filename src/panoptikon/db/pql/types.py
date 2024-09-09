@@ -2,7 +2,7 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 from pypika.queries import Selectable
-from sqlalchemy import CTE, Select
+from sqlalchemy import CTE, Select, func, over, select
 
 OrderByType = Literal[
     "last_modified",
@@ -54,6 +54,21 @@ their values are coalesced into a single column to order by
     )
 
 
+def get_order_direction_field_rownum(default: OrderTypeNN):
+    return Field(
+        default=default,
+        title="Order Direction For Row Number",
+        description="""
+The order direction (asc or desc) for the internal row number calculation.
+Only used if order_by_row_n is True.
+When order_by_row_n is True, the filter's output is sorted by its rank_order column
+following this direction, and a row number is assigned to each row.
+This row number is used to order the final query.
+You should generally leave this as the default value.
+""",
+    )
+
+
 class Filter(BaseModel):
     def build_query(self, context: CTE) -> Select:
         raise NotImplementedError("build_query not implemented")
@@ -61,8 +76,25 @@ class Filter(BaseModel):
 
 class SortableFilter(Filter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("desc")
+    order_direction: OrderTypeNN = get_order_direction_field("asc")
     order_priority: int = get_order_priority_field(0)
+    order_by_row_n: bool = Field(
+        default=False,
+        title="Use Row Number for rank column",
+        description="""
+Has no effect if order_by is False.
+
+If True, internally sorts the filter's output by its rank_order
+column and assigns a row number to each row.
+
+The row number is used to order the final query.
+
+This is useful for combining multiple filters with different 
+rank_order types that may not be directly comparable,
+such as text search and embeddings search.
+        """,
+    )
+    order_by_row_n_direction = get_order_direction_field_rownum("asc")
 
 
 # class ExtractedTextEmbeddingsFilter(BaseModel):
