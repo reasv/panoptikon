@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, literal_column, or_, text
+from sqlalchemy import Select, asc, desc, func, literal_column, or_, text
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import files_path_fts
@@ -41,12 +41,9 @@ class MatchPath(SortableFilter):
             if args.filename_only
             else files_path_fts.c.path
         )
+        rank_column = self.get_rank_column(literal_column("rank"))
         return (
-            select(
-                context.c.file_id,
-                context.c.item_id,
-                literal_column("rank").label("order_rank"),
-            )
+            select(context.c.file_id, context.c.item_id, rank_column)
             .join(
                 files_path_fts,
                 literal_column("files_path_fts.rowid") == context.c.file_id,

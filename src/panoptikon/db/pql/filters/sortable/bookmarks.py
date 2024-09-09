@@ -1,7 +1,7 @@
 from typing import List
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, and_, or_
+from sqlalchemy import Select, and_, asc, desc, func, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import bookmarks, files
@@ -10,6 +10,7 @@ from panoptikon.db.pql.types import (
     SortableFilter,
     get_order_by_field,
     get_order_direction_field,
+    get_order_direction_field_rownum,
 )
 
 
@@ -47,6 +48,9 @@ If empty, all bookmarks will be included.
 class InBookmarks(SortableFilter):
     order_by: bool = get_order_by_field(False)
     order_direction: OrderTypeNN = get_order_direction_field("desc")
+    order_by_row_n_direction: OrderTypeNN = get_order_direction_field_rownum(
+        "desc"
+    )
     in_bookmarks: InBookmarksArgs = Field(
         ...,
         title="Restrict search to Bookmarks",
@@ -81,11 +85,12 @@ class InBookmarks(SortableFilter):
         else:
             criterions.append(bookmarks.c.user == args.user)
 
+        rank_column = self.get_rank_column(bookmarks.c.time_added)
         return (
             select(
                 context.c.file_id,
                 context.c.item_id,
-                bookmarks.c.time_added.label("order_rank"),
+                rank_column,
             )
             .join(files, files.c.id == context.c.file_id)
             .join(bookmarks, bookmarks.c.sha256 == files.c.sha256)

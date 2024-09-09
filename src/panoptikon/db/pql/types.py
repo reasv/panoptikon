@@ -2,7 +2,17 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 from pypika.queries import Selectable
-from sqlalchemy import CTE, Select, func, over, select
+from sqlalchemy import (
+    CTE,
+    Column,
+    ColumnClause,
+    Select,
+    asc,
+    desc,
+    func,
+    over,
+    select,
+)
 
 OrderByType = Literal[
     "last_modified",
@@ -49,7 +59,11 @@ The priority of this filter in the order by clause.
 If there are multiple filters with order_by set to True,
 the priority is used to determine the order.
 If two filter order bys have the same priority,
-their values are coalesced into a single column to order by
+their values are coalesced into a single column to order by,
+and the order direction is determined by the first filter that we find from this set.
+
+It's assumed that if the filters have the same priority, and should be coalesced,
+they will have the same order direction.
 """,
     )
 
@@ -60,8 +74,8 @@ def get_order_direction_field_rownum(default: OrderTypeNN):
         title="Order Direction For Row Number",
         description="""
 The order direction (asc or desc) for the internal row number calculation.
-Only used if order_by_row_n is True.
-When order_by_row_n is True, the filter's output is sorted by its rank_order column
+Only used if `order_by_row_n` is True.
+When `order_by_row_n` is True, the filter's output is sorted by its rank_order column
 following this direction, and a row number is assigned to each row.
 This row number is used to order the final query.
 You should generally leave this as the default value.
@@ -94,7 +108,26 @@ rank_order types that may not be directly comparable,
 such as text search and embeddings search.
         """,
     )
-    order_by_row_n_direction = get_order_direction_field_rownum("asc")
+    order_by_row_n_direction: OrderTypeNN = get_order_direction_field_rownum(
+        "asc"
+    )
+
+    def get_rank_column(self, column: ColumnClause) -> ColumnClause:
+        """Applies the row number function to the column if `order_by_row_n` is set.
+
+        Args:
+            column (ColumnClause): The column that this filter exposes for ordering.
+
+        Returns:
+            ColumnClause: The new sorting column that will be exposed by this filter.
+            Always aliased to "order_rank".
+        """
+        if self.order_by and self.order_by_row_n:
+            dir_str = self.order_by_row_n_direction
+            direction = asc if dir_str == "asc" else desc
+            column = func.row_number().over(order_by=direction(column))
+
+        return column.label("order_rank")
 
 
 # class ExtractedTextEmbeddingsFilter(BaseModel):

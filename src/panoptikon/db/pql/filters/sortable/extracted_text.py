@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, and_, literal_column, or_, text
+from sqlalchemy import Select, and_, asc, desc, func, literal_column, or_, text
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import (
@@ -95,11 +95,12 @@ including tags and OCR text
             )
         if args.min_confidence:
             criteria.append(extracted_text.c.confidence >= args.min_confidence)
+
         return (
             select(
                 context.c.file_id,
                 context.c.item_id,
-                literal_column("rank").label("order_rank"),
+                self.get_rank_column(literal_column("rank")),
             )
             .join(item_data, item_data.c.item_id == context.c.item_id)
             .join(setters, setters.c.id == item_data.c.setter_id)
