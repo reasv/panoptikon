@@ -20,3 +20,4 @@ class OrderByFilter:
 class QueryState:
     order_list: List[OrderByFilter] = field(default_factory=list)
     cte_counter: int = 0
+    is_count_query: bool = False

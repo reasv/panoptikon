@@ -17,13 +17,13 @@ from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
-def build_query(input_query: SearchQuery) -> Tuple[Select, Select]:
+def build_query(input_query: SearchQuery, count_query: bool = False) -> Select:
     from panoptikon.db.pql.tables import files, items
 
     # Preprocess the query to remove empty filters and validate args
     query_root = preprocess_query(input_query.query)
     # Initialize the state object
-    state = QueryState()
+    state = QueryState(is_count_query=count_query)
     root_cte_name: str | None = None
     # Start the recursive processing
     if query_root:
@@ -58,9 +58,9 @@ def build_query(input_query: SearchQuery) -> Tuple[Select, Select]:
             items.c.type,
         ).join(items, items.c.id == files.c.item_id)
 
-    count_query: Select = full_query.with_only_columns(
-        func.count().label("total")
-    )
+    if count_query:
+        return full_query.with_only_columns(func.count().label("total"))
+
     # Add order by clauses
     full_query = build_order_by(
         full_query, root_cte_name, state.order_list, input_query.order_args
@@ -70,7 +70,7 @@ def build_query(input_query: SearchQuery) -> Tuple[Select, Select]:
     page_size = input_query.page_size
     offset = (page - 1) * page_size
     full_query = full_query.limit(page_size).offset(offset)
-    return full_query, count_query
+    return full_query
 
 
 def process_query_element(

@@ -27,6 +27,8 @@ def filter_function(filter: Filter, context: CTE, state: QueryState) -> CTE:
         query = filter.build_query(context)
     else:
         raise ValueError(f"Unknown filter type: {filter.__class__.__name__}")
+    if state.is_count_query:
+        query = query.with_only_columns(context.c.file_id, context.c.item_id)
     filter_type = filter.__class__.__name__
     cte_name = f"n_{state.cte_counter}_{filter_type}"
     state.cte_counter += 1
