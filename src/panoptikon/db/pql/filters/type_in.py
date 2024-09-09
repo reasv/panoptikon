@@ -13,7 +13,11 @@ class TypeIn(Filter):
         title="MIME Type must begin with one of the given strings",
     )
 
+    def validate(self) -> bool:
+        return self.set_validated(bool(self.type_in))
+
     def build_query(self, context: CTE) -> Select:
+        self.raise_if_not_validated()
         from panoptikon.db.pql.tables import items
 
         mime_types = self.type_in

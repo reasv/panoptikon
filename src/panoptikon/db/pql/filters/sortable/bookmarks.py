@@ -56,7 +56,11 @@ class InBookmarks(SortableFilter):
         description="Only include items that are bookmarked.",
     )
 
+    def validate(self) -> bool:
+        return self.set_validated(self.in_bookmarks.enable)
+
     def build_query(self, context: CTE) -> Select:
+        self.raise_if_not_validated()
         from panoptikon.db.pql.tables import bookmarks, files
 
         args = self.in_bookmarks

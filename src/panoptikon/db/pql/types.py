@@ -84,8 +84,33 @@ You should generally leave this as the default value.
 
 
 class Filter(BaseModel):
+    _validated: bool = False
+
     def build_query(self, context: CTE) -> Select:
         raise NotImplementedError("build_query not implemented")
+
+    def is_validated(self) -> bool:
+        return self._validated
+
+    def set_validated(self, value: bool):
+        self._validated = value
+        return self._validated
+
+    def raise_if_not_validated(self):
+        """Raise a ValueError if validate() has not been called.
+        Raises:
+            ValueError: If the filter has not been validated.
+        """
+        if not self.is_validated():
+            raise ValueError("Filter was not validated")
+
+    def validate(self) -> bool:
+        """Pre-process filter args and validate them.
+        Must return True if the filter should be included, False otherwise.
+        Must be called before build_query.
+        Can raise a ValueError if the filter args are invalid.
+        """
+        raise NotImplementedError("validate not implemented")
 
 
 class SortableFilter(Filter):

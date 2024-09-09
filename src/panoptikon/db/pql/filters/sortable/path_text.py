@@ -8,6 +8,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
+from panoptikon.db.search.utils import parse_and_escape_query
 
 
 class MatchPathArgs(BaseModel):
@@ -33,7 +34,17 @@ class MatchPath(SortableFilter):
         description="Match a query against file paths",
     )
 
+    def validate(self) -> bool:
+        if len(self.match_path.match.strip()) == 0:
+            return self.set_validated(False)
+        if not self.match_path.raw_fts5_match:
+            self.match_path.match = parse_and_escape_query(
+                self.match_path.match
+            )
+        return self.set_validated(True)
+
     def build_query(self, context: CTE) -> Select:
+        self.raise_if_not_validated()
         from panoptikon.db.pql.tables import files_path_fts
 
         args = self.match_path

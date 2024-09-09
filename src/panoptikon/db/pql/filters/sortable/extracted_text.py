@@ -10,6 +10,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
+from panoptikon.db.search.utils import parse_and_escape_query
 
 
 # # Filter arguments
@@ -75,7 +76,17 @@ including tags and OCR text
 """,
     )
 
+    def validate(self) -> bool:
+        if len(self.match_text.match.strip()) == 0:
+            return self.set_validated(False)
+        if not self.match_text.raw_fts5_match:
+            self.match_text.match = parse_and_escape_query(
+                self.match_text.match
+            )
+        return self.set_validated(True)
+
     def build_query(self, context: CTE) -> Select:
+        self.raise_if_not_validated()
         from panoptikon.db.pql.tables import (
             extracted_text,
             extracted_text_fts,

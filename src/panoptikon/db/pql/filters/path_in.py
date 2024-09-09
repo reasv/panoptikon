@@ -13,7 +13,11 @@ class InPaths(Filter):
         title="Path must begin with one of the given strings",
     )
 
+    def validate(self) -> bool:
+        return self.set_validated(bool(self.in_paths))
+
     def build_query(self, context: CTE) -> Select:
+        self.raise_if_not_validated()
         from panoptikon.db.pql.tables import files
 
         paths = self.in_paths
