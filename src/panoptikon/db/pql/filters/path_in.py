@@ -1,12 +1,11 @@
 from typing import List
 
 from pydantic import Field
-from pypika import Criterion
-from pypika.queries import Selectable
+from sqlalchemy import Select, or_
+from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import files
 from panoptikon.db.pql.types import Filter
-from panoptikon.db.pql.utils import wrap_select
 
 
 class InPaths(Filter):
@@ -15,14 +14,10 @@ class InPaths(Filter):
         title="Path must begin with one of the given strings",
     )
 
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         paths = self.in_paths
-        query = (
-            wrap_select(context)
-            .join(files)
-            .on(files.id == context.file_id)
-            .where(
-                Criterion.any([files.path.like(f"{path}%") for path in paths])
-            )
+        return (
+            select(context.c.file_id, context.c.item_id)
+            .join(files, files.c.id == context.c.file_id)
+            .where(or_(*[files.c.path.like(f"{path}%") for path in paths]))
         )
-        return query

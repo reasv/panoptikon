@@ -7,6 +7,7 @@ from pypika import SQLLiteQuery as Query
 from pypika.functions import Function
 from pypika.queries import QueryBuilder, Selectable
 from pypika.terms import Comparator
+from sqlalchemy import CTE
 
 from panoptikon.db.pql.types import OrderTypeNN
 
@@ -33,14 +34,8 @@ def wrap_select(selectable: Selectable) -> QueryBuilder:
 
 
 @dataclass
-class CTE:
-    query: Selectable
-    name: str
-
-
-@dataclass
 class OrderByFilter:
-    cte: AliasedQuery
+    cte: CTE
     direction: OrderTypeNN
     priority: int = 0
 

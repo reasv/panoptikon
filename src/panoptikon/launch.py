@@ -9,6 +9,7 @@ from gradio.routes import mount_gradio_app
 from panoptikon.api.app import get_app
 from panoptikon.db import get_database_connection, run_migrations
 from panoptikon.db.folders import get_folders_from_database
+from panoptikon.db.pql.tables import build_metadata
 from panoptikon.log import setup_logging
 
 setup_logging()
@@ -34,6 +35,7 @@ def launch_app():
     logger.info(f"User Data DB: {user_data}")
     if not readonly_mode:
         run_migrations()
+        build_metadata()
     conn = get_database_connection(write_lock=False)
     folders = get_folders_from_database(conn, included=True)
     conn.close()

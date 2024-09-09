@@ -1,12 +1,11 @@
 from typing import List
 
 from pydantic import Field
-from pypika import Criterion
-from pypika.queries import Selectable
+from sqlalchemy import Select, or_
+from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.tables import items
 from panoptikon.db.pql.types import Filter
-from panoptikon.db.pql.utils import wrap_select
 
 
 class TypeIn(Filter):
@@ -15,16 +14,10 @@ class TypeIn(Filter):
         title="MIME Type must begin with one of the given strings",
     )
 
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         mime_types = self.type_in
-        query = (
-            wrap_select(context)
-            .join(items)
-            .on(context.item_id == items.id)
-            .where(
-                Criterion.any(
-                    [items.type.like(f"{mime}%") for mime in mime_types]
-                )
-            )
+        return (
+            select(context.c.file_id, context.c.item_id)
+            .join(items, items.c.id == context.c.item_id)
+            .where(or_(*[items.c.type.like(f"{mime}%") for mime in mime_types]))
         )
-        return query

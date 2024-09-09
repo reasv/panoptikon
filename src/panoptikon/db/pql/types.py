@@ -2,6 +2,7 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 from pypika.queries import Selectable
+from sqlalchemy import CTE, Select
 
 OrderByType = Literal[
     "last_modified",
@@ -54,7 +55,7 @@ their values are coalesced into a single column to order by
 
 
 class Filter(BaseModel):
-    def build_query(self, context: Selectable) -> Selectable:
+    def build_query(self, context: CTE) -> Select:
         raise NotImplementedError("build_query not implemented")
 
 
