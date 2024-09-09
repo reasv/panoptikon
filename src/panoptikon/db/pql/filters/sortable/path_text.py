@@ -27,7 +27,7 @@ class MatchPathArgs(BaseModel):
 
 class MatchPath(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("desc")
+    order_direction: OrderTypeNN = get_order_direction_field("asc")
     match_path: MatchPathArgs = Field(
         ...,
         title="Match Path",
