@@ -1,16 +1,7 @@
 from itertools import groupby
 from typing import List, Tuple, Type, Union
 
-from sqlalchemy import (
-    Select,
-    asc,
-    desc,
-    func,
-    literal,
-    literal_column,
-    nulls_last,
-    text,
-)
+from sqlalchemy import Select, asc, desc, func, literal_column, nulls_last
 
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.tables import files
