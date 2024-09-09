@@ -9,7 +9,7 @@ from gradio.routes import mount_gradio_app
 from panoptikon.api.app import get_app
 from panoptikon.db import get_database_connection, run_migrations
 from panoptikon.db.folders import get_folders_from_database
-from panoptikon.db.pql.tables import build_metadata
+from panoptikon.db.pql.build_table_meta import build_metadata
 from panoptikon.log import setup_logging
 
 setup_logging()
