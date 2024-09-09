@@ -45,7 +45,7 @@ OrOperator.model_rebuild()
 NotOperator.model_rebuild()
 
 
-class SearchQuery(BaseModel):
+class PQLQuery(BaseModel):
     query: Optional[QueryElement] = None
     order_args: List[OrderArgs] = Field(
         default_factory=lambda: [

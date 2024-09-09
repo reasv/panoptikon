@@ -9,15 +9,15 @@ from panoptikon.db.pql.pql_model import (
     NotOperator,
     Operator,
     OrOperator,
+    PQLQuery,
     QueryElement,
-    SearchQuery,
 )
 from panoptikon.db.pql.preprocess_query import preprocess_query
 from panoptikon.db.pql.types import Filter, SortableFilter
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
-def build_query(input_query: SearchQuery, count_query: bool = False) -> Select:
+def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
     from panoptikon.db.pql.tables import files, items
 
     # Preprocess the query to remove empty filters and validate args
