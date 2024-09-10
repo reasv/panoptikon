@@ -2,7 +2,6 @@ from typing import List, Tuple
 
 from sqlalchemy import CTE, Label, Select, except_, func, select, union
 
-from panoptikon.db.pql.filters import filter_function
 from panoptikon.db.pql.order_by import build_order_by
 from panoptikon.db.pql.pql_model import (
     AndOperator,
@@ -95,7 +94,7 @@ def process_query_element(
 ) -> CTE:
     # Process primitive filters
     if isinstance(el, Filter):
-        cte = filter_function(el, context, state)
+        cte = el.build_query(context, state)
         if isinstance(el, SortableFilter):
             if el.order_by:
                 state.order_list.append(

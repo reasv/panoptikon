@@ -8,6 +8,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
+from panoptikon.db.pql.utils import QueryState
 from panoptikon.db.search.utils import parse_and_escape_query
 
 
@@ -43,7 +44,7 @@ class MatchPath(SortableFilter):
             )
         return self.set_validated(True)
 
-    def build_query(self, context: CTE) -> Select:
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
         from panoptikon.db.pql.tables import files_path_fts
 
@@ -54,11 +55,15 @@ class MatchPath(SortableFilter):
             else files_path_fts.c.path
         )
         rank_column = self.derive_rank_column(func.min(literal_column("rank")))
-        return (
-            select(context.c.file_id, context.c.item_id, rank_column)
-            .join(
-                files_path_fts,
-                literal_column("files_path_fts.rowid") == context.c.file_id,
-            )
-            .where(column.match(args.match))
+        return self.wrap_query(
+            (
+                select(context.c.file_id, context.c.item_id, rank_column)
+                .join(
+                    files_path_fts,
+                    literal_column("files_path_fts.rowid") == context.c.file_id,
+                )
+                .where(column.match(args.match))
+            ),
+            context,
+            state,
         )

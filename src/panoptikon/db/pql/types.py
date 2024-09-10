@@ -2,7 +2,6 @@ import sqlite3
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 from pydantic import BaseModel, Field
-from pypika.queries import Selectable
 from sqlalchemy import (
     CTE,
     Column,
@@ -12,9 +11,12 @@ from sqlalchemy import (
     asc,
     desc,
     func,
+    literal_column,
     over,
     select,
 )
+
+from panoptikon.db.pql.utils import ExtraColumn, QueryState
 
 OrderByType = Literal[
     "last_modified",
@@ -164,8 +166,18 @@ You should generally leave this as the default value.
 class Filter(BaseModel):
     _validated: bool = False
 
-    def build_query(self, context: CTE) -> Select:
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
         raise NotImplementedError("build_query not implemented")
+
+    def wrap_query(self, query: Select, context: CTE, state: QueryState) -> CTE:
+        if state.is_count_query:
+            query = query.with_only_columns(
+                context.c.file_id, context.c.item_id
+            )
+        filter_type = self.__class__.__name__
+        cte_name = f"n_{state.cte_counter}_{filter_type}"
+        state.cte_counter += 1
+        return query.cte(cte_name)
 
     def is_validated(self) -> bool:
         return self._validated
@@ -259,6 +271,28 @@ If set, the order_rank column will be returned with the results as this alias un
             column = func.row_number().over(order_by=direction(column))
 
         return column.label("order_rank")
+
+    def wrap_query(self, query: Select, context: CTE, state: QueryState) -> CTE:
+        if state.is_count_query:
+            return super().wrap_query(query, context, state)
+
+        order_rank = literal_column("order_rank")
+        if order_rank is not None:
+            if self.gt:
+                query = query.where(order_rank > self.gt)
+            if self.lt:
+                query = query.where(order_rank < self.lt)
+        cte = super().wrap_query(query, context, state)
+        if self.select_as:
+            state.extra_columns.append(
+                ExtraColumn(
+                    column=cte.c.order_rank,
+                    cte=cte,
+                    alias=self.select_as,
+                    need_join=not self.order_by,
+                )
+            )
+        return cte
 
 
 class SelectFields(BaseModel):

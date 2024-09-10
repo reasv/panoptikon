@@ -11,6 +11,7 @@ from panoptikon.db.pql.types import (
     get_order_direction_field,
     get_order_direction_field_rownum,
 )
+from panoptikon.db.pql.utils import QueryState
 
 
 class InBookmarksArgs(BaseModel):
@@ -57,7 +58,7 @@ class InBookmarks(SortableFilter):
     def validate(self) -> bool:
         return self.set_validated(self.in_bookmarks.enable)
 
-    def build_query(self, context: CTE) -> Select:
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
         from panoptikon.db.pql.tables import bookmarks, files
 
@@ -89,15 +90,19 @@ class InBookmarks(SortableFilter):
             criterions.append(bookmarks.c.user == args.user)
 
         rank_column = self.derive_rank_column(bookmarks.c.time_added)
-        return (
-            select(
-                context.c.file_id,
-                context.c.item_id,
-                rank_column,
-            )
-            .join(files, files.c.id == context.c.file_id)
-            .join(bookmarks, bookmarks.c.sha256 == files.c.sha256)
-            .where(
-                and_(*criterions),
-            )
+        return self.wrap_query(
+            (
+                select(
+                    context.c.file_id,
+                    context.c.item_id,
+                    rank_column,
+                )
+                .join(files, files.c.id == context.c.file_id)
+                .join(bookmarks, bookmarks.c.sha256 == files.c.sha256)
+                .where(
+                    and_(*criterions),
+                )
+            ),
+            context,
+            state,
         )

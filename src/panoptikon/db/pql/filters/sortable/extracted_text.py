@@ -10,6 +10,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
+from panoptikon.db.pql.utils import QueryState
 from panoptikon.db.search.utils import parse_and_escape_query
 
 
@@ -84,7 +85,7 @@ including tags and OCR text
             )
         return self.set_validated(True)
 
-    def build_query(self, context: CTE) -> Select:
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
         from panoptikon.db.pql.tables import (
             extracted_text,
@@ -107,20 +108,24 @@ including tags and OCR text
         if args.min_confidence:
             criteria.append(extracted_text.c.confidence >= args.min_confidence)
 
-        return (
-            select(
-                context.c.file_id,
-                context.c.item_id,
-                self.derive_rank_column(func.min(literal_column("rank"))),
-            )
-            .join(item_data, item_data.c.item_id == context.c.item_id)
-            .join(setters, setters.c.id == item_data.c.setter_id)
-            .join(extracted_text, item_data.c.id == extracted_text.c.id)
-            .join(
-                extracted_text_fts,
-                literal_column("extracted_text_fts.rowid")
-                == extracted_text.c.id,
-            )
-            .where(and_(*criteria))
-            .group_by(context.c.file_id)
+        return self.wrap_query(
+            (
+                select(
+                    context.c.file_id,
+                    context.c.item_id,
+                    self.derive_rank_column(func.min(literal_column("rank"))),
+                )
+                .join(item_data, item_data.c.item_id == context.c.item_id)
+                .join(setters, setters.c.id == item_data.c.setter_id)
+                .join(extracted_text, item_data.c.id == extracted_text.c.id)
+                .join(
+                    extracted_text_fts,
+                    literal_column("extracted_text_fts.rowid")
+                    == extracted_text.c.id,
+                )
+                .where(and_(*criteria))
+                .group_by(context.c.file_id)
+            ),
+            context,
+            state,
         )
