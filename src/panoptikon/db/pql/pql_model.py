@@ -72,7 +72,7 @@ The default columns are sha256, path, last_modified, and type.
 These columns are always returned, even if they are not in the select list.
 """,
     )
-    entity: Literal["file", "item"] = Field(
+    entity: Literal["file", "item", "text-item", "text-file"] = Field(
         default="file",
         title="Target Entity",
         description="""
@@ -86,6 +86,21 @@ When searching for items, sorting by path or last_modified may not work as expec
 The file with the highest internal ID will be returned with the item.
 
 Searching files is generally faster than searching items.
+
+`Text-item` queries are used to search extracted text for items.
+You'll get one result for each text, containing the text_id, 
+text itself, as well as all the normal item columns.
+Since each text is associated to exactly one item, 
+you can use all the normal filters, orders, 
+and selects as well as the text-specific ones.
+
+`text-file` queries are used to search extracted text for files.
+The result is exactly the same as a text-item query, but you'll get one result for each text-file pair.
+There is exactly one item for each text, so text-item returns one result per text,
+but there can be multiple files for the same unique item, and consequently multiple files for the same text,
+meaning multiple results with the same text.
+
+Using text-item involves the same tradeoffs as item vs file queries, so file-text is recommended for the most consistent results.
 """,
     )
     page: int = Field(default=1)
