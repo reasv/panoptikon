@@ -66,8 +66,11 @@ Results can be ordered by multiple fields by adding multiple objects.
 `Files` represent actual files on disk. They are unique by path.
 If you search for files, you will get duplicates for items that have multiple identical files.
 If you search for items, you will get one result per item, even if multiple identical files exist with different paths.
+
 When searching for items, sorting by path or last_modified may not work as expected.
 The file with the highest internal ID will be returned with the item.
+
+Searching files is generally faster than searching items.
 """,
     )
     page: int = Field(default=1)
