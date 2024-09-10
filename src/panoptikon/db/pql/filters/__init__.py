@@ -31,12 +31,12 @@ def filter_function(filter: Filter, context: CTE, state: QueryState) -> CTE:
         query = query.with_only_columns(context.c.file_id, context.c.item_id)
     else:
         if isinstance(filter, SortableFilter):
-            rank_order = literal_column("rank_order")
-            if rank_order is not None:
+            order_rank = literal_column("order_rank")
+            if order_rank is not None:
                 if filter.gt:
-                    query.where(rank_order > filter.gt)
+                    query = query.where(order_rank > filter.gt)
                 if filter.lt:
-                    query.where(rank_order < filter.lt)
+                    query = query.where(order_rank < filter.lt)
 
     filter_type = filter.__class__.__name__
     cte_name = f"n_{state.cte_counter}_{filter_type}"
@@ -51,7 +51,7 @@ def filter_function(filter: Filter, context: CTE, state: QueryState) -> CTE:
     ):
         state.extra_columns.append(
             ExtraColumn(
-                column=cte.c.rank_order,
+                column=cte.c.order_rank,
                 cte=cte,
                 alias=filter.select_as,
                 need_join=not filter.order_by,

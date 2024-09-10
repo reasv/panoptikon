@@ -199,7 +199,7 @@ class SortableFilter(Filter):
         default=False,
         title="Use Row Number for rank column",
         description="""
-Has no effect if order_by is False.
+Only applied if either order_by is True, or select_as is set.
 
 If True, internally sorts the filter's output by its rank_order
 column and assigns a row number to each row.
@@ -213,7 +213,7 @@ such as text search and embeddings search.
     )
     row_n_direction: OrderTypeNN = get_order_direction_field_rownum("asc")
     gt: Optional[int | str | float] = Field(
-        None,
+        default=None,
         title="Order By Greater Than",
         description="""
 If set, only include items with an order_rank greater than this value.
@@ -225,7 +225,7 @@ With cursor-based pagination, you should probably not rely on count = True anyho
         """,
     )
     lt: Optional[int | str | float] = Field(
-        None,
+        default=None,
         title="Order By Less Than",
         description="""
 If set, only include items with an order_rank less than this value.
@@ -236,7 +236,7 @@ used to determine the total number of results when count = True.
         """,
     )
     select_as: Optional[str] = Field(
-        None,
+        default=None,
         title="Order By Select As",
         description="""
 If set, the order_rank column will be returned with the results as this alias under the "extra" object.
@@ -253,7 +253,7 @@ If set, the order_rank column will be returned with the results as this alias un
             ColumnClause: The new sorting column that will be exposed by this filter.
             Always aliased to "order_rank".
         """
-        if self.order_by and self.row_n:
+        if self.row_n and (self.order_by or self.select_as):
             dir_str = self.row_n_direction
             direction = asc if dir_str == "asc" else desc
             column = func.row_number().over(order_by=direction(column))
