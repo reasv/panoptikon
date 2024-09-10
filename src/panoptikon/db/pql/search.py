@@ -29,7 +29,7 @@ def get_sql(stmt: Select, binds: bool = False) -> Tuple[str, List[Any]]:
     return sql_string, params_ordered
 
 
-def search(
+def search_pql(
     conn: sqlite3.Connection,
     query: PQLQuery,
 ):
@@ -77,6 +77,6 @@ def search(
                 if file := get_existing_file_for_sha256(conn, result.sha256):
                     result.path = file.path
                     result.last_modified = file.last_modified
-            yield row
+            yield result
 
     return results_generator(), total_count

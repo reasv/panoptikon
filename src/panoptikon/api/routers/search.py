@@ -18,6 +18,9 @@ from panoptikon.db.extracted_text import get_text_stats
 from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
 from panoptikon.db.folders import get_folders_from_database
+from panoptikon.db.pql.pql_model import PQLQuery
+from panoptikon.db.pql.search import search_pql
+from panoptikon.db.pql.types import SearchResult
 from panoptikon.db.search import search_files
 from panoptikon.db.search.types import SearchQuery
 from panoptikon.db.search.utils import pprint_dataclass
@@ -76,6 +79,11 @@ def extract_embeddings(buffer: bytes) -> bytes:
     return serialize_f32(numpy_array[0].tolist())
 
 
+class FileSearchResponse(BaseModel):
+    count: int
+    results: List[SearchResult]
+
+
 @router.post(
     "",
     summary="Search for files in the database",
@@ -121,6 +129,31 @@ def search(
             )
         results = list(search_files(conn, search_query))
         return process_results(results)
+    finally:
+        conn.close()
+
+
+@router.post(
+    "/pql",
+    summary="Search for files and items in the database",
+    description="""
+Search for files in the database based on the provided query parameters.
+This endpoint is meant to be used with the Panoptikon Query Language.
+    """,
+    response_model=FileSearchResponse,
+)
+def pql(
+    search_query: PQLQuery = Body(
+        default_factory=lambda: PQLQuery(),
+        description="The PQL Search query to execute",
+    ),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> FileSearchResponse:
+    conn = get_database_connection(**conn_args)
+    try:
+        logger.debug(f"Searching for files with PQL: {search_query}")
+        results, count = search_pql(conn, search_query)
+        return FileSearchResponse(count=count, results=list(results))
     finally:
         conn.close()
 
