@@ -34,6 +34,7 @@ def search_pql(
     query: PQLQuery,
 ):
     cursor = conn.cursor()
+    cursor.row_factory = sqlite3.Row
     if query.count:
         count_stmt = build_query(query, count_query=True)
         count_sql_string, count_params_ordered = get_sql(count_stmt)

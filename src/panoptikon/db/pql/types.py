@@ -1,3 +1,4 @@
+import sqlite3
 from typing import Any, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -65,8 +66,8 @@ class SearchResult(BaseModel):
     subtitle_tracks: Optional[int] = None
 
 
-def map_row_to_class(row, class_instance):
-    for key, value in row.items():
+def map_row_to_class(row: sqlite3.Row, class_instance):
+    for key, value in dict(row).items():
         if hasattr(class_instance, key):
             setattr(class_instance, key, value)
 
