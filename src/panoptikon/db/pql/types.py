@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 from pydantic import BaseModel, Field
 from pypika.queries import Selectable
@@ -64,12 +64,28 @@ class SearchResult(BaseModel):
     audio_tracks: Optional[int] = None
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
+    extra: Optional[Dict[str, float | int | str | None]] = Field(
+        default=None,
+        title="Extra Fields",
+        description="Extra fields retrieved from filters that are not part of the main result object.",
+    )
 
 
 def map_row_to_class(row: sqlite3.Row, class_instance):
     for key, value in dict(row).items():
         if hasattr(class_instance, key):
             setattr(class_instance, key, value)
+
+
+def get_extra_columns(row: sqlite3.Row, column_aliases: List[str] | None):
+    if not column_aliases:
+        return None
+    extras: Dict[str, float | int | str | None] = {}
+    for i, alias in enumerate(column_aliases):
+        value = dict(row).get(f"extra_{i}")
+        extras[alias] = value
+
+    return extras if extras else None
 
 
 def get_column(column: Union[FileColumns, ItemColumns]) -> Column:

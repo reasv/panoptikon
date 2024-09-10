@@ -9,7 +9,11 @@ from sqlalchemy.dialects import sqlite
 from panoptikon.db.files import get_existing_file_for_sha256
 from panoptikon.db.pql.pql_model import PQLQuery
 from panoptikon.db.pql.query_builder import build_query
-from panoptikon.db.pql.types import SearchResult, map_row_to_class
+from panoptikon.db.pql.types import (
+    SearchResult,
+    get_extra_columns,
+    map_row_to_class,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +38,9 @@ def search_pql(
     query: PQLQuery,
 ):
     cursor = conn.cursor()
-    cursor.row_factory = sqlite3.Row
+    cursor.row_factory = sqlite3.Row  # type: ignore
     if query.count:
-        count_stmt = build_query(query, count_query=True)
+        count_stmt, _ = build_query(query, count_query=True)
         count_sql_string, count_params_ordered = get_sql(count_stmt)
         try:
             cursor.execute(count_sql_string, count_params_ordered)
@@ -52,7 +56,7 @@ def search_pql(
     else:
         total_count = 0
 
-    stmt = build_query(query, count_query=False)
+    stmt, extra_columns = build_query(query, count_query=False)
     sql_string, params_ordered = get_sql(stmt)
     try:
         cursor.execute(sql_string, params_ordered)
@@ -69,6 +73,7 @@ def search_pql(
         while row := cursor.fetchone():
             result = SearchResult(file_id=row[0], item_id=row[1])
             map_row_to_class(row, result)
+            result.extra = get_extra_columns(row, extra_columns)
             if query.check_path and not os.path.exists(result.path):
                 if query.entity == "file":
                     logger.warning(f"File not found: {result.path}")
