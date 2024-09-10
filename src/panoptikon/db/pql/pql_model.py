@@ -68,6 +68,8 @@ Results can be ordered by multiple fields by adding multiple objects.
         title="Data to return",
         description="""
 The columns to return in the query.
+The default columns are sha256, path, last_modified, and type.
+These columns are always returned, even if they are not in the select list.
 """,
     )
     entity: Literal["file", "item"] = Field(
@@ -88,5 +90,25 @@ Searching files is generally faster than searching items.
     )
     page: int = Field(default=1)
     page_size: int = Field(default=10)
-    count: bool = Field(default=True)
-    check_path: bool = Field(default=False)
+    count: bool = Field(
+        default=True,
+        title="Count Results",
+        description="""
+If true, the query will return the total number of results that match the query.
+This is useful for pagination, but it requires an additional query to be executed.
+""",
+    )
+    check_path: bool = Field(
+        default=False,
+        title="Check Paths Exist",
+        description="""
+If true, the query will check if the path exists on disk before returning it.
+
+For `file` queries, the file will be omitted if the path does not exist.
+
+For `item` queries, the system will try to find another path for the item and substitute it.
+This will substitute last_modified to the new path's last_modified, but not any other fields such as filename.
+
+If no other working path is found, the item will be omitted from the results.
+""",
+    )

@@ -46,6 +46,31 @@ OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
 
 
+# Define Search results
+class SearchResult(BaseModel):
+    file_id: int
+    item_id: int
+    path: str = ""
+    sha256: str = ""
+    last_modified: str = ""
+    type: str = ""
+    size: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[float] = None
+    time_added: Optional[str] = None
+    md5: Optional[str] = None
+    audio_tracks: Optional[int] = None
+    video_tracks: Optional[int] = None
+    subtitle_tracks: Optional[int] = None
+
+
+def map_row_to_class(row, class_instance):
+    for key, value in row.items():
+        if hasattr(class_instance, key):
+            setattr(class_instance, key, value)
+
+
 def get_column(column: Union[FileColumns, ItemColumns]) -> Column:
     from panoptikon.db.pql.tables import files, items
 

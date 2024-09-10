@@ -130,6 +130,8 @@ def process_query_element(
 
 
 def add_select_columns(input_query: PQLQuery, query: Select) -> Select:
-    column_name_list = list(set(input_query.select))
-    columns = [get_column(col) for col in column_name_list]
+    # Always include the path, sha256, type, and last_modified columns
+    input_query.select.extend(["path", "sha256", "type", "last_modified"])
+    input_query.select = list(set(input_query.select))
+    columns = [get_column(col) for col in input_query.select]
     return query.add_columns(*columns)
