@@ -198,8 +198,31 @@ such as text search and embeddings search.
     order_by_row_n_direction: OrderTypeNN = get_order_direction_field_rownum(
         "asc"
     )
+    order_by_gt: Optional[int | str | float] = Field(
+        None,
+        title="Order By Greater Than",
+        description="""
+If set, only include items with an order_rank greater than this value.
+Can be used for cursor-based pagination.
+The type depends on the filter.
+Will be ignored in the count query, which is 
+used to determine the total number of results when count = True.
+With cursor-based pagination, you should probably not rely on count = True anyhow.
+        """,
+    )
+    order_by_lt: Optional[int | str | float] = Field(
+        None,
+        title="Order By Less Than",
+        description="""
+If set, only include items with an order_rank less than this value.
+Can be used for cursor-based pagination.
+The type depends on the filter.
+Will be ignored in the count query, which is 
+used to determine the total number of results when count = True.
+        """,
+    )
 
-    def get_rank_column(self, column: Any) -> ColumnClause | Label:
+    def derive_rank_column(self, column: Any) -> ColumnClause | Label:
         """Applies the row number function to the column if `order_by_row_n` is set.
 
         Args:

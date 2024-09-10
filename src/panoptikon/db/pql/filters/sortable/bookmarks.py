@@ -90,7 +90,7 @@ class InBookmarks(SortableFilter):
         else:
             criterions.append(bookmarks.c.user == args.user)
 
-        rank_column = self.get_rank_column(bookmarks.c.time_added)
+        rank_column = self.derive_rank_column(bookmarks.c.time_added)
         return (
             select(
                 context.c.file_id,

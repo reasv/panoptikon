@@ -111,7 +111,7 @@ including tags and OCR text
             select(
                 context.c.file_id,
                 context.c.item_id,
-                self.get_rank_column(func.min(literal_column("rank"))),
+                self.derive_rank_column(func.min(literal_column("rank"))),
             )
             .join(item_data, item_data.c.item_id == context.c.item_id)
             .join(setters, setters.c.id == item_data.c.setter_id)
