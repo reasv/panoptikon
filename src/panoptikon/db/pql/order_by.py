@@ -1,7 +1,16 @@
 from itertools import groupby
 from typing import List, Tuple, Type, Union
 
-from sqlalchemy import Select, asc, desc, func, literal_column, nulls_last
+from sqlalchemy import (
+    ColumnClause,
+    Label,
+    Select,
+    asc,
+    desc,
+    func,
+    literal_column,
+    nulls_last,
+)
 
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.utils import (
@@ -14,11 +23,10 @@ from panoptikon.db.pql.utils import (
 def build_order_by(
     query: Select,
     root_cte_name: str | None,
+    file_id: Label,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
-    from panoptikon.db.pql.tables import files
-
     full_order_list = combine_order_lists(order_list, order_args)
 
     for ospec in full_order_list:
@@ -33,7 +41,7 @@ def build_order_by(
             if ospec.cte.name != root_cte_name:
                 query = query.join(
                     ospec.cte,
-                    ospec.cte.c.file_id == files.c.id,
+                    ospec.cte.c.file_id == file_id,
                     isouter=True,
                 )
             query = query.order_by(nulls_last(direction(field)))
@@ -48,7 +56,7 @@ def build_order_by(
                 if spec.cte.name != root_cte_name:
                     query = query.join(
                         spec.cte,
-                        spec.cte.c.file_id == files.c.id,
+                        spec.cte.c.file_id == file_id,
                         isouter=True,
                     )
 
@@ -123,7 +131,7 @@ def group_order_list(
 
 def get_order_by_and_direction(
     order_args: OrderArgs,
-) -> Tuple[str, Type[asc] | Type[desc]]:
+):
     order_by = order_args.order_by
     if order_by is None:
         order_by = "last_modified"

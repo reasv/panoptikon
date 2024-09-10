@@ -21,7 +21,8 @@ def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
     from panoptikon.db.pql.tables import files, items
 
     # Preprocess the query to remove empty filters and validate args
-    query_root = preprocess_query(input_query.query)
+    if query_root := input_query.query:
+        query_root = preprocess_query(query_root)
     # Initialize the state object
     state = QueryState(is_count_query=count_query)
     root_cte_name: str | None = None
@@ -36,34 +37,44 @@ def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
         )
         root_cte_name = root_cte.name
 
-        full_query = (
-            select(
-                root_cte.c.file_id,
-                root_cte.c.item_id,
-                files.c.sha256,
-                files.c.path,
-                files.c.last_modified,
-                items.c.type,
-            )
-            .join(files, files.c.id == root_cte.c.file_id)
-            .join(items, items.c.id == root_cte.c.item_id)
+        file_id, item_id = (
+            root_cte.c.file_id.label("file_id"),
+            root_cte.c.item_id.label("item_id"),
         )
     else:
-        full_query = select(
-            files.c.id.label("file_id"),
-            files.c.item_id,
-            files.c.sha256,
-            files.c.path,
-            files.c.last_modified,
-            items.c.type,
-        ).join(items, items.c.id == files.c.item_id)
+        file_id, item_id = files.c.id.label("file_id"), files.c.item_id.label(
+            "item_id"
+        )
+
+    if input_query.entity == "item":
+        item_cte = (
+            select(func.max(file_id).label("file_id"), item_id)
+            .group_by(item_id)
+            .cte("item_cte")
+        )
+        full_query = select(item_cte.c.file_id, item_cte.c.item_id)
+        file_id, item_id = item_cte.c.file_id.label(
+            "file_id"
+        ), item_cte.c.item_id.label("file_id")
+        root_cte_name = item_cte.name
+    else:
+        full_query = select(file_id, item_id)
 
     if count_query:
         return full_query.with_only_columns(func.count().label("total"))
 
+    # Join the item and file tables
+    full_query = full_query.join(items, items.c.id == item_id).join(
+        files, files.c.id == file_id
+    )
+
     # Add order by clauses
     full_query = build_order_by(
-        full_query, root_cte_name, state.order_list, input_query.order_args
+        full_query,
+        root_cte_name,
+        file_id,
+        state.order_list,
+        input_query.order_args,
     )
 
     page = max(input_query.page, 1)

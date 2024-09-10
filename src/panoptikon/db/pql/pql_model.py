@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -58,7 +58,19 @@ objects that define how the results should be ordered.
 Results can be ordered by multiple fields by adding multiple objects.
         """,
     )
-    page: int = 1
-    page_size: int = 10
-    count: bool = True
-    check_path: bool = False
+    entity: Literal["file", "item"] = Field(
+        default="file",
+        title="Target Entity",
+        description="""The entity to query for.
+`Items` are unique files.
+`Files` represent actual files on disk. They are unique by path.
+If you search for files, you will get duplicates for items that have multiple identical files.
+If you search for items, you will get one result per item, even if multiple identical files exist with different paths.
+When searching for items, sorting by path or last_modified may not work as expected.
+The file with the highest internal ID will be returned with the item.
+""",
+    )
+    page: int = Field(default=1)
+    page_size: int = Field(default=10)
+    count: bool = Field(default=True)
+    check_path: bool = Field(default=False)
