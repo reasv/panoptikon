@@ -12,8 +12,13 @@ from panoptikon.db.pql.pql_model import (
     QueryElement,
 )
 from panoptikon.db.pql.preprocess_query import preprocess_query
-from panoptikon.db.pql.types import Filter, SortableFilter, get_column
-from panoptikon.db.pql.utils import OrderByFilter, QueryState
+from panoptikon.db.pql.types import (
+    Filter,
+    OrderByFilter,
+    QueryState,
+    SortableFilter,
+    get_column,
+)
 
 
 def build_query(

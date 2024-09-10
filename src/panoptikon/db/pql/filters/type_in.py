@@ -4,8 +4,7 @@ from pydantic import Field
 from sqlalchemy import Select, or_
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.types import Filter
-from panoptikon.db.pql.utils import QueryState
+from panoptikon.db.pql.types import Filter, QueryState
 
 
 class TypeIn(Filter):

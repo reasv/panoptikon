@@ -6,12 +6,12 @@ from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.types import (
     OrderTypeNN,
+    QueryState,
     SortableFilter,
     get_order_by_field,
     get_order_direction_field,
     get_order_direction_field_rownum,
 )
-from panoptikon.db.pql.utils import QueryState
 
 
 class InBookmarksArgs(BaseModel):

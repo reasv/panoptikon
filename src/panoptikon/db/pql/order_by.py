@@ -13,7 +13,7 @@ from sqlalchemy import (
 )
 
 from panoptikon.db.pql.pql_model import OrderArgs
-from panoptikon.db.pql.utils import (
+from panoptikon.db.pql.types import (
     VERY_LARGE_NUMBER,
     VERY_SMALL_NUMBER,
     OrderByFilter,

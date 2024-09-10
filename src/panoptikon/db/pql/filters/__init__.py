@@ -16,7 +16,11 @@ from panoptikon.db.pql.filters.sortable.path_text import (
     MatchPathArgs,
 )
 from panoptikon.db.pql.filters.type_in import TypeIn
-from panoptikon.db.pql.types import Filter, SortableFilter
-from panoptikon.db.pql.utils import ExtraColumn, QueryState
+from panoptikon.db.pql.types import (
+    ExtraColumn,
+    Filter,
+    QueryState,
+    SortableFilter,
+)
 
 Filters = Union[InPaths, InBookmarks, TypeIn, MatchPath, MatchText]

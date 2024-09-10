@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 from pydantic import BaseModel, Field
@@ -15,8 +16,11 @@ from sqlalchemy import (
     over,
     select,
 )
+from sqlalchemy.sql.elements import KeyedColumnElement
 
-from panoptikon.db.pql.utils import ExtraColumn, QueryState
+VERY_LARGE_NUMBER = 9223372036854775805
+VERY_SMALL_NUMBER = -9223372036854775805
+
 
 OrderByType = Literal[
     "last_modified",
@@ -47,6 +51,29 @@ ItemColumns = Literal[
 
 OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
+
+
+@dataclass
+class OrderByFilter:
+    cte: CTE
+    direction: OrderTypeNN
+    priority: int = 0
+
+
+@dataclass
+class ExtraColumn:
+    column: ColumnClause | Column | KeyedColumnElement
+    cte: CTE
+    alias: str
+    need_join: bool = False
+
+
+@dataclass
+class QueryState:
+    order_list: List[OrderByFilter] = field(default_factory=list)
+    extra_columns: List[ExtraColumn] = field(default_factory=list)
+    cte_counter: int = 0
+    is_count_query: bool = False
 
 
 # Define Search results
