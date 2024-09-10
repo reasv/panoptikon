@@ -61,7 +61,8 @@ Results can be ordered by multiple fields by adding multiple objects.
     entity: Literal["file", "item"] = Field(
         default="file",
         title="Target Entity",
-        description="""The entity to query for.
+        description="""
+The entity to query for.
 `Items` are unique files.
 `Files` represent actual files on disk. They are unique by path.
 If you search for files, you will get duplicates for items that have multiple identical files.
