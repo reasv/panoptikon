@@ -3,7 +3,12 @@ from typing import List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 from panoptikon.db.pql.filters import Filters
-from panoptikon.db.pql.types import OrderByType, OrderType
+from panoptikon.db.pql.types import (
+    FileColumns,
+    ItemColumns,
+    OrderByType,
+    OrderType,
+)
 
 
 class Operator(BaseModel):
@@ -57,6 +62,13 @@ The order_args field is a list of { order_by: [field name], order: ["asc" or "de
 objects that define how the results should be ordered.
 Results can be ordered by multiple fields by adding multiple objects.
         """,
+    )
+    select: List[Union[FileColumns, ItemColumns]] = Field(
+        default_factory=lambda: ["sha256", "path", "last_modified", "type"],
+        title="Data to return",
+        description="""
+The columns to return in the query.
+""",
     )
     entity: Literal["file", "item"] = Field(
         default="file",

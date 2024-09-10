@@ -27,9 +27,44 @@ OrderByType = Literal[
     "time_added",
 ]
 
+FileColumns = Literal["sha256", "path", "filename", "last_modified"]
+ItemColumns = Literal[
+    "sha256",
+    "md5",
+    "type",
+    "size",
+    "width",
+    "height",
+    "duration",
+    "time_added",
+    "audio_tracks",
+    "video_tracks",
+    "subtitle_tracks",
+]
 
 OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
+
+
+def get_column(column: Union[FileColumns, ItemColumns]) -> Column:
+    from panoptikon.db.pql.tables import files, items
+
+    return {
+        "sha256": files.c.sha256,
+        "path": files.c.path,
+        "filename": files.c.filename,
+        "last_modified": files.c.last_modified,
+        "type": items.c.type,
+        "size": items.c.size,
+        "width": items.c.width,
+        "height": items.c.height,
+        "duration": items.c.duration,
+        "time_added": items.c.time_added,
+        "md5": items.c.md5,
+        "audio_tracks": items.c.audio_tracks,
+        "video_tracks": items.c.video_tracks,
+        "subtitle_tracks": items.c.subtitle_tracks,
+    }[column]
 
 
 def get_order_by_field(default: bool):
@@ -154,6 +189,14 @@ such as text search and embeddings search.
             column = func.row_number().over(order_by=direction(column))
 
         return column.label("order_rank")
+
+
+class SelectFields(BaseModel):
+    fields: List[str] = Field(
+        default_factory=list,
+        title="Fields to select",
+        description="The fields to select from the database.",
+    )
 
 
 # class ExtractedTextEmbeddingsFilter(BaseModel):

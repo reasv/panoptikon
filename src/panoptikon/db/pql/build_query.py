@@ -13,7 +13,7 @@ from panoptikon.db.pql.pql_model import (
     QueryElement,
 )
 from panoptikon.db.pql.preprocess_query import preprocess_query
-from panoptikon.db.pql.types import Filter, SortableFilter
+from panoptikon.db.pql.types import Filter, SortableFilter, get_column
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
@@ -67,7 +67,7 @@ def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
     full_query = full_query.join(items, items.c.id == item_id).join(
         files, files.c.id == file_id
     )
-
+    full_query = add_select_columns(input_query, full_query)
     # Add order by clauses
     full_query = build_order_by(
         full_query,
@@ -127,3 +127,9 @@ def process_query_element(
             ).cte(cte_name)
     else:
         raise ValueError("Unknown query element type")
+
+
+def add_select_columns(input_query: PQLQuery, query: Select) -> Select:
+    column_name_list = list(set(input_query.select))
+    columns = [get_column(col) for col in column_name_list]
+    return query.add_columns(*columns)
