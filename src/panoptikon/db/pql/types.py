@@ -201,10 +201,14 @@ class Filter(BaseModel):
             query = query.with_only_columns(
                 context.c.file_id, context.c.item_id
             )
-        filter_type = self.__class__.__name__
-        cte_name = f"n_{state.cte_counter}_{filter_type}"
+        cte_name = self.get_cte_name(state.cte_counter)
         state.cte_counter += 1
         return query.cte(cte_name)
+
+    def get_cte_name(self, counter: int) -> str:
+        filter_type = self.__class__.__name__
+        cte_name = f"n_{counter}_{filter_type}"
+        return cte_name
 
     def is_validated(self) -> bool:
         return self._validated
@@ -304,11 +308,15 @@ If set, the order_rank column will be returned with the results as this alias un
             return super().wrap_query(query, context, state)
 
         order_rank = literal_column("order_rank")
-        if order_rank is not None:
+        if order_rank is not None and (self.gt or self.lt):
+            query = select(
+                query.alias(f"wrapped_{self.get_cte_name(state.cte_counter)}")
+            )
             if self.gt:
                 query = query.where(order_rank > self.gt)
             if self.lt:
                 query = query.where(order_rank < self.lt)
+
         cte = super().wrap_query(query, context, state)
         if self.select_as:
             state.extra_columns.append(
