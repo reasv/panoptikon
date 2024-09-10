@@ -53,7 +53,7 @@ class MatchPath(SortableFilter):
             if args.filename_only
             else files_path_fts.c.path
         )
-        rank_column = self.get_rank_column(literal_column("rank"))
+        rank_column = self.get_rank_column(func.min(literal_column("rank")))
         return (
             select(context.c.file_id, context.c.item_id, rank_column)
             .join(

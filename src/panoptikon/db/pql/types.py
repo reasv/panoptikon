@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 from pypika.queries import Selectable
@@ -6,6 +6,7 @@ from sqlalchemy import (
     CTE,
     Column,
     ColumnClause,
+    Label,
     Select,
     asc,
     desc,
@@ -137,7 +138,7 @@ such as text search and embeddings search.
         "asc"
     )
 
-    def get_rank_column(self, column: ColumnClause) -> ColumnClause:
+    def get_rank_column(self, column: Any) -> ColumnClause | Label:
         """Applies the row number function to the column if `order_by_row_n` is set.
 
         Args:
