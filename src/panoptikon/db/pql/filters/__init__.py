@@ -17,7 +17,7 @@ from panoptikon.db.pql.filters.sortable.path_text import (
 )
 from panoptikon.db.pql.filters.type_in import TypeIn
 from panoptikon.db.pql.types import Filter, SortableFilter
-from panoptikon.db.pql.utils import QueryState
+from panoptikon.db.pql.utils import ExtraColumn, QueryState
 
 Filters = Union[InPaths, InBookmarks, TypeIn, MatchPath, MatchText]
 
@@ -33,12 +33,28 @@ def filter_function(filter: Filter, context: CTE, state: QueryState) -> CTE:
         if isinstance(filter, SortableFilter):
             rank_order = literal_column("rank_order")
             if rank_order is not None:
-                if filter.order_by_gt:
-                    query.where(rank_order > filter.order_by_gt)
-                elif filter.order_by_lt:
-                    query.where(rank_order < filter.order_by_lt)
+                if filter.gt:
+                    query.where(rank_order > filter.gt)
+                if filter.lt:
+                    query.where(rank_order < filter.lt)
 
     filter_type = filter.__class__.__name__
     cte_name = f"n_{state.cte_counter}_{filter_type}"
     state.cte_counter += 1
-    return query.cte(cte_name)
+    cte = query.cte(cte_name)
+
+    if (
+        isinstance(filter, SortableFilter)
+        and not state.is_count_query
+        and filter.select_as
+        and len(filter.select_as) > 0
+    ):
+        state.extra_columns.append(
+            ExtraColumn(
+                column=cte.c.rank_order,
+                cte=cte,
+                alias=filter.select_as,
+                need_join=not filter.order_by,
+            )
+        )
+    return cte

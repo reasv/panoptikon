@@ -65,7 +65,7 @@ Confidence scores are usually set by the model that extracted the text.
 
 class MatchText(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("asc")
+    direction: OrderTypeNN = get_order_direction_field("asc")
     match_text: MatchTextArgs = Field(
         ...,
         title="Match Extracted Text",

@@ -177,9 +177,9 @@ class Filter(BaseModel):
 
 class SortableFilter(Filter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("asc")
-    order_priority: int = get_order_priority_field(0)
-    order_by_row_n: bool = Field(
+    direction: OrderTypeNN = get_order_direction_field("asc")
+    priority: int = get_order_priority_field(0)
+    row_n: bool = Field(
         default=False,
         title="Use Row Number for rank column",
         description="""
@@ -195,10 +195,8 @@ rank_order types that may not be directly comparable,
 such as text search and embeddings search.
         """,
     )
-    order_by_row_n_direction: OrderTypeNN = get_order_direction_field_rownum(
-        "asc"
-    )
-    order_by_gt: Optional[int | str | float] = Field(
+    row_n_direction: OrderTypeNN = get_order_direction_field_rownum("asc")
+    gt: Optional[int | str | float] = Field(
         None,
         title="Order By Greater Than",
         description="""
@@ -210,7 +208,7 @@ used to determine the total number of results when count = True.
 With cursor-based pagination, you should probably not rely on count = True anyhow.
         """,
     )
-    order_by_lt: Optional[int | str | float] = Field(
+    lt: Optional[int | str | float] = Field(
         None,
         title="Order By Less Than",
         description="""
@@ -220,6 +218,13 @@ The type depends on the filter.
 Will be ignored in the count query, which is 
 used to determine the total number of results when count = True.
         """,
+    )
+    select_as: Optional[str] = Field(
+        None,
+        title="Order By Select As",
+        description="""
+If set, the order_rank column will be returned with the results as this alias under the "extra" object.
+""",
     )
 
     def derive_rank_column(self, column: Any) -> ColumnClause | Label:
@@ -232,8 +237,8 @@ used to determine the total number of results when count = True.
             ColumnClause: The new sorting column that will be exposed by this filter.
             Always aliased to "order_rank".
         """
-        if self.order_by and self.order_by_row_n:
-            dir_str = self.order_by_row_n_direction
+        if self.order_by and self.row_n:
+            dir_str = self.row_n_direction
             direction = asc if dir_str == "asc" else desc
             column = func.row_number().over(order_by=direction(column))
 

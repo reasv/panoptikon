@@ -1,6 +1,6 @@
 from typing import List, Tuple
 
-from sqlalchemy import CTE, Select, except_, func, select, union
+from sqlalchemy import CTE, Label, Select, except_, func, select, union
 
 from panoptikon.db.pql.filters import filter_function
 from panoptikon.db.pql.order_by import build_order_by
@@ -17,7 +17,9 @@ from panoptikon.db.pql.types import Filter, SortableFilter, get_column
 from panoptikon.db.pql.utils import OrderByFilter, QueryState
 
 
-def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
+def build_query(
+    input_query: PQLQuery, count_query: bool = False
+) -> Tuple[Select, List[str]]:
     from panoptikon.db.pql.tables import files, items
 
     # Preprocess the query to remove empty filters and validate args
@@ -61,7 +63,7 @@ def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
         full_query = select(file_id, item_id)
 
     if count_query:
-        return full_query.with_only_columns(func.count().label("total"))
+        return full_query.with_only_columns(func.count().label("total")), []
 
     # Join the item and file tables
     full_query = full_query.join(items, items.c.id == item_id).join(
@@ -76,12 +78,16 @@ def build_query(input_query: PQLQuery, count_query: bool = False) -> Select:
         state.order_list,
         input_query.order_args,
     )
+    # Add extra columns
+    full_query, extra_columns = add_extra_columns(
+        full_query, state, root_cte_name, file_id
+    )
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size
     offset = (page - 1) * page_size
     full_query = full_query.limit(page_size).offset(offset)
-    return full_query
+    return full_query, extra_columns
 
 
 def process_query_element(
@@ -95,8 +101,8 @@ def process_query_element(
                 state.order_list.append(
                     OrderByFilter(
                         cte=cte,
-                        direction=el.order_direction,
-                        priority=el.order_priority,
+                        direction=el.direction,
+                        priority=el.priority,
                     )
                 )
         return cte
@@ -135,3 +141,27 @@ def add_select_columns(input_query: PQLQuery, query: Select) -> Select:
     input_query.select = list(set(input_query.select))
     columns = [get_column(col) for col in input_query.select]
     return query.add_columns(*columns)
+
+
+def add_extra_columns(
+    query: Select,
+    state: QueryState,
+    root_cte_name: str | None,
+    file_id: Label,
+) -> Tuple[Select, List[str]]:
+    column_aliases = []
+    for i, extra_column in enumerate(state.extra_columns):
+        column, cte, alias = (
+            extra_column.column,
+            extra_column.cte,
+            extra_column.alias,
+        )
+        query = query.add_columns(column.label(f"extra_{i}"))
+        column_aliases.append(alias)
+        if extra_column.need_join and cte.name != root_cte_name:
+            query = query.join(
+                cte,
+                cte.c.file_id == file_id,
+                isouter=True,
+            )
+    return query, column_aliases

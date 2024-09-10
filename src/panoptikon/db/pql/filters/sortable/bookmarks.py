@@ -46,10 +46,8 @@ If empty, all bookmarks will be included.
 
 class InBookmarks(SortableFilter):
     order_by: bool = get_order_by_field(False)
-    order_direction: OrderTypeNN = get_order_direction_field("desc")
-    order_by_row_n_direction: OrderTypeNN = get_order_direction_field_rownum(
-        "desc"
-    )
+    direction: OrderTypeNN = get_order_direction_field("desc")
+    row_n_direction: OrderTypeNN = get_order_direction_field_rownum("desc")
     in_bookmarks: InBookmarksArgs = Field(
         ...,
         title="Restrict search to Bookmarks",
