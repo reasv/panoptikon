@@ -38,9 +38,12 @@ class MatchTextArgs(BaseModel):
         description="""
 Only filter out text based on the other criteria,
 without actually matching the query.
-If set to True, the query field will be ignored.
-If set to False (default), this filter will be *skipped* entirely
-if the query field is empty.
+
+If set to True, the match field will be ignored.
+Order by, select_as, and row_n will also be ignored.
+
+If set to False (default), and the match field is empty,
+this filter will be skipped entirely.
 """,
     )
     targets: List[str] = Field(
@@ -127,6 +130,10 @@ including tags and OCR text
             return self.set_validated(False)
         if self.match_text.filter_only:
             self.match_text.select_snippet_as = None
+            self.order_by = False
+            self.select_as = None
+            self.row_n = False
+            self.match_text.match = ""
 
         if not self.match_text.raw_fts5_match:
             self.match_text.match = parse_and_escape_query(
