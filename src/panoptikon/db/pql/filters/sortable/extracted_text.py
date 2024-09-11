@@ -104,7 +104,6 @@ Confidence scores are usually set by the model that extracted the text.
         default=None,
         title="Return matching text snippet",
         description="""
-Only works in text-* queries. Ignored in item and file search.
 If set, the best matching text *snippet* will be included in the `extra` dict of each result under this key
 """,
     )
@@ -190,27 +189,63 @@ including tags and OCR text
             )
         if args.min_confidence:
             criteria.append(extracted_text.c.confidence >= args.min_confidence)
+
+        snippet_col = func.snippet(
+            literal_column("extracted_text_fts"),
+            -1,
+            args.s_start_tag,
+            args.s_end_tag,
+            args.s_ellipsis,
+            args.s_max_len,
+        ).label("snip")
+
         if not state.is_text_query:
-            rank_column = func.min(literal_column("rank"))
-            if args.filter_only:
-                rank_column = literal(1)
-            return self.wrap_query(
-                (
-                    select(
-                        *get_std_cols(context, state),
-                        self.derive_rank_column(rank_column),
+            select_query = (
+                select(*get_std_cols(context, state))
+                .join(item_data, item_data.c.item_id == context.c.item_id)
+                .join(setters, setters.c.id == item_data.c.setter_id)
+                .join(extracted_text, item_data.c.id == extracted_text.c.id)
+                .join(
+                    extracted_text_fts,
+                    literal_column("extracted_text_fts.rowid")
+                    == extracted_text.c.id,
+                )
+                .where(and_(*criteria))
+            )
+            if args.select_snippet_as:
+                rank_column = literal_column("rank")
+                # Need to partition by file_id to get the best text result per file
+                row_number_col = (
+                    func.rank()
+                    .over(
+                        partition_by=context.c.file_id,
+                        order_by=asc(rank_column),
                     )
-                    .join(item_data, item_data.c.item_id == context.c.item_id)
-                    .join(setters, setters.c.id == item_data.c.setter_id)
-                    .join(extracted_text, item_data.c.id == extracted_text.c.id)
-                    .join(
-                        extracted_text_fts,
-                        literal_column("extracted_text_fts.rowid")
-                        == extracted_text.c.id,
+                    .label("rn")
+                )
+                select_query = select_query.add_columns(
+                    snippet_col, rank_column, row_number_col
+                )
+                # Wrap as subquery to filter out only the best text result per file
+                select_query = select(
+                    select_query.cte(
+                        f"rownum_{self.get_cte_name(state.cte_counter)}"
                     )
-                    .where(and_(*criteria))
-                    .group_by(context.c.file_id)
-                ),
+                ).where(literal_column("rn") == 1)
+
+            else:
+                # Normal GROUP BY query
+                select_query = select_query.group_by(context.c.file_id)
+                rank_column = func.min(literal_column("rank"))
+                if args.filter_only:
+                    rank_column = literal(1)
+
+            select_query = select_query.add_columns(
+                self.derive_rank_column(rank_column)
+            )
+
+            cte = self.wrap_query(
+                select_query,
                 context,
                 state,
             )
@@ -219,24 +254,16 @@ including tags and OCR text
             rank_column = literal_column("rank")
             if args.filter_only:
                 rank_column = literal(1)
+
+            columns = [
+                *get_std_cols(context, state),
+                self.derive_rank_column(rank_column),
+            ]
             if args.select_snippet_as:
-                snippet_col = func.snippet(
-                    literal_column("extracted_text_fts"),
-                    -1,
-                    args.s_start_tag,
-                    args.s_end_tag,
-                    args.s_ellipsis,
-                    args.s_max_len,
-                ).label("snippet")
-            else:
-                snippet_col = literal(None).label("snippet")
+                columns.append(snippet_col)
             cte = self.wrap_query(
                 (
-                    select(
-                        *get_std_cols(context, state),
-                        self.derive_rank_column(rank_column),
-                        snippet_col,
-                    )
+                    select(*columns)
                     .join(item_data, item_data.c.id == context.c.text_id)
                     .join(setters, setters.c.id == item_data.c.setter_id)
                     .join(
@@ -252,13 +279,13 @@ including tags and OCR text
                 context,
                 state,
             )
-            if args.select_snippet_as and not state.is_count_query:
-                state.extra_columns.append(
-                    ExtraColumn(
-                        column=cte.c.snippet,
-                        cte=cte,
-                        alias=args.select_snippet_as,
-                        need_join=not self.order_by,
-                    )
+        if args.select_snippet_as and not state.is_count_query:
+            state.extra_columns.append(
+                ExtraColumn(
+                    column=cte.c.snip,
+                    cte=cte,
+                    alias=args.select_snippet_as,
+                    need_join=not self.order_by,
                 )
-            return cte
+            )
+        return cte
