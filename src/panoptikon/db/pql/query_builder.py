@@ -42,13 +42,13 @@ def build_query(
         query_root = preprocess_query(query_root)
     # Initialize the state object
     state = QueryState(is_count_query=count_query)
-    if input_query.entity.startswith("text"):
+    if input_query.entity == "text":
         state.is_text_query = True
     root_cte_name: str | None = None
     # Start the recursive processing
     if query_root:
         start = select(files.c.id.label("file_id"), files.c.item_id)
-        if input_query.entity.startswith("text"):
+        if input_query.entity == "text":
             start = (
                 start.join(item_data, item_data.c.item_id == files.c.item_id)
                 .join(extracted_text, extracted_text.c.id == item_data.c.id)
@@ -66,7 +66,7 @@ def build_query(
             root_cte.c.file_id.label("file_id"),
             root_cte.c.item_id.label("item_id"),
         )
-        if input_query.entity.startswith("text"):
+        if input_query.entity == "text":
             text_id = root_cte.c.text_id.label("text_id")
         else:
             # Not actually used, but needed for type checking
@@ -77,7 +77,7 @@ def build_query(
         )
         # Not actually used, but needed for type checking
         text_id = extracted_text.c.id.label("text_id")
-        if input_query.entity.startswith("file"):
+        if input_query.entity == "text":
             # We must join to get the corresponding item and files
             text_cte = (
                 select(file_id, item_id, text_id)
@@ -92,7 +92,7 @@ def build_query(
             )
             root_cte_name = text_cte.name
 
-    if input_query.entity.startswith("text"):
+    if input_query.entity == "text":
         full_query = select(file_id, item_id, text_id)
     else:
         full_query = select(file_id, item_id)
@@ -109,13 +109,13 @@ def build_query(
     full_query = full_query.join(items, items.c.id == item_id).join(
         files, files.c.id == file_id
     )
-    if input_query.entity.startswith("text"):
+    if input_query.entity == "text":
         full_query = (
             full_query.join(extracted_text, extracted_text.c.id == text_id)
             .join(item_data, item_data.c.id == extracted_text.c.id)
             .join(setters, setters.c.id == item_data.c.setter_id)
         )
-    if not input_query.entity.startswith("text"):
+    if not input_query.entity == "text":
         if contains_text_columns(input_query.select):
             logger.error("Tried to select text columns in a non-text query")
             raise ValueError("Tried to select text columns in a non-text query")
@@ -128,7 +128,7 @@ def build_query(
 
     full_query = add_select_columns(input_query, full_query)
     # Add order by clauses
-    text_id = text_id if input_query.entity.startswith("text") else None
+    text_id = text_id if input_query.entity == "text" else None
     full_query, order_by_conds = build_order_by(
         full_query,
         root_cte_name,
