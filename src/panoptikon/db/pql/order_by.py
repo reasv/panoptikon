@@ -2,6 +2,7 @@ from itertools import groupby
 from typing import List, Tuple, Type, Union
 
 from sqlalchemy import (
+    Column,
     Label,
     Select,
     UnaryExpression,
@@ -32,14 +33,25 @@ def build_order_by(
 ):
     full_order_list = combine_order_lists(order_list, order_args)
     order_by_conditions: List[UnaryExpression] = []
-    for ospec in full_order_list:
+    order_columns: List[Column] = []
+    for index, ospec in enumerate(full_order_list):
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
             field = get_column(order_by)
+            if select_conds:
+                label = f"o{index}_{order_by}"
+                query = query.column(field.label(label))
+                field = Column(label)
+                order_columns.append(field)
             order_by_conditions.append(nulls_last(direction(field)))
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
             field = ospec.cte.c.order_rank
+            if select_conds:
+                label = f"o{index}_{ospec.cte.name}_rank"
+                query = query.column(field.label(label))
+                field = Column(label)
+                order_columns.append(field)
 
             join_cond = ospec.cte.c.file_id == file_id
             if text_id is not None:
@@ -72,8 +84,14 @@ def build_order_by(
                         join_cond,
                         isouter=True,
                     )
+                field = spec.cte.c.order_rank
+                if select_conds:
+                    label = f"o{index}_{spec.cte.name}_rank"
+                    query = query.column(field.label(label))
+                    field = Column(label)
+                    order_columns.append(field)
 
-                columns.append(spec.cte.c.order_rank)
+                columns.append(field)
 
             # For ascending order, use MIN to get the smallest non-null value
             if direction == asc:
@@ -92,7 +110,7 @@ def build_order_by(
                     ]
                 )
             order_by_conditions.append(direction(coalesced_column))
-    return query, order_by_conditions
+    return query, order_by_conditions, order_columns
 
 
 def combine_order_lists(

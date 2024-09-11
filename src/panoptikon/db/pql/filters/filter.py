@@ -36,7 +36,7 @@ class Filter(BaseModel):
 
     def get_cte_name(self, counter: int) -> str:
         filter_type = self.__class__.__name__
-        cte_name = f"n_{counter}_{filter_type}"
+        cte_name = f"n{counter}_{filter_type}"
         return cte_name
 
     def is_validated(self) -> bool:

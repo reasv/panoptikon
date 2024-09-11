@@ -136,7 +136,7 @@ def build_query(
     ]
     # Add order by clauses
     text_id = text_id if input_query.entity == "text" else None
-    full_query, order_by_conds = build_order_by(
+    full_query, order_by_conds, order_by_cols = build_order_by(
         full_query,
         root_cte_name,
         file_id,
@@ -159,8 +159,12 @@ def build_query(
         ).cte("partition_cte")
 
         # Only select explicitly requested columns
-        full_query = select(*[full_query.c[k] for k in selected_columns]).where(
-            full_query.c.partition_rownum == 1
+        full_query = (
+            select(*[full_query.c[k] for k in selected_columns])
+            .where(full_query.c.partition_rownum == 1)
+            .add_columns(
+                *[full_query.c[c.key].label(c.key) for c in order_by_cols]
+            )
         )
 
     full_query = full_query.order_by(*order_by_conds)
@@ -200,13 +204,13 @@ def process_query_element(
                 subq = process_query_element(sub_element, context, state)
                 # Combine the subqueries using UNION (OR logic)
                 union_list.append(select(*get_std_cols(subq, state)))
-            cte_name = f"n_{state.cte_counter}_or"
+            cte_name = f"n{state.cte_counter}_or"
             state.cte_counter += 1
             return union(*union_list).cte(cte_name)
 
         elif isinstance(el, NotOperator):
             subquery = process_query_element(el.not_, context, state)
-            cte_name = f"n_{state.cte_counter}_not_{subquery.name}"
+            cte_name = f"n{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
 
             return except_(
