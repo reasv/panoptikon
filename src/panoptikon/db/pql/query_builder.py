@@ -258,7 +258,9 @@ def add_extra_columns(
         if extra_column.need_join and cte.name != root_cte_name:
             join_cond = cte.c.file_id == file_id
             if text_id is not None:
-                join_cond = cte.c.text_id == text_id
+                # For text-based queries, we need to join on the text_id as well
+                # The results are unique on file_id, text_id rather than just file_id
+                join_cond = join_cond & cte.c.text_id == text_id
             query = query.join(
                 cte,
                 join_cond,
