@@ -108,6 +108,27 @@ Only works in text-* queries. Ignored in item and file search.
 If set, the best matching text *snippet* will be included in the `extra` dict of each result under this key
 """,
     )
+    s_max_len: int = Field(
+        default=20,
+        ge=0,
+        title="Maximum Snippet Length",
+        description="The maximum length (in tokens) of the snippet returned by select_snippet_as",
+    )
+    s_ellipsis: str = Field(
+        default="...",
+        title="Snippet Ellipsis",
+        description="The ellipsis to use when truncating the snippet",
+    )
+    s_start_tag: str = Field(
+        default="<b>",
+        title="Snippet Start Tag",
+        description="The tag to use at the beginning of the snippet",
+    )
+    s_end_tag: str = Field(
+        default="</b>",
+        title="Snippet End Tag",
+        description="The tag to use at the end of the snippet",
+    )
 
 
 class MatchText(SortableFilter):
@@ -201,10 +222,11 @@ including tags and OCR text
             if args.select_snippet_as:
                 snippet_col = func.snippet(
                     literal_column("extracted_text_fts"),
-                    "<b>",
-                    "</b>",
-                    "...",
-                    20,
+                    -1,
+                    args.s_start_tag,
+                    args.s_end_tag,
+                    args.s_ellipsis,
+                    args.s_max_len,
                 ).label("snippet")
             else:
                 snippet_col = literal(None).label("snippet")
