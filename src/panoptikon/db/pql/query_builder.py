@@ -136,7 +136,7 @@ def build_query(
     ]
     # Add order by clauses
     text_id = text_id if input_query.entity == "text" else None
-    full_query, order_by_conds, order_by_cols = build_order_by(
+    full_query, order_by_conds, order_fns = build_order_by(
         full_query,
         root_cte_name,
         file_id,
@@ -157,17 +157,15 @@ def build_query(
         full_query = full_query.add_columns(
             rownum.label("partition_rownum")
         ).cte("partition_cte")
-
+        outer_order_by_conds = [f(full_query) for f in order_fns]
+        [print(c) for c in outer_order_by_conds]
         # Only select explicitly requested columns
-        full_query = (
-            select(*[full_query.c[k] for k in selected_columns])
-            .where(full_query.c.partition_rownum == 1)
-            .add_columns(
-                *[full_query.c[c.key].label(c.key) for c in order_by_cols]
-            )
+        full_query = select(*[full_query.c[k] for k in selected_columns]).where(
+            full_query.c.partition_rownum == 1
         )
-
-    full_query = full_query.order_by(*order_by_conds)
+        full_query = full_query.order_by(*outer_order_by_conds)
+    else:
+        full_query = full_query.order_by(*order_by_conds)
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size

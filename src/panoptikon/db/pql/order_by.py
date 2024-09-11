@@ -39,30 +39,25 @@ def build_order_by(
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
             field = get_column(order_by)
+            order_by_conditions.append(nulls_last(direction(field)))
+
             if select_conds:
                 label = f"o{index}_{order_by}"
                 query = query.column(field.label(label))
-
-                def gen_order_fn(cte: CTE) -> UnaryExpression:
-                    return nulls_last(direction(cte.c[label]))
-
+                gen_order_fn = lambda cte: nulls_last(direction(cte.c[label]))
                 order_fns.append(gen_order_fn)
 
-            order_by_conditions.append(nulls_last(direction(field)))
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
             field = ospec.cte.c.order_rank
+            order_by_conditions.append(nulls_last(direction(field)))
+
             if select_conds:
                 label = f"o{index}_{ospec.cte.name}_rank"
                 query = query.column(field.label(label))
-
-                # Recreates the order function from a CTE
-                def gen_order_fn(cte: CTE) -> UnaryExpression:
-                    return nulls_last(direction(cte.c[label]))
-
+                gen_order_fn = lambda cte: nulls_last(direction(cte.c[label]))
                 order_fns.append(gen_order_fn)
 
-            order_by_conditions.append(nulls_last(direction(field)))
             join_cond = ospec.cte.c.file_id == file_id
             if text_id is not None:
                 # For text-based queries, we need to join on the text_id as well
@@ -125,12 +120,9 @@ def build_order_by(
                 return direction(coalesced_column)
 
             if select_conds:
-
-                def gen_order_fn(cte: CTE) -> UnaryExpression:
-                    return coalesce_cols(
-                        [cte.c[label] for label in select_labels]
-                    )
-
+                gen_order_fn = lambda cte: coalesce_cols(
+                    [cte.c[label] for label in select_labels]
+                )
                 order_fns.append(gen_order_fn)
 
             order_by_conditions.append(coalesce_cols(columns))
