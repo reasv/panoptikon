@@ -125,6 +125,15 @@ def build_query(
             raise ValueError(
                 "Tried to order by text columns in a non-text query"
             )
+        if input_query.partition_by and contains_text_columns(
+            input_query.partition_by
+        ):
+            logger.error(
+                "Tried to partition by text columns in a non-text query"
+            )
+            raise ValueError(
+                "Tried to partition by text columns in a non-text query"
+            )
 
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns

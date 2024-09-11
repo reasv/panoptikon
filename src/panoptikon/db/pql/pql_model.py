@@ -90,14 +90,21 @@ Most of the same filters can be used on both.
 "text" queries will include "text_id" in each result. "file_id" and "item_id" are always included.
 """,
     )
-    partition_by: Optional[List[Literal["text_id", "file_id", "item_id"]]] = (
-        Field(
-            default=None,
-            title="Partition results By",
-            description="""
-Group results by the specified column(s) and return the first result for each group according to all of the order settings of the query.
+    partition_by: Optional[
+        List[Union[FileColumns, ItemColumns, TextColumns]]
+    ] = Field(
+        default=None,
+        title="Partition results By",
+        description="""
+Group results by the values of the specified column(s) and return the first result
+for each group according to all of the order settings of the query.
+
+For example, if you partition by "item_id", you'll get one result per unique item.
+If you partition by "file_id", you'll get one result per unique file.
+Multiple columns yield one result for each unique combination of values for those columns.
+
+You cannot partition by text columns if the entity is "file".
 """,
-        )
     )
     page: int = Field(default=1)
     page_size: int = Field(default=10)
