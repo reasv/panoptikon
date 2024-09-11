@@ -229,8 +229,6 @@ def process_query_element(
 
 
 def add_select_columns(input_query: PQLQuery, query: Select) -> Select:
-    # Always include the path, sha256, type, and last_modified columns
-    input_query.select.extend(["path", "sha256", "type", "last_modified"])
     input_query.select = list(set(input_query.select))
     # These columns are already included
     input_query.select = [

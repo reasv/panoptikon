@@ -70,7 +70,6 @@ Results can be ordered by multiple fields by adding multiple objects.
         description="""
 The columns to return in the query.
 The default columns are sha256, path, last_modified, and type.
-These columns are always returned, even if they are not in the select list.
 Columns belonging to text can only be selected if the entity is "text".
 """,
     )
