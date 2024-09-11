@@ -1,7 +1,5 @@
 from typing import Union
 
-from sqlalchemy import CTE, literal_column
-
 from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.sortable.bookmarks import (
     InBookmarks,
@@ -16,11 +14,5 @@ from panoptikon.db.pql.filters.sortable.path_text import (
     MatchPathArgs,
 )
 from panoptikon.db.pql.filters.type_in import TypeIn
-from panoptikon.db.pql.types import (
-    ExtraColumn,
-    Filter,
-    QueryState,
-    SortableFilter,
-)
 
 Filters = Union[InPaths, InBookmarks, TypeIn, MatchPath, MatchText]

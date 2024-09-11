@@ -14,15 +14,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.expression import CTE, select
 
+from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.types import (
     ExtraColumn,
     OrderTypeNN,
     QueryState,
-    SortableFilter,
     get_order_by_field,
     get_order_direction_field,
+    get_std_cols,
 )
-from panoptikon.db.pql.utils import get_std_cols
 from panoptikon.db.search.utils import parse_and_escape_query
 
 

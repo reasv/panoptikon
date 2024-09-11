@@ -1,3 +1,4 @@
+from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.pql_model import (
     AndOperator,
     NotOperator,
@@ -5,7 +6,6 @@ from panoptikon.db.pql.pql_model import (
     OrOperator,
     QueryElement,
 )
-from panoptikon.db.pql.types import Filter
 
 
 def preprocess_query(el: QueryElement) -> QueryElement | None:

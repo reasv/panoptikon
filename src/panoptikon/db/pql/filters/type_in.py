@@ -4,8 +4,8 @@ from pydantic import Field
 from sqlalchemy import Select, or_
 from sqlalchemy.sql.expression import CTE, select
 
-from panoptikon.db.pql.types import Filter, QueryState
-from panoptikon.db.pql.utils import get_std_cols
+from panoptikon.db.pql.filters.filter import Filter
+from panoptikon.db.pql.types import QueryState, get_std_cols
 
 
 class TypeIn(Filter):

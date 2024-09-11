@@ -4,15 +4,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Select, and_, asc, desc, func, or_
 from sqlalchemy.sql.expression import CTE, select
 
+from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     QueryState,
-    SortableFilter,
     get_order_by_field,
     get_order_direction_field,
     get_order_direction_field_rownum,
+    get_std_cols,
+    get_std_group_by,
 )
-from panoptikon.db.pql.utils import get_std_cols, get_std_group_by
 
 
 class InBookmarksArgs(BaseModel):

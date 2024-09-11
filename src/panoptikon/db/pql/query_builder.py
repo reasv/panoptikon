@@ -3,6 +3,8 @@ from typing import List, Tuple
 
 from sqlalchemy import CTE, Column, Label, Select, except_, func, select, union
 
+from panoptikon.db.pql.filters.filter import Filter
+from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.order_by import build_order_by
 from panoptikon.db.pql.pql_model import (
     AndOperator,
@@ -14,14 +16,12 @@ from panoptikon.db.pql.pql_model import (
 )
 from panoptikon.db.pql.preprocess_query import preprocess_query
 from panoptikon.db.pql.types import (
-    Filter,
     OrderByFilter,
     QueryState,
-    SortableFilter,
     contains_text_columns,
     get_column,
+    get_std_cols,
 )
-from panoptikon.db.pql.utils import get_std_cols
 
 logger = logging.getLogger(__name__)
 

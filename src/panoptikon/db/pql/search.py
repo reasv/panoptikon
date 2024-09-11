@@ -71,7 +71,7 @@ def search_pql(
 
     def results_generator():
         while row := cursor.fetchone():
-            result = SearchResult(file_id=row[0], item_id=row[1])
+            result = SearchResult(file_id=0, item_id=0)
             map_row_to_class(row, result)
             result.extra = get_extra_columns(row, extra_columns)
             if query.check_path and not os.path.exists(result.path):
