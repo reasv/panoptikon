@@ -158,7 +158,8 @@ def build_query(
             rownum.label("partition_rownum")
         ).cte("partition_cte")
         outer_order_by_conds = [f(full_query) for f in order_fns]
-        [print(c) for c in outer_order_by_conds]
+        print([str(c) for c in outer_order_by_conds])
+
         # Only select explicitly requested columns
         full_query = select(*[full_query.c[k] for k in selected_columns]).where(
             full_query.c.partition_rownum == 1

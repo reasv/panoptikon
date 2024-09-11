@@ -44,8 +44,9 @@ def build_order_by(
             if select_conds:
                 label = f"o{index}_{order_by}"
                 query = query.column(field.label(label))
-                gen_order_fn = lambda cte: nulls_last(direction(cte.c[label]))
-                order_fns.append(gen_order_fn)
+                order_fns.append(
+                    lambda cte: nulls_last(direction(cte.c[label]))
+                )
 
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
@@ -55,8 +56,9 @@ def build_order_by(
             if select_conds:
                 label = f"o{index}_{ospec.cte.name}_rank"
                 query = query.column(field.label(label))
-                gen_order_fn = lambda cte: nulls_last(direction(cte.c[label]))
-                order_fns.append(gen_order_fn)
+                order_fns.append(
+                    lambda cte: nulls_last(direction(cte.c[label]))
+                )
 
             join_cond = ospec.cte.c.file_id == file_id
             if text_id is not None:
@@ -120,10 +122,12 @@ def build_order_by(
                 return direction(coalesced_column)
 
             if select_conds:
-                gen_order_fn = lambda cte: coalesce_cols(
-                    [cte.c[label] for label in select_labels]
+
+                order_fns.append(
+                    lambda cte: coalesce_cols(
+                        [cte.c[label] for label in select_labels]
+                    )
                 )
-                order_fns.append(gen_order_fn)
 
             order_by_conditions.append(coalesce_cols(columns))
     return query, order_by_conditions, order_fns
