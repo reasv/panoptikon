@@ -173,7 +173,7 @@ including tags and OCR text
         args = self.match_text
         criteria = [extracted_text_fts.c.text.match(args.match)]
         if args.filter_only:
-            criteria.append(text("1 = 1"))
+            criteria = []
         if args.min_length:
             criteria.append(extracted_text.c.text_text >= args.min_length)
         if args.max_length:
