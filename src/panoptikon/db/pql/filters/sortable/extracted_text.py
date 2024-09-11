@@ -297,7 +297,7 @@ including tags and OCR text
                     column=cte.c.snip,
                     cte=cte,
                     alias=args.select_snippet_as,
-                    need_join=not self.order_by,
+                    need_join=(not self.order_by and not self.select_as),
                 )
             )
         return cte
