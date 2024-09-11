@@ -127,6 +127,13 @@ def build_query(
             )
 
     full_query = add_select_columns(input_query, full_query)
+    # Add extra columns
+    full_query, extra_columns = add_extra_columns(
+        full_query, state, root_cte_name, file_id, text_id
+    )
+    selected_columns = [
+        col.key for col in full_query.selected_columns if col.key
+    ]
     # Add order by clauses
     text_id = text_id if input_query.entity == "text" else None
     full_query, order_by_conds = build_order_by(
@@ -134,14 +141,11 @@ def build_query(
         root_cte_name,
         file_id,
         text_id,
-        state.order_list,
-        input_query.order_args,
+        select_conds=True if input_query.partition_by is not None else False,
+        order_list=state.order_list,
+        order_args=input_query.order_args,
     )
 
-    # Add extra columns
-    full_query, extra_columns = add_extra_columns(
-        full_query, state, root_cte_name, file_id, text_id
-    )
     if input_query.partition_by:
         # Add row number column for partitioning, and get the first row of each partition
         partition_by_cols = [
@@ -153,7 +157,9 @@ def build_query(
         full_query = full_query.add_columns(
             rownum.label("partition_rownum")
         ).cte("partition_cte")
-        full_query = select(full_query).where(
+
+        # Only select explicitly requested columns
+        full_query = select(*[full_query.c[k] for k in selected_columns]).where(
             full_query.c.partition_rownum == 1
         )
 

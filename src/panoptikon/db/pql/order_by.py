@@ -10,6 +10,7 @@ from sqlalchemy import (
     func,
     nulls_last,
 )
+from sqlalchemy.sql.elements import KeyedColumnElement
 
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.types import (
@@ -25,6 +26,7 @@ def build_order_by(
     root_cte_name: str | None,
     file_id: Label,
     text_id: Label | None,
+    select_conds: bool,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
