@@ -159,7 +159,7 @@ def build_query(
     full_query = add_select_columns(input_query, full_query)
     # Add order by clauses
     text_id = text_id if input_query.entity.startswith("text") else None
-    full_query = build_order_by(
+    full_query, order_by_conds = build_order_by(
         full_query,
         root_cte_name,
         file_id,
@@ -167,6 +167,7 @@ def build_query(
         state.order_list,
         input_query.order_args,
     )
+    full_query = full_query.order_by(*order_by_conds)
     # Add extra columns
     full_query, extra_columns = add_extra_columns(
         full_query, state, root_cte_name, file_id, text_id

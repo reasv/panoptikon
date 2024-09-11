@@ -1,7 +1,15 @@
 from itertools import groupby
 from typing import List, Tuple, Type, Union
 
-from sqlalchemy import Label, Select, asc, desc, func, nulls_last
+from sqlalchemy import (
+    Label,
+    Select,
+    UnaryExpression,
+    asc,
+    desc,
+    func,
+    nulls_last,
+)
 
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.types import (
@@ -21,12 +29,12 @@ def build_order_by(
     order_args: List[OrderArgs],
 ):
     full_order_list = combine_order_lists(order_list, order_args)
-
+    order_by_conditions: List[UnaryExpression] = []
     for ospec in full_order_list:
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
             field = get_column(order_by)
-            query = query.order_by(nulls_last(direction(field)))
+            order_by_conditions.append(nulls_last(direction(field)))
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
             field = ospec.cte.c.order_rank
@@ -42,7 +50,7 @@ def build_order_by(
                     join_cond,
                     isouter=True,
                 )
-            query = query.order_by(nulls_last(direction(field)))
+            order_by_conditions.append(nulls_last(direction(field)))
         elif isinstance(ospec, list):
             # Coalesce filter order by columns with the same priority
             columns = []  # Initialize variable for coalesced column
@@ -81,8 +89,8 @@ def build_order_by(
                         for column in columns
                     ]
                 )
-            query = query.order_by(direction(coalesced_column))
-    return query
+            order_by_conditions.append(direction(coalesced_column))
+    return query, order_by_conditions
 
 
 def combine_order_lists(
