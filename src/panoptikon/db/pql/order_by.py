@@ -37,99 +37,40 @@ def build_order_by(
     order_fns: List[Callable[[CTE], UnaryExpression]] = []
     for index, ospec in enumerate(full_order_list):
         if isinstance(ospec, OrderArgs):
-            order_by, direction = get_order_by_and_direction(ospec)
-            field = get_column(order_by)
-            order_by_conditions.append(nulls_last(direction(field)))
-
-            if select_conds:
-                label = f"o{index}_{order_by}"
-                query = query.column(field.label(label))
-                order_fns.append(
-                    lambda cte: nulls_last(direction(cte.c[label]))
-                )
+            query, order_by_condition, order_fn = apply_order_args(
+                ospec, index, query, select_conds
+            )
+            order_by_conditions.append(order_by_condition)
+            if order_fn:
+                order_fns.append(order_fn)
 
         elif isinstance(ospec, OrderByFilter):
-            direction = asc if ospec.direction == "asc" else desc
-            field = ospec.cte.c.order_rank
-            order_by_conditions.append(nulls_last(direction(field)))
-
-            if select_conds:
-                label = f"o{index}_{ospec.cte.name}_rank"
-                query = query.column(field.label(label))
-                order_fns.append(
-                    lambda cte: nulls_last(direction(cte.c[label]))
-                )
-
-            join_cond = ospec.cte.c.file_id == file_id
-            if text_id is not None:
-                # For text-based queries, we need to join on the text_id as well
-                join_cond = join_cond & (ospec.cte.c.text_id == text_id)
-            # If this is not the last CTE in the chain, we have to LEFT JOIN it
-            if ospec.cte.name != root_cte_name:
-                query = query.join(
-                    ospec.cte,
-                    join_cond,
-                    isouter=True,
-                )
+            query, order_by_condition, order_fn = apply_order_filter(
+                ospec,
+                index,
+                query,
+                select_conds,
+                root_cte_name,
+                file_id,
+                text_id,
+            )
+            order_by_conditions.append(order_by_condition)
+            if order_fn:
+                order_fns.append(order_fn)
 
         elif isinstance(ospec, list):
-            # Coalesce filter order by columns with the same priority
-            columns = []  # Initialize variable for coalesced column
-            direction = asc if ospec[0].direction == "asc" else desc
-
-            select_labels: List[str] = []
-            for spec in ospec:
-                assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
-                # If this is not the last CTE in the chain, we have to LEFT JOIN it
-                join_cond = spec.cte.c.file_id == file_id
-                if text_id is not None:
-                    # For text-based queries, we need to join on the text_id as well
-                    join_cond = join_cond & (spec.cte.c.text_id == text_id)
-
-                if spec.cte.name != root_cte_name:
-                    query = query.join(
-                        spec.cte,
-                        join_cond,
-                        isouter=True,
-                    )
-                field = spec.cte.c.order_rank
-                columns.append(field)
-
-                if select_conds:
-                    label = f"o{index}_{spec.cte.name}_rank"
-                    query = query.column(field.label(label))
-                    select_labels.append(label)
-
-            def coalesce_cols(
-                cols: List[KeyedColumnElement],
-            ) -> UnaryExpression:
-                # For ascending order, use MIN to get the smallest non-null value
-                if direction == asc:
-                    coalesced_column = func.min(
-                        *[
-                            func.coalesce(column, VERY_LARGE_NUMBER)
-                            for column in cols
-                        ]
-                    )
-                # For descending order, use MAX to get the largest non-null value
-                else:
-                    coalesced_column = func.max(
-                        *[
-                            func.coalesce(column, VERY_SMALL_NUMBER)
-                            for column in cols
-                        ]
-                    )
-                return direction(coalesced_column)
-
-            if select_conds:
-
-                order_fns.append(
-                    lambda cte: coalesce_cols(
-                        [cte.c[label] for label in select_labels]
-                    )
-                )
-
-            order_by_conditions.append(coalesce_cols(columns))
+            query, order_by_condition, order_fn = coalesce_order_filters(
+                ospec,
+                index,
+                query,
+                select_conds,
+                root_cte_name,
+                file_id,
+                text_id,
+            )
+            order_by_conditions.append(order_by_condition)
+            if order_fn:
+                order_fns.append(order_fn)
     return query, order_by_conditions, order_fns
 
 
@@ -195,3 +136,119 @@ def get_order_by_and_direction(
     else:
         direction = asc if direction == "asc" else desc
     return (order_by, direction)
+
+
+def apply_order_args(
+    args: OrderArgs,
+    index: int,
+    query: Select,
+    select_conds: bool,
+) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
+    order_by, direction = get_order_by_and_direction(args)
+    field = get_column(order_by)
+
+    gen = None
+    if select_conds:
+        label = f"o{index}_{order_by}"
+        query = query.column(field.label(label))
+        gen = lambda cte: nulls_last(direction(cte.c[label]))
+
+    return (
+        query,
+        nulls_last(direction(field)),
+        gen,
+    )
+
+
+def apply_order_filter(
+    args: OrderByFilter,
+    index: int,
+    query: Select,
+    select_conds: bool,
+    root_cte_name: str | None,
+    file_id: Label,
+    text_id: Label | None,
+) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
+    direction = asc if args.direction == "asc" else desc
+    field = args.cte.c.order_rank
+    gen = None
+    if select_conds:
+        label = f"o{index}_{args.cte.name}_rank"
+        query = query.column(field.label(label))
+        gen = lambda cte: nulls_last(direction(cte.c[label]))
+
+    join_cond = args.cte.c.file_id == file_id
+    if text_id is not None:
+        # For text-based queries, we need to join on the text_id as well
+        join_cond = join_cond & (args.cte.c.text_id == text_id)
+    # If this is not the last CTE in the chain, we have to LEFT JOIN it
+    if args.cte.name != root_cte_name:
+        query = query.join(
+            args.cte,
+            join_cond,
+            isouter=True,
+        )
+    return (
+        query,
+        nulls_last(direction(field)),
+        gen,
+    )
+
+
+def coalesce_order_filters(
+    args: List[OrderByFilter],
+    index: int,
+    query: Select,
+    select_conds: bool,
+    root_cte_name: str | None,
+    file_id: Label,
+    text_id: Label | None,
+) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
+    # Coalesce filter order by columns with the same priority
+    columns = []  # Initialize variable for coalesced column
+    direction = asc if args[0].direction == "asc" else desc
+
+    select_labels: List[str] = []
+    for spec in args:
+        assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
+        # If this is not the last CTE in the chain, we have to LEFT JOIN it
+        join_cond = spec.cte.c.file_id == file_id
+        if text_id is not None:
+            # For text-based queries, we need to join on the text_id as well
+            join_cond = join_cond & (spec.cte.c.text_id == text_id)
+
+        if spec.cte.name != root_cte_name:
+            query = query.join(
+                spec.cte,
+                join_cond,
+                isouter=True,
+            )
+        field = spec.cte.c.order_rank
+        columns.append(field)
+
+        if select_conds:
+            label = f"o{index}_{spec.cte.name}_rank"
+            query = query.column(field.label(label))
+            select_labels.append(label)
+
+    def coalesce_cols(
+        cols: List[KeyedColumnElement],
+    ) -> UnaryExpression:
+        # For ascending order, use MIN to get the smallest non-null value
+        if direction == asc:
+            coalesced_column = func.min(
+                *[func.coalesce(column, VERY_LARGE_NUMBER) for column in cols]
+            )
+        # For descending order, use MAX to get the largest non-null value
+        else:
+            coalesced_column = func.max(
+                *[func.coalesce(column, VERY_SMALL_NUMBER) for column in cols]
+            )
+        return direction(coalesced_column)
+
+    gen = None
+    if select_conds:
+        gen = lambda cte: coalesce_cols(
+            [cte.c[label] for label in select_labels]
+        )
+    return query, coalesce_cols(columns), gen
