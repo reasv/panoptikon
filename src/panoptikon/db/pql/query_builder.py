@@ -129,8 +129,8 @@ def build_query(
 
     if count_query:
         return (
-            full_query.with_only_columns(
-                func.count(Column("*")).label("total")
+            select(func.count().label("total")).select_from(
+                full_query.alias("wrapped_query")
             ),
             [],
         )
