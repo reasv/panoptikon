@@ -260,7 +260,7 @@ def add_extra_columns(
             if text_id is not None:
                 # For text-based queries, we need to join on the text_id as well
                 # The results are unique on file_id, text_id rather than just file_id
-                join_cond = join_cond & cte.c.text_id == text_id
+                join_cond = join_cond & (cte.c.text_id == text_id)
             query = query.join(
                 cte,
                 join_cond,

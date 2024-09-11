@@ -34,7 +34,7 @@ def build_order_by(
             join_cond = ospec.cte.c.file_id == file_id
             if text_id is not None:
                 # For text-based queries, we need to join on the text_id as well
-                join_cond = join_cond & ospec.cte.c.text_id == text_id
+                join_cond = join_cond & (ospec.cte.c.text_id == text_id)
             # If this is not the last CTE in the chain, we have to LEFT JOIN it
             if ospec.cte.name != root_cte_name:
                 query = query.join(
@@ -54,7 +54,7 @@ def build_order_by(
                 join_cond = spec.cte.c.file_id == file_id
                 if text_id is not None:
                     # For text-based queries, we need to join on the text_id as well
-                    join_cond = join_cond & spec.cte.c.text_id == text_id
+                    join_cond = join_cond & (spec.cte.c.text_id == text_id)
 
                 if spec.cte.name != root_cte_name:
                     query = query.join(
