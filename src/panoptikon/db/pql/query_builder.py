@@ -119,7 +119,7 @@ def build_query(
         if contains_text_columns(input_query.select):
             logger.error("Tried to select text columns in a non-text query")
             raise ValueError("Tried to select text columns in a non-text query")
-        order_cols = [order.order_by for order in input_query.order_args]
+        order_cols = [order.order_by for order in input_query.order_by]
         if contains_text_columns(order_cols):
             logger.error("Tried to order by text columns in a non-text query")
             raise ValueError(
@@ -143,7 +143,7 @@ def build_query(
         text_id,
         select_conds=True if input_query.partition_by is not None else False,
         order_list=state.order_list,
-        order_args=input_query.order_args,
+        order_args=input_query.order_by,
     )
 
     if input_query.partition_by:
