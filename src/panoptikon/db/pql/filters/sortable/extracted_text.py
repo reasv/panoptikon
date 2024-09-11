@@ -1,17 +1,7 @@
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import (
-    Select,
-    and_,
-    asc,
-    desc,
-    func,
-    literal,
-    literal_column,
-    or_,
-    text,
-)
+from sqlalchemy import and_, asc, func, literal, literal_column
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
@@ -104,11 +94,14 @@ Confidence scores are usually set by the model that extracted the text.
         default=None,
         title="Return matching text snippet",
         description="""
-If set, the best matching text *snippet* will be included in the `extra` dict of each result under this key
+If set, the best matching text *snippet* will be included in the `extra` dict of each result under this key.
+Works with any type of query, but it's best used with text-* queries.
+
+Otherwise, it's somewhat slow because of the contortions needed to get the best snippet per file.
 """,
     )
     s_max_len: int = Field(
-        default=20,
+        default=30,
         ge=0,
         title="Maximum Snippet Length",
         description="The maximum length (in tokens) of the snippet returned by select_snippet_as",
@@ -214,24 +207,33 @@ including tags and OCR text
             )
             if args.select_snippet_as:
                 rank_column = literal_column("rank")
+
+                select_query = select_query.add_columns(
+                    snippet_col, rank_column
+                )
+                match_cte = select_query.cte(
+                    f"matchq_{self.get_cte_name(state.cte_counter)}"
+                )
                 # Need to partition by file_id to get the best text result per file
+                # For whatever reason, the row_number function doesn't work with the snippet function
+                # in the same query, so we need to wrap it in a subquery
                 row_number_col = (
-                    func.rank()
+                    func.row_number()
                     .over(
-                        partition_by=context.c.file_id,
+                        partition_by=match_cte.c.file_id,
                         order_by=asc(rank_column),
                     )
                     .label("rn")
                 )
-                select_query = select_query.add_columns(
-                    snippet_col, rank_column, row_number_col
-                )
+                select_query = select(match_cte).add_columns(row_number_col)
                 # Wrap as subquery to filter out only the best text result per file
-                select_query = select(
-                    select_query.cte(
-                        f"rownum_{self.get_cte_name(state.cte_counter)}"
-                    )
-                ).where(literal_column("rn") == 1)
+                # This, again, requires a subquery because the row_number function
+                # can't be used in the WHERE clause in the same query
+                rownum_cte = select_query.cte(
+                    f"rownum_{self.get_cte_name(state.cte_counter)}"
+                )
+                select_query = select(rownum_cte).where(rownum_cte.c.rn == 1)
+                context = rownum_cte
 
             else:
                 # Normal GROUP BY query
