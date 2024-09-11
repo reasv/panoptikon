@@ -230,7 +230,7 @@ including tags and OCR text
                 context,
                 state,
             )
-            if args.select_snippet_as:
+            if args.select_snippet_as and not state.is_count_query:
                 state.extra_columns.append(
                     ExtraColumn(
                         column=cte.c.snippet,
