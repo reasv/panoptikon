@@ -205,7 +205,7 @@ including tags and OCR text
                 )
                 .where(and_(*criteria))
             )
-            if args.select_snippet_as:
+            if args.select_snippet_as and not state.is_count_query:
                 rank_column = literal_column("rank")
 
                 select_query = select_query.add_columns(
@@ -256,28 +256,38 @@ including tags and OCR text
             rank_column = literal_column("rank")
             if args.filter_only:
                 rank_column = literal(1)
+            select_query = (
+                select(
+                    *get_std_cols(context, state),
+                )
+                .join(item_data, item_data.c.id == context.c.text_id)
+                .join(setters, setters.c.id == item_data.c.setter_id)
+                .join(extracted_text, context.c.text_id == extracted_text.c.id)
+                .join(
+                    extracted_text_fts,
+                    literal_column("extracted_text_fts.rowid")
+                    == context.c.text_id,
+                )
+                .where(and_(*criteria))
+            )
+            if args.select_snippet_as and not state.is_count_query:
+                select_query = select_query.add_columns(
+                    snippet_col, rank_column
+                )
+                # For whatever reason, the row_number function doesn't work with the snippet function
+                # in the same query, so we need to wrap it in a subquery
+                # given that derive_rank_column is could generate a row_number function
+                match_cte = select_query.cte(
+                    f"matchq_{self.get_cte_name(state.cte_counter)}"
+                )
+                context = match_cte
+                select_query = select(match_cte)
 
-            columns = [
-                *get_std_cols(context, state),
-                self.derive_rank_column(rank_column),
-            ]
-            if args.select_snippet_as:
-                columns.append(snippet_col)
+            select_query = select_query.add_columns(
+                self.derive_rank_column(rank_column)
+            )
             cte = self.wrap_query(
-                (
-                    select(*columns)
-                    .join(item_data, item_data.c.id == context.c.text_id)
-                    .join(setters, setters.c.id == item_data.c.setter_id)
-                    .join(
-                        extracted_text, context.c.text_id == extracted_text.c.id
-                    )
-                    .join(
-                        extracted_text_fts,
-                        literal_column("extracted_text_fts.rowid")
-                        == context.c.text_id,
-                    )
-                    .where(and_(*criteria))
-                ),
+                select_query,
                 context,
                 state,
             )
