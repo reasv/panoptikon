@@ -5,6 +5,7 @@ from sqlalchemy import Select, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.types import Filter, QueryState
+from panoptikon.db.pql.utils import get_std_cols
 
 
 class TypeIn(Filter):
@@ -23,7 +24,7 @@ class TypeIn(Filter):
         mime_types = self.type_in
         return self.wrap_query(
             (
-                select(context.c.file_id, context.c.item_id)
+                select(*get_std_cols(context, state))
                 .join(items, items.c.id == context.c.item_id)
                 .where(
                     or_(*[items.c.type.like(f"{mime}%") for mime in mime_types])

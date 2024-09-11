@@ -9,6 +9,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
 )
+from panoptikon.db.pql.utils import get_std_cols
 from panoptikon.db.search.utils import parse_and_escape_query
 
 
@@ -57,7 +58,7 @@ class MatchPath(SortableFilter):
         rank_column = self.derive_rank_column(func.min(literal_column("rank")))
         return self.wrap_query(
             (
-                select(context.c.file_id, context.c.item_id, rank_column)
+                select(*get_std_cols(context, state), rank_column)
                 .join(
                     files_path_fts,
                     literal_column("files_path_fts.rowid") == context.c.file_id,

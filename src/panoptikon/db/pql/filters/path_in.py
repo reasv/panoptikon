@@ -5,6 +5,7 @@ from sqlalchemy import Select, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.types import Filter, QueryState
+from panoptikon.db.pql.utils import get_std_cols
 
 
 class InPaths(Filter):
@@ -23,7 +24,7 @@ class InPaths(Filter):
         paths = self.in_paths
         return self.wrap_query(
             (
-                select(context.c.file_id, context.c.item_id)
+                select(*get_std_cols(context, state))
                 .join(files, files.c.id == context.c.file_id)
                 .where(or_(*[files.c.path.like(f"{path}%") for path in paths]))
             ),

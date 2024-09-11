@@ -1,6 +1,6 @@
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union, get_args
 
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -18,24 +18,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
 
+from panoptikon.db.pql.utils import get_std_cols
+
 VERY_LARGE_NUMBER = 9223372036854775805
 VERY_SMALL_NUMBER = -9223372036854775805
 
 
-OrderByType = Literal[
-    "last_modified",
-    "path",
-    "type",
-    "size",
-    "filename",
-    "width",
-    "height",
-    "duration",
-    "time_added",
-]
-
-FileColumns = Literal["sha256", "path", "filename", "last_modified"]
+FileColumns = Literal["file_id", "sha256", "path", "filename", "last_modified"]
 ItemColumns = Literal[
+    "item_id",
     "sha256",
     "md5",
     "type",
@@ -49,8 +40,33 @@ ItemColumns = Literal[
     "subtitle_tracks",
 ]
 
+TextColumns = Literal[
+    "text_id",
+    "language",
+    "language_confidence",
+    "text",
+    "confidence",
+    "text_length",
+    "job_id",
+    "setter_id",
+    "setter_name",
+    "text_index",
+    "source_id",
+]
+
+
+OrderByType = Union[FileColumns, ItemColumns, TextColumns]
+
 OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
+
+
+def contains_text_columns(lst: Sequence[str]) -> bool:
+    # Get the allowed values from the Literal
+    literal_values = set(get_args(TextColumns))
+
+    # Check if there's any intersection between the list and the literal values
+    return bool(set(lst) & literal_values)
 
 
 @dataclass
@@ -74,6 +90,7 @@ class QueryState:
     extra_columns: List[ExtraColumn] = field(default_factory=list)
     cte_counter: int = 0
     is_count_query: bool = False
+    is_text_query: bool = False
 
 
 # Define Search results
@@ -93,6 +110,19 @@ class SearchResult(BaseModel):
     audio_tracks: Optional[int] = None
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
+    # Text columns (only present for text-* queries)
+    text_id: Optional[int] = None  # Always present for text-* queries
+    language: Optional[str] = None
+    language_confidence: Optional[float] = None
+    text: Optional[str] = None
+    confidence: Optional[float] = None
+    text_length: Optional[int] = None
+    job_id: Optional[int] = None
+    setter_id: Optional[int] = None
+    setter_name: Optional[str] = None
+    text_index: Optional[int] = None
+    source_id: Optional[int] = None
+
     extra: Optional[Dict[str, float | int | str | None]] = Field(
         default=None,
         title="Extra Fields",
@@ -117,10 +147,19 @@ def get_extra_columns(row: sqlite3.Row, column_aliases: List[str] | None):
     return extras if extras else None
 
 
-def get_column(column: Union[FileColumns, ItemColumns]) -> Column:
-    from panoptikon.db.pql.tables import files, items
+def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
+    from panoptikon.db.pql.tables import (
+        extracted_text,
+        files,
+        item_data,
+        items,
+        setters,
+    )
 
     return {
+        "file_id": files.c.id,
+        "item_id": files.c.item_id,
+        "text_id": extracted_text.c.id,
         "sha256": files.c.sha256,
         "path": files.c.path,
         "filename": files.c.filename,
@@ -135,6 +174,17 @@ def get_column(column: Union[FileColumns, ItemColumns]) -> Column:
         "audio_tracks": items.c.audio_tracks,
         "video_tracks": items.c.video_tracks,
         "subtitle_tracks": items.c.subtitle_tracks,
+        # Text columns
+        "language": extracted_text.c.language,
+        "language_confidence": extracted_text.c.language_confidence,
+        "text": extracted_text.c.text,
+        "confidence": extracted_text.c.confidence,
+        "text_length": extracted_text.c.text_length,
+        "job_id": item_data.c.job_id,
+        "setter_id": item_data.c.setter_id,
+        "setter_name": setters.c.name,
+        "text_index": item_data.c.idx,
+        "source_id": item_data.c.source_id,
     }[column]
 
 
@@ -198,9 +248,7 @@ class Filter(BaseModel):
 
     def wrap_query(self, query: Select, context: CTE, state: QueryState) -> CTE:
         if state.is_count_query:
-            query = query.with_only_columns(
-                context.c.file_id, context.c.item_id
-            )
+            query = query.with_only_columns(*get_std_cols(context, state))
         cte_name = self.get_cte_name(state.cte_counter)
         state.cte_counter += 1
         return query.cte(cte_name)
@@ -308,7 +356,7 @@ If set, the order_rank column will be returned with the results as this alias un
             return super().wrap_query(query, context, state)
 
         order_rank = literal_column("order_rank")
-        if order_rank is not None and (self.gt or self.lt):
+        if self.gt or self.lt:
             query = select(
                 query.alias(f"wrapped_{self.get_cte_name(state.cte_counter)}")
             )

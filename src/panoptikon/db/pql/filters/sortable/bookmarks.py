@@ -12,6 +12,7 @@ from panoptikon.db.pql.types import (
     get_order_direction_field,
     get_order_direction_field_rownum,
 )
+from panoptikon.db.pql.utils import get_std_cols, get_std_group_by
 
 
 class InBookmarksArgs(BaseModel):
@@ -93,8 +94,7 @@ class InBookmarks(SortableFilter):
         return self.wrap_query(
             (
                 select(
-                    context.c.file_id,
-                    context.c.item_id,
+                    *get_std_cols(context, state),
                     rank_column,
                 )
                 .join(files, files.c.id == context.c.file_id)
@@ -102,7 +102,7 @@ class InBookmarks(SortableFilter):
                 .where(
                     and_(*criterions),
                 )
-                .group_by(context.c.file_id)
+                .group_by(*get_std_group_by(context, state))
             ),
             context,
             state,

@@ -1,22 +1,14 @@
 from itertools import groupby
 from typing import List, Tuple, Type, Union
 
-from sqlalchemy import (
-    ColumnClause,
-    Label,
-    Select,
-    asc,
-    desc,
-    func,
-    literal_column,
-    nulls_last,
-)
+from sqlalchemy import Label, Select, asc, desc, func, nulls_last
 
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.types import (
     VERY_LARGE_NUMBER,
     VERY_SMALL_NUMBER,
     OrderByFilter,
+    get_column,
 )
 
 
@@ -24,6 +16,7 @@ def build_order_by(
     query: Select,
     root_cte_name: str | None,
     file_id: Label,
+    text_id: Label | None,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
 ):
@@ -32,16 +25,21 @@ def build_order_by(
     for ospec in full_order_list:
         if isinstance(ospec, OrderArgs):
             order_by, direction = get_order_by_and_direction(ospec)
-            field = literal_column(order_by)
+            field = get_column(order_by)
             query = query.order_by(nulls_last(direction(field)))
         elif isinstance(ospec, OrderByFilter):
             direction = asc if ospec.direction == "asc" else desc
             field = ospec.cte.c.order_rank
+
+            join_cond = ospec.cte.c.file_id == file_id
+            if text_id is not None:
+                # For text-based queries, we need to join on the text_id
+                join_cond = ospec.cte.c.text_id == text_id
             # If this is not the last CTE in the chain, we have to LEFT JOIN it
             if ospec.cte.name != root_cte_name:
                 query = query.join(
                     ospec.cte,
-                    ospec.cte.c.file_id == file_id,
+                    join_cond,
                     isouter=True,
                 )
             query = query.order_by(nulls_last(direction(field)))
@@ -53,10 +51,15 @@ def build_order_by(
             for spec in ospec:
                 assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
                 # If this is not the last CTE in the chain, we have to LEFT JOIN it
+                join_cond = spec.cte.c.file_id == file_id
+                if text_id is not None:
+                    # For text-based queries, we need to join on the text_id
+                    join_cond = spec.cte.c.text_id == text_id
+
                 if spec.cte.name != root_cte_name:
                     query = query.join(
                         spec.cte,
-                        spec.cte.c.file_id == file_id,
+                        join_cond,
                         isouter=True,
                     )
 

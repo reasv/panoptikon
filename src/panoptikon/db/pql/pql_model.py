@@ -8,6 +8,7 @@ from panoptikon.db.pql.types import (
     ItemColumns,
     OrderByType,
     OrderType,
+    TextColumns,
 )
 
 
@@ -63,7 +64,7 @@ objects that define how the results should be ordered.
 Results can be ordered by multiple fields by adding multiple objects.
         """,
     )
-    select: List[Union[FileColumns, ItemColumns]] = Field(
+    select: List[Union[FileColumns, ItemColumns, TextColumns]] = Field(
         default_factory=lambda: ["sha256", "path", "last_modified", "type"],
         title="Data to return",
         description="""
