@@ -122,11 +122,13 @@ This is useful for pagination, but it requires an additional query to be execute
         description="""
 If true, the query will check if the path exists on disk before returning it.
 
-For `file` queries, the file will be omitted if the path does not exist.
+For `file` queries with no partition by,
+the result will be omitted if the path does not exist.
+This is because if another file exists, it will be included later in the results.
 
-For `item` queries, the system will try to find another path for the item and substitute it.
-This will substitute last_modified to the new path's last_modified, but not any other fields such as filename.
+In other cases, the system will try to find another file for the item and substitute it.
+If no other working path is found, the result will be omitted.
 
-If no other working path is found, the item will be omitted from the results.
+This is not reflected in the total count of results.
 """,
     )

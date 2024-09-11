@@ -6,7 +6,7 @@ from typing import Any, List, Tuple
 from sqlalchemy import Select
 from sqlalchemy.dialects import sqlite
 
-from panoptikon.db.files import get_existing_file_for_sha256
+from panoptikon.db.files import get_existing_file_for_item_id
 from panoptikon.db.pql.pql_model import PQLQuery
 from panoptikon.db.pql.query_builder import build_query
 from panoptikon.db.pql.types import (
@@ -74,15 +74,28 @@ def search_pql(
             result = SearchResult(file_id=0, item_id=0)
             map_row_to_class(row, result)
             result.extra = get_extra_columns(row, extra_columns)
-            if query.check_path and not os.path.exists(result.path):
-                if query.entity == "file":
+            if (
+                query.check_path
+                and result.path
+                and not os.path.exists(result.path)
+            ):
+                if query.entity == "file" and not query.partition_by:
                     logger.warning(f"File not found: {result.path}")
                     continue
                 else:
-                    logger.warning(f"Item path not found: {result.path}")
-                if file := get_existing_file_for_sha256(conn, result.sha256):
+                    logger.warning(f"Result path not found: {result.path}")
+                if file := get_existing_file_for_item_id(conn, result.item_id):
                     result.path = file.path
-                    result.last_modified = file.last_modified
+                    # Only set if not already set
+                    result.last_modified = (
+                        file.last_modified if result.last_modified else None
+                    )
+                    result.filename = file.filename if result.filename else None
+                else:
+                    logger.warning(
+                        f"File not found in database: {result.sha256}"
+                    )
+                    continue
             yield result
 
     return results_generator(), total_count

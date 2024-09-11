@@ -323,6 +323,29 @@ def get_existing_file_for_sha256(
     return None
 
 
+def get_existing_file_for_item_id(
+    conn: sqlite3.Connection, item_id: int
+) -> FileRecord | None:
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+    SELECT sha256, path, last_modified, filename
+    FROM files
+    WHERE item_id = ?
+    ORDER BY available DESC
+    """,
+        (item_id,),
+    )
+
+    while row := cursor.fetchone():
+        sha256, path, last_modified, filename = row
+        if os.path.exists(path):
+            return FileRecord(sha256, path, last_modified, filename)
+
+    return None
+
+
 def delete_unavailable_files(conn: sqlite3.Connection):
     cursor = conn.cursor()
     result = cursor.execute(

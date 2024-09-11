@@ -107,10 +107,11 @@ def get_std_group_by(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
 class SearchResult(BaseModel):
     file_id: int
     item_id: int
-    path: str = ""
-    sha256: str = ""
-    last_modified: str = ""
-    type: str = ""
+    path: Optional[str] = ""
+    filename: Optional[str] = ""
+    sha256: Optional[str] = ""
+    last_modified: Optional[str] = ""
+    type: Optional[str] = ""
     size: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None

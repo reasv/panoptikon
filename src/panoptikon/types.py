@@ -108,6 +108,7 @@ class FileRecord:
     sha256: str
     path: str
     last_modified: str
+    filename: str = ""
 
 
 @dataclass
