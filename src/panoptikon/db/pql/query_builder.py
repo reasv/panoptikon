@@ -92,40 +92,10 @@ def build_query(
             )
             root_cte_name = text_cte.name
 
-    if input_query.entity == "file":
-        full_query = select(file_id, item_id)
-    elif input_query.entity == "item":
-        # Uniqueness of item_id
-        item_cte = (
-            select(func.max(file_id).label("file_id"), item_id)
-            .group_by(item_id)
-            .cte("item_cte")
-        )
-        full_query = select(item_cte.c.file_id, item_cte.c.item_id)
-        file_id, item_id = item_cte.c.file_id.label(
-            "file_id"
-        ), item_cte.c.item_id.label("file_id")
-        root_cte_name = item_cte.name
-    elif input_query.entity == "text-file":
+    if input_query.entity.startswith("text"):
         full_query = select(file_id, item_id, text_id)
-    elif input_query.entity == "text-item":
-        # Uniqueness of text_id, item_id
-        item_text_cte = (
-            select(func.max(file_id).label("file_id"), item_id, text_id)
-            .group_by(text_id)
-            .cte("text_cte")
-        )
-        full_query = select(
-            item_text_cte.c.file_id,
-            item_text_cte.c.item_id,
-            item_text_cte.c.text_id,
-        )
-        file_id, item_id, text_id = (
-            item_text_cte.c.file_id.label("file_id"),
-            item_text_cte.c.item_id.label("item_id"),
-            item_text_cte.c.text_id.label("text_id"),
-        )
-        root_cte_name = item_text_cte.name
+    else:
+        full_query = select(file_id, item_id)
 
     if count_query:
         return (
@@ -167,11 +137,27 @@ def build_query(
         state.order_list,
         input_query.order_args,
     )
-    full_query = full_query.order_by(*order_by_conds)
+
     # Add extra columns
     full_query, extra_columns = add_extra_columns(
         full_query, state, root_cte_name, file_id, text_id
     )
+    if input_query.partition_by:
+        # Add row number column for partitioning, and get the first row of each partition
+        partition_by_cols = [
+            get_column(col).label(col) for col in input_query.partition_by
+        ]
+        rownum = func.row_number().over(
+            partition_by=partition_by_cols, order_by=order_by_conds
+        )
+        full_query = full_query.add_columns(
+            rownum.label("partition_rownum")
+        ).cte("partition_cte")
+        full_query = select(full_query).where(
+            full_query.c.partition_rownum == 1
+        )
+
+    full_query = full_query.order_by(*order_by_conds)
 
     page = max(input_query.page, 1)
     page_size = input_query.page_size

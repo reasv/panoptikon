@@ -71,38 +71,33 @@ Results can be ordered by multiple fields by adding multiple objects.
 The columns to return in the query.
 The default columns are sha256, path, last_modified, and type.
 These columns are always returned, even if they are not in the select list.
+Columns belonging to text can only be selected if the entity is "text".
 """,
     )
-    entity: Literal["file", "item", "text-item", "text-file"] = Field(
+    entity: Literal["file", "text"] = Field(
         default="file",
         title="Target Entity",
         description="""
-The entity to query for.
-`Items` are unique files.
-`Files` represent actual files on disk. They are unique by path.
-If you search for files, you will get duplicates for items that have multiple identical files.
-If you search for items, you will get one result per item, even if multiple identical files exist with different paths.
+The entity to query on.
+You can perform the search on either files or text.
+This means that intermediate results will be one per file, or one per text-file pair.
+There are generally more text-file pairs than files, so this incurs overhead.
 
-When searching for items, sorting by path or last_modified may not work as expected.
-The file with the highest internal ID will be returned with the item.
+However, "text" queries allow you to include text-specific columns in the select list.
+The final results will also be one for each text-file pair.
 
-Searching files is generally faster than searching items.
-
-`Text-item` queries are used to search extracted text for items.
-You'll get one result for each text, containing the text_id, 
-text itself, as well as all the normal item columns.
-Since each text is associated to exactly one item, 
-you can use all the normal filters, orders, 
-and selects as well as the text-specific ones.
-
-`text-file` queries are used to search extracted text for files.
-The result is exactly the same as a text-item query, but you'll get one result for each text-file pair.
-There is exactly one item for each text, so text-item returns one result per text,
-but there can be multiple files for the same unique item, and consequently multiple files for the same text,
-meaning multiple results with the same text.
-
-Using text-item involves the same tradeoffs as item vs file queries, so file-text is recommended for the most consistent results.
+Most of the same filters can be used on both.
+"text" queries will include "text_id" in each result. "file_id" and "item_id" are always included.
 """,
+    )
+    partition_by: Optional[List[Literal["text_id", "file_id", "item_id"]]] = (
+        Field(
+            default=None,
+            title="Partition results By",
+            description="""
+Group results by the specified column(s) and return the first result for each group according to all of the order settings of the query.
+""",
+        )
     )
     page: int = Field(default=1)
     page_size: int = Field(default=10)
