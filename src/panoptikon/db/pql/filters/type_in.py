@@ -10,7 +10,7 @@ from panoptikon.db.pql.types import QueryState, get_std_cols
 
 class TypeIn(Filter):
     type_in: List[str] = Field(
-        default_factory=list,
+        ...,
         title="MIME Type must begin with one of the given strings",
     )
 

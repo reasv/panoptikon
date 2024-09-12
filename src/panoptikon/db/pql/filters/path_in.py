@@ -10,7 +10,7 @@ from panoptikon.db.pql.types import QueryState, get_std_cols
 
 class InPaths(Filter):
     in_paths: List[str] = Field(
-        default_factory=list,
+        ...,
         title="Path must begin with one of the given strings",
     )
 
