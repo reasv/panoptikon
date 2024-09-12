@@ -263,36 +263,6 @@ class Operator(BaseModel):
     pass
 
 
-# class ExtractedTextEmbeddingsFilter(BaseModel):
-#     query: bytes
-#     model: str
-#     targets: List[str] = Field(default_factory=list)
-#     languages: List[str] = Field(default_factory=list)
-#     language_min_confidence: Optional[float] = None
-#     min_confidence: Optional[float] = None
-
-
-# class TagFilter(BaseModel):
-#     pos_match_all: List[str] = Field(default_factory=list)
-#     pos_match_any: List[str] = Field(default_factory=list)
-#     neg_match_any: List[str] = Field(default_factory=list)
-#     neg_match_all: List[str] = Field(default_factory=list)
-#     all_setters_required: bool = False
-#     setters: List[str] = Field(default_factory=list)
-#     namespaces: List[str] = Field(default_factory=list)
-#     min_confidence: Optional[float] = None
-
-
-# class ImageEmbeddingFilter(BaseModel):
-#     query: bytes
-#     model: str
-
-
-# class AnyTextFilter(BaseModel):
-#     path_text: Union[MatchPathArgs, None] = None
-#     extracted_text: Union[ExtractedTextFilter, None] = None
-
-
 # FieldValueType = Union[str, int, float, bool]
 # FieldName = Literal["last_modified", "path"]
 
@@ -343,29 +313,3 @@ class Operator(BaseModel):
 
 # class TagFilterModel(Filter):
 #     tags: TagFilter
-
-
-# class ExtractedTextFilterModel(SortableFilter):
-#     order_by: bool = get_order_by_field(False)
-#     order_direction: OrderTypeNN = get_order_direction_field("asc")
-#     extracted_text: ExtractedTextFilter
-
-
-# class ExtractedTextEmbeddingsFilterModel(SortableFilter):
-#     order_by: bool = get_order_by_field(True)
-#     order_direction: OrderTypeNN = get_order_direction_field("asc")
-#     order_priority: int = get_order_priority_field(100)
-#     extracted_text_embeddings: ExtractedTextEmbeddingsFilter
-
-
-# class ImageEmbeddingFilterModel(SortableFilter):
-#     order_by: bool = get_order_by_field(True)
-#     order_direction: OrderTypeNN = get_order_direction_field("asc")
-#     order_priority: int = get_order_priority_field(100)
-#     image_embeddings: ImageEmbeddingFilter
-
-
-# class AnyTextFilterModel(SortableFilter):
-#     order_by: bool = get_order_by_field(False)
-#     order_direction: OrderTypeNN = get_order_direction_field("desc")
-#     any_text: AnyTextFilter

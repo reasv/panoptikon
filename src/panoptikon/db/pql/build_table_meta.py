@@ -22,6 +22,7 @@ def build_metadata():
     setters = Table("setters", metadata, autoload_with=engine)
     embeddings = Table("embeddings", metadata, autoload_with=engine)
     tags = Table("tags", metadata, autoload_with=engine)
+    tags_items = Table("tags_items", metadata, autoload_with=engine)
     with open(db_file + ".pkl", "wb") as f:
         pickle.dump(metadata, f)
 
