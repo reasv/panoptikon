@@ -6,14 +6,11 @@ from panoptikon.db.pql.filters import Filters
 from panoptikon.db.pql.types import (
     FileColumns,
     ItemColumns,
+    Operator,
     OrderByType,
     OrderType,
     TextColumns,
 )
-
-
-class Operator(BaseModel):
-    pass
 
 
 class AndOperator(Operator):

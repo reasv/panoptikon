@@ -259,6 +259,10 @@ class SelectFields(BaseModel):
     )
 
 
+class Operator(BaseModel):
+    pass
+
+
 # class ExtractedTextEmbeddingsFilter(BaseModel):
 #     query: bytes
 #     model: str
