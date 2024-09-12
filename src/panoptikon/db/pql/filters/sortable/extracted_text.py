@@ -36,7 +36,7 @@ If set to False (default), and the match field is empty,
 this filter will be skipped entirely.
 """,
     )
-    targets: List[str] = Field(
+    setters: List[str] = Field(
         default_factory=list,
         title="Include text from these setters",
         description="""
@@ -171,8 +171,8 @@ including tags and OCR text
             criteria.append(extracted_text.c.text_text >= args.min_length)
         if args.max_length:
             criteria.append(extracted_text.c.text_text <= args.max_length)
-        if args.targets:
-            criteria.append(setters.c.name.in_(args.targets))
+        if args.setters:
+            criteria.append(setters.c.name.in_(args.setters))
         if args.languages:
             criteria.append(extracted_text.c.language.in_(args.languages))
         if args.language_min_confidence:
