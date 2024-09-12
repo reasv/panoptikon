@@ -340,6 +340,8 @@ class ModelOptsFactory:
             group_name, inference_id = s
         else:
             group_name, inference_id = None, None
+        if not cls._api_models:
+            cls.get_api_model_opts()
         if group_name in cls._api_models:
             return cls._api_models[group_name](model_name=inference_id)
         model_opts = cls.get_model_opts(setter_name)
