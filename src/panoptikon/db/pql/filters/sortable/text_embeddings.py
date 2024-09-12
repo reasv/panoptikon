@@ -1,5 +1,6 @@
 from typing import List, Optional
 
+from click import group
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, asc, func, literal, literal_column
 from sqlalchemy.sql.expression import CTE, select
@@ -12,6 +13,7 @@ from panoptikon.db.pql.types import (
     get_order_by_field,
     get_order_direction_field,
     get_std_cols,
+    get_std_group_by,
 )
 
 
@@ -99,4 +101,58 @@ Search for text using semantic search on text embeddings.
         return self.set_validated(True)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
-        raise NotImplementedError("build_query not implemented")
+        self.raise_if_not_validated()
+        from panoptikon.db.pql.tables import (
+            embeddings,
+            extracted_text,
+            item_data,
+            setters,
+        )
+
+        args = self.text_embeddings
+        criteria = []
+        text_data = item_data.alias("text_data")
+        text_setters = setters.alias("text_setters")
+        vec_data = item_data.alias("vec_data")
+        vec_setters = setters.alias("vec_setters")
+        if args.min_length:
+            criteria.append(extracted_text.c.text_text >= args.min_length)
+        if args.max_length:
+            criteria.append(extracted_text.c.text_text <= args.max_length)
+        if args.setters:
+            criteria.append(text_setters.c.name.in_(args.setters))
+        if args.languages:
+            criteria.append(extracted_text.c.language.in_(args.languages))
+        if args.language_min_confidence:
+            criteria.append(
+                extracted_text.c.language_confidence
+                >= args.language_min_confidence
+            )
+        if args.min_confidence:
+            criteria.append(extracted_text.c.confidence >= args.min_confidence)
+        if args.model:
+            criteria.append(vec_setters.c.name == args.model)
+
+        columns = [*get_std_cols(context, state)]
+
+        return self.wrap_query(
+            select(*columns)
+            .join(
+                text_data,
+                (text_data.c.item_id == context.c.item_id)
+                & (text_data.c.data_type == "text"),
+            )
+            .join(text_setters, text_setters.c.id == text_data.c.setter_id)
+            .join(extracted_text, text_data.c.id == extracted_text.c.id)
+            .join(
+                vec_data,
+                (vec_data.c.source_id == extracted_text.c.id)
+                & (vec_data.c.data_type == "text-embedding"),
+            )
+            .join(vec_setters, vec_setters.c.id == vec_data.c.setter_id)
+            .join(embeddings, embeddings.c.id == vec_data.c.id)
+            .where(and_(*criteria))
+            .group_by(*get_std_group_by(context, state)),
+            context,
+            state,
+        )
