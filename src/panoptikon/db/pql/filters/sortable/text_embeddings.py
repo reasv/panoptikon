@@ -133,10 +133,17 @@ Search for text using semantic search on text embeddings.
         if args.model:
             criteria.append(vec_setters.c.name == args.model)
 
-        columns = [*get_std_cols(context, state)]
+        vec_distance = func.vec_distance_L2(
+            embeddings.c.embedding, literal(args.query)
+        )
+
+        rank_column = func.min(vec_distance)
 
         return self.wrap_query(
-            select(*columns)
+            select(
+                *get_std_cols(context, state),
+                self.derive_rank_column(rank_column)
+            )
             .join(
                 text_data,
                 (text_data.c.item_id == context.c.item_id)
