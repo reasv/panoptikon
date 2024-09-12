@@ -13,6 +13,12 @@ from panoptikon.db.pql.filters.sortable.path_text import (
     MatchPath,
     MatchPathArgs,
 )
+from panoptikon.db.pql.filters.sortable.text_embeddings import (
+    SemanticTextArgs,
+    SemanticTextSearch,
+)
 from panoptikon.db.pql.filters.type_in import TypeIn
 
-Filters = Union[InPaths, InBookmarks, TypeIn, MatchPath, MatchText]
+Filters = Union[
+    InPaths, InBookmarks, TypeIn, MatchPath, MatchText, SemanticTextSearch
+]

@@ -12,7 +12,7 @@ from typing import (
     get_args,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import (
     CTE,
     Column,
@@ -33,7 +33,7 @@ from panoptikon.db.pql.types import QueryState, get_std_cols
 
 
 class Filter(BaseModel):
-    _validated: bool = False
+    _validated: bool = PrivateAttr(False)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         raise NotImplementedError("build_query not implemented")

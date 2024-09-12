@@ -4,7 +4,7 @@ import logging
 from typing import List, Optional
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import and_, func, literal
 from sqlalchemy.sql.expression import CTE, select
 
@@ -49,7 +49,7 @@ class SemanticTextArgs(BaseModel):
         description="Semantic query to match against the text",
     )
 
-    _embedding: Optional[bytes]
+    _embedding: Optional[bytes] = PrivateAttr(None)
 
     model: str = Field(
         title="The text embedding model to use",
@@ -58,7 +58,6 @@ The text embedding model to use for the semantic search.
 Will search embeddings produced by this model.
 """,
     )
-
     setters: List[str] = Field(
         default_factory=list,
         title="Include text from these setters",
