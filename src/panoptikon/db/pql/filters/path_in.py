@@ -14,7 +14,7 @@ class InPaths(Filter):
         title="Path must begin with one of the given strings",
     )
 
-    def validate(self) -> bool:
+    def validate(self):
         return self.set_validated(bool(self.in_paths))
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:

@@ -21,9 +21,7 @@ def preprocess_query(el: QueryElement) -> QueryElement | None:
         QueryElement | None: The validated query element or None if it is empty
     """
     if isinstance(el, Filter):
-        if el.validate():
-            return el
-        return None
+        return el.validate()
     elif isinstance(el, Operator):
         if isinstance(el, AndOperator):
             element_list = []

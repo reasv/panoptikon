@@ -1,6 +1,16 @@
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union, get_args
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+    get_args,
+)
 
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -18,6 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
 
+from panoptikon.db.pql.pql_model import Operator
 from panoptikon.db.pql.types import QueryState, get_std_cols
 
 
@@ -44,7 +55,7 @@ class Filter(BaseModel):
 
     def set_validated(self, value: bool):
         self._validated = value
-        return self._validated
+        return self if self._validated else None
 
     def raise_if_not_validated(self):
         """Raise a ValueError if validate() has not been called.
@@ -54,9 +65,9 @@ class Filter(BaseModel):
         if not self.is_validated():
             raise ValueError("Filter was not validated")
 
-    def validate(self) -> bool:
+    def validate(self) -> Optional[Union["Filter", Operator]]:
         """Pre-process filter args and validate them.
-        Must return True if the filter should be included, False otherwise.
+        Should return a Filter object or None if the filter should be skipped.
         Must be called before build_query.
         Can raise a ValueError if the filter args are invalid.
         """
