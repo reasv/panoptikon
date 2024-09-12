@@ -1,13 +1,16 @@
+import base64
+import io
+import logging
 from typing import List, Optional
 
-from click import group
+import numpy as np
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, asc, func, literal, literal_column
+from sqlalchemy import and_, func, literal
 from sqlalchemy.sql.expression import CTE, select
 
+from inferio.impl.utils import deserialize_array
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.types import (
-    ExtraColumn,
     OrderTypeNN,
     QueryState,
     get_order_by_field,
@@ -15,10 +18,13 @@ from panoptikon.db.pql.types import (
     get_std_cols,
     get_std_group_by,
 )
+from panoptikon.db.utils import serialize_f32
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticTextArgs(BaseModel):
-    query: str = Field(
+    query: str | bytes = Field(
         ...,
         title="Query",
         description="Semantic query to match against the text",
@@ -98,6 +104,16 @@ Search for text using semantic search on text embeddings.
         if len(self.text_embeddings.query.strip()) == 0:
             return self.set_validated(False)
 
+        if isinstance(self.text_embeddings.query, str):
+            self.text_embeddings.query = get_embed(
+                self.text_embeddings.query,
+                self.text_embeddings.model,
+            )
+        else:
+            self.text_embeddings.query = extract_embeddings(
+                self.text_embeddings.query
+            )
+
         return self.set_validated(True)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -142,7 +158,7 @@ Search for text using semantic search on text embeddings.
         return self.wrap_query(
             select(
                 *get_std_cols(context, state),
-                self.derive_rank_column(rank_column)
+                self.derive_rank_column(rank_column),
             )
             .join(
                 text_data,
@@ -163,3 +179,62 @@ Search for text using semantic search on text embeddings.
             context,
             state,
         )
+
+
+last_embedded_text: str | None = None
+last_embedded_text_embed: bytes | None = None
+last_used_model: str | None = None
+
+
+def get_embed(
+    text: str,
+    model_name: str,
+    cache_key: str = "search",
+    lru_size: int = 1,
+    ttl_seconds: int = 60,
+) -> bytes:
+
+    global last_embedded_text, last_embedded_text_embed, last_used_model
+    if (
+        text == last_embedded_text
+        and model_name == last_used_model
+        and last_embedded_text_embed is not None
+    ):
+        return last_embedded_text_embed
+
+    from panoptikon.data_extractors.models import ModelOptsFactory
+
+    logger.debug(f"Getting embedding for text: {text}")
+    model = ModelOptsFactory.get_model(model_name)
+    embed_bytes: bytes = model.run_batch_inference(
+        cache_key,
+        lru_size,
+        ttl_seconds,
+        [({"text": text, "task": "s2s"}, None)],
+    )[0]
+    text_embed = deserialize_array(embed_bytes)[0]
+    assert isinstance(text_embed, np.ndarray)
+    # Set as persistent so that the model is not reloaded every time the function is called
+    last_embedded_text = text
+    last_used_model = model_name
+    last_embedded_text_embed = serialize_f32(text_embed.tolist())
+    return last_embedded_text_embed
+
+
+def deserialize_array(buffer: bytes) -> np.ndarray:
+    bio = io.BytesIO(buffer)
+    bio.seek(0)
+    return np.load(bio, allow_pickle=False)
+
+
+def extract_embeddings(buffer: bytes) -> bytes:
+    numpy_array = deserialize_array(base64.b64decode(buffer))
+    assert isinstance(
+        numpy_array, np.ndarray
+    ), "Expected a numpy array for embeddings"
+    # Check the number of dimensions
+    if len(numpy_array.shape) == 1:
+        # If it is a 1D array, it is a single embedding
+        return serialize_f32(numpy_array.tolist())
+    # If it is a 2D array, it is a list of embeddings, get the first one
+    return serialize_f32(numpy_array[0].tolist())
