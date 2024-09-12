@@ -168,9 +168,9 @@ including tags and OCR text
         if args.filter_only:
             criteria = []
         if args.min_length:
-            criteria.append(extracted_text.c.text_text >= args.min_length)
+            criteria.append(extracted_text.c.text_length >= args.min_length)
         if args.max_length:
-            criteria.append(extracted_text.c.text_text <= args.max_length)
+            criteria.append(extracted_text.c.text_length <= args.max_length)
         if args.setters:
             criteria.append(setters.c.name.in_(args.setters))
         if args.languages:

@@ -166,9 +166,9 @@ Search for text using semantic search on text embeddings.
         vec_data = item_data.alias("vec_data")
         vec_setters = setters.alias("vec_setters")
         if args.min_length:
-            criteria.append(extracted_text.c.text_text >= args.min_length)
+            criteria.append(extracted_text.c.text_length >= args.min_length)
         if args.max_length:
-            criteria.append(extracted_text.c.text_text <= args.max_length)
+            criteria.append(extracted_text.c.text_length <= args.max_length)
         if args.setters:
             criteria.append(text_setters.c.name.in_(args.setters))
         if args.languages:
