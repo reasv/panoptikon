@@ -11,6 +11,7 @@ from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
+from panoptikon.db.pql.filters.sortable.utils import extract_embeddings
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     QueryState,
@@ -138,7 +139,6 @@ Search for text using semantic search on text embeddings.
             return self.set_validated(False)
 
         if self.text_embeddings.embed:
-            start_time = time.time()
             self.text_embeddings._embedding = get_embed(
                 self.text_embeddings.query,
                 self.text_embeddings.model,
@@ -190,6 +190,43 @@ Search for text using semantic search on text embeddings.
         )
 
         rank_column = func.min(vec_distance)
+        if state.is_text_query:
+            return self.wrap_query(
+                select(
+                    *get_std_cols(context, state),
+                    self.derive_rank_column(rank_column),
+                )
+                .join(
+                    text_data,
+                    (text_data.c.id == context.c.text_id)
+                    & (text_data.c.data_type == "text"),
+                )
+                .join(
+                    text_setters,
+                    text_setters.c.id == text_data.c.setter_id,
+                )
+                .join(
+                    extracted_text,
+                    context.c.text_id == extracted_text.c.id,
+                )
+                .join(
+                    vec_data,
+                    (vec_data.c.source_id == extracted_text.c.id)
+                    & (vec_data.c.data_type == "text-embedding"),
+                )
+                .join(
+                    vec_setters,
+                    vec_setters.c.id == vec_data.c.setter_id,
+                )
+                .join(
+                    embeddings,
+                    embeddings.c.id == vec_data.c.id,
+                )
+                .where(and_(*criteria))
+                .group_by(*get_std_group_by(context, state)),
+                context,
+                state,
+            )
 
         return self.wrap_query(
             select(
@@ -201,15 +238,27 @@ Search for text using semantic search on text embeddings.
                 (text_data.c.item_id == context.c.item_id)
                 & (text_data.c.data_type == "text"),
             )
-            .join(text_setters, text_setters.c.id == text_data.c.setter_id)
-            .join(extracted_text, text_data.c.id == extracted_text.c.id)
+            .join(
+                text_setters,
+                text_setters.c.id == text_data.c.setter_id,
+            )
+            .join(
+                extracted_text,
+                text_data.c.id == extracted_text.c.id,
+            )
             .join(
                 vec_data,
                 (vec_data.c.source_id == extracted_text.c.id)
                 & (vec_data.c.data_type == "text-embedding"),
             )
-            .join(vec_setters, vec_setters.c.id == vec_data.c.setter_id)
-            .join(embeddings, embeddings.c.id == vec_data.c.id)
+            .join(
+                vec_setters,
+                vec_setters.c.id == vec_data.c.setter_id,
+            )
+            .join(
+                embeddings,
+                embeddings.c.id == vec_data.c.id,
+            )
             .where(and_(*criteria))
             .group_by(*get_std_group_by(context, state)),
             context,
@@ -257,22 +306,3 @@ def get_embed(
         f"Embedding generation took {time.time() - start_time} seconds"
     )
     return last_embedded_text_embed
-
-
-def deserialize_array(buffer: bytes) -> np.ndarray:
-    bio = io.BytesIO(buffer)
-    bio.seek(0)
-    return np.load(bio, allow_pickle=False)
-
-
-def extract_embeddings(buffer: str) -> bytes:
-    numpy_array = deserialize_array(base64.b64decode(buffer))
-    assert isinstance(
-        numpy_array, np.ndarray
-    ), "Expected a numpy array for embeddings"
-    # Check the number of dimensions
-    if len(numpy_array.shape) == 1:
-        # If it is a 1D array, it is a single embedding
-        return serialize_f32(numpy_array.tolist())
-    # If it is a 2D array, it is a list of embeddings, get the first one
-    return serialize_f32(numpy_array[0].tolist())
