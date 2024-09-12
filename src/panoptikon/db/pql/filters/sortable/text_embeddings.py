@@ -23,12 +23,33 @@ from panoptikon.db.utils import serialize_f32
 logger = logging.getLogger(__name__)
 
 
+class EmbedArgs(BaseModel):
+    cache_key: str = Field(
+        default="search",
+        title="Cache Key",
+        description="The cache key to use for the inference *model*",
+    )
+    lru_size: int = Field(
+        default=1,
+        ge=1,
+        title="LRU Cache Size",
+        description="The size of the LRU cache to use for the inference *model*",
+    )
+    ttl_seconds: int = Field(
+        default=60,
+        title="TTL Seconds",
+        description="The time-to-live in seconds for the inference *model* to be kept in memory",
+    )
+
+
 class SemanticTextArgs(BaseModel):
-    query: str | bytes = Field(
+    query: str = Field(
         ...,
         title="Query",
         description="Semantic query to match against the text",
     )
+
+    _embedding: Optional[bytes]
 
     model: str = Field(
         title="The text embedding model to use",
@@ -88,6 +109,18 @@ Confidence scores are usually set by the model that extracted the text.
         description="Filter out text that is longer than this. Inclusive.",
     )
 
+    embed: EmbedArgs = Field(
+        default_factory=EmbedArgs,
+        title="Embed The Query",
+        description="""
+Embed the query using the model already specified in `model`.
+This is useful when the query is a string and needs to be converted to an embedding.
+
+If this is not present, the query is assumed to be an embedding already.
+In that case, it must be a base64 encoded string of a numpy array.
+        """,
+    )
+
 
 class SemanticTextSearch(SortableFilter):
     order_by: bool = get_order_by_field(True)
@@ -104,13 +137,14 @@ Search for text using semantic search on text embeddings.
         if len(self.text_embeddings.query.strip()) == 0:
             return self.set_validated(False)
 
-        if isinstance(self.text_embeddings.query, str):
-            self.text_embeddings.query = get_embed(
+        if self.text_embeddings.embed:
+            self.text_embeddings._embedding = get_embed(
                 self.text_embeddings.query,
                 self.text_embeddings.model,
+                self.text_embeddings.embed,
             )
         else:
-            self.text_embeddings.query = extract_embeddings(
+            self.text_embeddings._embedding = extract_embeddings(
                 self.text_embeddings.query
             )
 
@@ -150,7 +184,7 @@ Search for text using semantic search on text embeddings.
             criteria.append(vec_setters.c.name == args.model)
 
         vec_distance = func.vec_distance_L2(
-            embeddings.c.embedding, literal(args.query)
+            embeddings.c.embedding, literal(args._embedding)
         )
 
         rank_column = func.min(vec_distance)
@@ -189,9 +223,7 @@ last_used_model: str | None = None
 def get_embed(
     text: str,
     model_name: str,
-    cache_key: str = "search",
-    lru_size: int = 1,
-    ttl_seconds: int = 60,
+    cache_args: EmbedArgs,
 ) -> bytes:
 
     global last_embedded_text, last_embedded_text_embed, last_used_model
@@ -207,9 +239,9 @@ def get_embed(
     logger.debug(f"Getting embedding for text: {text}")
     model = ModelOptsFactory.get_model(model_name)
     embed_bytes: bytes = model.run_batch_inference(
-        cache_key,
-        lru_size,
-        ttl_seconds,
+        cache_args.cache_key,
+        cache_args.lru_size,
+        cache_args.ttl_seconds,
         [({"text": text, "task": "s2s"}, None)],
     )[0]
     text_embed = deserialize_array(embed_bytes)[0]
@@ -227,7 +259,7 @@ def deserialize_array(buffer: bytes) -> np.ndarray:
     return np.load(bio, allow_pickle=False)
 
 
-def extract_embeddings(buffer: bytes) -> bytes:
+def extract_embeddings(buffer: str) -> bytes:
     numpy_array = deserialize_array(base64.b64decode(buffer))
     assert isinstance(
         numpy_array, np.ndarray
