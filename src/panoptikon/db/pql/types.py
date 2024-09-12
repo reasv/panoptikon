@@ -107,11 +107,11 @@ def get_std_group_by(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
 class SearchResult(BaseModel):
     file_id: int
     item_id: int
-    path: Optional[str] = ""
-    filename: Optional[str] = ""
-    sha256: Optional[str] = ""
-    last_modified: Optional[str] = ""
-    type: Optional[str] = ""
+    path: Optional[str] = None
+    filename: Optional[str] = None
+    sha256: Optional[str] = None
+    last_modified: Optional[str] = None
+    type: Optional[str] = None
     size: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None
@@ -261,55 +261,3 @@ class SelectFields(BaseModel):
 
 class Operator(BaseModel):
     pass
-
-
-# FieldValueType = Union[str, int, float, bool]
-# FieldName = Literal["last_modified", "path"]
-
-
-# class KVFilter(BaseModel):
-#     k: FieldName
-#     v: FieldValueType
-
-
-# class KVInFilter(BaseModel):
-#     k: FieldName
-#     v: List[FieldValueType]
-
-
-# Define filters
-
-# class EqualsFilterModel(Filter):
-#     eq: KVFilter
-
-
-# class NotEqualsFilterModel(Filter):
-#     neq: KVFilter
-
-
-# class InFilterModel(Filter):
-#     in_: KVInFilter
-
-
-# class NotInFilterModel(Filter):
-#     nin: KVInFilter
-
-
-# class GreaterThanFilterModel(Filter):
-#     gt: KVFilter
-
-
-# class GreaterThanOrEqualFilterModel(Filter):
-#     gte: KVFilter
-
-
-# class LessThanFilterModel(Filter):
-#     lt: KVFilter
-
-
-# class LessThanOrEqualFilterModel(Filter):
-#     lte: KVFilter
-
-
-# class TagFilterModel(Filter):
-#     tags: TagFilter

@@ -1,5 +1,6 @@
 from typing import Union
 
+from panoptikon.db.pql.filters.kvfilters import ValueFilters
 from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.sortable.bookmarks import (
     InBookmarks,
@@ -17,6 +18,7 @@ from panoptikon.db.pql.filters.sortable.path_text import (
     MatchPath,
     MatchPathArgs,
 )
+from panoptikon.db.pql.filters.sortable.tags import MatchTags, TagsArgs
 from panoptikon.db.pql.filters.sortable.text_embeddings import (
     EmbedArgs,
     SemanticTextArgs,
@@ -32,4 +34,6 @@ Filters = Union[
     MatchText,
     SemanticTextSearch,
     SemanticImageSearch,
+    MatchTags,
+    ValueFilters,
 ]
