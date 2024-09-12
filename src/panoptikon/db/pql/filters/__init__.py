@@ -2,6 +2,10 @@ from typing import Union
 
 from panoptikon.db.pql.filters.kvfilters import ValueFilters
 from panoptikon.db.pql.filters.path_in import InPaths
+from panoptikon.db.pql.filters.processed_extracted_data import (
+    DerivedDataArgs,
+    HasUnprocessedData,
+)
 from panoptikon.db.pql.filters.processed_items import HasDataFrom
 from panoptikon.db.pql.filters.sortable.bookmarks import (
     InBookmarks,
@@ -37,5 +41,6 @@ Filters = Union[
     SemanticImageSearch,
     MatchTags,
     HasDataFrom,
+    HasUnprocessedData,
     ValueFilters,
 ]
