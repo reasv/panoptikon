@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -137,11 +138,13 @@ Search for text using semantic search on text embeddings.
             return self.set_validated(False)
 
         if self.text_embeddings.embed:
+            start_time = time.time()
             self.text_embeddings._embedding = get_embed(
                 self.text_embeddings.query,
                 self.text_embeddings.model,
                 self.text_embeddings.embed,
             )
+
         else:
             self.text_embeddings._embedding = extract_embeddings(
                 self.text_embeddings.query
@@ -236,6 +239,7 @@ def get_embed(
     from panoptikon.data_extractors.models import ModelOptsFactory
 
     logger.debug(f"Getting embedding for text: {text}")
+    start_time = time.time()
     model = ModelOptsFactory.get_model(model_name)
     embed_bytes: bytes = model.run_batch_inference(
         cache_args.cache_key,
@@ -249,6 +253,9 @@ def get_embed(
     last_embedded_text = text
     last_used_model = model_name
     last_embedded_text_embed = serialize_f32(text_embed.tolist())
+    logger.debug(
+        f"Embedding generation took {time.time() - start_time} seconds"
+    )
     return last_embedded_text_embed
 
 
