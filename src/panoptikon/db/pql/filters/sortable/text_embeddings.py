@@ -2,7 +2,7 @@ import base64
 import io
 import logging
 import time
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr
@@ -109,6 +109,10 @@ Confidence scores are usually set by the model that extracted the text.
         title="Maximum Length",
         description="Filter out text that is longer than this. Inclusive.",
     )
+    distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
+        default="MIN",
+        description="The method to aggregate distances when an item has multiple embeddings. Default is MIN.",
+    )
 
     embed: EmbedArgs = Field(
         default_factory=EmbedArgs,
@@ -188,8 +192,13 @@ Search for text using semantic search on text embeddings.
         vec_distance = func.vec_distance_L2(
             embeddings.c.embedding, literal(args._embedding)
         )
+        if args.distance_aggregation == "MAX":
+            rank_column = func.max(vec_distance)
+        elif args.distance_aggregation == "AVG":
+            rank_column = func.avg(vec_distance)
+        elif args.distance_aggregation == "MIN":
+            rank_column = func.min(vec_distance)
 
-        rank_column = func.min(vec_distance)
         if state.is_text_query:
             return self.wrap_query(
                 select(
