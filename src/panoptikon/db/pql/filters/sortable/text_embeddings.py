@@ -260,8 +260,7 @@ Search for text using semantic search on text embeddings.
                 )
                 .join(
                     text_data,
-                    (text_data.c.id == context.c.text_id)
-                    & (text_data.c.data_type == "text"),
+                    (text_data.c.id == context.c.text_id),
                 )
                 .join(
                     text_setters,
