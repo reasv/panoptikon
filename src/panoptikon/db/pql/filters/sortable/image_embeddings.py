@@ -45,7 +45,7 @@ Will search embeddings produced by this model.
 """,
     )
     distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
-        "MIN",
+        default="MIN",
         description="The method to aggregate distances when an item has multiple embeddings. Default is MIN.",
     )
     embed: EmbedArgs = Field(
