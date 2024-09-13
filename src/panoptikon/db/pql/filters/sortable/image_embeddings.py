@@ -137,8 +137,8 @@ Search for image using semantic search on image embeddings.
         )
 
         vec_distance = func.vec_distance_cosine(
-            func.vec_normalize(embeddings.c.embedding),
-            func.vec_normalize(literal(args._embedding)),
+            embeddings.c.embedding,
+            literal(args._embedding),
         )
         if args.distance_aggregation == "MAX":
             rank_column = func.max(vec_distance)
