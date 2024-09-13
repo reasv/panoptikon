@@ -1,6 +1,6 @@
 import io
 import logging
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import numpy as np
 import PIL
@@ -43,6 +43,10 @@ class SemanticImageArgs(BaseModel):
 The image embedding model to use for the semantic search.
 Will search embeddings produced by this model.
 """,
+    )
+    distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
+        "MIN",
+        description="The method to aggregate distances when an item has multiple embeddings. Default is MIN.",
     )
     embed: EmbedArgs = Field(
         default_factory=EmbedArgs,
@@ -136,7 +140,12 @@ Search for image using semantic search on image embeddings.
             func.vec_normalize(embeddings.c.embedding),
             func.vec_normalize(literal(args._embedding)),
         )
-        rank_column = func.min(vec_distance)
+        if args.distance_aggregation == "MAX":
+            rank_column = func.max(vec_distance)
+        elif args.distance_aggregation == "AVG":
+            rank_column = func.avg(vec_distance)
+        elif args.distance_aggregation == "MIN":
+            rank_column = func.min(vec_distance)
 
         # Now we join back with the embeddings table and get the distance
         # between the query embedding and the embeddings in the database
