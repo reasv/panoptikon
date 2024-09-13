@@ -113,6 +113,39 @@ Confidence scores are usually set by the model that extracted the text.
         default="MIN",
         description="The method to aggregate distances when an item has multiple embeddings. Default is MIN.",
     )
+    confidence_weight: float = Field(
+        default=0.0,
+        description="""
+The weight to apply to the confidence of the source text
+on the embedding distance aggregation for individual items with multiple embeddings.
+Default is 0.0, which means that the confidence of the source text
+does not affect the distance aggregation.
+This parameter is only relevant when the source text has a confidence value.
+The confidence of the source text is multiplied by the confidence of the other
+source text when calculating the distance between two items.
+The formula for the distance calculation is as follows:
+```
+weights = POW(COALESCE(text.confidence, 1)), src_confidence_weight)
+distance = SUM(distance * weights) / SUM(weights)
+```
+So this weight is the exponent to which the confidence is raised, which means that it can be greater than 1.
+When confidence weights are set, the distance_aggregation setting is ignored.
+""",
+    )
+    language_confidence_weight: float = Field(
+        default=0.0,
+        description="""
+The weight to apply to the confidence of the source text language
+on the embedding distance aggregation.
+Default is 0.0, which means that the confidence of the source text language detection
+does not affect the distance calculation.
+Totally analogous to `src_confidence_weight`, but for the language confidence.
+When both are present, the results of the POW() functions for both are multiplied together before being applied to the distance.
+```
+weights = POW(..., src_confidence_weight) * POW(..., src_language_confidence_weight)
+```
+""",
+    )
 
     embed: EmbedArgs = Field(
         default_factory=EmbedArgs,
@@ -198,6 +231,26 @@ Search for text using semantic search on text embeddings.
             rank_column = func.avg(vec_distance)
         elif args.distance_aggregation == "MIN":
             rank_column = func.min(vec_distance)
+
+        conf_weight_clause = func.pow(
+            func.coalesce(extracted_text.c.confidence, 1),
+            args.confidence_weight,
+        )
+        lang_conf_weight_clause = func.pow(
+            func.coalesce(extracted_text.c.language_confidence, 1),
+            args.language_confidence_weight,
+        )
+        if args.confidence_weight != 0 and args.language_confidence_weight != 0:
+            weights = conf_weight_clause * lang_conf_weight_clause
+            rank_column = func.sum(vec_distance * weights) / func.sum(weights)
+        elif args.confidence_weight != 0:
+            rank_column = func.sum(
+                vec_distance * conf_weight_clause
+            ) / func.sum(conf_weight_clause)
+        elif args.language_confidence_weight != 0:
+            rank_column = func.sum(
+                vec_distance * lang_conf_weight_clause
+            ) / func.sum(lang_conf_weight_clause)
 
         if state.is_text_query:
             return self.wrap_query(
