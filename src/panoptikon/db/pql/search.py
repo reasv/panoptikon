@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 def get_sql(stmt: Select, binds: bool = False) -> Tuple[str, List[Any]]:
     compiled_sql = stmt.compile(
-        dialect=sqlite.dialect(), compile_kwargs={"literal_binds": binds}
+        dialect=sqlite.dialect(),
+        compile_kwargs={"literal_binds": binds, "render_postcompile": True},
     )
     sql_string = str(compiled_sql)
     if compiled_sql.positiontup is not None:
