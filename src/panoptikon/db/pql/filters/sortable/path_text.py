@@ -1,5 +1,14 @@
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, asc, desc, func, literal_column, or_, text
+from sqlalchemy import (
+    Column,
+    Select,
+    asc,
+    desc,
+    func,
+    literal_column,
+    or_,
+    text,
+)
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
@@ -62,7 +71,7 @@ class MatchPath(SortableFilter):
                 .select_from(context)
                 .join(
                     files_path_fts,
-                    literal_column("files_path_fts.rowid") == context.c.file_id,
+                    Column("files_path_fts.rowid") == context.c.file_id,
                 )
                 .where(column.match(args.match))
             ),
