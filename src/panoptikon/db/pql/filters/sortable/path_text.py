@@ -59,6 +59,7 @@ class MatchPath(SortableFilter):
         return self.wrap_query(
             (
                 select(*get_std_cols(context, state), rank_column)
+                .select_from(context)
                 .join(
                     files_path_fts,
                     literal_column("files_path_fts.rowid") == context.c.file_id,
