@@ -76,7 +76,7 @@ class OrderByFilter:
 
 @dataclass
 class ExtraColumn:
-    column: ColumnClause | Column | KeyedColumnElement
+    column: str
     cte: CTE
     alias: str
     need_join: bool = False

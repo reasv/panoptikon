@@ -100,7 +100,7 @@ If set, the order_rank column will be returned with the results as this alias un
         if state.is_count_query:
             return super().wrap_query(query, context, state)
 
-        order_rank = literal_column("order_rank")
+        order_rank = Column("order_rank")
         if self.gt or self.lt:
             query = select(
                 query.alias(f"wrapped_{self.get_cte_name(state.cte_counter)}")
@@ -114,7 +114,7 @@ If set, the order_rank column will be returned with the results as this alias un
         if self.select_as:
             state.extra_columns.append(
                 ExtraColumn(
-                    column=cte.c.order_rank,
+                    column="order_rank",
                     cte=cte,
                     alias=self.select_as,
                     need_join=not self.order_by,

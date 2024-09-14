@@ -294,7 +294,7 @@ including tags and OCR text
         if args.select_snippet_as and not state.is_count_query:
             state.extra_columns.append(
                 ExtraColumn(
-                    column=cte.c.snip,
+                    column="snip",
                     cte=cte,
                     alias=args.select_snippet_as,
                     need_join=(not self.order_by and not self.select_as),

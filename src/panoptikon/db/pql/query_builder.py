@@ -229,11 +229,12 @@ def add_extra_columns(
 ) -> Tuple[Select, List[str]]:
     column_aliases = []
     for i, extra_column in enumerate(state.extra_columns):
-        column, cte, alias = (
+        column_name, cte, alias = (
             extra_column.column,
             extra_column.cte,
             extra_column.alias,
         )
+        column = cte.c[column_name]
         query = query.add_columns(column.label(f"extra_{i}"))
         column_aliases.append(alias)
         if extra_column.need_join and cte.name != root_cte_name:
