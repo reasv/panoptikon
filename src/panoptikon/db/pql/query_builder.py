@@ -1,7 +1,17 @@
 import logging
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
-from sqlalchemy import CTE, Column, Label, Select, except_, func, select, union
+from sqlalchemy import (
+    CTE,
+    Column,
+    Label,
+    Select,
+    UnaryExpression,
+    except_,
+    func,
+    select,
+    union,
+)
 
 from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
@@ -16,8 +26,11 @@ from panoptikon.db.pql.pql_model import (
 )
 from panoptikon.db.pql.preprocess_query import preprocess_query
 from panoptikon.db.pql.types import (
+    FileColumns,
+    ItemColumns,
     OrderByFilter,
     QueryState,
+    TextColumns,
     contains_text_columns,
     get_column,
     get_std_cols,
@@ -37,18 +50,20 @@ def build_query(
         setters,
     )
 
+    raise_if_invalid(input_query)
     # Preprocess the query to remove empty filters and validate args
     if query_root := input_query.query:
         query_root = preprocess_query(query_root)
     # Initialize the state object
-    state = QueryState(is_count_query=count_query)
-    if input_query.entity == "text":
-        state.is_text_query = True
+    state = QueryState(
+        is_count_query=count_query,
+        is_text_query=input_query.entity == "text",
+    )
     root_cte_name: str | None = None
     # Start the recursive processing
     if query_root:
         start = select(files.c.id.label("file_id"), files.c.item_id)
-        if input_query.entity == "text":
+        if state.is_text_query:
             start = (
                 start.join(item_data, item_data.c.item_id == files.c.item_id)
                 .join(extracted_text, extracted_text.c.id == item_data.c.id)
@@ -66,74 +81,49 @@ def build_query(
             root_cte.c.file_id.label("file_id"),
             root_cte.c.item_id.label("item_id"),
         )
-        if input_query.entity == "text":
-            text_id = root_cte.c.text_id.label("text_id")
-        else:
-            # Not actually used, but needed for type checking
-            text_id = extracted_text.c.id.label("text_id")
-    else:
-        file_id, item_id = files.c.id.label("file_id"), files.c.item_id.label(
-            "item_id"
-        )
-        # Not actually used, but needed for type checking
-        text_id = extracted_text.c.id.label("text_id")
-        if input_query.entity == "text":
-            # We must join to get the corresponding item and files
-            text_cte = (
-                select(file_id, item_id, text_id)
-                .join(item_data, item_data.c.item_id == files.c.item_id)
-                .join(extracted_text, extracted_text.c.id == item_data.c.id)
-                .cte("text_cte")
-            )
-            file_id, item_id, text_id = (
-                text_cte.c.file_id.label("file_id"),
-                text_cte.c.item_id.label("item_id"),
-                text_cte.c.text_id.label("text_id"),
-            )
-            root_cte_name = text_cte.name
-
-    if input_query.entity == "text":
-        full_query = select(file_id, item_id, text_id)
-    else:
+        text_id = None
         full_query = select(file_id, item_id)
+        if state.is_text_query:
+            text_id = root_cte.c.text_id.label("text_id")
+            full_query = select(file_id, item_id, text_id)
+
+    else:
+        full_query, file_id, item_id, text_id, root_cte_name = get_empty_query(
+            is_text_query=state.is_text_query
+        )
 
     if count_query:
         return (
-            select(func.count().label("total")).select_from(
-                full_query.alias("wrapped_query")
+            select(
+                func.count().label("total"),
+            ).select_from(
+                full_query.alias("wrapped_query"),
             ),
             [],
         )
-
     # Join the item and file tables
-    full_query = full_query.join(items, items.c.id == item_id).join(
-        files, files.c.id == file_id
+    full_query = full_query.join(
+        items,
+        items.c.id == item_id,
+    ).join(
+        files,
+        files.c.id == file_id,
     )
     if input_query.entity == "text":
         full_query = (
-            full_query.join(extracted_text, extracted_text.c.id == text_id)
-            .join(item_data, item_data.c.id == extracted_text.c.id)
-            .join(setters, setters.c.id == item_data.c.setter_id)
+            full_query.join(
+                extracted_text,
+                extracted_text.c.id == text_id,
+            )
+            .join(
+                item_data,
+                item_data.c.id == extracted_text.c.id,
+            )
+            .join(
+                setters,
+                setters.c.id == item_data.c.setter_id,
+            )
         )
-    if not input_query.entity == "text":
-        if contains_text_columns(input_query.select):
-            logger.error("Tried to select text columns in a non-text query")
-            raise ValueError("Tried to select text columns in a non-text query")
-        order_cols = [order.order_by for order in input_query.order_by]
-        if contains_text_columns(order_cols):
-            logger.error("Tried to order by text columns in a non-text query")
-            raise ValueError(
-                "Tried to order by text columns in a non-text query"
-            )
-        if input_query.partition_by and contains_text_columns(
-            input_query.partition_by
-        ):
-            logger.error(
-                "Tried to partition by text columns in a non-text query"
-            )
-            raise ValueError(
-                "Tried to partition by text columns in a non-text query"
-            )
 
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns
@@ -144,7 +134,6 @@ def build_query(
         col.key for col in full_query.selected_columns if col.key
     ]
     # Add order by clauses
-    text_id = text_id if input_query.entity == "text" else None
     full_query, order_by_conds, order_fns = build_order_by(
         full_query,
         root_cte_name,
@@ -156,23 +145,13 @@ def build_query(
     )
 
     if input_query.partition_by:
-        # Add row number column for partitioning, and get the first row of each partition
-        partition_by_cols = [
-            get_column(col).label(col) for col in input_query.partition_by
-        ]
-        rownum = func.row_number().over(
-            partition_by=partition_by_cols, order_by=order_by_conds
+        full_query = apply_partition_by(
+            input_query.partition_by,
+            full_query,
+            selected_columns,
+            order_by_conds,
+            order_fns,
         )
-        full_query = full_query.add_columns(
-            rownum.label("partition_rownum")
-        ).cte("partition_cte")
-        outer_order_by_conds = [f(full_query) for f in order_fns]
-
-        # Only select explicitly requested columns
-        full_query = select(*[full_query.c[k] for k in selected_columns]).where(
-            full_query.c.partition_rownum == 1
-        )
-        full_query = full_query.order_by(*outer_order_by_conds)
     else:
         full_query = full_query.order_by(*order_by_conds)
 
@@ -269,3 +248,83 @@ def add_extra_columns(
                 isouter=True,
             )
     return query, column_aliases
+
+
+def get_empty_query(
+    is_text_query: bool = False,
+) -> Tuple[Select, Label, Label, Label | None, str | None]:
+    # Query with no filters
+    from panoptikon.db.pql.tables import extracted_text, files, item_data
+
+    file_id, item_id = files.c.id.label("file_id"), files.c.item_id.label(
+        "item_id"
+    )
+    if is_text_query:
+        # We must join to get the corresponding item and files
+        text_id = extracted_text.c.id.label("text_id")
+        text_cte = (
+            select(file_id, item_id, text_id)
+            .join(item_data, item_data.c.item_id == files.c.item_id)
+            .join(extracted_text, extracted_text.c.id == item_data.c.id)
+            .cte("text_cte")
+        )
+        file_id, item_id, text_id = (
+            text_cte.c.file_id.label("file_id"),
+            text_cte.c.item_id.label("item_id"),
+            text_cte.c.text_id.label("text_id"),
+        )
+        return (
+            select(file_id, item_id, text_id),
+            file_id,
+            item_id,
+            text_id,
+            text_cte.name,
+        )
+    return select(file_id, item_id), file_id, item_id, None, None
+
+
+def raise_if_invalid(input_query: PQLQuery):
+    if not input_query.entity == "text":
+        if contains_text_columns(input_query.select):
+            logger.error("Tried to select text columns in a non-text query")
+            raise ValueError("Tried to select text columns in a non-text query")
+        order_cols = [order.order_by for order in input_query.order_by]
+        if contains_text_columns(order_cols):
+            logger.error("Tried to order by text columns in a non-text query")
+            raise ValueError(
+                "Tried to order by text columns in a non-text query"
+            )
+        if input_query.partition_by and contains_text_columns(
+            input_query.partition_by
+        ):
+            logger.error(
+                "Tried to partition by text columns in a non-text query"
+            )
+            raise ValueError(
+                "Tried to partition by text columns in a non-text query"
+            )
+
+
+def apply_partition_by(
+    partition_by: List[FileColumns | ItemColumns | TextColumns],
+    query: Select,
+    selected_columns: List[str],
+    order_by_conds: List[UnaryExpression],
+    order_fns: List[Callable[[CTE], UnaryExpression]],
+) -> Select:
+    # Add row number column for partitioning, and get the first row of each partition
+    partition_by_cols = [get_column(col).label(col) for col in partition_by]
+    rownum = func.row_number().over(
+        partition_by=partition_by_cols, order_by=order_by_conds
+    )
+    partition_cte = query.add_columns(
+        rownum.label("partition_rownum"),
+    ).cte("partition_cte")
+    outer_order_by_conds = [f(partition_cte) for f in order_fns]
+
+    # Only select explicitly requested columns
+    query = select(*[query.c[k] for k in selected_columns]).where(
+        partition_cte.c.partition_rownum == 1
+    )
+    query = query.order_by(*outer_order_by_conds)
+    return query
