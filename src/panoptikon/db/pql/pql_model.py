@@ -83,7 +83,7 @@ However, "text" queries allow you to include text-specific columns in the select
 The final results will also be one for each text-file pair.
 
 Most of the same filters can be used on both.
-"text" queries will include "text_id" in each result. "file_id" and "item_id" are always included.
+"text" queries will include "data_id" in each result. "file_id" and "item_id" are always included.
 """,
     )
     partition_by: Optional[

@@ -73,7 +73,7 @@ def build_query(
                     extracted_text,
                     extracted_text.c.id == item_data.c.id,
                 )
-                .add_columns(extracted_text.c.id.label("text_id"))
+                .add_columns(extracted_text.c.id.label("data_id"))
             )
 
         root_cte = process_query_element(
@@ -87,14 +87,14 @@ def build_query(
             root_cte.c.file_id.label("file_id"),
             root_cte.c.item_id.label("item_id"),
         )
-        text_id = None
+        data_id = None
         full_query = select(file_id, item_id)
         if state.is_text_query:
-            text_id = root_cte.c.text_id.label("text_id")
-            full_query = select(file_id, item_id, text_id)
+            data_id = root_cte.c.data_id.label("data_id")
+            full_query = select(file_id, item_id, data_id)
 
     else:
-        full_query, file_id, item_id, text_id, root_cte_name = get_empty_query(
+        full_query, file_id, item_id, data_id, root_cte_name = get_empty_query(
             is_text_query=state.is_text_query
         )
 
@@ -119,7 +119,7 @@ def build_query(
         full_query = (
             full_query.join(
                 extracted_text,
-                extracted_text.c.id == text_id,
+                extracted_text.c.id == data_id,
             )
             .join(
                 item_data,
@@ -134,7 +134,7 @@ def build_query(
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns
     full_query, extra_columns = add_extra_columns(
-        full_query, state, root_cte_name, file_id, text_id
+        full_query, state, root_cte_name, file_id, data_id
     )
     selected_columns = [
         col.key for col in full_query.selected_columns if col.key
@@ -144,7 +144,7 @@ def build_query(
         full_query,
         root_cte_name,
         file_id,
-        text_id,
+        data_id,
         select_conds=True if input_query.partition_by is not None else False,
         order_list=state.order_list,
         order_args=input_query.order_by,
@@ -219,7 +219,7 @@ def add_select_columns(input_query: PQLQuery, query: Select) -> Select:
     input_query.select = [
         x
         for x in input_query.select
-        if x not in {"item_id", "file_id", "text_id"}
+        if x not in {"item_id", "file_id", "data_id"}
     ]
 
     columns = [get_column(col).label(col) for col in input_query.select]
@@ -231,7 +231,7 @@ def add_extra_columns(
     state: QueryState,
     root_cte_name: str | None,
     file_id: Label,
-    text_id: Label | None,
+    data_id: Label | None,
 ) -> Tuple[Select, List[str]]:
     column_aliases = []
     for i, extra_column in enumerate(state.extra_columns):
@@ -245,10 +245,10 @@ def add_extra_columns(
         column_aliases.append(alias)
         if extra_column.need_join and cte.name != root_cte_name:
             join_cond = cte.c.file_id == file_id
-            if text_id is not None:
-                # For text-based queries, we need to join on the text_id as well
-                # The results are unique on file_id, text_id rather than just file_id
-                join_cond = join_cond & (cte.c.text_id == text_id)
+            if data_id is not None:
+                # For text-based queries, we need to join on the data_id as well
+                # The results are unique on file_id, data_id rather than just file_id
+                join_cond = join_cond & (cte.c.data_id == data_id)
             query = query.join(
                 cte,
                 join_cond,
@@ -268,23 +268,23 @@ def get_empty_query(
     )
     if is_text_query:
         # We must join to get the corresponding item and files
-        text_id = extracted_text.c.id.label("text_id")
+        data_id = extracted_text.c.id.label("data_id")
         text_cte = (
-            select(file_id, item_id, text_id)
+            select(file_id, item_id, data_id)
             .join(item_data, item_data.c.item_id == files.c.item_id)
             .join(extracted_text, extracted_text.c.id == item_data.c.id)
             .cte("text_cte")
         )
-        file_id, item_id, text_id = (
+        file_id, item_id, data_id = (
             text_cte.c.file_id.label("file_id"),
             text_cte.c.item_id.label("item_id"),
-            text_cte.c.text_id.label("text_id"),
+            text_cte.c.data_id.label("data_id"),
         )
         return (
-            select(file_id, item_id, text_id),
+            select(file_id, item_id, data_id),
             file_id,
             item_id,
-            text_id,
+            data_id,
             text_cte.name,
         )
     return select(file_id, item_id), file_id, item_id, None, None

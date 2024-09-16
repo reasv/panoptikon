@@ -252,7 +252,7 @@ including tags and OCR text
                 state,
             )
         else:
-            # We are in a text-query and have a text_id
+            # We are in a text-query and have a data_id
             rank_column = literal_column("rank")
             if args.filter_only:
                 rank_column = literal(1)
@@ -260,13 +260,13 @@ including tags and OCR text
                 select(
                     *get_std_cols(context, state),
                 )
-                .join(item_data, item_data.c.id == context.c.text_id)
+                .join(item_data, item_data.c.id == context.c.data_id)
                 .join(setters, setters.c.id == item_data.c.setter_id)
-                .join(extracted_text, context.c.text_id == extracted_text.c.id)
+                .join(extracted_text, context.c.data_id == extracted_text.c.id)
                 .join(
                     extracted_text_fts,
                     literal_column("extracted_text_fts.rowid")
-                    == context.c.text_id,
+                    == context.c.data_id,
                 )
                 .where(and_(*criteria))
             )

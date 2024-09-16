@@ -36,7 +36,7 @@ class ArgValues(BaseModel):
     audio_tracks: Optional[Union[int, List[int]]] = None
     video_tracks: Optional[Union[int, List[int]]] = None
     subtitle_tracks: Optional[Union[int, List[int]]] = None
-    text_id: Optional[Union[int, List[int]]] = None
+    data_id: Optional[Union[int, List[int]]] = None
     language: Optional[Union[str, List[str]]] = None
     language_confidence: Optional[Union[float, List[float]]] = None
     text: Optional[Union[str, List[str]]] = None
@@ -77,7 +77,7 @@ class ArgValuesScalar(ArgValues):
     audio_tracks: Optional[int] = None
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
-    text_id: Optional[int] = None
+    data_id: Optional[int] = None
     language: Optional[str] = None
     language_confidence: Optional[float] = None
     text: Optional[str] = None
@@ -195,7 +195,7 @@ class KVFilter(Filter):
             )
             .join(
                 extracted_text,
-                extracted_text.c.id == context.c.text_id,
+                extracted_text.c.id == context.c.data_id,
             )
             .join(
                 item_data,

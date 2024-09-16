@@ -39,7 +39,7 @@ ItemColumns = Literal[
 ]
 
 TextColumns = Literal[
-    "text_id",
+    "data_id",
     "language",
     "language_confidence",
     "text",
@@ -93,13 +93,13 @@ class QueryState:
 
 def get_std_cols(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
     if state.is_text_query:
-        return [cte.c.item_id, cte.c.file_id, cte.c.text_id]
+        return [cte.c.item_id, cte.c.file_id, cte.c.data_id]
     return [cte.c.item_id, cte.c.file_id]
 
 
 def get_std_group_by(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
     if state.is_text_query:
-        return [cte.c.text_id, cte.c.file_id]
+        return [cte.c.data_id, cte.c.file_id]
     return [cte.c.file_id]
 
 
@@ -122,7 +122,7 @@ class SearchResult(BaseModel):
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
     # Text columns (only present for text-* queries)
-    text_id: Optional[int] = None  # Always present for text-* queries
+    data_id: Optional[int] = None  # Always present for text-* queries
     language: Optional[str] = None
     language_confidence: Optional[float] = None
     text: Optional[str] = None
@@ -170,7 +170,7 @@ def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
     return {
         "file_id": files.c.id,
         "item_id": files.c.item_id,
-        "text_id": extracted_text.c.id,
+        "data_id": extracted_text.c.id,
         "sha256": files.c.sha256,
         "path": files.c.path,
         "filename": files.c.filename,
