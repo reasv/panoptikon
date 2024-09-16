@@ -65,8 +65,14 @@ def build_query(
         start = select(files.c.id.label("file_id"), files.c.item_id)
         if state.is_text_query:
             start = (
-                start.join(item_data, item_data.c.item_id == files.c.item_id)
-                .join(extracted_text, extracted_text.c.id == item_data.c.id)
+                start.join(
+                    item_data,
+                    item_data.c.item_id == files.c.item_id,
+                )
+                .join(
+                    extracted_text,
+                    extracted_text.c.id == item_data.c.id,
+                )
                 .add_columns(extracted_text.c.id.label("text_id"))
             )
 
