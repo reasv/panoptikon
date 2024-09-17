@@ -3,7 +3,12 @@ from typing import Optional, Union
 from pydantic import BaseModel, PrivateAttr
 from sqlalchemy import CTE, Select
 
-from panoptikon.db.pql.types import Operator, QueryState, get_std_cols
+from panoptikon.db.pql.types import (
+    FilterSelect,
+    Operator,
+    QueryState,
+    get_std_cols,
+)
 
 
 class Filter(BaseModel):
@@ -17,6 +22,7 @@ class Filter(BaseModel):
             query = query.with_only_columns(*get_std_cols(context, state))
         cte_name = self.get_cte_name(state.cte_counter)
         state.cte_counter += 1
+        state.selects[cte_name] = FilterSelect(query)
         return query.cte(cte_name)
 
     def get_cte_name(self, counter: int) -> str:

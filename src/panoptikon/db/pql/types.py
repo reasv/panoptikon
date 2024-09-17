@@ -1,5 +1,6 @@
 import sqlite3
 from dataclasses import dataclass, field
+from shlex import join
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union, get_args
 
 from pydantic import BaseModel, Field
@@ -82,9 +83,15 @@ class ExtraColumn:
 
 
 @dataclass
+class FilterSelect:
+    select: Select
+
+
+@dataclass
 class QueryState:
     order_list: List[OrderByFilter] = field(default_factory=list)
     extra_columns: List[ExtraColumn] = field(default_factory=list)
+    selects: Dict[str, FilterSelect] = field(default_factory=dict)
     cte_counter: int = 0
     is_count_query: bool = False
     is_text_query: bool = False
