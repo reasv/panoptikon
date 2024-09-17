@@ -79,7 +79,6 @@ class ExtraColumn:
     column: str
     cte: CTE
     alias: str
-    need_join: bool = False
 
 
 @dataclass

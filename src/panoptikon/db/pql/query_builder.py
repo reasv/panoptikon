@@ -130,11 +130,20 @@ def build_query(
                 setters.c.id == item_data.c.setter_id,
             )
         )
-
+    # Add joins for extra columns and order by clauses
+    needed_joins = [c.cte for c in state.extra_columns]
+    needed_joins.extend([c.cte for c in state.order_list])
+    full_query = add_joins(
+        needed_joins,
+        full_query,
+        file_id,
+        data_id,
+        root_cte_name,
+    )
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns
     full_query, extra_columns = add_extra_columns(
-        full_query, state, root_cte_name, file_id, data_id
+        full_query, state, root_cte_name
     )
     selected_columns = [
         col.key for col in full_query.selected_columns if col.key
@@ -143,8 +152,6 @@ def build_query(
     full_query, order_by_conds, order_fns = build_order_by(
         full_query,
         root_cte_name,
-        file_id,
-        data_id,
         select_conds=True if input_query.partition_by is not None else False,
         order_list=state.order_list,
         order_args=input_query.order_by,
@@ -230,8 +237,6 @@ def add_extra_columns(
     query: Select,
     state: QueryState,
     root_cte_name: str | None,
-    file_id: Label,
-    data_id: Label | None,
 ) -> Tuple[Select, List[str]]:
     column_aliases = []
     for i, extra_column in enumerate(state.extra_columns):
@@ -243,18 +248,32 @@ def add_extra_columns(
         column = cte.c[column_name]
         query = query.add_columns(column.label(f"extra_{i}"))
         column_aliases.append(alias)
-        if extra_column.need_join and cte.name != root_cte_name:
-            join_cond = cte.c.file_id == file_id
-            if data_id is not None:
-                # For text-based queries, we need to join on the data_id as well
-                # The results are unique on file_id, data_id rather than just file_id
-                join_cond = join_cond & (cte.c.data_id == data_id)
-            query = query.join(
-                cte,
-                join_cond,
-                isouter=True,
-            )
     return query, column_aliases
+
+
+def add_joins(
+    targets: List[CTE],
+    query: Select,
+    file_id: Label,
+    data_id: Label | None,
+    root_cte_name: str | None,
+) -> Select:
+    # Deduplicate the targets by .name
+    targets = list({target.name: target for target in targets}.values())
+    for target in targets:
+        if target.name == root_cte_name:
+            continue
+        join_cond = target.c.file_id == file_id
+        if data_id is not None:
+            # For item_data queries, we need to join on the data_id as well
+            # The intermediate results are unique on file_id, data_id rather than just file_id
+            join_cond = join_cond & (target.c.data_id == data_id)
+        query = query.join(
+            target,
+            join_cond,
+            isouter=True,
+        )
+    return query
 
 
 def get_empty_query(

@@ -117,7 +117,6 @@ If set, the order_rank column will be returned with the results as this alias un
                     column="order_rank",
                     cte=cte,
                     alias=self.select_as,
-                    need_join=not self.order_by,
                 )
             )
         return cte

@@ -26,8 +26,6 @@ from panoptikon.db.pql.types import (
 def build_order_by(
     query: Select,
     root_cte_name: str | None,
-    file_id: Label,
-    data_id: Label | None,
     select_conds: bool,
     order_list: List[OrderByFilter],
     order_args: List[OrderArgs],
@@ -51,8 +49,6 @@ def build_order_by(
                 query,
                 select_conds,
                 root_cte_name,
-                file_id,
-                data_id,
             )
             order_by_conditions.append(order_by_condition)
             if order_fn:
@@ -65,8 +61,6 @@ def build_order_by(
                 query,
                 select_conds,
                 root_cte_name,
-                file_id,
-                data_id,
             )
             order_by_conditions.append(order_by_condition)
             if order_fn:
@@ -166,8 +160,6 @@ def apply_order_filter(
     query: Select,
     select_conds: bool,
     root_cte_name: str | None,
-    file_id: Label,
-    data_id: Label | None,
 ) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
     direction = asc if args.direction == "asc" else desc
     field = args.cte.c.order_rank
@@ -176,18 +168,6 @@ def apply_order_filter(
         label = f"o{index}_{args.cte.name}_rank"
         query = query.column(field.label(label))
         gen = lambda cte: nulls_last(direction(cte.c[label]))
-
-    join_cond = args.cte.c.file_id == file_id
-    if data_id is not None:
-        # For text-based queries, we need to join on the data_id as well
-        join_cond = join_cond & (args.cte.c.data_id == data_id)
-    # If this is not the last CTE in the chain, we have to LEFT JOIN it
-    if args.cte.name != root_cte_name:
-        query = query.join(
-            args.cte,
-            join_cond,
-            isouter=True,
-        )
     return (
         query,
         nulls_last(direction(field)),
@@ -201,8 +181,6 @@ def coalesce_order_filters(
     query: Select,
     select_conds: bool,
     root_cte_name: str | None,
-    file_id: Label,
-    data_id: Label | None,
 ) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
     # Coalesce filter order by columns with the same priority
     columns = []  # Initialize variable for coalesced column
@@ -211,18 +189,6 @@ def coalesce_order_filters(
     select_labels: List[str] = []
     for spec in args:
         assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
-        # If this is not the last CTE in the chain, we have to LEFT JOIN it
-        join_cond = spec.cte.c.file_id == file_id
-        if data_id is not None:
-            # For text-based queries, we need to join on the data_id as well
-            join_cond = join_cond & (spec.cte.c.data_id == data_id)
-
-        if spec.cte.name != root_cte_name:
-            query = query.join(
-                spec.cte,
-                join_cond,
-                isouter=True,
-            )
         field = spec.cte.c.order_rank
         columns.append(field)
 
