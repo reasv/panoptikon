@@ -100,15 +100,15 @@ If set, the order_rank column will be returned with the results as this alias un
         if state.is_count_query:
             return super().wrap_query(query, context, state)
 
-        order_rank = Column("order_rank")
         if self.gt or self.lt:
-            query = select(
-                query.alias(f"wrapped_{self.get_cte_name(state.cte_counter)}")
+            context = query.cte(
+                f"wrapped_{self.get_cte_name(state.cte_counter)}"
             )
+            query = select(context)
             if self.gt:
-                query = query.where(order_rank > self.gt)
+                query = query.where(context.c.order_rank > self.gt)
             if self.lt:
-                query = query.where(order_rank < self.lt)
+                query = query.where(context.c.order_rank < self.lt)
 
         cte = super().wrap_query(query, context, state)
         if self.select_as:
