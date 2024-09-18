@@ -19,7 +19,21 @@ from panoptikon.db.pql.types import (
 FieldValueType = Union[str, int, float, bool, None]
 
 
-class ArgValues(BaseModel):
+class ArgValuesBase(BaseModel):
+
+    def get_set_values(
+        self,
+    ) -> Sequence[
+        Tuple[
+            Union[FileColumns, ItemColumns, TextColumns],
+            FieldValueType | List[FieldValueType],
+        ]
+    ]:
+        mdict = self.model_dump(exclude_unset=True)
+        return [(k, v) for k, v in mdict.items()]  # type: ignore
+
+
+class ArgValues(ArgValuesBase):
     file_id: Optional[Union[int, List[int]]] = None
     item_id: Optional[Union[int, List[int]]] = None
     path: Optional[Union[str, List[str]]] = None
@@ -48,19 +62,8 @@ class ArgValues(BaseModel):
     text_index: Optional[Union[int, List[int]]] = None
     source_id: Optional[Union[int, List[int]]] = None
 
-    def get_set_values(
-        self,
-    ) -> Sequence[
-        Tuple[
-            Union[FileColumns, ItemColumns, TextColumns],
-            FieldValueType | List[FieldValueType],
-        ]
-    ]:
-        mdict = self.model_dump(exclude_unset=True)
-        return [(k, v) for k, v in mdict.items()]  # type: ignore
 
-
-class ArgValuesScalar(ArgValues):
+class ArgValuesScalar(ArgValuesBase):
     file_id: Optional[int] = None
     item_id: Optional[int] = None
     path: Optional[str] = None
@@ -91,7 +94,7 @@ class ArgValuesScalar(ArgValues):
 
 
 class KVFilter(Filter):
-    def kv_get_validated(self, args: ArgValues):
+    def kv_get_validated(self, args: ArgValuesBase):
         if len(args.get_set_values()) == 0:
             return self.set_validated(False)
 
@@ -110,7 +113,7 @@ class KVFilter(Filter):
             "endswith",
             "contains",
         ],
-        args: ArgValues,
+        args: ArgValuesBase,
         context: CTE,
         state: QueryState,
     ) -> CTE:
