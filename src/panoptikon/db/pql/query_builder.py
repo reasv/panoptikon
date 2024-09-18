@@ -1,11 +1,12 @@
 import logging
-from typing import Callable, List, Tuple
+from typing import Callable, List, Literal, Tuple
 
 from sqlalchemy import (
     CTE,
     Column,
     Label,
     Select,
+    Table,
     UnaryExpression,
     except_,
     func,
@@ -107,29 +108,14 @@ def build_query(
             ),
             [],
         )
-    # Join the item and file tables
-    full_query = full_query.join(
-        items,
-        items.c.id == item_id,
-    ).join(
-        files,
-        files.c.id == file_id,
+
+    full_query = add_inner_joins(
+        full_query,
+        input_query.entity,
+        item_id,
+        file_id,
+        data_id,
     )
-    if input_query.entity == "text":
-        full_query = (
-            full_query.join(
-                extracted_text,
-                extracted_text.c.id == data_id,
-            )
-            .join(
-                item_data,
-                item_data.c.id == extracted_text.c.id,
-            )
-            .join(
-                setters,
-                setters.c.id == item_data.c.setter_id,
-            )
-        )
     # Add joins for extra columns and order by clauses
     needed_joins = [c.cte for c in state.extra_columns]
     needed_joins.extend([c.cte for c in state.order_list])
@@ -276,6 +262,53 @@ def add_joins(
     return query
 
 
+def add_inner_joins(
+    query: Select,
+    entity: Literal["text", "file"],
+    item_id: Label,
+    file_id: Label,
+    data_id: Label | None,
+):
+    from panoptikon.db.pql.tables import (
+        extracted_text,
+        files,
+        item_data,
+        items,
+        setters,
+    )
+
+    # Join the item and file tables
+    if not has_joined(query, items):
+        query = query.join(
+            items,
+            items.c.id == item_id,
+        )
+
+    if not has_joined(query, files):
+        query = query.join(
+            files,
+            files.c.id == file_id,
+        )
+
+    if data_id is not None:
+        if not has_joined(query, item_data):
+            query = query.join(
+                item_data,
+                item_data.c.id == data_id,
+            )
+        if not has_joined(query, setters):
+            query = query.join(
+                setters,
+                setters.c.id == item_data.c.setter_id,
+            )
+        if not has_joined(query, extracted_text) and entity == "text":
+            query = query.join(
+                extracted_text,
+                extracted_text.c.id == data_id,
+            )
+    return query
+
+
 def get_empty_query(
     is_text_query: bool = False,
 ) -> Tuple[Select, Label, Label, Label | None, str | None]:
@@ -354,3 +387,11 @@ def apply_partition_by(
     )
     query = query.order_by(*outer_order_by_conds)
     return query
+
+
+def has_joined(query: Select, table: Table) -> bool:
+    for from_clause in query.froms:
+        # Ensure it's the exact table, not an alias
+        if isinstance(from_clause, table.__class__) and from_clause == table:
+            return True
+    return False
