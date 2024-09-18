@@ -38,14 +38,14 @@ class Filter(BaseModel):
         return self if self._validated else None
 
     def raise_if_not_validated(self):
-        """Raise a ValueError if validate() has not been called.
+        """Raise a ValueError if get_validated() has not been called.
         Raises:
             ValueError: If the filter has not been validated.
         """
         if not self.is_validated():
             raise ValueError("Filter was not validated")
 
-    def validate(self) -> Optional[Union["Filter", Operator]]:
+    def get_validated(self) -> Optional[Union["Filter", Operator]]:
         """Pre-process filter args and validate them.
         Should return a Filter object or None if the filter should be skipped.
         Must be called before build_query.

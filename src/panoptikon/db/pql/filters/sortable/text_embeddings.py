@@ -171,7 +171,7 @@ Search for text using semantic search on text embeddings.
 """,
     )
 
-    def validate(self):
+    def get_validated(self):
         if len(self.text_embeddings.query.strip()) == 0:
             return self.set_validated(False)
 

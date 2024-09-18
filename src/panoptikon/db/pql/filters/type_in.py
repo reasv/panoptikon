@@ -14,7 +14,7 @@ class TypeIn(Filter):
         title="MIME Type must begin with one of the given strings",
     )
 
-    def validate(self):
+    def get_validated(self):
         return self.set_validated(bool(self.type_in))
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:

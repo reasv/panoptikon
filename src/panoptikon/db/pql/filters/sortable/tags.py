@@ -68,7 +68,7 @@ class MatchTags(SortableFilter):
     row_n_direction: OrderTypeNN = get_order_direction_field_rownum("desc")
     match_tags: TagsArgs
 
-    def validate(self):
+    def get_validated(self):
         if not self.match_tags.tags:
             return self.set_validated(False)
         if self.match_tags.all_setters_required and not self.match_tags.setters:

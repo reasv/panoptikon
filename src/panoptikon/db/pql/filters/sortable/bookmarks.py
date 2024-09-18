@@ -57,7 +57,7 @@ class InBookmarks(SortableFilter):
         description="Only include items that are bookmarked.",
     )
 
-    def validate(self):
+    def get_validated(self):
         return self.set_validated(self.in_bookmarks.enable)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:

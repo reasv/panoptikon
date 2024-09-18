@@ -91,7 +91,7 @@ class ArgValuesScalar(ArgValues):
 
 
 class KVFilter(Filter):
-    def kv_validate(self, args: ArgValues):
+    def kv_get_validated(self, args: ArgValues):
         if len(args.get_set_values()) == 0:
             return self.set_validated(False)
 
@@ -214,8 +214,8 @@ class KVFilter(Filter):
 class Equals(KVFilter):
     eq: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.eq)
+    def get_validated(self):
+        return self.kv_get_validated(self.eq)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("eq", self.eq, context, state)
@@ -224,8 +224,8 @@ class Equals(KVFilter):
 class NotEquals(KVFilter):
     neq: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.neq)
+    def get_validated(self):
+        return self.kv_get_validated(self.neq)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("neq", self.neq, context, state)
@@ -234,8 +234,8 @@ class NotEquals(KVFilter):
 class In(KVFilter):
     in_: ArgValues
 
-    def validate(self):
-        return self.kv_validate(self.in_)
+    def get_validated(self):
+        return self.kv_get_validated(self.in_)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("eq", self.in_, context, state)
@@ -244,8 +244,8 @@ class In(KVFilter):
 class NotIn(KVFilter):
     nin: ArgValues
 
-    def validate(self):
-        return self.kv_validate(self.nin)
+    def get_validated(self):
+        return self.kv_get_validated(self.nin)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("neq", self.nin, context, state)
@@ -254,8 +254,8 @@ class NotIn(KVFilter):
 class GtThan(KVFilter):
     gt: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.gt)
+    def get_validated(self):
+        return self.kv_get_validated(self.gt)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("gt", self.gt, context, state)
@@ -264,8 +264,8 @@ class GtThan(KVFilter):
 class GtThanOrEq(KVFilter):
     gte: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.gte)
+    def get_validated(self):
+        return self.kv_get_validated(self.gte)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("gte", self.gte, context, state)
@@ -274,8 +274,8 @@ class GtThanOrEq(KVFilter):
 class LessThan(KVFilter):
     lt: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.lt)
+    def get_validated(self):
+        return self.kv_get_validated(self.lt)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("lt", self.lt, context, state)
@@ -284,8 +284,8 @@ class LessThan(KVFilter):
 class LessThanOrEq(KVFilter):
     lte: ArgValuesScalar
 
-    def validate(self):
-        return self.kv_validate(self.lte)
+    def get_validated(self):
+        return self.kv_get_validated(self.lte)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("lte", self.lte, context, state)
@@ -294,8 +294,8 @@ class LessThanOrEq(KVFilter):
 class StartsWith(KVFilter):
     startswith: ArgValues
 
-    def validate(self):
-        return self.kv_validate(self.startswith)
+    def get_validated(self):
+        return self.kv_get_validated(self.startswith)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query(
@@ -306,8 +306,8 @@ class StartsWith(KVFilter):
 class EndsWith(KVFilter):
     endswith: ArgValues
 
-    def validate(self):
-        return self.kv_validate(self.endswith)
+    def get_validated(self):
+        return self.kv_get_validated(self.endswith)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("endswith", self.endswith, context, state)
@@ -316,8 +316,8 @@ class EndsWith(KVFilter):
 class Contains(KVFilter):
     contains: ArgValues
 
-    def validate(self):
-        return self.kv_validate(self.contains)
+    def get_validated(self):
+        return self.kv_get_validated(self.contains)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("contains", self.contains, context, state)
