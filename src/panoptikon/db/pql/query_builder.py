@@ -96,7 +96,7 @@ def build_query(
 
     else:
         full_query, file_id, item_id, data_id, root_cte_name = get_empty_query(
-            is_text_query=state.is_text_query
+            item_data_query=state.is_text_query, entity=input_query.entity
         )
 
     if count_query:
@@ -310,7 +310,8 @@ def add_inner_joins(
 
 
 def get_empty_query(
-    is_text_query: bool = False,
+    item_data_query: bool = False,
+    entity: Literal["text", "file"] = "file",
 ) -> Tuple[Select, Label, Label, Label | None, str | None]:
     # Query with no filters
     from panoptikon.db.pql.tables import extracted_text, files, item_data
@@ -318,7 +319,7 @@ def get_empty_query(
     file_id, item_id = files.c.id.label("file_id"), files.c.item_id.label(
         "item_id"
     )
-    if is_text_query:
+    if item_data_query and entity == "text":
         # We must join to get the corresponding item and files
         data_id = extracted_text.c.id.label("data_id")
         text_cte = (
