@@ -36,6 +36,7 @@ from panoptikon.db.pql.types import (
     get_column,
     get_std_cols,
 )
+from panoptikon.db.pql.utils import has_joined, relabel_column
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,9 @@ def build_query(
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns
     full_query, extra_columns = add_extra_columns(
-        full_query, state, root_cte_name
+        full_query,
+        state,
+        root_cte_name,
     )
     selected_columns = [
         col.key for col in full_query.selected_columns if col.key
@@ -236,9 +239,15 @@ def add_extra_columns(
             extra_column.cte,
             extra_column.alias,
         )
+        column_aliases.append(alias)
+        if cte.name == root_cte_name:
+            # The column is already in the root query
+            # We still need to change the label
+            relabel_column(query, column_name, f"extra_{i}")
+            continue
         column = cte.c[column_name]
         query = query.add_columns(column.label(f"extra_{i}"))
-        column_aliases.append(alias)
+
     return query, column_aliases
 
 
@@ -393,11 +402,3 @@ def apply_partition_by(
     )
     query = query.order_by(*outer_order_by_conds)
     return query
-
-
-def has_joined(query: Select, table: Table) -> bool:
-    for from_clause in query.froms:
-        # Ensure it's the exact table, not an alias
-        if isinstance(from_clause, table.__class__) and from_clause == table:
-            return True
-    return False

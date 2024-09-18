@@ -163,11 +163,18 @@ def apply_order_filter(
 ) -> Tuple[Select, UnaryExpression, Callable[[CTE], UnaryExpression] | None]:
     direction = asc if args.direction == "asc" else desc
     field = args.cte.c.order_rank
+    if root_cte_name == args.cte.name:
+        # If the order rank is in the root CTE, use the column directly
+        field = Column("order_rank")
     gen = None
     if select_conds:
-        label = f"o{index}_{args.cte.name}_rank"
-        query = query.column(field.label(label))
-        gen = lambda cte: nulls_last(direction(cte.c[label]))
+        if root_cte_name == args.cte.name:
+            # If the order rank is in the root CTE, use the column directly
+            gen = lambda cte: nulls_last(direction(cte.c.order_rank))
+        else:
+            label = f"o{index}_{args.cte.name}_rank"
+            query = query.column(field.label(label))
+            gen = lambda cte: nulls_last(direction(cte.c[label]))
     return (
         query,
         nulls_last(direction(field)),
@@ -190,12 +197,20 @@ def coalesce_order_filters(
     for spec in args:
         assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
         field = spec.cte.c.order_rank
+        if root_cte_name == spec.cte.name:
+            # If the order rank is in the root CTE, use the column directly
+            field = Column("order_rank")
         columns.append(field)
 
         if select_conds:
-            label = f"o{index}_{spec.cte.name}_rank"
-            query = query.column(field.label(label))
-            select_labels.append(label)
+            if root_cte_name == spec.cte.name:
+                # If the order rank is in the root CTE, use the column directly
+                select_labels.append("order_rank")
+            else:
+                # Select the order rank column from the CTE explicitly in the root SELECT
+                label = f"o{index}_{spec.cte.name}_rank"
+                query = query.column(field.label(label))
+                select_labels.append(label)
 
     def coalesce_cols(
         cols: List[KeyedColumnElement],

@@ -49,7 +49,7 @@ TextColumns = Literal[
     "job_id",
     "setter_id",
     "setter_name",
-    "text_index",
+    "data_index",
     "source_id",
 ]
 
@@ -138,7 +138,7 @@ class SearchResult(BaseModel):
     job_id: Optional[int] = None
     setter_id: Optional[int] = None
     setter_name: Optional[str] = None
-    text_index: Optional[int] = None
+    data_index: Optional[int] = None
     source_id: Optional[int] = None
 
     extra: Optional[Dict[str, float | int | str | None]] = Field(
@@ -177,7 +177,7 @@ def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
     return {
         "file_id": files.c.id,
         "item_id": files.c.item_id,
-        "data_id": extracted_text.c.id,
+        "data_id": item_data.c.id,
         "sha256": files.c.sha256,
         "path": files.c.path,
         "filename": files.c.filename,
@@ -201,7 +201,7 @@ def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
         "job_id": item_data.c.job_id,
         "setter_id": item_data.c.setter_id,
         "setter_name": setters.c.name,
-        "text_index": item_data.c.idx,
+        "data_index": item_data.c.idx,
         "source_id": item_data.c.source_id,
     }[column]
 

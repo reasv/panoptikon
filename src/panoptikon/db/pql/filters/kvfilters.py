@@ -59,7 +59,7 @@ class ArgValues(ArgValuesBase):
     job_id: Optional[Union[int, List[int]]] = None
     setter_id: Optional[Union[int, List[int]]] = None
     setter_name: Optional[Union[str, List[str]]] = None
-    text_index: Optional[Union[int, List[int]]] = None
+    data_index: Optional[Union[int, List[int]]] = None
     source_id: Optional[Union[int, List[int]]] = None
 
 
@@ -89,7 +89,7 @@ class ArgValuesScalar(ArgValuesBase):
     job_id: Optional[int] = None
     setter_id: Optional[int] = None
     setter_name: Optional[str] = None
-    text_index: Optional[int] = None
+    data_index: Optional[int] = None
     source_id: Optional[int] = None
 
 
