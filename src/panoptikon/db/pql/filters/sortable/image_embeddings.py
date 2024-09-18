@@ -146,6 +146,10 @@ Search for image using semantic search on image embeddings.
             rank_column = func.avg(vec_distance)
         elif args.distance_aggregation == "MIN":
             rank_column = func.min(vec_distance)
+        else:
+            raise ValueError(
+                f"Invalid distance aggregation method: {args.distance_aggregation}"
+            )
 
         # Now we join back with the embeddings table and get the distance
         # between the query embedding and the embeddings in the database

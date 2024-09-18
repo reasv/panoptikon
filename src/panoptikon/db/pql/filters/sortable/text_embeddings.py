@@ -231,6 +231,10 @@ Search for text using semantic search on text embeddings.
             rank_column = func.avg(vec_distance)
         elif args.distance_aggregation == "MIN":
             rank_column = func.min(vec_distance)
+        else:
+            raise ValueError(
+                f"Invalid distance aggregation method: {args.distance_aggregation}"
+            )
 
         conf_weight_clause = func.pow(
             func.coalesce(extracted_text.c.confidence, 1),
