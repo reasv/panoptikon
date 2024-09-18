@@ -85,6 +85,7 @@ class ExtraColumn:
 @dataclass
 class FilterSelect:
     select: Select
+    context: CTE
 
 
 @dataclass

@@ -22,7 +22,7 @@ class Filter(BaseModel):
             query = query.with_only_columns(*get_std_cols(context, state))
         cte_name = self.get_cte_name(state.cte_counter)
         state.cte_counter += 1
-        state.selects[cte_name] = FilterSelect(query)
+        state.selects[cte_name] = FilterSelect(query, context)
         return query.cte(cte_name)
 
     def get_cte_name(self, counter: int) -> str:
