@@ -84,15 +84,20 @@ def build_query(
         )
         root_cte_name = root_cte.name
 
+        # Disregard the root CTE, and instead use it as a select statement
+        full_query, root_cte_context = (
+            state.selects[root_cte_name].select,
+            state.selects[root_cte_name].context,
+        )
+        # We can take the file_id and item_id from the root CTE's context.
+        # The context is the last CTE in the chain, so we can use it to get the file_id and item_id
         file_id, item_id = (
-            root_cte.c.file_id.label("file_id"),
-            root_cte.c.item_id.label("item_id"),
+            root_cte_context.c.file_id.label("file_id"),
+            root_cte_context.c.item_id.label("item_id"),
         )
         data_id = None
-        full_query = select(file_id, item_id)
         if state.is_text_query:
-            data_id = root_cte.c.data_id.label("data_id")
-            full_query = select(file_id, item_id, data_id)
+            data_id = root_cte_context.c.data_id.label("data_id")
 
     else:
         full_query, file_id, item_id, data_id, root_cte_name = get_empty_query(
