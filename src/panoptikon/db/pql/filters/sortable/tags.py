@@ -73,10 +73,7 @@ class MatchTags(SortableFilter):
             return self.set_validated(False)
         if self.match_tags.all_setters_required and not self.match_tags.setters:
             # If we require all setters to match, we need to know what setters to match
-            conn = get_database_connection(write_lock=False)
-            setters = get_existing_setters(conn)
-            tag_setters = [name for type, name in setters if type == "tags"]
-            self.match_tags.setters = tag_setters
+            self.match_tags.all_setters_required = False
 
         return self.set_validated(True)
 
