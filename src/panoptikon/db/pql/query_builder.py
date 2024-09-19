@@ -151,7 +151,6 @@ def build_query(
             input_query.partition_by,
             full_query,
             selected_columns,
-            order_by_conds,
             order_fns,
         )
     else:
@@ -370,7 +369,6 @@ def apply_partition_by(
     partition_by: List[FileColumns | ItemColumns | TextColumns],
     query: Select,
     selected_columns: List[str],
-    order_by_conds: List[UnaryExpression],
     order_fns: List[Callable[[CTE], UnaryExpression]],
 ) -> Select:
 
