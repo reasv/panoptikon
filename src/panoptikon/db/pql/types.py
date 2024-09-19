@@ -95,17 +95,18 @@ class QueryState:
     selects: Dict[str, FilterSelect] = field(default_factory=dict)
     cte_counter: int = 0
     is_count_query: bool = False
-    is_text_query: bool = False
+    item_data_query: bool = False
+    entity: Literal["file", "text"] = "file"
 
 
 def get_std_cols(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
-    if state.is_text_query:
+    if state.item_data_query:
         return [cte.c.item_id, cte.c.file_id, cte.c.data_id]
     return [cte.c.item_id, cte.c.file_id]
 
 
 def get_std_group_by(cte: CTE, state: QueryState) -> List[KeyedColumnElement]:
-    if state.is_text_query:
+    if state.item_data_query:
         return [cte.c.data_id, cte.c.file_id]
     return [cte.c.file_id]
 

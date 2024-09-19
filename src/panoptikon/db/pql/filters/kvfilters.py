@@ -169,7 +169,7 @@ class KVFilter(Filter):
                 else:
                     raise ValueError("Invalid operator for list values")
 
-        if not state.is_text_query:
+        if not state.item_data_query:
             if contains_text_columns(key_list):
                 raise ValueError("Text columns are not allowed in this context")
             return self.wrap_query(
@@ -202,7 +202,7 @@ class KVFilter(Filter):
             )
             .join(
                 item_data,
-                item_data.c.id == extracted_text.c.id,
+                item_data.c.id == context.c.data_id,
             )
             .join(
                 setters,

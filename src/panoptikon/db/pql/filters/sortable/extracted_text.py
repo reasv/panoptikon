@@ -192,7 +192,7 @@ including tags and OCR text
             args.s_max_len,
         ).label("snip")
 
-        if not state.is_text_query:
+        if not state.item_data_query:
             select_query = (
                 select(*get_std_cols(context, state))
                 .join(item_data, item_data.c.item_id == context.c.item_id)

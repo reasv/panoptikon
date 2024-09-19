@@ -59,24 +59,19 @@ def build_query(
     # Initialize the state object
     state = QueryState(
         is_count_query=count_query,
-        is_text_query=input_query.entity == "text",
+        item_data_query=input_query.entity != "file",
+        entity=input_query.entity,
     )
     root_cte_name: str | None = None
     # Start the recursive processing
     if query_root:
         start = select(files.c.id.label("file_id"), files.c.item_id)
-        if state.is_text_query:
-            start = (
-                start.join(
-                    item_data,
-                    item_data.c.item_id == files.c.item_id,
-                )
-                .join(
-                    extracted_text,
-                    extracted_text.c.id == item_data.c.id,
-                )
-                .add_columns(extracted_text.c.id.label("data_id"))
-            )
+        if state.item_data_query:
+            start = start.join(
+                item_data,
+                (item_data.c.item_id == files.c.item_id)
+                & (item_data.c.data_type == state.entity),
+            ).add_columns(item_data.c.id.label("data_id"))
 
         root_cte = process_query_element(
             query_root,
@@ -97,12 +92,12 @@ def build_query(
             root_cte_context.c.item_id.label("item_id"),
         )
         data_id = None
-        if state.is_text_query:
+        if state.item_data_query:
             data_id = root_cte_context.c.data_id.label("data_id")
 
     else:
         full_query, file_id, item_id, data_id, root_cte_name = get_empty_query(
-            item_data_query=state.is_text_query, entity=input_query.entity
+            item_data_query=state.item_data_query, entity=input_query.entity
         )
 
     if count_query:

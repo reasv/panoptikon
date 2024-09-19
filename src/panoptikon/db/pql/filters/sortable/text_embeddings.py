@@ -256,7 +256,7 @@ Search for text using semantic search on text embeddings.
                 vec_distance * lang_conf_weight_clause
             ) / func.sum(lang_conf_weight_clause)
 
-        if state.is_text_query:
+        if state.item_data_query:
             return self.wrap_query(
                 select(
                     *get_std_cols(context, state),
