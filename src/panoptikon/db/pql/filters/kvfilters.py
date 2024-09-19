@@ -217,7 +217,7 @@ class KVFilter(Filter):
 class Equals(KVFilter):
     eq: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.eq)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -227,7 +227,7 @@ class Equals(KVFilter):
 class NotEquals(KVFilter):
     neq: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.neq)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -237,7 +237,7 @@ class NotEquals(KVFilter):
 class In(KVFilter):
     in_: ArgValues
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.in_)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -247,7 +247,7 @@ class In(KVFilter):
 class NotIn(KVFilter):
     nin: ArgValues
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.nin)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -257,7 +257,7 @@ class NotIn(KVFilter):
 class GtThan(KVFilter):
     gt: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.gt)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -267,7 +267,7 @@ class GtThan(KVFilter):
 class GtThanOrEq(KVFilter):
     gte: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.gte)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -277,7 +277,7 @@ class GtThanOrEq(KVFilter):
 class LessThan(KVFilter):
     lt: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.lt)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -287,7 +287,7 @@ class LessThan(KVFilter):
 class LessThanOrEq(KVFilter):
     lte: ArgValuesScalar
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.lte)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -297,7 +297,7 @@ class LessThanOrEq(KVFilter):
 class StartsWith(KVFilter):
     startswith: ArgValues
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.startswith)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -309,7 +309,7 @@ class StartsWith(KVFilter):
 class EndsWith(KVFilter):
     endswith: ArgValues
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.endswith)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
@@ -319,7 +319,7 @@ class EndsWith(KVFilter):
 class Contains(KVFilter):
     contains: ArgValues
 
-    def get_validated(self):
+    def _validate(self):
         return self.kv_get_validated(self.contains)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:

@@ -135,7 +135,7 @@ including tags and OCR text
 """,
     )
 
-    def get_validated(self):
+    def _validate(self):
         if (
             not self.match_text.filter_only
             and len(self.match_text.match.strip()) == 0

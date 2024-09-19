@@ -45,7 +45,7 @@ class MatchPath(SortableFilter):
         description="Match a query against file paths",
     )
 
-    def get_validated(self):
+    def _validate(self):
         if len(self.match_path.match.strip()) == 0:
             return self.set_validated(False)
         if not self.match_path.raw_fts5_match:

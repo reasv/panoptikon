@@ -72,7 +72,7 @@ Search for image using semantic search on image embeddings.
 """,
     )
 
-    def get_validated(self):
+    def _validate(self):
         if len(self.image_embeddings.query.strip()) == 0:
             return self.set_validated(False)
 

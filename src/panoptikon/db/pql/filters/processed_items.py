@@ -14,7 +14,7 @@ class HasDataFrom(Filter):
         title="Item must have item_data produced by the given setter name",
     )
 
-    def get_validated(self):
+    def _validate(self):
         return self.set_validated(bool(self.has_data_from))
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:

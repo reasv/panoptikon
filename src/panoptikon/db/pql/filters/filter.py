@@ -51,4 +51,10 @@ class Filter(BaseModel):
         Must be called before build_query.
         Can raise a ValueError if the filter args are invalid.
         """
-        raise NotImplementedError("validate not implemented")
+        if self.is_validated():
+            return self
+        else:
+            return self._validate()
+
+    def _validate(self) -> Optional[Union["Filter", Operator]]:
+        raise NotImplementedError("_validate not implemented")

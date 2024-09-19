@@ -25,7 +25,7 @@ class HasUnprocessedData(Filter):
         title="Item must have item_data of given types that has not been processed by the given setter name",
     )
 
-    def get_validated(self):
+    def _validate(self):
         if (
             not self.has_data_unprocessed.data_types
             or not self.has_data_unprocessed.setter_name
