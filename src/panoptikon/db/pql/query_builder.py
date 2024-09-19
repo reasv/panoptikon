@@ -328,27 +328,19 @@ def get_empty_query(
     file_id, item_id = files.c.id.label("file_id"), files.c.item_id.label(
         "item_id"
     )
-    if item_data_query and entity == "text":
+    if item_data_query:
         # We must join to get the corresponding item and files
-        data_id = extracted_text.c.id.label("data_id")
-        text_cte = (
-            select(file_id, item_id, data_id)
-            .join(item_data, item_data.c.item_id == files.c.item_id)
-            .join(extracted_text, extracted_text.c.id == item_data.c.id)
-            .cte("text_cte")
+        data_id = item_data.c.id.label("data_id")
+        query = select(file_id, item_id, data_id).join(
+            item_data,
+            (item_data.c.item_id == files.c.item_id)
+            & (item_data.c.data_type == entity),
         )
-        file_id, item_id, data_id = (
-            text_cte.c.file_id.label("file_id"),
-            text_cte.c.item_id.label("item_id"),
-            text_cte.c.data_id.label("data_id"),
-        )
-        return (
-            select(file_id, item_id, data_id),
-            file_id,
-            item_id,
-            data_id,
-            text_cte.name,
-        )
+        if entity == "text":
+            query = query.join(
+                extracted_text, extracted_text.c.id == item_data.c.id
+            )
+        return query, file_id, item_id, data_id, None
     return select(file_id, item_id), file_id, item_id, None, None
 
 
