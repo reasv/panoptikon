@@ -373,18 +373,29 @@ def apply_partition_by(
     order_by_conds: List[UnaryExpression],
     order_fns: List[Callable[[CTE], UnaryExpression]],
 ) -> Select:
-    # Add row number column for partitioning, and get the first row of each partition
-    partition_by_cols = [get_column(col).label(col) for col in partition_by]
-    rownum = func.row_number().over(
-        partition_by=partition_by_cols, order_by=order_by_conds
+
+    # Select the partition columns
+    partition_by_cols = [
+        get_column(col).label(f"part_{col}") for col in partition_by
+    ]
+    query = query.add_columns(
+        *partition_by_cols,
     )
-    partition_cte = query.add_columns(
-        rownum.label("partition_rownum"),
-    ).cte("partition_cte")
+    select_cte = query.cte("select_cte")
+    # Add row number column for partitioning, and get the first row of each partition
+    rownum = func.row_number().over(
+        partition_by=[select_cte.c[f"part_{col}"] for col in partition_by],
+        order_by=[f(select_cte) for f in order_fns],
+    )
+    partition_cte = (
+        select(select_cte)
+        .column(rownum.label("partition_rownum"))
+        .cte("partition_cte")
+    )
     outer_order_by_conds = [f(partition_cte) for f in order_fns]
 
     # Only select explicitly requested columns
-    query = select(*[query.c[k] for k in selected_columns]).where(
+    query = select(*[partition_cte.c[k] for k in selected_columns]).where(
         partition_cte.c.partition_rownum == 1
     )
     query = query.order_by(*outer_order_by_conds)
