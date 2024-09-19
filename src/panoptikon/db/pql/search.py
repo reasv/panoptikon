@@ -1,7 +1,7 @@
 import logging
 import os
 import sqlite3
-from typing import Any, List, Tuple
+from typing import Any, Generator, List, Tuple
 
 from sqlalchemy import Select
 from sqlalchemy.dialects import sqlite
@@ -57,6 +57,13 @@ def search_pql(
     else:
         total_count = 0
 
+    if not query.results:
+
+        def empty_generator() -> Generator[SearchResult, Any, None]:
+            yield from []
+
+        return empty_generator(), total_count
+
     stmt, extra_columns = build_query(query, count_query=False)
     sql_string, params_ordered = get_sql(stmt)
     try:
@@ -70,7 +77,7 @@ def search_pql(
         logger.error(params_ordered)
         raise e
 
-    def results_generator():
+    def results_generator() -> Generator[SearchResult, Any, None]:
         while row := cursor.fetchone():
             result = SearchResult(file_id=0, item_id=0)
             map_row_to_class(row, result)

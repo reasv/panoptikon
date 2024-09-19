@@ -112,6 +112,14 @@ If true, the query will return the total number of results that match the query.
 This is useful for pagination, but it requires an additional query to be executed.
 """,
     )
+    results: bool = Field(
+        default=True,
+        title="Return Results",
+        description="""
+If true, the query will return the results that match the query.
+If false, only the total count will be returned, if requested.
+""",
+    )
     check_path: bool = Field(
         default=False,
         title="Check Paths Exist",
