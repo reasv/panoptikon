@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Literal, Tuple
+from typing import Callable, Dict, List, Literal, Tuple
 
 from sqlalchemy import (
     CTE,
@@ -36,14 +36,14 @@ from panoptikon.db.pql.types import (
     get_column,
     get_std_cols,
 )
-from panoptikon.db.pql.utils import has_joined, relabel_column
+from panoptikon.db.pql.utils import has_joined
 
 logger = logging.getLogger(__name__)
 
 
 def build_query(
     input_query: PQLQuery, count_query: bool = False
-) -> Tuple[Select, List[str]]:
+) -> Tuple[Select, Dict[str, str]]:
     from panoptikon.db.pql.tables import (
         extracted_text,
         files,
@@ -112,7 +112,7 @@ def build_query(
             ).select_from(
                 full_query.alias("wrapped_query"),
             ),
-            [],
+            {},
         )
 
     full_query = add_inner_joins(
@@ -231,22 +231,22 @@ def add_extra_columns(
     query: Select,
     state: QueryState,
     root_cte_name: str | None,
-) -> Tuple[Select, List[str]]:
-    column_aliases = []
+) -> Tuple[Select, Dict[str, str]]:
+    column_aliases = {}
     for i, extra_column in enumerate(state.extra_columns):
         column_name, cte, alias = (
             extra_column.column,
             extra_column.cte,
             extra_column.alias,
         )
-        column_aliases.append(alias)
         if cte.name == root_cte_name:
-            # The column is already in the root query
-            # We still need to change the label
-            relabel_column(query, column_name, f"extra_{i}")
+            # The column is already selected.
+            # We don't need to add it again
+            column_aliases[alias] = alias
             continue
         column = cte.c[column_name]
         query = query.add_columns(column.label(f"extra_{i}"))
+        column_aliases[f"extra_{i}"] = alias
 
     return query, column_aliases
 

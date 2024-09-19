@@ -154,12 +154,12 @@ def map_row_to_class(row: sqlite3.Row, class_instance):
             setattr(class_instance, key, value)
 
 
-def get_extra_columns(row: sqlite3.Row, column_aliases: List[str] | None):
+def get_extra_columns(row: sqlite3.Row, column_aliases: Dict[str, str] | None):
     if not column_aliases:
         return None
     extras: Dict[str, float | int | str | None] = {}
-    for i, alias in enumerate(column_aliases):
-        value = dict(row).get(f"extra_{i}")
+    for column_label, alias in column_aliases.items():
+        value = dict(row).get(column_label)
         extras[alias] = value
 
     return extras if extras else None
