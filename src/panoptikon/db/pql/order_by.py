@@ -225,14 +225,14 @@ def coalesce_order_filters(
         # If RRF is enabled, combine the columns using the RRF function
         if enable_rrf:
             # Apply RRF to the coalesced columns
-            coalesced_column = func.sum(
-                *[
+            coalesced_column = sum(
+                (
                     (1 / (rrf.k + func.coalesce(column, VERY_LARGE_NUMBER)))
                     * rrf.weight
-                    for rrf, column in zip(rrfs, cols)
-                ]
+                )
+                for rrf, column in zip(rrfs, cols)
             )
-            return direction(coalesced_column)
+            return direction(coalesced_column)  # type: ignore
 
         # If RRF is not enabled, pick the best value from the columns
         # For ascending order, use MIN to get the smallest non-null value
