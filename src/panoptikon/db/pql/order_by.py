@@ -10,6 +10,7 @@ from sqlalchemy import (
     asc,
     desc,
     func,
+    literal_column,
     nulls_last,
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
@@ -227,7 +228,15 @@ def coalesce_order_filters(
             # Apply RRF to the coalesced columns
             coalesced_column = sum(
                 (
-                    (1 / (rrf.k + func.coalesce(column, VERY_LARGE_NUMBER)))
+                    (
+                        literal_column("1")
+                        / (
+                            literal_column(str(int(rrf.k)))
+                            + func.coalesce(
+                                column, literal_column(str(VERY_LARGE_NUMBER))
+                            )
+                        )
+                    )
                     * rrf.weight
                 )
                 for rrf, column in zip(rrfs, cols)
