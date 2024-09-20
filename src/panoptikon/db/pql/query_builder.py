@@ -256,7 +256,7 @@ def add_extra_columns(
         if cte.name == root_cte_name:
             # The column is already selected.
             # We don't need to add it again
-            column_aliases[alias] = alias
+            column_aliases[column_name] = alias
             continue
         column = cte.c[column_name]
         query = query.add_columns(column.label(f"extra_{i}"))
