@@ -67,6 +67,7 @@ class ItemData:
 
 @dataclass
 class ExtractedText:
+    id: int
     item_sha256: str
     setter_name: str
     language: str

@@ -62,7 +62,9 @@ def get_extracted_text_for_item(
             language,
             text,
             confidence,
-            language_confidence
+            language_confidence,
+            text_length,
+            extracted_text.id
         FROM extracted_text
         JOIN item_data
         ON extracted_text.id = item_data.id
@@ -93,7 +95,8 @@ def get_extracted_text_for_item(
             text=text,
             confidence=row[4],
             language_confidence=row[5],
-            length=original_length,
+            length=row[6],
+            id=row[7],
         )
         extracted_texts.append(extracted_text)
 
@@ -135,6 +138,7 @@ def get_text_by_ids(
         (
             row[6],
             ExtractedText(
+                id=row[6],
                 item_sha256=row[0],
                 setter_name=row[1],
                 language=row[2],
