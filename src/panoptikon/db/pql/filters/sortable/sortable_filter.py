@@ -93,6 +93,7 @@ If only one filter has RRF set, but multiple filters have the same priority,
 the RRF function will still be applied the other filters, but with the default parameters.
 
 If using RRF, you should set row_n to True for all the filters involved.
+Moreover, the correct direction for RRF is "desc" (higher is better).
 """,
     )
 
