@@ -29,6 +29,7 @@ from panoptikon.db.pql.pql_model import (
 from panoptikon.db.pql.preprocess_query import preprocess_query
 from panoptikon.db.pql.types import (
     FileColumns,
+    FilterSelect,
     ItemColumns,
     OrderByFilter,
     QueryState,
@@ -214,17 +215,26 @@ def process_query_element(
                 union_list.append(select(*get_std_cols(subq, state)))
             cte_name = f"n{state.cte_counter}_or"
             state.cte_counter += 1
-            return union(*union_list).cte(cte_name)
+            or_cte = union(*union_list).cte(cte_name)
+            state.selects[cte_name] = FilterSelect(
+                select=select(*get_std_cols(or_cte, state)),
+                context=or_cte,
+            )
+            return or_cte
 
         elif isinstance(el, NotOperator):
             subquery = process_query_element(el.not_, context, state)
             cte_name = f"n{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
-
-            return except_(
+            not_cte = except_(
                 select(*get_std_cols(context, state)),
                 select(*get_std_cols(subquery, state)),
             ).cte(cte_name)
+            state.selects[cte_name] = FilterSelect(
+                select=select(*get_std_cols(not_cte, state)),
+                context=not_cte,
+            )
+            return not_cte
     else:
         raise ValueError("Unknown query element type")
 
