@@ -1,6 +1,6 @@
 from typing import Any, Optional
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from sqlalchemy import (
     CTE,
     Column,
@@ -27,6 +27,29 @@ from panoptikon.db.pql.types import (
 )
 
 
+class RRF(BaseModel):
+    k: int = Field(
+        default=1,
+        title="Smoothing Constant",
+        description="""
+The smoothing constant for the RRF function.
+The formula is: 1 / (rank + k).
+
+Can be 0 for no smoothing.
+
+Smoothing reduces the impact of "high" ranks (close to 1) on the final rank value.
+""",
+    )
+    weight: float = Field(
+        default=1.0,
+        title="Weight",
+        description="""
+The weight to apply to this filter's rank value in the RRF function.
+The formula is: weight * 1 / (rank + k).
+""",
+    )
+
+
 class SortableFilter(Filter):
     order_by: bool = get_order_by_field(False)
     direction: OrderTypeNN = get_order_direction_field("asc")
@@ -45,6 +68,8 @@ The row number is used to order the final query.
 This is useful for combining multiple filters with different 
 rank_order types that may not be directly comparable,
 such as text search and embeddings search.
+
+See `RRF` for a way to combine heterogeneous rank_order filters when using row_n = True.
         """,
     )
     row_n_direction: OrderTypeNN = get_order_direction_field_rownum("asc")
@@ -76,6 +101,20 @@ used to determine the total number of results when count = True.
         title="Order By Select As",
         description="""
 If set, the order_rank column will be returned with the results as this alias under the "extra" object.
+""",
+    )
+    rrf: Optional[RRF] = Field(
+        default=None,
+        title="Reciprocal Ranked Fusion Parameters",
+        description="""
+Parameters for the Reciprocal Ranked Fusion.
+If set, when coalescing multiple filters with the same priority,
+the RRF function will be applied to the rank_order columns.
+
+If only one filter has RRF set, but multiple filters have the same priority,
+the RRF function will still be applied the other filters, but with the default parameters.
+
+If using RRF, you should set row_n to True for all the filters involved.
 """,
     )
 
