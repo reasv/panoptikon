@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import time
 from typing import Any, Generator, List, Tuple
 
 from sqlalchemy import Select
@@ -67,7 +68,9 @@ def search_pql(
     stmt, extra_columns = build_query(query, count_query=False)
     sql_string, params_ordered = get_sql(stmt)
     try:
+        start_time = time.time()
         cursor.execute(sql_string, params_ordered)
+        logger.debug(f"Query took {time.time() - start_time:2f} seconds")
         logger.debug(f"Executing query: {sql_string}")
         logger.debug(f"Params: {params_ordered}")
     except Exception as e:
