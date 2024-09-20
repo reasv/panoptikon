@@ -17,6 +17,7 @@ from sqlalchemy import (
 
 from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.types import (
+    RRF,
     ExtraColumn,
     OrderTypeNN,
     QueryState,
@@ -25,29 +26,6 @@ from panoptikon.db.pql.types import (
     get_order_direction_field_rownum,
     get_order_priority_field,
 )
-
-
-class RRF(BaseModel):
-    k: int = Field(
-        default=1,
-        title="Smoothing Constant",
-        description="""
-The smoothing constant for the RRF function.
-The formula is: 1 / (rank + k).
-
-Can be 0 for no smoothing.
-
-Smoothing reduces the impact of "high" ranks (close to 1) on the final rank value.
-""",
-    )
-    weight: float = Field(
-        default=1.0,
-        title="Weight",
-        description="""
-The weight to apply to this filter's rank value in the RRF function.
-The formula is: weight * 1 / (rank + k).
-""",
-    )
 
 
 class SortableFilter(Filter):

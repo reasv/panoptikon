@@ -14,9 +14,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
 
-from panoptikon.db.pql.filters.sortable.sortable_filter import RRF
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.types import (
+    RRF,
     VERY_LARGE_NUMBER,
     VERY_SMALL_NUMBER,
     OrderByFilter,

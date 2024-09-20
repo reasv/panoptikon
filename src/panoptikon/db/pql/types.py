@@ -1,6 +1,5 @@
 import sqlite3
 from dataclasses import dataclass, field
-from shlex import join
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union, get_args
 
 from pydantic import BaseModel, Field
@@ -18,8 +17,6 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
-
-from panoptikon.db.pql.filters.sortable.sortable_filter import RRF
 
 VERY_LARGE_NUMBER = 9223372036854775805
 VERY_SMALL_NUMBER = -9223372036854775805
@@ -68,6 +65,29 @@ def contains_text_columns(lst: Sequence[str]) -> bool:
 
     # Check if there's any intersection between the list and the literal values
     return bool(set(lst) & literal_values)
+
+
+class RRF(BaseModel):
+    k: int = Field(
+        default=1,
+        title="Smoothing Constant",
+        description="""
+The smoothing constant for the RRF function.
+The formula is: 1 / (rank + k).
+
+Can be 0 for no smoothing.
+
+Smoothing reduces the impact of "high" ranks (close to 1) on the final rank value.
+""",
+    )
+    weight: float = Field(
+        default=1.0,
+        title="Weight",
+        description="""
+The weight to apply to this filter's rank value in the RRF function.
+The formula is: weight * 1 / (rank + k).
+""",
+    )
 
 
 @dataclass
