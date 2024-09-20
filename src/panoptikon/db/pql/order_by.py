@@ -14,6 +14,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
 
+from panoptikon.db.pql.filters.sortable.sortable_filter import RRF
 from panoptikon.db.pql.pql_model import OrderArgs
 from panoptikon.db.pql.types import (
     VERY_LARGE_NUMBER,
@@ -193,6 +194,10 @@ def coalesce_order_filters(
     columns = []  # Initialize variable for coalesced column
     direction = asc if args[0].direction == "asc" else desc
 
+    # Enable Reciprocal Ranked Fusion (RRF) if the first of the filters has it set
+    enable_rrf = True if args[0].rrf is not None else False
+    rrfs: List[RRF] = []
+
     select_labels: List[str] = []
     for spec in args:
         assert isinstance(spec, OrderByFilter), "Invalid OrderByFilter"
@@ -201,6 +206,8 @@ def coalesce_order_filters(
             # If the order rank is in the root CTE, use the column directly
             field = Column("order_rank")
         columns.append(field)
+        if enable_rrf:
+            rrfs.append(spec.rrf or RRF())
 
         if select_conds:
             if root_cte_name == spec.cte.name:
@@ -215,6 +222,19 @@ def coalesce_order_filters(
     def coalesce_cols(
         cols: List[KeyedColumnElement],
     ) -> UnaryExpression:
+        # If RRF is enabled, combine the columns using the RRF function
+        if enable_rrf:
+            # Apply RRF to the coalesced columns
+            coalesced_column = func.sum(
+                *[
+                    (1 / (rrf.k + func.coalesce(column, VERY_LARGE_NUMBER)))
+                    * rrf.weight
+                    for rrf, column in zip(rrfs, cols)
+                ]
+            )
+            return direction(coalesced_column)
+
+        # If RRF is not enabled, pick the best value from the columns
         # For ascending order, use MIN to get the smallest non-null value
         if direction == asc:
             coalesced_column = func.min(

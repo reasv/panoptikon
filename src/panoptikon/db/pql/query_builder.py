@@ -196,6 +196,7 @@ def process_query_element(
                         cte=cte,
                         direction=el.direction,
                         priority=el.priority,
+                        rrf=el.rrf,
                     )
                 )
         return cte

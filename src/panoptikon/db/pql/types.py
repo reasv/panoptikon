@@ -19,6 +19,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql.elements import KeyedColumnElement
 
+from panoptikon.db.pql.filters.sortable.sortable_filter import RRF
+
 VERY_LARGE_NUMBER = 9223372036854775805
 VERY_SMALL_NUMBER = -9223372036854775805
 
@@ -73,6 +75,7 @@ class OrderByFilter:
     cte: CTE
     direction: OrderTypeNN
     priority: int = 0
+    rrf: Optional[RRF] = None
 
 
 @dataclass
