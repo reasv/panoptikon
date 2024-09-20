@@ -11,7 +11,10 @@ from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import get_db_readonly, strip_non_latin1_chars
 from panoptikon.db import get_database_connection
-from panoptikon.db.extracted_text import get_extracted_text_for_item
+from panoptikon.db.extracted_text import (
+    get_extracted_text_for_item,
+    get_text_by_ids,
+)
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_file_by_path,
@@ -316,6 +319,27 @@ def get_text_by_sha256(
         if setters:
             text = [t for t in text if t.setter_name in setters]
         return TextResponse(text=text)
+    finally:
+        conn.close()
+
+
+@router.get(
+    "/text",
+    summary="Get text from text_ids",
+    description="""
+Returns texts given a list of text IDs.
+""",
+    response_model=TextResponse,
+)
+def get_texts_by_text_ids(
+    text_ids: List[int] = Query(..., description="List of extracted text IDs"),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+):
+    conn = get_database_connection(**conn_args)
+    try:
+        result = get_text_by_ids(conn, text_ids)
+        texts = [t[1] for t in result]
+        return TextResponse(text=texts)
     finally:
         conn.close()
 
