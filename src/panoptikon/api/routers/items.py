@@ -16,6 +16,8 @@ from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_file_by_path,
     get_item_metadata_by_sha256,
+    get_sha256_for_file_id,
+    get_sha256_for_item_id,
 )
 from panoptikon.db.storage import get_thumbnail_bytes
 from panoptikon.db.tags import get_all_tags_for_item
@@ -59,6 +61,68 @@ def get_item_by_sha256(
 ):
     conn = get_database_connection(**conn_args)
     try:
+        item, files = get_item_metadata_by_sha256(conn, sha256)
+        if item is None or files is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return ItemMetadata(item=item, files=files)
+    finally:
+        conn.close()
+
+
+@router.get(
+    "/from-id/{item_id}",
+    summary="Get item metadata from its item_id",
+    description="""
+Returns metadata for a given item by its item_id.
+This includes the item metadata and a list of all files associated with the item.
+Files that do not exist on disk will not be included in the response.
+This means the file list may be empty.
+
+An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
+Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
+    """,
+    response_model=ItemMetadata,
+)
+def get_item_by_id(
+    item_id: int,
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+):
+    conn = get_database_connection(**conn_args)
+    try:
+        sha256 = get_sha256_for_item_id(conn, item_id)
+        if sha256 is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        item, files = get_item_metadata_by_sha256(conn, sha256)
+        if item is None or files is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return ItemMetadata(item=item, files=files)
+    finally:
+        conn.close()
+
+
+@router.get(
+    "/from-file-id/{file_id}",
+    summary="Get item metadata from a file_id",
+    description="""
+Returns metadata for a given item by the file_id of one of its files.
+This includes the item metadata and a list of all files associated with the item.
+Files that do not exist on disk will not be included in the response.
+This means the file list may be empty.
+
+An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
+Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
+    """,
+    response_model=ItemMetadata,
+)
+def get_item_by_file_id(
+    file_id: int,
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+):
+    conn = get_database_connection(**conn_args)
+    try:
+        sha256 = get_sha256_for_file_id(conn, file_id)
+        if sha256 is None:
+            raise HTTPException(status_code=404, detail="Item not found")
         item, files = get_item_metadata_by_sha256(conn, sha256)
         if item is None or files is None:
             raise HTTPException(status_code=404, detail="Item not found")

@@ -105,6 +105,7 @@ class FileScanRecord:
 
 @dataclass
 class FileRecord:
+    id: int
     sha256: str
     path: str
     last_modified: str

@@ -283,7 +283,7 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
 
     cursor.execute(
         """
-    SELECT files.sha256, files.last_modified
+    SELECT files.id, files.sha256, files.last_modified
     FROM files
     JOIN items ON files.sha256 = items.sha256
     WHERE files.path = ?
@@ -296,8 +296,10 @@ def get_file_by_path(conn: sqlite3.Connection, path: str):
     if not row:
         return None
     else:
-        sha256, last_modified = row
-        return FileRecord(sha256=sha256, path=path, last_modified=last_modified)
+        file_id, sha256, last_modified = row
+        return FileRecord(
+            id=file_id, sha256=sha256, path=path, last_modified=last_modified
+        )
 
 
 def get_existing_file_for_sha256(
@@ -307,7 +309,7 @@ def get_existing_file_for_sha256(
 
     cursor.execute(
         """
-    SELECT path, last_modified
+    SELECT id, path, last_modified
     FROM files
     WHERE sha256 = ?
     ORDER BY available DESC
@@ -316,9 +318,14 @@ def get_existing_file_for_sha256(
     )
 
     while row := cursor.fetchone():
-        path, last_modified = row
+        file_id, path, last_modified = row
         if os.path.exists(path):
-            return FileRecord(sha256, path, last_modified)
+            return FileRecord(
+                id=file_id,
+                sha256=sha256,
+                path=path,
+                last_modified=last_modified,
+            )
 
     return None
 
@@ -330,7 +337,7 @@ def get_existing_file_for_item_id(
 
     cursor.execute(
         """
-    SELECT sha256, path, last_modified, filename
+    SELECT id, sha256, path, last_modified, filename
     FROM files
     WHERE item_id = ?
     ORDER BY available DESC
@@ -339,9 +346,9 @@ def get_existing_file_for_item_id(
     )
 
     while row := cursor.fetchone():
-        sha256, path, last_modified, filename = row
+        file_id, sha256, path, last_modified, filename = row
         if os.path.exists(path):
-            return FileRecord(sha256, path, last_modified, filename)
+            return FileRecord(file_id, sha256, path, last_modified, filename)
 
     return None
 
@@ -549,7 +556,7 @@ def get_item_metadata_by_sha256(
 
     cursor.execute(
         """
-    SELECT path, last_modified
+    SELECT id, path, last_modified
     FROM files
     WHERE sha256 = ?
     ORDER BY available DESC
@@ -558,8 +565,44 @@ def get_item_metadata_by_sha256(
     )
     files: List[FileRecord] = []
     while row := cursor.fetchone():
-        path, last_modified = row
+        file_id, path, last_modified = row
         if os.path.exists(path):
-            files.append(FileRecord(sha256, path, last_modified))
+            files.append(FileRecord(file_id, sha256, path, last_modified))
 
     return item_record, files
+
+
+def get_sha256_for_item_id(
+    conn: sqlite3.Connection, item_id: int
+) -> str | None:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT sha256
+    FROM items
+    WHERE id = ?
+    """,
+        (item_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    return None
+
+
+def get_sha256_for_file_id(
+    conn: sqlite3.Connection, file_id: int
+) -> str | None:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT sha256
+    FROM files
+    WHERE id = ?
+    """,
+        (file_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    return None
