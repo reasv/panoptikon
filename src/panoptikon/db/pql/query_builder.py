@@ -8,6 +8,7 @@ from sqlalchemy import (
     Select,
     Table,
     UnaryExpression,
+    distinct,
     except_,
     func,
     select,
@@ -100,16 +101,6 @@ def build_query(
             item_data_query=state.item_data_query, entity=input_query.entity
         )
 
-    if count_query:
-        return (
-            select(
-                func.count().label("total"),
-            ).select_from(
-                full_query.alias("wrapped_query"),
-            ),
-            {},
-        )
-
     full_query = add_inner_joins(
         full_query,
         input_query.entity,
@@ -117,6 +108,35 @@ def build_query(
         file_id,
         data_id,
     )
+
+    if count_query:
+        if not input_query.partition_by:
+            return (
+                select(
+                    func.count().label("total"),
+                ).select_from(
+                    full_query.alias("wrapped_query"),
+                ),
+                {},
+            )
+        else:
+            # Count the number of unique values for the partition columns
+            partition_columns = [
+                get_column(col) for col in input_query.partition_by
+            ]
+            return (
+                select(
+                    func.count(distinct(Column("partition_key"))).label(
+                        "total"
+                    ),
+                ).select_from(
+                    full_query.column(
+                        func.concat(*partition_columns).label("partition_key")
+                    ).alias("wrapped_query")
+                ),
+                {},
+            )
+
     # Add joins for extra columns and order by clauses
     needed_joins = [c.cte for c in state.extra_columns]
     needed_joins.extend([c.cte for c in state.order_list])
