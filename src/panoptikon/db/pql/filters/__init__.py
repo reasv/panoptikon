@@ -19,6 +19,11 @@ from panoptikon.db.pql.filters.sortable.image_embeddings import (
     SemanticImageArgs,
     SemanticImageSearch,
 )
+from panoptikon.db.pql.filters.sortable.item_similarity import (
+    SimilarityArgs,
+    SimilarTo,
+    SourceArgs,
+)
 from panoptikon.db.pql.filters.sortable.path_text import (
     MatchPath,
     MatchPathArgs,
@@ -32,6 +37,7 @@ from panoptikon.db.pql.filters.sortable.text_embeddings import (
 from panoptikon.db.pql.filters.type_in import TypeIn
 
 Filters = Union[
+    SimilarTo,
     InPaths,
     InBookmarks,
     TypeIn,
