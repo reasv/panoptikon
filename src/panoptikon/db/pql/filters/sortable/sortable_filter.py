@@ -90,7 +90,7 @@ If set, when coalescing multiple filters with the same priority,
 the RRF function will be applied to the rank_order columns.
 
 If only one filter has RRF set, but multiple filters have the same priority,
-the RRF function will still be applied the other filters, but with the default parameters.
+RRF will be ignored.
 
 If using RRF, you should set row_n to True for all the filters involved.
 Moreover, the correct direction for RRF is "desc" (higher is better).
