@@ -130,7 +130,7 @@ When using CLIP cross-modal similarity, whether to use text-to-text similarity a
         """,
     )
     xmodal_i2i: bool = Field(
-        default=False,
+        default=True,
         description="""
 When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
         """,
