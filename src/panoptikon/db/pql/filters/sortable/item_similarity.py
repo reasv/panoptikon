@@ -93,6 +93,10 @@ class SimilarityArgs(BaseModel):
         ...,
         description="The name of the embedding model used for similarity search",
     )
+    distance_function: Literal["L2", "COSINE"] = Field(
+        default="L2",
+        description="The distance function to use for similarity search. Default is L2.",
+    )
     distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
         default="AVG",
         description="The method to aggregate distances when an item has multiple embeddings. Default is AVG.",
@@ -186,11 +190,148 @@ Restricting similarity to a tagger model or a set of tagger models
             embeddings,
             extracted_text,
             item_data,
+            items,
             setters,
         )
 
         args = self.similar_to
-
-        return self.wrap_query(
-            select(*get_std_cols(context, state)), context, state
+        # Join with embeddings and apply filters
+        embeddings_query = (
+            select(
+                *get_std_cols(context, state),
+            )
+            .join(
+                item_data,
+                item_data.c.item_id == context.c.item_id,
+            )
+            .join(
+                setters,
+                (setters.c.id == item_data.c.setter_id)
+                & (setters.c.name == args.setter_name),
+            )
+            .join(
+                embeddings,
+                item_data.c.id == embeddings.c.id,
+            )
         )
+
+        src_setters = setters.alias("src_setters")
+        src_item_data = item_data.alias("src_item_data")
+
+        if args.src_text:
+            # Filter text embeddings based on source text
+            src_args = args.src_text
+            embeddings_query = embeddings_query.join(
+                extracted_text,
+                extracted_text.c.id == item_data.c.source_id,
+            ).join(
+                src_item_data,
+                src_item_data.c.id == extracted_text.c.id,
+            )
+
+            if src_args.setter_names:
+                embeddings_query = embeddings_query.join(
+                    src_setters,
+                    (setters.c.id == item_data.c.setter_id)
+                    & (setters.c.name.in_(src_args.setter_names)),
+                )
+
+            if src_args.languages:
+                embeddings_query = embeddings_query.where(
+                    extracted_text.c.language.in_(src_args.languages)
+                )
+
+            if src_args.min_confidence > 0:
+                embeddings_query = embeddings_query.where(
+                    extracted_text.c.confidence >= src_args.min_confidence
+                )
+
+            if src_args.min_language_confidence > 0:
+                embeddings_query = embeddings_query.where(
+                    extracted_text.c.language_confidence
+                    >= src_args.min_language_confidence
+                )
+
+            if src_args.min_length > 0:
+                embeddings_query = embeddings_query.where(
+                    extracted_text.c.text_length >= src_args.min_length
+                )
+
+        if state.is_count_query:
+            # No need to order by distance if we are just counting
+            # This basically returns all results that have associated embeddings
+            # matching the filters
+            return self.wrap_query(
+                embeddings_query.group_by(*get_std_group_by(context, state)),
+                context,
+                state,
+            )
+        # Group by item_id and emb_id to get all unique embeddings for each unique item
+        unqemb_cte = (
+            embeddings_query.with_only_columns(
+                context.c.item_id.label("item_id"),
+                items.c.sha256.label("sha256"),
+                embeddings.c.id.label("emb_id"),
+                embeddings.c.embedding.label("embedding"),
+            )
+            .join(
+                items,
+                items.c.id == context.c.item_id,
+            )
+            .group_by(
+                context.c.item_id,
+                embeddings.c.id,
+            )
+            .cte(f"unqemb_{self.get_cte_name(state.cte_counter)}")
+        )
+
+        # For the target item
+        main_embeddings = unqemb_cte.alias("main_embeddings")
+        # For the items to compare against
+        other_embeddings = unqemb_cte.alias("other_embeddings")
+
+        distance_func = (
+            func.vec_distance_L2
+            if args.distance_function == "L2"
+            else func.vec_distance_cosine
+        )
+        vec_distance = distance_func(
+            main_embeddings.c.embedding,
+            other_embeddings.c.embedding,
+        )
+        if args.distance_aggregation == "MAX":
+            rank_column = func.max(vec_distance)
+        elif args.distance_aggregation == "AVG":
+            rank_column = func.avg(vec_distance)
+        elif args.distance_aggregation == "MIN":
+            rank_column = func.min(vec_distance)
+        else:
+            raise ValueError(
+                f"Invalid distance aggregation method: {args.distance_aggregation}"
+            )
+
+        # Join the target item with all other items
+        distance_cte = (
+            select(
+                other_embeddings.c.item_id.label("other_item_id"),
+                rank_column.label("distance"),
+            )
+            .select_from(other_embeddings)
+            .join(
+                main_embeddings,
+                main_embeddings.c.sha256 == args.target,
+            )
+            .where(other_embeddings.c.sha256 != args.target)
+            .group_by(other_embeddings.c.item_id)
+            .cte(f"dist_{self.get_cte_name(state.cte_counter)}")
+        )
+
+        # Now we join with the original query to give the min distance for each item
+        res = select(
+            *get_std_cols(context, state),
+            self.derive_rank_column(distance_cte.c.distance),
+        ).join(
+            distance_cte,
+            context.c.item_id == distance_cte.c.other_item_id,
+        )
+        return self.wrap_query(res, context, state)
