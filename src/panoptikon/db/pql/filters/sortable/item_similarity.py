@@ -267,7 +267,7 @@ Restricting similarity to a tagger model or a set of tagger models
                 state,
             )
         # Group by item_id and emb_id to get all unique embeddings for each unique item
-        unqemb_cte = (
+        unqemb_select = (
             embeddings_query.with_only_columns(
                 context.c.item_id.label("item_id"),
                 items.c.sha256.label("sha256"),
@@ -282,7 +282,21 @@ Restricting similarity to a tagger model or a set of tagger models
                 context.c.item_id,
                 embeddings.c.id,
             )
-            .cte(f"unqemb_{self.get_cte_name(state.cte_counter)}")
+        )
+        if args.src_text:
+            if args.src_text.confidence_weight != 0:
+                unqemb_select = unqemb_select.column(
+                    extracted_text.c.confidence.label("confidence")
+                )
+            if args.src_text.language_confidence_weight != 0:
+                unqemb_select = unqemb_select.column(
+                    extracted_text.c.language_confidence.label(
+                        "language_confidence"
+                    )
+                )
+
+        unqemb_cte = unqemb_select.cte(
+            f"unqemb_{self.get_cte_name(state.cte_counter)}"
         )
 
         # For the target item
@@ -309,6 +323,34 @@ Restricting similarity to a tagger model or a set of tagger models
             raise ValueError(
                 f"Invalid distance aggregation method: {args.distance_aggregation}"
             )
+
+        if args.src_text:
+            conf_weight_clause = func.pow(
+                func.coalesce(main_embeddings.c.confidence, 1)
+                * func.coalesce(other_embeddings.c.confidence, 1),
+                args.src_text.confidence_weight,
+            )
+            lang_conf_weight_clause = func.pow(
+                func.coalesce(other_embeddings.c.language_confidence, 1)
+                * func.coalesce(main_embeddings.c.language_confidence, 1),
+                args.src_text.language_confidence_weight,
+            )
+            if (
+                args.src_text.confidence_weight != 0
+                and args.src_text.language_confidence_weight != 0
+            ):
+                weights = conf_weight_clause * lang_conf_weight_clause
+                rank_column = func.sum(vec_distance * weights) / func.sum(
+                    weights
+                )
+            elif args.src_text.confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * conf_weight_clause
+                ) / func.sum(conf_weight_clause)
+            elif args.src_text.language_confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * lang_conf_weight_clause
+                ) / func.sum(lang_conf_weight_clause)
 
         # Join the target item with all other items
         distance_cte = (
