@@ -198,9 +198,13 @@ Restricting similarity to a tagger model or a set of tagger models
         # Join with embeddings and apply filters
         model_name = args.setter_name
         image_embeddings_query = None
+
         if args.clip_xmodal:
+            # If using cross-modal similarity, use the
+            # corresponding text embedding setter in the main embeddings query
+            model_name = f"t{model_name}"
             # If using cross-modal similarity,
-            # The following query only gets the text embeddings
+            # The main query only gets the text embeddings
             # We need to get the image embeddings as well
             image_embeddings_query = (
                 select(
@@ -220,8 +224,7 @@ Restricting similarity to a tagger model or a set of tagger models
                     item_data.c.id == embeddings.c.id,
                 )
             )
-            # If using cross-modal similarity, use the corresponding text embedding setter
-            model_name = f"t{model_name}"
+
         embeddings_query = (
             select(
                 *get_std_cols(context, state),
