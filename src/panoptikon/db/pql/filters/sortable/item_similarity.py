@@ -147,20 +147,9 @@ class SimilarTo(SortableFilter):
 Search for items similar to a target item using similarity search on embeddings.
 The search is based on the image or text embeddings of the provided item.
 
-The count value in the response is equal to the number 
-of items returned (+ (page_size - 1) * page for page > 1),
-rather than the total number of similar items in the database.
-This is because there is no way to define what 
-constitutes a "similar" item in a general sense.
-We just return the top N items that are most similar to the provided item.
-If you still need the total number of "similar" items in the database,
-set the `full_count` parameter to true.
-
 The setter name refers to the model that produced the embeddings.
 You can find a list of available values for this parameter using the /api/search/stats endpoint.
 Any setters of type "text-embedding" or "clip" can be used for this search.
-
-The `limit` parameter can be used to control the number of similar items to return.
 
 "text" embeddings are derived from text produced by another model, such as an OCR model or a tagger.
 You can restrict the search to embeddings derived from text that was 
@@ -171,7 +160,6 @@ Remember that tagging models also produce text by concatenating the tags,
  and are therefore also returned as "text" models by the stats endpoint.
 Restricting similarity to a tagger model or a set of tagger models
  is recommended for item similarity search based on text embeddings.
-
 """,
     )
 
