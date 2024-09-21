@@ -6,7 +6,7 @@ import numpy as np
 import PIL
 import PIL.Image
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal
+from sqlalchemy import and_, func, literal, literal_column
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
@@ -196,6 +196,32 @@ Restricting similarity to a tagger model or a set of tagger models
 
         args = self.similar_to
         # Join with embeddings and apply filters
+        model_name = args.setter_name
+        image_embeddings_query = None
+        if args.clip_xmodal:
+            # If using cross-modal similarity,
+            # The following query only gets the text embeddings
+            # We need to get the image embeddings as well
+            image_embeddings_query = (
+                select(
+                    *get_std_cols(context, state),
+                )
+                .join(
+                    item_data,
+                    item_data.c.item_id == context.c.item_id,
+                )
+                .join(
+                    setters,
+                    (setters.c.id == item_data.c.setter_id)
+                    & (setters.c.name == args.setter_name),
+                )
+                .join(
+                    embeddings,
+                    item_data.c.id == embeddings.c.id,
+                )
+            )
+            # If using cross-modal similarity, use the corresponding text embedding setter
+            model_name = f"t{model_name}"
         embeddings_query = (
             select(
                 *get_std_cols(context, state),
@@ -207,7 +233,7 @@ Restricting similarity to a tagger model or a set of tagger models
             .join(
                 setters,
                 (setters.c.id == item_data.c.setter_id)
-                & (setters.c.name == args.setter_name),
+                & (setters.c.name == model_name),
             )
             .join(
                 embeddings,
@@ -261,6 +287,22 @@ Restricting similarity to a tagger model or a set of tagger models
             # No need to order by distance if we are just counting
             # This basically returns all results that have associated embeddings
             # matching the filters
+            if args.clip_xmodal:
+                assert (
+                    image_embeddings_query is not None
+                ), "Image embeddings query is None"
+                # Need to union the text and image embeddings
+                union_select_cte = embeddings_query.union(
+                    image_embeddings_query,
+                ).cte(f"union_{self.get_cte_name(state.cte_counter)}")
+                # We need to turn this into a select statement
+                return self.wrap_query(
+                    select(union_select_cte).group_by(
+                        *get_std_group_by(union_select_cte, state)
+                    ),
+                    context,
+                    state,
+                )
             return self.wrap_query(
                 embeddings_query.group_by(*get_std_group_by(context, state)),
                 context,
@@ -273,6 +315,7 @@ Restricting similarity to a tagger model or a set of tagger models
                 items.c.sha256.label("sha256"),
                 embeddings.c.id.label("emb_id"),
                 embeddings.c.embedding.label("embedding"),
+                item_data.c.data_type.label("data_type"),
             )
             .join(
                 items,
@@ -298,6 +341,47 @@ Restricting similarity to a tagger model or a set of tagger models
         unqemb_cte = unqemb_select.cte(
             f"unqemb_{self.get_cte_name(state.cte_counter)}"
         )
+        if args.clip_xmodal:
+            assert (
+                image_embeddings_query is not None
+            ), "Image embeddings query is None"
+            imgemb_select = (
+                image_embeddings_query.with_only_columns(
+                    context.c.item_id.label("item_id"),
+                    items.c.sha256.label("sha256"),
+                    embeddings.c.id.label("emb_id"),
+                    embeddings.c.embedding.label("embedding"),
+                    item_data.c.data_type.label("data_type"),
+                )
+                .join(
+                    items,
+                    items.c.id == context.c.item_id,
+                )
+                .group_by(
+                    context.c.item_id,
+                    embeddings.c.id,
+                )
+            )
+            if args.src_text:
+                # We need to ensure the columns are the same as the text embeddings
+                if args.src_text.confidence_weight != 0:
+                    imgemb_select = imgemb_select.column(
+                        literal_column("NULL").label("confidence")
+                    )
+                if args.src_text.language_confidence_weight != 0:
+                    imgemb_select = imgemb_select.column(
+                        literal_column("NULL").label("language_confidence")
+                    )
+
+            imgemb_cte = imgemb_select.cte(
+                f"imgemb_{self.get_cte_name(state.cte_counter)}"
+            )
+            # Now we join the text and image embeddings together
+            unqemb_cte = unqemb_cte.union(
+                select(
+                    *imgemb_cte.columns,
+                ).select_from(imgemb_cte),
+            )
 
         # For the target item
         main_embeddings = unqemb_cte.alias("main_embeddings")
@@ -352,8 +436,7 @@ Restricting similarity to a tagger model or a set of tagger models
                     vec_distance * lang_conf_weight_clause
                 ) / func.sum(lang_conf_weight_clause)
 
-        # Join the target item with all other items
-        distance_cte = (
+        distance_select = (
             select(
                 other_embeddings.c.item_id.label("other_item_id"),
                 rank_column.label("distance"),
@@ -365,7 +448,26 @@ Restricting similarity to a tagger model or a set of tagger models
             )
             .where(other_embeddings.c.sha256 != args.target)
             .group_by(other_embeddings.c.item_id)
-            .cte(f"dist_{self.get_cte_name(state.cte_counter)}")
+        )
+        if args.clip_xmodal:
+            # If using cross-modal similarity, we can restrict the distance calculation
+            # to only the relevant types of embeddings
+            if not args.xmodal_i2i:
+                # Disallow image-to-image similarity
+                distance_select = distance_select.where(
+                    (main_embeddings.c.data_type != "clip")
+                    | (other_embeddings.c.data_type != "clip")
+                )
+            if not args.xmodal_t2t:
+                # Disallow text-to-text similarity
+                distance_select = distance_select.where(
+                    (main_embeddings.c.data_type != "text-embedding")
+                    | (other_embeddings.c.data_type != "text-embedding")
+                )
+
+        # Join the target item with all other items
+        distance_cte = distance_select.cte(
+            f"dist_{self.get_cte_name(state.cte_counter)}"
         )
 
         # Now we join with the original query to give the min distance for each item
