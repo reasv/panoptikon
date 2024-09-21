@@ -6,7 +6,7 @@ import numpy as np
 import PIL
 import PIL.Image
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal, literal_column
+from sqlalchemy import and_, func, literal, literal_column, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
@@ -196,34 +196,12 @@ Restricting similarity to a tagger model or a set of tagger models
 
         args = self.similar_to
         # Join with embeddings and apply filters
-        model_name = args.setter_name
-        image_embeddings_query = None
+        model_cond = setters.c.name == args.setter_name
 
         if args.clip_xmodal:
             # If using cross-modal similarity, use the
             # corresponding text embedding setter in the main embeddings query
-            model_name = f"t{model_name}"
-            # If using cross-modal similarity,
-            # The main query only gets the text embeddings
-            # We need to get the image embeddings as well
-            image_embeddings_query = (
-                select(
-                    *get_std_cols(context, state),
-                )
-                .join(
-                    item_data,
-                    item_data.c.item_id == context.c.item_id,
-                )
-                .join(
-                    setters,
-                    (setters.c.id == item_data.c.setter_id)
-                    & (setters.c.name == args.setter_name),
-                )
-                .join(
-                    embeddings,
-                    item_data.c.id == embeddings.c.id,
-                )
-            )
+            model_cond = model_cond | (setters.c.name == f"t{args.setter_name}")
 
         embeddings_query = (
             select(
@@ -235,8 +213,7 @@ Restricting similarity to a tagger model or a set of tagger models
             )
             .join(
                 setters,
-                (setters.c.id == item_data.c.setter_id)
-                & (setters.c.name == model_name),
+                (setters.c.id == item_data.c.setter_id) & model_cond,
             )
             .join(
                 embeddings,
@@ -250,70 +227,69 @@ Restricting similarity to a tagger model or a set of tagger models
         if args.src_text:
             # Filter text embeddings based on source text
             src_args = args.src_text
+            # Join with extracted_text and apply filters
+            # If the query is cross-modal, we only apply the source text filters to the text embeddings
             embeddings_query = embeddings_query.join(
                 extracted_text,
                 extracted_text.c.id == item_data.c.source_id,
+                isouter=args.clip_xmodal,
             ).join(
                 src_item_data,
                 src_item_data.c.id == extracted_text.c.id,
+                isouter=args.clip_xmodal,
             )
-
             if src_args.setter_names:
                 embeddings_query = embeddings_query.join(
                     src_setters,
-                    (setters.c.id == item_data.c.setter_id)
-                    & (setters.c.name.in_(src_args.setter_names)),
+                    src_setters.c.id == src_item_data.c.setter_id,
+                    isouter=args.clip_xmodal,
                 )
 
+            conditions = []
+            if src_args.setter_names:
+                conditions.append(src_setters.c.name.in_(src_args.setter_names))
+
             if src_args.languages:
-                embeddings_query = embeddings_query.where(
+                conditions.append(
                     extracted_text.c.language.in_(src_args.languages)
                 )
 
             if src_args.min_confidence > 0:
-                embeddings_query = embeddings_query.where(
+                conditions.append(
                     extracted_text.c.confidence >= src_args.min_confidence
                 )
 
             if src_args.min_language_confidence > 0:
-                embeddings_query = embeddings_query.where(
+                conditions.append(
                     extracted_text.c.language_confidence
                     >= src_args.min_language_confidence
                 )
 
             if src_args.min_length > 0:
-                embeddings_query = embeddings_query.where(
+                conditions.append(
                     extracted_text.c.text_length >= src_args.min_length
+                )
+            if not args.clip_xmodal:
+                embeddings_query = embeddings_query.where(and_(*conditions))
+            else:
+                # Only apply the source text filters to the text embeddings
+                embeddings_query = embeddings_query.where(
+                    or_(
+                        extracted_text.c.id.is_(None),
+                        and_(*conditions),
+                    )
                 )
 
         if state.is_count_query:
             # No need to order by distance if we are just counting
             # This basically returns all results that have associated embeddings
             # matching the filters
-            if not args.clip_xmodal:
-                return self.wrap_query(
-                    embeddings_query.group_by(
-                        *get_std_group_by(context, state)
-                    ),
-                    context,
-                    state,
-                )
-            # If using cross-modal similarity, we need to get the image embeddings as well
-            assert (
-                image_embeddings_query is not None
-            ), "Image embeddings query is None"
-            # Need to union the text and image embeddings
-            union_select_cte = embeddings_query.union(
-                image_embeddings_query,
-            ).cte(f"union_{self.get_cte_name(state.cte_counter)}")
-            # We need to turn this into a select statement
             return self.wrap_query(
-                select(union_select_cte).group_by(
-                    *get_std_group_by(union_select_cte, state)
-                ),
+                embeddings_query.group_by(*get_std_group_by(context, state)),
                 context,
                 state,
             )
+
         # Group by item_id and emb_id to get all unique embeddings for each unique item
         unqemb_select = embeddings_query.with_only_columns(
             *get_std_cols(context, state),
@@ -340,40 +316,6 @@ Restricting similarity to a tagger model or a set of tagger models
         unqemb_cte = unqemb_select.cte(
             f"unqemb_{self.get_cte_name(state.cte_counter)}"
         )
-        if args.clip_xmodal:
-            assert (
-                image_embeddings_query is not None
-            ), "Image embeddings query is None"
-            imgemb_select = image_embeddings_query.with_only_columns(
-                *get_std_cols(context, state),
-                items.c.sha256.label("sha256"),
-                embeddings.c.id.label("emb_id"),
-                embeddings.c.embedding.label("embedding"),
-                item_data.c.data_type.label("data_type"),
-            ).join(
-                items,
-                items.c.id == context.c.item_id,
-            )
-            if args.src_text:
-                # We need to ensure the columns are the same as the text embeddings
-                if args.src_text.confidence_weight != 0:
-                    imgemb_select = imgemb_select.column(
-                        literal_column("NULL").label("confidence")
-                    )
-                if args.src_text.language_confidence_weight != 0:
-                    imgemb_select = imgemb_select.column(
-                        literal_column("NULL").label("language_confidence")
-                    )
-
-            imgemb_cte = imgemb_select.cte(
-                f"imgemb_{self.get_cte_name(state.cte_counter)}"
-            )
-            # Now we join the text and image embeddings together
-            unqemb_cte = unqemb_cte.union(
-                select(
-                    *imgemb_cte.columns,
-                ).select_from(imgemb_cte),
-            )
 
         # For the target item
         main_embeddings = unqemb_cte.alias("main_embeddings")
