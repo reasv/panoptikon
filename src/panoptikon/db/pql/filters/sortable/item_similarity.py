@@ -415,16 +415,20 @@ Restricting similarity to a tagger model or a set of tagger models
             )
 
         if args.src_text:
-            conf_weight_clause = func.pow(
-                func.coalesce(main_embeddings.c.confidence, 1)
-                * func.coalesce(other_embeddings.c.confidence, 1),
-                args.src_text.confidence_weight,
-            )
-            lang_conf_weight_clause = func.pow(
-                func.coalesce(other_embeddings.c.language_confidence, 1)
-                * func.coalesce(main_embeddings.c.language_confidence, 1),
-                args.src_text.language_confidence_weight,
-            )
+            conf_weight_clause = 1
+            lang_conf_weight_clause = 1
+            if args.src_text.confidence_weight != 0:
+                conf_weight_clause = func.pow(
+                    func.coalesce(main_embeddings.c.confidence, 1)
+                    * func.coalesce(other_embeddings.c.confidence, 1),
+                    args.src_text.confidence_weight,
+                )
+            if args.src_text.language_confidence_weight != 0:
+                lang_conf_weight_clause = func.pow(
+                    func.coalesce(other_embeddings.c.language_confidence, 1)
+                    * func.coalesce(main_embeddings.c.language_confidence, 1),
+                    args.src_text.language_confidence_weight,
+                )
             if (
                 args.src_text.confidence_weight != 0
                 and args.src_text.language_confidence_weight != 0
