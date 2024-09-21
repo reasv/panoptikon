@@ -315,22 +315,15 @@ Restricting similarity to a tagger model or a set of tagger models
                 state,
             )
         # Group by item_id and emb_id to get all unique embeddings for each unique item
-        unqemb_select = (
-            embeddings_query.with_only_columns(
-                context.c.item_id.label("item_id"),
-                items.c.sha256.label("sha256"),
-                embeddings.c.id.label("emb_id"),
-                embeddings.c.embedding.label("embedding"),
-                item_data.c.data_type.label("data_type"),
-            )
-            .join(
-                items,
-                items.c.id == context.c.item_id,
-            )
-            .group_by(
-                context.c.item_id,
-                embeddings.c.id,
-            )
+        unqemb_select = embeddings_query.with_only_columns(
+            *get_std_cols(context, state),
+            items.c.sha256.label("sha256"),
+            embeddings.c.id.label("emb_id"),
+            embeddings.c.embedding.label("embedding"),
+            item_data.c.data_type.label("data_type"),
+        ).join(
+            items,
+            items.c.id == context.c.item_id,
         )
         if args.src_text:
             if args.src_text.confidence_weight != 0:
@@ -351,22 +344,15 @@ Restricting similarity to a tagger model or a set of tagger models
             assert (
                 image_embeddings_query is not None
             ), "Image embeddings query is None"
-            imgemb_select = (
-                image_embeddings_query.with_only_columns(
-                    context.c.item_id.label("item_id"),
-                    items.c.sha256.label("sha256"),
-                    embeddings.c.id.label("emb_id"),
-                    embeddings.c.embedding.label("embedding"),
-                    item_data.c.data_type.label("data_type"),
-                )
-                .join(
-                    items,
-                    items.c.id == context.c.item_id,
-                )
-                .group_by(
-                    context.c.item_id,
-                    embeddings.c.id,
-                )
+            imgemb_select = image_embeddings_query.with_only_columns(
+                *get_std_cols(context, state),
+                items.c.sha256.label("sha256"),
+                embeddings.c.id.label("emb_id"),
+                embeddings.c.embedding.label("embedding"),
+                item_data.c.data_type.label("data_type"),
+            ).join(
+                items,
+                items.c.id == context.c.item_id,
             )
             if args.src_text:
                 # We need to ensure the columns are the same as the text embeddings
@@ -448,8 +434,8 @@ Restricting similarity to a tagger model or a set of tagger models
 
         distance_select = (
             select(
-                other_embeddings.c.item_id.label("other_item_id"),
-                rank_column.label("distance"),
+                self.derive_rank_column(rank_column),
+                *get_std_cols(other_embeddings, state),
             )
             .select_from(other_embeddings)
             .join(
@@ -457,7 +443,7 @@ Restricting similarity to a tagger model or a set of tagger models
                 main_embeddings.c.sha256 == args.target,
             )
             .where(other_embeddings.c.sha256 != args.target)
-            .group_by(other_embeddings.c.item_id)
+            .group_by(*get_std_group_by(other_embeddings, state))
         )
         if args.clip_xmodal:
             # If using cross-modal similarity, we can restrict the distance calculation
@@ -475,17 +461,4 @@ Restricting similarity to a tagger model or a set of tagger models
                     | (other_embeddings.c.data_type != "text-embedding")
                 )
 
-        # Join the target item with all other items
-        distance_cte = distance_select.cte(
-            f"dist_{self.get_cte_name(state.cte_counter)}"
-        )
-
-        # Now we join with the original query to give the min distance for each item
-        res = select(
-            *get_std_cols(context, state),
-            self.derive_rank_column(distance_cte.c.distance),
-        ).join(
-            distance_cte,
-            context.c.item_id == distance_cte.c.other_item_id,
-        )
-        return self.wrap_query(res, context, state)
+        return self.wrap_query(distance_select, other_embeddings, state)
