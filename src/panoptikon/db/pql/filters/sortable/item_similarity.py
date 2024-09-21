@@ -287,24 +287,27 @@ Restricting similarity to a tagger model or a set of tagger models
             # No need to order by distance if we are just counting
             # This basically returns all results that have associated embeddings
             # matching the filters
-            if args.clip_xmodal:
-                assert (
-                    image_embeddings_query is not None
-                ), "Image embeddings query is None"
-                # Need to union the text and image embeddings
-                union_select_cte = embeddings_query.union(
-                    image_embeddings_query,
-                ).cte(f"union_{self.get_cte_name(state.cte_counter)}")
-                # We need to turn this into a select statement
+            if not args.clip_xmodal:
                 return self.wrap_query(
-                    select(union_select_cte).group_by(
-                        *get_std_group_by(union_select_cte, state)
+                    embeddings_query.group_by(
+                        *get_std_group_by(context, state)
                     ),
                     context,
                     state,
                 )
+            # If using cross-modal similarity, we need to get the image embeddings as well
+            assert (
+                image_embeddings_query is not None
+            ), "Image embeddings query is None"
+            # Need to union the text and image embeddings
+            union_select_cte = embeddings_query.union(
+                image_embeddings_query,
+            ).cte(f"union_{self.get_cte_name(state.cte_counter)}")
+            # We need to turn this into a select statement
             return self.wrap_query(
-                embeddings_query.group_by(*get_std_group_by(context, state)),
+                select(union_select_cte).group_by(
+                    *get_std_group_by(union_select_cte, state)
+                ),
                 context,
                 state,
             )
