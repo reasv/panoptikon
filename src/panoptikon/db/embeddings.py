@@ -5,7 +5,7 @@ import time
 from typing import List, Literal, Optional, Tuple
 
 from panoptikon.db.files import get_existing_file_for_sha256
-from panoptikon.db.utils import serialize_f32
+from panoptikon.db.utils import pretty_print_SQL, serialize_f32
 from panoptikon.types import FileSearchResult, OutputDataType
 
 logger = logging.getLogger(__name__)
@@ -327,13 +327,18 @@ def find_similar_items(
         logger.debug(f"Count query took {time.time() - start_time:.2f} seconds")
 
     # Step 6: Execute the main query
+    start_time = time.time()
     cursor = conn.execute(query, tuple(parameters))
-
+    logger.debug(f"Main query took {time.time() - start_time:.2f} seconds")
+    pretty_print_SQL(query, parameters)
     # Step 7: Fetch results and create a list of FileSearchResult objects
     results = cursor.fetchall()
     file_search_results = [
         FileSearchResult(
-            path=row[0], sha256=row[1], last_modified=row[2], type=row[3]
+            path=row[0],
+            sha256=row[1],
+            last_modified=row[2],
+            type=row[3],
         )
         for row in results
     ]
