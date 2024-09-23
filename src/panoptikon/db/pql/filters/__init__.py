@@ -3,7 +3,10 @@ from typing import Union
 from panoptikon.db.pql.filters.kvfilters import (
     ArgValues,
     ArgValuesScalar,
+    MatchAnd,
+    MatchNot,
     MatchOps,
+    MatchOr,
     MatchValues,
 )
 from panoptikon.db.pql.filters.path_in import InPaths
