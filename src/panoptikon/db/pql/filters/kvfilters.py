@@ -425,7 +425,7 @@ class MatchOps(BaseModel):
     not_contains: Optional[ArgValues] = None
 
 
-class Values(KVFilter):
+class MatchValues(KVFilter):
     values: MatchOps
 
     def _validate(self):
@@ -462,5 +462,5 @@ ValueFilters = Union[
     NotStartsWith,
     NotEndsWith,
     NotContains,
-    Values,
+    MatchValues,
 ]
