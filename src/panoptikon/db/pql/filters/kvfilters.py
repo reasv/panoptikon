@@ -1,7 +1,7 @@
 from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel
-from sqlalchemy import CTE, or_, select
+from sqlalchemy import CTE, and_, not_, or_, select
 
 from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.types import (
@@ -106,12 +106,15 @@ class KVFilter(Filter):
             "eq",
             "neq",
             "startswith",
+            "not_startswith",
             "gt",
             "gte",
             "lt",
             "lte",
             "endswith",
+            "not_endswith",
             "contains",
+            "not_contains",
         ],
         args: ArgValuesBase,
         context: CTE,
@@ -137,10 +140,16 @@ class KVFilter(Filter):
                     criteria.append(get_column(key) != value)
                 elif operator == "startswith":
                     criteria.append(get_column(key).startswith(value))
+                elif operator == "not_startswith":
+                    criteria.append(not_(get_column(key).startswith(value)))
+                elif operator == "not_endswith":
+                    criteria.append(not_(get_column(key).endswith(value)))
                 elif operator == "endswith":
                     criteria.append(get_column(key).endswith(value))
                 elif operator == "contains":
                     criteria.append(get_column(key).contains(value))
+                elif operator == "not_contains":
+                    criteria.append(not_(get_column(key).contains(value)))
                 elif operator == "gt":
                     criteria.append(get_column(key) > value)
                 elif operator == "gte":
@@ -158,13 +167,34 @@ class KVFilter(Filter):
                     criteria.append(
                         or_(*[get_column(key).startswith(v) for v in value])
                     )
+                elif operator == "not_startswith":
+                    criteria.append(
+                        and_(
+                            *[
+                                not_(get_column(key).startswith(v))
+                                for v in value
+                            ]
+                        )
+                    )
                 elif operator == "endswith":
                     criteria.append(
                         or_(*[get_column(key).endswith(v) for v in value])
                     )
+                elif operator == "not_endswith":
+                    criteria.append(
+                        and_(
+                            *[not_(get_column(key).endswith(v)) for v in value]
+                        )
+                    )
                 elif operator == "contains":
                     criteria.append(
                         or_(*[get_column(key).contains(v) for v in value])
+                    )
+                elif operator == "not_contains":
+                    criteria.append(
+                        and_(
+                            *[not_(get_column(key).contains(v)) for v in value]
+                        )
                     )
                 else:
                     raise ValueError("Invalid operator for list values")
@@ -306,6 +336,18 @@ class StartsWith(KVFilter):
         )
 
 
+class NotStartsWith(KVFilter):
+    not_startswith: ArgValues
+
+    def _validate(self):
+        return self.kv_get_validated(self.not_startswith)
+
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
+        return self.build_kv_query(
+            "not_startswith", self.not_startswith, context, state
+        )
+
+
 class EndsWith(KVFilter):
     endswith: ArgValues
 
@@ -316,6 +358,18 @@ class EndsWith(KVFilter):
         return self.build_kv_query("endswith", self.endswith, context, state)
 
 
+class NotEndsWith(KVFilter):
+    not_endswith: ArgValues
+
+    def _validate(self):
+        return self.kv_get_validated(self.not_endswith)
+
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
+        return self.build_kv_query(
+            "not_endswith", self.not_endswith, context, state
+        )
+
+
 class Contains(KVFilter):
     contains: ArgValues
 
@@ -324,6 +378,18 @@ class Contains(KVFilter):
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         return self.build_kv_query("contains", self.contains, context, state)
+
+
+class NotContains(KVFilter):
+    not_contains: ArgValues
+
+    def _validate(self):
+        return self.kv_get_validated(self.not_contains)
+
+    def build_query(self, context: CTE, state: QueryState) -> CTE:
+        return self.build_kv_query(
+            "not_contains", self.not_contains, context, state
+        )
 
 
 ValueFilters = Union[
@@ -338,4 +404,7 @@ ValueFilters = Union[
     StartsWith,
     EndsWith,
     Contains,
+    NotStartsWith,
+    NotEndsWith,
+    NotContains,
 ]
