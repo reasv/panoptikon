@@ -6,7 +6,7 @@ import numpy as np
 import PIL
 import PIL.Image
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal, literal_column, or_
+from sqlalchemy import and_, func, literal, literal_column, not_, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
@@ -193,11 +193,12 @@ Restricting similarity to a tagger model or a set of tagger models
 
         embeddings_query = (
             select(
-                *get_std_cols(context, state),
+                items.c.id.label("item_id"),
             )
+            .select_from(items)
             .join(
                 item_data,
-                item_data.c.item_id == context.c.item_id,
+                item_data.c.item_id == items.c.id,
             )
             .join(
                 setters,
@@ -268,26 +269,42 @@ Restricting similarity to a tagger model or a set of tagger models
                     )
                 )
 
+        embeddings_query = embeddings_query.join(
+            context,
+            context.c.item_id == items.c.id,
+            isouter=True,
+        )
+
         if state.is_count_query:
             # No need to order by distance if we are just counting
             # This basically returns all results that have associated embeddings
             # matching the filters
+            count_select = (
+                embeddings_query.with_only_columns(
+                    *get_std_cols(context, state),
+                )
+                .where(
+                    not_(context.c.item_id.is_(None)),
+                    not_(items.c.sha256 == args.target),
+                )
+                .group_by(*get_std_group_by(context, state))
+            )
             return self.wrap_query(
-                embeddings_query.group_by(*get_std_group_by(context, state)),
+                count_select,
                 context,
                 state,
             )
 
         # Group by item_id and emb_id to get all unique embeddings for each unique item
         embeddings_query = embeddings_query.with_only_columns(
+            # Present for all rows regardless of whether they're in context
+            items.c.id.label("item_id_all"),
+            # Present only for rows in context
             *get_std_cols(context, state),
             items.c.sha256.label("sha256"),
             embeddings.c.id.label("emb_id"),
             embeddings.c.embedding.label("embedding"),
             item_data.c.data_type.label("data_type"),
-        ).join(
-            items,
-            items.c.id == context.c.item_id,
         )
         if args.src_text:
             if args.src_text.confidence_weight != 0:
@@ -300,6 +317,13 @@ Restricting similarity to a tagger model or a set of tagger models
                         "language_confidence"
                     )
                 )
+
+        embeddings_query = embeddings_query.where(
+            or_(  # Either the item is in context or the item has the target sha256
+                not_(context.c.item_id.is_(None)),
+                items.c.sha256 == args.target,
+            )
+        )
 
         unqemb_cte = embeddings_query.cte(
             f"unqemb_{self.get_cte_name(state.cte_counter)}"
