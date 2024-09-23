@@ -462,4 +462,5 @@ ValueFilters = Union[
     NotStartsWith,
     NotEndsWith,
     NotContains,
+    Values,
 ]
