@@ -113,7 +113,7 @@ operatorType = Literal[
 class KVFilter(Filter):
     def build_multi_kv_query(
         self,
-        criteria: List[_ColumnExpressionArgument],
+        criteria: _ColumnExpressionArgument,
         context: CTE,
         state: QueryState,
     ) -> CTE:
@@ -137,7 +137,7 @@ class KVFilter(Filter):
                     files,
                     files.c.id == context.c.file_id,
                 )
-                .where(*criteria),
+                .where(criteria),
                 context,
                 state,
             )
@@ -163,7 +163,7 @@ class KVFilter(Filter):
                 setters,
                 setters.c.id == item_data.c.setter_id,
             )
-            .where(*criteria),
+            .where(criteria),
             context,
             state,
         )
@@ -184,13 +184,25 @@ class MatchOps(BaseModel):
     not_endswith: Optional[ArgValues] = None
     contains: Optional[ArgValues] = None
     not_contains: Optional[ArgValues] = None
-    and_: Optional[List["MatchOps"]] = None
-    or_: Optional[List["MatchOps"]] = None
-    not_: Optional["MatchOps"] = None
+
+
+class MatchAnd(BaseModel):
+    and_: List[MatchOps]
+
+
+class MatchOr(BaseModel):
+    or_: List[MatchOps]
+
+
+class MatchNot(BaseModel):
+    not_: MatchOps
+
+
+Matches = Union[MatchOps, MatchAnd, MatchOr, MatchNot]
 
 
 class MatchValues(KVFilter):
-    match: MatchOps
+    match: Matches
 
     def _validate(self):
         """
@@ -199,7 +211,7 @@ class MatchValues(KVFilter):
         Set the filter as validated only if at least one valid condition exists.
         """
 
-        def clean_match_ops(match_ops: MatchOps) -> bool:
+        def clean_match_ops(match_ops: Matches) -> bool:
             """
             Recursively clean the MatchOps instance.
             Returns True if at least one valid condition exists, else False.
@@ -225,45 +237,39 @@ class MatchValues(KVFilter):
             ]
 
             # Clean basic operators
-            for operator in basic_operators:
-                args = getattr(match_ops, operator, None)
-                if args is not None:
-                    if isinstance(args, ArgValuesBase):
-                        if len(args.get_set_values()) == 0:
-                            setattr(match_ops, operator, None)
-                        else:
-                            has_valid_condition = True
-
-            # Clean and_ operator
-            if match_ops.and_ is not None:
+            if isinstance(match_ops, MatchOps):
+                for operator in basic_operators:
+                    args = getattr(match_ops, operator, None)
+                    if args is not None:
+                        if isinstance(args, ArgValuesBase):
+                            if len(args.get_set_values()) == 0:
+                                setattr(match_ops, operator, None)
+                            else:
+                                has_valid_condition = True
+            if isinstance(match_ops, MatchAnd):
+                # Clean and_ operator
                 new_and = []
                 for sub_op in match_ops.and_:
                     if clean_match_ops(sub_op):
                         new_and.append(sub_op)
-                if not new_and:
-                    match_ops.and_ = None
-                else:
+                if new_and:
                     match_ops.and_ = new_and
                     has_valid_condition = True
 
             # Clean or_ operator
-            if match_ops.or_ is not None:
+            if isinstance(match_ops, MatchOr):
                 new_or = []
                 for sub_op in match_ops.or_:
                     if clean_match_ops(sub_op):
                         new_or.append(sub_op)
-                if not new_or:
-                    match_ops.or_ = None
-                else:
+                if new_or:
                     match_ops.or_ = new_or
                     has_valid_condition = True
 
             # Clean not_ operator
-            if match_ops.not_ is not None:
+            if isinstance(match_ops, MatchNot):
                 if clean_match_ops(match_ops.not_):
                     has_valid_condition = True
-                else:
-                    match_ops.not_ = None
 
             return has_valid_condition
 
@@ -276,11 +282,30 @@ class MatchValues(KVFilter):
             return self.set_validated(False)
 
     def _build_expression(
-        self, match_ops: MatchOps, text_columns: bool
+        self, match_ops: Matches, text_columns: bool
     ) -> _ColumnExpressionArgument:
-        expressions = []
+        # Handle logical operators first
+        if isinstance(match_ops, MatchOr):
+            or_expressions = [
+                self._build_expression(sub_op, text_columns)
+                for sub_op in match_ops.or_
+            ]
+            return or_(*or_expressions)
+        if isinstance(match_ops, MatchAnd):
+            and_expressions = [
+                self._build_expression(sub_op, text_columns)
+                for sub_op in match_ops.and_
+            ]
+            return and_(*and_expressions)
+        if isinstance(match_ops, MatchNot):
+            not_expression = not_(
+                self._build_expression(match_ops.not_, text_columns)
+            )
+            return not_expression
 
+        assert isinstance(match_ops, MatchOps), "Invalid Matches type"
         # Handle basic operators
+        basic_expressions = []
         basic_operators = [
             "eq",
             "neq",
@@ -300,7 +325,8 @@ class MatchValues(KVFilter):
 
         for operator in basic_operators:
             args = getattr(match_ops, operator, None)
-            if args is not None:
+            if args:
+                assert isinstance(args, ArgValuesBase), "Invalid Args type"
                 for key, value in args.get_set_values():
                     if not text_columns and contains_text_columns([key]):
                         raise ValueError(
@@ -309,89 +335,66 @@ class MatchValues(KVFilter):
                     column = get_column(key)
                     if not isinstance(value, list):
                         if operator == "eq":
-                            expressions.append(column == value)
+                            expr = column == value
                         elif operator == "neq":
-                            expressions.append(column != value)
+                            expr = column != value
                         elif operator == "startswith":
-                            expressions.append(column.startswith(value))
+                            expr = column.startswith(value)
                         elif operator == "not_startswith":
-                            expressions.append(not_(column.startswith(value)))
+                            expr = not_(column.startswith(value))
                         elif operator == "endswith":
-                            expressions.append(column.endswith(value))
+                            expr = column.endswith(value)
                         elif operator == "not_endswith":
-                            expressions.append(not_(column.endswith(value)))
+                            expr = not_(column.endswith(value))
                         elif operator == "contains":
-                            expressions.append(column.contains(value))
+                            expr = column.contains(value)
                         elif operator == "not_contains":
-                            expressions.append(not_(column.contains(value)))
+                            expr = not_(column.contains(value))
                         elif operator == "gt":
-                            expressions.append(column > value)
+                            expr = column > value
                         elif operator == "gte":
-                            expressions.append(column >= value)
+                            expr = column >= value
                         elif operator == "lt":
-                            expressions.append(column < value)
+                            expr = column < value
                         elif operator == "lte":
-                            expressions.append(column <= value)
+                            expr = column <= value
+                        else:
+                            raise ValueError("Invalid operator")
+                        basic_expressions.append(expr)
                     else:
+                        # List values
                         if operator == "eq":
-                            expressions.append(column.in_(value))
+                            expr = column.in_(value)
                         elif operator == "neq":
-                            expressions.append(column.notin_(value))
+                            expr = column.notin_(value)
                         elif operator == "startswith":
-                            expressions.append(
-                                or_(*[column.startswith(v) for v in value])
-                            )
+                            expr = or_(*[column.startswith(v) for v in value])
                         elif operator == "not_startswith":
-                            expressions.append(
-                                and_(
-                                    *[not_(column.startswith(v)) for v in value]
-                                )
+                            expr = and_(
+                                *[not_(column.startswith(v)) for v in value]
                             )
                         elif operator == "endswith":
-                            expressions.append(
-                                or_(*[column.endswith(v) for v in value])
-                            )
+                            expr = or_(*[column.endswith(v) for v in value])
                         elif operator == "not_endswith":
-                            expressions.append(
-                                and_(*[not_(column.endswith(v)) for v in value])
+                            expr = and_(
+                                *[not_(column.endswith(v)) for v in value]
                             )
                         elif operator == "contains":
-                            expressions.append(
-                                or_(*[column.contains(v) for v in value])
-                            )
+                            expr = or_(*[column.contains(v) for v in value])
                         elif operator == "not_contains":
-                            expressions.append(
-                                and_(*[not_(column.contains(v)) for v in value])
+                            expr = and_(
+                                *[not_(column.contains(v)) for v in value]
                             )
                         else:
                             raise ValueError("Invalid operator for list values")
+                        basic_expressions.append(expr)
 
-        # Handle logical operators
-        if match_ops.and_:
-            and_expressions = [
-                self._build_expression(sub_op, text_columns)
-                for sub_op in match_ops.and_
-            ]
-            expressions.append(and_(*and_expressions))
-        if match_ops.or_:
-            or_expressions = [
-                self._build_expression(sub_op, text_columns)
-                for sub_op in match_ops.or_
-            ]
-            expressions.append(or_(*or_expressions))
-        if match_ops.not_:
-            not_expression = self._build_expression(
-                match_ops.not_, text_columns
-            )
-            expressions.append(not_(not_expression))
+        if basic_expressions:
+            return and_(*basic_expressions)
 
-        if not expressions:
-            raise ValueError("No valid expressions found in MatchOps")
-
-        # Combine all expressions with AND
-        return and_(*expressions)
+        raise ValueError("No valid expressions found in MatchOps")
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         # Start building the expression from the root MatchOps
         expression = self._build_expression(self.match, state.item_data_query)
-        return self.build_multi_kv_query([expression], context, state)
+        return self.build_multi_kv_query(expression, context, state)
