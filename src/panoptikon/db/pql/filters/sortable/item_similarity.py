@@ -279,7 +279,7 @@ Restricting similarity to a tagger model or a set of tagger models
             )
 
         # Group by item_id and emb_id to get all unique embeddings for each unique item
-        unqemb_select = embeddings_query.with_only_columns(
+        embeddings_query = embeddings_query.with_only_columns(
             *get_std_cols(context, state),
             items.c.sha256.label("sha256"),
             embeddings.c.id.label("emb_id"),
@@ -291,17 +291,17 @@ Restricting similarity to a tagger model or a set of tagger models
         )
         if args.src_text:
             if args.src_text.confidence_weight != 0:
-                unqemb_select = unqemb_select.column(
+                embeddings_query = embeddings_query.column(
                     extracted_text.c.confidence.label("confidence")
                 )
             if args.src_text.language_confidence_weight != 0:
-                unqemb_select = unqemb_select.column(
+                embeddings_query = embeddings_query.column(
                     extracted_text.c.language_confidence.label(
                         "language_confidence"
                     )
                 )
 
-        unqemb_cte = unqemb_select.cte(
+        unqemb_cte = embeddings_query.cte(
             f"unqemb_{self.get_cte_name(state.cte_counter)}"
         )
 
