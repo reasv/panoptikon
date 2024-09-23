@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional, Sequence, Tuple, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import CTE, ClauseElement, and_, not_, or_, select
 from sqlalchemy.sql._typing import _ColumnExpressionArgument
 
@@ -202,7 +202,15 @@ Matches = Union[MatchOps, MatchAnd, MatchOr, MatchNot]
 
 
 class Match(KVFilter):
-    match: Matches
+    match: Matches = Field(
+        ...,
+        description="""
+The match operations to apply. Match filters operate on key-value pairs representing
+the primitive attributes of items, files, and extracted data.
+For example, a match filter can be used to filter items 
+based on their type, size, or the path of the file they are associated with.
+""",
+    )
 
     def _validate(self):
         """
