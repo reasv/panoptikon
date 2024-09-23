@@ -193,15 +193,87 @@ class MatchValues(KVFilter):
     match: MatchOps
 
     def _validate(self):
-        for operator, _ in self.match.model_dump().items():
-            args = getattr(self.match, operator, None)
-            if args is not None:
-                assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
-                if len(args.get_set_values()) == 0:
-                    setattr(self.match, operator, None)
-                    continue
-                # Find at least one valid operator
-                return self.set_validated(True)
+        """
+        Recursively validate and clean the MatchOps structure.
+        Remove any empty or invalid operators.
+        Set the filter as validated only if at least one valid condition exists.
+        """
+
+        def clean_match_ops(match_ops: MatchOps) -> bool:
+            """
+            Recursively clean the MatchOps instance.
+            Returns True if at least one valid condition exists, else False.
+            """
+            has_valid_condition = False
+
+            # Define all basic operators
+            basic_operators = [
+                "eq",
+                "neq",
+                "in_",
+                "nin",
+                "gt",
+                "gte",
+                "lt",
+                "lte",
+                "startswith",
+                "not_startswith",
+                "endswith",
+                "not_endswith",
+                "contains",
+                "not_contains",
+            ]
+
+            # Clean basic operators
+            for operator in basic_operators:
+                args = getattr(match_ops, operator, None)
+                if args is not None:
+                    if isinstance(args, ArgValuesBase):
+                        if len(args.get_set_values()) == 0:
+                            setattr(match_ops, operator, None)
+                        else:
+                            has_valid_condition = True
+
+            # Clean and_ operator
+            if match_ops.and_ is not None:
+                new_and = []
+                for sub_op in match_ops.and_:
+                    if clean_match_ops(sub_op):
+                        new_and.append(sub_op)
+                if not new_and:
+                    match_ops.and_ = None
+                else:
+                    match_ops.and_ = new_and
+                    has_valid_condition = True
+
+            # Clean or_ operator
+            if match_ops.or_ is not None:
+                new_or = []
+                for sub_op in match_ops.or_:
+                    if clean_match_ops(sub_op):
+                        new_or.append(sub_op)
+                if not new_or:
+                    match_ops.or_ = None
+                else:
+                    match_ops.or_ = new_or
+                    has_valid_condition = True
+
+            # Clean not_ operator
+            if match_ops.not_ is not None:
+                if clean_match_ops(match_ops.not_):
+                    has_valid_condition = True
+                else:
+                    match_ops.not_ = None
+
+            return has_valid_condition
+
+        # Start cleaning from the root MatchOps
+        is_valid = clean_match_ops(self.match)
+
+        if is_valid:
+            return self.set_validated(True)
+        else:
+            return self.set_validated(False)
 
     def _build_expression(
         self, match_ops: MatchOps, text_columns: bool
