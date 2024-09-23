@@ -9,7 +9,6 @@ from panoptikon.db.pql.filters.kvfilters import (
     MatchOr,
     MatchValues,
 )
-from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.processed_extracted_data import (
     DerivedDataArgs,
     HasUnprocessedData,
@@ -42,13 +41,10 @@ from panoptikon.db.pql.filters.sortable.text_embeddings import (
     SemanticTextArgs,
     SemanticTextSearch,
 )
-from panoptikon.db.pql.filters.type_in import TypeIn
 
 Filters = Union[
     SimilarTo,
-    InPaths,
     InBookmarks,
-    TypeIn,
     MatchPath,
     MatchText,
     SemanticTextSearch,
