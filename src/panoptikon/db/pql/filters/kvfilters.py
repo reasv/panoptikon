@@ -441,8 +441,10 @@ class MatchValues(KVFilter):
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         queries = []
-        for operator, args in self.values.model_dump().items():
+        for operator, _ in self.values.model_dump().items():
+            args = getattr(self.values, operator, None)
             if args is not None:
+                assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
                 queries.append((operator, args))
         return self.build_multi_kv_query(queries, context, state)
 
