@@ -203,104 +203,123 @@ class MatchValues(KVFilter):
                 # Find at least one valid operator
                 return self.set_validated(True)
 
-    def build_criteria(
-        self,
-        queries: List[Tuple[operatorType, ArgValuesBase]],
-        text_columns: bool,
-    ) -> List[_ColumnExpressionArgument]:
-        criteria: List[_ColumnExpressionArgument] = []
-        for operator, args in queries:
-            key_list = []
-            for key, value in args.get_set_values():
-                key_list.append(key)
-                if not isinstance(value, list):
-                    if operator == "eq":
-                        criteria.append(get_column(key) == value)
-                    elif operator == "neq":
-                        criteria.append(get_column(key) != value)
-                    elif operator == "startswith":
-                        criteria.append(get_column(key).startswith(value))
-                    elif operator == "not_startswith":
-                        criteria.append(not_(get_column(key).startswith(value)))
-                    elif operator == "not_endswith":
-                        criteria.append(not_(get_column(key).endswith(value)))
-                    elif operator == "endswith":
-                        criteria.append(get_column(key).endswith(value))
-                    elif operator == "contains":
-                        criteria.append(get_column(key).contains(value))
-                    elif operator == "not_contains":
-                        criteria.append(not_(get_column(key).contains(value)))
-                    elif operator == "gt":
-                        criteria.append(get_column(key) > value)
-                    elif operator == "gte":
-                        criteria.append(get_column(key) >= value)
-                    elif operator == "lt":
-                        criteria.append(get_column(key) < value)
-                    elif operator == "lte":
-                        criteria.append(get_column(key) <= value)
-                else:
-                    if operator == "eq":
-                        criteria.append(get_column(key).in_(value))
-                    elif operator == "neq":
-                        criteria.append(get_column(key).notin_(value))
-                    elif operator == "startswith":
-                        criteria.append(
-                            or_(*[get_column(key).startswith(v) for v in value])
+    def _build_expression(
+        self, match_ops: MatchOps, text_columns: bool
+    ) -> _ColumnExpressionArgument:
+        expressions = []
+
+        # Handle basic operators
+        basic_operators = [
+            "eq",
+            "neq",
+            "in_",
+            "nin",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "startswith",
+            "not_startswith",
+            "endswith",
+            "not_endswith",
+            "contains",
+            "not_contains",
+        ]
+
+        for operator in basic_operators:
+            args = getattr(match_ops, operator, None)
+            if args is not None:
+                for key, value in args.get_set_values():
+                    if not text_columns and contains_text_columns([key]):
+                        raise ValueError(
+                            "Text columns are not allowed in this context"
                         )
-                    elif operator == "not_startswith":
-                        criteria.append(
-                            and_(
-                                *[
-                                    not_(get_column(key).startswith(v))
-                                    for v in value
-                                ]
-                            )
-                        )
-                    elif operator == "endswith":
-                        criteria.append(
-                            or_(*[get_column(key).endswith(v) for v in value])
-                        )
-                    elif operator == "not_endswith":
-                        criteria.append(
-                            and_(
-                                *[
-                                    not_(get_column(key).endswith(v))
-                                    for v in value
-                                ]
-                            )
-                        )
-                    elif operator == "contains":
-                        criteria.append(
-                            or_(*[get_column(key).contains(v) for v in value])
-                        )
-                    elif operator == "not_contains":
-                        criteria.append(
-                            and_(
-                                *[
-                                    not_(get_column(key).contains(v))
-                                    for v in value
-                                ]
-                            )
-                        )
+                    column = get_column(key)
+                    if not isinstance(value, list):
+                        if operator == "eq":
+                            expressions.append(column == value)
+                        elif operator == "neq":
+                            expressions.append(column != value)
+                        elif operator == "startswith":
+                            expressions.append(column.startswith(value))
+                        elif operator == "not_startswith":
+                            expressions.append(not_(column.startswith(value)))
+                        elif operator == "endswith":
+                            expressions.append(column.endswith(value))
+                        elif operator == "not_endswith":
+                            expressions.append(not_(column.endswith(value)))
+                        elif operator == "contains":
+                            expressions.append(column.contains(value))
+                        elif operator == "not_contains":
+                            expressions.append(not_(column.contains(value)))
+                        elif operator == "gt":
+                            expressions.append(column > value)
+                        elif operator == "gte":
+                            expressions.append(column >= value)
+                        elif operator == "lt":
+                            expressions.append(column < value)
+                        elif operator == "lte":
+                            expressions.append(column <= value)
                     else:
-                        raise ValueError("Invalid operator for list values")
-            if not text_columns:
-                if contains_text_columns(key_list):
-                    raise ValueError(
-                        "Text columns are not allowed in this context"
-                    )
-        return criteria
+                        if operator == "eq":
+                            expressions.append(column.in_(value))
+                        elif operator == "neq":
+                            expressions.append(column.notin_(value))
+                        elif operator == "startswith":
+                            expressions.append(
+                                or_(*[column.startswith(v) for v in value])
+                            )
+                        elif operator == "not_startswith":
+                            expressions.append(
+                                and_(
+                                    *[not_(column.startswith(v)) for v in value]
+                                )
+                            )
+                        elif operator == "endswith":
+                            expressions.append(
+                                or_(*[column.endswith(v) for v in value])
+                            )
+                        elif operator == "not_endswith":
+                            expressions.append(
+                                and_(*[not_(column.endswith(v)) for v in value])
+                            )
+                        elif operator == "contains":
+                            expressions.append(
+                                or_(*[column.contains(v) for v in value])
+                            )
+                        elif operator == "not_contains":
+                            expressions.append(
+                                and_(*[not_(column.contains(v)) for v in value])
+                            )
+                        else:
+                            raise ValueError("Invalid operator for list values")
+
+        # Handle logical operators
+        if match_ops.and_:
+            and_expressions = [
+                self._build_expression(sub_op, text_columns)
+                for sub_op in match_ops.and_
+            ]
+            expressions.append(and_(*and_expressions))
+        if match_ops.or_:
+            or_expressions = [
+                self._build_expression(sub_op, text_columns)
+                for sub_op in match_ops.or_
+            ]
+            expressions.append(or_(*or_expressions))
+        if match_ops.not_:
+            not_expression = self._build_expression(
+                match_ops.not_, text_columns
+            )
+            expressions.append(not_(not_expression))
+
+        if not expressions:
+            raise ValueError("No valid expressions found in MatchOps")
+
+        # Combine all expressions with AND
+        return and_(*expressions)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
-        queries = []
-        for operator, _ in self.match.model_dump().items():
-            args = getattr(self.match, operator, None)
-            if args is not None:
-                assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
-                queries.append((operator, args))
-
-        criteria = self.build_criteria(queries, state.item_data_query)
-        return self.build_multi_kv_query(criteria, context, state)
-
-
-ValueFilters = MatchValues
+        # Start building the expression from the root MatchOps
+        expression = self._build_expression(self.match, state.item_data_query)
+        return self.build_multi_kv_query([expression], context, state)

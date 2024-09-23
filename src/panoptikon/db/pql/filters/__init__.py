@@ -4,7 +4,7 @@ from panoptikon.db.pql.filters.kvfilters import (
     ArgValues,
     ArgValuesScalar,
     MatchOps,
-    ValueFilters,
+    MatchValues,
 )
 from panoptikon.db.pql.filters.path_in import InPaths
 from panoptikon.db.pql.filters.processed_extracted_data import (
@@ -53,5 +53,5 @@ Filters = Union[
     MatchTags,
     HasDataFrom,
     HasUnprocessedData,
-    ValueFilters,
+    MatchValues,
 ]
