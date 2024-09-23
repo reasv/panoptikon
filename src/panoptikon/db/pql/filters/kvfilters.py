@@ -1,7 +1,8 @@
 from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel
-from sqlalchemy import CTE, and_, not_, or_, select
+from sqlalchemy import CTE, ClauseElement, and_, not_, or_, select
+from sqlalchemy.sql._typing import _ColumnExpressionArgument
 
 from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.types import (
@@ -116,22 +117,12 @@ class KVFilter(Filter):
 
         return self.set_validated(True)
 
-    def build_multi_kv_query(
+    def build_criteria(
         self,
         queries: List[Tuple[operatorType, ArgValuesBase]],
-        context: CTE,
-        state: QueryState,
-    ) -> CTE:
-        self.raise_if_not_validated()
-        from panoptikon.db.pql.tables import (
-            extracted_text,
-            files,
-            item_data,
-            items,
-            setters,
-        )
-
-        criteria = []
+        text_columns: bool,
+    ) -> List[_ColumnExpressionArgument]:
+        criteria: List[_ColumnExpressionArgument] = []
         for operator, args in queries:
             key_list = []
             for key, value in args.get_set_values():
@@ -207,11 +198,27 @@ class KVFilter(Filter):
                         )
                     else:
                         raise ValueError("Invalid operator for list values")
-            if not state.item_data_query:
+            if not text_columns:
                 if contains_text_columns(key_list):
                     raise ValueError(
                         "Text columns are not allowed in this context"
                     )
+        return criteria
+
+    def build_multi_kv_query(
+        self,
+        criteria: List[_ColumnExpressionArgument],
+        context: CTE,
+        state: QueryState,
+    ) -> CTE:
+        self.raise_if_not_validated()
+        from panoptikon.db.pql.tables import (
+            extracted_text,
+            files,
+            item_data,
+            items,
+            setters,
+        )
 
         if not state.item_data_query:
             return self.wrap_query(
@@ -256,158 +263,6 @@ class KVFilter(Filter):
         )
 
 
-class Equals(KVFilter):
-    eq: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.eq)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("eq", self.eq)], context, state)
-
-
-class NotEquals(KVFilter):
-    neq: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.neq)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("neq", self.neq)], context, state)
-
-
-class In(KVFilter):
-    in_: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.in_)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("eq", self.in_)], context, state)
-
-
-class NotIn(KVFilter):
-    nin: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.nin)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("neq", self.nin)], context, state)
-
-
-class GtThan(KVFilter):
-    gt: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.gt)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("gt", self.gt)], context, state)
-
-
-class GtThanOrEq(KVFilter):
-    gte: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.gte)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("gte", self.gte)], context, state)
-
-
-class LessThan(KVFilter):
-    lt: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.lt)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("lt", self.lt)], context, state)
-
-
-class LessThanOrEq(KVFilter):
-    lte: ArgValuesScalar
-
-    def _validate(self):
-        return self.kv_get_validated(self.lte)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query([("lte", self.lte)], context, state)
-
-
-class StartsWith(KVFilter):
-    startswith: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.startswith)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("startswith", self.startswith)], context, state
-        )
-
-
-class NotStartsWith(KVFilter):
-    not_startswith: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.not_startswith)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("not_startswith", self.not_startswith)], context, state
-        )
-
-
-class EndsWith(KVFilter):
-    endswith: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.endswith)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("endswith", self.endswith)], context, state
-        )
-
-
-class NotEndsWith(KVFilter):
-    not_endswith: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.not_endswith)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("not_endswith", self.not_endswith)], context, state
-        )
-
-
-class Contains(KVFilter):
-    contains: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.contains)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("contains", self.contains)], context, state
-        )
-
-
-class NotContains(KVFilter):
-    not_contains: ArgValues
-
-    def _validate(self):
-        return self.kv_get_validated(self.not_contains)
-
-    def build_query(self, context: CTE, state: QueryState) -> CTE:
-        return self.build_multi_kv_query(
-            [("not_contains", self.not_contains)], context, state
-        )
-
-
 class MatchOps(BaseModel):
     eq: Optional[ArgValuesScalar] = None
     neq: Optional[ArgValuesScalar] = None
@@ -423,6 +278,9 @@ class MatchOps(BaseModel):
     not_endswith: Optional[ArgValues] = None
     contains: Optional[ArgValues] = None
     not_contains: Optional[ArgValues] = None
+    and_: Optional[List["MatchOps"]] = None
+    or_: Optional[List["MatchOps"]] = None
+    not_: Optional["MatchOps"] = None
 
 
 class MatchValues(KVFilter):
@@ -446,23 +304,9 @@ class MatchValues(KVFilter):
             if args is not None:
                 assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
                 queries.append((operator, args))
-        return self.build_multi_kv_query(queries, context, state)
+
+        criteria = self.build_criteria(queries, state.item_data_query)
+        return self.build_multi_kv_query(criteria, context, state)
 
 
-ValueFilters = Union[
-    Equals,
-    NotEquals,
-    In,
-    NotIn,
-    GtThan,
-    GtThanOrEq,
-    LessThan,
-    LessThanOrEq,
-    StartsWith,
-    EndsWith,
-    Contains,
-    NotStartsWith,
-    NotEndsWith,
-    NotContains,
-    MatchValues,
-]
+ValueFilters = MatchValues
