@@ -284,23 +284,23 @@ class MatchOps(BaseModel):
 
 
 class MatchValues(KVFilter):
-    values: MatchOps
+    match: MatchOps
 
     def _validate(self):
-        for operator, _ in self.values.model_dump().items():
-            args = getattr(self.values, operator, None)
+        for operator, _ in self.match.model_dump().items():
+            args = getattr(self.match, operator, None)
             if args is not None:
                 assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
                 if len(args.get_set_values()) == 0:
-                    setattr(self.values, operator, None)
+                    setattr(self.match, operator, None)
                     continue
                 # Find at least one valid operator
                 return self.set_validated(True)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         queries = []
-        for operator, _ in self.values.model_dump().items():
-            args = getattr(self.values, operator, None)
+        for operator, _ in self.match.model_dump().items():
+            args = getattr(self.match, operator, None)
             if args is not None:
                 assert isinstance(args, ArgValuesBase), f"Invalid args: {args}"
                 queries.append((operator, args))
