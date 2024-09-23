@@ -1,12 +1,12 @@
 from typing import Union
 
 from panoptikon.db.pql.filters.kvfilters import (
-    ArgValues,
-    ArgValuesScalar,
+    Match,
     MatchAnd,
     MatchNot,
     MatchOps,
     MatchOr,
+    MatchValue,
     MatchValues,
 )
 from panoptikon.db.pql.filters.processed_extracted_data import (
@@ -52,5 +52,5 @@ Filters = Union[
     MatchTags,
     HasDataFrom,
     HasUnprocessedData,
-    MatchValues,
+    Match,
 ]

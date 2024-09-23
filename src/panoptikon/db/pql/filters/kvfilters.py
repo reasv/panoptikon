@@ -20,7 +20,7 @@ from panoptikon.db.pql.types import (
 FieldValueType = Union[str, int, float, bool, None]
 
 
-class ArgValuesBase(BaseModel):
+class MatchValuesBase(BaseModel):
 
     def get_set_values(
         self,
@@ -34,7 +34,7 @@ class ArgValuesBase(BaseModel):
         return [(k, v) for k, v in mdict.items()]  # type: ignore
 
 
-class ArgValues(ArgValuesBase):
+class MatchValues(MatchValuesBase):
     file_id: Optional[Union[int, List[int]]] = None
     item_id: Optional[Union[int, List[int]]] = None
     path: Optional[Union[str, List[str]]] = None
@@ -64,7 +64,7 @@ class ArgValues(ArgValuesBase):
     source_id: Optional[Union[int, List[int]]] = None
 
 
-class ArgValuesScalar(ArgValuesBase):
+class MatchValue(MatchValuesBase):
     file_id: Optional[int] = None
     item_id: Optional[int] = None
     path: Optional[str] = None
@@ -170,20 +170,20 @@ class KVFilter(Filter):
 
 
 class MatchOps(BaseModel):
-    eq: Optional[ArgValuesScalar] = None
-    neq: Optional[ArgValuesScalar] = None
-    in_: Optional[ArgValues] = None
-    nin: Optional[ArgValues] = None
-    gt: Optional[ArgValuesScalar] = None
-    gte: Optional[ArgValuesScalar] = None
-    lt: Optional[ArgValuesScalar] = None
-    lte: Optional[ArgValuesScalar] = None
-    startswith: Optional[ArgValues] = None
-    not_startswith: Optional[ArgValues] = None
-    endswith: Optional[ArgValues] = None
-    not_endswith: Optional[ArgValues] = None
-    contains: Optional[ArgValues] = None
-    not_contains: Optional[ArgValues] = None
+    eq: Optional[MatchValue] = None
+    neq: Optional[MatchValue] = None
+    in_: Optional[MatchValues] = None
+    nin: Optional[MatchValues] = None
+    gt: Optional[MatchValue] = None
+    gte: Optional[MatchValue] = None
+    lt: Optional[MatchValue] = None
+    lte: Optional[MatchValue] = None
+    startswith: Optional[MatchValues] = None
+    not_startswith: Optional[MatchValues] = None
+    endswith: Optional[MatchValues] = None
+    not_endswith: Optional[MatchValues] = None
+    contains: Optional[MatchValues] = None
+    not_contains: Optional[MatchValues] = None
 
 
 class MatchAnd(BaseModel):
@@ -201,7 +201,7 @@ class MatchNot(BaseModel):
 Matches = Union[MatchOps, MatchAnd, MatchOr, MatchNot]
 
 
-class MatchValues(KVFilter):
+class Match(KVFilter):
     match: Matches
 
     def _validate(self):
@@ -241,7 +241,7 @@ class MatchValues(KVFilter):
                 for operator in basic_operators:
                     args = getattr(match_ops, operator, None)
                     if args is not None:
-                        if isinstance(args, ArgValuesBase):
+                        if isinstance(args, MatchValuesBase):
                             if len(args.get_set_values()) == 0:
                                 setattr(match_ops, operator, None)
                             else:
@@ -326,7 +326,7 @@ class MatchValues(KVFilter):
         for operator in basic_operators:
             args = getattr(match_ops, operator, None)
             if args:
-                assert isinstance(args, ArgValuesBase), "Invalid Args type"
+                assert isinstance(args, MatchValuesBase), "Invalid Args type"
                 for key, value in args.get_set_values():
                     if not text_columns and contains_text_columns([key]):
                         raise ValueError(
