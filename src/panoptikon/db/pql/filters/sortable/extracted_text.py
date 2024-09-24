@@ -50,7 +50,7 @@ For example, the OCR model, the Whisper STT model, the captioning model or the t
         title="Included languages",
         description="Filter out text that is not in these languages",
     )
-    language_min_confidence: Optional[float] = Field(
+    min_language_confidence: Optional[float] = Field(
         default=None,
         ge=0,
         le=1,
@@ -175,10 +175,10 @@ including tags and OCR text
             criteria.append(setters.c.name.in_(args.setters))
         if args.languages:
             criteria.append(extracted_text.c.language.in_(args.languages))
-        if args.language_min_confidence:
+        if args.min_language_confidence:
             criteria.append(
                 extracted_text.c.language_confidence
-                >= args.language_min_confidence
+                >= args.min_language_confidence
             )
         if args.min_confidence:
             criteria.append(extracted_text.c.confidence >= args.min_confidence)

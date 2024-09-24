@@ -168,7 +168,7 @@ Search for image using semantic search on image embeddings.
                 src_item_data.c.id == item_data.c.source_id,
                 isouter=True,
             )
-            if src_args.setter_names:
+            if src_args.setters:
                 embeddings_query = embeddings_query.join(
                     src_setters,
                     src_setters.c.id == src_item_data.c.setter_id,
@@ -176,8 +176,8 @@ Search for image using semantic search on image embeddings.
                 )
             join_text = False
             conditions = []
-            if src_args.setter_names:
-                conditions.append(src_setters.c.name.in_(src_args.setter_names))
+            if src_args.setters:
+                conditions.append(src_setters.c.name.in_(src_args.setters))
 
             if src_args.languages:
                 join_text = True
@@ -185,13 +185,13 @@ Search for image using semantic search on image embeddings.
                     extracted_text.c.language.in_(src_args.languages)
                 )
 
-            if src_args.min_confidence > 0:
+            if src_args.min_confidence:
                 join_text = True
                 conditions.append(
                     extracted_text.c.confidence >= src_args.min_confidence
                 )
 
-            if src_args.min_language_confidence > 0:
+            if src_args.min_language_confidence:
                 join_text = True
                 conditions.append(
                     extracted_text.c.language_confidence
@@ -202,6 +202,11 @@ Search for image using semantic search on image embeddings.
                 join_text = True
                 conditions.append(
                     extracted_text.c.text_length >= src_args.min_length
+                )
+            if src_args.max_length:
+                join_text = True
+                conditions.append(
+                    extracted_text.c.text_length <= src_args.max_length
                 )
             if (
                 args.src_text.confidence_weight != 0

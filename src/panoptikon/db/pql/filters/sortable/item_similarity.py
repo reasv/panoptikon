@@ -29,25 +29,49 @@ logger = logging.getLogger(__name__)
 
 
 class SourceArgs(BaseModel):
-    setter_names: Optional[List[str]] = Field(
-        default=None,
-        description="The source model names to restrict the search to. These are the models that produced the text.",
+    setters: List[str] = Field(
+        default_factory=list,
+        title="Include text from these setters",
+        description="""
+Filter out text that is was not set by these setters.
+The setters are usually the names of the models that extracted or generated the text.
+For example, the OCR model, the Whisper STT model, the captioning model or the tagger model.
+""",
     )
     languages: Optional[List[str]] = Field(
         default=None,
-        description="The source languages to restrict the search to. These are the languages of the text produced by the source models.",
+        description="""
+The source languages to restrict the search to.
+These are the languages of the text produced by the source models.
+""",
     )
-    min_confidence: float = Field(
-        default=0.0,
-        description="The minimum confidence of the text as given by its source model",
+    min_confidence: Optional[float] = Field(
+        default=None,
+        title="Minimum Confidence for the text",
+        description="""
+Filter out text that has a confidence score below this threshold.
+Usually a value between 0 and 1.
+Confidence scores are usually set by the model that extracted the text.
+""",
     )
     min_language_confidence: float = Field(
         default=0.0,
-        description="The minimum confidence for language detection in the text",
+        description="""
+Filter out text that has a language confidence score below this threshold.
+Usually a value between 0 and 1.
+Language confidence scores are usually set by the model that extracted the text.
+For tagging models, it's always 1.
+""",
     )
     min_length: int = Field(
         default=0,
-        description="The minimum length of the text in characters",
+        description="Filter out text that is shorter than this. Inclusive.",
+    )
+    max_length: Optional[int] = Field(
+        default=None,
+        ge=0,
+        title="Maximum Length",
+        description="Filter out text that is longer than this. Inclusive.",
     )
     confidence_weight: float = Field(
         default=0.0,
@@ -61,7 +85,7 @@ The confidence of the source text is multiplied by the confidence of the other
 source text when calculating the distance between two items.
 The formula for the distance calculation is as follows:
 ```
-weights = POW((COALESCE(main_source_text.confidence, 1) * COALESCE(other_source_text.confidence, 1)), src_confidence_weight)
+weights = POW(COALESCE(text.confidence, 1)), src_confidence_weight)
 distance = SUM(distance * weights) / SUM(weights)
 ```
 So this weight is the exponent to which the confidence is raised, which means that it can be greater than 1.
@@ -227,7 +251,7 @@ Restricting similarity to a tagger model or a set of tagger models
                 src_item_data.c.id == extracted_text.c.id,
                 isouter=args.clip_xmodal,
             )
-            if src_args.setter_names:
+            if src_args.setters:
                 embeddings_query = embeddings_query.join(
                     src_setters,
                     src_setters.c.id == src_item_data.c.setter_id,
@@ -235,28 +259,32 @@ Restricting similarity to a tagger model or a set of tagger models
                 )
 
             conditions = []
-            if src_args.setter_names:
-                conditions.append(src_setters.c.name.in_(src_args.setter_names))
+            if src_args.setters:
+                conditions.append(src_setters.c.name.in_(src_args.setters))
 
             if src_args.languages:
                 conditions.append(
                     extracted_text.c.language.in_(src_args.languages)
                 )
 
-            if src_args.min_confidence > 0:
+            if src_args.min_confidence:
                 conditions.append(
                     extracted_text.c.confidence >= src_args.min_confidence
                 )
 
-            if src_args.min_language_confidence > 0:
+            if src_args.min_language_confidence:
                 conditions.append(
                     extracted_text.c.language_confidence
                     >= src_args.min_language_confidence
                 )
 
-            if src_args.min_length > 0:
+            if src_args.min_length:
                 conditions.append(
                     extracted_text.c.text_length >= src_args.min_length
+                )
+            if src_args.max_length:
+                conditions.append(
+                    extracted_text.c.text_length <= src_args.max_length
                 )
             if not args.clip_xmodal:
                 embeddings_query = embeddings_query.where(and_(*conditions))

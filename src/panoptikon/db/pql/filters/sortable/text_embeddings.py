@@ -10,6 +10,7 @@ from sqlalchemy import and_, func, literal
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
+from panoptikon.db.pql.filters.sortable.item_similarity import SourceArgs
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.filters.sortable.utils import extract_embeddings
 from panoptikon.db.pql.types import (
@@ -60,93 +61,10 @@ The text embedding model to use for the semantic search.
 Will search embeddings produced by this model.
 """,
     )
-    setters: List[str] = Field(
-        default_factory=list,
-        title="Include text from these setters",
-        description="""
-Filter out text that is was not set by these setters.
-The setters are usually the names of the models that extracted or generated the text.
-For example, the OCR model, the Whisper STT model, the captioning model or the tagger model.
-""",
-    )
-    languages: List[str] = Field(
-        default_factory=list,
-        title="Included languages",
-        description="Filter out text that is not in these languages",
-    )
-    language_min_confidence: Optional[float] = Field(
-        default=None,
-        ge=0,
-        le=1,
-        title="Minimum Confidence for Language Detection",
-        description="""
-Filter out text that has a language confidence score below this threshold.
-Must be a value between 0 and 1.
-Language confidence scores are usually set by the model that extracted the text.
-For tagging models, it's always 1.
-""",
-    )
-    min_confidence: Optional[float] = Field(
-        default=None,
-        ge=0,
-        le=1,
-        title="Minimum Confidence for the text",
-        description="""
-Filter out text that has a confidence score below this threshold.
-Must be a value between 0 and 1.
-Confidence scores are usually set by the model that extracted the text.
-""",
-    )
-    min_length: Optional[int] = Field(
-        default=None,
-        ge=0,
-        title="Minimum Length",
-        description="Filter out text that is shorter than this. Inclusive.",
-    )
-    max_length: Optional[int] = Field(
-        default=None,
-        ge=0,
-        title="Maximum Length",
-        description="Filter out text that is longer than this. Inclusive.",
-    )
     distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
         default="MIN",
         description="The method to aggregate distances when an item has multiple embeddings. Default is MIN.",
     )
-    confidence_weight: float = Field(
-        default=0.0,
-        description="""
-The weight to apply to the confidence of the source text
-on the embedding distance aggregation for individual items with multiple embeddings.
-Default is 0.0, which means that the confidence of the source text
-does not affect the distance aggregation.
-This parameter is only relevant when the source text has a confidence value.
-The confidence of the source text is multiplied by the confidence of the other
-source text when calculating the distance between two items.
-The formula for the distance calculation is as follows:
-```
-weights = POW(COALESCE(text.confidence, 1)), src_confidence_weight)
-distance = SUM(distance * weights) / SUM(weights)
-```
-So this weight is the exponent to which the confidence is raised, which means that it can be greater than 1.
-When confidence weights are set, the distance_aggregation setting is ignored.
-""",
-    )
-    language_confidence_weight: float = Field(
-        default=0.0,
-        description="""
-The weight to apply to the confidence of the source text language
-on the embedding distance aggregation.
-Default is 0.0, which means that the confidence of the source text language detection
-does not affect the distance calculation.
-Totally analogous to `src_confidence_weight`, but for the language confidence.
-When both are present, the results of the POW() functions for both are multiplied together before being applied to the distance.
-```
-weights = POW(..., src_confidence_weight) * POW(..., src_language_confidence_weight)
-```
-""",
-    )
-
     embed: EmbedArgs = Field(
         default_factory=EmbedArgs,
         title="Embed The Query",
@@ -157,6 +75,12 @@ This is useful when the query is a string and needs to be converted to an embedd
 If this is not present, the query is assumed to be an embedding already.
 In that case, it must be a base64 encoded string of a numpy array.
         """,
+    )
+    src_text: Optional[SourceArgs] = Field(
+        default=None,
+        description="""
+Filters and options to apply on source text that the embeddings are derived from.
+""",
     )
 
 
@@ -204,21 +128,30 @@ Search for text using semantic search on text embeddings.
         text_setters = setters.alias("text_setters")
         vec_data = item_data.alias("vec_data")
         vec_setters = setters.alias("vec_setters")
-        if args.min_length:
-            criteria.append(extracted_text.c.text_length >= args.min_length)
-        if args.max_length:
-            criteria.append(extracted_text.c.text_length <= args.max_length)
-        if args.setters:
-            criteria.append(text_setters.c.name.in_(args.setters))
-        if args.languages:
-            criteria.append(extracted_text.c.language.in_(args.languages))
-        if args.language_min_confidence:
-            criteria.append(
-                extracted_text.c.language_confidence
-                >= args.language_min_confidence
-            )
-        if args.min_confidence:
-            criteria.append(extracted_text.c.confidence >= args.min_confidence)
+        if args.src_text:
+            if args.src_text.min_length:
+                criteria.append(
+                    extracted_text.c.text_length >= args.src_text.min_length
+                )
+            if args.src_text.max_length:
+                criteria.append(
+                    extracted_text.c.text_length <= args.src_text.max_length
+                )
+            if args.src_text.setters:
+                criteria.append(text_setters.c.name.in_(args.src_text.setters))
+            if args.src_text.languages:
+                criteria.append(
+                    extracted_text.c.language.in_(args.src_text.languages)
+                )
+            if args.src_text.min_language_confidence:
+                criteria.append(
+                    extracted_text.c.language_confidence
+                    >= args.src_text.min_language_confidence
+                )
+            if args.src_text.min_confidence:
+                criteria.append(
+                    extracted_text.c.confidence >= args.src_text.min_confidence
+                )
 
         vec_distance = func.vec_distance_L2(
             embeddings.c.embedding, literal(args._embedding)
@@ -233,26 +166,31 @@ Search for text using semantic search on text embeddings.
             raise ValueError(
                 f"Invalid distance aggregation method: {args.distance_aggregation}"
             )
-
-        conf_weight_clause = func.pow(
-            func.coalesce(extracted_text.c.confidence, 1),
-            args.confidence_weight,
-        )
-        lang_conf_weight_clause = func.pow(
-            func.coalesce(extracted_text.c.language_confidence, 1),
-            args.language_confidence_weight,
-        )
-        if args.confidence_weight != 0 and args.language_confidence_weight != 0:
-            weights = conf_weight_clause * lang_conf_weight_clause
-            rank_column = func.sum(vec_distance * weights) / func.sum(weights)
-        elif args.confidence_weight != 0:
-            rank_column = func.sum(
-                vec_distance * conf_weight_clause
-            ) / func.sum(conf_weight_clause)
-        elif args.language_confidence_weight != 0:
-            rank_column = func.sum(
-                vec_distance * lang_conf_weight_clause
-            ) / func.sum(lang_conf_weight_clause)
+        if args.src_text:
+            conf_weight_clause = func.pow(
+                func.coalesce(extracted_text.c.confidence, 1),
+                args.src_text.confidence_weight,
+            )
+            lang_conf_weight_clause = func.pow(
+                func.coalesce(extracted_text.c.language_confidence, 1),
+                args.src_text.language_confidence_weight,
+            )
+            if (
+                args.src_text.confidence_weight != 0
+                and args.src_text.language_confidence_weight != 0
+            ):
+                weights = conf_weight_clause * lang_conf_weight_clause
+                rank_column = func.sum(vec_distance * weights) / func.sum(
+                    weights
+                )
+            elif args.src_text.confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * conf_weight_clause
+                ) / func.sum(conf_weight_clause)
+            elif args.src_text.language_confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * lang_conf_weight_clause
+                ) / func.sum(lang_conf_weight_clause)
 
         if state.item_data_query and state.entity == "text":
             return self.wrap_query(
