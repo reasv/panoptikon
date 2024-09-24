@@ -6,7 +6,7 @@ import numpy as np
 import PIL
 import PIL.Image
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal
+from sqlalchemy import and_, func, literal, not_
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
@@ -106,7 +106,12 @@ Search for image using semantic search on image embeddings.
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
-        from panoptikon.db.pql.tables import embeddings, item_data, setters
+        from panoptikon.db.pql.tables import (
+            embeddings,
+            item_data,
+            items,
+            setters,
+        )
 
         args = self.image_embeddings
         model_cond = setters.c.name == args.model
@@ -118,8 +123,9 @@ Search for image using semantic search on image embeddings.
         # Gets all results with the requested embeddings
         embeddings_query = (
             select(
-                *get_std_cols(context, state),
+                items.c.id.label("item_id"),
             )
+            .select_from(items)
             .join(
                 item_data,
                 item_data.c.item_id == context.c.item_id,
@@ -128,8 +134,17 @@ Search for image using semantic search on image embeddings.
                 setters,
                 (setters.c.id == item_data.c.setter_id) & model_cond,
             )
-            .join(embeddings, item_data.c.id == embeddings.c.id)
+            .join(
+                embeddings,
+                item_data.c.id == embeddings.c.id,
+            )
         )
+
+        embeddings_query = embeddings_query.join(
+            context,
+            context.c.item_id == items.c.id,
+            isouter=True,
+        ).where(not_(context.c.item_id.is_(None)))
 
         if state.is_count_query:
             # No need to order by distance if we are just counting
@@ -142,17 +157,6 @@ Search for image using semantic search on image embeddings.
         # Image embeddings are connected to items via item_data
         # We want to do distance calculation on all unique item_id, embedding pairs
         # and then order by the distance
-        emb_cte = (
-            embeddings_query.with_only_columns(
-                context.c.item_id.label("item_id"),
-                embeddings.c.id.label("emb_id"),
-            )
-            .group_by(
-                context.c.item_id,
-                embeddings.c.id,
-            )
-            .cte(f"unqemb_{self.get_cte_name(state.cte_counter)}")
-        )
 
         vec_distance = func.vec_distance_cosine(
             embeddings.c.embedding,
@@ -171,29 +175,14 @@ Search for image using semantic search on image embeddings.
 
         # Now we join back with the embeddings table and get the distance
         # between the query embedding and the embeddings in the database
-
-        dist_select = (
-            select(
-                emb_cte.c.item_id,
-                emb_cte.c.emb_id,
-                rank_column.label("min_distance"),
-            )
-            .join(
-                embeddings,
-                embeddings.c.id == emb_cte.c.emb_id,
-            )
-            .group_by(emb_cte.c.item_id)
-        ).cte(f"dist_{self.get_cte_name(state.cte_counter)}")
+        embeddings_query = embeddings_query.with_only_columns(
+            *get_std_cols(context, state),
+            self.derive_rank_column(rank_column),
+        ).group_by(*get_std_group_by(context, state))
 
         # Now we join with the original query to give the min distance for each item
-        res = select(
-            *get_std_cols(context, state),
-            self.derive_rank_column(dist_select.c.min_distance),
-        ).join(
-            dist_select,
-            context.c.item_id == dist_select.c.item_id,
-        )
-        return self.wrap_query(res, context, state)
+
+        return self.wrap_query(embeddings_query, context, state)
 
 
 def get_clip_embed(
