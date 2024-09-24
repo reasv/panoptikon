@@ -219,8 +219,6 @@ Search for text using semantic search on text embeddings.
             )
         if args.min_confidence:
             criteria.append(extracted_text.c.confidence >= args.min_confidence)
-        if args.model:
-            criteria.append(vec_setters.c.name == args.model)
 
         vec_distance = func.vec_distance_L2(
             embeddings.c.embedding, literal(args._embedding)
@@ -276,12 +274,12 @@ Search for text using semantic search on text embeddings.
                 )
                 .join(
                     vec_data,
-                    (vec_data.c.source_id == extracted_text.c.id)
-                    & (vec_data.c.data_type == "text-embedding"),
+                    vec_data.c.source_id == extracted_text.c.id,
                 )
                 .join(
                     vec_setters,
-                    vec_setters.c.id == vec_data.c.setter_id,
+                    (vec_setters.c.id == vec_data.c.setter_id)
+                    & (vec_setters.c.name == args.model),
                 )
                 .join(
                     embeddings,
@@ -292,40 +290,45 @@ Search for text using semantic search on text embeddings.
                 context,
                 state,
             )
-
-        return self.wrap_query(
+        embeddings_query = (
             select(
                 *get_std_cols(context, state),
                 self.derive_rank_column(rank_column),
             )
             .join(
-                text_data,
-                (text_data.c.item_id == context.c.item_id)
-                & (text_data.c.data_type == "text"),
-            )
-            .join(
-                text_setters,
-                text_setters.c.id == text_data.c.setter_id,
-            )
-            .join(
-                extracted_text,
-                text_data.c.id == extracted_text.c.id,
-            )
-            .join(
                 vec_data,
-                (vec_data.c.source_id == extracted_text.c.id)
-                & (vec_data.c.data_type == "text-embedding"),
+                vec_data.c.item_id == context.c.item_id,
             )
             .join(
                 vec_setters,
-                vec_setters.c.id == vec_data.c.setter_id,
+                (vec_setters.c.id == vec_data.c.setter_id)
+                & (vec_setters.c.name == args.model),
             )
             .join(
                 embeddings,
                 embeddings.c.id == vec_data.c.id,
             )
             .where(and_(*criteria))
-            .group_by(*get_std_group_by(context, state)),
+            .group_by(*get_std_group_by(context, state))
+        )
+        if len(criteria) > 0:
+            embeddings_query = (
+                embeddings_query.join(
+                    text_data,
+                    text_data.c.id == vec_data.c.source_id,
+                )
+                .join(
+                    text_setters,
+                    text_setters.c.id == text_data.c.setter_id,
+                )
+                .join(
+                    extracted_text,
+                    text_data.c.id == extracted_text.c.id,
+                )
+            )
+
+        return self.wrap_query(
+            embeddings_query,
             context,
             state,
         )
