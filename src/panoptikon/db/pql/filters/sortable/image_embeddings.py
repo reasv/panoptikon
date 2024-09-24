@@ -256,6 +256,32 @@ Search for image using semantic search on image embeddings.
                 f"Invalid distance aggregation method: {args.distance_aggregation}"
             )
 
+        if args.src_text:
+            conf_weight_clause = func.pow(
+                func.coalesce(extracted_text.c.confidence, 1),
+                args.src_text.confidence_weight,
+            )
+            lang_conf_weight_clause = func.pow(
+                func.coalesce(extracted_text.c.language_confidence, 1),
+                args.src_text.language_confidence_weight,
+            )
+            if (
+                args.src_text.confidence_weight != 0
+                and args.src_text.language_confidence_weight != 0
+            ):
+                weights = conf_weight_clause * lang_conf_weight_clause
+                rank_column = func.sum(vec_distance * weights) / func.sum(
+                    weights
+                )
+            elif args.src_text.confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * conf_weight_clause
+                ) / func.sum(conf_weight_clause)
+            elif args.src_text.language_confidence_weight != 0:
+                rank_column = func.sum(
+                    vec_distance * lang_conf_weight_clause
+                ) / func.sum(lang_conf_weight_clause)
+
         # Now we join back with the embeddings table and get the distance
         # between the query embedding and the embeddings in the database
         embeddings_query = embeddings_query.with_only_columns(
