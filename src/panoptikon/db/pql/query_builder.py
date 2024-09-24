@@ -226,10 +226,16 @@ def process_query_element(
             subquery = process_query_element(el.not_, context, state)
             cte_name = f"n{state.cte_counter}_not_{subquery.name}"
             state.cte_counter += 1
-            not_cte = except_(
-                select(*get_std_cols(context, state)),
-                select(*get_std_cols(subquery, state)),
-            ).cte(cte_name)
+            not_cte = (
+                select(*get_std_cols(context, state))
+                .join(
+                    subquery,
+                    subquery.c.file_id == context.c.file_id,
+                    isouter=True,
+                )
+                .where(subquery.c.file_id == None)
+                .cte(cte_name)
+            )
             state.selects[cte_name] = FilterSelect(
                 select=select(*get_std_cols(not_cte, state)),
                 context=not_cte,
