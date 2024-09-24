@@ -89,7 +89,7 @@ class SimilarityArgs(BaseModel):
         ...,
         description="Sha256 hash of the target item to find similar items for",
     )
-    setter_name: str = Field(
+    model: str = Field(
         ...,
         description="The name of the embedding model used for similarity search",
     )
@@ -167,7 +167,7 @@ Restricting similarity to a tagger model or a set of tagger models
         if len(self.similar_to.target.strip()) == 0:
             return self.set_validated(False)
 
-        if len(self.similar_to.setter_name.strip()) == 0:
+        if len(self.similar_to.model.strip()) == 0:
             return self.set_validated(False)
 
         return self.set_validated(True)
@@ -184,12 +184,12 @@ Restricting similarity to a tagger model or a set of tagger models
 
         args = self.similar_to
         # Join with embeddings and apply filters
-        model_cond = setters.c.name == args.setter_name
+        model_cond = setters.c.name == args.model
 
         if args.clip_xmodal:
             # If using cross-modal similarity, use the
             # corresponding text embedding setter in the main embeddings query
-            model_cond = model_cond | (setters.c.name == f"t{args.setter_name}")
+            model_cond = model_cond | (setters.c.name == f"t{args.model}")
 
         embeddings_query = (
             select(
