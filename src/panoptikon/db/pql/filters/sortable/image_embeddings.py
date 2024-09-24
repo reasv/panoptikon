@@ -32,7 +32,11 @@ class SemanticImageArgs(BaseModel):
     query: str = Field(
         ...,
         title="Query",
-        description="Semantic query to match against the image",
+        description="""
+Semantic query to match against the image.
+Can be a string or a base64 encoded numpy array
+to supply an embedding directly.
+""",
     )
 
     _embedding: Optional[bytes] = PrivateAttr(None)
@@ -57,6 +61,17 @@ This is useful when the query is a string and needs to be converted to an embedd
 
 If this is not present, the query is assumed to be an embedding already.
 In that case, it must be a base64 encoded string of a numpy array.
+        """,
+    )
+    clip_xmodal: bool = Field(
+        default=False,
+        description="""
+If true, will search among text embeddings as well as image embeddings created by the same CLIP model.
+
+Note that you must have both image and text embeddings with the same CLIP model for this setting to work.
+Text embeddings are derived from text which must have been already previously produced by another model, such as an OCR model or a tagger.
+They are generated *separately* from the image embeddings, using a different job (Under 'CLIP Text Embeddings').
+Run a batch job with the same clip model for both image and text embeddings to use this setting.
         """,
     )
 
@@ -94,7 +109,12 @@ Search for image using semantic search on image embeddings.
         from panoptikon.db.pql.tables import embeddings, item_data, setters
 
         args = self.image_embeddings
+        model_cond = setters.c.name == args.model
 
+        if args.clip_xmodal:
+            # If using cross-modal similarity, use the
+            # corresponding text embedding setter in the main embeddings query
+            model_cond = model_cond | (setters.c.name == f"t{args.model}")
         # Gets all results with the requested embeddings
         embeddings_query = (
             select(
@@ -102,13 +122,11 @@ Search for image using semantic search on image embeddings.
             )
             .join(
                 item_data,
-                (item_data.c.item_id == context.c.item_id)
-                & (item_data.c.data_type == "clip"),
+                item_data.c.item_id == context.c.item_id,
             )
             .join(
                 setters,
-                (setters.c.id == item_data.c.setter_id)
-                & (setters.c.name == args.model),
+                (setters.c.id == item_data.c.setter_id) & model_cond,
             )
             .join(embeddings, item_data.c.id == embeddings.c.id)
         )
