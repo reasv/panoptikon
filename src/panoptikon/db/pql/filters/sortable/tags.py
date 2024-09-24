@@ -114,16 +114,11 @@ class MatchTags(SortableFilter):
         if args.match_any and len(args.tags) > 1:
             having_clause = []
 
-        unique_items = select(context.c.item_id.distinct()).cte(
-            f"unqitems_{self.get_cte_name(state.cte_counter)}"
-        )
-        avg_confidence = func.avg(tags_items.c.confidence).label(
-            "avg_confidence"
-        )
-        matching_items = (
+        avg_confidence = func.avg(tags_items.c.confidence)
+        matching_items_select = (
             select(
-                unique_items.c.item_id,
-                avg_confidence,
+                *get_std_cols(context, state),
+                self.derive_rank_column(avg_confidence),
             )
             .join(
                 item_data,
@@ -134,19 +129,20 @@ class MatchTags(SortableFilter):
             .join(tags_items, tags_items.c.item_data_id == item_data.c.id)
             .join(tags, tags.c.id == tags_items.c.tag_id)
             .where(and_(*conditions))
-            .group_by(unique_items.c.item_id)
+            .group_by(*get_std_group_by(context, state))
             .having(*having_clause)
-        ).cte(f"match_{self.get_cte_name(state.cte_counter)}")
+        )
+        matching_items = matching_items_select.cte(
+            f"match_{self.get_cte_name(state.cte_counter)}"
+        )
 
         return self.wrap_query(
-            (
-                select(
-                    *get_std_cols(context, state),
-                    self.derive_rank_column(matching_items.c.avg_confidence),
-                ).join(
-                    matching_items,
-                    matching_items.c.item_id == context.c.item_id,
-                )
+            select(
+                *get_std_cols(context, state),
+                matching_items.c.order_rank,
+            ).join(
+                matching_items,
+                context.c.item_id == matching_items.c.item_id,
             ),
             context,
             state,
