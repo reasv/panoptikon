@@ -6,7 +6,7 @@ import numpy as np
 import PIL
 import PIL.Image
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal, not_, or_
+from sqlalchemy import and_, func, literal, literal_column, not_, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from inferio.impl.utils import deserialize_array
@@ -215,6 +215,8 @@ Search for image using semantic search on image embeddings.
                     extracted_text.c.id == item_data.c.source_id,
                     isouter=True,
                 )
+            if not conditions:
+                conditions = [literal_column("1=1")]
             # Only apply the source text filters to the text embeddings
             embeddings_query = embeddings_query.where(
                 or_(
