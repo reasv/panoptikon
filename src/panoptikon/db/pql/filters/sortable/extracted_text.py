@@ -52,8 +52,6 @@ For example, the OCR model, the Whisper STT model, the captioning model or the t
     )
     min_language_confidence: Optional[float] = Field(
         default=None,
-        ge=0,
-        le=1,
         title="Minimum Confidence for Language Detection",
         description="""
 Filter out text that has a language confidence score below this threshold.
@@ -64,8 +62,6 @@ For tagging models, it's always 1.
     )
     min_confidence: Optional[float] = Field(
         default=None,
-        ge=0,
-        le=1,
         title="Minimum Confidence for the text",
         description="""
 Filter out text that has a confidence score below this threshold.
