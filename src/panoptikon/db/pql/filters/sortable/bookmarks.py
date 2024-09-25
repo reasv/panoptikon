@@ -17,7 +17,7 @@ from panoptikon.db.pql.types import (
 
 
 class InBookmarksArgs(BaseModel):
-    enable: bool = Field(
+    filter: bool = Field(
         default=True,
         title="Enable the filter",
         description="""
@@ -58,7 +58,7 @@ class InBookmarks(SortableFilter):
     )
 
     def _validate(self):
-        return self.set_validated(self.in_bookmarks.enable)
+        return self.set_validated(self.in_bookmarks.filter)
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
