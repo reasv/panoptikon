@@ -1,20 +1,11 @@
-import io
 import logging
 from typing import List, Literal, Optional
 
-import numpy as np
-import PIL
-import PIL.Image
-from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import and_, func, literal, literal_column, not_, or_
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, not_, or_
 from sqlalchemy.sql.expression import CTE, select
 
-from inferio.impl.utils import deserialize_array
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
-from panoptikon.db.pql.filters.sortable.text_embeddings import (
-    EmbedArgs,
-    extract_embeddings,
-)
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     QueryState,
@@ -23,7 +14,6 @@ from panoptikon.db.pql.types import (
     get_std_cols,
     get_std_group_by,
 )
-from panoptikon.db.utils import serialize_f32
 
 logger = logging.getLogger(__name__)
 
