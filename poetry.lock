@@ -4693,15 +4693,15 @@ sqlcipher = ["sqlcipher3_binary"]
 
 [[package]]
 name = "sqlite-vec"
-version = "0.1.1"
+version = "0.1.3"
 description = ""
 optional = false
 python-versions = "*"
 files = [
-    {file = "sqlite_vec-0.1.1-py3-none-macosx_10_6_x86_64.whl", hash = "sha256:a57ad382338d747490b7ea249a28615f17d657b06a2db9147c15490f5b7a7146"},
-    {file = "sqlite_vec-0.1.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:10e0b6c3ff6bb4fcd4dbd81acb1267c56e0f4b16b82f9426fe6e2b7f3f5a05e4"},
-    {file = "sqlite_vec-0.1.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux1_x86_64.whl", hash = "sha256:069b0f827d59d0edd95cbd725e524cd2c27d0ef075da6b66829006d67134aa14"},
-    {file = "sqlite_vec-0.1.1-py3-none-win_amd64.whl", hash = "sha256:e191aa6138303e79e00d5b79a49ba94e322671dd18f8d69ed90f92f709667a0e"},
+    {file = "sqlite_vec-0.1.3-py3-none-macosx_10_6_x86_64.whl", hash = "sha256:965a503cbad515d3f75f3cb43e18589a89ad793f16d96ba9328db6dfd86469f0"},
+    {file = "sqlite_vec-0.1.3-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c55ca8661444c4e669f6bf61cd1b985765f6f702b1df6da78f58ad7ee7297947"},
+    {file = "sqlite_vec-0.1.3-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux1_x86_64.whl", hash = "sha256:440233ddedd617b3cd64766bdd1858ee8fec7c6f6a4582da222ac37e4de587c7"},
+    {file = "sqlite_vec-0.1.3-py3-none-win_amd64.whl", hash = "sha256:69230bca64d2f2c23a87eb691ddf9ec33d72c714568138b408a097fd23b6550b"},
 ]
 
 [[package]]
