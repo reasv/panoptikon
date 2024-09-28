@@ -18,7 +18,6 @@ def has_joined(query: Select, table: Table) -> bool:
     def table_in_from(from_clause: FromClause) -> bool:
         # Base case: the from_clause is exactly the same table (no alias)
         if from_clause is table:
-            print("from", from_clause, "table", table)
             return True
 
         # If from_clause is an Alias of the table, do not consider it as the table itself
