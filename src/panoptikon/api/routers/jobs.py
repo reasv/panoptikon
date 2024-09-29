@@ -16,7 +16,6 @@ from panoptikon.db.config import persist_system_config, retrieve_system_config
 from panoptikon.db.extraction_log import get_all_data_logs
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
-from panoptikon.db.search.types import OrderType
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders, update_folder_lists
 from panoptikon.types import FileScanRecord, LogRecord, SystemConfig
