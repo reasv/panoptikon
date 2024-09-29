@@ -17,7 +17,13 @@ import panoptikon.api.routers.legacy as legacy
 import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
 from panoptikon.api.routers.utils import get_db_readonly
-from panoptikon.db import get_database_connection, get_db_lists, get_db_names
+from panoptikon.db import (
+    get_database_connection,
+    get_db_lists,
+    get_db_names,
+    run_migrations,
+    set_db_names,
+)
 from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
@@ -78,6 +84,43 @@ def get_db_info():
     return DBInfo(
         index=SingleDBInfo(current=index_db, all=index_dbs),
         user_data=SingleDBInfo(current=user_data_db, all=user_data_dbs),
+    )
+
+
+@app.post(
+    "/api/db",
+    summary="Create new databases",
+    description="""
+Create new databases with the specified names.
+It runs the migration scripts on the provided database names.
+If the databases already exist, the effect is the same as running the migrations.
+    """,
+    response_model=DBInfo,
+    tags=["database"],
+)
+def create_db(
+    new_index_db: str = Query(None),
+    new_user_data_db: str = Query(None),
+) -> DBInfo:
+    default_index_db, default_user_data_db, default_storage_db = get_db_names()
+    if new_index_db:
+        index_db = new_index_db
+    else:  # Use the default index database
+        index_db = default_index_db
+    if new_user_data_db:
+        user_data_db = new_user_data_db
+    else:  # Use the default user data database
+        user_data_db = default_user_data_db
+    # Set the new database names as current databases
+    set_db_names(index_db, user_data_db)
+    # Run migrations to create the new databases
+    run_migrations()
+    # Set the default databases back to the original values
+    set_db_names(default_index_db, default_user_data_db, default_storage_db)
+    index_dbs, user_data_dbs = get_db_lists()
+    return DBInfo(
+        index=SingleDBInfo(current=default_index_db, all=index_dbs),
+        user_data=SingleDBInfo(current=default_user_data_db, all=user_data_dbs),
     )
 
 

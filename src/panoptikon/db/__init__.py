@@ -92,6 +92,17 @@ def get_db_names():
     return index, user_data, storage
 
 
+def set_db_names(
+    index_db: str, user_data_db: str, storage_db: str | None = None
+):
+    os.environ["INDEX_DB"] = index_db
+    os.environ["USER_DATA_DB"] = user_data_db
+    if storage_db:
+        os.environ["STORAGE_DB"] = storage_db
+    else:
+        os.environ["STORAGE_DB"] = index_db
+
+
 def get_db_lists():
     db_file, user_db_file, _ = get_db_paths()
     # Get the folders containing the databases

@@ -3,10 +3,7 @@ from typing import List
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, all_, and_, distinct, func, or_
 from sqlalchemy.sql.expression import CTE, select
-from torch import cond
 
-from panoptikon.db import get_database_connection
-from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.types import (
     OrderTypeNN,
