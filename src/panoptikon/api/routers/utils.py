@@ -1,4 +1,3 @@
-from operator import index
 from typing import Dict, Optional
 
 from fastapi import HTTPException, Query
