@@ -16,6 +16,7 @@ import panoptikon.api.routers.items as items
 import panoptikon.api.routers.legacy as legacy
 import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
+from panoptikon.api.routers import jobs
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import (
     get_database_connection,
@@ -208,6 +209,7 @@ app.include_router(search.router)
 app.include_router(items.router)
 app.include_router(bookmarks.router)
 app.include_router(inferio.router)
+app.include_router(jobs.router)
 
 
 def get_app(
