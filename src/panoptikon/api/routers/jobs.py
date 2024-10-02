@@ -71,6 +71,34 @@ class JobModel(BaseModel):
     metadata: Optional[str] = None
 
 
+def execute_job(job: Job):
+    try:
+        if job.job_type == "data_extraction":
+            assert job.metadata is not None, "Inference ID is required."
+            model = ModelOptsFactory.get_model(job.metadata)
+            run_data_extraction_job(model=model, conn_args=job.conn_args)
+        elif job.job_type == "data_deletion":
+            assert job.metadata is not None, "Inference ID is required."
+            model = ModelOptsFactory.get_model(job.metadata)
+            delete_model_data(model=model, conn_args=job.conn_args)
+        elif job.job_type == "folder_rescan":
+            rescan_folders(conn_args=job.conn_args)
+        elif job.job_type == "folder_update":
+            assert (
+                job.included_folders is not None
+                and job.excluded_folders is not None
+            ), "Both included and excluded folders are required."
+            run_folder_update(
+                included_folders=job.included_folders,
+                excluded_folders=job.excluded_folders,
+                conn_args=job.conn_args,
+            )
+        else:
+            logger.error(f"Unknown job type: {job.job_type}")
+    except Exception as e:
+        logger.error(f"Job {job.queue_id} failed with error: {e}")
+
+
 class JobManager:
     def __init__(self):
         self.job_queue: List[Job] = []
@@ -106,7 +134,7 @@ class JobManager:
 
             if job:
                 process = multiprocessing.Process(
-                    target=self.execute_job, args=(job,)
+                    target=execute_job, args=(job,)
                 )
                 running_job = RunningJob(job=job, process=process)
                 with self.lock:
@@ -126,33 +154,6 @@ class JobManager:
             else:
                 # No job to process, sleep briefly to prevent tight loop
                 threading.Event().wait(1)
-
-    def execute_job(self, job: Job):
-        try:
-            if job.job_type == "data_extraction":
-                assert job.metadata is not None, "Inference ID is required."
-                model = ModelOptsFactory.get_model(job.metadata)
-                run_data_extraction_job(model=model, conn_args=job.conn_args)
-            elif job.job_type == "data_deletion":
-                assert job.metadata is not None, "Inference ID is required."
-                model = ModelOptsFactory.get_model(job.metadata)
-                delete_model_data(model=model, conn_args=job.conn_args)
-            elif job.job_type == "folder_rescan":
-                rescan_folders(conn_args=job.conn_args)
-            elif job.job_type == "folder_update":
-                assert (
-                    job.included_folders is not None
-                    and job.excluded_folders is not None
-                ), "Both included and excluded folders are required."
-                run_folder_update(
-                    included_folders=job.included_folders,
-                    excluded_folders=job.excluded_folders,
-                    conn_args=job.conn_args,
-                )
-            else:
-                logger.error(f"Unknown job type: {job.job_type}")
-        except Exception as e:
-            logger.error(f"Job {job.queue_id} failed with error: {e}")
 
     def get_queue_status(self) -> QueueStatusModel:
         with self.lock:
