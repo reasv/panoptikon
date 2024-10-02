@@ -211,9 +211,8 @@ job_manager = JobManager()
 @router.get(
     "/queue",
     summary="Get running job and queue status",
-    response_model=QueueStatusModel,
 )
-def get_queue_status():
+def get_queue_status() -> QueueStatusModel:
     return job_manager.get_queue_status()
 
 
@@ -221,24 +220,29 @@ def get_queue_status():
 @router.post(
     "/data/extraction",
     summary="Run a data extraction job",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=JobModel,
 )
 def enqueue_data_extraction_job(
-    inference_id: str = Query(..., title="Inference ID"),
+    inference_ids: List[str] = Query(..., title="Inference ID List"),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
-):
-    queue_id = job_manager.get_next_job_id()
-    job = Job(
-        queue_id=queue_id,
-        job_type="data_extraction",
-        conn_args=conn_args,
-        metadata=inference_id,
-    )
-    job_manager.enqueue_job(job)
-    return JobModel(
-        queue_id=job.queue_id, job_type=job.job_type, metadata=job.metadata
-    )
+) -> List[JobModel]:
+    jobs = []
+    for inference_id in inference_ids:
+        queue_id = job_manager.get_next_job_id()
+        job = Job(
+            queue_id=queue_id,
+            job_type="data_extraction",
+            conn_args=conn_args,
+            metadata=inference_id,
+        )
+        job_manager.enqueue_job(job)
+        jobs.append(
+            JobModel(
+                queue_id=job.queue_id,
+                job_type=job.job_type,
+                metadata=job.metadata,
+            )
+        )
+    return jobs
 
 
 # Endpoint to delete extracted data
@@ -246,23 +250,29 @@ def enqueue_data_extraction_job(
     "/data/extraction",
     summary="Delete extracted data",
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=JobModel,
 )
 def enqueue_delete_extracted_data(
-    inference_id: str = Query(..., title="Inference ID"),
+    inference_ids: str = Query(..., title="Inference ID List"),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
-):
-    queue_id = job_manager.get_next_job_id()
-    job = Job(
-        queue_id=queue_id,
-        job_type="data_deletion",
-        conn_args=conn_args,
-        metadata=inference_id,
-    )
-    job_manager.enqueue_job(job)
-    return JobModel(
-        queue_id=job.queue_id, job_type=job.job_type, metadata=job.metadata
-    )
+) -> List[JobModel]:
+    jobs = []
+    for inference_id in inference_ids:
+        queue_id = job_manager.get_next_job_id()
+        job = Job(
+            queue_id=queue_id,
+            job_type="data_deletion",
+            conn_args=conn_args,
+            metadata=inference_id,
+        )
+        job_manager.enqueue_job(job)
+        jobs.append(
+            JobModel(
+                queue_id=job.queue_id,
+                job_type=job.job_type,
+                metadata=job.metadata,
+            )
+        )
+    return jobs
 
 
 # Endpoint to run a folder rescan
@@ -270,11 +280,10 @@ def enqueue_delete_extracted_data(
     "/folders/rescan",
     summary="Run a folder rescan",
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=JobModel,
 )
 def enqueue_folder_rescan(
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
-):
+) -> JobModel:
     queue_id = job_manager.get_next_job_id()
     job = Job(
         queue_id=queue_id,
@@ -297,7 +306,6 @@ class Folders(BaseModel):
     "/folders",
     summary="Update the folder lists",
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=JobModel,
 )
 def enqueue_update_folders(
     folders: Folders = Body(
@@ -305,7 +313,7 @@ def enqueue_update_folders(
         title="The new sets of included and excluded folders. Replaces the current lists with these.",
     ),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
-):
+) -> JobModel:
     queue_id = job_manager.get_next_job_id()
     job = Job(
         queue_id=queue_id,
@@ -318,6 +326,10 @@ def enqueue_update_folders(
     return JobModel(queue_id=job.queue_id, job_type=job.job_type, metadata=None)
 
 
+class QueueCancelResponse(BaseModel):
+    cancelled_jobs: List[int]
+
+
 # Endpoint to cancel queued jobs
 @router.delete(
     "/queue",
@@ -326,13 +338,17 @@ def enqueue_update_folders(
 )
 def cancel_queued_jobs(
     queue_ids: List[int] = Query(..., title="List of Queue IDs to cancel"),
-):
+) -> QueueCancelResponse:
     cancelled = job_manager.cancel_queued_jobs(queue_ids)
     if not cancelled:
         raise HTTPException(
             status_code=404, detail="No matching queued jobs found."
         )
-    return {"cancelled_jobs": cancelled}
+    return QueueCancelResponse(cancelled_jobs=cancelled)
+
+
+class CancelResponse(BaseModel):
+    detail: str
 
 
 # Endpoint to cancel the currently running job
@@ -341,20 +357,19 @@ def cancel_queued_jobs(
     summary="Cancel the currently running job",
     status_code=status.HTTP_200_OK,
 )
-def cancel_current_job():
+def cancel_current_job() -> CancelResponse:
     cancelled_job_id = job_manager.cancel_running_job()
     if cancelled_job_id is None:
         raise HTTPException(
             status_code=404, detail="No job is currently running."
         )
-    return {"detail": f"Current job {cancelled_job_id} has been cancelled."}
+    return CancelResponse(detail=f"Job {cancelled_job_id} cancelled.")
 
 
 # Additional endpoints remain unchanged
 @router.get(
     "/folders",
     summary="Get the current folder lists",
-    response_model=Folders,
 )
 def get_folders(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
@@ -378,7 +393,6 @@ def get_folders(
 @router.get(
     "/folders/history",
     summary="Get the scan history",
-    response_model=List[FileScanRecord],
 )
 def get_scan_history(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
@@ -393,7 +407,6 @@ def get_scan_history(
 @router.get(
     "/data/history",
     summary="Get the extraction history",
-    response_model=List[LogRecord],
 )
 def get_extraction_history(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
@@ -405,6 +418,10 @@ def get_extraction_history(
         conn.close()
 
 
+class ConfigResponse(BaseModel):
+    detail: str
+
+
 @router.put(
     "/config",
     summary="Update the system configuration",
@@ -413,14 +430,14 @@ def get_extraction_history(
 def update_config(
     config: SystemConfig = Body(..., title="The new system configuration"),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
-):
+) -> ConfigResponse:
     conn = get_database_connection(**conn_args)
     try:
         persist_system_config(conn, config)
         conn.commit()
     finally:
         conn.close()
-    return {"detail": "Configuration updated successfully."}
+    return ConfigResponse(detail="System configuration updated.")
 
 
 @router.get(
