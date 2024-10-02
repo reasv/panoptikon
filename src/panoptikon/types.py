@@ -131,8 +131,8 @@ class LogRecord:
     total_remaining: int
     data_load_time: float
     inference_time: float
-    failed: bool
-    completed: bool
+    failed: int
+    completed: int
 
 
 @dataclass
