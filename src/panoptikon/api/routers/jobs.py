@@ -55,20 +55,14 @@ class RunningJob:
 
 
 class QueueStatusModel(BaseModel):
-    running_job: Optional["RunningJobModel"]
     queue: List["JobModel"]
-
-
-class RunningJobModel(BaseModel):
-    queue_id: int
-    job_type: JobType
-    metadata: Optional[str] = None
 
 
 class JobModel(BaseModel):
     queue_id: int
     job_type: JobType
     metadata: Optional[str] = None
+    running: bool = False
 
 
 def execute_job(job: Job):
@@ -162,24 +156,33 @@ class JobManager:
                     queue_id=job.queue_id,
                     job_type=job.job_type,
                     metadata=job.metadata,
+                    running=False,
                 )
                 for job in self.job_queue
             ]
             running = (
-                RunningJobModel(
+                JobModel(
                     queue_id=self.running_job.job.queue_id,
                     job_type=self.running_job.job.job_type,
                     metadata=self.running_job.job.metadata,
+                    running=True,
                 )
                 if self.running_job
                 else None
             )
-        return QueueStatusModel(running_job=running, queue=queue_list)
+            if running:
+                queue_list.insert(0, running)
+        return QueueStatusModel(queue=queue_list)
 
     def cancel_queued_jobs(self, queue_ids: List[int]) -> List[int]:
         cancelled = []
         with self.lock:
             for qid in queue_ids:
+                # Check if it's the running job
+                if self.running_job and self.running_job.job.queue_id == qid:
+                    self.cancel_running_job()
+                    cancelled.append(qid)
+                    continue
                 job = self.queued_jobs.pop(qid, None)
                 if job and job in self.job_queue:
                     self.job_queue.remove(job)
@@ -252,7 +255,7 @@ def enqueue_data_extraction_job(
     status_code=status.HTTP_202_ACCEPTED,
 )
 def enqueue_delete_extracted_data(
-    inference_ids: str = Query(..., title="Inference ID List"),
+    inference_ids: List[str] = Query(..., title="Inference ID List"),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
 ) -> List[JobModel]:
     jobs = []
@@ -457,5 +460,4 @@ def get_config(
 
 # To support forward references in Pydantic models
 QueueStatusModel.model_rebuild()
-RunningJobModel.model_rebuild()
 JobModel.model_rebuild()
