@@ -47,6 +47,7 @@ class QueueStatusModel(BaseModel):
 class JobModel(BaseModel):
     queue_id: int
     job_type: JobType
+    index_db: str
     metadata: Optional[str] = None
     running: bool = False
 
@@ -142,6 +143,7 @@ class JobManager:
                     queue_id=job.queue_id,
                     job_type=job.job_type,
                     metadata=job.metadata,
+                    index_db=job.conn_args["index_db"],
                     running=False,
                 )
                 for job in self.job_queue
@@ -151,6 +153,7 @@ class JobManager:
                     queue_id=self.running_job.job.queue_id,
                     job_type=self.running_job.job.job_type,
                     metadata=self.running_job.job.metadata,
+                    index_db=self.running_job.job.conn_args["index_db"],
                     running=True,
                 )
                 if self.running_job
