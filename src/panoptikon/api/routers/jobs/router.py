@@ -63,6 +63,7 @@ def enqueue_data_extraction_job(
                 queue_id=job.queue_id,
                 job_type=job.job_type,
                 metadata=job.metadata,
+                index_db=job.conn_args["index_db"],
             )
         )
     return jobs
@@ -93,6 +94,7 @@ def enqueue_delete_extracted_data(
                 queue_id=job.queue_id,
                 job_type=job.job_type,
                 metadata=job.metadata,
+                index_db=job.conn_args["index_db"],
             )
         )
     return jobs
@@ -115,7 +117,10 @@ def enqueue_folder_rescan(
     )
     job_manager.enqueue_job(job)
     return JobModel(
-        queue_id=job.queue_id, job_type=job.job_type, metadata=job.metadata
+        queue_id=job.queue_id,
+        job_type=job.job_type,
+        metadata=job.metadata,
+        index_db=job.conn_args["index_db"],
     )
 
 
@@ -146,7 +151,12 @@ def enqueue_update_folders(
         excluded_folders=folders.excluded_folders,
     )
     job_manager.enqueue_job(job)
-    return JobModel(queue_id=job.queue_id, job_type=job.job_type, metadata=None)
+    return JobModel(
+        queue_id=job.queue_id,
+        job_type=job.job_type,
+        metadata=None,
+        index_db=job.conn_args["index_db"],
+    )
 
 
 class QueueCancelResponse(BaseModel):
