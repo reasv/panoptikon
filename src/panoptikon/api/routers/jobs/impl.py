@@ -71,7 +71,7 @@ def rescan_folders(conn_args: Dict[str, Any]):
         conn.commit()
         vacuum_database(conn)
         conn.close()
-        return (
+        logger.info(
             f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items. "
             + f"Files deleted due to rules: {rule_files_deleted}"
         )
@@ -88,6 +88,7 @@ def delete_model_data(
         cursor = conn.cursor()
         cursor.execute("BEGIN")
         report_str = model.delete_extracted_data(conn)
+        logger.info(report_str)
         conn.commit()
         vacuum_database(conn)
         return report_str
@@ -129,14 +130,14 @@ def run_data_extraction_job(
         total_time_pretty = str(total_time).split(".")[0]
         conn.commit()
         failed_str = "\n".join(failed)
-        report_str = f"""
+        logger.info(f"""
         Extraction completed for model {model} in {total_time_pretty}.
         Successfully processed {images} images and {videos} videos,
         and {other} other file types.
         The model processed a total of {units} individual pieces of data.
         {len(failed)} files failed to process due to errors.
-        """
+        """)
         if len(failed) > 0:
-            report_str += f"\nFailed files:\n{failed_str}"
+            logger.info(f"\nFailed files:\n{failed_str}")
     finally:
         conn.close()
