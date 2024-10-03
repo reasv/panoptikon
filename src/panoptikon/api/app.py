@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
+from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
 import inferio
@@ -88,6 +89,11 @@ def get_db_info():
     )
 
 
+class DBCreateResponse(BaseModel):
+    index_db: str
+    user_data_db: str
+
+
 @app.post(
     "/api/db",
     summary="Create new databases",
@@ -96,13 +102,12 @@ Create new databases with the specified names.
 It runs the migration scripts on the provided database names.
 If the databases already exist, the effect is the same as running the migrations.
     """,
-    response_model=DBInfo,
     tags=["database"],
 )
 def create_db(
     new_index_db: str = Query(None),
     new_user_data_db: str = Query(None),
-) -> DBInfo:
+) -> DBCreateResponse:
     default_index_db, default_user_data_db, default_storage_db = get_db_names()
     if new_index_db:
         index_db = new_index_db
@@ -118,10 +123,10 @@ def create_db(
     run_migrations()
     # Set the default databases back to the original values
     set_db_names(default_index_db, default_user_data_db, default_storage_db)
-    index_dbs, user_data_dbs = get_db_lists()
-    return DBInfo(
-        index=SingleDBInfo(current=default_index_db, all=index_dbs),
-        user_data=SingleDBInfo(current=default_user_data_db, all=user_data_dbs),
+
+    return DBCreateResponse(
+        index_db=index_db,
+        user_data_db=user_data_db,
     )
 
 
