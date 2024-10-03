@@ -34,23 +34,24 @@ def run_folder_update(
             new_included_folders,
             new_excluded_folders,
         )
-        update_result_text = f"""
+        logger.info(f"""
         Included folders added (and scanned): {", ".join(update_result.included_added)} ({len(update_result.scan_ids)});
-        """
+        """)
         if update_result.excluded_added:
-            update_result_text += f"\nExcluded folders added: {", ".join(update_result.excluded_added)};"
+            logger.info(f"Excluded folders added: {", ".join(update_result.excluded_added)};")
         if update_result.included_deleted or update_result.excluded_deleted:
-            update_result_text += f"\nRemoved {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;"
+            logger.info(f"Removed {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;")
         if update_result.unavailable_files_deleted:
-            update_result_text += f"\nRemoved {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;"
+            logger.info(f"Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;")
         if update_result.excluded_folder_files_deleted:
-            update_result_text += f"\nRemoved {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;"
+            logger.info(f"Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;")
         if update_result.orphan_files_deleted:
-            update_result_text += f"\nRemoved {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;"
+            logger.info(f"Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;")
         if update_result.rule_files_deleted:
-            update_result_text += f"\nRemoved {update_result.rule_files_deleted} files from the database that were not allowed by user rules;"
+            logger.info(f"Removed {update_result.rule_files_deleted} files from the database that were not allowed by user rules;")
         if update_result.orphan_items_deleted:
-            update_result_text += f"\nRemoved {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed."
+            logger.info(f"Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed.")
+        
         conn.commit()
         vacuum_database(conn)
     except Exception as e:
