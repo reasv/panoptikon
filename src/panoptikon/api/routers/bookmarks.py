@@ -17,7 +17,7 @@ from panoptikon.db.bookmarks import (
     get_bookmarks_item,
     remove_bookmark,
 )
-from panoptikon.db.search.types import OrderType
+from panoptikon.db.pql.types import OrderType
 from panoptikon.types import FileSearchResult
 
 logger = logging.getLogger(__name__)

@@ -19,7 +19,7 @@ from panoptikon.db.pql.types import (
     get_order_direction_field,
     get_std_cols,
 )
-from panoptikon.db.search.utils import parse_and_escape_query
+from panoptikon.db.pql.utils import parse_and_escape_query
 
 
 class MatchPathArgs(BaseModel):

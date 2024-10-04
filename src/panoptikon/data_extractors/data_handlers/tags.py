@@ -4,10 +4,10 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
+from panoptikon.data_extractors.data_handlers.utils import from_dict
 from panoptikon.data_extractors.extraction_jobs.types import TagResult
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
-from panoptikon.db.search.utils import from_dict
 from panoptikon.db.tags import add_tag_to_item
 from panoptikon.types import ItemData
 
