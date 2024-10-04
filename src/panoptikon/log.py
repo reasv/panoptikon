@@ -4,8 +4,6 @@ import logging.config
 import os
 import sys
 
-from panoptikon.db import get_db_names
-
 
 def setup_logging():
     # Wrap sys.stdout to use UTF-8 encoding

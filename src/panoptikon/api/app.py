@@ -67,7 +67,7 @@ class DBInfo:
 Get information about the database, including the names of all other available databases.
 Most API endpoints support specifying the databases to use for index and user data
 through the `index_db` and `user_data_db` query parameters.
-Regardless of which database is currently being used by panoptikon,
+Regardless of which database is currently being defaulted to by panoptikon,
 the API allows you to perform actions and query data from any of the available databases.
 The current databases are simply the ones that are used by default.
     """,
