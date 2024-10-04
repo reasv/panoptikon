@@ -193,3 +193,8 @@ class JobManager:
                 return completed_job_id
             else:
                 return None
+
+
+# To support forward references in Pydantic models
+QueueStatusModel.model_rebuild()
+JobModel.model_rebuild()

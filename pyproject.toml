@@ -35,6 +35,8 @@ sqlalchemy = "^2.0.34"
 tomlkit = "^0.13.2"
 uvicorn = "^0.31.0"
 python-multipart = "^0.0.12"
+tomli = "^2.0.2"
+tomli-w = "^1.0.0"
 
 [tool.poetry.group.inference]
 optional = true

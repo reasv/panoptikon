@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union
 
+from pydantic import BaseModel, Field
+
 if TYPE_CHECKING:
     from panoptikon.data_extractors.models import ModelOpts
 
@@ -164,16 +166,23 @@ class RuleStats:
     model_types: List[Type["ModelOpts"]] = field(default_factory=list)
 
 
-@dataclass
-class SystemConfig:
-    remove_unavailable_files: bool = True
-    scan_images: bool = True
-    scan_video: bool = True
-    scan_audio: bool = False
-    scan_html: bool = False
-    scan_pdf: bool = False
-    enable_cron_job: bool = False
-    cron_schedule: str = "0 3 * * *"
+class JobSettings(BaseModel):
+    group_name: str
+    inference_id: Optional[str] = None
+    default_batch_size: Optional[int] = None
+    default_threshold: Optional[float] = None
+
+
+class SystemConfig(BaseModel):
+    remove_unavailable_files: bool = Field(default=True)
+    scan_images: bool = Field(default=True)
+    scan_video: bool = Field(default=True)
+    scan_audio: bool = Field(default=False)
+    scan_html: bool = Field(default=False)
+    scan_pdf: bool = Field(default=False)
+    enable_cron_job: bool = Field(default=False)
+    cron_schedule: str = Field(default="0 3 * * *")
+    job_settings: List[JobSettings] = field(default_factory=list)
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]

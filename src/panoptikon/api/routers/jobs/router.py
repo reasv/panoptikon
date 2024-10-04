@@ -1,6 +1,9 @@
 import logging
+import os
 from typing import Any, Dict, List
 
+import tomli
+import tomli_w
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -12,7 +15,6 @@ from panoptikon.api.routers.jobs.manager import (
 )
 from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
 from panoptikon.db import get_database_connection
-from panoptikon.db.config import persist_system_config, retrieve_system_config
 from panoptikon.db.extraction_log import get_all_data_logs
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
@@ -262,14 +264,15 @@ class ConfigResponse(BaseModel):
 )
 def update_config(
     config: SystemConfig = Body(..., title="The new system configuration"),
-    conn_args: Dict[str, Any] = Depends(get_db_system_wl),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> ConfigResponse:
-    conn = get_database_connection(**conn_args)
-    try:
-        persist_system_config(conn, config)
-        conn.commit()
-    finally:
-        conn.close()
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    config_dir = os.path.join(data_dir, "configs")
+    os.makedirs(config_dir, exist_ok=True)
+    config_file = os.path.join(config_dir, f"{conn_args['index_db']}.toml")
+    config_dict = config.model_dump()
+    with open(config_file, "wb") as f:
+        tomli_w.dump(config_dict, f)
     return ConfigResponse(detail="System configuration updated.")
 
 
@@ -281,13 +284,12 @@ def update_config(
 def get_config(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> SystemConfig:
-    conn = get_database_connection(**conn_args)
-    try:
-        return retrieve_system_config(conn)
-    finally:
-        conn.close()
-
-
-# To support forward references in Pydantic models
-QueueStatusModel.model_rebuild()
-JobModel.model_rebuild()
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    config_dir = os.path.join(data_dir, "configs")
+    os.makedirs(config_dir, exist_ok=True)
+    config_file = os.path.join(config_dir, f"{conn_args['index_db']}.toml")
+    if not os.path.exists(config_file):
+        return SystemConfig()
+    with open(config_file, "rb") as f:
+        config_dict = tomli.load(f)
+    return SystemConfig(**config_dict)

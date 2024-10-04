@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cronjob()
+    # cronjob()
     await inferio.check_ttl()
     yield
 
