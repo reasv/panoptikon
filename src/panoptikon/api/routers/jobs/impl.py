@@ -8,6 +8,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
 )
 from panoptikon.data_extractors.models import ModelOpts
 from panoptikon.db import get_database_connection
+from panoptikon.db.config import retrieve_system_config
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders, update_folder_lists
 
@@ -26,11 +27,13 @@ def run_folder_update(
     )
     conn = get_database_connection(**conn_args)
     try:
+        system_config = retrieve_system_config(conn_args["index_db"])
         cursor = conn.cursor()
         # Begin a transaction
         cursor.execute("BEGIN")
         update_result = update_folder_lists(
             conn,
+            system_config,
             new_included_folders,
             new_excluded_folders,
         )
@@ -63,10 +66,11 @@ def run_folder_update(
 def rescan_folders(conn_args: Dict[str, Any]):
     conn = get_database_connection(**conn_args)
     try:
+        system_config = retrieve_system_config(conn_args["index_db"])
         cursor = conn.cursor()
         cursor.execute("BEGIN")
         ids, files_deleted, items_deleted, rule_files_deleted = (
-            rescan_all_folders(conn)
+            rescan_all_folders(conn, system_config=system_config)
         )
         conn.commit()
         vacuum_database(conn)

@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import List
 
 from panoptikon.db import get_db_names
-from panoptikon.db.config import retrieve_system_config
 from panoptikon.db.files import (
     add_file_scan,
     delete_files_not_allowed,
@@ -33,13 +32,16 @@ from panoptikon.files import (
     ensure_thumbnail_exists,
     scan_files,
 )
+from panoptikon.types import SystemConfig
 from panoptikon.utils import normalize_path
 
 logger = logging.getLogger(__name__)
 
 
 def execute_folder_scan(
-    conn: sqlite3.Connection, included_folders: None | List[str] = None
+    conn: sqlite3.Connection,
+    system_config: SystemConfig,
+    included_folders: None | List[str] = None,
 ) -> list[int]:
     """
     Execute a scan of the files in the given `included_folders`,
@@ -70,7 +72,6 @@ def execute_folder_scan(
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
-    system_config = retrieve_system_config(conn)
     logger.info(f"Scanning folders: {included_folders}")
     scan_ids = []
     for folder in starting_points:
@@ -185,6 +186,7 @@ class UpdateFoldersResult:
 
 def update_folder_lists(
     conn: sqlite3.Connection,
+    system_config: SystemConfig,
     included_folders: List[str],
     excluded_folders: List[str],
 ):
@@ -223,9 +225,9 @@ def update_folder_lists(
         if added:
             excluded_added.append(folder)
 
-    scan_ids = execute_folder_scan(conn, included_folders=included_added)
-
-    system_config = retrieve_system_config(conn)
+    scan_ids = execute_folder_scan(
+        conn, system_config=system_config, included_folders=included_added
+    )
 
     if system_config.remove_unavailable_files:
         unavailable_files_deleted = delete_unavailable_files(conn)
@@ -258,14 +260,13 @@ def update_folder_lists(
     )
 
 
-def rescan_all_folders(conn: sqlite3.Connection):
+def rescan_all_folders(conn: sqlite3.Connection, system_config: SystemConfig):
     """
     Rescan all included folders in the database and update the database with the results.
     Executes the related cleanup operations.
 
     """
-    scan_ids = execute_folder_scan(conn)
-    system_config = retrieve_system_config(conn)
+    scan_ids = execute_folder_scan(conn, system_config=system_config)
     if system_config.remove_unavailable_files:
         unavailable_files_deleted = delete_unavailable_files(conn)
     else:
