@@ -254,10 +254,6 @@ def get_extraction_history(
         conn.close()
 
 
-class ConfigResponse(BaseModel):
-    detail: str
-
-
 @router.put(
     "/config",
     summary="Update the system configuration",
@@ -266,9 +262,9 @@ class ConfigResponse(BaseModel):
 def update_config(
     config: SystemConfig = Body(..., title="The new system configuration"),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> ConfigResponse:
+) -> SystemConfig:
     persist_system_config(conn_args["index_db"], config)
-    return ConfigResponse(detail="System configuration updated.")
+    return retrieve_system_config(conn_args["index_db"])
 
 
 @router.get(
