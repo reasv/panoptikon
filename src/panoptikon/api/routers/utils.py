@@ -4,7 +4,7 @@ from typing import Dict, Optional
 from fastapi import HTTPException, Query
 from PIL import Image, ImageDraw, ImageFont
 
-from panoptikon.db import get_db_lists, get_db_names
+from panoptikon.db import get_db_default_names, get_db_lists
 
 
 def check_dbs(index_db: Optional[str], user_data_db: Optional[str]):
@@ -32,7 +32,7 @@ def get_db_readonly(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_names()
+    index, user_data, _ = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:
@@ -55,7 +55,7 @@ def get_db_user_data_wl(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_names()
+    index, user_data, _ = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:
@@ -85,7 +85,7 @@ def get_db_system_wl(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_names()
+    index, user_data, _ = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:

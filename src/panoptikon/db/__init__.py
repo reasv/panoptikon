@@ -70,7 +70,7 @@ def get_db_paths(index_db: str | None = None, user_data_db: str | None = None):
     os.makedirs(user_data_db_dir, exist_ok=True)
     os.makedirs(storage_db_dir, exist_ok=True)
 
-    index, user_data, storage = get_db_names()
+    index, user_data, storage = get_db_default_names()
 
     # Override the database names if provided
     if index_db:
@@ -85,7 +85,7 @@ def get_db_paths(index_db: str | None = None, user_data_db: str | None = None):
     return db_file, user_db_file, storage_db_file
 
 
-def get_db_names():
+def get_db_default_names():
     index = os.getenv("INDEX_DB", "default")
     user_data = os.getenv("USER_DATA_DB", "default")
     storage = os.getenv("STORAGE_DB", index)  # Default to same name as index
