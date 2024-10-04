@@ -18,7 +18,6 @@ include = [
 
 [tool.poetry.dependencies]
 python = "^3.12"
-gradio = "^4.38.0"
 pillow = "^10.4.0"
 imageio-ffmpeg = { extras = ["ffmpeg"], version = "^0.5.1" }
 python-dotenv = "^1.0.1"
@@ -33,6 +32,9 @@ fastapi-proxy-lib = "^0.1.0"
 nodejs-wheel = "^20.17.0"
 pypika = { git = "https://github.com/reasv/pypika.git" }
 sqlalchemy = "^2.0.34"
+tomlkit = "^0.13.2"
+uvicorn = "^0.31.0"
+python-multipart = "^0.0.12"
 
 [tool.poetry.group.inference]
 optional = true

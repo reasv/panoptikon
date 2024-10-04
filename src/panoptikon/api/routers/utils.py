@@ -1,6 +1,8 @@
+import random
 from typing import Dict, Optional
 
 from fastapi import HTTPException, Query
+from PIL import Image, ImageDraw, ImageFont
 
 from panoptikon.db import get_db_lists, get_db_names
 
@@ -94,3 +96,68 @@ def get_db_system_wl(
         "index_db": index_db,
         "user_data_db": user_data_db,
     }
+
+
+def create_placeholder_image_with_gradient(size=(512, 512), text="No Preview"):
+    # Create a gradient background
+    gradient = Image.new("RGB", size)
+    draw = ImageDraw.Draw(gradient)
+
+    for y in range(size[1]):
+        r = int(255 * (y / size[1]))
+        g = int(255 * (random.random()))
+        b = int(255 * ((size[1] - y) / size[1]))
+        for x in range(size[0]):
+            draw.point((x, y), fill=(r, g, b))
+
+    # Draw the blocked symbol (a circle with a diagonal line through it)
+    symbol_radius = min(size) // 6
+    symbol_center = (size[0] // 2, size[1] // 3)
+    draw.ellipse(
+        [
+            (
+                symbol_center[0] - symbol_radius,
+                symbol_center[1] - symbol_radius,
+            ),
+            (
+                symbol_center[0] + symbol_radius,
+                symbol_center[1] + symbol_radius,
+            ),
+        ],
+        outline="black",
+        width=5,
+    )
+    draw.line(
+        [
+            (
+                symbol_center[0] - symbol_radius,
+                symbol_center[1] + symbol_radius,
+            ),
+            (
+                symbol_center[0] + symbol_radius,
+                symbol_center[1] - symbol_radius,
+            ),
+        ],
+        fill="black",
+        width=5,
+    )
+
+    # Load a default font
+    try:
+        font = ImageFont.load_default()
+    except IOError:
+        font = ImageFont.load_default()
+
+    # Calculate text size using textbbox
+    text_bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+
+    # Draw the "No Preview" text below the symbol
+    text_position = (
+        size[0] // 2 - text_width // 2,
+        size[1] // 2 + symbol_radius // 2,
+    )
+    draw.text(text_position, text, fill="black", font=font)
+
+    return gradient

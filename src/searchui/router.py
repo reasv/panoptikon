@@ -44,7 +44,11 @@ def get_routers(
 
     @router.get("/search")
     async def search():
-        return RedirectResponse(url=client_url)
+        return RedirectResponse(url=f"{client_url}/search")
+
+    @router.get("/scan")
+    async def scan():
+        return RedirectResponse(url=f"{client_url}/scan")
 
     return router, client_url
 

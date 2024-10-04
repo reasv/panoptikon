@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic.dataclasses import dataclass
 
-from panoptikon.api.routers.utils import get_db_readonly, strip_non_latin1_chars
+from panoptikon.api.routers.utils import (
+    create_placeholder_image_with_gradient,
+    get_db_readonly,
+    strip_non_latin1_chars,
+)
 from panoptikon.db import get_database_connection
 from panoptikon.db.extracted_text import (
     get_extracted_text_for_item,
@@ -25,9 +29,6 @@ from panoptikon.db.files import (
 from panoptikon.db.storage import get_thumbnail_bytes
 from panoptikon.db.tags import get_all_tags_for_item
 from panoptikon.types import ExtractedText, FileRecord, ItemRecord
-from panoptikon.ui.components.utils import (
-    create_placeholder_image_with_gradient,
-)
 from panoptikon.utils import get_mime_type
 
 logger = logging.getLogger(__name__)

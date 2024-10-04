@@ -2,11 +2,9 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
@@ -14,7 +12,6 @@ from pydantic.dataclasses import dataclass
 import inferio
 import panoptikon.api.routers.bookmarks as bookmarks
 import panoptikon.api.routers.items as items
-import panoptikon.api.routers.legacy as legacy
 import panoptikon.api.routers.search as search
 from panoptikon.api.job import try_cronjob
 from panoptikon.api.routers import jobs
@@ -49,9 +46,6 @@ def cronjob():
 
 
 app = FastAPI(lifespan=lifespan)
-
-if os.getenv("LEGACY_GALLERY", "false").lower() == "true":
-    app.include_router(legacy.router)
 
 
 @dataclass
@@ -217,30 +211,10 @@ app.include_router(inferio.router)
 app.include_router(jobs.router)
 
 
-def get_app(
-    hostname: str, port: int, callback: Callable[[FastAPI], None]
-) -> FastAPI:
+def get_app(hostname: str, port: int) -> FastAPI:
     # Add the reverse HTTP and WebSocket routers
-    callback(app)
-    if os.getenv("ENABLE_CLIENT", "false").lower() == "true":
+    if os.getenv("ENABLE_CLIENT", "true").lower() == "true":
         client_redirect_router, client_url = get_routers(hostname, port)
         app.include_router(client_redirect_router)
-        # allowed_origins = [
-        #     client_url[:-1],
-        # ]
-        # logger.debug(f"Allowed origins: {allowed_origins}")
-        # # Add CORS middleware to allow requests from the specific origin
-        # app.add_middleware(
-        #     CORSMiddleware,
-        #     allow_origins=allowed_origins,  # Allow requests from this list of origins
-        #     allow_credentials=True,
-        #     allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
-        #     allow_headers=["*"],  # Allow all headers
-        # )
-    else:
-
-        @app.get("/")
-        async def redirect_to_gradio():
-            return RedirectResponse(url="/gradio/")
 
     return app
