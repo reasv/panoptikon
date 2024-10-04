@@ -3,9 +3,9 @@ from datetime import datetime
 
 from croniter import croniter
 
+from panoptikon.config import retrieve_system_config
 from panoptikon.cronjob import run_cronjob
 from panoptikon.db import get_database_connection
-from panoptikon.db.config import retrieve_system_config
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Function to get the cron string
 def get_cron_string():
     conn = get_database_connection(write_lock=False)
+    assert False, "This function is not implemented"
     system_config = retrieve_system_config(conn)
     conn.close()
     if system_config.enable_cron_job:

@@ -11,8 +11,8 @@ from panoptikon.api.routers.jobs.manager import (
     QueueStatusModel,
 )
 from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
+from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.db import get_database_connection
-from panoptikon.db.config import persist_system_config, retrieve_system_config
 from panoptikon.db.extraction_log import get_all_data_logs
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
