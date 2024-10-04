@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List
 
-from panoptikon.db import get_db_names
 from panoptikon.db.files import (
     add_file_scan,
     delete_files_not_allowed,
@@ -238,13 +237,8 @@ def update_folder_lists(
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
     rule_files_deleted = delete_files_not_allowed(conn)
     orphan_items_deleted = delete_items_without_files(conn)
-    index, user_data, storage = get_db_names()
-    # Don't delete data from the storage database
-    # if the index DB has a different name from the storage DB,
-    # since it means we're probably sharing the storage DB with another index
-    if index == storage:
-        delete_orphaned_frames(conn)
-        delete_orphaned_thumbnails(conn)
+    delete_orphaned_frames(conn)
+    delete_orphaned_thumbnails(conn)
 
     return UpdateFoldersResult(
         included_deleted=included_deleted,
@@ -274,10 +268,9 @@ def rescan_all_folders(conn: sqlite3.Connection, system_config: SystemConfig):
 
     rule_files_deleted = delete_files_not_allowed(conn)
     orphan_items_deleted = delete_items_without_files(conn)
-    index, user_data, storage = get_db_names()
-    if index == storage:
-        delete_orphaned_frames(conn)
-        delete_orphaned_thumbnails(conn)
+
+    delete_orphaned_frames(conn)
+    delete_orphaned_thumbnails(conn)
 
     return (
         scan_ids,
