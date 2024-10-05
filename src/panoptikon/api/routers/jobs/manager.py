@@ -157,6 +157,7 @@ class JobManager:
                     batch_size=job.batch_size,
                     threshold=job.threshold,
                     running=False,
+                    tag=job.tag,
                 )
                 for job in self.job_queue
             ]
@@ -169,6 +170,7 @@ class JobManager:
                     batch_size=self.running_job.job.batch_size,
                     threshold=self.running_job.job.threshold,
                     running=True,
+                    tag=self.running_job.job.tag,
                 )
                 if self.running_job
                 else None
