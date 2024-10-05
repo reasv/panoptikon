@@ -19,8 +19,9 @@ def get_config_path(name: str) -> str:
 def persist_system_config(name: str, config: SystemConfig):
     config_file = get_config_path(name)
     config_dict = config.model_dump(exclude_none=True)
-    with open(config_file, "wb") as f:
-        tomli_w.dump(config_dict, f)
+    serialized = tomli_w.dumps(config_dict)
+    with open(config_file, "w", encoding="utf-8") as f:
+        f.write(serialized)
 
 
 def retrieve_system_config(name: str) -> SystemConfig:
