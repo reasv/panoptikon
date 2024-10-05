@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
+from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from panoptikon.api.routers.jobs.impl import (
@@ -12,6 +13,7 @@ from panoptikon.api.routers.jobs.impl import (
     run_data_extraction_job,
     run_folder_update,
 )
+from panoptikon.log import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ class JobModel(BaseModel):
 
 
 def execute_job(job: Job):
+    load_dotenv()
+    setup_logging()
     try:
         if job.job_type == "data_extraction":
             assert job.metadata is not None, "Inference ID is required."
