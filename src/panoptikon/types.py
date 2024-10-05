@@ -174,7 +174,7 @@ class JobSettings(BaseModel):
 
 
 class CronJob(BaseModel):
-    inference_id: Optional[str] = None
+    inference_id: str
     batch_size: Optional[int] = None
     threshold: Optional[float] = None
 
