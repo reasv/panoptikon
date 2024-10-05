@@ -173,6 +173,12 @@ class JobSettings(BaseModel):
     default_threshold: Optional[float] = None
 
 
+class CronJob(BaseModel):
+    inference_id: Optional[str] = None
+    batch_size: Optional[int] = None
+    threshold: Optional[float] = None
+
+
 class SystemConfig(BaseModel):
     remove_unavailable_files: bool = Field(default=True)
     scan_images: bool = Field(default=True)
@@ -182,6 +188,7 @@ class SystemConfig(BaseModel):
     scan_pdf: bool = Field(default=False)
     enable_cron_job: bool = Field(default=False)
     cron_schedule: str = Field(default="0 3 * * *")
+    cron_jobs: List[CronJob] = field(default_factory=list)
     job_settings: List[JobSettings] = field(default_factory=list)
 
 
