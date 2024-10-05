@@ -32,8 +32,10 @@ def update_schedule(index_db: str):
     # Check if the cron string is None or has changed
     if cron_string is None:
         # If cron string is None, disable scheduling
-        del next_scheduled_time[index_db]
-        del current_cron_string[index_db]
+        if index_db in next_scheduled_time:
+            del next_scheduled_time[index_db]
+        if index_db in current_cron_string:
+            del current_cron_string[index_db]
     elif (
         cron_string != current_cron_string.get(index_db)
         or next_scheduled_time.get(index_db) is None
@@ -55,7 +57,8 @@ def try_cronjob(index_db: str):
     ):
         # Call the task function
         run_cronjob(index_db=index_db)
-        del next_scheduled_time[index_db]
+        if index_db in next_scheduled_time:
+            del next_scheduled_time[index_db]
         # Update the schedule after running the task
         update_schedule(index_db=index_db)
         logger.info(f"Next scheduled time: {next_scheduled_time.get(index_db)}")
