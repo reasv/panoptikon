@@ -24,16 +24,20 @@ from panoptikon.types import ItemData
 logger = logging.getLogger(__name__)
 
 
-def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
+def run_dynamic_extraction_job(
+    conn: sqlite3.Connection,
+    model: ModelGroup,
+    batch_size: int,
+    threshold: float | None,
+):
     """
     Run a job that processes items in the database using the given model.
     """
-    score_threshold = model.get_group_threshold(conn)
-    if score_threshold:
-        logger.info(f"Using score threshold {score_threshold}")
+    if threshold:
+        logger.info(f"Using score threshold {threshold}")
     else:
         logger.info("No score threshold set")
-    inference_opts = {"threshold": score_threshold} if score_threshold else {}
+    inference_opts = {"threshold": threshold} if threshold else {}
 
     cache_args = "batch", 1, 60
 
@@ -159,6 +163,8 @@ def run_dynamic_extraction_job(conn: sqlite3.Connection, model: ModelGroup):
     return run_extraction_job(
         conn,
         model,
+        batch_size,
+        threshold,
         data_loader,
         batch_inference_func,
         result_handler,  # type: ignore

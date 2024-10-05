@@ -5,10 +5,6 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
 import panoptikon.data_extractors.extraction_jobs.types as job_types
-from panoptikon.db.group_settings import (
-    retrieve_model_group_settings,
-    save_model_group_settings,
-)
 from panoptikon.db.rules.types import (
     MimeFilter,
     ProcessedExtractedDataFilter,
@@ -55,32 +51,6 @@ class ModelOpts(ABC):
         return None
 
     @classmethod
-    def get_group_batch_size(cls, conn: sqlite3.Connection) -> int:
-        settings = retrieve_model_group_settings(conn, cls.group_name())
-        if settings:
-            return settings[0]
-        return cls.default_batch_size()
-
-    @classmethod
-    def get_group_threshold(cls, conn: sqlite3.Connection) -> float | None:
-        settings = retrieve_model_group_settings(conn, cls.group_name())
-        if settings:
-            return settings[1]
-        return cls.default_threshold()
-
-    @classmethod
-    def set_group_threshold(cls, conn: sqlite3.Connection, threshold: float):
-        save_model_group_settings(
-            conn, cls.group_name(), cls.get_group_batch_size(conn), threshold
-        )
-
-    @classmethod
-    def set_group_batch_size(cls, conn: sqlite3.Connection, batch_size: int):
-        save_model_group_settings(
-            conn, cls.group_name(), batch_size, cls.get_group_threshold(conn)
-        )
-
-    @classmethod
     def valid_model(cls, model_name: str) -> bool:
         return model_name in cls.available_models()
 
@@ -124,7 +94,12 @@ class ModelOpts(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def run_extractor(self, conn: sqlite3.Connection) -> Generator[
+    def run_extractor(
+        self,
+        conn: sqlite3.Connection,
+        batch_size: int | None = None,
+        threshold: float | None = None,
+    ) -> Generator[
         job_types.ExtractionJobProgress
         | job_types.ExtractionJobReport
         | job_types.ExtractionJobStart,
@@ -274,12 +249,31 @@ class ModelGroup(ModelOpts):
             msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
         return msg
 
-    def run_extractor(self, conn: sqlite3.Connection):
+    def run_extractor(
+        self,
+        conn: sqlite3.Connection,
+        batch_size: int | None = None,
+        threshold: float | None = None,
+    ):
         from panoptikon.data_extractors.extraction_jobs.dynamic_job import (
             run_dynamic_extraction_job,
         )
 
-        return run_dynamic_extraction_job(conn, self)
+        if batch_size is None:
+            batch_size = self.default_batch_size()
+
+        if threshold is None:
+            threshold = self.default_threshold()
+        elif self.default_threshold() is None:
+            logger.warning(
+                f"Threshold {threshold} set for model {self.setter_name()} "
+                "but model does not accept thresholds."
+            )
+            threshold = None
+
+        return run_dynamic_extraction_job(
+            conn, self, batch_size=batch_size, threshold=threshold
+        )
 
     def run_batch_inference(
         self,
@@ -306,13 +300,7 @@ class ModelOptsFactory:
             api_modelopts = cls.get_api_model_opts()
         except Exception as e:
             logger.error(f"Failed to load API model opts: {e}", exc_info=True)
-        return [
-            # TagsModel,
-            # OCRModel,
-            # WhisperSTTModel,
-            # ImageEmbeddingModel,
-            # TextEmbeddingModel,
-        ] + api_modelopts
+        return api_modelopts
 
     @classmethod
     def get_api_model_opts(cls) -> List[Type[ModelOpts]]:

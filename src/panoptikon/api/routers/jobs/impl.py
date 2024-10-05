@@ -113,7 +113,7 @@ def run_data_extraction_job(
         cursor.execute("BEGIN")
         failed, images, videos, other, units = [], 0, 0, 0, 0
         start_time = datetime.datetime.now()
-        for progress in model.run_extractor(conn):
+        for progress in model.run_extractor(conn, batch_size, threshold):
             if type(progress) == ExtractionJobProgress:
                 # Job is in progress
                 pass

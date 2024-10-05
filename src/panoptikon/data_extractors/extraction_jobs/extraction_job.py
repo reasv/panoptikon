@@ -39,6 +39,8 @@ I = TypeVar("I")
 def run_extraction_job(
     conn: sqlite3.Connection,
     model_opts: models.ModelOpts,
+    batch_size: int,
+    threshold: float | None,
     input_transform: Callable[[ItemData], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
     output_handler: Callable[[int, ItemData, Sequence[I], Sequence[R]], None],
@@ -83,8 +85,6 @@ def run_extraction_job(
         0,
     )
     data_load_time, inference_time = 0.0, 0.0
-    threshold = model_opts.get_group_threshold(conn)
-    batch_size = model_opts.get_group_batch_size(conn)
     job_id = add_data_log(
         conn,
         scan_time,
