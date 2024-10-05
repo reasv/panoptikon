@@ -13,7 +13,7 @@ import inferio
 import panoptikon.api.routers.bookmarks as bookmarks
 import panoptikon.api.routers.items as items
 import panoptikon.api.routers.search as search
-from panoptikon.api.job import try_cronjob
+from panoptikon.api.cronjob.schedule import try_cronjobs
 from panoptikon.api.routers import jobs
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import (
@@ -35,14 +35,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # cronjob()
+    cronjob()
     await inferio.check_ttl()
     yield
 
 
 @repeat_at(cron="* * * * *", logger=logger)
 def cronjob():
-    try_cronjob()
+    try_cronjobs()
 
 
 app = FastAPI(lifespan=lifespan)
