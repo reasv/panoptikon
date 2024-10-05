@@ -15,7 +15,14 @@ def run_cronjob(index_db: str):
     try:
         logger.info("Running cronjob")
         conn_args = get_db_system_wl(index_db, None)
-        job_tag = f"cronjob[{index_db}]"
+        job_tag = "cronjob"
+        queue = job_manager.get_queue_status().queue
+        for job in queue:
+            if job.tag == job_tag and job.index_db == index_db:
+                logger.info(
+                    f"A previous cronjob for Index DB {index_db} is still running, skipping..."
+                )
+                return
         job_manager.enqueue_job(
             Job(
                 queue_id=job_manager.get_next_job_id(),
