@@ -7,7 +7,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
 )
-from panoptikon.data_extractors.models import ModelOpts, ModelOptsFactory
+from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders, update_folder_lists

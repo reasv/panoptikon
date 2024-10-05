@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Dict, List, Optional
+from email.policy import default
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from panoptikon.api.routers.jobs.manager import (
 )
 from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
 from panoptikon.config import persist_system_config, retrieve_system_config
+from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import get_all_data_logs
 from panoptikon.db.files import get_all_file_scans
@@ -54,6 +56,13 @@ def enqueue_data_extraction_job(
 ) -> List[JobModel]:
     jobs = []
     for inference_id in inference_ids:
+        def_batch_size, def_threshold = get_default_config(
+            inference_id, conn_args["index_db"]
+        )
+        if batch_size is None or batch_size < 1:
+            batch_size = def_batch_size
+        if threshold is None:
+            threshold = def_threshold
         queue_id = job_manager.get_next_job_id()
         job = Job(
             queue_id=queue_id,
@@ -75,6 +84,53 @@ def enqueue_data_extraction_job(
             )
         )
     return jobs
+
+
+def get_default_config(
+    inference_id: str, index_db: str
+) -> Tuple[int, float | None]:
+    model = ModelOptsFactory.get_model(inference_id)
+    batch_size, threshold = (
+        model.default_batch_size(),
+        model.default_threshold(),
+    )
+    system_config = retrieve_system_config(index_db)
+    job_settings = system_config.job_settings
+    for setting in job_settings:
+        if (
+            setting.group_name == model.group_name()
+            and setting.inference_id == None
+        ):
+            batch_size = (
+                setting.default_batch_size
+                if setting.default_batch_size is not None
+                else batch_size
+            )
+            # Model accepts threshold as a parameter
+            if model.default_threshold() is not None:
+                threshold = (
+                    setting.default_threshold
+                    if setting.default_threshold is not None
+                    else threshold
+                )
+    for setting in job_settings:
+        if (
+            setting.group_name == model.group_name()
+            and setting.inference_id == model.setter_name()
+        ):
+            batch_size = (
+                setting.default_batch_size
+                if setting.default_batch_size is not None
+                else batch_size
+            )
+            # Model accepts threshold as a parameter
+            if model.default_threshold() is not None:
+                threshold = (
+                    setting.default_threshold
+                    if setting.default_threshold is not None
+                    else threshold
+                )
+    return batch_size, threshold
 
 
 # Endpoint to delete extracted data
