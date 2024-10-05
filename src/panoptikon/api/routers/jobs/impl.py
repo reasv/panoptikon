@@ -7,7 +7,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
 )
-from panoptikon.data_extractors.models import ModelOpts
+from panoptikon.data_extractors.models import ModelOpts, ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders, update_folder_lists
@@ -83,9 +83,10 @@ def rescan_folders(conn_args: Dict[str, Any]):
         conn.close()
 
 def delete_model_data(
-    model: ModelOpts,
+    inference_id: str,
     conn_args: Dict[str, Any],
 ):
+    model = ModelOptsFactory.get_model(inference_id)
     conn = get_database_connection(**conn_args)
     try:
         logger.info(f"Running data deletion job for model {model}")
@@ -100,9 +101,12 @@ def delete_model_data(
         conn.close()
 
 def run_data_extraction_job(
-    model: ModelOpts,
+    inference_id: str,
+    batch_size: int | None,
+    threshold: float | None,
     conn_args: Dict[str, Any],
 ):
+    model = ModelOptsFactory.get_model(inference_id)
     conn = get_database_connection(**conn_args)
     try:
         cursor = conn.cursor()
@@ -113,14 +117,6 @@ def run_data_extraction_job(
             if type(progress) == ExtractionJobProgress:
                 # Job is in progress
                 pass
-                # progress_tracker(
-                #     (progress.processed_items, progress.total_items),
-                #     desc=(
-                #         f"ETA: {progress.eta_string} | "
-                #         + f"Last Item: {shorten_path(progress.item.path)}"
-                #     ),
-                #     unit="files",
-                # )
             elif type(progress) == ExtractionJobReport:
                 # Job is complete
                 images = progress.images

@@ -12,7 +12,6 @@ from panoptikon.api.routers.jobs.impl import (
     run_data_extraction_job,
     run_folder_update,
 )
-from panoptikon.data_extractors.models import ModelOptsFactory
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +29,8 @@ class Job(BaseModel):
     job_type: JobType
     conn_args: Dict[str, Any]
     metadata: Optional[str] = None
+    batch_size: Optional[int] = None
+    threshold: Optional[float] = None
     included_folders: Optional[List[str]] = None
     excluded_folders: Optional[List[str]] = None
 
@@ -49,6 +50,8 @@ class JobModel(BaseModel):
     job_type: JobType
     index_db: str
     metadata: Optional[str] = None
+    batch_size: Optional[int] = None
+    threshold: Optional[float] = None
     running: bool = False
 
 
@@ -56,12 +59,17 @@ def execute_job(job: Job):
     try:
         if job.job_type == "data_extraction":
             assert job.metadata is not None, "Inference ID is required."
-            model = ModelOptsFactory.get_model(job.metadata)
-            run_data_extraction_job(model=model, conn_args=job.conn_args)
+            run_data_extraction_job(
+                inference_id=job.metadata,
+                batch_size=job.batch_size,
+                threshold=job.threshold,
+                conn_args=job.conn_args,
+            )
         elif job.job_type == "data_deletion":
             assert job.metadata is not None, "Inference ID is required."
-            model = ModelOptsFactory.get_model(job.metadata)
-            delete_model_data(model=model, conn_args=job.conn_args)
+            delete_model_data(
+                inference_id=job.metadata, conn_args=job.conn_args
+            )
         elif job.job_type == "folder_rescan":
             rescan_folders(conn_args=job.conn_args)
         elif job.job_type == "folder_update":
@@ -144,6 +152,8 @@ class JobManager:
                     job_type=job.job_type,
                     metadata=job.metadata,
                     index_db=job.conn_args["index_db"],
+                    batch_size=job.batch_size,
+                    threshold=job.threshold,
                     running=False,
                 )
                 for job in self.job_queue
@@ -154,6 +164,8 @@ class JobManager:
                     job_type=self.running_job.job.job_type,
                     metadata=self.running_job.job.metadata,
                     index_db=self.running_job.job.conn_args["index_db"],
+                    batch_size=self.running_job.job.batch_size,
+                    threshold=self.running_job.job.threshold,
                     running=True,
                 )
                 if self.running_job

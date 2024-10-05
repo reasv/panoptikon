@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -46,6 +46,10 @@ def get_queue_status() -> QueueStatusModel:
 )
 def enqueue_data_extraction_job(
     inference_ids: List[str] = Query(..., title="Inference ID List"),
+    batch_size: Optional[int] = Query(default=None, title="Batch Size"),
+    threshold: Optional[float] = Query(
+        default=None, title="Confidence Threshold"
+    ),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
 ) -> List[JobModel]:
     jobs = []
@@ -56,6 +60,8 @@ def enqueue_data_extraction_job(
             job_type="data_extraction",
             conn_args=conn_args,
             metadata=inference_id,
+            batch_size=batch_size,
+            threshold=threshold,
         )
         job_manager.enqueue_job(job)
         jobs.append(
@@ -64,6 +70,8 @@ def enqueue_data_extraction_job(
                 job_type=job.job_type,
                 metadata=job.metadata,
                 index_db=job.conn_args["index_db"],
+                batch_size=job.batch_size,
+                threshold=job.threshold,
             )
         )
     return jobs
