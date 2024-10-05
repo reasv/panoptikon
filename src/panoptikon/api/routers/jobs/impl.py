@@ -9,6 +9,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
 )
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
+from panoptikon.db.extraction_log import remove_incomplete_jobs
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import rescan_all_folders, update_folder_lists
 
@@ -129,7 +130,7 @@ def run_data_extraction_job(
         total_time = end_time - start_time
         total_time_pretty = str(total_time).split(".")[0]
         conn.commit()
-        failed_str = "\n".join(failed)
+        failed_str = ", ".join(failed)
         logger.info(f"""
         Extraction completed for model {model} in {total_time_pretty}.
         Successfully processed {images} images and {videos} videos,
@@ -138,6 +139,17 @@ def run_data_extraction_job(
         {len(failed)} files failed to process due to errors.
         """)
         if len(failed) > 0:
-            logger.info(f"\nFailed files:\n{failed_str}")
+            logger.info(f"Failed files: {failed_str}")
+        logger.info(f"Running vacuum and analyze on database")
+        vacuum_database(conn)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Data extraction job for model {model} failed with error: {e}")
+        conn.rollback()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        remove_incomplete_jobs(conn)
+        conn.commit()
+        logger.info("Removed incomplete jobs from the database")
     finally:
         conn.close()
