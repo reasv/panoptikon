@@ -15,11 +15,13 @@ def run_cronjob(index_db: str):
     try:
         logger.info("Running cronjob")
         conn_args = get_db_system_wl(index_db, None)
+        job_tag = f"cronjob[{index_db}]"
         job_manager.enqueue_job(
             Job(
                 queue_id=job_manager.get_next_job_id(),
                 job_type="folder_rescan",
                 conn_args=conn_args,
+                tag=job_tag,
             )
         )
         system_config = retrieve_system_config(index_db)
@@ -46,6 +48,7 @@ def run_cronjob(index_db: str):
                     metadata=scheduled_job.inference_id,
                     batch_size=scheduled_job.batch_size,
                     threshold=scheduled_job.threshold,
+                    tag=job_tag,
                 )
             )
     except Exception as e:

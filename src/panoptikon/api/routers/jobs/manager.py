@@ -33,6 +33,7 @@ class Job(BaseModel):
     threshold: Optional[float] = None
     included_folders: Optional[List[str]] = None
     excluded_folders: Optional[List[str]] = None
+    tag: Optional[str] = None
 
 
 @dataclass
@@ -53,6 +54,7 @@ class JobModel(BaseModel):
     batch_size: Optional[int] = None
     threshold: Optional[float] = None
     running: bool = False
+    tag: Optional[str] = None
 
 
 def execute_job(job: Job):
