@@ -210,8 +210,6 @@ def get_all_file_scans(
     page = page if page is not None else 1
     page = max(1, page)
     offset = (page - 1) * page_size if page_size is not None else 0
-
-    logger.info(f"Getting file scans page {page} with page size {page_size}")
     cursor = conn.cursor()
     # Order by start_time in descending order
     cursor.execute(
