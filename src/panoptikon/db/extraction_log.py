@@ -167,11 +167,11 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
             data_load_time,
             inference_time,
             CASE 
-                WHEN completed = 1 THEN 0
+                WHEN data_log.completed = 1 THEN 0
                 WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
             END AS failed,
-            completed
+            data_log.completed
         FROM data_log
         LEFT JOIN item_data 
             ON item_data.job_id = data_log.job_id
