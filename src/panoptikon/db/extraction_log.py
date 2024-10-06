@@ -145,7 +145,14 @@ def remove_incomplete_jobs(conn: sqlite3.Connection):
     )
 
 
-def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
+def get_all_data_logs(
+    conn: sqlite3.Connection,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> List[LogRecord]:
+    page = page if page is not None else 1
+    page = max(1, page)
+    offset = (page - 1) * page_size if page_size is not None else 0
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -180,8 +187,10 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
         LEFT JOIN data_jobs
             ON data_log.job_id = data_jobs.id
         GROUP BY data_log.id
-        ORDER BY start_time DESC;
-        """
+        ORDER BY start_time DESC
+        LIMIT ? OFFSET ?
+        """,
+        (page_size, offset),
     )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
@@ -261,7 +270,8 @@ def add_item_data(
 
 
 def get_items_missing_data_extraction(
-    conn: sqlite3.Connection, model_opts: "models.ModelOpts"
+    conn: sqlite3.Connection,
+    model_opts: "models.ModelOpts",
 ):
     """
     Get all items that should be processed by the given setter.

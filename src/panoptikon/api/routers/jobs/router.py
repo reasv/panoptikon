@@ -302,11 +302,17 @@ def get_folders(
     summary="Get the scan history",
 )
 def get_scan_history(
+    page: int | None = Query(1, title="Page number", ge=1),
+    page_size: int | None = Query(None, title="Page size", ge=1),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> List[FileScanRecord]:
     conn = get_database_connection(**conn_args)
     try:
-        return get_all_file_scans(conn)
+        return get_all_file_scans(
+            conn,
+            page=page,
+            page_size=page_size,
+        )
     finally:
         conn.close()
 
@@ -316,11 +322,17 @@ def get_scan_history(
     summary="Get the extraction history",
 )
 def get_extraction_history(
+    page: int | None = Query(1, title="Page number", ge=1),
+    page_size: int | None = Query(None, title="Page size", ge=1),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> List[LogRecord]:
     conn = get_database_connection(**conn_args)
     try:
-        return get_all_data_logs(conn)
+        return get_all_data_logs(
+            conn,
+            page=page,
+            page_size=page_size,
+        )
     finally:
         conn.close()
 

@@ -202,7 +202,14 @@ def get_file_scan_by_id(
     return None
 
 
-def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
+def get_all_file_scans(
+    conn: sqlite3.Connection,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> List[FileScanRecord]:
+    page = page if page is not None else 1
+    page = max(1, page)
+    offset = (page - 1) * page_size if page_size is not None else 0
     cursor = conn.cursor()
     # Order by start_time in descending order
     cursor.execute(
@@ -226,7 +233,10 @@ def get_all_file_scans(conn: sqlite3.Connection) -> List[FileScanRecord]:
         FROM file_scans
         ORDER BY start_time
         DESC
-        """
+        LIMIT ?
+        OFFSET ?
+        """,
+        (page_size, offset),
     )
     scan_records = cursor.fetchall()
     return [FileScanRecord(*scan_record) for scan_record in scan_records]
