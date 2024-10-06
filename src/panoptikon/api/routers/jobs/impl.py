@@ -2,7 +2,7 @@ import datetime
 import logging
 from typing import Any, Dict, List, final
 
-from panoptikon.config import retrieve_system_config
+from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
@@ -21,6 +21,8 @@ def run_folder_update(
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
+        # Ensures that paths are saved in the standard format
+        persist_system_config(conn_args["index_db"], system_config)
         cursor = conn.cursor()
         # Begin a transaction
         cursor.execute("BEGIN")
