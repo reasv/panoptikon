@@ -132,14 +132,18 @@ class MatchTags(SortableFilter):
         matching_items = matching_items_select.cte(
             f"match_{self.get_cte_name(state.cte_counter)}"
         )
-
+        join_condition = (
+            context.c.data_id == matching_items.c.data_id
+            if state.item_data_query
+            else context.c.file_id == matching_items.c.file_id
+        )
         return self.wrap_query(
             select(
                 *get_std_cols(context, state),
                 matching_items.c.order_rank,
             ).join(
                 matching_items,
-                context.c.item_id == matching_items.c.item_id,
+                join_condition,
             ),
             context,
             state,
