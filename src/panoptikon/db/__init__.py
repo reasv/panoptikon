@@ -56,6 +56,7 @@ def get_database_connection(
     # Enable foreign key constraints
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys = ON")
+    cursor.execute("PRAGMA case_sensitive_like = ON")
     load_sqlite_vec(conn)
     return conn
 
