@@ -325,7 +325,7 @@ def delete_scan_data(
     log_ids: List[int] = Query(
         ..., title="List of Log Ids to delete the generated data for"
     ),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_system_wl),
 ) -> List[JobModel]:
     jobs = []
     for log_id in log_ids:
