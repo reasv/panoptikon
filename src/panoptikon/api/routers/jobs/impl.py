@@ -1,6 +1,6 @@
 import datetime
 import logging
-from typing import Any, Dict, List, final
+from typing import Any, Dict
 
 from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.data_extractors.extraction_jobs.types import (
@@ -9,7 +9,10 @@ from panoptikon.data_extractors.extraction_jobs.types import (
 )
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
-from panoptikon.db.extraction_log import remove_incomplete_jobs
+from panoptikon.db.extraction_log import (
+    delete_data_job_by_log_id,
+    remove_incomplete_jobs,
+)
 from panoptikon.db.utils import vacuum_database
 from panoptikon.folders import is_resync_needed, rescan_all_folders, update_folder_lists
 
@@ -104,7 +107,22 @@ def delete_model_data(
         logger.info(report_str)
         conn.commit()
         vacuum_database(conn)
-        return report_str
+    finally:
+        conn.close()
+
+def delete_job_data(
+    log_id: int,
+    conn_args: Dict[str, Any],
+):
+    conn = get_database_connection(**conn_args)
+    try:
+        logger.info(f"Running data deletion job log id {log_id}")
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        delete_data_job_by_log_id(conn, log_id)
+        logger.info(f"Deleted data for job log id {log_id}")
+        conn.commit()
+        vacuum_database(conn)
     finally:
         conn.close()
 

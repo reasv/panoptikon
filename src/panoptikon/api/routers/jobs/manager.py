@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from panoptikon.api.routers.jobs.impl import (
+    delete_job_data,
     delete_model_data,
     rescan_folders,
     run_data_extraction_job,
@@ -23,6 +24,7 @@ JobType = Literal[
     "data_deletion",
     "folder_rescan",
     "folder_update",
+    "job_data_deletion",
 ]
 
 
@@ -31,6 +33,7 @@ class Job(BaseModel):
     job_type: JobType
     conn_args: Dict[str, Any]
     metadata: Optional[str] = None
+    log_id: Optional[int] = None
     batch_size: Optional[int] = None
     threshold: Optional[float] = None
     tag: Optional[str] = None
@@ -53,6 +56,7 @@ class JobModel(BaseModel):
     metadata: Optional[str] = None
     batch_size: Optional[int] = None
     threshold: Optional[float] = None
+    log_id: Optional[int] = None
     running: bool = False
     tag: Optional[str] = None
 
@@ -80,6 +84,9 @@ def execute_job(job: Job):
             run_folder_update(
                 conn_args=job.conn_args,
             )
+        elif job.job_type == "job_data_deletion":
+            assert job.log_id is not None, "Log ID is required."
+            delete_job_data(log_id=job.log_id, conn_args=job.conn_args)
         else:
             logger.error(f"Unknown job type: {job.job_type}")
     except Exception as e:
@@ -152,6 +159,7 @@ class JobManager:
                     index_db=job.conn_args["index_db"],
                     batch_size=job.batch_size,
                     threshold=job.threshold,
+                    log_id=job.log_id,
                     running=False,
                     tag=job.tag,
                 )
@@ -165,6 +173,7 @@ class JobManager:
                     index_db=self.running_job.job.conn_args["index_db"],
                     batch_size=self.running_job.job.batch_size,
                     threshold=self.running_job.job.threshold,
+                    log_id=self.running_job.job.log_id,
                     running=True,
                     tag=self.running_job.job.tag,
                 )
