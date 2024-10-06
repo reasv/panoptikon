@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 import time
+from calendar import c
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -195,16 +196,8 @@ def update_folder_lists(
     Any orphaned items without files will be DELETED.
     Bookmarks on orphaned items will be DELETED.
     """
-    new_included_folders = [
-        normalize_path(p)
-        for p in system_config.included_folders
-        if len(p.strip()) > 0
-    ]
-    new_excluded_folders = [
-        normalize_path(p)
-        for p in system_config.excluded_folders
-        if len(p.strip()) > 0
-    ]
+    new_included_folders = clean_folder_list(system_config.included_folders)
+    new_excluded_folders = clean_folder_list(system_config.excluded_folders)
 
     included_deleted = delete_folders_not_in_list(
         conn=conn, folder_paths=new_included_folders, included=True
@@ -263,16 +256,8 @@ def is_resync_needed(
     """
     Check if the database needs to be updated with the new `included_folders` and `excluded_folders` lists.
     """
-    new_included_folders = [
-        normalize_path(p)
-        for p in system_config.included_folders
-        if len(p.strip()) > 0
-    ]
-    new_excluded_folders = [
-        normalize_path(p)
-        for p in system_config.excluded_folders
-        if len(p.strip()) > 0
-    ]
+    new_included_folders = clean_folder_list(system_config.included_folders)
+    new_excluded_folders = clean_folder_list(system_config.excluded_folders)
 
     current_included_folders = get_folders_from_database(conn, included=True)
     current_excluded_folders = get_folders_from_database(conn, included=False)
@@ -294,6 +279,13 @@ def is_resync_needed(
     for i, folder in enumerate(new_excluded_folders):
         if folder != current_excluded_folders[i]:
             return True
+
+
+def clean_folder_list(folder_list: List[str]) -> List[str]:
+    """
+    Clean up the folder list by removing any empty strings and normalizing the paths.
+    """
+    return [normalize_path(p) for p in folder_list if len(p.strip()) > 0]
 
 
 def rescan_all_folders(conn: sqlite3.Connection, system_config: SystemConfig):
