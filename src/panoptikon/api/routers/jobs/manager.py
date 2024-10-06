@@ -33,8 +33,6 @@ class Job(BaseModel):
     metadata: Optional[str] = None
     batch_size: Optional[int] = None
     threshold: Optional[float] = None
-    included_folders: Optional[List[str]] = None
-    excluded_folders: Optional[List[str]] = None
     tag: Optional[str] = None
 
 
@@ -79,13 +77,7 @@ def execute_job(job: Job):
         elif job.job_type == "folder_rescan":
             rescan_folders(conn_args=job.conn_args)
         elif job.job_type == "folder_update":
-            assert (
-                job.included_folders is not None
-                and job.excluded_folders is not None
-            ), "Both included and excluded folders are required."
             run_folder_update(
-                included_folders=job.included_folders,
-                excluded_folders=job.excluded_folders,
                 conn_args=job.conn_args,
             )
         else:

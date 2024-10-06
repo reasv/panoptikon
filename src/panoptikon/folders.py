@@ -186,8 +186,6 @@ class UpdateFoldersResult:
 def update_folder_lists(
     conn: sqlite3.Connection,
     system_config: SystemConfig,
-    included_folders: List[str],
-    excluded_folders: List[str],
 ):
     """
     Update the database with the new `included_folders` and `excluded_folders` lists.
@@ -198,10 +196,14 @@ def update_folder_lists(
     Bookmarks on orphaned items will be DELETED.
     """
     new_included_folders = [
-        normalize_path(p) for p in included_folders if len(p.strip()) > 0
+        normalize_path(p)
+        for p in system_config.included_folders
+        if len(p.strip()) > 0
     ]
     new_excluded_folders = [
-        normalize_path(p) for p in excluded_folders if len(p.strip()) > 0
+        normalize_path(p)
+        for p in system_config.excluded_folders
+        if len(p.strip()) > 0
     ]
 
     included_deleted = delete_folders_not_in_list(
@@ -252,6 +254,46 @@ def update_folder_lists(
         scan_ids=scan_ids,
         rule_files_deleted=rule_files_deleted,
     )
+
+
+def is_resync_needed(
+    conn: sqlite3.Connection,
+    system_config: SystemConfig,
+):
+    """
+    Check if the database needs to be updated with the new `included_folders` and `excluded_folders` lists.
+    """
+    new_included_folders = [
+        normalize_path(p)
+        for p in system_config.included_folders
+        if len(p.strip()) > 0
+    ]
+    new_excluded_folders = [
+        normalize_path(p)
+        for p in system_config.excluded_folders
+        if len(p.strip()) > 0
+    ]
+
+    current_included_folders = get_folders_from_database(conn, included=True)
+    current_excluded_folders = get_folders_from_database(conn, included=False)
+
+    # Sort the lists to make comparison easier
+    new_included_folders.sort()
+    new_excluded_folders.sort()
+    current_included_folders.sort()
+    current_excluded_folders.sort()
+    # Check lengths first
+    if len(new_included_folders) != len(current_included_folders):
+        return True
+    if len(new_excluded_folders) != len(current_excluded_folders):
+        return True
+    # Check each element
+    for i, folder in enumerate(new_included_folders):
+        if folder != current_included_folders[i]:
+            return True
+    for i, folder in enumerate(new_excluded_folders):
+        if folder != current_excluded_folders[i]:
+            return True
 
 
 def rescan_all_folders(conn: sqlite3.Connection, system_config: SystemConfig):

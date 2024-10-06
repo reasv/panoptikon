@@ -1,6 +1,6 @@
 import datetime
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, final
 
 from panoptikon.config import retrieve_system_config
 from panoptikon.data_extractors.extraction_jobs.types import (
@@ -11,21 +11,13 @@ from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import remove_incomplete_jobs
 from panoptikon.db.utils import vacuum_database
-from panoptikon.folders import rescan_all_folders, update_folder_lists
+from panoptikon.folders import is_resync_needed, rescan_all_folders, update_folder_lists
 
 logger = logging.getLogger(__name__)
 
 def run_folder_update(
-    included_folders: List[str],
-    excluded_folders: List[str],
     conn_args: Dict[str, Any]
 ):
-    new_included_folders = (
-        [p.strip() for p in included_folders if len(p.strip()) > 0]
-    )
-    new_excluded_folders = (
-        [p.strip() for p in excluded_folders if len(p.strip()) > 0]
-    )
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
@@ -34,9 +26,7 @@ def run_folder_update(
         cursor.execute("BEGIN")
         update_result = update_folder_lists(
             conn,
-            system_config,
-            new_included_folders,
-            new_excluded_folders,
+            system_config
         )
         logger.info(f"""
         Included folders added (and scanned): {", ".join(update_result.included_added)} ({len(update_result.scan_ids)});
@@ -61,6 +51,7 @@ def run_folder_update(
     except Exception as e:
         # Rollback the transaction on error
         conn.rollback()
+        logger.error(f"Folder update failed with error: {e}")
     conn.close()
 
 
@@ -68,6 +59,20 @@ def rescan_folders(conn_args: Dict[str, Any]):
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
+        resync_needed = is_resync_needed(conn, system_config)
+    finally:
+        conn.close()
+    if resync_needed:
+        logger.info("Resync needed, running folder update")
+        run_folder_update(conn_args)
+
+    conn = get_database_connection(**conn_args)
+    try:
+        system_config = retrieve_system_config(conn_args["index_db"])
+        if is_resync_needed(conn, system_config):
+            logger.info("Resync needed, running folder update")
+            run_folder_update(conn_args)
+
         cursor = conn.cursor()
         cursor.execute("BEGIN")
         ids, files_deleted, items_deleted, rule_files_deleted = (
@@ -107,6 +112,16 @@ def run_data_extraction_job(
     threshold: float | None,
     conn_args: Dict[str, Any],
 ):
+    conn = get_database_connection(**conn_args)
+    try:
+        system_config = retrieve_system_config(conn_args["index_db"])
+        resync_needed = is_resync_needed(conn, system_config)
+    finally:
+        conn.close()
+    if resync_needed:
+        logger.info("Folders in config changed. Resync needed, running folder update")
+        run_folder_update(conn_args)
+
     model = ModelOptsFactory.get_model(inference_id)
     conn = get_database_connection(**conn_args)
     try:

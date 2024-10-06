@@ -190,6 +190,8 @@ class SystemConfig(BaseModel):
     cron_schedule: str = Field(default="0 3 * * *")
     cron_jobs: List[CronJob] = field(default_factory=list)
     job_settings: List[JobSettings] = field(default_factory=list)
+    included_folders: List[str] = field(default_factory=list)
+    excluded_folders: List[str] = field(default_factory=list)
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]

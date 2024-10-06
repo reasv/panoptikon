@@ -18,6 +18,7 @@ from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import get_all_data_logs
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
+from panoptikon.folders import is_resync_needed
 from panoptikon.types import FileScanRecord, LogRecord, SystemConfig
 
 logger = logging.getLogger(__name__)
@@ -196,14 +197,19 @@ class Folders(BaseModel):
 # Endpoint to update folders
 @router.put(
     "/folders",
-    summary="Update the folder lists",
+    summary="Update the database with the current folder lists in the config",
+    description="""
+Must be run every time after the folder lists in the config are updated,
+to ensure that the database is in sync with the config.
+If you update the config through the API, this will be done automatically if needed.
+
+This will remove files and items from the database that are no longer in the included folders,
+and add files and items that are now in the included folders, as well as remove files and items
+from the database that are now in the excluded folders.
+""",
     status_code=status.HTTP_202_ACCEPTED,
 )
 def enqueue_update_folders(
-    folders: Folders = Body(
-        ...,
-        title="The new sets of included and excluded folders. Replaces the current lists with these.",
-    ),
     conn_args: Dict[str, Any] = Depends(get_db_system_wl),
 ) -> JobModel:
     queue_id = job_manager.get_next_job_id()
@@ -211,8 +217,6 @@ def enqueue_update_folders(
         queue_id=queue_id,
         job_type="folder_update",
         conn_args=conn_args,
-        included_folders=folders.included_folders,
-        excluded_folders=folders.excluded_folders,
     )
     job_manager.enqueue_job(job)
     return JobModel(
@@ -267,6 +271,12 @@ def cancel_current_job() -> CancelResponse:
 @router.get(
     "/folders",
     summary="Get the current folder lists",
+    description="""
+Get the current included and excluded folders in the database.
+These are the folders that are being scanned and not being scanned, respectively.
+
+This list may differ from the config, if the database has not been updated.
+""",
 )
 def get_folders(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
@@ -322,10 +332,27 @@ def get_extraction_history(
 )
 def update_config(
     config: SystemConfig = Body(..., title="The new system configuration"),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+    conn_args: Dict[str, Any] = Depends(get_db_system_wl),
 ) -> SystemConfig:
     persist_system_config(conn_args["index_db"], config)
-    return retrieve_system_config(conn_args["index_db"])
+    config = retrieve_system_config(conn_args["index_db"])
+    conn = get_database_connection(**conn_args)
+    try:
+        resync_needed = is_resync_needed(conn, config)
+    finally:
+        conn.close()
+    if resync_needed:
+        logger.info(
+            "Folder lists changed. Resync needed, scheduling folder update..."
+        )
+        job_manager.enqueue_job(
+            Job(
+                queue_id=job_manager.get_next_job_id(),
+                job_type="folder_update",
+                conn_args=conn_args,
+            )
+        )
+    return config
 
 
 @router.get(
