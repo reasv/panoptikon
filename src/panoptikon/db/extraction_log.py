@@ -87,6 +87,7 @@ def update_log(
     finished: bool = False,
 ):
     cursor = conn.cursor()
+    finished_value = 1 if finished else 0
     cursor.execute(
         """
         UPDATE data_log
@@ -98,7 +99,8 @@ def update_log(
         errors = ?,
         total_remaining = ?,
         data_load_time = ?,
-        inference_time = ?
+        inference_time = ?,
+        completed = ?
         WHERE job_id = ?
     """,
         (
@@ -111,6 +113,7 @@ def update_log(
             total_remaining,
             data_load_time,
             inference_time,
+            finished_value,
             job_id,
         ),
     )
@@ -164,13 +167,11 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
             data_load_time,
             inference_time,
             CASE 
+                WHEN completed = 1 THEN 0
                 WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
             END AS failed,
-            CASE
-                WHEN data_jobs.completed = 1 THEN 1
-                ELSE 0
-            END AS completed
+            completed
         FROM data_log
         LEFT JOIN item_data 
             ON item_data.job_id = data_log.job_id
@@ -184,6 +185,37 @@ def get_all_data_logs(conn: sqlite3.Connection) -> List[LogRecord]:
     )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
+
+
+def delete_data_job_by_log_id(
+    conn: sqlite3.Connection, data_log_id: int
+) -> None:
+    cursor = conn.cursor()
+
+    # Fetch the corresponding job_id from data_log
+    cursor.execute(
+        """
+        SELECT job_id
+        FROM data_log
+        WHERE id = ?
+        """,
+        (data_log_id,),
+    )
+
+    job_id_row = cursor.fetchone()
+
+    # Check if a job_id was found
+    if job_id_row and job_id_row[0] is not None:
+        job_id = job_id_row[0]
+
+        # Delete the corresponding row from data_jobs
+        cursor.execute(
+            """
+            DELETE FROM data_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        )
 
 
 def add_item_data(
