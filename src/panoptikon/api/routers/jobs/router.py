@@ -348,7 +348,11 @@ def update_config(
 ) -> SystemConfig:
     persist_system_config(conn_args["index_db"], config)
     config = retrieve_system_config(conn_args["index_db"])
-    conn = get_database_connection(**conn_args)
+    conn = get_database_connection(
+        write_lock=False,
+        index_db=conn_args["index_db"],
+        user_data_db=conn_args["user_data_db"],
+    )
     try:
         resync_needed = is_resync_needed(conn, config)
     finally:
