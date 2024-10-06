@@ -2,7 +2,6 @@ import logging
 import os
 import sqlite3
 import time
-from calendar import c
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -38,6 +37,22 @@ from panoptikon.utils import normalize_path
 logger = logging.getLogger(__name__)
 
 
+def check_folder_validity(folder: str) -> bool:
+    """
+    Check if the given folder is valid.
+    """
+    if not os.path.exists(folder):
+        logger.error(f"Path {folder} does not exist. Skipping...")
+        return False
+    if not os.path.isdir(folder):
+        logger.error(f"Path {folder} is not a directory. Skipping...")
+        return False
+    if not os.listdir(folder):
+        logger.error(f"Folder {folder} is empty. Skipping...")
+        return False
+    return True
+
+
 def execute_folder_scan(
     conn: sqlite3.Connection,
     system_config: SystemConfig,
@@ -57,18 +72,10 @@ def execute_folder_scan(
     included_folders = [
         folder for folder in included_folders if folder in all_included_folders
     ]
-    for folder in included_folders:
-        if not os.path.exists(folder):
-            raise FileNotFoundError(
-                f"Folder {folder} does not exist. Aborting scan."
-            )
-        if not os.path.isdir(folder):
-            raise NotADirectoryError(
-                f"Path {folder} is not a directory. Aborting scan."
-            )
-        if not os.listdir(folder):
-            raise FileNotFoundError(f"Folder {folder} is empty. Aborting scan.")
-
+    # Ensure that all included_folders are valid
+    included_folders = [
+        folder for folder in included_folders if check_folder_validity(folder)
+    ]
     excluded_folders = get_folders_from_database(conn, included=False)
     starting_points = deduplicate_paths(included_folders)
     scan_time = datetime.now().isoformat()
