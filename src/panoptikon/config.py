@@ -4,6 +4,7 @@ import os
 import tomli
 import tomli_w
 
+from panoptikon.folders import clean_folder_list
 from panoptikon.types import SystemConfig
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,10 @@ def get_config_path(name: str) -> str:
 
 
 def persist_system_config(name: str, config: SystemConfig):
+    if len(config.included_folders):
+        config.included_folders = clean_folder_list(config.included_folders)
+    if len(config.excluded_folders):
+        config.excluded_folders = clean_folder_list(config.excluded_folders)
     config_file = get_config_path(name)
     config_dict = config.model_dump(exclude_none=True)
     serialized = tomli_w.dumps(config_dict)
