@@ -155,7 +155,7 @@ def get_all_data_logs(
     offset = (page - 1) * page_size if page_size is not None else 0
     cursor = conn.cursor()
     cursor.execute(
-        """
+        f"""
         SELECT
             data_log.id,
             start_time,
@@ -188,9 +188,9 @@ def get_all_data_logs(
             ON data_log.job_id = data_jobs.id
         GROUP BY data_log.id
         ORDER BY start_time DESC
-        LIMIT ? OFFSET ?
+        {"LIMIT ? OFFSET ?" if page_size is not None else ""}
         """,
-        (page_size, offset),
+        (page_size, offset) if page_size is not None else (),
     )
     log_records = cursor.fetchall()
     return [LogRecord(*log_record) for log_record in log_records]
