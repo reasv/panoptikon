@@ -1,4 +1,4 @@
-"""Add completed column to data_log, copy values from data_jobs, and drop completed column from data_jobs
+"""Add completed column to data_log and copy values from data_jobs
 
 Revision ID: 9a6b3e4c2fbc
 Revises: 4b5f60e1b8d7
@@ -11,6 +11,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+# revision identifiers, used by Alembic.
 revision: str = "9a6b3e4c2fbc"
 down_revision: Union[str, None] = "4b5f60e1b8d7"
 branch_labels: Union[str, Sequence[str], None] = None
@@ -24,42 +25,21 @@ def upgrade() -> None:
         sa.Column("completed", sa.Boolean, nullable=False, server_default="0"),
     )
 
-    # Step 2: Copy the completed value from data_jobs to data_log
+    # Step 2: Copy the completed value from data_jobs to data_log where it exists, otherwise set it to 0
     op.execute(
         """
         UPDATE data_log
-        SET completed = (
-            SELECT completed
-            FROM data_jobs
-            WHERE data_jobs.id = data_log.job_id
+        SET completed = COALESCE(
+            (
+                SELECT completed
+                FROM data_jobs
+                WHERE data_jobs.id = data_log.job_id
+            ), 0
         )
         """
     )
-    # Step 3: Drop the completed column from data_jobs
-    op.drop_column("data_jobs", "completed")
 
 
 def downgrade() -> None:
-    # Step 1: Re-add the completed column to data_jobs
-    op.add_column(
-        "data_jobs",
-        sa.Column("completed", sa.Boolean, nullable=False, server_default="0"),
-    )
-
-    # Step 2: Copy the completed value back from data_log to data_jobs
-    op.execute(
-        """
-        UPDATE data_jobs
-        SET completed = (
-            SELECT completed
-            FROM data_log
-            WHERE data_log.job_id = data_jobs.id
-        )
-        """
-    )
-
-    # Step 3: Remove the default value for future inserts in data_jobs
-    op.alter_column("data_jobs", "completed", server_default=None)
-
-    # Step 4: Drop the completed column from data_log
+    # Reverse the migration: Drop the completed column
     op.drop_column("data_log", "completed")
