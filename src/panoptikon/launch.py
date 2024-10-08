@@ -29,5 +29,4 @@ def launch_app():
         app,
         host=hostname,
         port=port,
-        log_level=os.getenv("GRADIO_LOGLEVEL", "error"),
     )
