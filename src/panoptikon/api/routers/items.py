@@ -182,20 +182,27 @@ Content type is determined by the file extension.
 def get_file_by_sha256(
     sha256: str,
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> FileResponse:
+) -> StreamingResponse:
     conn = get_database_connection(**conn_args)
     try:
         file_record = get_existing_file_for_sha256(conn, sha256)
 
         if file_record is None:
             raise HTTPException(status_code=404, detail="File not found")
+
         path = file_record.path
         mime = get_mime_type(path)
-        return FileResponse(
-            path,
+
+        # Open the file in binary mode for streaming
+        file_handle = open(path, "rb")
+
+        # Return a StreamingResponse to avoid relying on filesystem-reported size
+        return StreamingResponse(
+            file_handle,
             media_type=mime,
-            filename=os.path.basename(path),
-            content_disposition_type="inline",
+            headers={
+                "Content-Disposition": f'inline; filename="{os.path.basename(path)}"'
+            },
         )
     finally:
         conn.close()
