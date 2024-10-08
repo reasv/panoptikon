@@ -22,7 +22,6 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 
 ### Warning
 Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any security features, and currently exposes, among other things, an API to access *all* your files, even outside of explicitly indexed directories. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
-In the future, Panoptikon will feature a more secure API, authentication, and a React-based client that can be publicly exposed.
 
 ## REST API
 Panoptikon exposes a REST API that can be used to interact with the search and bookmarking functionality programmatically, as well as to retrieve the indexed data, the actual files, and their associated metadata.
@@ -67,25 +66,13 @@ Will start panoptikon along with its inference server, listening by default at h
 Everything except for adding and customizing the AI models used can be done through the Next.js UI available at `/scan` and `/search` on the server.
 
 ## First steps
-Open http://127.0.0.1:6342/scan, start by adding the directories you want to index, one path per line, in the `Include Folder Paths` field. If you want to exclude some subdirectories, these go in the `Exclude Folder Paths` field.
-After setting the directories, Click on `Save and Scan New Paths`.
-This will run a job to hash and index all files of eligible file types.
-Whenever there are file changes you should run `Rescan All Directories` or set up the regular cronjob as explained in the UI in order to have this done automatically.
-
-After the basic indexing is done, you can run any of the models, which are all available on the same page, in order to generate searchable data from your files. This will initiate a data extraction job.
-After the job is finished, you search your files from the `search` tab.
-
-## Search
-The `Search` tab features Panoptikon's search functionality. Search criteria are divided in tabs, and note that by default most tabs will be hidden, because you haven't yet produced the relevant data using the various models. For example, Semantic Search will only be visible if you've either generated CLIP or Text embeddings.
-
+Open the home page of the web ui and follow the instructions to get started. You'll have to add directories to the list of allowed paths, and then run the file scan job to index the files in those directories. Before being able to search, you'll also have to run data extraction jobs to extract text, tags, and other metadata from the files.
 ## Bookmarks
-You can bookmark any search result. Simply type in a group name for the bookmarks group it should be saved under (or leave it as the default "default" and click on "Bookmark").
-The same item can belong to any number of bookmark groups, and bookmark groups can have arbitrary names.
+You can bookmark any search result by clicking on the bookmark button on each thumbnail.
+Bookmarks are stored in a separate database, and can be accessed through the API, as well as search.
+To search in your bookmarks, open Advanced Search and enable the bookmarks filter, which will show you only the items you've bookmarked.
 
-You can check out your bookmarks from the `Bookmarks` tab.
-You can also search inside your bookmarks using the regular search UI, by checking `Restrict Search to bookmarked Items` on the search page.
-
-Without any other search criteria, this is effectively just another way to browse your bookmarks, but it's a lot more flexible since you can use any of the regular search criteria along with being able to optionally select which specific groups to include.
+Bookmarks can belong to one or more "Groups" which are essentially tags that you can use to organize your bookmarks. You can create new groups by typing an arbitrary name in the Group field in Advanced Search and selecting it as the current group, then bookmarking an item.
 
 ## Adding more models
 See `config/inference/example.toml` for examples on how to add custom models from Hugging Face to Panoptikon.
