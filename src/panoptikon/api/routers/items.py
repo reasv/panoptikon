@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import PIL
 import PIL.Image
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import (
@@ -225,7 +225,7 @@ def get_thumbnail_by_sha256(
     sha256: str,
     big: bool = Query(True),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> Response:
+) -> StreamingResponse:
     conn = get_database_connection(**conn_args)
     resp_type = "default"
     try:
@@ -239,11 +239,13 @@ def get_thumbnail_by_sha256(
         if mime is None or mime.startswith("image/gif"):
             resp_type = "file/gif"
             logger.debug(f"{resp_type} for {sha256}: ")
-            return FileResponse(
-                file.path,
+            file_handle = open(file.path, "rb")
+            return StreamingResponse(
+                file_handle,
                 media_type=mime,
-                filename=original_filename,
-                content_disposition_type="inline",
+                headers={
+                    "Content-Disposition": f'inline; filename="{original_filename}"',
+                },
             )
 
         index = 0
@@ -254,35 +256,38 @@ def get_thumbnail_by_sha256(
         if buffer:
             resp_type = "thumbnail/buffer"
             logger.debug(f"{resp_type} for {sha256}: ")
-            return Response(
-                content=buffer,
+            return StreamingResponse(
+                io.BytesIO(buffer),
                 media_type="image/jpeg",
                 headers={
-                    "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"'
+                    "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"',
                 },
             )
 
         if mime.startswith("image"):
             resp_type = "file/image"
             logger.debug(f"{resp_type} for {sha256}: ")
-            return FileResponse(
-                file.path,
+            file_handle = open(file.path, "rb")
+            return StreamingResponse(
+                file_handle,
                 media_type=mime,
-                filename=original_filename,
-                content_disposition_type="inline",
+                headers={
+                    "Content-Disposition": f'inline; filename="{original_filename}"',
+                },
             )
-        gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
-        # Convert the PIL image to bytes
+
+        # Handle placeholder image
+        gradient = create_placeholder_image_with_gradient()
         img_byte_array = io.BytesIO()
         gradient.save(img_byte_array, format="PNG")
-        img_byte_array = img_byte_array.getvalue()
+        img_byte_array.seek(0)
         resp_type = "file/generated"
         logger.debug(f"{resp_type} for {sha256}: ")
-        return Response(
-            content=img_byte_array,
+        return StreamingResponse(
+            img_byte_array,
             media_type="image/png",
             headers={
-                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
+                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"',
             },
         )
     except Exception as e:
