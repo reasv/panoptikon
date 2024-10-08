@@ -14,7 +14,7 @@ def setup_logging():
     loglevel = os.getenv("LOGLEVEL", "INFO").upper()
     # Get logs folder from environment variable
     data_dir = os.getenv("DATA_FOLDER", "data")
-    default_logs_file = os.path.join(data_dir, "logs", f"panoptikon.log")
+    default_logs_file = os.path.join(data_dir, "panoptikon.log")
     logs_file = os.getenv("LOGS_FILE", default_logs_file)
     # Ensure the directory for the log file exists
     logs_folder = os.path.dirname(logs_file)

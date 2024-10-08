@@ -10,11 +10,12 @@ from panoptikon.types import SystemConfig
 logger = logging.getLogger(__name__)
 
 
-def get_config_path(name: str) -> str:
+def get_config_path(index: str) -> str:
     data_dir = os.getenv("DATA_FOLDER", "data")
-    config_dir = os.path.join(data_dir, "configs")
-    os.makedirs(config_dir, exist_ok=True)
-    return os.path.join(config_dir, f"{name}.toml")
+    index_db_dir = os.path.join(data_dir, "index")
+    index_dir = os.path.join(index_db_dir, index)
+    os.makedirs(index_dir, exist_ok=True)
+    return os.path.join(index_dir, "config.toml")
 
 
 def persist_system_config(name: str, config: SystemConfig):

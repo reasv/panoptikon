@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def launch_app():
-    readonly = not os.environ.get("READONLY", "false").lower() == "true"
-    if not readonly:
+    readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
+    if not readonly_mode:
+        logger.info("Running in read-write mode")
         run_migrations()
         build_metadata()
     else:

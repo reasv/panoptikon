@@ -1,7 +1,6 @@
 import logging
 import os
 import sqlite3
-from typing import Literal
 
 import sqlite_vec
 from alembic import command
@@ -65,55 +64,50 @@ def get_db_paths(index_db: str | None = None, user_data_db: str | None = None):
     data_dir = os.getenv("DATA_FOLDER", "data")
     index_db_dir = os.path.join(data_dir, "index")
     user_data_db_dir = os.path.join(data_dir, "user_data")
-    storage_db_dir = os.path.join(data_dir, "storage")
     # Ensure the directory exists
     os.makedirs(index_db_dir, exist_ok=True)
     os.makedirs(user_data_db_dir, exist_ok=True)
-    os.makedirs(storage_db_dir, exist_ok=True)
 
-    index, user_data, storage = get_db_default_names()
+    index, user_data = get_db_default_names()
 
     # Override the database names if provided
     if index_db:
         index = index_db
-        storage = index_db
     if user_data_db:
         user_data = user_data_db
 
-    db_file = os.path.join(index_db_dir, f"{index}.db")
+    index_dir = os.path.join(index_db_dir, index)
+    os.makedirs(index_dir, exist_ok=True)
+    index_db_file = os.path.join(index_dir, "index.db")
+    storage_db_file = os.path.join(index_dir, "storage.db")
     user_db_file = os.path.join(user_data_db_dir, f"{user_data}.db")
-    storage_db_file = os.path.join(storage_db_dir, f"{storage}.db")
-    return db_file, user_db_file, storage_db_file
+    return index_db_file, user_db_file, storage_db_file
 
 
 def get_db_default_names():
     index = os.getenv("INDEX_DB", "default")
     user_data = os.getenv("USER_DATA_DB", "default")
-    storage = os.getenv("STORAGE_DB", index)  # Default to same name as index
-    return index, user_data, storage
+    return index, user_data
 
 
-def set_db_names(
-    index_db: str, user_data_db: str, storage_db: str | None = None
-):
+def set_db_names(index_db: str, user_data_db: str):
     os.environ["INDEX_DB"] = index_db
     os.environ["USER_DATA_DB"] = user_data_db
-    if storage_db:
-        os.environ["STORAGE_DB"] = storage_db
-    else:
-        os.environ["STORAGE_DB"] = index_db
 
 
 def get_db_lists():
-    db_file, user_db_file, _ = get_db_paths()
+    user_db_file = get_db_paths()[1]
     # Get the folders containing the databases
-    index_db_dir = os.path.dirname(db_file)
+    data_dir = os.getenv("DATA_FOLDER", "data")
+    index_db_dir = os.path.join(data_dir, "index")
     user_data_db_dir = os.path.dirname(user_db_file)
     # Get the list of databases in the folders
     index_dbs = [
-        os.path.splitext(f)[0]
+        f
         for f in os.listdir(index_db_dir)
-        if f.endswith(".db")
+        if os.path.exists(
+            os.path.join(index_db_dir, f, "index.db"),
+        )
     ]
     user_data_dbs = [
         os.path.splitext(f)[0]

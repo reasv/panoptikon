@@ -75,7 +75,7 @@ The current databases are simply the ones that are used by default.
     tags=["database"],
 )
 def get_db_info():
-    index_db, user_data_db, _ = get_db_default_names()
+    index_db, user_data_db = get_db_default_names()
     index_dbs, user_data_dbs = get_db_lists()
     return DBInfo(
         index=SingleDBInfo(current=index_db, all=index_dbs),
@@ -102,9 +102,7 @@ def create_db(
     new_index_db: str = Query(None),
     new_user_data_db: str = Query(None),
 ) -> DBCreateResponse:
-    default_index_db, default_user_data_db, default_storage_db = (
-        get_db_default_names()
-    )
+    default_index_db, default_user_data_db = get_db_default_names()
     if new_index_db:
         index_db = new_index_db
     else:  # Use the default index database
@@ -118,7 +116,7 @@ def create_db(
     # Run migrations to create the new databases
     run_migrations()
     # Set the default databases back to the original values
-    set_db_names(default_index_db, default_user_data_db, default_storage_db)
+    set_db_names(default_index_db, default_user_data_db)
 
     return DBCreateResponse(
         index_db=index_db,

@@ -132,28 +132,16 @@ Default
 ```
 LOGLEVEL="INFO"
 ```
-The loglevel for the logger. You can find the log files under `[DATA_FOLDER]/logs`
+The loglevel for the logger. You can find the log file under `[DATA_FOLDER]/panoptikon.log`
 
-### INDEX_DB, USER_DATA_DB, STORAGE_DB
+### INDEX_DB, USER_DATA_DB
 
 Default:
 ```
 INDEX_DB="default"
-STORAGE_DB=[Automatically set to the same value as INDEX_DB]
 USER_DATA_DB="default"
 ```
-These are the names of the SQLite databases used by Panoptikon. You can set them to different values to have multiple independent Panoptikon instances running on the same machine, or to have different dataesets or configurations.
-The actual databases are stored under `[DATA_FOLDER]`.
-
-INDEX_DB is used to store the index data, such as file hashes and paths, and the extracted data from the models, as well as the related configuration such as which paths to index, excluded paths, cronjob settings, rule settings, etc.
-STORAGE_DB is used to store thumbnails. If you set INDEX_DB to a different value, STORAGE_DB will be set to the same value by default, so there is no need to manually specify a different name for STORAGE_DB.
-
-The USER_DATA_DB is used to store user-specific data such as bookmarks. You can use the same USER_DATA_DB for multiple INDEX_DBs if you want to share bookmarks between them. In fact, this is what you're intended to do. There's no need to have separate sets of bookmarks for different datasets. Keep a single USER_DATA_DB and set INDEX_DB to different values to separate your indexed files.
-However, only bookmarks related to files that are indexed in the current INDEX_DB will be shown in the UI. If a file is bookmarked and not present in the current INDEX_DB, it will not be shown in the bookmarks tab, nor will it be findable by search but it's still present in the USER_DATA_DB, so if you switch back to the INDEX_DB where the file is indexed, you will see the bookmark again.
-Bookmarks are by hash, not by path, so if the same file is indexed in multiple INDEX_DBs, it will have the same bookmark in all of them.
-
-You should not run multiple Panoptikon instances with the same INDEX_DB at the same time, as they will try to write to the same database file and will simply fail.
-The USER_DATA_DB can be shared between two running Panoptikon instances, but if you were setting a bookmark on both at the same time, as unlikely as that is, one of the two actions would error out.
+The names of the default databases to use for indexing (files and extracted data) and user data (bookmarks). These are the databases that are used by default when no database is specified in the API request. Regardless of what databases are specified in the environment variables, the API endpoints support specifying the database to use through the `index_db` and `user_data_db` query parameters, and the UI allows the creation of new index databases and the selection of which index database to use for search and other operations. 
 
 ### TEMP_DIR
 ```

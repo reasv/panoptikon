@@ -32,7 +32,7 @@ def get_db_readonly(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_default_names()
+    index, user_data = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:
@@ -55,7 +55,7 @@ def get_db_user_data_wl(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_default_names()
+    index, user_data = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:
@@ -85,7 +85,7 @@ def get_db_system_wl(
     ),
 ) -> Dict[str, str | bool | None]:
     check_dbs(index_db, user_data_db)
-    index, user_data, _ = get_db_default_names()
+    index, user_data = get_db_default_names()
     if not index_db:
         index_db = index
     if not user_data_db:

@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from torch import log_
 
 from panoptikon.api.routers.jobs.manager import (
     Job,
