@@ -14,7 +14,10 @@ from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
 from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
-from panoptikon.db.extraction_log import get_all_data_logs
+from panoptikon.db.extraction_log import (
+    get_all_data_logs,
+    get_setters_total_data,
+)
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.folders import is_resync_needed
@@ -410,3 +413,21 @@ def get_config(
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> SystemConfig:
     return retrieve_system_config(conn_args["index_db"])
+
+
+class SetterDataStats(BaseModel):
+    total_counts: List[Tuple[str, int]]
+
+
+@router.get(
+    "/data/setters/total",
+    summary="Get the total count of index data entry for each setter",
+)
+def get_setter_data_count(
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> SetterDataStats:
+    conn = get_database_connection(**conn_args)
+    try:
+        return SetterDataStats(total_counts=get_setters_total_data(conn))
+    finally:
+        conn.close()

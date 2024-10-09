@@ -377,6 +377,33 @@ def get_existing_setters(
     return results
 
 
+def get_setters_total_data(
+    conn: sqlite3.Connection,
+) -> List[Tuple[str, int]]:
+    """
+    Returns tuples containing (setter, total_data_count) pairs.
+
+    Args:
+        conn (sqlite3.Connection): The SQLite database connection.
+
+    Returns:
+        List[Tuple[str, str]]: A list tuples containing (setter, total_data_count) pairs.
+    """
+    query = """
+    SELECT s.name, COUNT(ie.id)
+    FROM item_data ie
+    JOIN setters s ON ie.setter_id = s.id
+    GROUP BY s.id, s.name;
+    """
+
+    cursor = conn.cursor()
+    cursor.execute(query)
+    results = cursor.fetchall()
+    cursor.close()
+
+    return results
+
+
 def get_unprocessed_item_data_for_item(
     conn: sqlite3.Connection,
     item: str,
