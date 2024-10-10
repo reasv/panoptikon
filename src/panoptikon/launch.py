@@ -29,4 +29,5 @@ def launch_app():
         app,
         host=hostname,
         port=port,
+        log_level="error",
     )

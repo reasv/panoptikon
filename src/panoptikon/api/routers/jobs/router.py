@@ -62,18 +62,21 @@ def enqueue_data_extraction_job(
         def_batch_size, def_threshold = get_default_config(
             inference_id, conn_args["index_db"]
         )
-        if batch_size is None or batch_size < 1:
-            batch_size = def_batch_size
-        if threshold is None:
-            threshold = def_threshold
+        chosen_batch_size = batch_size
+        chosen_threshold = threshold
+
+        if chosen_batch_size is None or chosen_batch_size < 1:
+            chosen_batch_size = def_batch_size
+        if chosen_threshold is None:
+            chosen_threshold = def_threshold
         queue_id = job_manager.get_next_job_id()
         job = Job(
             queue_id=queue_id,
             job_type="data_extraction",
             conn_args=conn_args,
             metadata=inference_id,
-            batch_size=batch_size,
-            threshold=threshold,
+            batch_size=chosen_batch_size,
+            threshold=chosen_threshold,
         )
         job_manager.enqueue_job(job)
         jobs.append(
