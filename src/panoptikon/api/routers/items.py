@@ -182,7 +182,7 @@ Content type is determined by the file extension.
 def get_file_by_id(
     file_id: int,
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> StreamingResponse:
+) -> Response:
     conn = get_database_connection(**conn_args)
     try:
         sha256 = get_sha256_for_file_id(conn, file_id)
@@ -212,7 +212,7 @@ def get_thumbnail_by_file_id(
     file_id: int,
     big: bool = Query(True),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> StreamingResponse:
+) -> Response:
     conn = get_database_connection(**conn_args)
     try:
         sha256 = get_sha256_for_file_id(conn, file_id)
@@ -241,27 +241,20 @@ Content type is determined by the file extension.
 def get_file_by_sha256(
     sha256: str,
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> StreamingResponse:
+) -> FileResponse:
     conn = get_database_connection(**conn_args)
     try:
         file_record = get_existing_file_for_sha256(conn, sha256)
 
         if file_record is None:
             raise HTTPException(status_code=404, detail="File not found")
-
         path = file_record.path
         mime = get_mime_type(path)
-
-        # Open the file in binary mode for streaming
-        file_handle = open(path, "rb")
-
-        # Return a StreamingResponse to avoid relying on filesystem-reported size
-        return StreamingResponse(
-            file_handle,
+        return FileResponse(
+            path,
             media_type=mime,
-            headers={
-                "Content-Disposition": f'inline; filename="{os.path.basename(path)}"'
-            },
+            filename=os.path.basename(path),
+            content_disposition_type="inline",
         )
     finally:
         conn.close()
@@ -291,7 +284,7 @@ def get_thumbnail_by_sha256(
     sha256: str,
     big: bool = Query(True),
     conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> StreamingResponse:
+) -> Response:
     conn = get_database_connection(**conn_args)
     resp_type = "default"
     try:
@@ -305,13 +298,11 @@ def get_thumbnail_by_sha256(
         if mime is None or mime.startswith("image/gif"):
             resp_type = "file/gif"
             logger.debug(f"{resp_type} for {sha256}: ")
-            file_handle = open(file.path, "rb")
-            return StreamingResponse(
-                file_handle,
+            return FileResponse(
+                file.path,
                 media_type=mime,
-                headers={
-                    "Content-Disposition": f'inline; filename="{original_filename}"',
-                },
+                filename=original_filename,
+                content_disposition_type="inline",
             )
 
         index = 0
@@ -322,38 +313,35 @@ def get_thumbnail_by_sha256(
         if buffer:
             resp_type = "thumbnail/buffer"
             logger.debug(f"{resp_type} for {sha256}: ")
-            return StreamingResponse(
-                io.BytesIO(buffer),
+            return Response(
+                content=buffer,
                 media_type="image/jpeg",
                 headers={
-                    "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"',
+                    "Content-Disposition": f'inline; filename="{original_filename_no_ext}.jpg"'
                 },
             )
 
         if mime.startswith("image"):
             resp_type = "file/image"
             logger.debug(f"{resp_type} for {sha256}: ")
-            file_handle = open(file.path, "rb")
-            return StreamingResponse(
-                file_handle,
+            return FileResponse(
+                file.path,
                 media_type=mime,
-                headers={
-                    "Content-Disposition": f'inline; filename="{original_filename}"',
-                },
+                filename=original_filename,
+                content_disposition_type="inline",
             )
-
-        # Handle placeholder image
-        gradient = create_placeholder_image_with_gradient()
+        gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
+        # Convert the PIL image to bytes
         img_byte_array = io.BytesIO()
         gradient.save(img_byte_array, format="PNG")
-        img_byte_array.seek(0)
+        img_byte_array = img_byte_array.getvalue()
         resp_type = "file/generated"
         logger.debug(f"{resp_type} for {sha256}: ")
-        return StreamingResponse(
-            img_byte_array,
+        return Response(
+            content=img_byte_array,
             media_type="image/png",
             headers={
-                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"',
+                "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
             },
         )
     except Exception as e:
