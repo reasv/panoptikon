@@ -165,6 +165,65 @@ def get_item_by_path(
 
 
 @router.get(
+    "/from-file-id/{file_id}/file",
+    summary="Get file by id",
+    description="""
+Returns the actual file contents for a given file_id.
+Content type is determined by the file extension.
+    """,
+    responses={
+        200: {
+            "description": "Arbitrary binary data",
+            "content": {"*/*": {}},  # Accepts any MIME type
+        },
+        404: {"description": "Item not found"},
+    },
+)
+def get_file_by_id(
+    file_id: int,
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> StreamingResponse:
+    conn = get_database_connection(**conn_args)
+    try:
+        sha256 = get_sha256_for_file_id(conn, file_id)
+        if sha256 is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return get_file_by_sha256(sha256, conn_args)
+    finally:
+        conn.close()
+
+
+@router.get(
+    "/from-file-id/{file_id}/thumbnail",
+    summary="Get file by id",
+    description="""
+Returns the thumbnail for a given file_id.
+Content type is determined by the file extension.
+    """,
+    responses={
+        200: {
+            "description": "Arbitrary binary data",
+            "content": {"*/*": {}},  # Accepts any MIME type
+        },
+        404: {"description": "Item not found"},
+    },
+)
+def get_thumbnail_by_file_id(
+    file_id: int,
+    big: bool = Query(True),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> StreamingResponse:
+    conn = get_database_connection(**conn_args)
+    try:
+        sha256 = get_sha256_for_file_id(conn, file_id)
+        if sha256 is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return get_thumbnail_by_sha256(sha256, big, conn_args)
+    finally:
+        conn.close()
+
+
+@router.get(
     "/file/{sha256}",
     summary="Get file by sha256",
     description="""
