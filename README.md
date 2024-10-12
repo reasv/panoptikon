@@ -148,3 +148,20 @@ Panoptikon has sane defaults for each platform (Windows, Linux, MacOS) but you c
 The strings `{path}`, `{folder}`, `{filename}` within your command will be replaced with the full path to the file, the folder containing the file, the filename with extension respectively.
 
 You can also set these commands to no-ops by setting them to something like `echo {path}` or `echo {filename}` in order to disable the functionality. ***This is absolutely necessary if you intend to expose Panoptikon to the internet, as the default commands are shell commands that can be used to execute arbitrary code on your machine. By default this is basically remote code execution as a service.***
+
+### ENABLE_CLIENT
+Default:
+```
+ENABLE_CLIENT="true"
+```
+Whether to run the Next.js UI. If you're running Panoptikon in a headless environment, you can set this to `false` to disable the UI and only run the API server, then host the UI separately.
+
+You can still access the API documentation at `/docs` and `/redoc` even if the UI is disabled.
+
+### CLIENT_HOST, CLIENT_PORT
+Default:
+```
+CLIENT_HOST=HOST
+CLIENT_PORT=6339
+```
+Where to bind the Next.js UI. Defaults to the same host as the API server and port 6339.

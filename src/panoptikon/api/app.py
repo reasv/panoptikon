@@ -216,7 +216,6 @@ app.include_router(jobs.router)
 
 
 def get_app(hostname: str, port: int) -> FastAPI:
-    # Add the reverse HTTP and WebSocket routers
     if os.getenv("ENABLE_CLIENT", "true").lower() == "true":
         client_redirect_router, client_url = get_routers(hostname, port)
         app.include_router(client_redirect_router)
