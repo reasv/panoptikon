@@ -163,7 +163,7 @@ def get_item_metadata(
     select = """
     SELECT
         items.id AS item_id,
-        sha256,
+        items.sha256 AS sha256,
         md5,
         type,
         size,
@@ -182,9 +182,14 @@ def get_item_metadata(
         JOIN files ON items.id = files.item_id
     """
     if identifier_type in ["item_id", "file_id", "path", "sha256", "md5"]:
+        if identifier_type == "sha256":
+            column = "items.sha256"
+        else:
+            column = identifier_type
+
         query = f"""
         {select}
-        WHERE {identifier_type} = ?
+        WHERE {column} = ?
         ORDER BY files.available DESC
         """
     elif identifier_type == "data_id":

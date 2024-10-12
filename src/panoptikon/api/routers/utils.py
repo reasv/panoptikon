@@ -99,48 +99,53 @@ def get_db_system_wl(
 
 
 def create_placeholder_image_with_gradient(size=(512, 512), text="No Preview"):
+    """
+    Creates a placeholder image with a smooth gradient background, a blocked symbol, and custom text.
+
+    Args:
+        size (tuple): Size of the image in pixels (width, height).
+        text (str): Text to display below the symbol.
+
+    Returns:
+        PIL.Image: The generated placeholder image.
+    """
     # Create a gradient background
     gradient = Image.new("RGB", size)
     draw = ImageDraw.Draw(gradient)
 
     for y in range(size[1]):
-        r = int(255 * (y / size[1]))
-        g = int(255 * (random.random()))
-        b = int(255 * ((size[1] - y) / size[1]))
+        # Smoothly vary all color channels based on y
+        r = int(255 * (y / size[1]))  # Red increases from top to bottom
+        g = int(255 * (y / size[1]))  # Green increases from top to bottom
+        b = int(
+            255 * ((size[1] - y) / size[1])
+        )  # Blue decreases from top to bottom
         for x in range(size[0]):
             draw.point((x, y), fill=(r, g, b))
 
     # Draw the blocked symbol (a circle with a diagonal line through it)
     symbol_radius = min(size) // 6
     symbol_center = (size[0] // 2, size[1] // 3)
-    draw.ellipse(
-        [
-            (
-                symbol_center[0] - symbol_radius,
-                symbol_center[1] - symbol_radius,
-            ),
-            (
-                symbol_center[0] + symbol_radius,
-                symbol_center[1] + symbol_radius,
-            ),
-        ],
-        outline="black",
-        width=5,
+    ellipse_bbox = [
+        (
+            symbol_center[0] - symbol_radius,
+            symbol_center[1] - symbol_radius,
+        ),
+        (
+            symbol_center[0] + symbol_radius,
+            symbol_center[1] + symbol_radius,
+        ),
+    ]
+    draw.ellipse(ellipse_bbox, outline="black", width=5)
+    line_start = (
+        symbol_center[0] - symbol_radius,
+        symbol_center[1] + symbol_radius,
     )
-    draw.line(
-        [
-            (
-                symbol_center[0] - symbol_radius,
-                symbol_center[1] + symbol_radius,
-            ),
-            (
-                symbol_center[0] + symbol_radius,
-                symbol_center[1] - symbol_radius,
-            ),
-        ],
-        fill="black",
-        width=5,
+    line_end = (
+        symbol_center[0] + symbol_radius,
+        symbol_center[1] - symbol_radius,
     )
+    draw.line([line_start, line_end], fill="black", width=5)
 
     # Load a default font
     try:
@@ -148,15 +153,15 @@ def create_placeholder_image_with_gradient(size=(512, 512), text="No Preview"):
     except IOError:
         font = ImageFont.load_default()
 
-    # Calculate text size using textbbox
+    # Calculate text size using textbbox for better positioning
     text_bbox = draw.textbbox((0, 0), text, font=font)
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
 
     # Draw the "No Preview" text below the symbol
     text_position = (
-        size[0] // 2 - text_width // 2,
-        size[1] // 2 + symbol_radius // 2,
+        (size[0] - text_width) // 2,
+        symbol_center[1] + symbol_radius + 20,  # 20 pixels below the symbol
     )
     draw.text(text_position, text, fill="black", font=font)
 

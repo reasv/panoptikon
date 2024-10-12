@@ -1,7 +1,7 @@
 import io
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import PIL
 import PIL.Image
@@ -14,17 +14,14 @@ from panoptikon.api.routers.utils import (
     get_db_readonly,
     strip_non_latin1_chars,
 )
-from panoptikon.db import get_database_connection
+from panoptikon.db import (
+    ItemIdentifierType,
+    get_database_connection,
+    get_item_metadata,
+)
 from panoptikon.db.extracted_text import (
     get_extracted_text_for_item,
     get_text_by_ids,
-)
-from panoptikon.db.files import (
-    get_existing_file_for_sha256,
-    get_file_by_path,
-    get_item_metadata_by_sha256,
-    get_sha256_for_file_id,
-    get_sha256_for_item_id,
 )
 from panoptikon.db.storage import get_thumbnail_bytes
 from panoptikon.db.tags import get_all_tags_for_item
@@ -39,6 +36,27 @@ router = APIRouter(
 )
 
 
+def get_item(
+    id: str | int = Query(
+        ...,
+        description="An item identifier (sha256 hash, file ID, path, item ID, or data ID for associated data)",
+    ),
+    id_type: ItemIdentifierType = Query(
+        ...,
+        description="The type of the item identifier",
+    ),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> Tuple[ItemRecord, List[FileRecord], Dict[str, Any]]:
+    conn = get_database_connection(**conn_args)
+    try:
+        item, files = get_item_metadata(conn, id, id_type)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return item, files, conn_args
+    finally:
+        conn.close()
+
+
 @dataclass
 class ItemMetadata:
     item: ItemRecord
@@ -46,10 +64,10 @@ class ItemMetadata:
 
 
 @router.get(
-    "/item/{sha256}",
-    summary="Get item metadata from its sha256 hash",
+    "/item",
+    summary="Get item metadata and associated file metadata",
     description="""
-Returns metadata for a given item by its sha256 hash.
+Returns metadata for a given item.
 This includes the item metadata and a list of all files associated with the item.
 Files that do not exist on disk will not be included in the response.
 This means the file list may be empty.
@@ -57,214 +75,53 @@ This means the file list may be empty.
 An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
 Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
     """,
-    response_model=ItemMetadata,
 )
-def get_item_by_sha256(
-    sha256: str,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+def get_item_meta(
+    item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
+        get_item
+    ),
 ):
-    conn = get_database_connection(**conn_args)
-    try:
-        item, files = get_item_metadata_by_sha256(conn, sha256)
-        if item is None or files is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return ItemMetadata(item=item, files=files)
-    finally:
-        conn.close()
+    item, files, conn_args = item_data
+    return ItemMetadata(item=item, files=files)
 
 
 @router.get(
-    "/from-id/{item_id}",
-    summary="Get item metadata from its item_id",
+    "/item/file",
+    summary="Get actual file contents for an item",
     description="""
-Returns metadata for a given item by its item_id.
-This includes the item metadata and a list of all files associated with the item.
-Files that do not exist on disk will not be included in the response.
-This means the file list may be empty.
-
-An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
-Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
-    """,
-    response_model=ItemMetadata,
-)
-def get_item_by_id(
-    item_id: int,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
-    conn = get_database_connection(**conn_args)
-    try:
-        sha256 = get_sha256_for_item_id(conn, item_id)
-        if sha256 is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        item, files = get_item_metadata_by_sha256(conn, sha256)
-        if item is None or files is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return ItemMetadata(item=item, files=files)
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/from-file-id/{file_id}",
-    summary="Get item metadata from a file_id",
-    description="""
-Returns metadata for a given item by the file_id of one of its files.
-This includes the item metadata and a list of all files associated with the item.
-Files that do not exist on disk will not be included in the response.
-This means the file list may be empty.
-
-An `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.
-Files are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.
-    """,
-    response_model=ItemMetadata,
-)
-def get_item_by_file_id(
-    file_id: int,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
-    conn = get_database_connection(**conn_args)
-    try:
-        sha256 = get_sha256_for_file_id(conn, file_id)
-        if sha256 is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        item, files = get_item_metadata_by_sha256(conn, sha256)
-        if item is None or files is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return ItemMetadata(item=item, files=files)
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/from-path/{path}",
-    summary="Get item metadata from a path",
-    description="""
-Returns metadata for a given item from its original file path.
-This includes the item metadata and a list of all files associated with the item.
-Files that do not exist on disk will not be included in the response.
-This means the file list may be empty.
-    """,
-    response_model=ItemMetadata,
-)
-def get_item_by_path(
-    path: str,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
-    conn = get_database_connection(**conn_args)
-    try:
-        file_record = get_file_by_path(conn, path)
-        if file_record is None:
-            raise HTTPException(status_code=404, detail="File not found")
-        sha256 = file_record.sha256
-        item, files = get_item_metadata_by_sha256(conn, sha256)
-        if item is None or files is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return ItemMetadata(item=item, files=files)
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/from-file-id/{file_id}/file",
-    summary="Get file by id",
-    description="""
-Returns the actual file contents for a given file_id.
+Returns the actual file contents for a given item.
 Content type is determined by the file extension.
-    """,
-    responses={
-        200: {
-            "description": "Arbitrary binary data",
-            "content": {"*/*": {}},  # Accepts any MIME type
-        },
-        404: {"description": "Item not found"},
-    },
+""",
 )
-def get_file_by_id(
-    file_id: int,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> Response:
-    conn = get_database_connection(**conn_args)
-    try:
-        sha256 = get_sha256_for_file_id(conn, file_id)
-        if sha256 is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return get_file_by_sha256(sha256, conn_args)
-    finally:
-        conn.close()
+def get_item_file(
+    item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
+        get_item
+    ),
+):
+    item, files, conn_args = item_data
+    if len(files) == 0:
+        raise HTTPException(status_code=404, detail="No file found for item")
+    file = files[0]
+    return FileResponse(
+        path=file.path,
+        media_type=item.type,
+        filename=file.filename,
+        content_disposition_type="inline",
+    )
+
+
+placeholder_byte_array = io.BytesIO()
+create_placeholder_image_with_gradient().save(
+    placeholder_byte_array, format="PNG"
+)
+placeholder_byte_array = placeholder_byte_array.getvalue()
 
 
 @router.get(
-    "/from-file-id/{file_id}/thumbnail",
-    summary="Get file by id",
+    "/item/thumbnail",
+    summary="Get thumbnail for an item",
     description="""
-Returns the thumbnail for a given file_id.
-Content type is determined by the file extension.
-    """,
-    responses={
-        200: {
-            "description": "Arbitrary binary data",
-            "content": {"*/*": {}},  # Accepts any MIME type
-        },
-        404: {"description": "Item not found"},
-    },
-)
-def get_thumbnail_by_file_id(
-    file_id: int,
-    big: bool = Query(True),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> Response:
-    conn = get_database_connection(**conn_args)
-    try:
-        sha256 = get_sha256_for_file_id(conn, file_id)
-        if sha256 is None:
-            raise HTTPException(status_code=404, detail="Item not found")
-        return get_thumbnail_by_sha256(sha256, big, conn_args)
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/file/{sha256}",
-    summary="Get file by sha256",
-    description="""
-Returns the actual file contents for a given sha256 hash.
-Content type is determined by the file extension.
-    """,
-    responses={
-        200: {
-            "description": "Arbitrary binary data",
-            "content": {"*/*": {}},  # Accepts any MIME type
-        },
-        404: {"description": "Item not found"},
-    },
-)
-def get_file_by_sha256(
-    sha256: str,
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> FileResponse:
-    conn = get_database_connection(**conn_args)
-    try:
-        file_record = get_existing_file_for_sha256(conn, sha256)
-
-        if file_record is None:
-            raise HTTPException(status_code=404, detail="File not found")
-        path = file_record.path
-        mime = get_mime_type(path)
-        return FileResponse(
-            path,
-            media_type=mime,
-            filename=os.path.basename(path),
-            content_disposition_type="inline",
-        )
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/thumbnail/{sha256}",
-    summary="Get thumbnail for an item by its sha256",
-    description="""
-Returns a thumbnail for a given item by its sha256 hash.
+Returns a thumbnail for a given item.
 The thumbnail may be a thumbnail,
 the unmodified original image (only for images),
 or a placeholder image generated on the fly.
@@ -272,32 +129,28 @@ GIFs are always returned as the original file.
 For video thumbnails, the `big` parameter can be used to
 select between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).
     """,
-    responses={
-        200: {
-            "description": "Image file binary",
-            "content": {"*/*": {}},  # Accepts any MIME type
-        },
-        404: {"description": "Item not found"},
-    },
 )
-def get_thumbnail_by_sha256(
-    sha256: str,
+def get_item_thumbnail(
+    item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
+        get_item
+    ),
     big: bool = Query(True),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-) -> Response:
+):
+    item, files, conn_args = item_data
+    if len(files) == 0:
+        raise HTTPException(status_code=404, detail="No file found for item")
+    file = files[0]
+    resp_type = "unknown"
+    file_str = f"{file.sha256} ({file.filename})"
     conn = get_database_connection(**conn_args)
-    resp_type = "default"
     try:
-        file = get_existing_file_for_sha256(conn, sha256)
-        if not file:
-            raise HTTPException(status_code=404, detail="Item not found")
-        mime = get_mime_type(file.path)
-        original_filename = strip_non_latin1_chars(os.path.basename(file.path))
+        mime = item.type
+        original_filename = strip_non_latin1_chars(file.filename)
         original_filename_no_ext, _ = os.path.splitext(original_filename)
 
         if mime is None or mime.startswith("image/gif"):
             resp_type = "file/gif"
-            logger.debug(f"{resp_type} for {sha256}: ")
+            logger.debug(f"Returning {resp_type} for {file_str}")
             return FileResponse(
                 file.path,
                 media_type=mime,
@@ -312,7 +165,7 @@ def get_thumbnail_by_sha256(
         buffer = get_thumbnail_bytes(conn, file.sha256, index)
         if buffer:
             resp_type = "thumbnail/buffer"
-            logger.debug(f"{resp_type} for {sha256}: ")
+            logger.debug(f"Returning {resp_type} for {file_str}")
             return Response(
                 content=buffer,
                 media_type="image/jpeg",
@@ -323,22 +176,18 @@ def get_thumbnail_by_sha256(
 
         if mime.startswith("image"):
             resp_type = "file/image"
-            logger.debug(f"{resp_type} for {sha256}: ")
+            logger.debug(f"Returning {resp_type} for {file_str}")
             return FileResponse(
                 file.path,
                 media_type=mime,
                 filename=original_filename,
                 content_disposition_type="inline",
             )
-        gradient: PIL.Image.Image = create_placeholder_image_with_gradient()
-        # Convert the PIL image to bytes
-        img_byte_array = io.BytesIO()
-        gradient.save(img_byte_array, format="PNG")
-        img_byte_array = img_byte_array.getvalue()
-        resp_type = "file/generated"
-        logger.debug(f"{resp_type} for {sha256}: ")
+
+        resp_type = "file/placeholder"
+        logger.debug(f"Returning {resp_type} for {file_str}")
         return Response(
-            content=img_byte_array,
+            content=placeholder_byte_array,
             media_type="image/png",
             headers={
                 "Content-Disposition": f'inline; filename="{original_filename_no_ext}.png"'
@@ -357,49 +206,29 @@ class TextResponse:
 
 
 @router.get(
-    "/text/{sha256}",
-    summary="Get text extracted from an item by its sha256",
+    "/item/text",
+    summary="Get all text extracted from an item",
     description="""
-Returns the text extracted from a given item by its sha256 hash.
+Returns the text extracted from a given item
 """,
-    response_model=TextResponse,
 )
 def get_text_by_sha256(
-    sha256: str,
+    item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
+        get_item
+    ),
     setters: List[str] = Query([]),
     truncate_length: int | None = Query(
         None,
         description="Text will be truncated to this length, if set. The `length` field will contain the original length.",
     ),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
+) -> TextResponse:
+    item, files, conn_args = item_data
     conn = get_database_connection(**conn_args)
     try:
-        text = get_extracted_text_for_item(conn, sha256, truncate_length)
+        text = get_extracted_text_for_item(conn, item.id, truncate_length)
         if setters:
             text = [t for t in text if t.setter_name in setters]
         return TextResponse(text=text)
-    finally:
-        conn.close()
-
-
-@router.get(
-    "/text",
-    summary="Get text from text_ids",
-    description="""
-Returns texts given a list of text IDs.
-""",
-    response_model=TextResponse,
-)
-def get_texts_by_text_ids(
-    text_ids: List[int] = Query(..., description="List of extracted text IDs"),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
-    conn = get_database_connection(**conn_args)
-    try:
-        result = get_text_by_ids(conn, text_ids)
-        texts = [t[1] for t in result]
-        return TextResponse(text=texts)
     finally:
         conn.close()
 
@@ -410,20 +239,21 @@ class TagResponse:
 
 
 @router.get(
-    "/tags/{sha256}",
-    summary="Get tags for an item by its sha256",
+    "/item/tags",
+    summary="Get tags for an item",
     description="""
-Returns the tags associated with a given item by its sha256 hash.
+Returns the tags associated with a given item.
 The response contains a list of tuples, where each tuple contains
 the tag namespace, tag name, confidence, and setter name.
 The `setters` parameter can be used to filter tags by the setter name.
 The `confidence_threshold` parameter can be used to filter tags based on
 the minimum confidence threshold
 """,
-    response_model=TagResponse,
 )
-def get_tags_by_sha256(
-    sha256: str,
+def get_tags(
+    item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
+        get_item
+    ),
     setters: List[str] = Query(
         [],
         description="List of models that set the tags to filter by (default: all)",
@@ -442,18 +272,38 @@ def get_tags_by_sha256(
         None,
         description="Maximum number of tags to return for each *setter, namespace pair* (default: all). Higher confidence tags are given priority.",
     ),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
-):
+) -> TagResponse:
+    item, files, conn_args = item_data
     conn = get_database_connection(**conn_args)
     try:
         tags = get_all_tags_for_item(
             conn,
-            sha256,
+            item.id,
             setters,
             confidence_threshold,
             namespaces,
             limit_per_namespace,
         )
         return TagResponse(tags=tags)
+    finally:
+        conn.close()
+
+
+@router.get(
+    "/text/any",
+    summary="Get text from text_ids",
+    description="""
+Returns texts given a list of text IDs
+""",
+)
+def get_texts_by_text_ids(
+    text_ids: List[int] = Query(..., description="List of extracted text IDs"),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> TextResponse:
+    conn = get_database_connection(**conn_args)
+    try:
+        result = get_text_by_ids(conn, text_ids)
+        texts = [t[1] for t in result]
+        return TextResponse(text=texts)
     finally:
         conn.close()

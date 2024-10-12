@@ -99,7 +99,7 @@ def get_tag_names_list(conn: sqlite3.Connection):
 
 def get_all_tags_for_item(
     conn: sqlite3.Connection,
-    sha256: str,
+    item_id: int,
     setters: List[str] = [],
     confidence_threshold: float = 0.0,
     namespaces: List[str] = [],
@@ -128,23 +128,21 @@ def get_all_tags_for_item(
     cursor.execute(
         f"""
     SELECT tags.namespace, tags.name, tags_items.confidence, setters.name
-    FROM items
-    JOIN item_data
-        ON items.id = item_data.item_id
+    FROM item_data
     JOIN tags_items
         ON tags_items.item_data_id = item_data.id
     JOIN tags
         ON tags_items.tag_id = tags.id        
     JOIN setters 
         ON item_data.setter_id = setters.id
-    WHERE items.sha256 = ?
+    WHERE item_data.item_id = ?
     {setters_clause}
     {confidence_clause}
     {tag_namespace_condition}
     ORDER BY tags_items.rowid
     """,
         (
-            sha256,
+            item_id,
             *(setters if setters else ()),
             *((confidence_threshold,) if confidence_threshold else ()),
             *(namespaces if namespaces else ()),

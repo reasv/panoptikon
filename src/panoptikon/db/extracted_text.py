@@ -48,7 +48,9 @@ def add_extracted_text(
 
 
 def get_extracted_text_for_item(
-    conn: sqlite3.Connection, item_sha256: str, max_length: Optional[int] = None
+    conn: sqlite3.Connection,
+    item_id: int,
+    max_length: Optional[int] = None,
 ) -> List[ExtractedText]:
     """
     Get all extracted text for an item, with an optional maximum text length.
@@ -71,10 +73,10 @@ def get_extracted_text_for_item(
         JOIN setters AS setters
         ON item_data.setter_id = setters.id
         JOIN items ON item_data.item_id = items.id
-        WHERE items.sha256 = ?
+        WHERE item_data.item_id = ?
         ORDER BY setters.name, item_data.source_id, item_data.idx
     """,
-        (item_sha256,),
+        (item_id,),
     )
     rows = cursor.fetchall()
 
