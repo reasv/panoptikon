@@ -61,9 +61,9 @@ Panoptikon uses [Weasyprint](https://doc.courtbouillon.org/weasyprint/stable/ind
 ```
 poetry run panoptikon
 ```
-Will start panoptikon along with its inference server, listening by default at http://127.0.0.1:6342/
+Will start panoptikon along with its inference server, listening by default at `http://127.0.0.1:6342/`
 
-Everything except for adding and customizing the AI models used can be done through the Next.js UI available at `/scan` and `/search` on the server.
+Everything except for adding new AI models and customizing existing ones can be done through the Next.js UI available at `http://127.0.0.1:6339` by default.
 
 ## First steps
 Open the home page of the web ui and follow the instructions to get started. You'll have to add directories to the list of allowed paths, and then run the file scan job to index the files in those directories. Before being able to search, you'll also have to run data extraction jobs to extract text, tags, and other metadata from the files.
