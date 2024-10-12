@@ -78,7 +78,7 @@ def get_item_meta(
     item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
         get_item
     ),
-):
+) -> ItemMetadata:
     item, files, conn_args = item_data
     return ItemMetadata(item=item, files=files)
 
@@ -95,7 +95,7 @@ def get_item_file(
     item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
         get_item
     ),
-):
+) -> FileResponse:
     item, files, conn_args = item_data
     if len(files) == 0:
         raise HTTPException(status_code=404, detail="No file found for item")
@@ -210,7 +210,7 @@ class TextResponse:
 Returns the text extracted from a given item
 """,
 )
-def get_text_by_sha256(
+def get_item_text(
     item_data: Tuple[ItemRecord, List[FileRecord], Dict[str, Any]] = Depends(
         get_item
     ),
