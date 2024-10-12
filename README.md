@@ -50,7 +50,7 @@ You may have to repeat this after updates.
 ### Other dependency issues
 #### cuDNN
 When running the Whisper implementation, which is based on [CTranslate2](https://github.com/OpenNMT/CTranslate2/), you may see errors related to cuDNN libraries.
-Download a cuDNN version 8.x appropriate for your system from [Nvidia](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/), unpack the archive and save its contents inside the `cudnn` directory at the root of this repo.
+Download a version 8.x cuDNN package appropriate for your system from [Nvidia](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/), unpack the archive and save its contents inside the `cudnn` directory at the root of this repo.
 Make sure the cudnn folder contains `bin`, `lib`, `include`, etc as direct subfolders.
 
 #### Weasyprint
