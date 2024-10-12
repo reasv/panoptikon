@@ -27,7 +27,7 @@ from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
 )
-from panoptikon.utils import open_file, open_in_explorer
+from panoptikon.utils import open_file, show_in_fm
 from searchui.router import get_routers
 
 logger = logging.getLogger(__name__)
@@ -169,9 +169,11 @@ def open_file_on_host(
     conn = get_database_connection(**conn_args)
     try:
         path = get_correct_path(conn, sha256, path)
-        msg = open_file(path)
+        open_file(path)
 
-        return OpenResponse(path=path, message=msg)
+        return OpenResponse(path=path, message=f"Attempting to open: {path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
@@ -197,9 +199,11 @@ def show_in_file_manager(
     conn = get_database_connection(**conn_args)
     try:
         path = get_correct_path(conn, sha256, path)
-        msg = open_in_explorer(path)
+        show_in_fm(path)
 
-        return OpenResponse(path=path, message=msg)
+        return OpenResponse(path=path, message=f"Attempting to open: {path}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 

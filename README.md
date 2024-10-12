@@ -100,7 +100,7 @@ These **ONLY** apply when the inference server (inferio) is run separately as st
 These determine where to bind the inference server which runs the models.
 To run the inference server separately, you can run `poetry run inferio`.
 ### INFERENCE_API_URL
-Default: Not set.
+Default: `Not set.`
 
 If you're running the inference server separately, you can point this to the URL of the inference server to allow Panoptikon to use it.
 
@@ -131,7 +131,20 @@ USER_DATA_DB="default"
 The names of the default databases to use for indexing (files and extracted data) and user data (bookmarks). These are the databases that are used by default when no database is specified in the API request. Regardless of what databases are specified in the environment variables, the API endpoints support specifying the database to use through the `index_db` and `user_data_db` query parameters, and the UI allows the creation of new index databases and the selection of which index database to use for search and other operations. 
 
 ### TEMP_DIR
+Default:
 ```
 TEMP_DIR="./data/tmp"
 ```
 Where to store temporary files. Defaults to `./data/tmp`. These files are generally short-lived and are cleaned up automatically, but if you're running out of space on `./data/tmp` you can set this to a different location.
+
+### SHOW_IN_FM_COMMAND, OPEN_FILE_COMMAND
+Default:
+`Not set`
+
+Panoptikon includes APIs to open files in the file manager or in the default application for the file type. These are used in the UI to allow you to open the file in your file manager or in the default application for the file type.
+
+Panoptikon has sane defaults for each platform (Windows, Linux, MacOS) but you can override these by setting the `SHOW_IN_FM_COMMAND` and `OPEN_FILE_COMMAND` environment variables to your custom commands.
+
+The strings `{path}`, `{folder}`, `{filename}` within your command will be replaced with the full path to the file, the folder containing the file, the filename with extension respectively.
+
+You can also set these commands to no-ops by setting them to something like `echo {path}` or `echo {filename}` in order to disable the functionality. ***This is absolutely necessary if you intend to expose Panoptikon to the internet, as the default commands are shell commands that can be used to execute arbitrary code on your machine. By default this is basically remote code execution as a service.***

@@ -2,11 +2,45 @@ import math
 import mimetypes
 import os
 import platform
+import shlex
 import subprocess
 from datetime import datetime
 
 mimetypes.add_type("image/webp", ".webp")
 from PIL import Image, ImageDraw, ImageFont
+
+
+def execute_custom_command(command_template: str, path: str):
+    """
+    Executes the custom command by replacing placeholders with actual values.
+
+    :param command_template: The command template with placeholders.
+    :param path: The full path to the file.
+    """
+    directory, file_name = os.path.split(path)
+    # Define placeholders
+    replacements = {
+        "{path}": f'"{path}"',
+        "{folder}": f'"{directory}"',
+        "{filename}": f'"{file_name}"',
+    }
+
+    # Replace placeholders
+    for placeholder, actual in replacements.items():
+        command_template = command_template.replace(placeholder, actual)
+
+    if not command_template.strip():
+        # Empty command; do nothing
+        return
+
+    # Split the command into arguments
+    if platform.system() == "Windows":
+        # On Windows, use shell=True to handle built-in commands
+        subprocess.run(command_template, shell=True)
+    else:
+        # On Unix-like systems, use shlex to split the command
+        args = shlex.split(command_template)
+        subprocess.run(args)
 
 
 def show_in_fm(path):
@@ -15,6 +49,17 @@ def show_in_fm(path):
 
     :param path: The path to the file to be shown in the file explorer.
     """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Path '{path}' does not exist")
+    custom_cmd = os.getenv("SHOW_IN_FM_COMMAND")
+    if custom_cmd is not None:
+        try:
+            execute_custom_command(custom_cmd, path)
+            return
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Failed to execute custom SHOW_IN_FM_COMMAND for path '{path}': {e}"
+            )
 
     system_name = platform.system()
 
@@ -30,7 +75,7 @@ def show_in_fm(path):
             # This is trickier on Linux, as it depends on the file manager.
             # Here's a generic approach using 'xdg-open' to open the directory,
             # followed by attempts to focus the file.
-            directory, file_name = os.path.split(path)
+            directory, _ = os.path.split(path)
             subprocess.run(["xdg-open", directory])
             # Additional steps might be required depending on the desktop environment and file manager.
         else:
@@ -41,20 +86,41 @@ def show_in_fm(path):
         )
 
 
-def open_file(image_path):
-    if os.path.exists(image_path):
-        os.startfile(image_path, cwd=os.path.dirname(image_path))
-        return f"Attempting to open: {image_path}"
-    else:
-        return "File does not exist"
+def open_file(file_path):
+    """
+    Open the specified file using the default application.
 
+    :param image_path: The path to the file to be opened.
+    """
+    # Check for custom command
+    custom_cmd = os.getenv("OPEN_FILE_COMMAND")
+    if custom_cmd is not None:
+        try:
+            execute_custom_command(custom_cmd, file_path)
+            return
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Failed to execute custom OPEN_FILE_COMMAND for path '{file_path}': {e}"
+            )
 
-def open_in_explorer(image_path):
-    if os.path.exists(image_path):
-        show_in_fm(image_path)
-        return f"Attempting to open: {image_path}"
+    # Default behavior
+    if os.path.exists(file_path):
+        try:
+            if platform.system() == "Windows":
+                os.startfile(file_path)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", file_path])
+            elif platform.system() == "Linux":
+                subprocess.run(["xdg-open", file_path])
+            else:
+                raise OSError(
+                    f"Unsupported operating system: {platform.system()}"
+                )
+            return
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to open file '{file_path}': {e}")
     else:
-        return "File does not exist"
+        raise FileNotFoundError(f"File '{file_path}' not found")
 
 
 def ensure_trailing_slash(path: str) -> str:
