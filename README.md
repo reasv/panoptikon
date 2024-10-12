@@ -78,8 +78,8 @@ Bookmarks can belong to one or more "Groups" which are essentially tags that you
 See `config/inference/example.toml` for examples on how to add custom models from Hugging Face to Panoptikon.
 
 ## Environment variables and config
-Aside from the inference config, which uses TOML, and the configuration saved in the SQLite database, which can be modified through the UI, Panoptikon accepts environment variables as config options.
-Panoptikon uses dotenv, so you can create a file called `.env` in this directory with all the environment variables and their values and it will be automatically applied at runtime.
+Panoptikon accepts environment variables as config options.
+Panoptikon uses dotenv, so you can create a file called `.env` in this folder with all the environment variables and their values and it will be automatically applied at runtime.
 
 ### HOST and PORT
 Default:
