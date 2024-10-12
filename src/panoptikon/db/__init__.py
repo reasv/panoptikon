@@ -1,10 +1,13 @@
 import logging
 import os
 import sqlite3
+from typing import List, Literal, Tuple
 
 import sqlite_vec
 from alembic import command
 from alembic.config import Config
+
+from panoptikon.types import FileRecord, ItemRecord
 
 logger = logging.getLogger(__name__)
 
@@ -144,3 +147,98 @@ def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
     if item_id:
         return item_id[0]
     return None
+
+
+ItemIdentifierType = Literal[
+    "item_id", "file_id", "data_id", "path", "sha256", "md5"
+]
+
+
+def get_item_metadata(
+    conn: sqlite3.Connection,
+    identifier: str | int,
+    identifier_type: ItemIdentifierType,
+) -> Tuple[ItemRecord | None, List[FileRecord]]:
+    cursor = conn.cursor()
+    select = """
+    SELECT
+        items.id AS item_id,
+        sha256,
+        md5,
+        type,
+        size,
+        width,
+        height,
+        duration,
+        audio_tracks,
+        video_tracks,
+        subtitle_tracks,
+        time_added,
+        files.id AS file_id,
+        files.path AS path,
+        files.filename,
+        files.last_modified
+    FROM items
+        JOIN files ON items.id = files.item_id
+    """
+    if identifier_type in ["item_id", "file_id", "path", "sha256", "md5"]:
+        query = f"""
+        {select}
+        WHERE {identifier_type} = ?
+        ORDER BY files.available DESC
+        """
+    elif identifier_type == "data_id":
+        query = f"""
+        {select}
+        JOIN item_data ON items.id = item_data.item_id
+        WHERE item_data.id = ?
+        ORDER BY files.available DESC
+        """
+    else:
+        raise ValueError(f"Invalid identifier type: {identifier_type}")
+
+    cursor.execute(query, (identifier,))
+    item_record = None
+    files: List[FileRecord] = []
+    while row := cursor.fetchone():
+        # destructuring the row
+        (
+            item_id,
+            sha256,
+            md5,
+            type,
+            size,
+            width,
+            height,
+            duration,
+            audio_tracks,
+            video_tracks,
+            subtitle_tracks,
+            time_added,
+            file_id,
+            path,
+            filename,
+            last_modified,
+        ) = row
+        if not item_record:
+            item_record = ItemRecord(
+                id=item_id,
+                sha256=sha256,
+                md5=md5,
+                type=type,
+                size=size,
+                width=width,
+                height=height,
+                duration=duration,
+                audio_tracks=audio_tracks,
+                video_tracks=video_tracks,
+                subtitle_tracks=subtitle_tracks,
+                time_added=time_added,
+            )
+        if os.path.exists(path):
+            files.append(
+                FileRecord(
+                    file_id, sha256, path, last_modified, filename=filename
+                )
+            )
+    return item_record, files
