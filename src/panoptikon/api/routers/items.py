@@ -1,9 +1,8 @@
 import io
 import logging
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import PIL
 import PIL.Image
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -26,7 +25,6 @@ from panoptikon.db.extracted_text import (
 from panoptikon.db.storage import get_thumbnail_bytes
 from panoptikon.db.tags import get_all_tags_for_item
 from panoptikon.types import ExtractedText, FileRecord, ItemRecord
-from panoptikon.utils import get_mime_type
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
