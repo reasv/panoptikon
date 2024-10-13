@@ -21,9 +21,8 @@ RUN apk update && \
 RUN ln -sf python3 /usr/bin/python && \
     ln -sf pip3 /usr/bin/pip
 
-# Install Poetry
-RUN pip install --upgrade pip && \
-    pip install poetry
+# Use pipx to install Poetry in an isolated environment
+RUN pipx install poetry
 
 # Create a user with UID 1000 and set permissions
 RUN adduser -D -u 1000 appuser && chown -R appuser /app
