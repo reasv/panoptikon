@@ -48,7 +48,7 @@ RUN PYTHON_VERSION=3.12.0 && \
     wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz && \
     tar -xzf Python-$PYTHON_VERSION.tgz && \
     cd Python-$PYTHON_VERSION && \
-    ./configure --enable-optimizations --with-ensurepip=install && \
+    ./configure --enable-optimizations --with-ensurepip=install --enable-loadable-sqlite-extensions && \
     make -j$(nproc) && \
     make altinstall && \
     # Remove existing symbolic links if they exist
@@ -60,8 +60,9 @@ RUN PYTHON_VERSION=3.12.0 && \
     cd .. && \
     rm -rf Python-$PYTHON_VERSION.tgz Python-$PYTHON_VERSION
 
-# Verify that Python has _sqlite3
+# Verify that Python has _sqlite3 with loadable extensions enabled
 RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
+RUN python3 -c "import sqlite3; print('SQLite has loadable extensions:', sqlite3.connect(':memory:').enable_load_extension(True))"
 
 # Upgrade pip and install Poetry globally
 RUN pip3 install --upgrade pip && \
