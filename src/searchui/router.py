@@ -90,6 +90,7 @@ def run_node_client(hostname: str, port: int, parent_url: str):
 
     # Function to start the server in a separate thread
     def start_server():
+        logger.info("Starting the Node.js client server...")
         npx(
             ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
