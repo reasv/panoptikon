@@ -29,14 +29,14 @@ RUN apt-get update && \
 
 # Install the latest SQLite 3.46.1 from source
 RUN SQLITE_VERSION=3.46.1 && \
-    wget https://www.sqlite.org/2024/sqlite-amalgamation-${SQLITE_VERSION}.zip && \
-    unzip sqlite-amalgamation-${SQLITE_VERSION}.zip && \
-    cd sqlite-amalgamation-${SQLITE_VERSION} && \
+    wget https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip && \
+    unzip sqlite-amalgamation-3460100.zip && \
+    cd sqlite-amalgamation-3460100 && \
     ./configure --prefix=/usr/local && \
     make -j$(nproc) && \
     make install && \
     ldconfig && \
-    cd .. && rm -rf sqlite-amalgamation-${SQLITE_VERSION}*
+    cd .. && rm -rf sqlite-amalgamation-3460100*
 
 # Set environment variables to help Python find SQLite
 ENV CFLAGS="-I/usr/local/include" \
