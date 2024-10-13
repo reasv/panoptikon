@@ -60,28 +60,20 @@ WORKDIR /app
 # Copy the current directory contents into the container
 COPY . /app
 
-# Change ownership of app directory to the new user
-RUN chown -R appuser /app
+# Install dependencies using Poetry as root
+RUN poetry config virtualenvs.create false && poetry install --with inference
 
 # Switch to the app user
 USER appuser
-
-# Set environment variables to prevent Poetry from creating virtual environments
-ENV POETRY_VIRTUALENVS_CREATE=false
-ENV POETRY_CACHE_DIR='/home/appuser/.cache/pypoetry'
-ENV PATH="/home/appuser/.local/bin:$PATH"
-
-# Configure Poetry and install dependencies
-RUN poetry install --with inference
-
-# Expose the port for the application
-EXPOSE 6342
 
 # Set environment variables for the application
 ENV HOST=0.0.0.0
 ENV PORT=6342
 ENV DATA_FOLDER=data
 ENV LOGLEVEL=INFO
+
+# Expose the port for the application
+EXPOSE 6342
 
 # Run the application
 CMD ["poetry", "run", "panoptikon"]
