@@ -181,7 +181,19 @@ def get_item_metadata(
     FROM items
         JOIN files ON items.id = files.item_id
     """
-    if identifier_type in ["item_id", "file_id", "path", "sha256", "md5"]:
+    if (
+        identifier_type == "sha256"
+        and isinstance(identifier, str)
+        and len(identifier) < 64
+    ):
+        # Identifier is a hash prefix
+        logger.debug(f"Searching for items with SHA256 prefix: {identifier}")
+        query = f"""
+        {select}
+        WHERE items.sha256 LIKE ? || '%'
+        ORDER BY files.available DESC
+        """
+    elif identifier_type in ["item_id", "file_id", "path", "sha256", "md5"]:
         if identifier_type == "sha256":
             column = "items.sha256"
         else:
