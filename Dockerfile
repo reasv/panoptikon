@@ -31,8 +31,8 @@ RUN . $VENV_PATH/bin/activate && pip install --upgrade pip && pip install poetry
 # Set up environment variables to use Poetry from the virtual environment
 ENV PATH="$VENV_PATH/bin:$PATH"
 
-# Create a user with UID 1000 and set permissions
-RUN adduser -D -u 1000 appuser && chown -R appuser /app
+# Create the /app directory and a user with UID 1000, set permissions
+RUN mkdir /app && adduser -D -u 1000 appuser && chown -R appuser /app
 
 # Set the working directory in the container
 WORKDIR /app
