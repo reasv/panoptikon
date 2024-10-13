@@ -21,9 +21,15 @@ RUN apk update && \
 RUN ln -sf python3 /usr/bin/python && \
     ln -sf pip3 /usr/bin/pip
 
-# Install Poetry with pip using the --break-system-packages flag
-RUN pip install --upgrade pip && \
-    pip install poetry --break-system-packages
+# Create a directory for the virtual environment
+ENV VENV_PATH="/opt/poetry_venv"
+RUN python3 -m venv $VENV_PATH
+
+# Activate the virtual environment and install Poetry within it
+RUN . $VENV_PATH/bin/activate && pip install --upgrade pip && pip install poetry
+
+# Set up environment variables to use Poetry from the virtual environment
+ENV PATH="$VENV_PATH/bin:$PATH"
 
 # Create a user with UID 1000 and set permissions
 RUN adduser -D -u 1000 appuser && chown -R appuser /app
@@ -37,7 +43,7 @@ COPY . /app
 # Change ownership of app directory to the new user
 RUN chown -R appuser /app
 
-# Install dependencies with Poetry
+# Install dependencies using Poetry
 RUN poetry config virtualenvs.create false && poetry install --with inference
 
 # Expose the port the app runs on
