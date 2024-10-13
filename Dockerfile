@@ -28,14 +28,16 @@ RUN apt-get update && \
     pkg-config \
     && apt-get clean
 
-# Install the latest SQLite 3.46.1 from source (amalgamation package)
+# Install the latest SQLite 3.46.1 from source (autoconf package)
 RUN SQLITE_VERSION=3.46.1 && \
-    wget https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip && \
-    unzip sqlite-amalgamation-3460100.zip && \
-    cd sqlite-amalgamation-3460100 && \
-    gcc -o sqlite3 shell.c sqlite3.c -lpthread -ldl -lm && \
-    cp sqlite3 /usr/local/bin && \
-    cd .. && rm -rf sqlite-amalgamation-3460100*
+    wget https://www.sqlite.org/2024/sqlite-autoconf-3460100.tar.gz && \
+    tar -xzf sqlite-autoconf-3460100.tar.gz && \
+    cd sqlite-autoconf-3460100 && \
+    ./configure --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd .. && rm -rf sqlite-autoconf-3460100.tar.gz sqlite-autoconf-3460100
 
 # Set environment variables to help Python find SQLite
 ENV CFLAGS="-I/usr/local/include" \
@@ -56,7 +58,7 @@ RUN PYTHON_VERSION=3.12.0 && \
     ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
     ln -s /usr/local/bin/pip3.12 /usr/bin/pip3 && \
     cd .. && \
-    rm -rf Python-$PYTHON_VERSION*
+    rm -rf Python-$PYTHON_VERSION.tgz Python-$PYTHON_VERSION
 
 # Verify that Python has _sqlite3
 RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"

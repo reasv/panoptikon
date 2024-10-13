@@ -15,3 +15,11 @@ services:
       - CLIENT_PORT=6339
     volumes:
       - ./data:/app/data
+      - ./ui:/app/src/searchui/panoptikon-ui
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
