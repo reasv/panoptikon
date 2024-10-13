@@ -1,7 +1,7 @@
 # Use an NVIDIA CUDA base image with Debian
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Install necessary dependencies for Python 3.12, SQLite, and build tools
+# Install necessary dependencies for building SQLite, Python, and other build tools
 RUN apt-get update && \
     apt-get install -y \
     software-properties-common \
@@ -13,18 +13,39 @@ RUN apt-get update && \
     zlib1g-dev \
     libbz2-dev \
     libreadline-dev \
+    libncurses5-dev \
+    libgdbm-dev \
+    libnss3-dev \
+    liblzma-dev \
+    tk-dev \
     unzip \
     git \
     make \
     gcc \
+    pkg-config \
     && apt-get clean
 
-# Install Python 3.12 from source
+# Install the latest SQLite 3.46.1 from source
+RUN SQLITE_VERSION=3.46.1 && \
+    wget https://www.sqlite.org/2024/sqlite-amalgamation-${SQLITE_VERSION}.zip && \
+    unzip sqlite-amalgamation-${SQLITE_VERSION}.zip && \
+    cd sqlite-amalgamation-${SQLITE_VERSION} && \
+    ./configure --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd .. && rm -rf sqlite-amalgamation-${SQLITE_VERSION}*
+
+# Set environment variables to help Python find SQLite
+ENV CFLAGS="-I/usr/local/include" \
+    LDFLAGS="-L/usr/local/lib"
+
+# Install Python 3.12 from source, ensuring it detects the newly installed SQLite
 RUN PYTHON_VERSION=3.12.0 && \
     wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz && \
     tar -xzf Python-$PYTHON_VERSION.tgz && \
     cd Python-$PYTHON_VERSION && \
-    ./configure --enable-optimizations && \
+    ./configure --enable-optimizations --with-ensurepip=install && \
     make -j$(nproc) && \
     make altinstall && \
     # Remove existing symbolic links if they exist
@@ -36,14 +57,8 @@ RUN PYTHON_VERSION=3.12.0 && \
     cd .. && \
     rm -rf Python-$PYTHON_VERSION*
 
-# Install the latest SQLite 3.46.1 from source
-RUN SQLITE_VERSION=3460100 && \
-    wget https://www.sqlite.org/2024/sqlite-amalgamation-${SQLITE_VERSION}.zip && \
-    unzip sqlite-amalgamation-${SQLITE_VERSION}.zip && \
-    cd sqlite-amalgamation-${SQLITE_VERSION} && \
-    gcc -o sqlite3 shell.c sqlite3.c -lpthread -ldl -lm && \
-    cp sqlite3 /usr/local/bin && \
-    cd .. && rm -rf sqlite-amalgamation-${SQLITE_VERSION}*
+# Verify that Python has _sqlite3
+RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 
 # Upgrade pip and install Poetry globally
 RUN pip3 install --upgrade pip && \
@@ -83,5 +98,5 @@ ENV HOST=0.0.0.0 \
     DATA_FOLDER=data \
     LOGLEVEL=INFO
 
-# Activate the virtual environment and run the application
+# Run the application within the virtual environment
 CMD ["poetry", "run", "panoptikon"]
