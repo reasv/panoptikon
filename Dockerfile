@@ -21,8 +21,9 @@ RUN apk update && \
 RUN ln -sf python3 /usr/bin/python && \
     ln -sf pip3 /usr/bin/pip
 
-# Use pipx to install Poetry in an isolated environment
-RUN pipx install poetry
+# Install Poetry with pip using the --break-system-packages flag
+RUN pip install --upgrade pip && \
+    pip install poetry --break-system-packages
 
 # Create a user with UID 1000 and set permissions
 RUN adduser -D -u 1000 appuser && chown -R appuser /app
@@ -36,7 +37,7 @@ COPY . /app
 # Change ownership of app directory to the new user
 RUN chown -R appuser /app
 
-# Install dependencies as root, then switch to appuser for runtime
+# Install dependencies with Poetry
 RUN poetry config virtualenvs.create false && poetry install --with inference
 
 # Expose the port the app runs on
