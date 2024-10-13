@@ -27,7 +27,6 @@ RUN PYTHON_VERSION=3.12.0 && \
     ./configure --enable-optimizations && \
     make -j$(nproc) && \
     make altinstall && \
-    # Remove existing symbolic link if it exists, then create new ones
     [ -e /usr/bin/python3 ] && rm /usr/bin/python3 || true && \
     ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
     [ -e /usr/bin/pip3 ] && rm /usr/bin/pip3 || true && \
@@ -36,14 +35,14 @@ RUN PYTHON_VERSION=3.12.0 && \
     rm -rf Python-$PYTHON_VERSION* 
 
 # Install the latest SQLite 3.46.1 from source
-RUN SQLITE_VERSION=3.46.1 && \
-    wget https://www.sqlite.org/2023/sqlite-autoconf-${SQLITE_VERSION//./}00.tar.gz && \
-    tar -xzf sqlite-autoconf-${SQLITE_VERSION//./}00.tar.gz && \
-    cd sqlite-autoconf-${SQLITE_VERSION//./}00 && \
+RUN SQLITE_VERSION=3460100 && \
+    wget https://www.sqlite.org/2023/sqlite-autoconf-${SQLITE_VERSION}.tar.gz && \
+    tar -xzf sqlite-autoconf-${SQLITE_VERSION}.tar.gz && \
+    cd sqlite-autoconf-${SQLITE_VERSION} && \
     ./configure --prefix=/usr/local && \
     make && make install && \
     ldconfig && \
-    cd .. && rm -rf sqlite-autoconf-${SQLITE_VERSION//./}00*
+    cd .. && rm -rf sqlite-autoconf-${SQLITE_VERSION}*
 
 # Upgrade pip and install Poetry
 RUN pip3 install --upgrade pip && \
