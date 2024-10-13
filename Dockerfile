@@ -3,6 +3,7 @@ FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
 # Set DEBIAN_FRONTEND to noninteractive to avoid timezone configuration prompts
 ENV DEBIAN_FRONTEND=noninteractive
+
 # Install necessary dependencies for building SQLite, Python, and other build tools
 RUN apt-get update && \
     apt-get install -y \
@@ -27,15 +28,13 @@ RUN apt-get update && \
     pkg-config \
     && apt-get clean
 
-# Install the latest SQLite 3.46.1 from source
+# Install the latest SQLite 3.46.1 from source (amalgamation package)
 RUN SQLITE_VERSION=3.46.1 && \
     wget https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip && \
     unzip sqlite-amalgamation-3460100.zip && \
     cd sqlite-amalgamation-3460100 && \
-    ./configure --prefix=/usr/local && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
+    gcc -o sqlite3 shell.c sqlite3.c -lpthread -ldl -lm && \
+    cp sqlite3 /usr/local/bin && \
     cd .. && rm -rf sqlite-amalgamation-3460100*
 
 # Set environment variables to help Python find SQLite
