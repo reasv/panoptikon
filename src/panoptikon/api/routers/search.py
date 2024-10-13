@@ -167,7 +167,8 @@ def get_stats(
             bookmarks=bookmark_namespaces,
             files=FileStats(total=files, unique=items, mime_types=file_types),
             tags=TagStats(
-                namespaces=tag_namespaces, min_confidence=min_tags_threshold
+                namespaces=tag_namespaces,
+                min_confidence=min_tags_threshold or 0.0,
             ),
             folders=folders,
             text_stats=text_stats,
