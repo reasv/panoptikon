@@ -47,6 +47,9 @@ RUN SQLITE_VERSION=3460100 && \
 RUN pip3 install --upgrade pip && \
     pip3 install poetry
 
+# Set up Poetry to use the global environment
+RUN poetry config virtualenvs.create false
+
 # Create a directory for the application and add a non-root user
 RUN mkdir /app && adduser --disabled-password --gecos '' appuser && chown -R appuser /app
 
@@ -56,8 +59,8 @@ WORKDIR /app
 # Copy the current directory contents into the container
 COPY . /app
 
-# Install dependencies using Poetry
-RUN poetry config virtualenvs.create false && poetry install --with inference
+# Install dependencies using Poetry, including panoptikon in editable mode
+RUN poetry install --with inference --no-root && poetry install --with inference
 
 # Expose the port for the application
 EXPOSE 6342
