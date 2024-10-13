@@ -27,12 +27,14 @@ RUN PYTHON_VERSION=3.12.0 && \
     ./configure --enable-optimizations && \
     make -j$(nproc) && \
     make altinstall && \
+    # Remove existing symbolic links if they exist
     [ -e /usr/bin/python3 ] && rm /usr/bin/python3 || true && \
-    ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
     [ -e /usr/bin/pip3 ] && rm /usr/bin/pip3 || true && \
+    # Create new symbolic links
+    ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
     ln -s /usr/local/bin/pip3.12 /usr/bin/pip3 && \
     cd .. && \
-    rm -rf Python-$PYTHON_VERSION* 
+    rm -rf Python-$PYTHON_VERSION*
 
 # Install the latest SQLite 3.46.1 from source
 RUN SQLITE_VERSION=3460100 && \
@@ -43,15 +45,14 @@ RUN SQLITE_VERSION=3460100 && \
     cp sqlite3 /usr/local/bin && \
     cd .. && rm -rf sqlite-amalgamation-${SQLITE_VERSION}*
 
-# Upgrade pip and install Poetry
+# Upgrade pip and install Poetry globally
 RUN pip3 install --upgrade pip && \
     pip3 install poetry
 
-# Set up Poetry to use the global environment
-RUN poetry config virtualenvs.create false
-
 # Create a directory for the application and add a non-root user
-RUN mkdir /app && adduser --disabled-password --gecos '' appuser && chown -R appuser /app
+RUN mkdir /app && \
+    adduser --disabled-password --gecos '' appuser && \
+    chown -R appuser /app
 
 # Set the working directory in the container
 WORKDIR /app
@@ -59,20 +60,28 @@ WORKDIR /app
 # Copy the current directory contents into the container
 COPY . /app
 
-# Install dependencies using Poetry, including panoptikon in editable mode
-RUN poetry install --with inference --no-root && poetry install --with inference
+# Change ownership of app directory to the new user
+RUN chown -R appuser /app
+
+# Switch to the app user
+USER appuser
+
+# Set environment variables to prevent Poetry from creating virtual environments
+ENV POETRY_VIRTUALENVS_CREATE=false
+ENV POETRY_CACHE_DIR='/home/appuser/.cache/pypoetry'
+ENV PATH="/home/appuser/.local/bin:$PATH"
+
+# Configure Poetry and install dependencies
+RUN poetry install --with inference
 
 # Expose the port for the application
 EXPOSE 6342
 
-# Set environment variables
+# Set environment variables for the application
 ENV HOST=0.0.0.0
 ENV PORT=6342
 ENV DATA_FOLDER=data
 ENV LOGLEVEL=INFO
-
-# Switch to the app user
-USER appuser
 
 # Run the application
 CMD ["poetry", "run", "panoptikon"]
