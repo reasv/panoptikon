@@ -1,6 +1,8 @@
 # Use an NVIDIA CUDA base image with Debian
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
+# Set DEBIAN_FRONTEND to noninteractive to avoid timezone configuration prompts
+ENV DEBIAN_FRONTEND=noninteractive
 # Install necessary dependencies for building SQLite, Python, and other build tools
 RUN apt-get update && \
     apt-get install -y \
