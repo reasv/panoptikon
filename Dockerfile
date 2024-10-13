@@ -1,7 +1,7 @@
-# Start with an NVIDIA CUDA base image with Debian and the required CUDA version
+# Use an NVIDIA CUDA base image with Debian
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Install necessary dependencies for Python 3.12, building SQLite, and other build tools
+# Install necessary dependencies for Python 3.12, SQLite, and build tools
 RUN apt-get update && \
     apt-get install -y \
     software-properties-common \
@@ -27,7 +27,10 @@ RUN PYTHON_VERSION=3.12.0 && \
     ./configure --enable-optimizations && \
     make -j$(nproc) && \
     make altinstall && \
+    # Remove existing symbolic link if it exists, then create new ones
+    [ -e /usr/bin/python3 ] && rm /usr/bin/python3 || true && \
     ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
+    [ -e /usr/bin/pip3 ] && rm /usr/bin/pip3 || true && \
     ln -s /usr/local/bin/pip3.12 /usr/bin/pip3 && \
     cd .. && \
     rm -rf Python-$PYTHON_VERSION* 
