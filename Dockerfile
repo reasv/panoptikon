@@ -13,7 +13,7 @@ RUN apt-get update && \
     zlib1g-dev \
     libbz2-dev \
     libreadline-dev \
-    libsqlite3-dev \
+    unzip \
     git \
     make \
     gcc \
@@ -36,13 +36,12 @@ RUN PYTHON_VERSION=3.12.0 && \
 
 # Install the latest SQLite 3.46.1 from source
 RUN SQLITE_VERSION=3460100 && \
-    wget https://www.sqlite.org/2023/sqlite-autoconf-${SQLITE_VERSION}.tar.gz && \
-    tar -xzf sqlite-autoconf-${SQLITE_VERSION}.tar.gz && \
-    cd sqlite-autoconf-${SQLITE_VERSION} && \
-    ./configure --prefix=/usr/local && \
-    make && make install && \
-    ldconfig && \
-    cd .. && rm -rf sqlite-autoconf-${SQLITE_VERSION}*
+    wget https://www.sqlite.org/2024/sqlite-amalgamation-${SQLITE_VERSION}.zip && \
+    unzip sqlite-amalgamation-${SQLITE_VERSION}.zip && \
+    cd sqlite-amalgamation-${SQLITE_VERSION} && \
+    gcc -o sqlite3 shell.c sqlite3.c -lpthread -ldl -lm && \
+    cp sqlite3 /usr/local/bin && \
+    cd .. && rm -rf sqlite-amalgamation-${SQLITE_VERSION}*
 
 # Upgrade pip and install Poetry
 RUN pip3 install --upgrade pip && \
