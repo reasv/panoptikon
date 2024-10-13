@@ -1,38 +1,53 @@
-# Use the Alpine-based SQLite image as the base
-FROM keinos/sqlite3:3.46.1
+# Start with an NVIDIA CUDA base image with Debian and the required CUDA version
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Temporarily switch to root for package installation
-USER root
-
-# Install Python 3.12 and dependencies
-RUN apk update && \
-    apk add --no-cache \
-    python3=3.12.7-r0 \
-    py3-pip \
-    py3-setuptools \
-    py3-wheel \
-    gcc \
-    musl-dev \
+# Install necessary dependencies for Python 3.12, building SQLite, and other build tools
+RUN apt-get update && \
+    apt-get install -y \
+    software-properties-common \
+    wget \
+    curl \
+    build-essential \
     libffi-dev \
-    openssl-dev \
-    git
+    libssl-dev \
+    zlib1g-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    git \
+    make \
+    gcc \
+    && apt-get clean
 
-# Ensure Python3.12 is the default Python and pip commands
-RUN ln -sf python3 /usr/bin/python && \
-    ln -sf pip3 /usr/bin/pip
+# Install Python 3.12 from source
+RUN PYTHON_VERSION=3.12.0 && \
+    wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz && \
+    tar -xzf Python-$PYTHON_VERSION.tgz && \
+    cd Python-$PYTHON_VERSION && \
+    ./configure --enable-optimizations && \
+    make -j$(nproc) && \
+    make altinstall && \
+    ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
+    ln -s /usr/local/bin/pip3.12 /usr/bin/pip3 && \
+    cd .. && \
+    rm -rf Python-$PYTHON_VERSION* 
 
-# Create a directory for the virtual environment
-ENV VENV_PATH="/opt/poetry_venv"
-RUN python3 -m venv $VENV_PATH
+# Install the latest SQLite 3.46.1 from source
+RUN SQLITE_VERSION=3.46.1 && \
+    wget https://www.sqlite.org/2023/sqlite-autoconf-${SQLITE_VERSION//./}00.tar.gz && \
+    tar -xzf sqlite-autoconf-${SQLITE_VERSION//./}00.tar.gz && \
+    cd sqlite-autoconf-${SQLITE_VERSION//./}00 && \
+    ./configure --prefix=/usr/local && \
+    make && make install && \
+    ldconfig && \
+    cd .. && rm -rf sqlite-autoconf-${SQLITE_VERSION//./}00*
 
-# Activate the virtual environment and install Poetry within it
-RUN . $VENV_PATH/bin/activate && pip install --upgrade pip && pip install poetry
+# Upgrade pip and install Poetry
+RUN pip3 install --upgrade pip && \
+    pip3 install poetry
 
-# Set up environment variables to use Poetry from the virtual environment
-ENV PATH="$VENV_PATH/bin:$PATH"
-
-# Create the /app directory and a user with UID 1000, set permissions
-RUN mkdir /app && adduser -D -u 1000 appuser && chown -R appuser /app
+# Create a directory for the application and add a non-root user
+RUN mkdir /app && adduser --disabled-password --gecos '' appuser && chown -R appuser /app
 
 # Set the working directory in the container
 WORKDIR /app
@@ -40,13 +55,10 @@ WORKDIR /app
 # Copy the current directory contents into the container
 COPY . /app
 
-# Change ownership of app directory to the new user
-RUN chown -R appuser /app
-
 # Install dependencies using Poetry
 RUN poetry config virtualenvs.create false && poetry install --with inference
 
-# Expose the port the app runs on
+# Expose the port for the application
 EXPOSE 6342
 
 # Set environment variables
@@ -55,7 +67,7 @@ ENV PORT=6342
 ENV DATA_FOLDER=data
 ENV LOGLEVEL=INFO
 
-# Switch to the app user with UID 1000
+# Switch to the app user
 USER appuser
 
 # Run the application
