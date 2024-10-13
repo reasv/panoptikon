@@ -7,7 +7,7 @@ USER root
 # Install Python 3.12 and dependencies
 RUN apk update && \
     apk add --no-cache \
-    python3=3.12.0-r0 \
+    python3=3.12.7-r0 \
     py3-pip \
     py3-setuptools \
     py3-wheel \
