@@ -6,7 +6,7 @@ services:
       - "6342:6342"
       - "6339:6339"
     environment:
-      - HOST=0.0.0.0
+      - HOST=127.0.0.1
       - PORT=6342
       - DATA_FOLDER=data
       - LOGLEVEL=INFO
