@@ -22,8 +22,9 @@ def get_client_url(parent_hostname: str, parent_port: int) -> str:
     else:
         client_hostname = os.getenv("CLIENT_HOST", parent_hostname)
         client_port = int(os.getenv("CLIENT_PORT", 6339))
-        parent_url = f"http://{parent_hostname}:{parent_port}/"
-        run_node_client(client_hostname, client_port, parent_url)
+        run_node_client(client_hostname, client_port)
+        if client_hostname == "0.0.0.0":
+            client_hostname = "127.0.0.1"
         return f"http://{client_hostname}:{client_port}/"
 
 
@@ -56,7 +57,7 @@ def get_routers(
 REPO_URL = "https://github.com/reasv/panoptikon-ui.git"
 
 
-def run_node_client(hostname: str, port: int, parent_url: str):
+def run_node_client(hostname: str, port: int):
     logger.info("Running Node.js client")
 
     client_dir = os.path.join(os.path.dirname(__file__), "panoptikon-ui")

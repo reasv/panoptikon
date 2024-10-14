@@ -372,6 +372,8 @@ def get_inference_api_client():
 
     if not os.getenv("INFERENCE_API_URL"):
         hostname = os.getenv("HOST", "127.0.0.1")
+        if hostname == "0.0.0.0":
+            hostname = "127.0.0.1"
         port = int(os.getenv("PORT", 6342))
         os.environ["INFERENCE_API_URL"] = f"http://{hostname}:{port}"
     return InferenceAPIClient(
