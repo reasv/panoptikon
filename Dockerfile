@@ -117,11 +117,6 @@ RUN npm install --include=dev && \
 # Expose the port for the application
 EXPOSE 6342
 
-# Set environment variables for the application
-ENV HOST=0.0.0.0 \
-    PORT=6342 \
-    DATA_FOLDER=data \
-    LOGLEVEL=INFO
 WORKDIR /app
 # Run the application within the virtual environment
 CMD ["poetry", "run", "panoptikon"]
