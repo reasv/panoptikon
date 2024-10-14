@@ -67,9 +67,6 @@ def run_node_client(hostname: str, port: int, parent_url: str):
     # Fetch the repository or pull the latest changes
     fetch_or_pull_repo(REPO_URL, client_dir)
 
-    # Set in case panoptikon is running somewhere else
-    panoptikon_public_url = os.getenv("PANOPTIKON_PUBLIC_URL", parent_url)
-
     # Check if build is needed based on the latest commit timestamp
     if is_build_needed(build_dir, client_dir):
         logger.info("Building the Next.js application...")
@@ -94,8 +91,6 @@ def run_node_client(hostname: str, port: int, parent_url: str):
         npx(
             ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
-            # stdout=subprocess.DEVNULL,
-            # env={"API_URL": panoptikon_public_url},
         )
 
     # Start the server in a new thread
