@@ -165,3 +165,18 @@ CLIENT_HOST=HOST
 CLIENT_PORT=6339
 ```
 Where to bind the Next.js UI. Defaults to the same host as the API server and port 6339.
+
+### DISABLE_CLIENT_UPDATE
+Default:
+```
+DISABLE_CLIENT_UPDATE="false"
+```
+
+Whether to disable the automatic update of the Next.js UI.
+You can set this to `true` to disable the automatic update of the UI when the server is restarted.
+If this is set to the default `false`, panoptikon will git pull the latest version of 
+the UI on startup from the repository "master" branch.
+This might break Panoptikon if the UI is not compatible with the current version of the server.
+If you're not planning on constantly keeping Panoptikon up to date, you should set this to `true` after the first run, to prevent the UI from being updated to a version that is incompatible with the server.
+
+After every update, you can set it to `false` again once to allow the UI to be updated on the next restart.

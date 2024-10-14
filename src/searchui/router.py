@@ -64,27 +64,29 @@ def run_node_client(hostname: str, port: int):
     build_dir = os.path.join(client_dir, ".next")
 
     logger.debug(f"Client directory: {client_dir}")
-
-    # Fetch the repository or pull the latest changes
-    fetch_or_pull_repo(REPO_URL, client_dir)
-
-    # Check if build is needed based on the latest commit timestamp
-    if is_build_needed(build_dir, client_dir):
-        logger.info("Building the Next.js application...")
-        # Install dependencies
-        delete_build_directory(build_dir)
-        npm(
-            ["install", "--include=dev"],
-            cwd=client_dir,
-            stdout=subprocess.DEVNULL,
-        )
-        npx(
-            ["--yes", "next@rc", "build"],
-            cwd=client_dir,
-            stdout=subprocess.DEVNULL,
-        )
+    if os.getenv("DISABLE_CLIENT_UPDATE", "false").lower() in ["1", "true"]:
+        logger.info("Client build is disabled. Skipping build step.")
     else:
-        logger.info("Build is up to date. Skipping build step.")
+        # Fetch the repository or pull the latest changes
+        fetch_or_pull_repo(REPO_URL, client_dir)
+
+        # Check if build is needed based on the latest commit timestamp
+        if is_build_needed(build_dir, client_dir):
+            logger.info("Building the Next.js application...")
+            # Install dependencies
+            delete_build_directory(build_dir)
+            npm(
+                ["install", "--include=dev"],
+                cwd=client_dir,
+                stdout=subprocess.DEVNULL,
+            )
+            npx(
+                ["--yes", "next@rc", "build"],
+                cwd=client_dir,
+                stdout=subprocess.DEVNULL,
+            )
+        else:
+            logger.info("Build is up to date. Skipping build step.")
 
     # Function to start the server in a separate thread
     def start_server():
