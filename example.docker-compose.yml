@@ -13,9 +13,9 @@ services:
       - ENABLE_CLIENT=true
       - CLIENT_HOST=0.0.0.0
       - CLIENT_PORT=6339
+      - DISABLE_CLIENT_UPDATE=true
     volumes:
       - ./data:/app/data
-      - ./panoptikon-ui:/app/src/searchui/panoptikon-ui
     deploy:
       resources:
         reservations:

@@ -4,7 +4,7 @@ FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 # Set DEBIAN_FRONTEND to noninteractive to avoid timezone configuration prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install necessary dependencies for building SQLite, Python, and other build tools
+# Install necessary dependencies for building SQLite, Python, Node.js, and other build tools
 RUN apt-get update && \
     apt-get install -y \
     software-properties-common \
@@ -68,6 +68,11 @@ RUN python3 -c "import sqlite3; print('SQLite has loadable extensions:', sqlite3
 RUN pip3 install --upgrade pip && \
     pip3 install poetry
 
+# Install Node.js (version 20+) and NPM
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g npm@latest
+
 # Create a directory for the application and add a non-root user
 RUN mkdir /app && \
     adduser --disabled-password --gecos '' appuser && \
@@ -78,6 +83,11 @@ WORKDIR /app
 
 # Copy the current directory contents into the container
 COPY . /app
+
+# Clone panoptikon-ui if not already present, to avoid issues with missing repository
+RUN if [ ! -d "/app/src/searchui/panoptikon-ui" ]; then \
+    git clone https://github.com/reasv/panoptikon-ui.git /app/src/searchui/panoptikon-ui; \
+    fi
 
 # Change ownership of app directory to the new user
 RUN chown -R appuser /app
@@ -92,6 +102,11 @@ ENV POETRY_VIRTUALENVS_CREATE=true \
 
 # Configure Poetry and install dependencies as appuser
 RUN poetry install --with inference
+
+# Set up Node.js project and build Next.js application
+WORKDIR /app/src/searchui/panoptikon-ui
+RUN npm install --include=dev && \
+    npx --yes next build
 
 # Expose the port for the application
 EXPOSE 6342

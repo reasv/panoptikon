@@ -8,15 +8,12 @@ from venv import logger
 
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
-from fastapi_proxy_lib.core.http import ReverseHttpProxy
-from fastapi_proxy_lib.core.websocket import ReverseWebSocketProxy
-from fastapi_proxy_lib.fastapi.router import RouterHelper
 from nodejs_wheel import npm, npx
 
 logger = logging.getLogger(__name__)
 
 
-def get_client_url(parent_hostname: str, parent_port: int) -> str:
+def get_client_url(parent_hostname: str) -> str:
     if url := os.getenv("CLIENT_URL"):
         return url
     else:
@@ -31,7 +28,7 @@ def get_client_url(parent_hostname: str, parent_port: int) -> str:
 def get_routers(
     parent_hostname: str, parent_port: int
 ) -> Tuple[APIRouter, str]:
-    client_url = get_client_url(parent_hostname, parent_port)
+    client_url = get_client_url(parent_hostname)
 
     logger.info(f"Client URL: {client_url}")
     router = APIRouter(
