@@ -15,7 +15,7 @@ services:
       - CLIENT_PORT=6339
     volumes:
       - ./data:/app/data
-      - ./ui:/app/src/searchui/panoptikon-ui
+      - ./panoptikon-ui:/app/src/searchui/panoptikon-ui
     deploy:
       resources:
         reservations:
