@@ -64,7 +64,7 @@ class DBInfo:
     "/api/db",
     summary="Get information about all available databases",
     description="""
-Get information about the database, including the names of all other available databases.
+Get the name of the current default databases and a list of all available databases.
 Most API endpoints support specifying the databases to use for index and user data
 through the `index_db` and `user_data_db` query parameters.
 Regardless of which database is currently being defaulted to by panoptikon,
@@ -89,7 +89,7 @@ class DBCreateResponse(BaseModel):
 
 
 @app.post(
-    "/api/db",
+    "/api/db/create",
     summary="Create new databases",
     description="""
 Create new databases with the specified names.
