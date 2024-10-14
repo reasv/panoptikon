@@ -122,6 +122,6 @@ ENV HOST=0.0.0.0 \
     PORT=6342 \
     DATA_FOLDER=data \
     LOGLEVEL=INFO
-
+WORKDIR /app
 # Run the application within the virtual environment
 CMD ["poetry", "run", "panoptikon"]
