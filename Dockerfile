@@ -103,6 +103,12 @@ ENV POETRY_VIRTUALENVS_CREATE=true \
 # Configure Poetry and install dependencies as appuser
 RUN poetry install --with inference
 
+ARG RESTRICTED_MODE
+ARG INFERENCE_API_URL
+ARG PANOPTIKON_API_URL
+ENV RESTRICTED_MODE=${RESTRICTED_MODE}
+ENV INFERENCE_API_URL=${INFERENCE_API_URL}
+ENV PANOPTIKON_API_URL=${PANOPTIKON_API_URL}
 # Set up Node.js project and build Next.js application
 WORKDIR /app/src/searchui/panoptikon-ui
 RUN npm install --include=dev && \
