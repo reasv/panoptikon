@@ -49,8 +49,12 @@ def get_item(
     try:
         item, files = get_item_metadata(conn, id, id_type)
         if item is None:
+            logger.error(f"Item not found: {id}")
             raise HTTPException(status_code=404, detail="Item not found")
         return item, files, conn_args
+    except Exception as e:
+        logger.error(f"Error getting item: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get item")
     finally:
         conn.close()
 
@@ -136,6 +140,7 @@ def get_item_thumbnail(
 ):
     item, files, conn_args = item_data
     if len(files) == 0:
+        logger.error(f"No file found for item {item.id}")
         raise HTTPException(status_code=404, detail="No file found for item")
     file = files[0]
     resp_type = "unknown"
