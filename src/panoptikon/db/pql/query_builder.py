@@ -65,6 +65,7 @@ def build_query(
         entity=input_query.entity,
     )
     root_cte_name: str | None = None
+    last_cte_name: str | None = None
     # Start the recursive processing
     if query_root:
         start = select(files.c.id.label("file_id"), files.c.item_id)
@@ -88,8 +89,7 @@ def build_query(
             state.selects[root_cte_name].context,
         )
         # We unwrap the root CTE, so its context becomes the last CTE in the chain
-        # ie, the root CTE.
-        root_cte_name = root_cte_context.name
+        last_cte_name = root_cte_context.name
         # We can take the file_id and item_id from the root CTE's context.
         # The context is the last CTE in the chain, so we can use it to get the file_id and item_id
         file_id, item_id = (
@@ -150,6 +150,7 @@ def build_query(
         file_id,
         data_id,
         root_cte_name,
+        last_cte_name=last_cte_name,
     )
     full_query = add_select_columns(input_query, full_query)
     # Add extra columns
@@ -291,11 +292,14 @@ def add_joins(
     file_id: Label,
     data_id: Label | None,
     root_cte_name: str | None,
+    last_cte_name: str | None = None,
 ) -> Select:
     # Deduplicate the targets by .name
     targets = list({target.name: target for target in targets}.values())
     for target in targets:
         if target.name == root_cte_name:
+            continue
+        if target.name == last_cte_name:
             continue
         join_cond = target.c.file_id == file_id
         if data_id is not None:
