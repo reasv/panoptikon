@@ -50,10 +50,17 @@ def search_pql(
             logger.debug(f"Params: {count_params_ordered}")
         except Exception as e:
             logger.error(f"Error executing query: {e}")
-            debug_string, _ = get_sql(count_stmt, binds=True)
-            logger.error(debug_string)
-            logger.error(count_params_ordered)
-            raise e
+            try:
+                debug_string, _ = get_sql(count_stmt, binds=True)
+                logger.error(debug_string)
+                logger.error(count_params_ordered)
+                raise e
+            except Exception as e:
+                logger.error(f"Error getting debug string: {e}")
+                debug_string, _ = get_sql(count_stmt, binds=False)
+                logger.error(debug_string)
+                logger.error(count_params_ordered)
+                raise e
         total_count: int = cursor.fetchone()[0]
     else:
         total_count = 0
