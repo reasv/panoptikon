@@ -87,6 +87,9 @@ def build_query(
             state.selects[root_cte_name].select,
             state.selects[root_cte_name].context,
         )
+        # We unwrap the root CTE, so its context becomes the last CTE in the chain
+        # ie, the root CTE.
+        root_cte_name = root_cte_context.name
         # We can take the file_id and item_id from the root CTE's context.
         # The context is the last CTE in the chain, so we can use it to get the file_id and item_id
         file_id, item_id = (
