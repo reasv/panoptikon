@@ -78,7 +78,7 @@ def run_node_client(hostname: str, port: int):
                 stdout=subprocess.DEVNULL,
             )
             npx(
-                ["--yes", "next@rc", "build"],
+                ["--yes", "next", "build"],
                 cwd=client_dir,
                 stdout=subprocess.DEVNULL,
             )
@@ -91,7 +91,7 @@ def run_node_client(hostname: str, port: int):
         if public_api := os.getenv("PANOPTIKON_API_URL"):
             logger.info(f"API URL for client: {public_api}")
         npx(
-            ["--yes", "next@rc", "start", "-p", str(port), "-H", hostname],
+            ["--yes", "next", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
         )
 
