@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi_utilities.repeat.repeat_every import repeat_every
+from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
 from inferio.impl.clip import ClipModel
@@ -214,6 +215,25 @@ def clear_cache(cache_key: str):
     return StatusResponse(status="cleared")
 
 
+class CacheKeyResponse(BaseModel):
+    expirations: Dict[str, str]
+
+
+@router.get(
+    "/cache/{cache_key}",
+    summary="Get expiration times for all models in a cache",
+    description="Returns a mapping of `inference_id`s for all models in the cache to their expiration times.",
+)
+async def get_cache_expiration(cache_key: str) -> CacheKeyResponse:
+    expire_dict = ModelManager().get_ttl_expiration(cache_key)
+    return CacheKeyResponse(
+        expirations={
+            inference_id: expiration_time.isoformat()
+            for inference_id, expiration_time in expire_dict.items()
+        }
+    )
+
+
 @dataclass
 class CacheListResponse:
     cache: Dict[str, List[str]]
@@ -235,7 +255,7 @@ async def get_cached_models():
     description="Returns metadata for all available `inference_id`s, divided by group.",
     response_model=Dict[str, Dict[str, Any]],
 )
-async def get_metadata() -> Dict[str, Dict[str, Any]]:
+def get_metadata() -> Dict[str, Dict[str, Any]]:
     return ModelRegistry().list_inference_ids()
 
 

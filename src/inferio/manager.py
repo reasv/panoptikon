@@ -137,11 +137,13 @@ class ModelManager:
                     self._unload_model(inference_id)
 
     def list_loaded_models(self) -> Dict[str, List[str]]:
-        with self._lock:
-            return {
-                inference_id: list(cache_keys)
-                for inference_id, cache_keys in self._cache_key_map.items()
-            }
+        return {
+            inference_id: list(cache_keys)
+            for inference_id, cache_keys in self._cache_key_map.items()
+        }
+
+    def get_ttl_expiration(self, cache_key: str) -> Dict[str, datetime]:
+        return dict(self._lru_caches[cache_key])
 
     def check_ttl_expired(self) -> None:
         """Check for expired TTLs and remove them from the cache."""
