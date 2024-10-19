@@ -62,9 +62,3 @@ def try_cronjob(index_db: str):
         # Update the schedule after running the task
         update_schedule(index_db=index_db)
         logger.info(f"Next scheduled time: {next_scheduled_time.get(index_db)}")
-
-
-def try_cronjobs():
-    # Loop through all the index dbs
-    for index_db in get_db_lists()[0]:
-        try_cronjob(index_db=index_db)
