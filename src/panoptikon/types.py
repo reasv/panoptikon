@@ -192,6 +192,7 @@ class SystemConfig(BaseModel):
     job_settings: List[JobSettings] = field(default_factory=list)
     included_folders: List[str] = field(default_factory=list)
     excluded_folders: List[str] = field(default_factory=list)
+    preload_embedding_models: bool = Field(default=False)
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]

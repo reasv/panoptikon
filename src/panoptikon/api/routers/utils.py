@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Query
 from PIL import Image, ImageDraw, ImageFont
@@ -30,7 +30,7 @@ def get_db_readonly(
         None,
         description="The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
     ),
-) -> Dict[str, str | bool | None]:
+) -> Dict[str, Any]:
     check_dbs(index_db, user_data_db)
     index, user_data = get_db_default_names()
     if not index_db:

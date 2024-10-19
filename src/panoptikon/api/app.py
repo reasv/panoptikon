@@ -14,6 +14,7 @@ import panoptikon.api.routers.bookmarks as bookmarks
 import panoptikon.api.routers.items as items
 import panoptikon.api.routers.search as search
 from panoptikon.api.cronjob.schedule import try_cronjob
+from panoptikon.api.preload import preload_embedding_models
 from panoptikon.api.routers import jobs
 from panoptikon.api.routers.utils import get_db_readonly
 from panoptikon.db import (
@@ -45,6 +46,7 @@ def cronjob():
     # Loop through all the index dbs
     for index_db in get_db_lists()[0]:
         try_cronjob(index_db=index_db)
+        preload_embedding_models(index_db=index_db)
 
 
 app = FastAPI(lifespan=lifespan)
