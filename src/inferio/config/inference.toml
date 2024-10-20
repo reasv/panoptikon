@@ -135,7 +135,7 @@ microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_na
 [group.tclip]
 config = { impl_class = "openclip" }
 [group.tclip.metadata]
-description = "Generate Text Embeddings from extracted text using OpenAI's CLIP model for semantic image search. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
+description = "Generate Text Embeddings from extracted text using OpenAI's CLIP model. This is exclusively meant for cross-modal item similarity search. For semantic text search, use the `Text Embeddings` model group. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
 name = "CLIP Text Embeddings"
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 default_batch_size = 64
