@@ -68,11 +68,6 @@ RUN python3 -c "import sqlite3; print('SQLite has loadable extensions:', sqlite3
 RUN pip3 install --upgrade pip && \
     pip3 install poetry
 
-# Install Node.js (version 20+) and NPM
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && \
-    npm install -g npm@latest
-
 # Create a directory for the application and add a non-root user
 RUN mkdir /app && \
     adduser --disabled-password --gecos '' appuser && \
@@ -83,11 +78,6 @@ WORKDIR /app
 
 # Copy the current directory contents into the container
 COPY . /app
-
-# Clone panoptikon-ui if not already present, to avoid issues with missing repository
-RUN if [ ! -d "/app/src/searchui/panoptikon-ui" ]; then \
-    git clone https://github.com/reasv/panoptikon-ui.git /app/src/searchui/panoptikon-ui; \
-    fi
 
 # Change ownership of app directory to the new user
 RUN chown -R appuser /app
@@ -103,20 +93,11 @@ ENV POETRY_VIRTUALENVS_CREATE=true \
 # Configure Poetry and install dependencies as appuser
 RUN poetry install --with inference
 
-ARG RESTRICTED_MODE
-ARG INFERENCE_API_URL
-ARG PANOPTIKON_API_URL
-ENV RESTRICTED_MODE=${RESTRICTED_MODE}
-ENV INFERENCE_API_URL=${INFERENCE_API_URL}
-ENV PANOPTIKON_API_URL=${PANOPTIKON_API_URL}
-# Set up Node.js project and build Next.js application
-WORKDIR /app/src/searchui/panoptikon-ui
-RUN npm install --include=dev && \
-    npx --yes next build
+ENV ENABLE_CLIENT=false
+ENV DISABLE_CLIENT_UPDATE=true
 
 # Expose the port for the application
 EXPOSE 6342
 
-WORKDIR /app
 # Run the application within the virtual environment
 CMD ["poetry", "run", "panoptikon"]
