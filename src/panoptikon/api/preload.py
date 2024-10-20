@@ -64,7 +64,7 @@ def preload_embedding_models(index_db: str, ttl: int = 3600):
                     f"preload[{index_db}]", len(embedding_setters), ttl
                 )
                 next_renewal_times[index_db][setter] = current_time + timedelta(
-                    seconds=ttl
+                    seconds=max(ttl - 130, 60)  # Renew >2 minutes before expiry
                 )
     except Exception as e:
         logger.error(
