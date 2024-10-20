@@ -15,7 +15,7 @@ services:
       - DISABLE_CLIENT_UPDATE=true
     volumes:
       - ./data:/app/data
-#      - /imagefolder:/imagefolder
+      - ${FILE_FOLDER_PATH}:/files
     deploy:
       resources:
         reservations:
