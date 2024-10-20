@@ -42,24 +42,15 @@ services:
     depends_on:
       - panoptikon
 
-  nginx-normal:
+  nginx:
     image: nginx:latest
-    container_name: nginx-normal
-    ports:
-      - "6340:80"  # Exposed port for Normal Mode
-    volumes:
-      - ./nginx-config/nginx-normal.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - panoptikon-ui-private
-      - panoptikon
-
-  nginx-restricted:
-    image: nginx:latest
-    container_name: nginx-restricted
+    container_name: nginx
     ports:
       - "6339:80"  # Exposed port for Restricted Mode
+      - "6340:8080"  # Exposed port for Normal Mode
     volumes:
-      - ./nginx-config/nginx-restricted.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx-config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
+      - panoptikon-ui-private
       - panoptikon-ui-public
       - panoptikon
