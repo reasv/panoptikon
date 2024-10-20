@@ -1,25 +1,65 @@
+version: '3.8'
+
 services:
   panoptikon:
     build: .
     container_name: panoptikon
     ports:
       - "6342:6342"
-      - "6339:6339"
     environment:
-      - HOST=127.0.0.1
+      - HOST=0.0.0.0
       - PORT=6342
       - DATA_FOLDER=data
       - LOGLEVEL=INFO
-      - ENABLE_CLIENT=true
-      - CLIENT_HOST=0.0.0.0
-      - CLIENT_PORT=6339
+      - ENABLE_CLIENT=false
       - DISABLE_CLIENT_UPDATE=true
     volumes:
       - ./data:/app/data
+#      - /imagefolder:/imagefolder
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [ gpu ]
+              capabilities: [gpu]
+
+  panoptikon-ui:
+    image: ghcr.io/reasv/panoptikon-ui:master
+    container_name: panoptikon-ui
+    environment:
+      - PANOPTIKON_API_URL=http://panoptikon:6342
+      - RESTRICTED_MODE=true
+    depends_on:
+      - panoptikon
+
+  panoptikon-ui-private:
+    image: ghcr.io/reasv/panoptikon-ui:master
+    container_name: panoptikon-ui-private
+    environment:
+      - PANOPTIKON_API_URL=http://panoptikon:6342
+      - RESTRICTED_MODE=false
+    depends_on:
+      - panoptikon
+
+  nginx-normal:
+    image: nginx:latest
+    container_name: nginx-normal
+    ports:
+      - "6340:80"  # Exposed port for Normal Mode
+    volumes:
+      - ./nginx-config/nginx-normal.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - panoptikon-ui
+      - panoptikon
+
+  nginx-restricted:
+    image: nginx:latest
+    container_name: nginx-restricted
+    ports:
+      - "6339:80"  # Exposed port for Restricted Mode
+    volumes:
+      - ./nginx-config/nginx-restricted.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - panoptikon-ui-private
+      - panoptikon
