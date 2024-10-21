@@ -1,4 +1,21 @@
 services:
+  inferio:
+    build: .
+    container_name: inferio
+    environment:
+      - INFERIO_HOST=0.0.0.0
+      - INFERIO_PORT=7777
+      - LOGLEVEL=INFO
+    volumes:
+      - ./inferio:/app/data
+    entrypoint: [ "poetry", "run", "inferio" ]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
   panoptikon:
     build: .
     container_name: panoptikon
@@ -9,23 +26,19 @@ services:
       - LOGLEVEL=INFO
       - ENABLE_CLIENT=false
       - DISABLE_CLIENT_UPDATE=true
+      - INFERENCE_API_URL=http://inferio:7777
     volumes:
       - ./data:/app/data
       - ${FILE_FOLDER_PATH}:/files
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
-
+    depends_on:
+      - inferio
   panoptikon-ui-private:
     # Normal Mode (Private)
     image: ghcr.io/reasv/panoptikon-ui:master
     container_name: panoptikon-ui-private
     environment:
       - PANOPTIKON_API_URL=http://panoptikon:6342
+      - INFERENCE_API_URL=http://inferio:7777
       - RESTRICTED_MODE=false
     depends_on:
       - panoptikon
@@ -36,6 +49,7 @@ services:
     container_name: panoptikon-ui-public
     environment:
       - PANOPTIKON_API_URL=http://panoptikon:6342
+      - INFERENCE_API_URL=http://inferio:7777
       - RESTRICTED_MODE=true
     depends_on:
       - panoptikon
