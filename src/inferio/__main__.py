@@ -13,6 +13,9 @@ async def lifespan(app: FastAPI):
 
 
 def launch_app():
+    from panoptikon.log import setup_logging
+
+    setup_logging()
     app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     import uvicorn
