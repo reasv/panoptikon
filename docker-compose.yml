@@ -6,8 +6,9 @@ services:
       - INFERIO_HOST=0.0.0.0
       - INFERIO_PORT=7777
       - LOGLEVEL=INFO
+      - LOGS_FILE=/logs/inferio.log
     volumes:
-      - ./inferio:/app/data
+      - ./inferio:/logs
     entrypoint: [ "poetry", "run", "inferio" ]
     deploy:
       resources:
