@@ -23,7 +23,9 @@ The intended use of Panoptikon is for power users and more technically minded en
 
 Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them around after they've been indexed. You only need to make sure to re-run the file scan job after moving or renaming files to update the index with the new paths. It's also possible to configure Panoptikon to automatically re-scan directories at regular intervals through the cron job feature.
 
-<img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
+<a href="https://panoptikon.dev/search">
+  <img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
+</a>
 
 ### Warning
 
@@ -33,7 +35,7 @@ Panoptikon is designed to be used as a local service and is not intended to be e
 
 The only configuration that we endorse for a public Panoptikon instance is the provided docker-compose file, which exposes two separate services running on ports 6339 and 6340, respectively. The former is meant to be exposed publicly and blocks access to all dangerous APIs, while the second one is to be used as a private admin panel and has no restrictions on usage or API access. There is no authentication, although HTTP Basic Auth can easily be added to the Nginx configuration file if needed.
 
-This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev) as a public demonstration instance for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
+This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev/search) as a public demonstration instance for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
 
 Panoptikon is also not designed with high concurrency in mind, and the public instance may be slow or unresponsive at times if many users are accessing it simultaneously, especially when it comes to the inference server and related semantic search features. This is because requests to the inference server's prediction endpoint are neither debounced nor automatically batched, which means it will only handle one request at a time for all users, and the instant search box will make a request for every keystroke.
 
