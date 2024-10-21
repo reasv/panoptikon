@@ -20,6 +20,8 @@ The intended use of Panoptikon is for power users and more technically minded en
 Unlike tools such as Hydrus, Panoptikon will never copy, move or otherwise touch your files. Simply add your directories to the list of allowed paths, and run the indexing jobs.
 Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them, so long as they remain within one of the directory trees Panoptikon has access to, and so long as you run the File Scan job regularly, or enable the scheduled cronjob.
 
+<img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
+
 ### Warning
 Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features, exposes, among other things, an API that can be used for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
 ### Public Instance
