@@ -2,8 +2,6 @@ services:
   panoptikon:
     build: .
     container_name: panoptikon
-    ports:
-      - "6342:6342"
     environment:
       - HOST=0.0.0.0
       - PORT=6342
@@ -20,9 +18,10 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
-  panoptikon-ui-private: # Normal Mode (Private)
+  panoptikon-ui-private:
+    # Normal Mode (Private)
     image: ghcr.io/reasv/panoptikon-ui:master
     container_name: panoptikon-ui-private
     environment:
@@ -31,7 +30,8 @@ services:
     depends_on:
       - panoptikon
 
-  panoptikon-ui-public: # Restricted Mode
+  panoptikon-ui-public:
+    # Restricted Mode (Public)
     image: ghcr.io/reasv/panoptikon-ui:master
     container_name: panoptikon-ui-public
     environment:
@@ -44,8 +44,8 @@ services:
     image: nginx:latest
     container_name: nginx
     ports:
-      - "6339:80"  # Exposed port for Restricted Mode
-      - "6340:8080"  # Exposed port for Normal Mode
+      - "6339:80" # Exposed port for Restricted Mode
+      - "6340:8080" # Exposed port for Normal Mode
     volumes:
       - ./nginx-config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
