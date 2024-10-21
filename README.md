@@ -23,10 +23,7 @@ The intended use of Panoptikon is for power users and more technically minded en
 
 Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them around after they've been indexed. You only need to make sure to re-run the file scan job after moving or renaming files to update the index with the new paths. It's also possible to configure Panoptikon to automatically re-scan directories at regular intervals through the cron job feature.
 
-<a
-  href="https://panoptikon.dev/search"
-  target="_blank"
->
+<a href="https://panoptikon.dev/search" target="_blank">
   <img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
 </a>
 
