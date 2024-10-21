@@ -174,5 +174,3 @@ data/
 !/cudnn/.gitpreserve
 
 /src/searchui/panoptikon-ui/
-
-docker-compose.yml
