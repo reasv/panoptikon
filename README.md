@@ -21,7 +21,17 @@ Unlike tools such as Hydrus, Panoptikon will never copy, move or otherwise touch
 Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them, so long as they remain within one of the directory trees Panoptikon has access to, and so long as you run the File Scan job regularly, or enable the scheduled cronjob.
 
 ### Warning
-Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any security features, and currently exposes, among other things, an API to access *all* your files, even outside of explicitly indexed directories. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
+Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features, exposes, among other things, an API that can be used for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
+### Public Instance
+The only configuration that we endorse for exposing Panoptikon to the internet is through the provided docker-compose file, which exposes two separate services, running on ports 6339 and 6340. The former is meant to be exposed publicly, and blocks access to all dangerous APIs, while the second is to be used as a private admin panel and has no restrictions. There is no authentication.
+
+This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev) as a public demonstration instance for users to try panoptikon before installing it locally.
+Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
+
+The public instance currently contains a small subset of images from the [latentcat/animesfw](https://huggingface.co/datasets/latentcat/animesfw) dataset.
+
+Although large parts of the API are disabled in the public instance, you can still consult the full API documentation at [panoptikon.dev/docs](https://panoptikon.dev/docs).
+
 
 ## REST API
 Panoptikon exposes a REST API that can be used to interact with the search and bookmarking functionality programmatically, as well as to retrieve the indexed data, the actual files, and their associated metadata.

@@ -59,8 +59,8 @@ services:
     image: nginx:latest
     container_name: nginx
     ports:
-      - "6339:80" # Exposed port for Restricted Mode
-      - "6340:8080" # Exposed port for Normal Mode
+      - "6339:80" # Exposed port for Restricted Mode (Public)
+      - "6340:8080" # Exposed port for Normal Mode (Private)
     volumes:
       - ./nginx-config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
