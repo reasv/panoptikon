@@ -1,3 +1,9 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+from panoptikon.log import setup_logging
+
+setup_logging()
 import os
 
 from fastapi import FastAPI
@@ -13,9 +19,6 @@ async def lifespan(app: FastAPI):
 
 
 def launch_app():
-    from panoptikon.log import setup_logging
-
-    setup_logging()
     app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     import uvicorn
