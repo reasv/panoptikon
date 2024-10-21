@@ -8,27 +8,36 @@
 ## State of the art, local, multimodal, multimedia search engine
 Panoptikon indexes your local files using state-of-the-art AI and Machine learning models and makes difficult-to-search media such as images and videos easily findable.
 
-Combining OCR, Whisper Speech To Text, CLIP Image Embeddings, Text Embeddings, Full Text Search, Automated Tagging, Automated Image Captioning, Panoptikon is the swiss army knife of local media indexing. 
+Combining OCR, Whisper Speech To Text, CLIP Image Embeddings, Text Embeddings, Full Text Search, Automated Tagging, and Automated Image Captioning, Panoptikon is the swiss army knife of local media indexing. 
 
 Panoptikon aims to be the `text-generation-webui` or `stable-diffusion-webui` for search.
-It is fully customizable, and allows you to easily configure custom models for any of the supported tasks. It comes with a wealth of capable models available out of the box, but adding another model or a newer finetune is never more than a few TOML configuration lines away.
-As long as a model is supported by any of the built-in implementation classes (Among other things, supporting OpenCLIP, Sentence Transformers, Faster Whisper) you can simply add the huggingface repo for your custom model to the inference server configuration, and it will immediately be available for use.
+It is fully customizable, also allowing you to easily configure custom models for any of the supported tasks. It comes with a wealth of capable models which are available out of the box, and adding another one or updating to a newer finetune is never more than a few TOML configuration lines away.
+As long as a model is supported by any of the built-in implementation classes (Supporting, among others, OpenCLIP, Sentence Transformers, and Faster Whisper) you can simply add it to the inference server configuration, specifying the huggingface repo, and it will immediately be available for use.
 
-Panoptikon is designed to keep the index data from multiple models (or different configurations of the same model) **side by side**, letting you choose which one(s) to use *at search time*. As such, Panoptikon is an excellent tool for the purpose of comparing the real-world performance of different methods of data extraction or embedding models, also allowing you to leverage their combined power instead of only relying on one. For example, when searching for a tag, you can configure a list of tagging models to use, and choose whether to match an item if at least one model has set the tags you're searching for, or whether to require that all of them have.
+Panoptikon is designed to keep index data produced by multiple different models (or different configurations of the same model) **side by side**, letting you choose which one(s) to use *at search time*. As such, Panoptikon is an excellent tool for comparing the real-world performance of different methods of data extraction or embedding models, also allowing you to leverage their combined power instead of only relying on the accuracy of one.
 
-The intended use of Panoptikon is for power users and more technically minded enthusiasts to leverage more powerful or custom open source models to index and search their files.
-Unlike tools such as Hydrus, Panoptikon will never copy, move or otherwise touch your files. Simply add your directories to the list of allowed paths, and run the indexing jobs.
-Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them, so long as they remain within one of the directory trees Panoptikon has access to, and so long as you run the File Scan job regularly, or enable the scheduled cronjob.
+For example, when searching with a given tag, you can pick multiple tagging models from a list, and choose whether to match an item if at least one model has set the tag(s) you're searching for, or to require that all of them have.
+
+The intended use of Panoptikon is for power users and more technically minded enthusiasts to leverage more capable and/or custom trained open source models to index and search their files.
+Unlike tools such as Hydrus, Panoptikon will never copy, move or otherwise touch your data. You only need to add your directories to the list of allowed paths, and run the indexing jobs.
+Panoptikon will build an index inside its own SQLite database, referencing the original source file paths. Files are kept track of by their hash, so there's no issue with renaming or moving them around after they've been indexed.
+You only need to make sure to re-run the file scan job after moving or renaming files, to update the index with the new paths. It's also possible to configure Panoptikon to automatically re-scan directories at regular intervals through the cron job feature.
 
 <img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
 
 ### Warning
-Panoptikon is designed as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features, exposes, among other things, an API that can be used for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
+Panoptikon is designed to be used as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features, and exposes, among other things, an API that can be abused for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
 ### Public Instance
-The only configuration that we endorse for exposing Panoptikon to the internet is through the provided docker-compose file, which exposes two separate services, running on ports 6339 and 6340. The former is meant to be exposed publicly, and blocks access to all dangerous APIs, while the second is to be used as a private admin panel and has no restrictions. There is no authentication.
+The only configuration that we endorse for a public Panoptikon instance is the provided docker-compose file, which exposes two separate services, running on ports 6339 and 6340 respectively. The former is meant to be exposed publicly, and blocks access to all dangerous APIs, while the second one is to be used as a private admin panel and has no restrictions on usage or API access. There is no authentication, although HTTP-Basic-Auth can easily be added to the nginx configuration file if needed.
 
 This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev) as a public demonstration instance for users to try panoptikon before installing it locally.
 Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
+Panoptikon is also not designed with high concurrency in mind, and the public instance may be slow or unresponsive at times if many users are accessing it simultaneously, especially when it comes to the inference server and related Semantic Search features. This is because requests to the inference server's prediction endpoint are neither debounced nor automatically batched, which means it will only handle one request at a time for all users, and the instant search box will make a request for every keystroke.
+
+The public instance is meant for demonstration purposes only, to show the capabilities of Panoptikon to interested users. If one wanted to host a public Panoptikon instance for
+real-world use, it would be necessary to add authentication and rate limiting to the API, as well as to optimize the inference server to batch concurrent requests.
+
+Panoptikon's search API is not tightly coupled to the inference server, and it would be possible to implement a caching layer or a queue system to handle inference requests more efficiently, and without modifying Panoptikon's source code, it would be possible to use a different inference server implementation that supports batching and concurrency, then simply pass the embeddings to Panoptikon's search API.
 
 The public instance currently contains a small subset of images from the [latentcat/animesfw](https://huggingface.co/datasets/latentcat/animesfw) dataset.
 
