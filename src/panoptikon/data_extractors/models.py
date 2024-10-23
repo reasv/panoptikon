@@ -5,12 +5,13 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
 import panoptikon.data_extractors.extraction_jobs.types as job_types
-from panoptikon.db.rules.types import (
-    MimeFilter,
-    ProcessedExtractedDataFilter,
-    ProcessedItemsFilter,
-    RuleItemFilters,
+from panoptikon.db.pql.filters.kvfilters import Match, MatchOps, MatchValues
+from panoptikon.db.pql.filters.processed_extracted_data import (
+    DerivedDataArgs,
+    HasUnprocessedData,
 )
+from panoptikon.db.pql.filters.processed_items import HasDataFrom
+from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
 from panoptikon.types import OutputDataType, TargetEntityType
@@ -66,27 +67,35 @@ class ModelOpts(ABC):
     def supported_mime_types(cls) -> List[str] | None:
         return None
 
-    def item_extraction_rules(self) -> RuleItemFilters:
-        rules = []
+    def item_extraction_rules(self) -> AndOperator:
+        item_filter = AndOperator(and_=[])
+        mime_types = self.supported_mime_types()
+        if mime_types:
+            item_filter.and_.append(
+                Match(
+                    match=MatchOps(
+                        in_=MatchValues(
+                            type=mime_types,
+                        )
+                    )
+                )
+            )
         target_entities = self.target_entities()
         if "items" in target_entities:
-            rules.append(ProcessedItemsFilter(setter_name=self.setter_name()))
+            item_filter.and_.append(
+                NotOperator(not_=HasDataFrom(has_data_from=self.setter_name()))
+            )
         else:
-            rules.append(
-                ProcessedExtractedDataFilter(
-                    setter_name=self.setter_name(),
-                    data_types=target_entities,  # type: ignore
+            item_filter.and_.append(
+                HasUnprocessedData(
+                    has_data_unprocessed=DerivedDataArgs(
+                        setter_name=self.setter_name(),
+                        data_types=target_entities,
+                    )
                 )
             )
 
-        mime_types = self.supported_mime_types()
-        if mime_types:
-            rules.append(
-                MimeFilter(
-                    mime_type_prefixes=mime_types,
-                )
-            )
-        return RuleItemFilters(positive=rules, negative=[])
+        return item_filter
 
     @classmethod
     @abstractmethod

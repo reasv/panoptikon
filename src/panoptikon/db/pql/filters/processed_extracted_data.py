@@ -6,6 +6,7 @@ from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.filters.filter import Filter
 from panoptikon.db.pql.types import QueryState, get_std_cols, get_std_group_by
+from panoptikon.types import TargetEntityType
 
 
 class DerivedDataArgs(BaseModel):
@@ -13,7 +14,7 @@ class DerivedDataArgs(BaseModel):
         ...,
         title="Name of the setter that would produce the derived data",
     )
-    data_types: List[str] = Field(
+    data_types: List[TargetEntityType] | List[str] = Field(
         ...,
         title="Data types that the associated data must have",
     )
