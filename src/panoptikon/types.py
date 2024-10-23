@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union
 
 from pydantic import BaseModel, Field
 
+from panoptikon.db.pql.pql_model import QueryElement
+
 if TYPE_CHECKING:
     from panoptikon.data_extractors.models import ModelOpts
 
@@ -179,6 +181,11 @@ class CronJob(BaseModel):
     threshold: Optional[float] = None
 
 
+class JobFilter(BaseModel):
+    setter_names: List[str] = field(default_factory=list)
+    pql_query: QueryElement
+
+
 class SystemConfig(BaseModel):
     remove_unavailable_files: bool = Field(default=True)
     scan_images: bool = Field(default=True)
@@ -193,6 +200,7 @@ class SystemConfig(BaseModel):
     included_folders: List[str] = field(default_factory=list)
     excluded_folders: List[str] = field(default_factory=list)
     preload_embedding_models: bool = Field(default=False)
+    job_filters: List[JobFilter] = field(default_factory=list)
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
