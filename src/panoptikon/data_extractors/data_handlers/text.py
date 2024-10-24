@@ -1,16 +1,16 @@
 import sqlite3
 from typing import Any, Dict, Sequence
 
+from panoptikon.data_extractors.extraction_jobs.types import JobInputData
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
-from panoptikon.types import ItemData
 
 
 def handle_text(
     conn: sqlite3.Connection,
     job_id: int,
     setter_name: str,
-    item: ItemData,
+    item: JobInputData,
     text_results: Sequence[Dict[str, Any]],
 ):
     """

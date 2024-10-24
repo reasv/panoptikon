@@ -5,11 +5,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 
 from panoptikon.data_extractors.data_handlers.utils import from_dict
-from panoptikon.data_extractors.extraction_jobs.types import TagResult
+from panoptikon.data_extractors.extraction_jobs.types import (
+    JobInputData,
+    TagResult,
+)
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
 from panoptikon.db.tags import add_tag_to_item
-from panoptikon.types import ItemData
 
 
 def mcut_threshold(probs: np.ndarray) -> float:
@@ -89,7 +91,7 @@ def handle_tag_result(
     conn: sqlite3.Connection,
     job_id: int,
     setter_name: str,
-    item: ItemData,
+    item: JobInputData,
     results: Sequence[Dict[str, Any]],
 ):
     if len(results) == 0:

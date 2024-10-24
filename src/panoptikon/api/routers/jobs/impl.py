@@ -14,13 +14,16 @@ from panoptikon.db.extraction_log import (
     remove_incomplete_jobs,
 )
 from panoptikon.db.utils import vacuum_database
-from panoptikon.folders import is_resync_needed, rescan_all_folders, update_folder_lists
+from panoptikon.folders import (
+    is_resync_needed,
+    rescan_all_folders,
+    update_folder_lists,
+)
 
 logger = logging.getLogger(__name__)
 
-def run_folder_update(
-    conn_args: Dict[str, Any]
-):
+
+def run_folder_update(conn_args: Dict[str, Any]):
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
@@ -29,28 +32,41 @@ def run_folder_update(
         cursor = conn.cursor()
         # Begin a transaction
         cursor.execute("BEGIN")
-        update_result = update_folder_lists(
-            conn,
-            system_config
-        )
-        logger.info(f"""
+        update_result = update_folder_lists(conn, system_config)
+        logger.info(
+            f"""
         Included folders added (and scanned): {", ".join(update_result.included_added)} ({len(update_result.scan_ids)});
-        """)
+        """
+        )
         if update_result.excluded_added:
-            logger.info(f"Excluded folders added: {", ".join(update_result.excluded_added)};")
+            logger.info(
+                f"Excluded folders added: {", ".join(update_result.excluded_added)};"
+            )
         if update_result.included_deleted or update_result.excluded_deleted:
-            logger.info(f"Removed {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;")
+            logger.info(
+                f"Removed {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;"
+            )
         if update_result.unavailable_files_deleted:
-            logger.info(f"Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;")
+            logger.info(
+                f"Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;"
+            )
         if update_result.excluded_folder_files_deleted:
-            logger.info(f"Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;")
+            logger.info(
+                f"Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;"
+            )
         if update_result.orphan_files_deleted:
-            logger.info(f"Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;")
+            logger.info(
+                f"Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;"
+            )
         if update_result.rule_files_deleted:
-            logger.info(f"Removed {update_result.rule_files_deleted} files from the database that were not allowed by user rules;")
+            logger.info(
+                f"Removed {update_result.rule_files_deleted} files from the database that were not allowed by user rules;"
+            )
         if update_result.orphan_items_deleted:
-            logger.info(f"Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed.")
-        
+            logger.info(
+                f"Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed."
+            )
+
         conn.commit()
         vacuum_database(conn)
     except Exception as e:
@@ -93,6 +109,7 @@ def rescan_folders(conn_args: Dict[str, Any]):
     finally:
         conn.close()
 
+
 def delete_model_data(
     inference_id: str,
     conn_args: Dict[str, Any],
@@ -110,6 +127,7 @@ def delete_model_data(
     finally:
         conn.close()
 
+
 def delete_job_data(
     log_id: int,
     conn_args: Dict[str, Any],
@@ -126,6 +144,7 @@ def delete_job_data(
     finally:
         conn.close()
 
+
 def run_data_extraction_job(
     inference_id: str,
     batch_size: int | None,
@@ -139,7 +158,9 @@ def run_data_extraction_job(
     finally:
         conn.close()
     if resync_needed:
-        logger.info("Folders in config changed. Resync needed, running folder update")
+        logger.info(
+            "Folders in config changed. Resync needed, running folder update"
+        )
         run_folder_update(conn_args)
 
     model = ModelOptsFactory.get_model(inference_id)
@@ -166,20 +187,25 @@ def run_data_extraction_job(
         total_time_pretty = str(total_time).split(".")[0]
         conn.commit()
         failed_str = ", ".join(failed)
-        logger.info(f"""
+        logger.info(
+            f"""
         Extraction completed for model {model} in {total_time_pretty}.
         Successfully processed {images} images and {videos} videos,
         and {other} other file types.
         The model processed a total of {units} individual pieces of data.
         {len(failed)} files failed to process due to errors.
-        """)
+        """
+        )
         if len(failed) > 0:
             logger.info(f"Failed files: {failed_str}")
         logger.info(f"Running vacuum and analyze on database")
         vacuum_database(conn)
         conn.commit()
     except Exception as e:
-        logger.error(f"Data extraction job for model {model} failed with error: {e}")
+        logger.error(
+            f"Data extraction job for model {model} failed with error: {e}",
+            exc_info=True,
+        )
         conn.rollback()
         cursor = conn.cursor()
         cursor.execute("BEGIN")

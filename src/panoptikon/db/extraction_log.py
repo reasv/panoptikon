@@ -1,6 +1,6 @@
+import os
 import sqlite3
 from datetime import datetime
-from time import time
 from typing import TYPE_CHECKING, List, Sequence, Tuple
 
 from panoptikon.db.setters import get_setter_id
@@ -12,11 +12,7 @@ import logging
 
 from panoptikon.db import get_item_id
 from panoptikon.db.files import get_existing_file_for_sha256
-from panoptikon.db.rules.build_filters import build_multirule_query
-from panoptikon.db.rules.rules import get_rules_for_setter
-from panoptikon.db.rules.types import combine_rule_item_filters
-from panoptikon.db.utils import pretty_print_SQL
-from panoptikon.types import ItemData, LogRecord, OutputDataType
+from panoptikon.types import LogRecord, OutputDataType
 
 logger = logging.getLogger(__name__)
 
@@ -280,71 +276,47 @@ def get_items_missing_data_extraction(
     It also avoids joining with the files table to get the path,
     instead getting paths one by one.
     """
+    from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+    from panoptikon.db.pql.pql_model import PQLQuery
+    from panoptikon.db.pql.search import search_pql
+
     model_filters = model_opts.item_extraction_rules()
-    user_rules = get_rules_for_setter(conn, model_opts.setter_name())
-    # Merge each user rule with the model's buit-in filters
-    combined_filters = [
-        combine_rule_item_filters(model_filters, user_rule.filters)
-        for user_rule in user_rules
-    ]
-    # If no user rules are present, use only the model's built-in filters
-    if not combined_filters:
-        combined_filters = [model_filters]
-
-    query, params = build_multirule_query(
-        combined_filters,
+    query = PQLQuery(
+        query=model_filters,
+        page_size=0,
+        check_path=False,
     )
-    result_query = f"""
-        WITH
-        {query}
-        SELECT
-            items.sha256,
-            items.md5,
-            items.type,
-            items.size,
-            items.time_added
-        FROM items JOIN multirule_results
-        ON items.id = multirule_results.id
-    """
-    count_query = f"""
-        WITH
-        {query}
-        SELECT COUNT(*)
-        FROM multirule_results
-    """
-    pretty_print_SQL(result_query, params)
-    start_time = time()
-    cursor = conn.cursor()
+    if model_opts.target_entities() == ["items"]:
+        query.entity = "file"
+        query.partition_by = ["item_id"]
+        query.select = ["sha256", "path", "last_modified", "type"]
+    elif model_opts.target_entities() == ["text"]:
+        query.entity = "text"
+        query.partition_by = ["item_id", "data_id"]
+        query.select = [
+            "sha256",
+            "path",
+            "last_modified",
+            "type",
+            "data_id",
+            "text",
+        ]
+    else:
+        raise ValueError("Only Items and Text target entities are supported")
 
-    cursor.execute(
-        count_query,
-        params,
-    )
-    total_count = cursor.fetchone()[0]
-
-    cursor.execute(
-        result_query,
-        params,
-    )
-
-    logger.debug(f"Query took {time() - start_time:.2f}s")
+    results_generator, total_count = search_pql(conn, query)
 
     remaining_count: int = total_count
-    while row := cursor.fetchone():
-        item = ItemData(*row, path="", item_data_ids=[])
+    for result in results_generator:
+        item = JobInputData(**result.model_dump())
         remaining_count -= 1
+        if os.path.exists(item.path):
+            yield item, remaining_count
+            continue
         if file := get_existing_file_for_sha256(conn, item.sha256):
             item.path = file.path
-
-            if model_opts.target_entities() != ["items"]:
-                # This model operates on derived data, not the items themselves
-                item.item_data_ids = get_unprocessed_item_data_for_item(
-                    conn,
-                    item=item.sha256,
-                    data_types=model_opts.target_entities(),
-                    setter_name=model_opts.setter_name(),
-                )
-                item.item_data_ids.sort()
+            item.file_id = file.id
+            item.last_modified = file.last_modified
             yield item, remaining_count
         else:
             # If no working path is found, skip this item

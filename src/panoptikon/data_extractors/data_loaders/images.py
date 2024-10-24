@@ -9,14 +9,12 @@ from PIL import ImageSequence
 
 from panoptikon.data_extractors.data_loaders.pdf import read_pdf
 from panoptikon.data_extractors.data_loaders.video import video_to_frames
+from panoptikon.data_extractors.extraction_jobs.types import JobInputData
 from panoptikon.db.storage import (
-    get_frames,
     get_frames_bytes,
     store_frames,
     thumbnail_to_bytes,
 )
-from panoptikon.types import ItemData, ItemWithPath
-from panoptikon.utils import pil_ensure_rgb
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +41,9 @@ def gif_to_frames(path: str) -> List[PILImage.Image]:
     return frames
 
 
-def image_loader(conn: sqlite3.Connection, item: ItemData) -> Sequence[bytes]:
+def image_loader(
+    conn: sqlite3.Connection, item: JobInputData
+) -> Sequence[bytes]:
     if item.type.startswith("image/gif"):
         return [
             thumbnail_to_bytes(frame, "JPEG")

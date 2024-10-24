@@ -182,9 +182,12 @@ def build_query(
         full_query = full_query.order_by(*order_by_conds)
 
     page = max(input_query.page, 1)
-    page_size = input_query.page_size
-    offset = (page - 1) * page_size
-    full_query = full_query.limit(page_size).offset(offset)
+
+    if input_query.page_size >= 1:
+        page_size = input_query.page_size
+        offset = (page - 1) * page_size
+        full_query = full_query.limit(page_size).offset(offset)
+
     return full_query, extra_columns
 
 

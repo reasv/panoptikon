@@ -375,6 +375,10 @@ based on their type, size, or the path of the file they are associated with.
                             expr = column.in_(value)
                         elif operator == "neq":
                             expr = column.notin_(value)
+                        elif operator == "in_":
+                            expr = column.in_(value)
+                        elif operator == "nin":
+                            expr = column.notin_(value)
                         elif operator == "startswith":
                             expr = or_(*[column.startswith(v) for v in value])
                         elif operator == "not_startswith":

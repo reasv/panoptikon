@@ -9,17 +9,13 @@ from panoptikon.data_extractors.data_handlers.text import handle_text
 from panoptikon.data_extractors.data_handlers.text_embeddings import (
     handle_text_embeddings,
 )
-from panoptikon.data_extractors.data_loaders.audio import (
-    load_audio,
-    load_audio_single,
-)
+from panoptikon.data_extractors.data_loaders.audio import load_audio_single
 from panoptikon.data_extractors.data_loaders.images import image_loader
 from panoptikon.data_extractors.extraction_jobs.extraction_job import (
     run_extraction_job,
 )
+from panoptikon.data_extractors.extraction_jobs.types import JobInputData
 from panoptikon.data_extractors.models import ModelGroup
-from panoptikon.db.extracted_text import get_text_by_ids
-from panoptikon.types import ItemData
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +48,7 @@ def run_dynamic_extraction_job(
     if handler_name == "image_frames":
 
         def frame_loader(
-            item: ItemData,
+            item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             max_frames = handler_opts.get("max_frames", 4)
             frames = image_loader(conn, item)
@@ -65,7 +61,7 @@ def run_dynamic_extraction_job(
         max_tracks: int = handler_opts.get("max_tracks", 4)
 
         def audio_loader(
-            item: ItemData,
+            item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             if item.type.startswith("video") or item.type.startswith("audio"):
                 audio = load_audio_single(item.path, sr=sample_rate)
@@ -80,21 +76,12 @@ def run_dynamic_extraction_job(
     elif handler_name == "extracted_text":
 
         def get_item_text(
-            item: ItemData,
+            item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], None]]:
-            ids_to_text = {
-                text_id: et.text
-                for text_id, et in get_text_by_ids(conn, item.item_data_ids)
-            }
-            assert len(ids_to_text) == len(item.item_data_ids), (
-                f"Text ids {item.item_data_ids} not found in "
-                f"extracted text {ids_to_text.keys()}"
-            )
+            assert item.data_id is not None, "Data ID must be present"
+            assert item.text is not None, "Text must be present"
             # Ensure that the text is in the same order as the item_data_ids
-            return [
-                ({"text": ids_to_text[text_id]}, None)
-                for text_id in item.item_data_ids
-            ]
+            return [({"text": item.text}, None)]
 
         data_loader = get_item_text
     else:
@@ -112,7 +99,7 @@ def run_dynamic_extraction_job(
 
         def tag_handler(
             job_id: int,
-            item: ItemData,
+            item: JobInputData,
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
@@ -124,7 +111,7 @@ def run_dynamic_extraction_job(
 
         def text_handler(
             job_id: int,
-            item: ItemData,
+            item: JobInputData,
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
@@ -136,7 +123,7 @@ def run_dynamic_extraction_job(
 
         def clip_handler(
             job_id: int,
-            item: ItemData,
+            item: JobInputData,
             _: Sequence[Any],
             embeddings: Sequence[bytes],
         ):
@@ -148,7 +135,7 @@ def run_dynamic_extraction_job(
 
         def text_emb_handler(
             job_id: int,
-            item: ItemData,
+            item: JobInputData,
             _: Sequence[Any],
             embeddings: Sequence[bytes],
         ):

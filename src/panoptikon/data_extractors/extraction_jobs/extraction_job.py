@@ -19,6 +19,7 @@ from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
     ExtractionJobStart,
+    JobInputData,
 )
 from panoptikon.db.extraction_log import (
     add_data_log,
@@ -27,7 +28,6 @@ from panoptikon.db.extraction_log import (
     update_log,
 )
 from panoptikon.db.setters import upsert_setter
-from panoptikon.types import ItemData
 from panoptikon.utils import estimate_eta
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,11 @@ def run_extraction_job(
     model_opts: models.ModelOpts,
     batch_size: int,
     threshold: float | None,
-    input_transform: Callable[[ItemData], Sequence[I]],
+    input_transform: Callable[[JobInputData], Sequence[I]],
     run_batch_inference: Callable[[Sequence[I]], Sequence[R]],
-    output_handler: Callable[[int, ItemData, Sequence[I], Sequence[R]], None],
+    output_handler: Callable[
+        [int, JobInputData, Sequence[I], Sequence[R]], None
+    ],
     final_callback: Callable[[], None] = lambda: None,
     load_callback: Callable[[], None] = lambda: None,
 ):
@@ -76,7 +78,7 @@ def run_extraction_job(
     start_time = datetime.now()
     scan_time = start_time.isoformat()
 
-    failed_items: Dict[str, ItemData] = {}
+    failed_items: Dict[str, JobInputData] = {}
     processed_items, videos, images, other, total_processed_units = (
         0,
         0,
@@ -116,7 +118,7 @@ def run_extraction_job(
         inference_time += (datetime.now() - inf_start).total_seconds()
         return o
 
-    def transform_input_handle_error(item: ItemData):
+    def transform_input_handle_error(item: JobInputData):
         try:
             nonlocal data_load_time
             load_start = datetime.now()
@@ -227,9 +229,9 @@ def run_extraction_job(
 
 
 def batch_items(
-    items_generator: Generator[Tuple[ItemData, int], Any, None],
+    items_generator: Generator[Tuple[JobInputData, int], Any, None],
     batch_size: int,
-    input_transform_func: Callable[[ItemData], Sequence[I]],
+    input_transform_func: Callable[[JobInputData], Sequence[I]],
     process_batch_func: Callable[[Sequence[I]], Sequence[R]],
 ):
     """
@@ -237,7 +239,7 @@ def batch_items(
     item extractor and batch processing functions.
     """
     while True:
-        batch: List[Tuple[ItemData, int]] = []
+        batch: List[Tuple[JobInputData, int]] = []
         work_units: List[I] = []
         batch_index_to_work_units: dict[int, List[int]] = {}
         for item, remaining in items_generator:

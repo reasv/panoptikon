@@ -74,7 +74,7 @@ class ModelOpts(ABC):
             item_filter.and_.append(
                 Match(
                     match=MatchOps(
-                        in_=MatchValues(
+                        startswith=MatchValues(
                             type=mime_types,
                         )
                     )

@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from panoptikon.types import ItemData
+from pydantic import BaseModel
 
 
 @dataclass
@@ -12,13 +12,25 @@ class ExtractionJobStart:
     job_id: int
 
 
+class JobInputData(BaseModel):
+    file_id: int
+    item_id: int
+    path: str
+    sha256: str
+    last_modified: str
+    type: str
+    # Text columns (only present for text-* queries)
+    data_id: Optional[int] = None  # Always present for text-* queries
+    text: Optional[str] = None
+
+
 @dataclass
 class ExtractionJobProgress:
     start_time: datetime
     processed_items: int
     total_items: int
     eta_string: str
-    item: ItemData
+    item: JobInputData
     job_id: int
 
 

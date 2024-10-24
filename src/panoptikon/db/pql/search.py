@@ -78,7 +78,7 @@ def search_pql(
         start_time = time.time()
         cursor.execute(sql_string, params_ordered)
         logger.debug(f"Query took {time.time() - start_time:2f} seconds")
-        logger.debug(f"Executing query: {sql_string}")
+        logger.debug(f"Executed query: {sql_string}")
         logger.debug(f"Params: {params_ordered}")
     except Exception as e:
         logger.error(f"Error executing query: {e}")

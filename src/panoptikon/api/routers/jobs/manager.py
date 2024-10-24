@@ -90,7 +90,9 @@ def execute_job(job: Job):
         else:
             logger.error(f"Unknown job type: {job.job_type}")
     except Exception as e:
-        logger.error(f"Job {job.queue_id} failed with error: {e}")
+        logger.error(
+            f"Job {job.queue_id} failed with error: {e}", exc_info=True
+        )
 
 
 class JobManager:

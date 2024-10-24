@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union
 
 from pydantic import BaseModel, Field
 
-from panoptikon.db.pql.pql_model import QueryElement
+# from panoptikon.db.pql.pql_model import QueryElement
 
 if TYPE_CHECKING:
     from panoptikon.data_extractors.models import ModelOpts
@@ -56,17 +56,6 @@ class ItemWithPath:
     size: int
     time_added: str
     path: str
-
-
-@dataclass
-class ItemData:
-    sha256: str
-    md5: str
-    type: str
-    size: int
-    time_added: str
-    path: str
-    item_data_ids: List[int]
 
 
 @dataclass
@@ -181,9 +170,9 @@ class CronJob(BaseModel):
     threshold: Optional[float] = None
 
 
-class JobFilter(BaseModel):
-    setter_names: List[str] = field(default_factory=list)
-    pql_query: QueryElement
+# class JobFilter(BaseModel):
+#     setter_names: List[str] = field(default_factory=list)
+#     pql_query: "QueryElement"
 
 
 class SystemConfig(BaseModel):
@@ -200,7 +189,7 @@ class SystemConfig(BaseModel):
     included_folders: List[str] = field(default_factory=list)
     excluded_folders: List[str] = field(default_factory=list)
     preload_embedding_models: bool = Field(default=False)
-    job_filters: List[JobFilter] = field(default_factory=list)
+    # job_filters: List[JobFilter] = field(default_factory=list)
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
