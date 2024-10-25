@@ -12,7 +12,7 @@ import logging
 
 from panoptikon.db import get_item_id
 from panoptikon.db.files import get_existing_file_for_sha256
-from panoptikon.types import LogRecord, OutputDataType
+from panoptikon.types import LogRecord, OutputDataType, SystemConfig
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +267,7 @@ def add_item_data(
 
 def get_items_missing_data_extraction(
     conn: sqlite3.Connection,
+    config: SystemConfig,
     model_opts: "models.ModelOpts",
 ):
     """

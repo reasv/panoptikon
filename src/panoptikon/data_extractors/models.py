@@ -14,7 +14,7 @@ from panoptikon.db.pql.filters.processed_items import HasDataFrom
 from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
-from panoptikon.types import OutputDataType, TargetEntityType
+from panoptikon.types import OutputDataType, SystemConfig, TargetEntityType
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,7 @@ class ModelOpts(ABC):
     def run_extractor(
         self,
         conn: sqlite3.Connection,
+        config: SystemConfig,
         batch_size: int | None = None,
         threshold: float | None = None,
     ) -> Generator[
@@ -261,6 +262,7 @@ class ModelGroup(ModelOpts):
     def run_extractor(
         self,
         conn: sqlite3.Connection,
+        config: SystemConfig,
         batch_size: int | None = None,
         threshold: float | None = None,
     ):
@@ -281,7 +283,7 @@ class ModelGroup(ModelOpts):
             threshold = None
 
         return run_dynamic_extraction_job(
-            conn, self, batch_size=batch_size, threshold=threshold
+            conn, config, self, batch_size=batch_size, threshold=threshold
         )
 
     def run_batch_inference(

@@ -16,12 +16,14 @@ from panoptikon.data_extractors.extraction_jobs.extraction_job import (
 )
 from panoptikon.data_extractors.extraction_jobs.types import JobInputData
 from panoptikon.data_extractors.models import ModelGroup
+from panoptikon.types import SystemConfig
 
 logger = logging.getLogger(__name__)
 
 
 def run_dynamic_extraction_job(
     conn: sqlite3.Connection,
+    config: SystemConfig,
     model: ModelGroup,
     batch_size: int,
     threshold: float | None,
@@ -149,6 +151,7 @@ def run_dynamic_extraction_job(
 
     return run_extraction_job(
         conn,
+        config,
         model,
         batch_size,
         threshold,

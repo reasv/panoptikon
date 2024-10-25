@@ -38,6 +38,7 @@ I = TypeVar("I")
 
 def run_extraction_job(
     conn: sqlite3.Connection,
+    config: models.SystemConfig,
     model_opts: models.ModelOpts,
     batch_size: int,
     threshold: float | None,
@@ -61,6 +62,7 @@ def run_extraction_job(
             next(
                 get_items_missing_data_extraction(
                     conn,
+                    config,
                     model_opts=model_opts,
                 ),
                 [None, -1],
@@ -135,6 +137,7 @@ def run_extraction_job(
     for item, remaining, inputs, outputs in batch_items(
         get_items_missing_data_extraction(
             conn,
+            config,
             model_opts=model_opts,
         ),
         batch_size,
