@@ -374,39 +374,3 @@ def get_setters_total_data(
     cursor.close()
 
     return results
-
-
-def get_unprocessed_item_data_for_item(
-    conn: sqlite3.Connection,
-    item: str,
-    data_types: Sequence[str],
-    setter_name: str,
-) -> List[int]:
-    """
-    Find all item associated data of the specified data_types for this item
-    that have not yet been processed by the specified setter.
-    """
-    item_id = get_item_id(conn, item)
-    setter_id = get_setter_id(conn, setter_name)
-    data_type_condition = ", ".join(["?" for _ in data_types])
-    query = f"""
-        SELECT data_src.id
-        FROM item_data AS data_src
-        WHERE data_src.item_id = ?
-        AND data_src.data_type IN ({data_type_condition})
-        AND data_src.is_placeholder = 0
-        AND NOT EXISTS (
-            SELECT 1
-            FROM item_data AS data_derived
-            WHERE data_derived.source_id = data_src.id
-            AND data_derived.setter_id = ?
-        )
-    """
-    params = (item_id, *data_types, setter_id)
-
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    results = cursor.fetchall()
-    cursor.close()
-
-    return [result[0] for result in results]
