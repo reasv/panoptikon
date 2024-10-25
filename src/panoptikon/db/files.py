@@ -1,13 +1,11 @@
 import logging
 import os
 import sqlite3
+from ast import And
 from typing import List, Tuple
 
+from panoptikon.config_type import SystemConfig
 from panoptikon.db import get_item_id
-from panoptikon.db.rules.build_filters import build_multirule_query
-from panoptikon.db.rules.rules import get_rules_for_setter
-from panoptikon.db.rules.types import RuleItemFilters
-from panoptikon.db.utils import pretty_print_SQL
 from panoptikon.types import (
     FileRecord,
     FileScanData,
@@ -419,74 +417,74 @@ def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
     return mime_types
 
 
-def isFiltersEmpty(filters: List[RuleItemFilters]) -> bool:
-    for rule in filters:
-        if len(rule.positive) > 0 or len(rule.negative) > 0:
-            return False
-    return True
+def delete_files_not_allowed(conn: sqlite3.Connection, config: SystemConfig):
+    from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+    from panoptikon.db.pql.pql_model import (
+        AndOperator,
+        NotOperator,
+        PQLQuery,
+        QueryElement,
+    )
+    from panoptikon.db.pql.search import search_pql
 
-
-def delete_files_not_allowed(conn: sqlite3.Connection):
-    user_rules = get_rules_for_setter(conn, "file_scan")
-    filters = [rule.filters for rule in user_rules]
-    if not user_rules or isFiltersEmpty(filters):
+    user_filters = [
+        f.pql_query
+        for f in config.job_filters
+        if f.setter_names.index("file_scan") != -1
+    ]
+    # Flatten AND operators into a list of filters
+    flattened_user_filters: List[QueryElement] = []
+    for f in user_filters:
+        if isinstance(f, AndOperator):
+            flattened_user_filters.extend(f.and_)
+        else:
+            flattened_user_filters.append(f)
+    if not flattened_user_filters:
         logger.debug("No rules for files, skipping deletion")
         return 0
-    query, params = build_multirule_query(
-        filters,
+
+    query = PQLQuery(
+        query=NotOperator(
+            not_=AndOperator(
+                and_=flattened_user_filters,
+            ),
+        ),
+        page_size=0,
+        check_path=False,
     )
-    count_query = f"""
-        WITH
-        {query}
-        SELECT COUNT(*)
-        FROM multirule_results
-    """
-    pretty_print_SQL(count_query, params)
+    logger.debug(
+        f"File Scan Item Query: {(query.query or query).model_dump(exclude_defaults=True)}"
+    )
+
+    results_generator, result_count = search_pql(conn, query)
     cursor = conn.cursor()
-    cursor.execute(count_query, params)
-    count: int = cursor.fetchone()[0]
-    count_all_items = f"""
-        SELECT COUNT(*)
-        FROM items
-    """
-    cursor.execute(count_all_items)
-    total_items: int = cursor.fetchone()[0]
-    if count < total_items:
+    cursor.execute("""SELECT COUNT(*) FROM files""")
+    total_files: int = cursor.fetchone()[0]
+    if result_count > 0:
         logger.warning(
-            f"{count} items out of {total_items} items match the rules"
+            f"{result_count} files out of {total_files} files do not match the rules"
         )
     else:
-        logger.debug(f"All {total_items} items match the rules")
+        logger.debug(f"All {total_files} items match the rules")
 
-    assert count <= total_items, "Too many items match the rules"
-
-    count_all_files = f"""
-        SELECT COUNT(*)
-        FROM files
-    """
-    cursor.execute(count_all_files)
-    total_files: int = cursor.fetchone()[0]
+    assert result_count <= total_files, "Too many files violate the rules"
     logger.debug(f"{total_files} files in the database before deletion")
-
-    cursor.execute(
-        f"""
-        WITH
-        {query}
+    # Delete files that do not match the rules
+    for file in results_generator:
+        cursor.execute(
+            """
         DELETE FROM files
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM multirule_results
-            WHERE multirule_results.id = files.item_id
-        );
-    """,
-        params,
-    )
+        WHERE id = ?
+        """,
+            (file.file_id,),
+        )
+        logger.debug(f"Deleted file {file.file_id} ({file.path})")
 
-    cursor.execute(count_all_files)
+    cursor.execute("""SELECT COUNT(*) FROM files""")
     total_files_after: int = cursor.fetchone()[0]
-    files_deleted = total_files - total_files_after
-
     logger.debug(f"{total_files_after} files in the database after deletion")
+
+    files_deleted = total_files - total_files_after
     if files_deleted > 0:
         logger.warning(
             f"Deleted {files_deleted} files due to file scan rules set by the user"

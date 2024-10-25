@@ -236,7 +236,7 @@ def update_folder_lists(
 
     excluded_folder_files_deleted = delete_files_under_excluded_folders(conn)
     orphan_files_deleted = delete_files_not_under_included_folders(conn)
-    rule_files_deleted = delete_files_not_allowed(conn)
+    rule_files_deleted = delete_files_not_allowed(conn, system_config)
     orphan_items_deleted = delete_items_without_files(conn)
     delete_orphaned_frames(conn)
     delete_orphaned_thumbnails(conn)
@@ -306,7 +306,7 @@ def rescan_all_folders(conn: sqlite3.Connection, system_config: SystemConfig):
     else:
         unavailable_files_deleted = 0
 
-    rule_files_deleted = delete_files_not_allowed(conn)
+    rule_files_deleted = delete_files_not_allowed(conn, system_config)
     orphan_items_deleted = delete_items_without_files(conn)
 
     delete_orphaned_frames(conn)
