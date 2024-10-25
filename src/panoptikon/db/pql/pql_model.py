@@ -136,3 +136,12 @@ If no other working path is found, the result will be omitted.
 This is not reflected in the total count of results.
 """,
     )
+
+
+class JobFilter(BaseModel):
+    setter_names: List[str] = Field(default_factory=list)
+    pql_query: "QueryElement"
+
+
+JobFilter.model_rebuild()
+PQLQuery.model_rebuild()
