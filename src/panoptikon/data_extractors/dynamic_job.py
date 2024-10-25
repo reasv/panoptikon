@@ -12,11 +12,9 @@ from panoptikon.data_extractors.data_handlers.text_embeddings import (
 )
 from panoptikon.data_extractors.data_loaders.audio import load_audio_single
 from panoptikon.data_extractors.data_loaders.images import image_loader
-from panoptikon.data_extractors.extraction_jobs.extraction_job import (
-    run_extraction_job,
-)
-from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+from panoptikon.data_extractors.extraction_job import run_extraction_job
 from panoptikon.data_extractors.models import ModelGroup
+from panoptikon.data_extractors.types import JobInputData
 
 logger = logging.getLogger(__name__)
 

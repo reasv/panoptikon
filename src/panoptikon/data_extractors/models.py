@@ -4,7 +4,7 @@ import sqlite3
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
-import panoptikon.data_extractors.extraction_jobs.types as job_types
+import panoptikon.data_extractors.types as job_types
 from panoptikon.config_type import SystemConfig
 from panoptikon.db.pql.filters.kvfilters import Match, MatchOps, MatchValues
 from panoptikon.db.pql.filters.processed_extracted_data import (
@@ -267,7 +267,7 @@ class ModelGroup(ModelOpts):
         batch_size: int | None = None,
         threshold: float | None = None,
     ):
-        from panoptikon.data_extractors.extraction_jobs.dynamic_job import (
+        from panoptikon.data_extractors.dynamic_job import (
             run_dynamic_extraction_job,
         )
 

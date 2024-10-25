@@ -276,7 +276,7 @@ def get_items_missing_data_extraction(
     It also avoids joining with the files table to get the path,
     instead getting paths one by one.
     """
-    from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+    from panoptikon.data_extractors.types import JobInputData
     from panoptikon.db.pql.pql_model import AndOperator, PQLQuery, QueryElement
     from panoptikon.db.pql.search import search_pql
 

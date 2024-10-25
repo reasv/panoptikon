@@ -9,7 +9,7 @@ from PIL import ImageSequence
 
 from panoptikon.data_extractors.data_loaders.pdf import read_pdf
 from panoptikon.data_extractors.data_loaders.video import video_to_frames
-from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+from panoptikon.data_extractors.types import JobInputData
 from panoptikon.db.storage import (
     get_frames_bytes,
     store_frames,

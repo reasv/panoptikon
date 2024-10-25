@@ -16,7 +16,7 @@ from typing import (
 
 import panoptikon.data_extractors.models as models
 from panoptikon.config_type import SystemConfig
-from panoptikon.data_extractors.extraction_jobs.types import (
+from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
     ExtractionJobStart,

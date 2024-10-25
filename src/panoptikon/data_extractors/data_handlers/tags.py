@@ -5,10 +5,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 
 from panoptikon.data_extractors.data_handlers.utils import from_dict
-from panoptikon.data_extractors.extraction_jobs.types import (
-    JobInputData,
-    TagResult,
-)
+from panoptikon.data_extractors.types import JobInputData, TagResult
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
 from panoptikon.db.tags import add_tag_to_item

@@ -418,7 +418,7 @@ def get_all_mime_types(conn: sqlite3.Connection) -> List[str]:
 
 
 def delete_files_not_allowed(conn: sqlite3.Connection, config: SystemConfig):
-    from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+    from panoptikon.data_extractors.types import JobInputData
     from panoptikon.db.pql.pql_model import (
         AndOperator,
         NotOperator,

@@ -2,7 +2,7 @@ import sqlite3
 from typing import Sequence
 
 from panoptikon.data_extractors.data_handlers.utils import deserialize_array
-from panoptikon.data_extractors.extraction_jobs.types import JobInputData
+from panoptikon.data_extractors.types import JobInputData
 from panoptikon.db.embeddings import add_embedding
 from panoptikon.db.extraction_log import add_item_data
 

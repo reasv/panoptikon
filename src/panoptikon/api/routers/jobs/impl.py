@@ -3,11 +3,11 @@ import logging
 from typing import Any, Dict
 
 from panoptikon.config import persist_system_config, retrieve_system_config
-from panoptikon.data_extractors.extraction_jobs.types import (
+from panoptikon.data_extractors.models import ModelOptsFactory
+from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
 )
-from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import (
     delete_data_job_by_log_id,
