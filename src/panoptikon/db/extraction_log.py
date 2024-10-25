@@ -277,14 +277,32 @@ def get_items_missing_data_extraction(
     instead getting paths one by one.
     """
     from panoptikon.data_extractors.extraction_jobs.types import JobInputData
-    from panoptikon.db.pql.pql_model import PQLQuery
+    from panoptikon.db.pql.pql_model import AndOperator, PQLQuery, QueryElement
     from panoptikon.db.pql.search import search_pql
 
+    user_filters = [
+        f.pql_query
+        for f in config.job_filters
+        if f.setter_names.index(model_opts.setter_name()) != -1
+    ]
+    # Flatten AND operators into a list of filters
+    flattened_user_filters: List[QueryElement] = []
+    for f in user_filters:
+        if isinstance(f, AndOperator):
+            flattened_user_filters.extend(f.and_)
+        else:
+            flattened_user_filters.append(f)
+
     model_filters = model_opts.item_extraction_rules()
+    model_filters.and_.extend(flattened_user_filters)
+
     query = PQLQuery(
         query=model_filters,
         page_size=0,
         check_path=False,
+    )
+    logger.debug(
+        f"Job Item Query: {(query.query or query).model_dump(exclude_defaults=True)}"
     )
     if model_opts.target_entities() == ["items"]:
         query.entity = "file"
