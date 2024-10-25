@@ -57,6 +57,7 @@ def get_files_by_extension(
     starting_points = [
         normalize_path(starting_point) for starting_point in starting_points
     ]
+
     for starting_point in starting_points:
         for root, dirs, files in os.walk(starting_point):
             # Normalize root path with trailing slash
@@ -67,7 +68,10 @@ def get_files_by_extension(
                 d
                 for d in dirs
                 if not any(
-                    root_with_slash.startswith(excluded)
+                    # Create full path for the directory and check against excluded paths
+                    normalize_path(os.path.join(root_with_slash, d)).startswith(
+                        excluded
+                    )
                     for excluded in excluded_paths
                 )
             ]
