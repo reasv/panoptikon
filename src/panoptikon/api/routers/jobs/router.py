@@ -12,6 +12,7 @@ from panoptikon.api.routers.jobs.manager import (
 )
 from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
 from panoptikon.config import persist_system_config, retrieve_system_config
+from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import (
@@ -21,7 +22,7 @@ from panoptikon.db.extraction_log import (
 from panoptikon.db.files import get_all_file_scans
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.folders import is_resync_needed
-from panoptikon.types import FileScanRecord, LogRecord, SystemConfig
+from panoptikon.types import FileScanRecord, LogRecord
 
 logger = logging.getLogger(__name__)
 

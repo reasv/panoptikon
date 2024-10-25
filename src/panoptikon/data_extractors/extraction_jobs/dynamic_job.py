@@ -3,6 +3,7 @@ import sqlite3
 from typing import Any, Dict, List, Sequence, Tuple
 
 from inferio.impl.utils import serialize_array
+from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.data_handlers.clip import handle_clip
 from panoptikon.data_extractors.data_handlers.tags import handle_tag_result
 from panoptikon.data_extractors.data_handlers.text import handle_text
@@ -16,7 +17,6 @@ from panoptikon.data_extractors.extraction_jobs.extraction_job import (
 )
 from panoptikon.data_extractors.extraction_jobs.types import JobInputData
 from panoptikon.data_extractors.models import ModelGroup
-from panoptikon.types import SystemConfig
 
 logger = logging.getLogger(__name__)
 

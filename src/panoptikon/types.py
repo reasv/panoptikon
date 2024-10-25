@@ -170,27 +170,5 @@ class CronJob(BaseModel):
     threshold: Optional[float] = None
 
 
-# class JobFilter(BaseModel):
-#     setter_names: List[str] = field(default_factory=list)
-#     pql_query: "QueryElement"
-
-
-class SystemConfig(BaseModel):
-    remove_unavailable_files: bool = Field(default=True)
-    scan_images: bool = Field(default=True)
-    scan_video: bool = Field(default=True)
-    scan_audio: bool = Field(default=False)
-    scan_html: bool = Field(default=False)
-    scan_pdf: bool = Field(default=False)
-    enable_cron_job: bool = Field(default=False)
-    cron_schedule: str = Field(default="0 3 * * *")
-    cron_jobs: List[CronJob] = field(default_factory=list)
-    job_settings: List[JobSettings] = field(default_factory=list)
-    included_folders: List[str] = field(default_factory=list)
-    excluded_folders: List[str] = field(default_factory=list)
-    preload_embedding_models: bool = Field(default=False)
-    # job_filters: List[JobFilter] = field(default_factory=list)
-
-
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
 TargetEntityType = Literal["items", "text", "tags"]

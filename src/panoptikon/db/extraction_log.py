@@ -1,18 +1,17 @@
 import os
 import sqlite3
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Sequence, Tuple
-
-from panoptikon.db.setters import get_setter_id
+from typing import TYPE_CHECKING, List, Tuple
 
 if TYPE_CHECKING:
     import panoptikon.data_extractors.models as models
 
 import logging
 
+from panoptikon.config_type import SystemConfig
 from panoptikon.db import get_item_id
 from panoptikon.db.files import get_existing_file_for_sha256
-from panoptikon.types import LogRecord, OutputDataType, SystemConfig
+from panoptikon.types import LogRecord, OutputDataType
 
 logger = logging.getLogger(__name__)
 

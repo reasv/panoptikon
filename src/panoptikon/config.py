@@ -4,8 +4,8 @@ import os
 import tomli
 import tomli_w
 
+from panoptikon.config_type import SystemConfig
 from panoptikon.folders import clean_folder_list
-from panoptikon.types import SystemConfig
 
 logger = logging.getLogger(__name__)
 

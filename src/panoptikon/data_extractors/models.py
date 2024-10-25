@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
 
 import panoptikon.data_extractors.extraction_jobs.types as job_types
+from panoptikon.config_type import SystemConfig
 from panoptikon.db.pql.filters.kvfilters import Match, MatchOps, MatchValues
 from panoptikon.db.pql.filters.processed_extracted_data import (
     DerivedDataArgs,
@@ -14,7 +15,7 @@ from panoptikon.db.pql.filters.processed_items import HasDataFrom
 from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
-from panoptikon.types import OutputDataType, SystemConfig, TargetEntityType
+from panoptikon.types import OutputDataType, TargetEntityType
 
 logger = logging.getLogger(__name__)
 

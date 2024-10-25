@@ -15,6 +15,7 @@ from typing import (
 )
 
 import panoptikon.data_extractors.models as models
+from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.extraction_jobs.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
@@ -38,7 +39,7 @@ I = TypeVar("I")
 
 def run_extraction_job(
     conn: sqlite3.Connection,
-    config: models.SystemConfig,
+    config: SystemConfig,
     model_opts: models.ModelOpts,
     batch_size: int,
     threshold: float | None,

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List
 
+from panoptikon.config_type import SystemConfig
 from panoptikon.db.files import (
     add_file_scan,
     delete_files_not_allowed,
@@ -31,7 +32,6 @@ from panoptikon.files import (
     ensure_thumbnail_exists,
     scan_files,
 )
-from panoptikon.types import SystemConfig
 from panoptikon.utils import normalize_path
 
 logger = logging.getLogger(__name__)
