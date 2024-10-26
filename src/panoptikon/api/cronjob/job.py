@@ -59,4 +59,4 @@ def run_cronjob(index_db: str):
                 )
             )
     except Exception as e:
-        logger.error(f"Error running cronjob: {e}")
+        logger.error(f"Error running cronjob: {e}", exc_info=True)

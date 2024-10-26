@@ -435,3 +435,27 @@ def get_setter_data_count(
         return SetterDataStats(total_counts=get_setters_total_data(conn))
     finally:
         conn.close()
+
+
+class CronJobResponse(BaseModel):
+    detail: str
+
+
+@router.post(
+    "/cronjob/run",
+    summary="Manually trigger a cronjob run",
+    description="""
+Manually trigger the configured cronjob to run on the selected database. 
+""",
+)
+def manual_trigger_cronjob(
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> CronJobResponse:
+    from panoptikon.api.cronjob.job import run_cronjob
+
+    try:
+        run_cronjob(conn_args["index_db"])
+        return CronJobResponse(detail="Cronjob triggered.")
+    except Exception as e:
+        logger.error(f"Error running cronjob: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error running cronjob.")
