@@ -102,6 +102,7 @@ def execute_folder_scan(
         scan_ids.append(scan_id)
         for file_data, hash_time, metadata_time in scan_files(
             conn,
+            config=system_config,
             starting_points=[folder],
             excluded_paths=excluded_folders,
             include_images=system_config.scan_images,

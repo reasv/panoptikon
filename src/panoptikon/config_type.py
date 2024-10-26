@@ -1,7 +1,8 @@
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+from panoptikon.db.pql.filters import Match
 from panoptikon.db.pql.pql_model import JobFilter
 from panoptikon.types import CronJob, JobSettings
 
@@ -21,3 +22,4 @@ class SystemConfig(BaseModel):
     excluded_folders: List[str] = Field(default_factory=list)
     preload_embedding_models: bool = Field(default=False)
     job_filters: List[JobFilter] = Field(default_factory=list)
+    filescan_filter: Optional[Match] = None

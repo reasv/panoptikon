@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Tuple
 
+from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.data_loaders.audio import (
     extract_media_info,
     get_audio_thumbnail,
@@ -79,6 +80,7 @@ def parse_iso_date(date: str) -> int:
 
 def scan_files(
     conn: sqlite3.Connection,
+    config: SystemConfig,
     starting_points: List[str],
     excluded_paths: List[str],
     include_images=True,
@@ -90,6 +92,8 @@ def scan_files(
     """
     Scan files in the given starting points and their entire directory trees, excluding the given excluded paths, and including images, video, and/or audio files.
     """
+    from panoptikon.db.pql.filters.kvfilters import MatchValue, evaluate_match
+
     extensions = (
         include_images * get_image_extensions()
         + include_video * get_video_extensions()
@@ -113,10 +117,23 @@ def scan_files(
             yield None, 0.0, 0.0
             continue
 
-        # TODO: Check if the file matches any user rules
-        # logger.debug(f"File {file_path} does not match any rules")
-        # yield None, 0.0, 0.0
-        # continue
+        # Check if the value matches the filter
+        if config.filescan_filter is not None:
+            if not evaluate_match(
+                config.filescan_filter,
+                MatchValue(
+                    last_modified=last_modified,
+                    size=file_size,
+                    path=file_path,
+                    filename=os.path.basename(file_path),
+                    type=get_mime_type(file_path),
+                ),
+            ):
+                logger.debug(
+                    f"File {file_path} does not match the filescan filter, skipping..."
+                )
+                yield None, 0.0, 0.0
+                continue
 
         # Assume file is new or has changed
         new_or_new_timestamp = True
@@ -130,7 +147,12 @@ def scan_files(
         if new_or_new_timestamp:
             try:
                 yield extract_file_metadata(
-                    conn, file_path, last_modified, file_size, file_record
+                    conn,
+                    config,
+                    file_path,
+                    last_modified,
+                    file_size,
+                    file_record,
                 )
             except Exception as e:
                 logger.error(f"Error extracting metadata for {file_path}: {e}")
@@ -148,14 +170,17 @@ def scan_files(
 
 def extract_file_metadata(
     conn: sqlite3.Connection,
+    config: SystemConfig,
     file_path: str,
     last_modified: str,
     size: int,
     file_record: FileRecord | None,
-) -> Tuple[FileScanData, float, float]:
+) -> Tuple[FileScanData | None, float, float]:
     """
     Extract metadata from a file.
     """
+    from panoptikon.db.pql.filters.kvfilters import MatchValue, evaluate_match
+
     hash_start = datetime.now()
     md5, sha256 = calculate_hashes(file_path)
     hash_time_seconds = (datetime.now() - hash_start).total_seconds()
@@ -224,6 +249,30 @@ def extract_file_metadata(
         item_meta.subtitle_tracks = len(media_info.subtitle_tracks)
 
     meta_time_seconds = (datetime.now() - meta_start).total_seconds()
+    if config.filescan_filter is not None:
+        if not evaluate_match(
+            config.filescan_filter,
+            MatchValue(
+                last_modified=last_modified,
+                size=size,
+                path=file_path,
+                filename=os.path.basename(file_path),
+                type=mime_type,
+                md5=md5,
+                sha256=sha256,
+                audio_tracks=item_meta.audio_tracks,
+                video_tracks=item_meta.video_tracks,
+                subtitle_tracks=item_meta.subtitle_tracks,
+                width=item_meta.width,
+                height=item_meta.height,
+                duration=item_meta.duration,
+            ),
+        ):
+            logger.debug(
+                f"File {file_path} does not match the filescan filter, skipping..."
+            )
+            return None, hash_time_seconds, meta_time_seconds
+
     return (
         FileScanData(
             sha256=sha256,
