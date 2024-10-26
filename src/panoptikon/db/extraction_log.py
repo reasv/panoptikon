@@ -283,7 +283,10 @@ def get_items_missing_data_extraction(
     user_filters = [
         f.pql_query
         for f in config.job_filters
-        if f.setter_names.index(model_opts.setter_name()) != -1
+        if (
+            f.setter_names.index(model_opts.setter_name()) != -1
+            or f.setter_names == ["*"]
+        )
     ]
     # Flatten AND operators into a list of filters
     flattened_user_filters: List[QueryElement] = []
