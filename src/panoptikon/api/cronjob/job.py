@@ -37,9 +37,12 @@ def run_cronjob(index_db: str):
         derived_data_jobs: List[CronJob] = []
         for scheduled_job in system_config.cron_jobs:
             model = ModelOptsFactory.get_model(scheduled_job.inference_id)
-            if model.target_entities == ["items"]:
+            if model.target_entities() == ["items"]:
                 src_jobs.append(scheduled_job)
             else:
+                logger.debug(
+                    f"Moving {scheduled_job.inference_id} to the back of the queue as it is a derived data job (Target entities: {model.target_entities})"
+                )
                 derived_data_jobs.append(scheduled_job)
 
         ordered_jobs = src_jobs + derived_data_jobs
