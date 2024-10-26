@@ -130,7 +130,7 @@ def scan_files(
                 ),
             ):
                 logger.debug(
-                    f"File {file_path} does not match the filescan filter, skipping..."
+                    f"File {file_path} does not match the filescan filter (Stage 1), skipping..."
                 )
                 yield None, 0.0, 0.0
                 continue
@@ -269,7 +269,7 @@ def extract_file_metadata(
             ),
         ):
             logger.debug(
-                f"File {file_path} does not match the filescan filter, skipping..."
+                f"File {file_path} does not match the filescan filter (Stage 2), skipping..."
             )
             return None, hash_time_seconds, meta_time_seconds
 
