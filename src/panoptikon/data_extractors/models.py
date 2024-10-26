@@ -2,20 +2,27 @@ import logging
 import os
 import sqlite3
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generator, List, Sequence, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    DefaultDict,
+    Dict,
+    Generator,
+    List,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import panoptikon.data_extractors.types as job_types
-from panoptikon.config_type import SystemConfig
-from panoptikon.db.pql.filters.kvfilters import Match, MatchOps, MatchValues
-from panoptikon.db.pql.filters.processed_extracted_data import (
-    DerivedDataArgs,
-    HasUnprocessedData,
-)
-from panoptikon.db.pql.filters.processed_items import HasDataFrom
-from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
 from panoptikon.types import OutputDataType, TargetEntityType
+
+if TYPE_CHECKING:
+    from panoptikon.config_type import SystemConfig
+    from panoptikon.db.pql.pql_model import AndOperator
+
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +75,19 @@ class ModelOpts(ABC):
     def supported_mime_types(cls) -> List[str] | None:
         return None
 
-    def item_extraction_rules(self) -> AndOperator:
+    def item_extraction_rules(self) -> "AndOperator":
+        from panoptikon.db.pql.filters.kvfilters import (
+            Match,
+            MatchOps,
+            MatchValues,
+        )
+        from panoptikon.db.pql.filters.processed_extracted_data import (
+            DerivedDataArgs,
+            HasUnprocessedData,
+        )
+        from panoptikon.db.pql.filters.processed_items import HasDataFrom
+        from panoptikon.db.pql.pql_model import AndOperator, NotOperator
+
         item_filter = AndOperator(and_=[])
         mime_types = self.supported_mime_types()
         if mime_types:
@@ -107,7 +126,7 @@ class ModelOpts(ABC):
     def run_extractor(
         self,
         conn: sqlite3.Connection,
-        config: SystemConfig,
+        config: "SystemConfig",
         batch_size: int | None = None,
         threshold: float | None = None,
     ) -> Generator[
@@ -263,7 +282,7 @@ class ModelGroup(ModelOpts):
     def run_extractor(
         self,
         conn: sqlite3.Connection,
-        config: SystemConfig,
+        config: "SystemConfig",
         batch_size: int | None = None,
         threshold: float | None = None,
     ):

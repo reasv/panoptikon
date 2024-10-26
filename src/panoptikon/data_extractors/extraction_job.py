@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from datetime import datetime
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -15,7 +16,6 @@ from typing import (
 )
 
 import panoptikon.data_extractors.models as models
-from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
@@ -31,6 +31,9 @@ from panoptikon.db.extraction_log import (
 from panoptikon.db.setters import upsert_setter
 from panoptikon.utils import estimate_eta
 
+if TYPE_CHECKING:
+    from panoptikon.config_type import SystemConfig
+
 logger = logging.getLogger(__name__)
 
 R = TypeVar("R")
@@ -39,7 +42,7 @@ I = TypeVar("I")
 
 def run_extraction_job(
     conn: sqlite3.Connection,
-    config: SystemConfig,
+    config: "SystemConfig",
     model_opts: models.ModelOpts,
     batch_size: int,
     threshold: float | None,

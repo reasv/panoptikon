@@ -4,7 +4,6 @@ from typing import List
 from panoptikon.api.routers.jobs.manager import Job
 from panoptikon.api.routers.jobs.router import job_manager
 from panoptikon.api.routers.utils import get_db_system_wl
-from panoptikon.config import retrieve_system_config
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.types import CronJob
 
@@ -12,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def run_cronjob(index_db: str):
+    from panoptikon.config import retrieve_system_config
+
     try:
         logger.info("Running cronjob")
         conn_args = get_db_system_wl(index_db, None)

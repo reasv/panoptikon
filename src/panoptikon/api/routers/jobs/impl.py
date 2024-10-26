@@ -2,7 +2,6 @@ import datetime
 import logging
 from typing import Any, Dict
 
-from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
@@ -24,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 def run_folder_update(conn_args: Dict[str, Any]):
+    from panoptikon.config import persist_system_config, retrieve_system_config
+
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
@@ -77,6 +78,8 @@ def run_folder_update(conn_args: Dict[str, Any]):
 
 
 def rescan_folders(conn_args: Dict[str, Any]):
+    from panoptikon.config import retrieve_system_config
+
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
@@ -151,6 +154,8 @@ def run_data_extraction_job(
     threshold: float | None,
     conn_args: Dict[str, Any],
 ):
+    from panoptikon.config import retrieve_system_config
+
     conn = get_database_connection(**conn_args)
     try:
         system_config = retrieve_system_config(conn_args["index_db"])
