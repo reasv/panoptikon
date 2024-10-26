@@ -1,4 +1,14 @@
-from typing import List, Literal, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from pydantic import BaseModel, Field
 from sqlalchemy import CTE, ClauseElement, and_, not_, or_, select
@@ -410,3 +420,164 @@ based on their type, size, or the path of the file they are associated with.
         # Start building the expression from the root MatchOps
         expression = self._build_expression(self.match, state.item_data_query)
         return self.build_multi_kv_query(expression, context, state)
+
+
+# Evaluate Match object directly against a MatchValue object
+def evaluate_match(match: Match, obj: MatchValue) -> bool:
+    """
+    Evaluates whether the given MatchValue object satisfies the Match rules.
+
+    Args:
+        match (Match): The Match object containing the matching rules.
+        obj (MatchValue): The MatchValue object to evaluate against the rules.
+
+    Returns:
+        bool: True if the object satisfies the match conditions, False otherwise.
+    """
+    # Extract all set fields from the object, including those set to None
+    obj_fields: Dict[str, Any] = dict(obj.get_set_values())
+
+    def evaluate(matches: Matches, obj_fields: Dict[str, Any]) -> bool:
+        if isinstance(matches, MatchOps):
+            return evaluate_match_ops(matches, obj_fields)
+        elif isinstance(matches, MatchAnd):
+            return all(evaluate(sub_op, obj_fields) for sub_op in matches.and_)
+        elif isinstance(matches, MatchOr):
+            return any(evaluate(sub_op, obj_fields) for sub_op in matches.or_)
+        elif isinstance(matches, MatchNot):
+            return not evaluate(matches.not_, obj_fields)
+        else:
+            raise ValueError("Unsupported Matches type")
+
+    def evaluate_match_ops(
+        match_ops: MatchOps, obj_fields: Dict[str, Any]
+    ) -> bool:
+        # Collect all individual operator results
+        results = []
+
+        # Define operator functions
+        operator_functions: Dict[str, Callable[[Any, Any], bool]] = {
+            "eq": op_eq,
+            "neq": op_neq,
+            "in_": op_in,
+            "nin": op_nin,
+            "gt": op_gt,
+            "gte": op_gte,
+            "lt": op_lt,
+            "lte": op_lte,
+            "startswith": op_startswith,
+            "not_startswith": op_not_startswith,
+            "endswith": op_endswith,
+            "not_endswith": op_not_endswith,
+            "contains": op_contains,
+            "not_contains": op_not_contains,
+        }
+
+        for op_name, op_func in operator_functions.items():
+            op_value = getattr(match_ops, op_name, None)
+            if op_value is not None:
+                # op_value is either MatchValue or MatchValues
+                if isinstance(op_value, MatchValue):
+                    # Single value operations
+                    for field, value in op_value.get_set_values():
+                        if field in obj_fields:
+                            field_value = obj_fields[field]
+                            results.append(op_func(field_value, value))
+                        # If the field is not set in obj, ignore this condition
+                elif isinstance(op_value, MatchValues):
+                    # List-based operations
+                    for field, value in op_value.get_set_values():
+                        if field in obj_fields:
+                            field_value = obj_fields[field]
+                            results.append(op_func(field_value, value))
+                        # If the field is not set in obj, ignore this condition
+
+        if not results:
+            # No applicable conditions; default to True
+            return True
+        # All operators in MatchOps are ANDed together
+        return all(results)
+
+    # Define operator implementations
+    def op_eq(field_value: Any, value: Any) -> bool:
+        if isinstance(value, list):
+            return field_value in value
+        return field_value == value
+
+    def op_neq(field_value: Any, value: Any) -> bool:
+        if isinstance(value, list):
+            return field_value not in value
+        return field_value != value
+
+    def op_in(field_value: Any, values: List[Any]) -> bool:
+        return field_value in values
+
+    def op_nin(field_value: Any, values: List[Any]) -> bool:
+        return field_value not in values
+
+    def op_gt(field_value: Any, value: Any) -> bool:
+        if field_value is None:
+            return False
+        return field_value > value
+
+    def op_gte(field_value: Any, value: Any) -> bool:
+        if field_value is None:
+            return False
+        return field_value >= value
+
+    def op_lt(field_value: Any, value: Any) -> bool:
+        if field_value is None:
+            return False
+        return field_value < value
+
+    def op_lte(field_value: Any, value: Any) -> bool:
+        if field_value is None:
+            return False
+        return field_value <= value
+
+    def op_startswith(field_value: str, value: Union[str, List[str]]) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return any(field_value.startswith(v) for v in value)
+        return field_value.startswith(value)
+
+    def op_not_startswith(
+        field_value: str, value: Union[str, List[str]]
+    ) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return all(not field_value.startswith(v) for v in value)
+        return not field_value.startswith(value)
+
+    def op_endswith(field_value: str, value: Union[str, List[str]]) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return any(field_value.endswith(v) for v in value)
+        return field_value.endswith(value)
+
+    def op_not_endswith(field_value: str, value: Union[str, List[str]]) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return all(not field_value.endswith(v) for v in value)
+        return not field_value.endswith(value)
+
+    def op_contains(field_value: Any, value: Union[Any, List[Any]]) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return any(v in field_value for v in value)
+        return value in field_value
+
+    def op_not_contains(field_value: Any, value: Union[Any, List[Any]]) -> bool:
+        if field_value is None:
+            return False
+        if isinstance(value, list):
+            return all(v not in field_value for v in value)
+        return value not in field_value
+
+    # Start evaluation from the root of the Match object
+    return evaluate(match.match, obj_fields)
