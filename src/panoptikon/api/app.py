@@ -49,7 +49,10 @@ def cronjob():
         preload_embedding_models(index_db=index_db)
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    separate_input_output_schemas=False,
+)
 
 
 @dataclass

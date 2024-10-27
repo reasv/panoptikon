@@ -19,7 +19,10 @@ async def lifespan(app: FastAPI):
 
 
 def launch_app():
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(
+        lifespan=lifespan,
+        separate_input_output_schemas=False,
+    )
     app.include_router(router)
     import uvicorn
 
