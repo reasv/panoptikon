@@ -1,6 +1,7 @@
 import logging
 import re
 import shlex
+from typing import List, TypeVar
 
 from sqlalchemy import FromClause, Join, Select, Table
 from sqlalchemy.sql.expression import Alias as SQLAlchemyAlias
@@ -82,3 +83,16 @@ def parse_and_escape_query(user_input: str) -> str:
 
     # Step 5: Join the escaped tokens back into a single string
     return " ".join([f'"{token}"' for token in escaped_tokens])
+
+
+T = TypeVar("T")
+
+
+def clean_params(params: List[T]) -> List[T]:
+    cleaned = []
+    for param in params:
+        if isinstance(param, bytes):
+            cleaned.append(f"[{len(param)} Bytes]")
+        else:
+            cleaned.append(param)
+    return cleaned

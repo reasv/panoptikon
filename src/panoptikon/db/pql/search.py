@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 import time
+from calendar import c
 from typing import Any, Generator, List, Tuple
 
 from sqlalchemy import Select
@@ -15,6 +16,7 @@ from panoptikon.db.pql.types import (
     get_extra_columns,
     map_row_to_class,
 )
+from panoptikon.db.pql.utils import clean_params
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +46,23 @@ def search_pql(
     if query.count:
         count_stmt, _ = build_query(query, count_query=True)
         count_sql_string, count_params_ordered = get_sql(count_stmt)
+        cleaned_params = clean_params(count_params_ordered)
         try:
             cursor.execute(count_sql_string, count_params_ordered)
             logger.debug(f"Executing query: {count_sql_string}")
-            logger.debug(f"Params: {count_params_ordered}")
+            logger.debug(f"Params: {cleaned_params}")
         except Exception as e:
             logger.error(f"Error executing query: {e}")
             try:
                 debug_string, _ = get_sql(count_stmt, binds=True)
                 logger.error(debug_string)
-                logger.error(count_params_ordered)
+                logger.error(cleaned_params)
                 raise e
             except Exception as e:
                 logger.error(f"Error getting debug string: {e}")
                 debug_string, _ = get_sql(count_stmt, binds=False)
                 logger.error(debug_string)
-                logger.error(count_params_ordered)
+                logger.error(cleaned_params)
                 raise e
         total_count: int = cursor.fetchone()[0]
     else:
@@ -74,17 +77,18 @@ def search_pql(
 
     stmt, extra_columns = build_query(query, count_query=False)
     sql_string, params_ordered = get_sql(stmt)
+    cleaned_params = clean_params(params_ordered)
     try:
         start_time = time.time()
         cursor.execute(sql_string, params_ordered)
         logger.debug(f"Query took {time.time() - start_time:2f} seconds")
         logger.debug(f"Executed query: {sql_string}")
-        logger.debug(f"Params: {params_ordered}")
+        logger.debug(f"Params: {cleaned_params}")
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         debug_string, _ = get_sql(stmt, binds=True)
         logger.error(debug_string)
-        logger.error(params_ordered)
+        logger.error(cleaned_params)
         raise e
 
     def results_generator() -> Generator[SearchResult, Any, None]:
