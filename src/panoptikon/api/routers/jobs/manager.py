@@ -206,7 +206,7 @@ class JobManager:
         with self.lock:
             if self.running_job:
                 pid = self.running_job.process.pid
-                self.running_job.process.terminate()
+                self.running_job.process.kill()
                 self.running_job.process.join()
                 logger.info(
                     f"Cancelled running job {self.running_job.job.queue_id} with PID {pid}"
