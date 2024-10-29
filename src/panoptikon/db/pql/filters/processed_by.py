@@ -18,10 +18,6 @@ class ProcessedBy(Filter):
         self.raise_if_not_validated()
         from panoptikon.db.pql.tables import item_data, setters
 
-        if not state.item_data_query:
-            raise ValueError(
-                "ProcessedBy filter only works with Item Data queries such as 'text' entity queries"
-            )
         setter = self.processed_by
         join_cond = (
             item_data.c.source_id == context.c.data_id
