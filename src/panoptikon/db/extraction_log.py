@@ -313,7 +313,7 @@ def get_items_missing_data_extraction(
         query.select = ["sha256", "path", "last_modified", "type"]
     elif model_opts.target_entities() == ["text"]:
         query.entity = "text"
-        query.partition_by = ["item_id", "data_id"]
+        query.partition_by = ["data_id"]
         query.select = [
             "sha256",
             "path",
