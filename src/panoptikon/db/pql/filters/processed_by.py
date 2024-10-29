@@ -1,5 +1,3 @@
-from typing import List
-
 from pydantic import Field
 from sqlalchemy.sql.expression import CTE, select
 
@@ -10,13 +8,11 @@ from panoptikon.db.pql.types import QueryState, get_std_cols, get_std_group_by
 class ProcessedBy(Filter):
     processed_by: str = Field(
         ...,
-        title="This Item Data must have been processed by this setter name and have derived data from it",
+        title="This Item or Item Data must have been processed by this setter name and have data derived from it",
     )
 
     def _validate(self):
-        if not self.processed_by:
-            return self.set_validated(False)
-        return self.set_validated(True)
+        return self.set_validated(bool(self.processed_by))
 
     def build_query(self, context: CTE, state: QueryState) -> CTE:
         self.raise_if_not_validated()
@@ -27,11 +23,16 @@ class ProcessedBy(Filter):
                 "ProcessedBy filter only works with Item Data queries such as 'text' entity queries"
             )
         setter = self.processed_by
+        join_cond = (
+            item_data.c.source_id == context.c.data_id
+            if state.item_data_query
+            else item_data.c.item_id == context.c.item_id
+        )
         return self.wrap_query(
             select(*get_std_cols(context, state))
             .join(
                 item_data,
-                item_data.c.source_id == context.c.data_id,
+                join_cond,
             )
             .join(
                 setters,

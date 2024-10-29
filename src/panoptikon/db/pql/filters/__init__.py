@@ -14,7 +14,6 @@ from panoptikon.db.pql.filters.processed_extracted_data import (
     DerivedDataArgs,
     HasUnprocessedData,
 )
-from panoptikon.db.pql.filters.processed_items import HasDataFrom
 from panoptikon.db.pql.filters.sortable.bookmarks import (
     InBookmarks,
     InBookmarksArgs,
@@ -51,7 +50,6 @@ Filters = Union[
     SemanticTextSearch,
     SemanticImageSearch,
     MatchTags,
-    HasDataFrom,
     HasUnprocessedData,
     ProcessedBy,
     Match,

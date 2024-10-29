@@ -82,7 +82,6 @@ class ModelOpts(ABC):
             MatchValues,
         )
         from panoptikon.db.pql.filters.processed_by import ProcessedBy
-        from panoptikon.db.pql.filters.processed_items import HasDataFrom
         from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 
         item_filter = AndOperator(and_=[])
@@ -97,15 +96,9 @@ class ModelOpts(ABC):
                     )
                 )
             )
-        target_entities = self.target_entities()
-        if "items" in target_entities:
-            item_filter.and_.append(
-                NotOperator(not_=HasDataFrom(has_data_from=self.setter_name()))
-            )
-        else:
-            item_filter.and_.append(
-                NotOperator(not_=ProcessedBy(processed_by=self.setter_name()))
-            )
+        item_filter.and_.append(
+            NotOperator(not_=ProcessedBy(processed_by=self.setter_name()))
+        )
 
         return item_filter
 
