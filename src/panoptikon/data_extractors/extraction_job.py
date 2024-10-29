@@ -135,7 +135,8 @@ def run_extraction_job(
             logger.error(
                 f"Error processing item {item.path}: {e}", exc_info=True
             )
-            failed_items[item.sha256] = item
+            nonlocal failed_items
+            failed_items = add_failed_item(failed_items, item)
             return []
 
     for item, remaining, inputs, outputs in batch_items(
@@ -149,7 +150,7 @@ def run_extraction_job(
         run_batch_inference_with_counter,
     ):
         processed_items += 1
-        if failed_items.get(item.sha256) is not None:
+        if get_item_failed(failed_items, item):
             # Skip items that have already failed
             continue
         if transaction_per_item:
@@ -159,7 +160,7 @@ def run_extraction_job(
             output_handler(job_id, item, inputs, outputs)
         except Exception as e:
             logger.error(f"Error handling item {item.path}: {e}")
-            failed_items[item.sha256] = item
+            failed_items = add_failed_item(failed_items, item)
             if transaction_per_item:
                 conn.rollback()
             continue
@@ -309,3 +310,29 @@ def minibatcher(
         input_list
     ), f"Result length {len(filtered_result)} does not match input length {len(input_list)}"
     return filtered_result
+
+
+def add_failed_item(
+    failed_items: Dict[str, JobInputData],
+    item: JobInputData,
+):
+    """
+    Add an item to the failed items list.
+    """
+    if item.data_id is not None:
+        failed_items[str(item.data_id)] = item
+    else:
+        failed_items[item.sha256] = item
+    return failed_items
+
+
+def get_item_failed(
+    failed_items: Dict[str, JobInputData],
+    item: JobInputData,
+):
+    """
+    Check if an item is in the failed items list.
+    """
+    if item.data_id is not None:
+        return str(item.data_id) in failed_items
+    return item.sha256 in failed_items
