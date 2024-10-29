@@ -81,10 +81,7 @@ class ModelOpts(ABC):
             MatchOps,
             MatchValues,
         )
-        from panoptikon.db.pql.filters.processed_extracted_data import (
-            DerivedDataArgs,
-            HasUnprocessedData,
-        )
+        from panoptikon.db.pql.filters.processed_by import ProcessedBy
         from panoptikon.db.pql.filters.processed_items import HasDataFrom
         from panoptikon.db.pql.pql_model import AndOperator, NotOperator
 
@@ -107,12 +104,7 @@ class ModelOpts(ABC):
             )
         else:
             item_filter.and_.append(
-                HasUnprocessedData(
-                    has_data_unprocessed=DerivedDataArgs(
-                        setter_name=self.setter_name(),
-                        data_types=target_entities,
-                    )
-                )
+                NotOperator(not_=ProcessedBy(processed_by=self.setter_name()))
             )
 
         return item_filter

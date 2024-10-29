@@ -9,6 +9,7 @@ from panoptikon.db.pql.filters.kvfilters import (
     MatchValue,
     MatchValues,
 )
+from panoptikon.db.pql.filters.processed_by import ProcessedBy
 from panoptikon.db.pql.filters.processed_extracted_data import (
     DerivedDataArgs,
     HasUnprocessedData,
@@ -52,5 +53,6 @@ Filters = Union[
     MatchTags,
     HasDataFrom,
     HasUnprocessedData,
+    ProcessedBy,
     Match,
 ]
