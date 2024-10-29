@@ -71,7 +71,7 @@ class MatchPath(SortableFilter):
                 .select_from(context)
                 .join(
                     files_path_fts,
-                    Column("files_path_fts.rowid") == context.c.file_id,
+                    literal_column("files_path_fts.rowid") == context.c.file_id,
                 )
                 .where(column.match(args.match))
             ),
