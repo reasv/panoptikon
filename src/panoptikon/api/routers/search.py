@@ -88,6 +88,7 @@ Search for files in the database based on the provided query parameters.
 This endpoint is meant to be used with the Panoptikon Query Language.
     """,
     response_model=FileSearchResponse,
+    response_model_exclude_none=True,
 )
 def pql(
     search_query: PQLQuery = Body(
