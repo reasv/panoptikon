@@ -61,6 +61,7 @@ class MatchValues(MatchValuesBase):
     audio_tracks: Optional[Union[int, List[int]]] = None
     video_tracks: Optional[Union[int, List[int]]] = None
     subtitle_tracks: Optional[Union[int, List[int]]] = None
+    blurhash: Optional[Union[str, List[str]]] = None
     data_id: Optional[Union[int, List[int]]] = None
     language: Optional[Union[str, List[str]]] = None
     language_confidence: Optional[Union[float, List[float]]] = None
@@ -91,6 +92,7 @@ class MatchValue(MatchValuesBase):
     audio_tracks: Optional[int] = None
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
+    blurhash: Optional[str] = None
     data_id: Optional[int] = None
     language: Optional[str] = None
     language_confidence: Optional[float] = None

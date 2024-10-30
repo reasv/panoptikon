@@ -36,6 +36,7 @@ ItemColumns = Literal[
     "audio_tracks",
     "video_tracks",
     "subtitle_tracks",
+    "blurhash",
 ]
 
 TextColumns = Literal[
@@ -152,6 +153,7 @@ class SearchResult(BaseModel):
     audio_tracks: Optional[int] = None
     video_tracks: Optional[int] = None
     subtitle_tracks: Optional[int] = None
+    blurhash: Optional[str] = None
     # Text columns (only present for text-* queries)
     data_id: Optional[int] = None  # Always present for text-* queries
     language: Optional[str] = None
@@ -216,6 +218,7 @@ def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
         "audio_tracks": items.c.audio_tracks,
         "video_tracks": items.c.video_tracks,
         "subtitle_tracks": items.c.subtitle_tracks,
+        "blurhash": items.c.blurhash,
         # Text columns
         "language": extracted_text.c.language,
         "language_confidence": extracted_text.c.language_confidence,

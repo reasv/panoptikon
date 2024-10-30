@@ -521,6 +521,7 @@ def get_item_metadata_by_sha256(
         audio_tracks,
         video_tracks,
         subtitle_tracks,
+        blurhash,
         time_added
     FROM items
     WHERE sha256 = ?
@@ -544,7 +545,8 @@ def get_item_metadata_by_sha256(
         audio_tracks=row[8],
         video_tracks=row[9],
         subtitle_tracks=row[10],
-        time_added=row[11],
+        blurhash=row[11],
+        time_added=row[12],
     )
 
     cursor.execute(

@@ -35,6 +35,7 @@ class ItemRecord:
     audio_tracks: Optional[int]
     video_tracks: Optional[int]
     subtitle_tracks: Optional[int]
+    blurhash: Optional[str]
     time_added: str
 
 

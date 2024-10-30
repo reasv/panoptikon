@@ -173,6 +173,7 @@ def get_item_metadata(
         audio_tracks,
         video_tracks,
         subtitle_tracks,
+        blurhash,
         time_added,
         files.id AS file_id,
         files.path AS path,
@@ -231,6 +232,7 @@ def get_item_metadata(
             audio_tracks,
             video_tracks,
             subtitle_tracks,
+            blurhash,
             time_added,
             file_id,
             path,
@@ -250,6 +252,7 @@ def get_item_metadata(
                 audio_tracks=audio_tracks,
                 video_tracks=video_tracks,
                 subtitle_tracks=subtitle_tracks,
+                blurhash=blurhash,
                 time_added=time_added,
             )
         if os.path.exists(path):
