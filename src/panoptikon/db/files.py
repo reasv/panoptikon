@@ -144,6 +144,7 @@ def update_file_scan(
     metadata_time: float,
     hashing_time: float,
     thumbgen_time: float,
+    blurhash_time: float,
 ):
     cursor = conn.cursor()
     cursor.execute(
@@ -161,7 +162,8 @@ def update_file_scan(
         false_changes = ?,
         metadata_time = ?,
         hashing_time = ?,
-        thumbgen_time = ?
+        thumbgen_time = ?,
+        blurhash_time = ?
     WHERE id = ?
     """,
         (
@@ -174,30 +176,13 @@ def update_file_scan(
             errors,
             total_available,
             false_changes,
-            metadata_time,
-            hashing_time,
-            thumbgen_time,
+            round(metadata_time, 2),
+            round(hashing_time, 2),
+            round(thumbgen_time, 2),
+            round(blurhash_time, 2),
             scan_id,
         ),
     )
-
-
-def get_file_scan_by_id(
-    conn: sqlite3.Connection, scan_id: int
-) -> FileScanRecord | None:
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-    SELECT *
-    FROM file_scans
-    WHERE id = ?
-    """,
-        (scan_id,),
-    )
-    scan_record = cursor.fetchone()
-    if scan_record:
-        return FileScanRecord(*scan_record)
-    return None
 
 
 def get_all_file_scans(
@@ -227,7 +212,8 @@ def get_all_file_scans(
         false_changes,
         metadata_time,
         hashing_time,
-        thumbgen_time
+        thumbgen_time,
+        blurhash_time
         FROM file_scans
         ORDER BY start_time
         DESC
@@ -613,3 +599,31 @@ def get_sha256_for_file_id(
     if row:
         return row[0]
     return None
+
+
+def has_blurhash(conn: sqlite3.Connection, sha256: str) -> bool:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT blurhash
+    FROM items
+    WHERE sha256 = ?
+    """,
+        (sha256,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0] is not None
+    return False
+
+
+def set_blurhash(conn: sqlite3.Connection, sha256: str, blurhash: str):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    UPDATE items
+    SET blurhash = ?
+    WHERE sha256 = ?
+    """,
+        (blurhash, sha256),
+    )

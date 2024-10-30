@@ -29,6 +29,7 @@ from panoptikon.db.storage import (
 )
 from panoptikon.files import (
     deduplicate_paths,
+    ensure_blurhash_exists,
     ensure_thumbnail_exists,
     scan_files,
 )
@@ -97,7 +98,12 @@ def execute_folder_scan(
             0,
             0,
         )
-        time_hashing, time_metadata, time_thumbgen = 0.0, 0.0, 0.0
+        time_hashing, time_metadata, time_thumbgen, time_blurhash = (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
         scan_id = add_file_scan(conn, scan_time, folder)
         scan_ids.append(scan_id)
         for file_data, hash_time, metadata_time in scan_files(
@@ -121,9 +127,24 @@ def execute_folder_scan(
                 ensure_thumbnail_exists(conn, file_data.sha256, file_data.path)
             except Exception as e:
                 logger.error(
-                    f"Error generating thumbnail for {file_data.path}: {e}"
+                    f"Error generating thumbnail for {file_data.path}: {e}",
+                    exc_info=True,
                 )
             time_thumbgen += time.time() - thumbgen_start
+            blurhash_start = time.time()
+            try:
+                if ensure_blurhash_exists(
+                    conn, file_data.sha256, file_data.path
+                ):
+                    logger.debug(
+                        f"Generated blurhash for {file_data.path} in {round(time.time() - blurhash_start, 2)} seconds"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error generating blurhash for {file_data.path}: {e}",
+                    exc_info=True,
+                )
+            time_blurhash += time.time() - blurhash_start
             if (
                 file_data.new_file_timestamp == True
                 and file_data.new_file_hash == False
@@ -172,6 +193,7 @@ def execute_folder_scan(
             metadata_time=time_metadata,
             hashing_time=time_hashing,
             thumbgen_time=time_thumbgen,
+            blurhash_time=time_blurhash,
         )
 
     return scan_ids

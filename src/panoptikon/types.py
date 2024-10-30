@@ -95,6 +95,7 @@ class FileScanRecord:
     metadata_time: float
     hashing_time: float
     thumbgen_time: float
+    blurhash_time: float
 
 
 @dataclass

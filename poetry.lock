@@ -249,6 +249,20 @@ files = [
 test = ["tox"]
 
 [[package]]
+name = "blurhash"
+version = "1.1.4"
+description = "Pure-Python implementation of the blurhash algorithm."
+optional = false
+python-versions = "*"
+files = [
+    {file = "blurhash-1.1.4-py2.py3-none-any.whl", hash = "sha256:7611c1bc41383d2349b6129208587b5d61e8792ce953893cb49c38beeb400d1d"},
+    {file = "blurhash-1.1.4.tar.gz", hash = "sha256:da56b163e5a816e4ad07172f5639287698e09d7f3dc38d18d9726d9c1dbc4cee"},
+]
+
+[package.extras]
+test = ["Pillow", "numpy", "pytest"]
+
+[[package]]
 name = "brotli"
 version = "1.1.0"
 description = "Python bindings for the Brotli compression library"
@@ -5605,4 +5619,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "c33974f2952a447390e636271a350aa47717769c3ec891a7ab3a6305795a708a"
+content-hash = "1636da6cd65be4bbeda5bcde281325085373be6cdf0fa891d053277d8a06d8fc"

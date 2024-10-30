@@ -6,6 +6,10 @@ import time
 from datetime import datetime, timezone
 from typing import List, Tuple
 
+import blurhash
+import numpy as np
+from PIL import Image as PILImage
+
 from panoptikon.config_type import SystemConfig
 from panoptikon.data_extractors.data_loaders.audio import (
     extract_media_info,
@@ -18,9 +22,10 @@ from panoptikon.data_extractors.data_loaders.images import (
 )
 from panoptikon.data_extractors.data_loaders.video import video_to_frames
 from panoptikon.db import get_item_id
-from panoptikon.db.files import get_file_by_path
+from panoptikon.db.files import get_file_by_path, has_blurhash, set_blurhash
 from panoptikon.db.storage import (
     get_frames,
+    get_thumbnail,
     has_thumbnail,
     store_frames,
     store_thumbnails,
@@ -466,3 +471,43 @@ def ensure_thumbnail_exists(
         logger.debug(
             f"Generated image thumbnail (Gen: {generation_time} DB: {store_time}) for {file_path}"
         )
+
+
+def ensure_blurhash_exists(
+    conn: sqlite3.Connection, sha256: str, file_path: str
+):
+    """
+    Ensure that a blurhash exists for the given item.
+    """
+    if has_blurhash(conn, sha256):
+        return False
+
+    mime_type = get_mime_type(file_path)
+    thumb = get_thumbnail(conn, sha256, 0)
+    if thumb is None:
+        if mime_type.startswith("image"):
+            thumb = PILImage.open(file_path).convert("RGB")
+        else:
+            return False
+
+    # For the blurhash we need to resize the image to a smaller size
+    largest_dim = 128
+    if thumb.width > thumb.height:
+        blurhash_width, blurhash_height = (
+            largest_dim,
+            int(largest_dim * thumb.height / thumb.width),
+        )
+    else:
+        blurhash_width, blurhash_height = (
+            int(largest_dim * thumb.width / thumb.height),
+            largest_dim,
+        )
+    start_time = time.time()
+    thumb_arr = np.array(thumb.resize((blurhash_width, blurhash_height)))
+    resize_time = round(time.time() - start_time, 2)
+    logger.debug(
+        f"Resized image from {thumb.width}x{thumb.height} to {blurhash_width}x{blurhash_height} (Time: {resize_time}) for {file_path}"
+    )
+    blurhash_str = blurhash.encode(thumb_arr, 4, 4)
+    set_blurhash(conn, sha256, blurhash_str)
+    return True
