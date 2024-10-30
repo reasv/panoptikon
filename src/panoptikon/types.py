@@ -47,6 +47,7 @@ class FileScanData:
     new_file_timestamp: bool
     new_file_hash: bool
     item_metadata: ItemScanMeta | None = None
+    blurhash: str | None = None
 
 
 @dataclass

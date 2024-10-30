@@ -30,8 +30,8 @@ def update_file_data(
         cursor.execute(
             """
         INSERT INTO items
-        (sha256, md5, type, size, time_added, width, height, duration, audio_tracks, video_tracks, subtitle_tracks)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (sha256, md5, type, size, time_added, width, height, duration, audio_tracks, video_tracks, subtitle_tracks, blurhash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 sha256,
@@ -45,6 +45,7 @@ def update_file_data(
                 meta.audio_tracks,
                 meta.video_tracks,
                 meta.subtitle_tracks,
+                data.blurhash,
             ),
         )
         assert (

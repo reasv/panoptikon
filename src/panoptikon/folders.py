@@ -133,12 +133,14 @@ def execute_folder_scan(
             time_thumbgen += time.time() - thumbgen_start
             blurhash_start = time.time()
             try:
-                if ensure_blurhash_exists(
+                blurhash = ensure_blurhash_exists(
                     conn, file_data.sha256, file_data.path
-                ):
+                )
+                if blurhash is not None:
                     logger.debug(
                         f"Generated blurhash for {file_data.path} in {round(time.time() - blurhash_start, 2)} seconds"
                     )
+                    file_data.blurhash = blurhash
             except Exception as e:
                 logger.error(
                     f"Error generating blurhash for {file_data.path}: {e}",

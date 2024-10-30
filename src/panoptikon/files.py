@@ -475,12 +475,12 @@ def ensure_thumbnail_exists(
 
 def ensure_blurhash_exists(
     conn: sqlite3.Connection, sha256: str, file_path: str
-):
+) -> str | None:
     """
     Ensure that a blurhash exists for the given item.
     """
     if has_blurhash(conn, sha256):
-        return False
+        return None
 
     mime_type = get_mime_type(file_path)
     thumb = get_thumbnail(conn, sha256, 0)
@@ -488,7 +488,7 @@ def ensure_blurhash_exists(
         if mime_type.startswith("image"):
             thumb = PILImage.open(file_path).convert("RGB")
         else:
-            return False
+            return None
 
     # For the blurhash we need to resize the image to a smaller size
     largest_dim = 128
@@ -510,4 +510,4 @@ def ensure_blurhash_exists(
     )
     blurhash_str = blurhash.encode(thumb_arr, 4, 4)
     set_blurhash(conn, sha256, blurhash_str)
-    return True
+    return blurhash_str
