@@ -75,6 +75,9 @@ def get_files_by_extension(
             ]
             for file in files:
                 if any(file.lower().endswith(ext) for ext in extensions):
+                    # Skip hidden files and temporary files
+                    if file.startswith(".") or file.startswith("~"):
+                        continue
                     yield os.path.join(root, file)
 
 
