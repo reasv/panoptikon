@@ -21,7 +21,7 @@ from panoptikon.data_extractors.data_loaders.images import (
     get_pdf_image,
 )
 from panoptikon.data_extractors.data_loaders.video import video_to_frames
-from panoptikon.db import get_item_id
+from panoptikon.db import get_item_id, get_item_metadata
 from panoptikon.db.files import get_file_by_path, has_blurhash, set_blurhash
 from panoptikon.db.storage import (
     get_frames,
@@ -434,6 +434,18 @@ def ensure_thumbnail_exists(
         if frames := get_frames(conn, sha256):
             logger.debug(f"Found video frames for {file_path}")
         else:
+            item_meta, _ = get_item_metadata(conn, sha256, "sha256")
+            if item_meta:
+                if (
+                    item_meta.duration is None
+                    or item_meta.duration == 0
+                    or item_meta.video_tracks is None
+                    or item_meta.video_tracks == 0
+                ):
+                    logger.debug(
+                        f"Skipping video thumbnail generation due to missing video track: {file_path}"
+                    )
+                    return
             logger.debug(f"Extracting video frames for {file_path}")
             frames = video_to_frames(file_path, num_frames=4)
             store_frames(
