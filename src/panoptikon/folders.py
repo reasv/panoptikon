@@ -124,7 +124,12 @@ def execute_folder_scan(
                 continue
             thumbgen_start = time.time()
             try:
-                ensure_thumbnail_exists(conn, file_data.sha256, file_data.path)
+                ensure_thumbnail_exists(
+                    conn,
+                    file_data.sha256,
+                    file_data.path,
+                    file_data.item_metadata,
+                )
             except Exception as e:
                 logger.error(
                     f"Error generating thumbnail for {file_data.path}: {e}",

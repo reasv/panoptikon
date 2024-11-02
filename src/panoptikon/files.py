@@ -418,7 +418,10 @@ def deduplicate_paths(paths: List[str]):
 
 
 def ensure_thumbnail_exists(
-    conn: sqlite3.Connection, sha256: str, file_path: str
+    conn: sqlite3.Connection,
+    sha256: str,
+    file_path: str,
+    item_scan_meta: ItemScanMeta | None = None,
 ):
     """
     Ensure that a thumbnail exists for the given item.
@@ -434,7 +437,9 @@ def ensure_thumbnail_exists(
         if frames := get_frames(conn, sha256):
             logger.debug(f"Found video frames for {file_path}")
         else:
-            item_meta, _ = get_item_metadata(conn, sha256, "sha256")
+            item_meta = item_scan_meta
+            if not item_meta:
+                item_meta, _ = get_item_metadata(conn, sha256, "sha256")
             if item_meta:
                 if (
                     item_meta.duration is None
