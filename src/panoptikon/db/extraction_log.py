@@ -310,7 +310,16 @@ def get_items_missing_data_extraction(
     if model_opts.target_entities() == ["items"]:
         query.entity = "file"
         query.partition_by = ["item_id"]
-        query.select = ["sha256", "path", "last_modified", "type"]
+        query.select = [
+            "sha256",
+            "path",
+            "last_modified",
+            "type",
+            "duration",
+            "audio_tracks",
+            "video_tracks",
+            "subtitle_tracks",
+        ]
     elif model_opts.target_entities() == ["text"]:
         query.entity = "text"
         query.partition_by = ["data_id"]

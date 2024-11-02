@@ -57,6 +57,14 @@ def image_loader(
         if frames := get_frames_bytes(conn, item.sha256):
             logger.debug(f"Loaded {len(frames)} frames from database")
         else:
+            if item.duration is None or item.duration == 0:
+                logger.debug(f"Video {item.sha256} has no duration, skipping")
+                return []
+            if item.video_tracks is None or item.video_tracks == 0:
+                logger.debug(
+                    f"Video {item.sha256} has no video tracks, skipping"
+                )
+                return []
             pil_frames = video_to_frames(item.path, num_frames=4)
             frames = store_frames(
                 conn,

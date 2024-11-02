@@ -19,6 +19,11 @@ class JobInputData(BaseModel):
     sha256: str
     last_modified: str
     type: str
+    # Video/audio columns (only present for file-* queries)
+    duration: Optional[float] = None
+    audio_tracks: Optional[int] = None
+    video_tracks: Optional[int] = None
+    subtitle_tracks: Optional[int] = None
     # Text columns (only present for text-* queries)
     data_id: Optional[int] = None  # Always present for text-* queries
     text: Optional[str] = None
