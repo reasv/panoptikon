@@ -12,7 +12,7 @@ from panoptikon.db.extraction_log import (
     delete_data_job_by_log_id,
     remove_incomplete_jobs,
 )
-from panoptikon.db.utils import vacuum_database
+from panoptikon.db.utils import analyze_database, vacuum_database
 from panoptikon.folders import (
     is_resync_needed,
     rescan_all_folders,
@@ -39,6 +39,7 @@ def run_folder_update(conn_args: Dict[str, Any]):
         Included folders added (and scanned): {", ".join(update_result.included_added)} ({len(update_result.scan_ids)});
         """
         )
+        data_deleted = False
         if update_result.excluded_added:
             logger.info(
                 f"Excluded folders added: {", ".join(update_result.excluded_added)};"
@@ -48,28 +49,36 @@ def run_folder_update(conn_args: Dict[str, Any]):
                 f"Removed {update_result.included_deleted} included folders, {update_result.excluded_deleted} excluded folders;"
             )
         if update_result.unavailable_files_deleted:
+            data_deleted = True
             logger.info(
                 f"Removed {update_result.unavailable_files_deleted} files from the database which were no longer available on the filesystem;"
             )
         if update_result.excluded_folder_files_deleted:
+            data_deleted = True
             logger.info(
                 f"Removed {update_result.excluded_folder_files_deleted} files from the database that were inside excluded folders;"
             )
         if update_result.orphan_files_deleted:
+            data_deleted = True
             logger.info(
                 f"Removed {update_result.orphan_files_deleted} files from the database that were no longer inside included folders;"
             )
         if update_result.rule_files_deleted:
+            data_deleted = True
             logger.info(
                 f"Removed {update_result.rule_files_deleted} files from the database that were not allowed by user rules;"
             )
         if update_result.orphan_items_deleted:
+            data_deleted = True
             logger.info(
                 f"Removed {update_result.orphan_items_deleted} orphaned items (with no corresponding files) from the database. Any bookmarks on these items were also removed."
             )
 
         conn.commit()
-        vacuum_database(conn)
+        if data_deleted:
+            vacuum_database(conn)
+
+        analyze_database(conn)
     except Exception as e:
         # Rollback the transaction on error
         conn.rollback()
@@ -103,7 +112,9 @@ def rescan_folders(conn_args: Dict[str, Any]):
             rescan_all_folders(conn, system_config=system_config)
         )
         conn.commit()
-        vacuum_database(conn)
+        if files_deleted or items_deleted or rule_files_deleted:
+            vacuum_database(conn)
+        analyze_database(conn)
         conn.close()
         logger.info(
             f"Rescanned all folders. Removed {files_deleted} files and {items_deleted} orphaned items. "
@@ -127,6 +138,7 @@ def delete_model_data(
         logger.info(report_str)
         conn.commit()
         vacuum_database(conn)
+        analyze_database(conn)
     finally:
         conn.close()
 
@@ -144,6 +156,7 @@ def delete_job_data(
         logger.info(f"Deleted data for job log id {log_id}")
         conn.commit()
         vacuum_database(conn)
+        analyze_database(conn)
     finally:
         conn.close()
 
@@ -205,8 +218,7 @@ def run_data_extraction_job(
         )
         if len(failed) > 0:
             logger.info(f"Failed files: {failed_str}")
-        logger.info(f"Running vacuum and analyze on database")
-        vacuum_database(conn)
+        analyze_database(conn)
         conn.commit()
     except Exception as e:
         logger.error(

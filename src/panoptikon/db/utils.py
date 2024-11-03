@@ -39,11 +39,22 @@ def is_column_in_table(
 
 def vacuum_database(conn: sqlite3.Connection):
     """
-    Run VACUUM and ANALYZE on the database to optimize it
+    Run VACUUM on the database to optimize it
     """
+    logger.info("Running VACUUM on the database...")
     conn.execute("VACUUM")
+    logger.debug("VACUUM complete")
+
+
+def analyze_database(conn: sqlite3.Connection):
+    """
+    Run ANALYZE on the database to optimize it
+    """
+    logger.info("Running ANALYZE on the database...")
     conn.execute("ANALYZE")
+    logger.debug("ANALYZE complete")
     conn.execute("PRAGMA optimize")
+    logger.debug("PRAGMA optimize complete")
 
 
 def pretty_print_SQL(query_str: str, params: List[str | float | int]):
