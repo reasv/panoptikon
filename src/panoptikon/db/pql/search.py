@@ -5,6 +5,7 @@ import time
 from calendar import c
 from typing import Any, Generator, List, Tuple
 
+from pydantic import BaseModel, Field
 from sqlalchemy import Select
 from sqlalchemy.dialects import sqlite
 
@@ -37,18 +38,48 @@ def get_sql(stmt: Select, binds: bool = False) -> Tuple[str, List[Any]]:
     return sql_string, params_ordered
 
 
+class SearchMetrics(BaseModel):
+    build: float = Field(
+        default=0,
+        title="Build time",
+        description="Time taken to process the query into an SQLAlchemy Core statement",
+    )
+    compile: float = Field(
+        default=0,
+        title="Compile time",
+        description="Time taken to compile the SQLAlchemy Core statement into an SQL string",
+    )
+    execute: float = Field(
+        default=0,
+        title="Execution time",
+        description="Time taken to execute the SQL query",
+    )
+
+
+def td_rounded(start_time: float) -> float:
+    return round(time.time() - start_time, 3)
+
+
 def search_pql(
     conn: sqlite3.Connection,
     query: PQLQuery,
 ):
     cursor = conn.cursor()
     cursor.row_factory = sqlite3.Row  # type: ignore
+    count_query_metrics = SearchMetrics(build=0, compile=0, execute=0)
+    result_query_metrics = SearchMetrics(build=0, compile=0, execute=0)
     if query.count:
+        start_time = time.time()
         count_stmt, _ = build_query(query, count_query=True)
+        count_query_metrics.build = td_rounded(start_time)
+        start_time = time.time()
         count_sql_string, count_params_ordered = get_sql(count_stmt)
+        count_query_metrics.compile = td_rounded(start_time)
         cleaned_params = clean_params(count_params_ordered)
         try:
+            start_time = time.time()
             cursor.execute(count_sql_string, count_params_ordered)
+            count_query_metrics.execute = td_rounded(start_time)
             logger.debug(f"Executing query: {count_sql_string}")
             logger.debug(f"Params: {cleaned_params}")
         except Exception as e:
@@ -73,17 +104,28 @@ def search_pql(
         def empty_generator() -> Generator[SearchResult, Any, None]:
             yield from []
 
-        return empty_generator(), total_count
-
+        return (
+            empty_generator(),
+            total_count,
+            result_query_metrics,
+            count_query_metrics,
+        )
+    start_time = time.time()
     stmt, extra_columns = build_query(query, count_query=False)
+    result_query_metrics.build = td_rounded(start_time)
+    start_time = time.time()
     sql_string, params_ordered = get_sql(stmt)
+    result_query_metrics.compile = td_rounded(start_time)
     cleaned_params = clean_params(params_ordered)
     try:
         start_time = time.time()
         cursor.execute(sql_string, params_ordered)
-        logger.debug(f"Query took {time.time() - start_time:2f} seconds")
+        result_query_metrics.execute = td_rounded(start_time)
         logger.debug(f"Executed query: {sql_string}")
         logger.debug(f"Params: {cleaned_params}")
+        logger.debug(
+            f"Query execution took {result_query_metrics.execute} seconds (build: {result_query_metrics.build}, compile: {result_query_metrics.compile})"
+        )
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         debug_string, _ = get_sql(stmt, binds=True)
@@ -120,4 +162,9 @@ def search_pql(
                     continue
             yield result
 
-    return results_generator(), total_count
+    return (
+        results_generator(),
+        total_count,
+        result_query_metrics,
+        count_query_metrics,
+    )

@@ -18,7 +18,7 @@ from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.db.pql.pql_model import PQLQuery
-from panoptikon.db.pql.search import search_pql
+from panoptikon.db.pql.search import SearchMetrics, search_pql
 from panoptikon.db.pql.types import SearchResult
 from panoptikon.db.tags import find_tags, get_all_tag_namespaces
 from panoptikon.db.tagstats import (
@@ -78,6 +78,8 @@ def extract_embeddings(buffer: bytes) -> bytes:
 class FileSearchResponse(BaseModel):
     count: int
     results: List[SearchResult]
+    count_metrics: SearchMetrics
+    result_metrics: SearchMetrics
 
 
 @router.post(
@@ -100,8 +102,15 @@ def pql(
     conn = get_database_connection(**conn_args)
     try:
         logger.debug(f"Searching for files with PQL: {search_query}")
-        results, count = search_pql(conn, search_query)
-        return FileSearchResponse(count=count, results=list(results))
+        results, count, res_metrics, count_metrics = search_pql(
+            conn, search_query
+        )
+        return FileSearchResponse(
+            count=count,
+            results=list(results),
+            count_metrics=count_metrics,
+            result_metrics=res_metrics,
+        )
     finally:
         conn.close()
 

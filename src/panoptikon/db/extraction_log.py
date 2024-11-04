@@ -285,7 +285,7 @@ def get_items_missing_data_extraction(
         for f in config.job_filters
         if (
             f.setter_names.index(model_opts.setter_name()) != -1
-            or f.setter_names == ["*"]
+            or f.setter_names.index("*") != -1
         )
     ]
     # Flatten AND operators into a list of filters
@@ -334,7 +334,7 @@ def get_items_missing_data_extraction(
     else:
         raise ValueError("Only Items and Text target entities are supported")
 
-    results_generator, total_count = search_pql(conn, query)
+    results_generator, total_count, rm, cm = search_pql(conn, query)
 
     remaining_count: int = total_count
     for result in results_generator:

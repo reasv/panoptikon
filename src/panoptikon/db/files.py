@@ -443,7 +443,7 @@ def delete_files_not_allowed(conn: sqlite3.Connection, config: SystemConfig):
         f"File Scan Item Query: {(query.query or query).model_dump(exclude_defaults=True)}"
     )
 
-    results_generator, result_count = search_pql(conn, query)
+    results_generator, result_count, rm, cm = search_pql(conn, query)
     cursor = conn.cursor()
     cursor.execute("""SELECT COUNT(*) FROM files""")
     total_files: int = cursor.fetchone()[0]
