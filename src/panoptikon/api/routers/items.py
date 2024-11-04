@@ -3,9 +3,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import PIL.Image
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from more_itertools import last
 from pydantic.dataclasses import dataclass
 
 from panoptikon.api.routers.utils import (
@@ -24,7 +24,31 @@ from panoptikon.db.extracted_text import (
 )
 from panoptikon.db.storage import get_thumbnail_bytes
 from panoptikon.db.tags import get_all_tags_for_item
+from panoptikon.files import convert_iso_to_datetime
 from panoptikon.types import ExtractedText, FileRecord, ItemRecord
+
+
+def file_response(
+    item: ItemRecord,
+    file: FileRecord,
+    filename: Optional[str] = None,
+    content_disposition_type: str = "inline",
+):
+    last_modified = convert_iso_to_datetime(file.last_modified).timestamp()
+    size = item.size
+    assert size is not None, "Item Size should not be None"
+    logger.debug(f"Returning file {filename} (size: {size})")
+    stat_result = os.stat_result((0, 0, 0, 0, 0, 0, size, 0, 0, last_modified))
+    # Creating a custom response to set headers manually
+    response = FileResponse(
+        path=file.path,
+        media_type=item.type,
+        stat_result=stat_result,
+        filename=filename or file.filename,
+        content_disposition_type=content_disposition_type,
+    )
+    return response
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -104,10 +128,11 @@ def get_item_file(
     if len(files) == 0:
         raise HTTPException(status_code=404, detail="No file found for item")
     file = files[0]
-    return FileResponse(
-        path=file.path,
-        media_type=item.type,
-        filename=file.filename,
+    filename = strip_non_latin1_chars(file.filename)
+    return file_response(
+        item=item,
+        file=file,
+        filename=filename,
         content_disposition_type="inline",
     )
 
@@ -154,9 +179,9 @@ def get_item_thumbnail(
         if mime is None or mime.startswith("image/gif"):
             resp_type = "file/gif"
             logger.debug(f"Returning {resp_type} for {file_str}")
-            return FileResponse(
-                file.path,
-                media_type=mime,
+            return file_response(
+                item=item,
+                file=file,
                 filename=original_filename,
                 content_disposition_type="inline",
             )
@@ -180,9 +205,9 @@ def get_item_thumbnail(
         if mime.startswith("image"):
             resp_type = "file/image"
             logger.debug(f"Returning {resp_type} for {file_str}")
-            return FileResponse(
-                file.path,
-                media_type=mime,
+            return file_response(
+                item=item,
+                file=file,
                 filename=original_filename,
                 content_disposition_type="inline",
             )
