@@ -399,6 +399,16 @@ def get_last_modified_time_and_size(file_path: str):
     return iso_format, size
 
 
+def convert_iso_to_datetime(iso_format: str):
+    # Add the UTC timezone if the string doesn't have a timezone
+    iso_format_with_tz = (
+        iso_format + "Z" if not iso_format.endswith("Z") else iso_format
+    )
+    # Parse the ISO format string back to a datetime object
+    dt = datetime.fromisoformat(iso_format_with_tz.replace("Z", "+00:00"))
+    return dt
+
+
 def get_file_size(file_path: str):
     """
     Get the size of the file at the given path.
