@@ -181,7 +181,7 @@ def extract_file_metadata(
     config: SystemConfig,
     file_path: str,
     last_modified: str,
-    size: int,
+    reported_size: int,
     file_record: FileRecord | None,
 ) -> Tuple[FileScanData | None, float, float]:
     """
@@ -190,7 +190,12 @@ def extract_file_metadata(
     from panoptikon.db.pql.filters.kvfilters import MatchValue, evaluate_match
 
     hash_start = datetime.now()
-    md5, sha256 = calculate_hashes(file_path)
+    md5, sha256, real_size = calculate_hashes(file_path)
+    if real_size != reported_size:
+        logger.warning(
+            f"Real file size ({real_size}) does not reported size reported by filesystem ({reported_size}): {file_path}"
+        )
+
     hash_time_seconds = (datetime.now() - hash_start).total_seconds()
     if file_record is not None and file_record.sha256 == sha256:
         logger.warning(
@@ -228,7 +233,7 @@ def extract_file_metadata(
     item_meta = ItemScanMeta(
         md5=md5,
         mime_type=mime_type,
-        size=size,
+        size=real_size,
     )
     if mime_type.startswith("image"):
         from PIL import Image
@@ -262,7 +267,7 @@ def extract_file_metadata(
             config.filescan_filter,
             MatchValue(
                 last_modified=last_modified,
-                size=size,
+                size=real_size,
                 path=file_path,
                 filename=os.path.basename(file_path),
                 type=mime_type,
@@ -317,16 +322,19 @@ def get_pdf_extensions():
 
 def calculate_hashes(file_path: str):
     """
-    Calculate the MD5 and SHA-256 hashes of the file at the given path.
+    Calculate the MD5 and SHA-256 hashes of the file at the given path and return the file size.
     """
     hash_md5 = hashlib.md5()
     hash_sha256 = hashlib.sha256()
+    total_size = 0
+
     try:
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
+                total_size += len(chunk)  # Accumulate the size of each chunk
                 hash_md5.update(chunk)
                 hash_sha256.update(chunk)
-        return hash_md5.hexdigest(), hash_sha256.hexdigest()
+        return hash_md5.hexdigest(), hash_sha256.hexdigest(), total_size
     except FileNotFoundError:
         logger.error(f"Error: The file '{file_path}' does not exist.")
     except PermissionError:
