@@ -208,6 +208,7 @@ def extract_file_metadata(
                 sha256=sha256,
                 last_modified=last_modified,
                 path=file_path,
+                file_size=real_size,
                 new_file_timestamp=True,
                 new_file_hash=False,
             ),
@@ -221,6 +222,7 @@ def extract_file_metadata(
                 sha256=sha256,
                 last_modified=last_modified,
                 path=file_path,
+                file_size=real_size,
                 new_file_timestamp=True,
                 new_file_hash=True,
             ),
@@ -233,7 +235,6 @@ def extract_file_metadata(
     item_meta = ItemScanMeta(
         md5=md5,
         mime_type=mime_type,
-        size=real_size,
     )
     if mime_type.startswith("image"):
         from PIL import Image
@@ -291,6 +292,7 @@ def extract_file_metadata(
             sha256=sha256,
             last_modified=last_modified,
             path=file_path,
+            file_size=real_size,
             new_file_timestamp=True,
             new_file_hash=True,
             item_metadata=item_meta,

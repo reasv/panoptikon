@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 class ItemScanMeta:
     md5: str
     mime_type: str
-    size: int
     width: int | None = None
     height: int | None = None
     duration: float | None = None
@@ -46,6 +45,7 @@ class FileScanData:
     path: str
     new_file_timestamp: bool
     new_file_hash: bool
+    file_size: int | None = None
     item_metadata: ItemScanMeta | None = None
     blurhash: str | None = None
 

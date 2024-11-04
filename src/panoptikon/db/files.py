@@ -37,7 +37,7 @@ def update_file_data(
                 sha256,
                 meta.md5,
                 meta.mime_type,
-                meta.size,
+                data.file_size,
                 time_added,
                 meta.width,
                 meta.height,
@@ -58,6 +58,9 @@ def update_file_data(
         assert (
             item_id is not None
         ), f"Item not found and no meta given for sha256: {sha256} ({data.path})"
+        if data.file_size is not None:
+            if update_item_size(conn, item_id, data.file_size):
+                logger.debug(f"Updated size for item {item_id} ({sha256})")
         item_inserted = False
 
     if not data.new_file_hash:
@@ -630,3 +633,16 @@ def set_blurhash(conn: sqlite3.Connection, sha256: str, blurhash: str):
     """,
         (blurhash, sha256),
     )
+
+
+def update_item_size(conn: sqlite3.Connection, item_id: int, size: int):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    UPDATE items
+    SET size = ?
+    WHERE id = ?
+    """,
+        (size, item_id),
+    )
+    return cursor.rowcount > 0
