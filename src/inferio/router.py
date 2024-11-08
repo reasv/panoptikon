@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
 from inferio.impl.clip import ClipModel
+from inferio.impl.florence2 import Florence2
 from inferio.impl.ocr import DoctrModel
 from inferio.impl.sentence_transformers import SentenceTransformersModel
 from inferio.impl.wd_tagger import WDTagger
@@ -28,6 +29,7 @@ ModelRegistry.register_model(DoctrModel)
 ModelRegistry.register_model(SentenceTransformersModel)
 ModelRegistry.register_model(FasterWhisperModel)
 ModelRegistry.register_model(ClipModel)
+ModelRegistry.register_model(Florence2)
 
 router = APIRouter(
     prefix="/api/inference",

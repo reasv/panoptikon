@@ -42,6 +42,38 @@ db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recogni
 db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ViTSTR Base" } }
 db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "PARSEQ" } }
 
+[group.florence2]
+config = { impl_class = "florence2" }
+[group.florence2.metadata]
+description = "Image captioning and OCR through Microsoft's Florence2 models"
+name = "Florence 2"
+default_batch_size = 4
+default_inference_id = "msft_large-more-detailed"
+target_entities = ["items"]
+output_type = "text"
+input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
+input_spec = { handler = "image_frames" }
+
+[group.florence2.inference_ids]
+msft_large-more-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
+msft_large-caption = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<CAPTION>" }, metadata = { description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
+msft_large-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<DETAILED_CAPTION>" }, metadata = { description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model" } }
+msft_large-ocr = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large)  Microsoft's original Florence 2 Large Model" } }
+# Fine-tuned models
+gokaygokay_SD3-Caption = { config = { model_name = "gokaygokay/Florence-2-SD3-Captioner", task_prompt = "<DESCRIPTION>", text_input = "Describe this image in great detail." }, metadata = { description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion" } }
+DocVQA-Caption = { config = { model_name = "HuggingFaceM4/Florence-2-DocVQA", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering" } }
+yayayaaa_large-moredetailed = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Generates extremely verbose descriptions" } }
+yayayaaa_large-moredetailed-m = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<DETAILED_CAPTION>" }, metadata = { description = "(Medium Detail Captioning) (Size: Large) Generates extremely verbose descriptions" } }
+yayayaaa_large-moredetailed-s = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<CAPTION>" }, metadata = { description = "(Captioning) (Size: Large) Generates extremely verbose descriptions" } }
+yayayaaa_large-moredetailed-ocr = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) Generates extremely verbose descriptions" } }
+ljnlonoljpiljm_base-ft-keywords = { config = { model_name = "ljnlonoljpiljm/florence-2-base-ft-keywords-caption-interleaved", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Keyword-based captions" } }
+andito_large = { config = { model_name = "andito/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model" } }
+andito_large-ocr = { config = { model_name = "andito/Florence-2-large-ft", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model" } }
+MiaoshouAI_base-PromptGen-Caption = { config = { model_name = "MiaoshouAI/Florence-2-base-PromptGen", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Trained for the MiaoshouAI Tagger for ComfyUI" } }
+MiaoshouAI_base-PromptGen = { config = { model_name = "MiaoshouAI/Florence-2-base-PromptGen", task_prompt = "<GENERATE_PROMPT>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Stable Diffusion Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI" } }
+ljnlonoljpiljm_large-docci-caption = { config = { model_name = "ljnlonoljpiljm/florence-2-large-docci-caption", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci" } }
+aniketVerma07_finetuned = { config = { model_name = "aniketVerma07/finetuned_florence_2", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) Florence 2 Finetune" } }
+Oysiyl_OCR-Cauldron-IAM = { config = { model_name = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM", task_prompt = "<OCR>" }, metadata = { description = "(OCR) OCR Finetune" } }
 
 [group.textembed]
 config = { impl_class = "sentence_transformers" }

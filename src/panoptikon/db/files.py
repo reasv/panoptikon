@@ -1,7 +1,6 @@
 import logging
 import os
 import sqlite3
-from ast import And
 from typing import List, Tuple
 
 from panoptikon.config_type import SystemConfig
