@@ -13,7 +13,7 @@ Combining OCR, Whisper Speech-to-Text, CLIP image embeddings, text embeddings, f
 
 Panoptikon aims to be the `text-generation-webui` or `stable-diffusion-webui` of local search. It is fully customizable, allowing you to easily configure custom models for any of the supported tasks. It comes with a wealth of capable models available out of the box, and adding another one or updating to a newer fine-tune is never more than a few TOML configuration lines away.
 
-As long as a model is supported by any of the built-in implementation classes (supporting, among others, OpenCLIP, Sentence Transformers, and Faster Whisper), you can simply add it to the inference server configuration by specifying the Hugging Face repo, and it will immediately be available for use.
+As long as a model is supported by any of the built-in implementation classes (supporting, among others, OpenCLIP, Sentence Transformers, Faster Whisper, and Florence 2 via HF Transformers), you can simply add it to the inference server configuration by specifying the Hugging Face repo, and it will immediately be available for use.
 
 Panoptikon is designed to keep index data produced by multiple different models (or different configurations of the same model) **side by side**, letting you choose which one(s) to use *at search time*. As such, Panoptikon is an excellent tool for comparing the real-world performance of different methods of data extraction or embedding models, and allows you to leverage their combined power instead of relying on the accuracy of only one.
 
@@ -87,6 +87,27 @@ Make sure the `cudnn` folder contains `bin`, `lib`, `include`, etc., as direct s
 #### WeasyPrint
 
 This is only relevant if you intend to use Panoptikon with HTML files. Panoptikon uses [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/index.html) to handle HTML files. You have to follow their [Installation Guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation) to ensure all the external dependencies are present on your system. If they are present but not found, it's recommended to set the `WEASYPRINT_DLL_DIRECTORIES` environment variable to point to the correct folder.
+
+#### NoSuchOptionException (Poetry)
+```bash
+$ poetry install --with inference
+NoSuchOptionException
+The "--with" option does not exist.
+```
+This happens because you have an old version of poetry. Update it.
+
+#### enable_load_extension
+```
+AttributeError: 'sqlite3.Connection' object has no attribute 'enable_load_extension'
+```
+The SQLite version bundled with your python install doesn't support extensions.
+You need to install a version of SQLite that supports them.
+
+#### sqlite3.OperationalError: no such function: concat
+```
+sqlite3.OperationalError: no such function: concat
+```
+Your SQLite version is too old. Panoptikon requires SQLite >=3.43.0
 
 ## Running Panoptikon
 
