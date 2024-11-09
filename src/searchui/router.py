@@ -64,9 +64,20 @@ def run_node_client(hostname: str, port: int):
     if os.getenv("DISABLE_CLIENT_UPDATE", "false").lower() in ["1", "true"]:
         logger.info("Client build is disabled. Skipping build step.")
     else:
-        # Fetch the repository or pull the latest changes
-        fetch_or_pull_repo(REPO_URL, client_dir)
-
+        try:
+            # Fetch the repository or pull the latest changes
+            fetch_or_pull_repo(REPO_URL, client_dir)
+        except Exception as e:
+            logger.error(f"Failed to fetch or pull the UI repository: {e}")
+            logger.error(f"Do you have an internet connection?")
+            # Check if the directory exists and is not empty
+            if not os.path.exists(client_dir) or not os.listdir(client_dir):
+                logger.error("The client UI directory is empty. Exiting...")
+                logger.error(
+                    "If you want to disable the UI client, set ENABLE_CLIENT=false in the environment."
+                )
+                raise e
+            return
         # Check if build is needed based on the latest commit timestamp
         if is_build_needed(build_dir, client_dir):
             logger.info("Building the Next.js application...")
