@@ -397,7 +397,8 @@ def get_setters_total_data(
     SELECT s.name, COUNT(ie.id)
     FROM item_data ie
     JOIN setters s ON ie.setter_id = s.id
-    GROUP BY s.id, s.name;
+    WHERE ie.is_placeholder = 0
+    GROUP BY s.id, s.name
     """
 
     cursor = conn.cursor()
