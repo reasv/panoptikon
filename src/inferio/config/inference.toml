@@ -20,6 +20,22 @@ wd-eva02-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-eva02-large
 wd-vit-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-large-tagger-v3" }, metadata = { description = "ViT Based Tagger (Large Version)" } }
 
 
+[group.tagmatch]
+config = { impl_class = "danbooru_tagger" }
+[group.tagmatch.metadata]
+description = "Matches your images to those uploaded to places like Danbooru and returns the tags associated with them."
+name = "Tag Matching"
+default_batch_size = 64
+default_inference_id = "danbooru"
+target_entities = ["items"]
+output_type = "tags"
+input_mime_types = ["image/", "video/"]
+
+input_spec = { handler = "md5" }
+
+[group.tagmatch.inference_ids]
+danbooru = { config = {}, metadata = { description = "Finds your images and videos on Danbooru and downloads the tags" } }
+
 [group.doctr]
 config = { impl_class = "doctr" }
 [group.doctr.metadata]

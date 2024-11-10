@@ -102,6 +102,19 @@ def handle_tag_result(
             is_placeholder=True,
         )
         return []
+    total_tag_groups = sum([len(tag_result["tags"]) for tag_result in results])
+    if total_tag_groups == 0:
+        add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="tags",
+            index=0,
+            is_placeholder=True,
+        )
+        return []
+
     tag_results = [from_dict(TagResult, tag_result) for tag_result in results]
     main_namespace = tag_results[0].namespace
     rating_severity = tag_results[0].rating_severity
@@ -152,35 +165,61 @@ def handle_tag_result(
         language_confidence=1.0,
         confidence=min_confidence,
     )
-
-    # Save another tag set as text using mcut threshold on general tags
-    general = [confidence for ns, _, confidence in tags if ns == "general"]
-    if not general:
-        return
-    m_thresh = mcut_threshold(np.array(general))
-    mcut_tags_string = ", ".join(
-        [
-            tag
-            for ns, tag, confidence in tags
-            if confidence >= m_thresh or ns != "general"
-        ]
-    )
-    # During search, we can filter by this confidence value
-    mcut_text_data_id = add_item_data(
-        conn,
-        item=item.sha256,
-        setter_name=setter_name,
-        job_id=job_id,
-        data_type="text",
-        src_data_id=tags_data_id,
-        index=1,
-    )
-    add_extracted_text(
-        conn,
-        data_id=mcut_text_data_id,
-        text=mcut_tags_string,
-        language=f"{main_namespace}-mcut",
-        language_confidence=1.0,
-        confidence=m_thresh,
-    )
-    return [tags_data_id, text_data_id, mcut_text_data_id]
+    mcut_text_data_id = None
+    if tag_results[0].mcut > 0:
+        # Save another tag set as text using mcut threshold on general tags
+        general = [confidence for ns, _, confidence in tags if ns == "general"]
+        if not general:
+            return
+        m_thresh = mcut_threshold(np.array(general))
+        mcut_tags_string = ", ".join(
+            [
+                tag
+                for ns, tag, confidence in tags
+                if confidence >= m_thresh or ns != "general"
+            ]
+        )
+        # During search, we can filter by this confidence value
+        mcut_text_data_id = add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="text",
+            src_data_id=tags_data_id,
+            index=1,
+        )
+        add_extracted_text(
+            conn,
+            data_id=mcut_text_data_id,
+            text=mcut_tags_string,
+            language=f"{main_namespace}-mcut",
+            language_confidence=1.0,
+            confidence=m_thresh,
+        )
+    # Add metadata text
+    metadata_text_data_id = None
+    if tag_results[0].metadata:
+        metadata_text_data_id = add_item_data(
+            conn,
+            item=item.sha256,
+            setter_name=setter_name,
+            job_id=job_id,
+            data_type="text",
+            src_data_id=tags_data_id,
+            index=2,
+        )
+        add_extracted_text(
+            conn,
+            data_id=metadata_text_data_id,
+            text=str(tag_results[0].metadata),
+            language=f"metadata",
+            language_confidence=1.0,
+            confidence=1.0,
+        )
+    return [
+        tags_data_id,
+        text_data_id,
+        *([mcut_text_data_id] if mcut_text_data_id else []),
+        *([metadata_text_data_id] if tag_results[0].metadata else []),
+    ]

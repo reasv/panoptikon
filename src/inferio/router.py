@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
 from inferio.impl.clip import ClipModel
+from inferio.impl.danbooru import DanbooruTagger
 from inferio.impl.florence2 import Florence2
 from inferio.impl.ocr import DoctrModel
 from inferio.impl.sentence_transformers import SentenceTransformersModel
@@ -30,6 +31,7 @@ ModelRegistry.register_model(SentenceTransformersModel)
 ModelRegistry.register_model(FasterWhisperModel)
 ModelRegistry.register_model(ClipModel)
 ModelRegistry.register_model(Florence2)
+ModelRegistry.register_model(DanbooruTagger)
 
 router = APIRouter(
     prefix="/api/inference",

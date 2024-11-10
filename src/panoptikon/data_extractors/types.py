@@ -17,6 +17,7 @@ class JobInputData(BaseModel):
     item_id: int
     path: str
     sha256: str
+    md5: str
     last_modified: str
     type: str
     # Video/audio columns (only present for file-* queries)
@@ -57,3 +58,4 @@ class TagResult:
     tags: List[Tuple[str, dict[str, float]]]
     mcut: float
     rating_severity: List[str]
+    metadata: dict[str, str]

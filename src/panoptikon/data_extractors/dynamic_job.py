@@ -84,6 +84,16 @@ def run_dynamic_extraction_job(
             return [({"text": item.text}, None)]
 
         data_loader = get_item_text
+
+    elif handler_name == "md5":
+
+        def get_md5(
+            item: JobInputData,
+        ) -> Sequence[Tuple[Dict[str, Any], None]]:
+            assert item.md5 is not None, "Md5 must be present"
+            return [({"md5": item.md5}, None)]
+
+        data_loader = get_md5
     else:
         raise ValueError(f"Data loader {handler_name} not found")
 
