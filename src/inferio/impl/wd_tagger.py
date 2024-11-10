@@ -152,6 +152,8 @@ class WDTagger(InferenceModel):
                         "questionable",
                         "explicit",
                     ],
+                    "metadata": {},
+                    "metadata_score": 0.0,
                 }
             )
 

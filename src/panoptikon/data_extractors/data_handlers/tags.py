@@ -224,7 +224,7 @@ def handle_tag_result(
             text=json.dumps(tag_results[0].metadata),
             language=f"metadata",
             language_confidence=1.0,
-            confidence=1.0,
+            confidence=tag_results[0].metadata_score,
         )
     return [
         tags_data_id,

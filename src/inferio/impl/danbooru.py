@@ -323,6 +323,7 @@ class DanbooruTagger(InferenceModel):
                         "questionable",
                         "explicit",
                     ],
+                    "metadata_score": item_confidence,
                     "metadata": {
                         "source_url": post.source,
                         "danbooru_url": post.danbooru_url,

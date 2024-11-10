@@ -59,3 +59,4 @@ class TagResult:
     mcut: float
     rating_severity: List[str]
     metadata: dict[str, str]
+    metadata_score: float = 0.0
