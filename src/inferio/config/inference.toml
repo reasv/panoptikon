@@ -19,7 +19,6 @@ wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, m
 wd-eva02-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-eva02-large-tagger-v3" }, metadata = { description = "(Recommended Large) Eva02 Based Tagger (Large Version)" } }
 wd-vit-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-large-tagger-v3" }, metadata = { description = "ViT Based Tagger (Large Version)" } }
 
-
 [group.tagmatch]
 config = { impl_class = "danbooru_tagger" }
 [group.tagmatch.metadata]
