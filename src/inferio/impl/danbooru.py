@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class DanbooruPost:
     id: int
     source: str | None
+    pixiv_url: str | None
     danbooru_url: str
     tags: Dict[str, List[str]]
 
@@ -80,6 +81,11 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
             "meta": post.get("tag_string_meta", "").split(),
         }
 
+        pixiv_id = post.get("pixiv_id")
+        if pixiv_id:
+            pixiv_url = f"https://www.pixiv.net/en/artworks/{pixiv_id}"
+        else:
+            pixiv_url = None
         # Construct danbooru URL
         danbooru_url = f"https://danbooru.donmai.us/posts/{post['id']}"
 
@@ -88,6 +94,7 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
             source=post.get("source"),
             danbooru_url=danbooru_url,
             tags=tags,
+            pixiv_url=pixiv_url,
         )
 
     except requests.exceptions.RequestException as e:
@@ -181,7 +188,9 @@ def find_on_sauce_nao(
     best_id: int | None = None
     best_similarity = 0
     for result in results:
-        similarity = float(result.raw.get("header", {}).get("similarity", "0"))
+        similarity = (
+            float(result.raw.get("header", {}).get("similarity", "0")) / 100
+        )
         if similarity >= threshold and similarity > best_similarity:
             if danbooru_id := result.raw.get("data", {}).get("danbooru_id"):
                 best_id = int(danbooru_id)
@@ -280,6 +289,12 @@ class DanbooruTagger(InferenceModel):
                     continue
 
             logger.debug(f"Post: {post.danbooru_url}")
+            metadata = {
+                "source_url": post.source,
+                "danbooru_url": post.danbooru_url,
+            }
+            if post.pixiv_url:
+                metadata["pixiv_url"] = post.pixiv_url
             outputs.append(
                 {
                     "namespace": "danbooru",
@@ -324,10 +339,7 @@ class DanbooruTagger(InferenceModel):
                         "explicit",
                     ],
                     "metadata_score": item_confidence,
-                    "metadata": {
-                        "source_url": post.source,
-                        "danbooru_url": post.danbooru_url,
-                    },
+                    "metadata": metadata,
                 }
             )
 
