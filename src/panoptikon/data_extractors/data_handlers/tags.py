@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from collections import defaultdict
 from typing import Any, Dict, List, Sequence, Tuple
@@ -9,6 +10,8 @@ from panoptikon.data_extractors.types import JobInputData, TagResult
 from panoptikon.db.extracted_text import add_extracted_text
 from panoptikon.db.extraction_log import add_item_data
 from panoptikon.db.tags import add_tag_to_item
+
+logger = logging.getLogger(__name__)
 
 
 def mcut_threshold(probs: np.ndarray) -> float:
@@ -101,6 +104,11 @@ def handle_tag_result(
             index=0,
             is_placeholder=True,
         )
+        return []
+    if results[0].get("skip", False):
+        # This item is to be skipped, without adding placeholder data
+        # This way, it will be processed again next time
+        logger.info(f"Skipping item {item.sha256}")
         return []
     total_tag_groups = sum([len(tag_result["tags"]) for tag_result in results])
     if total_tag_groups == 0:

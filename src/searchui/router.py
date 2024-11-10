@@ -91,7 +91,7 @@ def run_node_client(hostname: str, port: int):
             npx(
                 ["--yes", "next", "build"],
                 cwd=client_dir,
-                stdout=subprocess.DEVNULL,
+                # stdout=subprocess.DEVNULL,
             )
         else:
             logger.info("Build is up to date. Skipping build step.")

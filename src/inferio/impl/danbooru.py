@@ -1,13 +1,17 @@
 import logging
 import os
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
-from saucenao_api import SauceNao
-from tomlkit import boolean
 
+from inferio.impl.saucenao import SauceNao
+from inferio.impl.saucenao.errors import (
+    LongLimitReachedError,
+    ShortLimitReachedError,
+)
 from inferio.model import InferenceModel
 from inferio.types import PredictionInput
 
@@ -117,6 +121,10 @@ def add_confidence_level(
     return {tag: confidence for tag in tags}
 
 
+class SauceNaoError(Exception):
+    pass
+
+
 def find_on_sauce_nao(
     image: BytesIO, threshold: float
 ) -> Tuple[int | None, float]:
@@ -129,8 +137,34 @@ def find_on_sauce_nao(
     Returns:
         Tuple[str, float]: Best match URL and similarity score
     """
+
     sauce = SauceNao(os.getenv("SAUCENAO_API_KEY"))
-    results = sauce.from_file(image)
+    attempts = 0
+    results = None
+    while attempts <= 4:
+        attempts += 1
+        try:
+            results = sauce.from_file(image)
+            break
+        except ShortLimitReachedError as e:
+            logger.error(
+                "30 Seconds limit reached on SauceNAO. Waiting for 10 seconds..."
+            )
+            time.sleep(10)
+        except LongLimitReachedError as e:
+            logger.error(
+                "24 hour limit reached on SauceNAO. Skipping this image this time, run the job again tomorrow..."
+            )
+            raise SauceNaoError("24 hour limit reached on SauceNAO")
+        except Exception as e:
+            logger.error(f"Error searching on SauceNAO: {e}")
+            logger.info("Retrying...")
+            time.sleep(1)
+
+    if results is None:
+        logger.error("Failed to search on SauceNAO")
+        raise SauceNaoError("Failed to search on SauceNAO")
+
     best_id: int | None = None
     best_similarity = 0
     for result in results:
@@ -189,13 +223,27 @@ class DanbooruTagger(InferenceModel):
                             "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
                         )
                     logger.debug(f"Searching on SauceNAO for md5: {md5}")
-                    danbooru_id, confidence = find_on_sauce_nao(
-                        images[md5], thresholds[md5]
-                    )
+                    try:
+                        danbooru_id, confidence = find_on_sauce_nao(
+                            images[md5], thresholds[md5]
+                        )
+                    except SauceNaoError:
+                        logger.warning(
+                            f"Skipping {md5} after SauceNAO search failed."
+                        )
+                        # Ensures Panoptikon will try this image again next time
+                        outputs.append({"skip": True})
+                        continue
+
                     if danbooru_id:
+                        logger.info(
+                            f"Found Danbooru ID for md5 {md5}: https://danbooru.donmai.us/posts/{danbooru_id}"
+                        )
                         post = get_danbooru_post(danbooru_id)
                         item_confidence = confidence
                 if not post:
+                    logger.warning(f"Failed to find {md5} through SauceNAO")
+                    # Not found. Will not be retried next time
                     outputs.append(
                         {
                             "namespace": "danbooru",
