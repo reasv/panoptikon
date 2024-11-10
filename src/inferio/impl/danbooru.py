@@ -142,7 +142,7 @@ class SauceNaoError(Exception):
 
 
 async def find_on_sauce_nao_async(
-    image: bytes, threshold: float, sauce: AIOSauceNao
+    image: bytes, threshold: float, saucenao_api_key: str
 ) -> Tuple[int | None, float]:
     """
     Finds the best match for the image on SauceNAO.
@@ -154,26 +154,27 @@ async def find_on_sauce_nao_async(
     Returns:
         Tuple[str, float]: Best match URL and similarity score
     """
-    attempts = 0
-    results = None
-    while attempts <= 4:
-        attempts += 1
-        try:
-            results = await sauce.from_file(BytesIO(image))
-            break
-        except ShortLimitReachedError:
-            logger.error(
-                "30 Seconds limit reached on SauceNAO. Waiting for 10 seconds..."
-            )
-            await asyncio.sleep(10)
-        except LongLimitReachedError:
-            logger.error("24 hour limit reached on SauceNAO...")
-            raise SauceNaoError("24 hour limit reached on SauceNAO")
-        except Exception as e:
-            logger.error(f"Error searching on SauceNAO: {e}")
-            if attempts <= 4:
-                logger.info("Retrying...")
-                await asyncio.sleep(1)
+    async with AIOSauceNao(api_key=saucenao_api_key) as sauce:
+        attempts = 0
+        results = None
+        while attempts <= 4:
+            attempts += 1
+            try:
+                results = await sauce.from_file(BytesIO(image))
+                break
+            except ShortLimitReachedError:
+                logger.error(
+                    "30 Seconds limit reached on SauceNAO. Waiting for 10 seconds..."
+                )
+                await asyncio.sleep(10)
+            except LongLimitReachedError:
+                logger.error("24 hour limit reached on SauceNAO...")
+                raise SauceNaoError("24 hour limit reached on SauceNAO")
+            except Exception as e:
+                logger.error(f"Error searching on SauceNAO: {e}")
+                if attempts <= 4:
+                    logger.info("Retrying...")
+                    await asyncio.sleep(1)
 
     if results is None:
         raise SauceNaoError("Failed to search on SauceNAO")
@@ -208,19 +209,15 @@ class DanbooruTagger(InferenceModel):
         self.load()
 
         async def process_all():
-            client_session = None
             sauce = None
             if self.sauce_nao_enabled:
                 if not os.getenv("SAUCENAO_API_KEY"):
                     raise ValueError(
                         "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
                     )
-                sauce = AIOSauceNao(os.getenv("SAUCENAO_API_KEY"))
-                client_session = sauce._session
+                sauce = os.getenv("SAUCENAO_API_KEY")
 
-            if client_session is None:
-                client_session = aiohttp.ClientSession()
-            async with client_session as session:
+            async with aiohttp.ClientSession() as session:
                 md5_inputs: List[str] = []
                 images: Dict[str, bytes] = {}
                 thresholds: Dict[str, float] = {}
@@ -267,7 +264,7 @@ class DanbooruTagger(InferenceModel):
         threshold: float,
         image: bytes | None,
         session: aiohttp.ClientSession,
-        sauce: AIOSauceNao | None = None,
+        sauce: str | None = None,
     ) -> dict:
         item_confidence = 1
         try:
