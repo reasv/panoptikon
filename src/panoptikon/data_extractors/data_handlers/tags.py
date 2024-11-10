@@ -1,3 +1,4 @@
+import json
 import logging
 import sqlite3
 from collections import defaultdict
@@ -220,7 +221,7 @@ def handle_tag_result(
         add_extracted_text(
             conn,
             data_id=metadata_text_data_id,
-            text=str(tag_results[0].metadata),
+            text=json.dumps(tag_results[0].metadata),
             language=f"metadata",
             language_confidence=1.0,
             confidence=1.0,
