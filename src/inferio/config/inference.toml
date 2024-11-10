@@ -24,7 +24,7 @@ config = { impl_class = "danbooru_tagger" }
 [group.tagmatch.metadata]
 description = "Matches your images to those uploaded to places like Danbooru and returns the tags associated with them."
 name = "Tag Matching"
-default_batch_size = 8
+default_batch_size = 5
 default_threshold = 0.5
 default_inference_id = "danbooru"
 target_entities = ["items"]
