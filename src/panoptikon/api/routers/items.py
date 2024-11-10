@@ -245,6 +245,7 @@ def get_item_text(
         get_item
     ),
     setters: List[str] = Query([]),
+    languages: List[str] = Query([]),
     truncate_length: int | None = Query(
         None,
         description="Text will be truncated to this length, if set. The `length` field will contain the original length.",
@@ -256,6 +257,8 @@ def get_item_text(
         text = get_extracted_text_for_item(conn, item.id, truncate_length)
         if setters:
             text = [t for t in text if t.setter_name in setters]
+        if languages:
+            text = [t for t in text if t.language in languages]
         return TextResponse(text=text)
     finally:
         conn.close()
