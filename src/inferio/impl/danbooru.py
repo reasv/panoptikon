@@ -235,115 +235,102 @@ class DanbooruTagger(InferenceModel):
         )
         outputs: List[dict] = []
         for md5 in md5_inputs:
-            item_confidence = 1
-            try:
-                post = get_danbooru_post(md5)
-            except DanbooruFetchError:
-                logger.warning(f"Skipping {md5} after Danbooru fetch failed.")
-                # Ensures Panoptikon will try this image again next time
-                outputs.append({"skip": True})
-                continue
-            if not post:
-                logger.debug(f"Post not found for md5: {md5}")
-                if self.sauce_nao_enabled and md5 in images:
-                    if not os.getenv("SAUCENAO_API_KEY"):
-                        raise ValueError(
-                            "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
-                        )
-                    logger.debug(f"Searching on SauceNAO for md5: {md5}")
-                    try:
-                        danbooru_id, confidence = find_on_sauce_nao(
-                            images[md5], thresholds[md5]
-                        )
-                    except SauceNaoError:
-                        logger.warning(
-                            f"Skipping {md5} after SauceNAO search failed."
-                        )
-                        # Ensures Panoptikon will try this image again next time
-                        outputs.append({"skip": True})
-                        continue
-
-                    if danbooru_id:
-                        logger.info(
-                            f"Found Danbooru ID for md5 {md5}: https://danbooru.donmai.us/posts/{danbooru_id}"
-                        )
-                        try:
-                            post = get_danbooru_post(danbooru_id)
-                        except DanbooruFetchError:
-                            logger.warning(
-                                f"Skipping {md5} after Danbooru fetch failed."
-                            )
-                            # Ensures Panoptikon will try this image again next time
-                            outputs.append({"skip": True})
-                            continue
-                        item_confidence = confidence
-                if not post:
-                    logger.warning(f"Failed to find {md5} through SauceNAO")
-                    # Not found. Will not be retried next time
-                    outputs.append(
-                        {
-                            "namespace": "danbooru",
-                            "tags": [],
-                        }
-                    )
-                    continue
-
-            logger.debug(f"Post: {post.danbooru_url}")
-            metadata = {
-                "source_url": post.source,
-                "danbooru_url": post.danbooru_url,
-            }
-            if post.pixiv_url:
-                metadata["pixiv_url"] = post.pixiv_url
             outputs.append(
-                {
-                    "namespace": "danbooru",
-                    "tags": [
-                        (
-                            "rating",
-                            add_confidence_level(
-                                post.tags["rating"], item_confidence
-                            ),
-                        ),
-                        (
-                            "character",
-                            add_confidence_level(
-                                post.tags["character"], item_confidence
-                            ),
-                        ),
-                        (
-                            "general",
-                            add_confidence_level(
-                                post.tags["general"], item_confidence
-                            ),
-                        ),
-                        (
-                            "artist",
-                            add_confidence_level(
-                                post.tags["artist"], item_confidence
-                            ),
-                        ),
-                        (
-                            "meta",
-                            add_confidence_level(
-                                post.tags["meta"], item_confidence
-                            ),
-                        ),
-                    ],
-                    "mcut": 0.0,
-                    "rating_severity": [
-                        "general",
-                        "safe",
-                        "sensitive",
-                        "questionable",
-                        "explicit",
-                    ],
-                    "metadata_score": item_confidence,
-                    "metadata": metadata,
-                }
+                self.process_item(md5, thresholds[md5], images.get(md5))
             )
 
         return outputs
+
+    def process_item(
+        self, md5: str, threshold: float, image: BytesIO | None
+    ) -> dict:
+        item_confidence = 1
+        try:
+            post = get_danbooru_post(md5)
+        except DanbooruFetchError:
+            logger.warning(f"Skipping {md5} after Danbooru fetch failed.")
+            # Ensures Panoptikon will try this image again next time
+            return {"skip": True}
+        if not post:
+            logger.debug(f"Post not found for md5: {md5}")
+            if self.sauce_nao_enabled and image is not None:
+                if not os.getenv("SAUCENAO_API_KEY"):
+                    raise ValueError(
+                        "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
+                    )
+                logger.debug(f"Searching on SauceNAO for md5: {md5}")
+                try:
+                    danbooru_id, confidence = find_on_sauce_nao(
+                        image, threshold
+                    )
+                except SauceNaoError:
+                    logger.warning(
+                        f"Skipping {md5} after SauceNAO search failed."
+                    )
+                    # Ensures Panoptikon will try this image again next time
+                    return {"skip": True}
+                if danbooru_id:
+                    logger.info(
+                        f"Found Danbooru ID for md5 {md5}: https://danbooru.donmai.us/posts/{danbooru_id}"
+                    )
+                    try:
+                        post = get_danbooru_post(danbooru_id)
+                    except DanbooruFetchError:
+                        logger.warning(
+                            f"Skipping {md5} after Danbooru fetch failed."
+                        )
+                        # Ensures Panoptikon will try this image again next time
+                        return {"skip": True}
+                    item_confidence = confidence
+            if not post:
+                logger.warning(f"Failed to find {md5} through SauceNAO")
+                # Not found. Will not be retried next time
+                return {"namespace": "danbooru", "tags": []}
+
+        logger.debug(f"Post: {post.danbooru_url}")
+        metadata = {
+            "source_url": post.source,
+            "danbooru_url": post.danbooru_url,
+        }
+        if post.pixiv_url:
+            metadata["pixiv_url"] = post.pixiv_url
+        return {
+            "namespace": "danbooru",
+            "tags": [
+                (
+                    "rating",
+                    add_confidence_level(post.tags["rating"], item_confidence),
+                ),
+                (
+                    "character",
+                    add_confidence_level(
+                        post.tags["character"], item_confidence
+                    ),
+                ),
+                (
+                    "general",
+                    add_confidence_level(post.tags["general"], item_confidence),
+                ),
+                (
+                    "artist",
+                    add_confidence_level(post.tags["artist"], item_confidence),
+                ),
+                (
+                    "meta",
+                    add_confidence_level(post.tags["meta"], item_confidence),
+                ),
+            ],
+            "mcut": 0.0,
+            "rating_severity": [
+                "general",
+                "safe",
+                "sensitive",
+                "questionable",
+                "explicit",
+            ],
+            "metadata_score": item_confidence,
+            "metadata": metadata,
+        }
 
     def unload(self) -> None:
         if self._model_loaded:
