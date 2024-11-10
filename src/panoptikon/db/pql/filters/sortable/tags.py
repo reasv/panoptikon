@@ -1,7 +1,7 @@
 from typing import List
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, all_, and_, distinct, func, or_
+from sqlalchemy import String, and_, distinct, func, or_
 from sqlalchemy.sql.expression import CTE, select
 
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
@@ -103,7 +103,9 @@ class MatchTags(SortableFilter):
             having_clause = [
                 func.count(
                     distinct(
-                        func.concat(item_data.c.setter_id, "-", tags.c.name)
+                        item_data.c.setter_id.op("||")("-").op("||")(
+                            tags.c.name
+                        )
                     )
                 )
                 == len(args.tags) * len(args.setters)

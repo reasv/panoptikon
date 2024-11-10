@@ -128,6 +128,10 @@ def build_query(
             partition_columns = [
                 get_column(col) for col in input_query.partition_by
             ]
+            # Build the concatenation using the || operator
+            partition_key = partition_columns[0]
+            for col in partition_columns[1:]:
+                partition_key = partition_key.op("||")(col)
             return (
                 select(
                     func.count(distinct(Column("partition_key"))).label(
@@ -135,7 +139,7 @@ def build_query(
                     ),
                 ).select_from(
                     full_query.column(
-                        func.concat(*partition_columns).label("partition_key")
+                        partition_key.label("partition_key")
                     ).alias("wrapped_query")
                 ),
                 {},
