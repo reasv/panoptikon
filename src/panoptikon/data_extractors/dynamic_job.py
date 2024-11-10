@@ -94,6 +94,19 @@ def run_dynamic_extraction_job(
             return [({"md5": item.md5}, None)]
 
         data_loader = get_md5
+    elif handler_name == "md5_image":
+
+        def get_md5_image(
+            item: JobInputData,
+        ) -> Sequence[Tuple[Dict[str, Any], None | bytes]]:
+            assert item.md5 is not None, "Md5 must be present"
+            frames = image_loader(conn, item)
+            frame = None
+            if frames:
+                frame = frames[0]
+            return [({"md5": item.md5}, frame)]
+
+        data_loader = get_md5_image
     else:
         raise ValueError(f"Data loader {handler_name} not found")
 

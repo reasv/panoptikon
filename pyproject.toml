@@ -38,6 +38,8 @@ python-multipart = "^0.0.12"
 tomli = "^2.0.2"
 tomli-w = "^1.0.0"
 blurhash = "^1.1.4"
+saucenao-api = "^2.4.0"
+urllib3 = "^2.2.3"
 
 [tool.poetry.group.inference]
 optional = true

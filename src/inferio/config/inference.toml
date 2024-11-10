@@ -26,15 +26,15 @@ config = { impl_class = "danbooru_tagger" }
 description = "Matches your images to those uploaded to places like Danbooru and returns the tags associated with them."
 name = "Tag Matching"
 default_batch_size = 64
+default_threshold = 0.5
 default_inference_id = "danbooru"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/"]
-
 input_spec = { handler = "md5" }
-
 [group.tagmatch.inference_ids]
-danbooru = { config = {}, metadata = { description = "Finds your images and videos on Danbooru and downloads the tags" } }
+danbooru = { config = {}, metadata = { description = "Finds your images and videos on Danbooru and downloads the tags. Ignores the confidence threshold." } }
+danbooru-saucenao = { config = { sauce_nao_enabled = true }, metadata = { input_spec = { handler = "md5_image" }, description = "Requires SAUCENAO_API_KEY environment variable to be set. Falls back to SauceNAO if it can't find your exact image on Danbooru. Finds your images and videos on Danbooru and downloads the tags. Applies the confidence threshold to the SauceNAO similarity level." } }
 
 [group.doctr]
 config = { impl_class = "doctr" }
