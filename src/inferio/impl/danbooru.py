@@ -21,11 +21,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DanbooruPost:
     id: int
-    md5: str
-    rating: str
-    source: str
+    source: str | None
     danbooru_url: str
     tags: Dict[str, List[str]]
+
+
+class DanbooruFetchError(Exception):
+    pass
 
 
 def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
@@ -45,9 +47,22 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
     else:
         params = {"tags": f"md5:{id_or_hash}"}
 
+    attempts = 0
+    response = None
+    while attempts <= 4:
+        attempts += 1
+        try:
+            response = requests.get(api_url, params=params)
+            response.raise_for_status()
+            break
+        except Exception as e:
+            logger.error(f"Error fetching data: {e}")
+            logger.info("Retrying...")
+            time.sleep(1)
+
+    if response is None:
+        raise DanbooruFetchError("Failed to fetch data from Danbooru")
     try:
-        response = requests.get(api_url, params=params)
-        response.raise_for_status()
 
         posts = response.json()
         if not posts:
@@ -57,7 +72,7 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
 
         # Extract all tag categories
         tags = {
-            "rating": [translate_rating(post.get("rating", ""))],
+            "rating": [translate_rating(post.get("rating", "unknown"))],
             "general": post.get("tag_string_general", "").split(),
             "character": post.get("tag_string_character", "").split(),
             "copyright": post.get("tag_string_copyright", "").split(),
@@ -70,18 +85,16 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
 
         return DanbooruPost(
             id=post["id"],
-            md5=post["md5"],
-            rating=post["rating"],
-            source=post["source"],
+            source=post.get("source"),
             danbooru_url=danbooru_url,
             tags=tags,
         )
 
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching data: {e}")
+        logger.error(f"Error fetching data: {e}")
         return None
     except (KeyError, IndexError, ValueError) as e:
-        print(f"Error processing data: {e}")
+        logger.error(f"Error processing data: {e}")
         return None
 
 
@@ -214,7 +227,13 @@ class DanbooruTagger(InferenceModel):
         outputs: List[dict] = []
         for md5 in md5_inputs:
             item_confidence = 1
-            post = get_danbooru_post(md5)
+            try:
+                post = get_danbooru_post(md5)
+            except DanbooruFetchError:
+                logger.warning(f"Skipping {md5} after Danbooru fetch failed.")
+                # Ensures Panoptikon will try this image again next time
+                outputs.append({"skip": True})
+                continue
             if not post:
                 logger.debug(f"Post not found for md5: {md5}")
                 if self.sauce_nao_enabled and md5 in images:
@@ -239,7 +258,15 @@ class DanbooruTagger(InferenceModel):
                         logger.info(
                             f"Found Danbooru ID for md5 {md5}: https://danbooru.donmai.us/posts/{danbooru_id}"
                         )
-                        post = get_danbooru_post(danbooru_id)
+                        try:
+                            post = get_danbooru_post(danbooru_id)
+                        except DanbooruFetchError:
+                            logger.warning(
+                                f"Skipping {md5} after Danbooru fetch failed."
+                            )
+                            # Ensures Panoptikon will try this image again next time
+                            outputs.append({"skip": True})
+                            continue
                         item_confidence = confidence
                 if not post:
                     logger.warning(f"Failed to find {md5} through SauceNAO")
