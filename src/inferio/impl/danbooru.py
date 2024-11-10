@@ -1,17 +1,18 @@
+import asyncio
 import logging
 import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import requests
+import aiohttp
 
-from inferio.impl.saucenao import SauceNao
 from inferio.impl.saucenao.errors import (
     LongLimitReachedError,
     ShortLimitReachedError,
 )
+from inferio.impl.saucenao.saucenao_api import AIOSauceNao
 from inferio.model import InferenceModel
 from inferio.types import PredictionInput
 
@@ -31,17 +32,19 @@ class DanbooruFetchError(Exception):
     pass
 
 
-def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
+async def get_danbooru_post_async(
+    id_or_hash: str | int, session: aiohttp.ClientSession
+) -> Optional[DanbooruPost]:
     """
     Retrieves post information from Danbooru using MD5 hash.
 
     Args:
         md5_hash (str): MD5 hash of the image
+        session (aiohttp.ClientSession): Aiohttp session
 
     Returns:
         Optional[DanbooruPost]: Structured post data or None if not found
     """
-
     api_url = f"https://danbooru.donmai.us/posts.json"
     if isinstance(id_or_hash, int):
         params = {"tags": f"id:{id_or_hash}"}
@@ -49,29 +52,26 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
         params = {"tags": f"md5:{id_or_hash}"}
 
     attempts = 0
-    response = None
+    posts = None
     while attempts <= 4:
         attempts += 1
         try:
-            response = requests.get(api_url, params=params)
-            response.raise_for_status()
-            break
+            async with session.get(api_url, params=params) as response:
+                response.raise_for_status()
+                posts = await response.json()
         except Exception as e:
             logger.error(f"Error fetching data: {e}")
-            logger.info("Retrying...")
-            time.sleep(1)
-
-    if response is None:
-        raise DanbooruFetchError("Failed to fetch data from Danbooru")
+            if attempts <= 4:
+                logger.info("Retrying...")
+                await asyncio.sleep(1)
+            else:
+                raise DanbooruFetchError("Failed to fetch data from Danbooru")
     try:
-
-        posts = response.json()
         if not posts:
             return None
 
         post = posts[0]
 
-        # Extract all tag categories
         tags = {
             "rating": [translate_rating(post.get("rating", "unknown"))],
             "general": post.get("tag_string_general", "").split(),
@@ -82,11 +82,11 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
         }
 
         pixiv_id = post.get("pixiv_id")
-        if pixiv_id:
-            pixiv_url = f"https://www.pixiv.net/en/artworks/{pixiv_id}"
-        else:
-            pixiv_url = None
-        # Construct danbooru URL
+        pixiv_url = (
+            f"https://www.pixiv.net/en/artworks/{pixiv_id}"
+            if pixiv_id
+            else None
+        )
         danbooru_url = f"https://danbooru.donmai.us/posts/{post['id']}"
 
         return DanbooruPost(
@@ -96,10 +96,6 @@ def get_danbooru_post(id_or_hash: str | int) -> Optional[DanbooruPost]:
             tags=tags,
             pixiv_url=pixiv_url,
         )
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching data: {e}")
-        return None
     except (KeyError, IndexError, ValueError) as e:
         logger.error(f"Error processing data: {e}")
         return None
@@ -145,44 +141,41 @@ class SauceNaoError(Exception):
     pass
 
 
-def find_on_sauce_nao(
-    image: BytesIO, threshold: float
+async def find_on_sauce_nao_async(
+    image: bytes, threshold: float, sauce: AIOSauceNao
 ) -> Tuple[int | None, float]:
     """
     Finds the best match for the image on SauceNAO.
 
     Args:
         image (BytesIO): Image to search
+        session (aiohttp.ClientSession): Aiohttp session
 
     Returns:
         Tuple[str, float]: Best match URL and similarity score
     """
-
-    sauce = SauceNao(os.getenv("SAUCENAO_API_KEY"))
     attempts = 0
     results = None
     while attempts <= 4:
         attempts += 1
         try:
-            results = sauce.from_file(image)
+            results = await sauce.from_file(BytesIO(image))
             break
-        except ShortLimitReachedError as e:
+        except ShortLimitReachedError:
             logger.error(
                 "30 Seconds limit reached on SauceNAO. Waiting for 10 seconds..."
             )
-            time.sleep(10)
-        except LongLimitReachedError as e:
-            logger.error(
-                "24 hour limit reached on SauceNAO. Skipping this image this time, run the job again tomorrow..."
-            )
+            await asyncio.sleep(10)
+        except LongLimitReachedError:
+            logger.error("24 hour limit reached on SauceNAO...")
             raise SauceNaoError("24 hour limit reached on SauceNAO")
         except Exception as e:
             logger.error(f"Error searching on SauceNAO: {e}")
-            logger.info("Retrying...")
-            time.sleep(1)
+            if attempts <= 4:
+                logger.info("Retrying...")
+                await asyncio.sleep(1)
 
     if results is None:
-        logger.error("Failed to search on SauceNAO")
         raise SauceNaoError("Failed to search on SauceNAO")
 
     best_id: int | None = None
@@ -195,6 +188,7 @@ def find_on_sauce_nao(
             if danbooru_id := result.raw.get("data", {}).get("danbooru_id"):
                 best_id = int(danbooru_id)
                 best_similarity = similarity
+
     return best_id, best_similarity
 
 
@@ -212,88 +206,119 @@ class DanbooruTagger(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        md5_inputs: List[str] = []
-        images: Dict[str, BytesIO] = {}
-        thresholds: Dict[str, float] = {}
-        for input_item in inputs:
-            if input_item.data:
-                threshold = 0.5
-                if isinstance(input_item.data, dict):
-                    md5 = input_item.data.get("md5", None)
-                    threshold = input_item.data.get("threshold", 0.5)
-                else:
-                    md5 = input_item.data
-                md5_inputs.append(md5)
-                thresholds[md5] = threshold
-                if input_item.file:
-                    images[md5] = BytesIO(input_item.file)
-            else:
-                raise ValueError("Danbooru requires md5 hashes")
 
-        logger.debug(
-            f"Running danbooru tag matching on {len(md5_inputs)} images"
-        )
-        outputs: List[dict] = []
-        for md5 in md5_inputs:
-            outputs.append(
-                self.process_item(md5, thresholds[md5], images.get(md5))
-            )
-
-        return outputs
-
-    def process_item(
-        self, md5: str, threshold: float, image: BytesIO | None
-    ) -> dict:
-        item_confidence = 1
-        try:
-            post = get_danbooru_post(md5)
-        except DanbooruFetchError:
-            logger.warning(f"Skipping {md5} after Danbooru fetch failed.")
-            # Ensures Panoptikon will try this image again next time
-            return {"skip": True}
-        if not post:
-            logger.debug(f"Post not found for md5: {md5}")
-            if self.sauce_nao_enabled and image is not None:
+        async def process_all():
+            client_session = None
+            sauce = None
+            if self.sauce_nao_enabled:
                 if not os.getenv("SAUCENAO_API_KEY"):
                     raise ValueError(
                         "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
                     )
+                sauce = AIOSauceNao(os.getenv("SAUCENAO_API_KEY"))
+                client_session = sauce._session
+
+            if client_session is None:
+                client_session = aiohttp.ClientSession()
+            async with client_session as session:
+                md5_inputs: List[str] = []
+                images: Dict[str, bytes] = {}
+                thresholds: Dict[str, float] = {}
+
+                for input_item in inputs:
+                    if input_item.data:
+                        threshold = 0.5
+                        if isinstance(input_item.data, dict):
+                            md5 = input_item.data.get("md5", None)
+                            threshold = input_item.data.get("threshold", 0.5)
+                        else:
+                            md5 = input_item.data
+                        md5_inputs.append(md5)
+                        thresholds[md5] = threshold
+                        if input_item.file:
+                            images[md5] = input_item.file
+                    else:
+                        raise ValueError("Danbooru requires md5 hashes")
+
+                logger.debug(
+                    f"Running danbooru tag matching on {len(md5_inputs)} images"
+                )
+
+                tasks = []
+                for md5 in md5_inputs:
+                    task = self.process_item_async(
+                        md5,
+                        thresholds[md5],
+                        images.get(md5),
+                        session,
+                        sauce,
+                    )
+                    tasks.append(task)
+
+                # Wait for all tasks to complete while preserving order
+                results = await asyncio.gather(*tasks)
+                return results
+
+        return asyncio.run(process_all())
+
+    async def process_item_async(
+        self,
+        md5: str,
+        threshold: float,
+        image: bytes | None,
+        session: aiohttp.ClientSession,
+        sauce: AIOSauceNao | None = None,
+    ) -> dict:
+        item_confidence = 1
+        try:
+            post = await get_danbooru_post_async(md5, session)
+        except DanbooruFetchError:
+            logger.warning(f"Skipping {md5} after Danbooru fetch failed.")
+            return {"skip": True}
+
+        if not post:
+            logger.debug(f"Post not found for md5: {md5}")
+            if self.sauce_nao_enabled and image is not None:
+                assert sauce is not None, "SauceNAO instance must be provided"
                 logger.debug(f"Searching on SauceNAO for md5: {md5}")
                 try:
-                    danbooru_id, confidence = find_on_sauce_nao(
-                        image, threshold
+                    danbooru_id, confidence = await find_on_sauce_nao_async(
+                        image, threshold, sauce
                     )
                 except SauceNaoError:
                     logger.warning(
                         f"Skipping {md5} after SauceNAO search failed."
                     )
-                    # Ensures Panoptikon will try this image again next time
                     return {"skip": True}
+
                 if danbooru_id:
                     logger.info(
                         f"Found Danbooru ID for md5 {md5}: https://danbooru.donmai.us/posts/{danbooru_id}"
                     )
                     try:
-                        post = get_danbooru_post(danbooru_id)
+                        post = await get_danbooru_post_async(
+                            danbooru_id, session
+                        )
                     except DanbooruFetchError:
                         logger.warning(
                             f"Skipping {md5} after Danbooru fetch failed."
                         )
-                        # Ensures Panoptikon will try this image again next time
                         return {"skip": True}
                     item_confidence = confidence
+
             if not post:
-                logger.warning(f"Failed to find {md5} through SauceNAO")
-                # Not found. Will not be retried next time
+                if self.sauce_nao_enabled:
+                    logger.warning(f"Failed to find {md5} through SauceNAO")
                 return {"namespace": "danbooru", "tags": []}
 
-        logger.debug(f"Post: {post.danbooru_url}")
+        logger.debug(f"Post: {post.danbooru_url} (md5: {md5})")
         metadata = {
             "source_url": post.source,
             "danbooru_url": post.danbooru_url,
         }
         if post.pixiv_url:
             metadata["pixiv_url"] = post.pixiv_url
+
         return {
             "namespace": "danbooru",
             "tags": [
@@ -340,12 +365,3 @@ class DanbooruTagger(InferenceModel):
         if self._model_loaded:
             logger.debug(f"Model danbooru deleted")
         self.unload()
-
-
-@dataclass
-class TagResult:
-    rating: Dict[str, float]
-    character: Dict[str, float]
-    general: Dict[str, float]
-    character_mcut: float
-    general_mcut: float
