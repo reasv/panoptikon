@@ -45,7 +45,7 @@ class InferenceAPIClient:
             logger.error(
                 f"Prediction Fail (Status: {response.status_code})",
             )
-            logger.debug("Response content:", response.content)
+            logger.debug(f"Response content: {response.content}")
             response.raise_for_status()
             raise ValueError("Unexpected response")
 
@@ -89,7 +89,7 @@ def handle_resp(response: Response):
     if response.status_code == 200:
         return response.json()
     else:
-        logger.debug("Response content:", response.content)
+        logger.debug(f"Response content: {response.content}")
         response.raise_for_status()
         raise ValueError("Unexpected response")
 
