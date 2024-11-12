@@ -148,12 +148,16 @@ target_entities = ["items"]
 output_type = "clip"
 input_spec = { handler = "image_frames" }
 [group.clip.inference_ids]
-ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
+ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)." } }
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
 apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
-apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
-apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
+apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-S1-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+TinyCLIP-ViT-39M-16-Text-19M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-39M-16-Text-19M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 63.5%)" } }
+TinyCLIP-ViT-8M-16-Text-3M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 41.1%)" } }
+jina-clip-v1 = { config = { model_name = "jinaai/jina-clip-v1", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) jina-clip-v1 is a state-of-the-art English multimodal (text-image) embedding model." } }
+
 ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
 ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
 ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
@@ -194,8 +198,12 @@ ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
 apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
-apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
-apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
+apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-S1-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
+TinyCLIP-ViT-39M-16-Text-19M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-39M-16-Text-19M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 63.5%)" } }
+TinyCLIP-ViT-8M-16-Text-3M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 41.1%)" } }
+jina-clip-v1 = { config = { model_name = "jinaai/jina-clip-v1", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) jina-clip-v1 is a state-of-the-art English multimodal (text-image) embedding model." } }
+
 ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
 ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
 ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
@@ -360,3 +368,35 @@ microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_na
 # ViTamin-L2-256_datacomp1b = { config = { model_name = "ViTamin-L2-256", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-256 model pretrained on DataComp1B" } }
 # ViTamin-L2-336_datacomp1b = { config = { model_name = "ViTamin-L2-336", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-336 model pretrained on DataComp1B" } }
 # ViTamin-L2-384_datacomp1b = { config = { model_name = "ViTamin-L2-384", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-384 model pretrained on DataComp1B" } }
+
+[group.clap]
+config = { impl_class = "clip_infinity" }
+[group.clap.metadata]
+description = "This is experimental. Generate Audio Embeddings using CLAP models for semantic sound search. In order to search for audio using these embeddings, use the 'Semantic Image Search' features in the Search UI, and specifically select one of these audio models in the advanced options"
+name = "CLAP Audio Embeddings"
+default_batch_size = 64
+default_inference_id = "clap-htsat-unfused"
+target_entities = ["items"]
+output_type = "clip"
+input_spec = { handler = "audio_files" }
+[group.clap.inference_ids]
+clap-htsat-unfused = { config = { model_name = "laion/clap-htsat-unfused" }, metadata = { description = "(Experimental Engine) CLAP: Contrastive Language-Audio Pretraining" } }
+larger_clap_music = { config = { model_name = "laion/larger_clap_music" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music" } }
+larger_clap_music_and_speech = { config = { model_name = "laion/larger_clap_music_and_speech" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music and speech." } }
+larger_clap_general = { config = { model_name = "laion/larger_clap_general" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on general audio, music and speech." } }
+
+[group.tclap]
+config = { impl_class = "clip_infinity" }
+[group.tclap.metadata]
+description = "Generate Text Embeddings from extracted text using CLAP models. This is exclusively meant for cross-modal item similarity search. For semantic text search, use the `Text Embeddings` model group. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
+name = "CLAP Text Embeddings"
+default_batch_size = 64
+default_inference_id = "clap-htsat-unfused"
+target_entities = ["text"]
+output_type = "text-embedding"
+input_spec = { handler = "extracted_text" }
+[group.tclap.inference_ids]
+clap-htsat-unfused = { config = { model_name = "laion/clap-htsat-unfused" }, metadata = { description = "(Experimental Engine) CLAP: Contrastive Language-Audio Pretraining" } }
+larger_clap_music = { config = { model_name = "laion/larger_clap_music" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music" } }
+larger_clap_music_and_speech = { config = { model_name = "laion/larger_clap_music_and_speech" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music and speech." } }
+larger_clap_general = { config = { model_name = "laion/larger_clap_general" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on general audio, music and speech." } }
