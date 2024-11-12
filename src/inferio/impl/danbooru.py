@@ -164,9 +164,9 @@ async def find_on_sauce_nao_async(
                 break
             except ShortLimitReachedError:
                 logger.error(
-                    "30 Seconds limit reached on SauceNAO. Waiting for 10 seconds..."
+                    "30 Seconds limit reached on SauceNAO. Waiting for 31 seconds..."
                 )
-                await asyncio.sleep(10)
+                await asyncio.sleep(31)
             except LongLimitReachedError:
                 logger.error("24 hour limit reached on SauceNAO...")
                 raise SauceNaoError("24 hour limit reached on SauceNAO")
@@ -251,9 +251,13 @@ class DanbooruTagger(InferenceModel):
                         sauce,
                     )
                     tasks.append(task)
-
-                # Wait for all tasks to complete while preserving order
-                results = await asyncio.gather(*tasks)
+                if self.sauce_nao_enabled:
+                    results = []
+                    for task in tasks:
+                        results.append(await task)
+                else:
+                    # Wait for all tasks to complete while preserving order
+                    results = await asyncio.gather(*tasks)
                 return results
 
         return asyncio.run(process_all())
