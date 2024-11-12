@@ -174,3 +174,4 @@ data/
 !/cudnn/.gitpreserve
 
 /src/searchui/panoptikon-ui/
+.infinity_cache/
