@@ -171,6 +171,7 @@ class AIOSauceNao(SauceNao):
                 parsed_resp = await resp.json()
                 if "Daily" in parsed_resp["header"]["message"]:
                     raise LongLimitReachedError("24 hours limit reached")
+                logger.debug(f"429 Response from SauceNao: {parsed_resp}")
                 raise ShortLimitReachedError("30 seconds limit reached")
 
             raise UnknownApiError(f"Server returned status code {status_code}")
