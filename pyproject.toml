@@ -47,7 +47,6 @@ python-doctr = { extras = ["torch"], version = "^0.8.1" }
 timm = "^1.0.7"
 faster-whisper = { git = "https://github.com/SYSTRAN/faster-whisper.git" }
 sentence-transformers = "^3.0.1"
-infinity-emb = { extras = ["all"], version = "^0.0.68" }
 
 [tool.poetry.scripts]
 panoptikon = "panoptikon.__main__:launch_app"
