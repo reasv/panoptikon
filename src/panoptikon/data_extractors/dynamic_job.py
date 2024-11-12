@@ -10,7 +10,10 @@ from panoptikon.data_extractors.data_handlers.text import handle_text
 from panoptikon.data_extractors.data_handlers.text_embeddings import (
     handle_text_embeddings,
 )
-from panoptikon.data_extractors.data_loaders.audio import load_audio_single
+from panoptikon.data_extractors.data_loaders.audio import (
+    array_to_audio_bytes,
+    load_audio_single,
+)
 from panoptikon.data_extractors.data_loaders.images import image_loader
 from panoptikon.data_extractors.extraction_job import run_extraction_job
 from panoptikon.data_extractors.models import ModelGroup
@@ -72,6 +75,25 @@ def run_dynamic_extraction_job(
             return []
 
         data_loader = audio_loader
+    elif handler_name == "audio_files":
+        sample_rate: int = handler_opts.get("sample_rate", 48000)
+        max_tracks: int = handler_opts.get("max_tracks", 4)
+
+        def audio_file_loader(
+            item: JobInputData,
+        ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
+            if item.type.startswith("video") or item.type.startswith("audio"):
+                audio = load_audio_single(item.path, sr=sample_rate)
+                return [
+                    (
+                        {"type": "audio"},
+                        array_to_audio_bytes(track, sample_rate),
+                    )
+                    for track in audio[:max_tracks]
+                ]
+            return []
+
+        data_loader = audio_file_loader
 
     elif handler_name == "extracted_text":
 

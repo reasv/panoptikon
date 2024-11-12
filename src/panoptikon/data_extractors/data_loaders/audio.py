@@ -2,6 +2,7 @@ import io
 import json
 import random
 import subprocess
+import wave
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -295,6 +296,44 @@ def load_audio_single(file: str, sr: int = SAMPLE_RATE) -> List[np.ndarray]:
         ) from e
 
     return [np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0]
+
+
+def array_to_audio_bytes(
+    audio_array: np.ndarray, sample_rate: int = 16000
+) -> bytes:
+    """
+    Convert a numpy array containing audio data to WAV file bytes.
+
+    Parameters
+    ----------
+    audio_array: np.ndarray
+        The audio data as a numpy array with values between -1 and 1
+    sample_rate: int
+        The sample rate of the audio
+
+    Returns
+    -------
+    bytes
+        The WAV file contents as bytes
+    """
+    # Convert float32 array to int16
+    audio_array = (audio_array * 32768).astype(np.int16)
+
+    # Create buffer
+    buffer = io.BytesIO()
+
+    # Create wave write object
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)  # mono
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_array.tobytes())
+
+    # Get the bytes
+    wav_bytes = buffer.getvalue()
+    buffer.close()
+
+    return wav_bytes
 
 
 def create_audio_placeholder(
