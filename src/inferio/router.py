@@ -6,6 +6,7 @@ from fastapi_utilities.repeat.repeat_every import repeat_every
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
+from inferio.impl.clap import ClapModel
 from inferio.impl.clip import ClipModel
 from inferio.impl.clip_inf import InfinityCLIP
 from inferio.impl.danbooru import DanbooruTagger
@@ -33,7 +34,8 @@ ModelRegistry.register_model(FasterWhisperModel)
 ModelRegistry.register_model(ClipModel)
 ModelRegistry.register_model(Florence2)
 ModelRegistry.register_model(DanbooruTagger)
-ModelRegistry.register_model(InfinityCLIP)
+# ModelRegistry.register_model(InfinityCLIP)
+ModelRegistry.register_model(ClapModel)
 
 router = APIRouter(
     prefix="/api/inference",
