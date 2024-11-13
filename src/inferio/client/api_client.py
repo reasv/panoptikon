@@ -5,13 +5,41 @@ from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import requests as r
 from requests import Response
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 logger = logging.getLogger(__name__)
 
 
 class InferenceAPIClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, retries: int = 3):
         self.base_url = base_url
+        self.session = self._create_session(retries)
+
+    def _create_session(self, retries: int) -> r.Session:
+        session = r.Session()
+        retry_strategy = Retry(
+            total=retries,
+            backoff_factor=1,
+            status_forcelist=[429, 502, 503, 504],
+            allowed_methods=[
+                "HEAD",
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "OPTIONS",
+                "TRACE",
+            ],
+            raise_on_status=True,
+            connect=retries,  # retry on connection errors
+            read=None,  # no retry on read timeouts
+            redirect=3,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
     def predict(
         self,
@@ -22,22 +50,16 @@ class InferenceAPIClient:
         inputs: Sequence[Tuple[str | dict | None, str | bytes | None]],
     ):
         url = f"{self.base_url}/predict/{inference_id}"
-        # Prepare the query parameters
         params = {
             "cache_key": cache_key,
             "lru_size": lru_size,
             "ttl_seconds": ttl_seconds,
         }
-        # Prepare the JSON data payload
         json_data = {"inputs": [item[0] for item in inputs]}
-        # Convert the JSON data to a string and add it to the form data
         data = {"data": json.dumps(json_data)}
-        # Prepare the file uploads
         files = process_input_files([item[1] for item in inputs])
 
-        # Make the POST request
-        response = r.post(url, params=params, data=data, files=files)
-        # Handle the response
+        response = self.session.post(url, params=params, data=data, files=files)
         if response.status_code == 200:
             result = handle_predict_resp(response)
             return result
@@ -62,7 +84,7 @@ class InferenceAPIClient:
             "lru_size": lru_size,
             "ttl_seconds": ttl_seconds,
         }
-        return handle_resp(r.put(url, params=params))
+        return handle_resp(self.session.put(url, params=params))
 
     def unload_model(
         self,
@@ -70,19 +92,21 @@ class InferenceAPIClient:
         cache_key: str,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}/cache/{cache_key}/{inference_id}"
-        return handle_resp(r.delete(url))
+        return handle_resp(self.session.delete(url))
 
     def clear_cache(
         self,
         cache_key: str,
     ) -> Dict[str, Any]:
-        return handle_resp(r.delete(f"{self.base_url}/cache/{cache_key}"))
+        return handle_resp(
+            self.session.delete(f"{self.base_url}/cache/{cache_key}")
+        )
 
     def get_cached_models(self) -> Dict[str, Any]:
-        return handle_resp(r.get(f"{self.base_url}/cache"))
+        return handle_resp(self.session.get(f"{self.base_url}/cache"))
 
     def get_metadata(self) -> Dict[str, dict]:
-        return handle_resp(r.get(f"{self.base_url}/metadata"))
+        return handle_resp(self.session.get(f"{self.base_url}/metadata"))
 
 
 def handle_resp(response: Response):
