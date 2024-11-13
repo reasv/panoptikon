@@ -205,7 +205,6 @@ def run_extraction_job(
     remaining_paths = get_remaining()
     if transaction_per_item:
         # Start a new transaction to update the log with the final results
-        # The transaction will be committed by the caller
         conn.execute("BEGIN TRANSACTION")
     update_log(
         conn,
@@ -220,7 +219,13 @@ def run_extraction_job(
         inference_time=inference_time,
         finished=True,
     )
+    if transaction_per_item:
+        # Commit the transaction after updating the log
+        conn.commit()
     logger.info("Updated log with scan results")
+    if transaction_per_item:
+        # The transaction will be committed by the caller
+        conn.execute("BEGIN TRANSACTION")
 
     failed_paths = [item.path for item in failed_items.values()]
     final_callback()

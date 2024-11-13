@@ -184,7 +184,7 @@ def get_all_data_logs(
                 WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
             END AS failed,
-            data_log.completed
+            data_log.completed,
             data_jobs.completed AS status
         FROM data_log
         LEFT JOIN item_data 
