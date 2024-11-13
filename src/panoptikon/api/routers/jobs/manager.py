@@ -1,5 +1,7 @@
 import logging
 import multiprocessing
+import os
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
@@ -206,8 +208,17 @@ class JobManager:
         with self.lock:
             if self.running_job:
                 pid = self.running_job.process.pid
-                self.running_job.process.kill()
-                self.running_job.process.join()
+                self.running_job.process.terminate()
+                self.running_job.process.join(timeout=3)
+                if self.running_job.process.is_alive():
+                    force_kill_process(self.running_job.process)
+                    self.running_job.process.join(timeout=5)
+
+                if self.running_job.process.is_alive():
+                    logger.error(
+                        f"Failed to terminate running job {self.running_job.job.queue_id} with PID {pid}"
+                    )
+                    return None
                 logger.info(
                     f"Cancelled running job {self.running_job.job.queue_id} with PID {pid}"
                 )
@@ -216,6 +227,13 @@ class JobManager:
                 return completed_job_id
             else:
                 return None
+
+
+def force_kill_process(process):
+    if sys.platform == "win32":
+        process.terminate()  # On Windows, this is equivalent to SIGTERM
+    else:
+        os.kill(process.pid, signal.SIGKILL)  # SIGKILL on Unix
 
 
 # To support forward references in Pydantic models
