@@ -129,6 +129,7 @@ class LogRecord:
     inference_time: float
     failed: int
     completed: int
+    status: int
 
 
 @dataclass
