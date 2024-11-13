@@ -1,5 +1,6 @@
 import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from math import exp
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -125,15 +126,15 @@ class FasterWhisperModel(InferenceModel):
                 threshold = None
 
             segment_list = [
-                (segment.text, segment.avg_logprob)
+                (segment.text, exp(segment.avg_logprob))
                 for segment in segments
-                if not threshold or segment.avg_logprob >= threshold
+                if not threshold or exp(segment.avg_logprob) >= threshold
             ]
             text_segments = [segment[0] for segment in segment_list]
             merged_text = "\n".join(text_segments)
 
             merged_text = merged_text.strip()
-            average_log_prob = (
+            average_confidence = (
                 sum(segment[1] for segment in segment_list) / len(segment_list)
                 if len(segment_list) > 0
                 else None
@@ -141,7 +142,7 @@ class FasterWhisperModel(InferenceModel):
             outputs.append(
                 {
                     "transcription": merged_text,
-                    "confidence": average_log_prob,
+                    "confidence": average_confidence,
                     "language": info.language,
                     "language_confidence": info.language_probability,
                 }
