@@ -132,6 +132,17 @@ def remove_incomplete_jobs(conn: sqlite3.Connection):
     This ensures that jobs are atomic.
     """
     cursor = conn.cursor()
+    if os.getenv("ATOMIC_EXTRACTION_JOBS", "false").lower() in ["false", "0"]:
+        # If atomic extraction is disabled, we don't want to delete incomplete jobs
+        # Set completed status to -1 for all incomplete jobs
+        cursor.execute(
+            """
+            UPDATE data_jobs
+            SET completed = -1
+            WHERE completed = 0
+        """
+        )
+        return
     cursor.execute(
         """
         DELETE FROM data_jobs
