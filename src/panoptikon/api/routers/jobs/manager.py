@@ -103,7 +103,7 @@ class JobManager:
         self.running_job: Optional[RunningJob] = None
         self.queued_jobs: Dict[int, Job] = {}
         self.job_counter: int = 0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.worker_thread = threading.Thread(
             target=self.job_consumer, daemon=True
         )
