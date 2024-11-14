@@ -1,6 +1,7 @@
 import logging
 import multiprocessing
 import os
+import signal
 import sys
 import threading
 from dataclasses import dataclass
