@@ -63,7 +63,7 @@ async def get_danbooru_post_async(
             logger.error(f"Error fetching data: {e}")
             if attempts <= 4:
                 logger.info("Retrying...")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2 * attempts)
             else:
                 raise DanbooruFetchError("Failed to fetch data from Danbooru")
     try:
