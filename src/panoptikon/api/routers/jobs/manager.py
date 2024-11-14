@@ -194,8 +194,8 @@ class JobManager:
             for qid in queue_ids:
                 # Check if it's the running job
                 if self.running_job and self.running_job.job.queue_id == qid:
-                    self.cancel_running_job()
-                    cancelled.append(qid)
+                    if self.cancel_running_job() is not None:
+                        cancelled.append(qid)
                     continue
                 job = self.queued_jobs.pop(qid, None)
                 if job and job in self.job_queue:
