@@ -14,7 +14,10 @@ from panoptikon.data_extractors.data_loaders.audio import (
     array_to_audio_bytes,
     load_audio_single,
 )
-from panoptikon.data_extractors.data_loaders.images import image_loader
+from panoptikon.data_extractors.data_loaders.images import (
+    ImageSliceSettings,
+    image_loader,
+)
 from panoptikon.data_extractors.extraction_job import run_extraction_job
 from panoptikon.data_extractors.models import ModelGroup
 from panoptikon.data_extractors.types import JobInputData
@@ -54,7 +57,16 @@ def run_dynamic_extraction_job(
             item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], bytes]]:
             max_frames = handler_opts.get("max_frames", 4)
-            frames = image_loader(conn, item)
+            slice_frames = handler_opts.get("slice_frames", True)
+            slice_settings = None
+            if slice_frames:
+                slice_settings = ImageSliceSettings(
+                    ratio_larger=16,
+                    ratio_smaller=9,
+                    max_multiplier=1.6,
+                    target_multiplier=1.5,
+                )
+            frames = image_loader(conn, item, slice_settings=slice_settings)
             return [({}, frame) for frame in frames[:max_frames]]
 
         data_loader = frame_loader
@@ -122,7 +134,7 @@ def run_dynamic_extraction_job(
             item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], None | bytes]]:
             assert item.md5 is not None, "Md5 must be present"
-            frames = image_loader(conn, item)
+            frames = image_loader(conn, item, slice_settings=None)
             frame = None
             if frames:
                 frame = frames[0]
