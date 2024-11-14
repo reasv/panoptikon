@@ -37,6 +37,9 @@ python-multipart = "^0.0.12"
 tomli = "^2.0.2"
 tomli-w = "^1.0.0"
 blurhash = "^1.1.4"
+aiohttp = "^3.11.0"
+more-itertools = "^10.5.0"
+pandas = "^2.2.3"
 
 [tool.poetry.group.inference]
 optional = true
