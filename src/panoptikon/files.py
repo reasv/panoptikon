@@ -57,7 +57,7 @@ def get_files_by_extension(
     ]
 
     for starting_point in starting_points:
-        for root, dirs, files in os.walk(starting_point):
+        for root, dirs, files in os.walk(starting_point, followlinks=True):
             # Normalize root path with trailing slash
             root_with_slash = normalize_path(root)
 
