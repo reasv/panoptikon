@@ -53,8 +53,8 @@ TextColumns = Literal[
     "source_id",
 ]
 
-
-OrderByType = Union[FileColumns, ItemColumns, TextColumns]
+RandomOrder = Literal["random"]
+OrderByType = Union[FileColumns, ItemColumns, TextColumns, RandomOrder]
 
 OrderType = Union[Literal["asc", "desc"], None]
 OrderTypeNN = Literal["asc", "desc"]
@@ -191,7 +191,9 @@ def get_extra_columns(row: sqlite3.Row, column_aliases: Dict[str, str] | None):
     return extras if extras else None
 
 
-def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
+def get_column(
+    column: Union[FileColumns, ItemColumns, TextColumns, RandomOrder]
+) -> Column:
     from panoptikon.db.pql.tables import (
         extracted_text,
         files,
@@ -230,6 +232,8 @@ def get_column(column: Union[FileColumns, ItemColumns, TextColumns]) -> Column:
         "setter_name": setters.c.name,
         "data_index": item_data.c.idx,
         "source_id": item_data.c.source_id,
+        # Random
+        "random": func.random(),
     }[column]
 
 
