@@ -152,9 +152,6 @@ class SentenceTransformersModel(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
-    def __del__(self):
-        self.unload()
-
 
 def split_text_by_tokens(text, tokenizer, max_tokens):
     # Tokenize the entire text

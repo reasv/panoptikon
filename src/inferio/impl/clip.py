@@ -54,9 +54,6 @@ class ClipModel(InferenceModel):
         )
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def predict(
         self, inputs: Sequence[PredictionInput]
     ) -> Sequence[Union[bytes, dict, list, str]]:

@@ -257,11 +257,6 @@ class WDTagger(InferenceModel):
             logger.debug(f"Model {self.model_repo} unloaded")
             self._model_loaded = False
 
-    def __del__(self):
-        if self._model_loaded:
-            logger.debug(f"Model {self.model_repo} deleted")
-        self.unload()
-
 
 @dataclass
 class TagResult:

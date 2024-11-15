@@ -23,3 +23,6 @@ class InferenceModel(ABC):
     @abstractmethod
     def unload(self) -> None:
         pass
+
+    def __del__(self):
+        self.unload()

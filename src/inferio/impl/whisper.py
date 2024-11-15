@@ -47,9 +47,6 @@ class FasterWhisperModel(InferenceModel):
         )
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def unload(self) -> None:
         if self._model_loaded:
             del self.model

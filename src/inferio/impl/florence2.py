@@ -92,9 +92,6 @@ class Florence2(InferenceModel):
         logger.debug(f"Model {self.model_name} loaded.")
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         import torch
 

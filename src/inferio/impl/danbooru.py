@@ -361,8 +361,3 @@ class DanbooruTagger(InferenceModel):
     def unload(self) -> None:
         if self._model_loaded:
             self._model_loaded = False
-
-    def __del__(self):
-        if self._model_loaded:
-            logger.debug(f"Model danbooru deleted")
-        self.unload()

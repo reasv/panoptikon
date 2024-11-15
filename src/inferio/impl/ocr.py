@@ -49,9 +49,6 @@ class DoctrModel(InferenceModel):
             self.model = self.model.cuda().half()
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
         image_inputs: List[np.ndarray] = []

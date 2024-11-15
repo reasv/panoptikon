@@ -47,9 +47,6 @@ class ClapModel(InferenceModel):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._model_loaded = True
 
-    def __del__(self):
-        self.unload()
-
     def predict(
         self, inputs: Sequence[PredictionInput]
     ) -> Sequence[Union[bytes, dict, list, str]]:
