@@ -27,10 +27,8 @@ def launch_app():
     app = get_app(hostname, port)
     connection = sqlite3.connect(":memory:")
     # Retrieve and print the SQLite version
-    sqlite_version = connection.execute("SELECT sqlite_version();").fetchone()[
-        0
-    ]
-    logger.info(f"SQLite version: {sqlite_version}")
+    sqlite_version = connection.execute("SELECT sqlite_version();").fetchone()
+    logger.info(f"SQLite version: {sqlite_version[0]}")
     logger.info(f"Starting API server at http://{hostname}:{port}/")
     uvicorn.run(
         app,
