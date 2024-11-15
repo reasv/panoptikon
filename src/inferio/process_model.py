@@ -9,40 +9,31 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
-from typing import (
-    Any,
-    Dict,
-    Generic,
-    List,
-    Optional,
-    Sequence,
-    Type,
-    TypeVar,
-    Union,
-)
+from typing import Any, Dict, List, Optional, Sequence, Type, Union
 
 from inferio.types import PredictionInput  # Ensure this is correctly imported
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class LoadMessage:
     command: str = "load"
-    kwargs: Dict[str, Any] | None = None
+    request_id: str = ""
+    kwargs: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class PredictMessage:
     command: str = "predict"
     request_id: str = ""
-    inputs: Sequence[PredictionInput] = ()
+    inputs: Sequence[dict] = ()
 
 
 @dataclass
 class UnloadMessage:
     command: str = "unload"
+    request_id: str = ""
 
 
 @dataclass
@@ -80,7 +71,7 @@ class InferenceModel(ABC):
 class ProcessIsolatedInferenceModel(InferenceModel, ABC):
     @classmethod
     @abstractmethod
-    def concrete_class(cls) -> "Type[InferenceModel]":
+    def concrete_class(cls) -> Type["InferenceModel"]:
         """Return the concrete InferenceModel class to instantiate in the process."""
         pass
 
@@ -114,10 +105,14 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             logger.debug(
                 f"{self.name()} - Started subprocess with PID {self._process.pid}"
             )
-            # Send load command with kwargs
-            load_msg = LoadMessage(kwargs=self._kwargs)
+            # Generate a unique request_id for the load operation
+            load_request_id = str(uuid.uuid4())
+            # Send load command with kwargs and request_id
+            load_msg = LoadMessage(
+                request_id=load_request_id, kwargs=self._kwargs
+            )
             self._parent_conn.send(asdict(load_msg))
-            response = self._get_response_sync()
+            response = self._get_response(load_request_id)
             if response.status == "loaded":
                 logger.debug(f"{self.name()} - Model loaded successfully.")
             elif response.error:
@@ -130,7 +125,9 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> Sequence[Any]:
         request_id = str(uuid.uuid4())
-        predict_msg = PredictMessage(request_id=request_id, inputs=inputs)
+        predict_msg = PredictMessage(
+            request_id=request_id, inputs=[asdict(i) for i in inputs]
+        )
         self._parent_conn.send(asdict(predict_msg))
         logger.debug(
             f"{self.name()} - Sent predict request with ID {request_id}"
@@ -153,11 +150,13 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
 
     def unload(self) -> None:
         if self._process is not None:
-            unload_msg = UnloadMessage()
+            # Generate a unique request_id for the unload operation
+            unload_request_id = str(uuid.uuid4())
+            unload_msg = UnloadMessage(request_id=unload_request_id)
             self._parent_conn.send(asdict(unload_msg))
             logger.debug(f"{self.name()} - Sent unload command.")
             try:
-                response = self._get_response_sync(timeout=10)
+                response = self._get_response(unload_request_id)
                 if response.status == "unloaded":
                     logger.debug(
                         f"{self.name()} - Model unloaded successfully."
@@ -194,35 +193,54 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
     @classmethod
     def _model_process(cls, conn: Connection, kwargs: Dict[str, Any]) -> None:
         """Run in the subprocess: instantiate and manage the concrete InferenceModel."""
-        logger.debug(f"{cls.name()} - Subprocess started.")
-        model_class = cls.concrete_class()
-        logger.debug(f"{model_class.name()} - Resolving concrete class.")
+        # Instantiate the class (cannot use cls.name() because cls is the main class)
+        # Need to resolve the concrete_class's name
         try:
+            model_class = cls.concrete_class()
+            logger.debug(f"{model_class.name()} - Resolving concrete class.")
             model_instance = model_class(**kwargs)
             logger.debug(f"{model_class.name()} - Subprocess started.")
+        except Exception as e:
+            error_response = ResponseMessage(error=str(e))
+            conn.send(asdict(error_response))
+            logger.error(
+                f"{cls.name()} - Error instantiating concrete class: {e}"
+            )
+            conn.close()
+            return
+
+        try:
             while True:
                 if conn.poll():
                     message_dict = conn.recv()
                     command = message_dict.get("command")
                     if command == "load":
                         load_msg = LoadMessage(**message_dict)
+                        request_id = load_msg.request_id
                         try:
                             model_instance.load()
-                            response = ResponseMessage(status="loaded")
+                            response = ResponseMessage(
+                                request_id=request_id, status="loaded"
+                            )
                             conn.send(asdict(response))
                             logger.debug(
                                 f"{model_class.name()} - Model loaded in subprocess."
                             )
                         except Exception as e:
-                            response = ResponseMessage(error=str(e))
+                            response = ResponseMessage(
+                                request_id=request_id, error=str(e)
+                            )
                             conn.send(asdict(response))
                             logger.error(
-                                f"{model_class.name()} - Error loading model: {e}"
+                                f"{model_class.name()} - Error loading model: {e}",
+                                exc_info=True,
                             )
                     elif command == "predict":
                         predict_msg = PredictMessage(**message_dict)
                         request_id = predict_msg.request_id
-                        inputs = predict_msg.inputs
+                        inputs = [
+                            PredictionInput(**pi) for pi in predict_msg.inputs
+                        ]
                         try:
                             outputs = model_instance.predict(inputs)
                             response = ResponseMessage(
@@ -238,20 +256,26 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                             )
                             conn.send(asdict(response))
                             logger.error(
-                                f"{model_class.name()} - Prediction error for request {request_id}: {e}"
+                                f"{model_class.name()} - Prediction error for request {request_id}: {e}",
+                                exc_info=True,
                             )
                     elif command == "unload":
                         unload_msg = UnloadMessage(**message_dict)
+                        request_id = unload_msg.request_id
                         try:
                             model_instance.unload()
-                            response = ResponseMessage(status="unloaded")
+                            response = ResponseMessage(
+                                request_id=request_id, status="unloaded"
+                            )
                             conn.send(asdict(response))
                             logger.debug(
                                 f"{model_class.name()} - Model unloaded in subprocess."
                             )
-                            break
+                            break  # Exit the subprocess loop
                         except Exception as e:
-                            response = ResponseMessage(error=str(e))
+                            response = ResponseMessage(
+                                request_id=request_id, error=str(e)
+                            )
                             conn.send(asdict(response))
                             logger.error(
                                 f"{model_class.name()} - Error unloading model: {e}"
@@ -303,19 +327,6 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         del self._response_handlers[request_id]
         return response
 
-    def _get_response_sync(
-        self,
-        timeout: float | None = None,
-    ) -> ResponseMessage:
-        """Used for load and unload which do not have request IDs."""
-        response_queue: queue.Queue = queue.Queue()
-        # Temporary request_id for sync messages
-        temp_id = str(uuid.uuid4())
-        self._response_handlers[temp_id] = response_queue
-        response = response_queue.get(timeout=timeout)  # Wait indefinitely
-        del self._response_handlers[temp_id]
-        return response
-
     def __del__(self):
         try:
             self.unload()
@@ -323,7 +334,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             logger.error(f"{self.name()} - Exception during __del__: {e}")
 
 
-def force_kill_process(process):
+def force_kill_process(process: multiprocessing.Process) -> None:
     if sys.platform == "win32":
         process.terminate()  # On Windows, this is equivalent to SIGTERM
     else:
