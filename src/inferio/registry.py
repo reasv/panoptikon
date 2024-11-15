@@ -8,12 +8,15 @@ from typing import Any, Dict, Optional, Type
 import tomlkit
 
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 
 logger = logging.getLogger(__name__)
 
 
 class ModelRegistry:
-    _registry: Dict[str, Type["InferenceModel"]] = {}
+    _registry: Dict[
+        str, Type["InferenceModel"] | Type[ProcessIsolatedInferenceModel]
+    ] = {}
     _instance: Optional["ModelRegistry"] = (
         None  # Class-level variable to hold the singleton instance
     )
@@ -43,7 +46,12 @@ class ModelRegistry:
         cls._user_folder = Path(folder)
 
     @classmethod
-    def register_model(cls, model_class: Type["InferenceModel"]) -> None:
+    def register_model(
+        cls,
+        model_class: (
+            Type["InferenceModel"] | Type[ProcessIsolatedInferenceModel]
+        ),
+    ) -> None:
         """Register a BaseModel subclass"""
         cls._registry[model_class.name()] = model_class
 
@@ -141,7 +149,9 @@ class ModelRegistry:
                     logger.error(f"Error loading TOML file {file}: {e}")
                     raise e
 
-    def get_model_instance(self, full_inference_id: str) -> "InferenceModel":
+    def get_model_instance(
+        self, full_inference_id: str
+    ) -> InferenceModel | ProcessIsolatedInferenceModel:
         """Retrieve and instantiate a BaseModel subclass based on the inference ID and group name."""
 
         group_name, inference_id = full_inference_id.split("/", 1)

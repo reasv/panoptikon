@@ -1,8 +1,9 @@
 import logging
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Type
 
 from inferio.impl.utils import clear_cache, get_device, serialize_array
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -178,3 +179,9 @@ def split_text_by_tokens(text, tokenizer, max_tokens):
     return [
         tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks
     ]
+
+
+class SentenceTransformersModelIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[SentenceTransformersModel]:  # type: ignore
+        return SentenceTransformersModel

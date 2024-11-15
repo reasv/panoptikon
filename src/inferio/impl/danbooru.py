@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Type
 
 import aiohttp
 
@@ -14,6 +14,7 @@ from inferio.impl.saucenao.errors import (
 )
 from inferio.impl.saucenao.saucenao_api import AIOSauceNao
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -361,3 +362,9 @@ class DanbooruTagger(InferenceModel):
     def unload(self) -> None:
         if self._model_loaded:
             self._model_loaded = False
+
+
+class DanbooruIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[DanbooruTagger]:  # type: ignore
+        return DanbooruTagger

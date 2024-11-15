@@ -1,12 +1,13 @@
 import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import exp
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple, Type
 
 import numpy as np
 
 from inferio.impl.utils import clear_cache, get_device
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 from panoptikon.data_extractors.data_handlers.utils import deserialize_array
 
@@ -145,3 +146,9 @@ class FasterWhisperModel(InferenceModel):
                 }
             )
         return outputs
+
+
+class FasterWhisperModelIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[FasterWhisperModel]:  # type: ignore
+        return FasterWhisperModel

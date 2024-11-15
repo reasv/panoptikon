@@ -1,12 +1,13 @@
 import re
 from io import BytesIO
-from typing import List, Sequence
+from typing import List, Sequence, Type
 
 import numpy as np
 from PIL import Image as PILImage
 
 from inferio.impl.utils import clear_cache, get_device
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 
@@ -127,3 +128,9 @@ def clean_whitespace(input_string: str) -> str:
     cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
 
     return cleaned_string
+
+
+class DoctrModelIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[DoctrModel]:  # type: ignore
+        return DoctrModel

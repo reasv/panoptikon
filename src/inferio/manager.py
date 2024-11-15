@@ -4,9 +4,11 @@ from datetime import datetime, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Set
 
-from inferio.model import InferenceModel
+import inferio.model
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.registry import ModelRegistry
 
+InferenceModel = inferio.model.InferenceModel | ProcessIsolatedInferenceModel
 logger = logging.getLogger(__name__)
 
 

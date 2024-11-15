@@ -9,7 +9,17 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Sequence, Type, Union
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Sequence,
+    Type,
+    TypeVar,
+    Union,
+)
 
 from inferio.types import PredictionInput  # Ensure this is correctly imported
 
@@ -70,7 +80,7 @@ class InferenceModel(ABC):
 class ProcessIsolatedInferenceModel(InferenceModel, ABC):
     @classmethod
     @abstractmethod
-    def concrete_class(cls) -> Type[InferenceModel]:
+    def concrete_class(cls) -> "Type[InferenceModel]":
         """Return the concrete InferenceModel class to instantiate in the process."""
         pass
 
@@ -167,8 +177,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                     self._process.join(timeout=3)
                     if self._process.is_alive():
                         logger.error(
-                            f"{self.name()} - Subprocess still alive,
-                            killing forcefully."
+                            f"{self.name()} - Subprocess still alive, killing forcefully."
                         )
                         force_kill_process(self._process)
                         self._process.join(timeout=3)

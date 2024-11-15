@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Type
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,7 @@ from inferio.impl.utils import (
     pil_pad_square,
 )
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 LABEL_FILENAME = "selected_tags.csv"
@@ -265,3 +266,9 @@ class TagResult:
     general: Dict[str, float]
     character_mcut: float
     general_mcut: float
+
+
+class WDTaggerIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[WDTagger]:  # type: ignore
+        return WDTagger

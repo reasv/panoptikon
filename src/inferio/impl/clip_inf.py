@@ -1,12 +1,13 @@
 import logging
 import os
 from calendar import c
-from typing import List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Type, Union
 
 from PIL import ImageFile
 
 from inferio.impl.utils import clear_cache, serialize_array
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -149,3 +150,9 @@ class InfinityCLIP(InferenceModel):
             del self.engine
             clear_cache()
             self._model_loaded = False
+
+
+class InfinityCLIPIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[InfinityCLIP]:  # type: ignore
+        return InfinityCLIP

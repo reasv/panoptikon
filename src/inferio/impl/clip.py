@@ -1,11 +1,12 @@
 from io import BytesIO
-from typing import List, Sequence, Union
+from typing import List, Sequence, Type, Union
 
 from PIL import Image as PILImage
 from PIL import ImageFile
 
 from inferio.impl.utils import clear_cache, get_device, serialize_array
 from inferio.model import InferenceModel
+from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -127,3 +128,9 @@ class ClipModel(InferenceModel):
             del self.preprocess
             clear_cache()
             self._model_loaded = False
+
+
+class CLIPIsolated(ProcessIsolatedInferenceModel):
+    @classmethod
+    def concrete_class(cls) -> Type[ClipModel]:  # type: ignore
+        return ClipModel

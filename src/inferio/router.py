@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -6,15 +7,18 @@ from fastapi_utilities.repeat.repeat_every import repeat_every
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
-from inferio.impl.clap import ClapModel
-from inferio.impl.clip import ClipModel
+from inferio.impl.clap import ClapModel, ClapModelIsolated
+from inferio.impl.clip import CLIPIsolated, ClipModel
 from inferio.impl.clip_inf import InfinityCLIP
-from inferio.impl.danbooru import DanbooruTagger
-from inferio.impl.florence2 import Florence2
-from inferio.impl.ocr import DoctrModel
-from inferio.impl.sentence_transformers import SentenceTransformersModel
-from inferio.impl.wd_tagger import WDTagger
-from inferio.impl.whisper import FasterWhisperModel
+from inferio.impl.danbooru import DanbooruIsolated, DanbooruTagger
+from inferio.impl.florence2 import Florence2, Florence2Isolated
+from inferio.impl.ocr import DoctrModel, DoctrModelIsolated
+from inferio.impl.sentence_transformers import (
+    SentenceTransformersModel,
+    SentenceTransformersModelIsolated,
+)
+from inferio.impl.wd_tagger import WDTagger, WDTaggerIsolated
+from inferio.impl.whisper import FasterWhisperModel, FasterWhisperModelIsolated
 from inferio.manager import InferenceModel, ModelManager
 from inferio.registry import ModelRegistry
 from inferio.utils import (
@@ -25,17 +29,28 @@ from inferio.utils import (
 
 add_cudnn_to_path()
 logger = logging.getLogger(__name__)
-
 ModelRegistry.set_user_folder("config/inference")
-ModelRegistry.register_model(WDTagger)
-ModelRegistry.register_model(DoctrModel)
-ModelRegistry.register_model(SentenceTransformersModel)
-ModelRegistry.register_model(FasterWhisperModel)
-ModelRegistry.register_model(ClipModel)
-ModelRegistry.register_model(Florence2)
-ModelRegistry.register_model(DanbooruTagger)
-# ModelRegistry.register_model(InfinityCLIP)
-ModelRegistry.register_model(ClapModel)
+
+if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
+    ModelRegistry.register_model(WDTagger)
+    ModelRegistry.register_model(DoctrModel)
+    ModelRegistry.register_model(SentenceTransformersModel)
+    ModelRegistry.register_model(FasterWhisperModel)
+    ModelRegistry.register_model(ClipModel)
+    ModelRegistry.register_model(Florence2)
+    ModelRegistry.register_model(DanbooruTagger)
+    # ModelRegistry.register_model(InfinityCLIP)
+    ModelRegistry.register_model(ClapModel)
+else:
+    ModelRegistry.register_model(WDTaggerIsolated)
+    ModelRegistry.register_model(DoctrModelIsolated)
+    ModelRegistry.register_model(SentenceTransformersModelIsolated)
+    ModelRegistry.register_model(FasterWhisperModelIsolated)
+    ModelRegistry.register_model(CLIPIsolated)
+    ModelRegistry.register_model(Florence2Isolated)
+    ModelRegistry.register_model(DanbooruIsolated)
+    # ModelRegistry.register_model(InfinityCLIPIsolated)
+    ModelRegistry.register_model(ClapModelIsolated)
 
 router = APIRouter(
     prefix="/api/inference",
