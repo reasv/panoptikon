@@ -131,7 +131,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                     exc_info=True,
                 )
                 self._handle_subprocess_crash()
-                raise
+                raise e
 
         else:
             logger.debug(f"{self.name()} - Subprocess already running.")
