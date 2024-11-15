@@ -1,10 +1,13 @@
+import asyncio
 import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
@@ -225,6 +228,91 @@ app.include_router(jobs.router)
 def get_app(hostname: str, port: int) -> FastAPI:
     if os.getenv("ENABLE_CLIENT", "true").lower() == "true":
         client_redirect_router, client_url = get_routers(hostname, port)
-        app.include_router(client_redirect_router)
+
+        @app.middleware("http")
+        async def proxy_middleware(request: Request, call_next):
+            logger.debug(
+                f"Received request: {request.method} {request.url.path}"
+            )
+
+            # If the request is for the API, let FastAPI handle it
+            if (
+                request.url.path.startswith("/api")
+                or request.url.path.startswith("/docs")
+                or request.url.path.startswith("/redoc")
+                or request.url.path.startswith("/openapi.json")
+            ):
+                if not request.url.path.startswith(
+                    "/api/inference"
+                ) or not os.getenv("INFERENCE_API_URL"):
+                    return await call_next(request)
+
+            proxy_url = client_url
+            # If the request is for the inference API, and we are using a custom URL for it, proxy it to the inference API
+            if request.url.path.startswith("/api/inference") and os.getenv(
+                "INFERENCE_API_URL"
+            ):
+                proxy_url = os.getenv("INFERENCE_API_URL")
+            # Otherwise, proxy the request to the Next.js frontend
+            async with httpx.AsyncClient() as client:
+                try:
+                    # Construct the target URL
+                    target_url = f"{proxy_url}{request.url.path}"
+                    if request.url.query:
+                        target_url += f"?{request.url.query}"
+
+                    logger.debug(f"Proxying request to: {target_url}")
+
+                    # Forward the request method, headers, and body
+                    proxy_response = await client.request(
+                        method=request.method,
+                        url=target_url,
+                        headers=request.headers.raw,
+                        content=await request.body(),
+                        timeout=50,  # Adjust timeout as needed
+                    )
+
+                    logger.debug(
+                        f"Received response from frontend: {proxy_response.status_code}"
+                    )
+                except httpx.RequestError as exc:
+                    logger.error(
+                        f"Error proxying request to {proxy_url}: {exc}"
+                    )
+                    raise HTTPException(
+                        status_code=502, detail=f"Error proxying request: {exc}"
+                    )
+
+            # Prepare headers by excluding certain problematic headers
+            excluded_headers = {
+                "content-encoding",
+                "transfer-encoding",
+                "connection",
+                "keep-alive",
+                "content-length",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "upgrade",
+            }
+
+            headers = {
+                k: v
+                for k, v in proxy_response.headers.items()
+                if k.lower() not in excluded_headers
+            }
+
+            logger.debug("Building response to client.")
+
+            # Create the FastAPI response
+            response = Response(
+                content=proxy_response.content,
+                status_code=proxy_response.status_code,
+                headers=headers,
+            )
+
+            return response
 
     return app
