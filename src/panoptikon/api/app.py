@@ -249,9 +249,7 @@ def get_app(hostname: str, port: int) -> FastAPI:
 
             proxy_url = client_url
             # If the request is for the inference API, and we are using a custom URL for it, proxy it to the inference API
-            if request.url.path.startswith("/api/inference") and os.getenv(
-                "INFERENCE_API_URL"
-            ):
+            if request.url.path.startswith("/api/inference"):
                 proxy_url = os.getenv("INFERENCE_API_URL")
             # Otherwise, proxy the request to the Next.js frontend
             async with httpx.AsyncClient() as client:
