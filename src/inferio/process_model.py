@@ -104,6 +104,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
 
     def load(self) -> None:
         if self._process is None:
+            logger.debug(f"{self.name()} - Starting subprocess.")
             self._process = multiprocessing.Process(
                 target=self._model_process,
                 args=(self._child_conn, self._kwargs),
@@ -192,7 +193,9 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
 
     def _model_process(self, conn: Connection, kwargs: Dict[str, Any]) -> None:
         """Run in the subprocess: instantiate and manage the concrete InferenceModel."""
+        logger.debug(f"{self.name()} - Subprocess started.")
         model_class = self.concrete_class()
+        logger.debug(f"{model_class.name()} - Resolving concrete class.")
         try:
             model_instance = model_class(**kwargs)
             logger.debug(f"{model_class.name()} - Subprocess started.")
