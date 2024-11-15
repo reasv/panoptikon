@@ -9,10 +9,11 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Sequence, Type, Union
+from typing import Any, Dict, Optional, Sequence, Type, Union
 
 from inferio.types import PredictionInput  # Ensure this is correctly imported
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 
@@ -27,7 +28,7 @@ class LoadMessage:
 class PredictMessage:
     command: str = "predict"
     request_id: str = ""
-    inputs: Sequence[dict] = ()
+    inputs: Sequence[dict] = ()  # Changed to dict for serialization
 
 
 @dataclass
@@ -94,14 +95,10 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         return cls.concrete_class().name()
 
     def load(self) -> None:
-        if self._process is None:
+        if self._process is None or not self._process.is_alive():
             logger.debug(f"{self.name()} - Starting subprocess.")
-            self._process = multiprocessing.Process(
-                target=self._model_process,
-                args=(self._child_conn, self._kwargs),
-                daemon=True,
-            )
-            self._process.start()
+            self._start_subprocess()
+            assert self._process is not None, "Subprocess not started."
             logger.debug(
                 f"{self.name()} - Started subprocess with PID {self._process.pid}"
             )
@@ -112,18 +109,40 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                 request_id=load_request_id, kwargs=self._kwargs
             )
             self._parent_conn.send(asdict(load_msg))
-            response = self._get_response(load_request_id)
-            if response.status == "loaded":
-                logger.debug(f"{self.name()} - Model loaded successfully.")
-            elif response.error:
+            try:
+                response = self._get_response(load_request_id)
+                if response.status == "loaded":
+                    logger.debug(f"{self.name()} - Model loaded successfully.")
+                elif response.error:
+                    logger.error(
+                        f"{self.name()} - Error during load: {response.error}"
+                    )
+                    self._handle_subprocess_crash()
+                    raise RuntimeError(response.error)
+            except queue.Empty:
                 logger.error(
-                    f"{self.name()} - Error during load: {response.error}"
+                    f"{self.name()} - Timeout waiting for load response."
                 )
-                raise RuntimeError(response.error)
+                self._handle_subprocess_crash()
+                raise RuntimeError("Timeout waiting for load response.")
+            except Exception as e:
+                logger.error(
+                    f"{self.name()} - Exception during load: {e}",
+                    exc_info=True,
+                )
+                self._handle_subprocess_crash()
+                raise
+
         else:
             logger.debug(f"{self.name()} - Subprocess already running.")
 
     def predict(self, inputs: Sequence[PredictionInput]) -> Sequence[Any]:
+        if not self._process or not self._process.is_alive():
+            logger.error(
+                f"{self.name()} - Subprocess is not running. Reloading."
+            )
+            self.load()
+
         request_id = str(uuid.uuid4())
         predict_msg = PredictMessage(
             request_id=request_id, inputs=[asdict(i) for i in inputs]
@@ -132,24 +151,38 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         logger.debug(
             f"{self.name()} - Sent predict request with ID {request_id}"
         )
-        response = self._get_response(request_id)
-        if response.error:
-            logger.error(
-                f"{self.name()} - Prediction error for request {request_id}: {response.error}"
+        try:
+            response = self._get_response(request_id)
+            if response.error:
+                logger.error(
+                    f"{self.name()} - Prediction error for request {request_id}: {response.error}"
+                )
+                raise RuntimeError(response.error)
+            if response.outputs is None:
+                logger.error(
+                    f"{self.name()} - Prediction response outputs are None for request {request_id}"
+                )
+                raise RuntimeError("Prediction response outputs are None.")
+            logger.debug(
+                f"{self.name()} - Received prediction for request {request_id}"
             )
-            raise RuntimeError(response.error)
-        if response.outputs is None:
+            return response.outputs
+        except queue.Empty:
             logger.error(
-                f"{self.name()} - Prediction response outputs are None for request {request_id}"
+                f"{self.name()} - Timeout waiting for predict response for request ID {request_id}."
             )
-            raise RuntimeError("Prediction response outputs are None.")
-        logger.debug(
-            f"{self.name()} - Received prediction for request {request_id}"
-        )
-        return response.outputs
+            self._handle_subprocess_crash()
+            raise RuntimeError("Timeout waiting for predict response.")
+        except Exception as e:
+            logger.error(
+                f"{self.name()} - Exception during predict for request ID {request_id}: {e}",
+                exc_info=True,
+            )
+            self._handle_subprocess_crash()
+            raise
 
     def unload(self) -> None:
-        if self._process is not None:
+        if self._process is not None and self._process.is_alive():
             # Generate a unique request_id for the unload operation
             unload_request_id = str(uuid.uuid4())
             unload_msg = UnloadMessage(request_id=unload_request_id)
@@ -204,7 +237,8 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))
             logger.error(
-                f"{cls.name()} - Error instantiating concrete class: {e}"
+                f"{cls.name()} - Error instantiating concrete class: {e}",
+                exc_info=True,
             )
             conn.close()
             return
@@ -278,12 +312,16 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                             )
                             conn.send(asdict(response))
                             logger.error(
-                                f"{model_class.name()} - Error unloading model: {e}"
+                                f"{model_class.name()} - Error unloading model: {e}",
+                                exc_info=True,
                             )
         except Exception as e:
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))
-            logger.error(f"{cls.name()} - Critical error in subprocess: {e}")
+            logger.error(
+                f"{cls.name()} - Critical error in subprocess: {e}",
+                exc_info=True,
+            )
         finally:
             conn.close()
             logger.debug(f"{model_class.name()} - Subprocess terminating.")
@@ -311,10 +349,17 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                         f"{self.name()} - Received error message: {response.error}"
                     )
             except EOFError:
-                logger.error(f"{self.name()} - Subprocess pipe closed.")
+                logger.error(
+                    f"{self.name()} - Subprocess pipe closed unexpectedly."
+                )
+                self._handle_subprocess_crash()
                 break
             except Exception as e:
-                logger.error(f"{self.name()} - Error in response listener: {e}")
+                logger.error(
+                    f"{self.name()} - Error in response listener: {e}",
+                    exc_info=True,
+                )
+                self._handle_subprocess_crash()
                 break
 
     def _get_response(self, request_id: str) -> ResponseMessage:
@@ -323,9 +368,52 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         logger.debug(
             f"{self.name()} - Waiting for response for request ID {request_id}."
         )
-        response = response_queue.get()  # Wait indefinitely
-        del self._response_handlers[request_id]
-        return response
+        try:
+            response = response_queue.get()  # Wait indefinitely
+            return response
+        except queue.Empty:
+            logger.error(
+                f"{self.name()} - Timeout waiting for response for request ID {request_id}."
+            )
+            raise
+        finally:
+            if request_id in self._response_handlers:
+                del self._response_handlers[request_id]
+
+    def _start_subprocess(self) -> None:
+        self._process = multiprocessing.Process(
+            target=self._model_process,
+            args=(self._child_conn, self._kwargs),
+            daemon=True,
+        )
+        self._process.start()
+
+    def _handle_subprocess_crash(self) -> None:
+        logger.error(f"{self.name()} - Detected subprocess crash.")
+        # Notify all pending requests about the crash
+        for request_id, handler in self._response_handlers.items():
+            error_response = ResponseMessage(
+                request_id=request_id, error="Subprocess crashed unexpectedly."
+            )
+            try:
+                handler.put(error_response)
+            except Exception as e:
+                logger.error(
+                    f"{self.name()} - Failed to notify request ID {request_id}: {e}"
+                )
+        self._response_handlers.clear()
+        # Clean up the process reference
+        if self._process is not None:
+            if self._process.is_alive():
+                logger.debug(f"{self.name()} - Terminating subprocess.")
+                self._process.terminate()
+                self._process.join(timeout=3)
+                if self._process.is_alive():
+                    logger.debug(f"{self.name()} - Force killing subprocess.")
+                    force_kill_process(self._process)
+                    self._process.join(timeout=3)
+            self._parent_conn.close()
+            self._process = None
 
     def __del__(self):
         try:
