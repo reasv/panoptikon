@@ -226,8 +226,6 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
     @classmethod
     def _model_process(cls, conn: Connection, kwargs: Dict[str, Any]) -> None:
         """Run in the subprocess: instantiate and manage the concrete InferenceModel."""
-        # Instantiate the class (cannot use cls.name() because cls is the main class)
-        # Need to resolve the concrete_class's name
         try:
             model_class = cls.concrete_class()
             logger.debug(f"{model_class.name()} - Resolving concrete class.")
@@ -245,8 +243,24 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
 
         try:
             while True:
-                if conn.poll():
-                    message_dict = conn.recv()
+                # Batch retrieval of all available messages
+                messages = []
+                while conn.poll():
+                    try:
+                        message = conn.recv()
+                        messages.append(message)
+                    except EOFError:
+                        logger.error(
+                            f"{model_class.name()} - Subprocess pipe closed."
+                        )
+                        break
+
+                if not messages:
+                    # If no messages are available, wait briefly to avoid busy waiting
+                    threading.Event().wait(0.01)
+                    continue
+
+                for message_dict in messages:
                     command = message_dict.get("command")
                     if command == "load":
                         load_msg = LoadMessage(**message_dict)
