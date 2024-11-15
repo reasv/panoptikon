@@ -191,10 +191,11 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         else:
             logger.debug(f"{self.name()} - Subprocess is not running.")
 
-    def _model_process(self, conn: Connection, kwargs: Dict[str, Any]) -> None:
+    @classmethod
+    def _model_process(cls, conn: Connection, kwargs: Dict[str, Any]) -> None:
         """Run in the subprocess: instantiate and manage the concrete InferenceModel."""
-        logger.debug(f"{self.name()} - Subprocess started.")
-        model_class = self.concrete_class()
+        logger.debug(f"{cls.name()} - Subprocess started.")
+        model_class = cls.concrete_class()
         logger.debug(f"{model_class.name()} - Resolving concrete class.")
         try:
             model_instance = model_class(**kwargs)
@@ -258,7 +259,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         except Exception as e:
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))
-            logger.error(f"{self.name()} - Critical error in subprocess: {e}")
+            logger.error(f"{cls.name()} - Critical error in subprocess: {e}")
         finally:
             conn.close()
             logger.debug(f"{model_class.name()} - Subprocess terminating.")
