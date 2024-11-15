@@ -22,7 +22,7 @@ def get_client_url(parent_hostname: str) -> str:
         run_node_client(client_hostname, client_port)
         if client_hostname == "0.0.0.0":
             client_hostname = "127.0.0.1"
-        return f"http://{client_hostname}:{client_port}/"
+        return f"http://{client_hostname}:{client_port}"
 
 
 def get_routers(
