@@ -7,7 +7,6 @@ from typing import Any, Dict, List
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse
 from fastapi_utilities.repeat.repeat_at import repeat_at
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
@@ -247,10 +246,12 @@ def get_app(hostname: str, port: int) -> FastAPI:
                 ) or not os.getenv("INFERENCE_API_URL"):
                     return await call_next(request)
 
+            timeout = 60
             proxy_url = client_url
             # If the request is for the inference API, and we are using a custom URL for it, proxy it to the inference API
             if request.url.path.startswith("/api/inference"):
                 proxy_url = os.getenv("INFERENCE_API_URL")
+                timeout = None
             # Otherwise, proxy the request to the Next.js frontend
             async with httpx.AsyncClient() as client:
                 try:
@@ -267,7 +268,7 @@ def get_app(hostname: str, port: int) -> FastAPI:
                         url=target_url,
                         headers=request.headers.raw,
                         content=await request.body(),
-                        timeout=50,  # Adjust timeout as needed
+                        timeout=timeout,
                     )
 
                     logger.debug(
