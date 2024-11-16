@@ -372,7 +372,7 @@ microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_na
 [group.clap]
 config = { impl_class = "clap" }
 [group.clap.metadata]
-description = "This is experimental. Generate Audio Embeddings using CLAP models for semantic audio search. In order to search for audio using these embeddings, use the 'Semantic Image Search' features in the Search UI, and specifically select one of these audio models in the advanced options"
+description = "(Experimental) Generate Audio Embeddings using CLAP models for semantic audio search."
 name = "CLAP Audio Embeddings"
 default_batch_size = 64
 default_inference_id = "clap-htsat-unfused"
@@ -381,7 +381,7 @@ output_type = "clip"
 input_spec = { handler = "audio_tracks" }
 input_mime_types = ["video/", "audio/"]
 [group.clap.inference_ids]
-clap-htsat-unfused = { config = { model_name = "laion/clap-htsat-unfused" }, metadata = { description = "(Experimental Engine) CLAP: Contrastive Language-Audio Pretraining" } }
-larger_clap_music = { config = { model_name = "laion/larger_clap_music" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music" } }
-larger_clap_music_and_speech = { config = { model_name = "laion/larger_clap_music_and_speech" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on music and speech." } }
-larger_clap_general = { config = { model_name = "laion/larger_clap_general" }, metadata = { description = "(Experimental Engine) This is an improved CLAP checkpoint, specifically trained on general audio, music and speech." } }
+clap-htsat-unfused = { config = { model_name = "laion/clap-htsat-unfused" }, metadata = { description = "CLAP: Contrastive Language-Audio Pretraining" } }
+larger_clap_music = { config = { model_name = "laion/larger_clap_music" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on music" } }
+larger_clap_music_and_speech = { config = { model_name = "laion/larger_clap_music_and_speech" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on music and speech." } }
+larger_clap_general = { config = { model_name = "laion/larger_clap_general" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on general audio, music and speech." } }
