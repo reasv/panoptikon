@@ -37,11 +37,11 @@ The only configuration that we endorse for a public Panoptikon instance is the p
 
 This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev/search) as a public demonstration instance for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
 
-Panoptikon is also not designed with high concurrency in mind, and the public instance may be slow or unresponsive at times if many users are accessing it simultaneously, especially when it comes to the inference server and related semantic search features. This is because requests to the inference server's prediction endpoint are neither debounced nor automatically batched, which means it will only handle one request at a time for all users, and the instant search box will make a request for every keystroke.
+Panoptikon is also not designed with high concurrency in mind, and the public instance may be slow or unresponsive at times if many users are accessing it simultaneously, especially when it comes to the inference server and related semantic search features. This is because requests to the inference server's prediction endpoint are not debounced, and the instant search box will make a request for every keystroke.
 
-The public instance is meant for demonstration purposes only, to show the capabilities of Panoptikon to interested users. If you wanted to host a public Panoptikon instance for real-world use, it would be necessary to add authentication and rate limiting to the API, as well as to optimize the inference server to batch concurrent requests.
+The public instance is meant for demonstration purposes only, to show the capabilities of Panoptikon to interested users. If you wanted to host a public Panoptikon instance for real-world use, it would be necessary to add authentication and rate limiting to the API, optimize the inference server for high concurrency, and possibly add a caching layer.
 
-Panoptikon's search API is not tightly coupled to the inference server. It is possible to implement a caching layer or a queue system to handle inference requests more efficiently. Without modifying Panoptikon's source code, you could use a different inference server implementation that supports batching and concurrency, then simply pass the embeddings it outputs to Panoptikon's search API.
+Panoptikon's search API is not tightly coupled to the inference server. It is possible to implement a caching layer or a distributed queue system to handle inference requests more efficiently. Without modifying Panoptikon's source code, you could use a different inference server implementation that supports batching and concurrency, then simply pass the embeddings it outputs to Panoptikon's search API.
 
 The public instance currently contains a small subset of images from the [latentcat/animesfw](https://huggingface.co/datasets/latentcat/animesfw) dataset.
 
@@ -102,12 +102,6 @@ AttributeError: 'sqlite3.Connection' object has no attribute 'enable_load_extens
 ```
 The SQLite version bundled with your python install doesn't support extensions.
 You need to install a version of SQLite that supports them.
-
-#### sqlite3.OperationalError: no such function: concat
-```
-sqlite3.OperationalError: no such function: concat
-```
-Your SQLite version is too old. Panoptikon requires SQLite >=3.43.0
 
 ## Running Panoptikon
 
