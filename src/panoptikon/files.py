@@ -35,6 +35,7 @@ from panoptikon.utils import (
     get_mime_type,
     make_video_thumbnails,
     normalize_path,
+    ParallelProcessor,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,10 @@ def scan_files(
     include_pdf=False,
 ):
     """
-    Scan files in the given starting points and their entire directory trees, excluding the given excluded paths, and including images, video, and/or audio files.
+    Scan files in the given starting points and their entire directory trees, 
+    excluding the given excluded paths, and including images, video, and/or audio files.
+    
+    Uses parallel processing to extract file metadata efficiently.
     """
     from panoptikon.db.pql.filters.kvfilters import MatchValue, evaluate_match
 
@@ -109,6 +113,8 @@ def scan_files(
         + include_html * get_html_extensions()
         + include_pdf * get_pdf_extensions()
     )
+
+    file_list = []
     for file_path in get_files_by_extension(
         starting_points=starting_points,
         excluded_paths=excluded_paths,
@@ -140,33 +146,20 @@ def scan_files(
                 logger.debug(
                     f"File {file_path} does not match the filescan filter (Stage 1), skipping..."
                 )
-                yield None, 0.0, 0.0
                 continue
 
-        # Assume file is new or has changed
-        new_or_new_timestamp = True
-        # Check if the file is already in the database
-        if file_record := get_file_by_path(conn, file_path):
-            # Check if the file has been modified since the last scan
-            if last_modified == file_record.last_modified:
-                # File has not been modified
-                new_or_new_timestamp = False
-
-        if new_or_new_timestamp:
-            try:
-                yield extract_file_metadata(
-                    conn,
-                    config,
-                    file_path,
-                    last_modified,
-                    file_size,
-                    file_record,
-                )
-            except Exception as e:
-                logger.error(f"Error extracting metadata for {file_path}: {e}")
-                yield None, 0.0, 0.0
+        # Check if file is new or has changed
+        file_record = get_file_by_path(conn, file_path)
+        if not file_record or last_modified != file_record.last_modified:
+            # Prepare metadata extraction request
+            file_list.append({
+                'file_path': file_path,
+                'last_modified': last_modified,
+                'file_size': file_size,
+                'file_record': file_record
+            })
         else:
-            assert file_record is not None
+            # Yield existing file record if unchanged
             yield FileScanData(
                 sha256=file_record.sha256,
                 last_modified=file_record.last_modified,
@@ -174,6 +167,33 @@ def scan_files(
                 new_file_timestamp=False,
                 new_file_hash=False,
             ), 0.0, 0.0
+
+    # Process files in parallel
+    def process_file(file_info):
+        try:
+            return extract_file_metadata(
+                conn,
+                config,
+                file_info['file_path'],
+                file_info['last_modified'],
+                file_info['file_size'],
+                file_info['file_record']
+            )
+        except Exception as e:
+            logger.error(f"Error extracting metadata for {file_info['file_path']}: {e}")
+            return None, 0.0, 0.0
+
+    # Use ParallelProcessor to process files
+    processed_files = ParallelProcessor.batch_process(
+        file_list, 
+        process_file, 
+        max_workers=os.cpu_count()  # Use number of CPU cores as default
+    )
+
+    # Yield processed file results
+    for result in processed_files:
+        if result[0] is not None:
+            yield result
 
 
 def extract_file_metadata(

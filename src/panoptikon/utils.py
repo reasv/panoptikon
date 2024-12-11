@@ -1,3 +1,4 @@
+import logging
 import math
 import mimetypes
 import os
@@ -9,6 +10,47 @@ from datetime import datetime
 mimetypes.add_type("image/webp", ".webp")
 from PIL import Image, ImageDraw, ImageFont
 
+import os
+from typing import Callable, Any, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logger = logging.getLogger(__name__)
+
+class ParallelProcessor:
+    """
+    Utility class to handle parallel processing of tasks
+    """
+    @staticmethod
+    def batch_process(
+        items: List[Any], 
+        process_func: Callable, 
+        max_workers: Optional[int] = None
+    ) -> List[Any]:
+        """
+        Process a list of items in parallel
+        
+        :param items: List of items to process
+        :param process_func: Function to apply to each item
+        :param max_workers: Maximum number of concurrent workers
+        :return: List of processed results
+        """
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_item = {
+                executor.submit(process_func, item): item 
+                for item in items
+            }
+            
+            # Collect results
+            results = []
+            for future in as_completed(future_to_item):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as exc:
+                    logger.error(f"Error processing item: {exc}", exc_info=True)
+            
+            return results
 
 def execute_custom_command(command_template: str, path: str):
     """

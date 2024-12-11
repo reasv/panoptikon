@@ -29,7 +29,10 @@ def get_database_connection(
         write_lock = True
         # Acquire a write lock
         logger.debug(f"Opening index database in write mode")
-        conn = sqlite3.connect(db_file)
+        # default python build multi thread safety is Serialized mode
+        # https://www.sqlite.org/threadsafe.html
+        # When making queries, sqlite itself handles the connection mutex
+        conn = sqlite3.connect(db_file, check_same_thread=False)
         logger.debug(f"Attaching storage database in write mode")
         conn.execute(f"ATTACH DATABASE '{storage_db_file}' AS storage")
         cursor = conn.cursor()
@@ -38,7 +41,7 @@ def get_database_connection(
     else:
         write_lock = False
         # Read-only connection
-        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, check_same_thread=False)
         # Attach storage database
         conn.execute(
             f"ATTACH DATABASE 'file:{storage_db_file}?mode=ro' AS storage"
