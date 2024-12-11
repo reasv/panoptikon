@@ -49,6 +49,7 @@ def extract_frames_ffmpeg(path: str, num_frames: int):
     # Build ffmpeg command to extract frames at regular intervals
     command = [
         "ffmpeg",
+        "-hwaccel", "auto",
         "-i",
         path,
         "-vf",
