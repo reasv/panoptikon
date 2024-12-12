@@ -129,7 +129,6 @@ def scan_files(
                 f"Error getting last modified time for {file_path}: {e}"
             )
             yield None, 0.0, 0.0
-            continue
 
         # Check if the value matches the filter
         if config.filescan_filter is not None:
@@ -146,6 +145,7 @@ def scan_files(
                 logger.debug(
                     f"File {file_path} does not match the filescan filter (Stage 1), skipping..."
                 )
+                # continue, not yield, because being filtered is not an error.
                 continue
 
         # Check if file is new or has changed
@@ -183,17 +183,13 @@ def scan_files(
             logger.error(f"Error extracting metadata for {file_info['file_path']}: {e}")
             return None, 0.0, 0.0
 
-    # Use ParallelProcessor to process files
     processed_files = ParallelProcessor.batch_process(
         file_list, 
         process_file, 
-        max_workers=os.cpu_count()  # Use number of CPU cores as default
+        max_workers=os.cpu_count()
     )
 
-    # Yield processed file results
-    for result in processed_files:
-        if result[0] is not None:
-            yield result
+    yield from processed_files
 
 
 def extract_file_metadata(
