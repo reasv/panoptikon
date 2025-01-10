@@ -245,9 +245,10 @@ class WDTagger(InferenceModel):
             rating=rating_labels,
             character=character_labels,
             general=general_labels,
-            character_mcut=character_mcut,
-            general_mcut=general_mcut,
+            character_mcut=float(character_mcut),  # Ensure Python float
+            general_mcut=float(general_mcut),      # Ensure Python float
         )
+
 
     def unload(self) -> None:
         if self._model_loaded:
