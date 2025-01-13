@@ -32,8 +32,8 @@ class ClapModel(InferenceModel):
             return
         from transformers import AutoTokenizer, ClapModel, ClapProcessor
 
-        self.model: ClapModel = ClapModel.from_pretrained(self.model_name)  # type: ignore
-        processor: ClapProcessor = ClapProcessor.from_pretrained(
+        self.model = ClapModel.from_pretrained(self.model_name)  # type: ignore
+        processor = ClapProcessor.from_pretrained(
             self.model_name
         )  # type: ignore
         assert not isinstance(
