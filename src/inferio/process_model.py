@@ -189,7 +189,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             self._parent_conn.send(asdict(unload_msg))
             logger.debug(f"{self.name()} - Sent unload command.")
             try:
-                response = self._get_response(unload_request_id)
+                response = self._get_response(unload_request_id, timeout=10)
                 if response.status == "unloaded":
                     logger.debug(
                         f"{self.name()} - Model unloaded successfully."
@@ -465,14 +465,14 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
                 self._handle_subprocess_crash()
                 break
 
-    def _get_response(self, request_id: str) -> ResponseMessage:
+    def _get_response(self, request_id: str, timeout: Optional[float] = None) -> ResponseMessage:
         response_queue: queue.Queue = queue.Queue()
         self._response_handlers[request_id] = response_queue
         logger.debug(
             f"{self.name()} - Waiting for response for request ID {request_id}."
         )
         try:
-            response = response_queue.get()  # Wait indefinitely
+            response = response_queue.get(timeout=timeout)
             return response
         except queue.Empty:
             logger.error(
