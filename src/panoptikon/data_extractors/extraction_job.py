@@ -128,10 +128,15 @@ def run_extraction_job(
         try:
             nonlocal data_load_time
             load_start = datetime.now()
+            
+            conn.execute("BEGIN TRANSACTION")  # Start transaction for potential frame extraction
             o = input_transform(item)
+            conn.commit()  # Commit any frame cache updates
+                
             data_load_time += (datetime.now() - load_start).total_seconds()
             return o
         except Exception as e:
+            conn.rollback()  # Roll back if anything failed
             logger.error(
                 f"Error processing item {item.path}: {e}", exc_info=True
             )
