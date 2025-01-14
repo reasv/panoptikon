@@ -21,7 +21,7 @@ python = "^3.12"
 pillow = "^10.4.0"
 imageio-ffmpeg = { extras = ["ffmpeg"], version = "^0.5.1" }
 python-dotenv = "^1.0.1"
-sqlite-vec = "^0.1.1"
+sqlite-vec = "^0.1.6"
 fastapi-utilities = "^0.2.0"
 mutagen = "^1.47.0"
 toml = "^0.10.2"
