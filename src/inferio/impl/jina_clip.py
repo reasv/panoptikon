@@ -137,12 +137,41 @@ class JinaClipModel(InferenceModel):
             "input": jina_input,
         }
 
-        response = requests.post(url, headers=headers, json=data)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Jina API request failed with status {response.status_code}: "
-                f"{response.text}"
-            )
+        # Attempt the request up to 3 times if we detect
+        # network failures or 5xx server errors
+        max_retries = int(os.environ.get("JINA_MAX_RETRIES", 3))
+        timeout = int(os.environ.get("JINA_TIMEOUT", 0)) or None
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=data, timeout=timeout)
+                # If successful, break
+                if response.status_code == 200:
+                    break
+                # If 5xx, try again (unless last attempt)
+                if 500 <= response.status_code < 600:
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        # Out of attempts
+                        response.raise_for_status()
+                else:
+                    # It's not 5xx, so let's raise
+                    response.raise_for_status()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # Connection-related errors -> retry if not exhausted
+                if attempt < max_retries - 1:
+                    continue
+                else:
+                    raise RuntimeError(f"Request failed after {max_retries} attempts: {str(e)}")
+            except requests.RequestException as e:
+                # Some other request error, do not retry
+                raise RuntimeError(
+                    f"Request to Jina embeddings API failed: {str(e)}"
+                ) from e
+
+        if response is None:
+            raise RuntimeError("Request could not be completed and did not raise an exception.")
 
         resp_json = response.json()
         # Each item in resp_json["data"] should have { "index": i, "embedding": [...] }
