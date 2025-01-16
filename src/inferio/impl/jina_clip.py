@@ -44,7 +44,7 @@ class JinaClipModel(InferenceModel):
 
     @classmethod
     def name(cls) -> str:
-        return "jina-clip"
+        return "jina-clip-api"
 
     def load(self) -> None:
         """
@@ -128,6 +128,7 @@ class JinaClipModel(InferenceModel):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "User-Agent": "Panoptikon/0.1.0 (https://github.com/reasv/panoptikon)",
         }
         data = {
             "model": self.model_name,

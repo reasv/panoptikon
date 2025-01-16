@@ -12,6 +12,7 @@ from inferio.impl.clip import CLIPIsolated, ClipModel
 from inferio.impl.clip_inf import InfinityCLIP
 from inferio.impl.danbooru import DanbooruIsolated, DanbooruTagger
 from inferio.impl.florence2 import Florence2, Florence2Isolated
+from inferio.impl.jina_clip import JinaCLIPIsolated, JinaClipModel
 from inferio.impl.ocr import DoctrModel, DoctrModelIsolated
 from inferio.impl.sentence_transformers import (
     SentenceTransformersModel,
@@ -41,6 +42,7 @@ if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
     ModelRegistry.register_model(DanbooruTagger)
     # ModelRegistry.register_model(InfinityCLIP)
     ModelRegistry.register_model(ClapModel)
+    ModelRegistry.register_model(JinaClipModel)
 else:
     ModelRegistry.register_model(WDTaggerIsolated)
     ModelRegistry.register_model(DoctrModelIsolated)
@@ -51,6 +53,7 @@ else:
     ModelRegistry.register_model(DanbooruIsolated)
     # ModelRegistry.register_model(InfinityCLIPIsolated)
     ModelRegistry.register_model(ClapModelIsolated)
+    ModelRegistry.register_model(JinaCLIPIsolated)
 
 router = APIRouter(
     prefix="/api/inference",
