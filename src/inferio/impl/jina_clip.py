@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 import numpy as np
 from io import BytesIO
 from typing import List, Sequence, Type, Union
@@ -11,7 +12,9 @@ from inferio.impl.utils import serialize_array
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
+import logging
 
+logger = logging.getLogger(__name__)
 import requests
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -93,9 +96,7 @@ class JinaClipModel(InferenceModel):
 
                 # Create data URL
                 image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-                data_url = f"data:image/{mime};base64,{image_base64}"
-
-                image_inputs.append((idx, data_url))
+                image_inputs.append((idx, image_base64))
             else:
                 # Expect a dict with key 'text'
                 assert isinstance(
@@ -145,7 +146,7 @@ class JinaClipModel(InferenceModel):
         response = None
         for attempt in range(max_retries):
             try:
-                response = requests.post(url, headers=headers, json=data, timeout=timeout)
+                response = requests.post(url, headers=headers, data=json.dumps(data), timeout=timeout)
                 # If successful, break
                 if response.status_code == 200:
                     break
@@ -157,6 +158,7 @@ class JinaClipModel(InferenceModel):
                         # Out of attempts
                         response.raise_for_status()
                 else:
+                    logger.error(f"Error response returned by Jina API: {response.json()}")
                     # It's not 5xx, so let's raise
                     response.raise_for_status()
             except (requests.ConnectionError, requests.Timeout) as e:
