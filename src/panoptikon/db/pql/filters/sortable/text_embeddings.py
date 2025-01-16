@@ -302,8 +302,11 @@ def get_embed(
         cache_args.ttl_seconds,
         [({"text": text, "task": "s2s"}, None)],
     )[0]
-    text_embed = deserialize_array(embed_bytes)[0]
-    assert isinstance(text_embed, np.ndarray)
+    deserialized_embedding = deserialize_array(embed_bytes)
+    if isinstance(deserialized_embedding[0], np.ndarray):
+        text_embed = deserialized_embedding[0]
+    else:
+        text_embed = deserialized_embedding
     # Set as persistent so that the model is not reloaded every time the function is called
     last_embedded_text = text
     last_used_model = model_name

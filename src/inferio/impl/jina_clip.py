@@ -28,9 +28,7 @@ class JinaClipModel(InferenceModel):
     def __init__(
         self,
         model_name: str = "jina-clip-v2",
-        dimensions: int = 1024,
-        normalized: bool = True,
-        embedding_type: str = "float",
+        **kwargs: Union[int, str, bool],
     ):
         """
         :param model_name: Name of the Jina model to use, e.g. "jina-clip-v2".
@@ -39,9 +37,7 @@ class JinaClipModel(InferenceModel):
         :param embedding_type: The numeric type of the embeddings: "float" or "int".
         """
         self.model_name = model_name
-        self.dimensions = dimensions
-        self.normalized = normalized
-        self.embedding_type = embedding_type
+        self.model_config = kwargs
 
         self._model_loaded: bool = False
 
@@ -110,6 +106,7 @@ class JinaClipModel(InferenceModel):
         jina_input = []
         text_map = []
         image_map = []
+        
 
         for idx, txt in text_inputs:
             text_map.append(idx)
@@ -133,9 +130,7 @@ class JinaClipModel(InferenceModel):
         }
         data = {
             "model": self.model_name,
-            "dimensions": self.dimensions,
-            "normalized": self.normalized,
-            "embedding_type": self.embedding_type,
+            **self.model_config,
             "input": jina_input,
         }
 
