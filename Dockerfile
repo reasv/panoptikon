@@ -24,6 +24,14 @@ RUN llvm-config --version || true
 RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 RUN python3 -c "import sqlite3; print('SQLite has loadable extensions:', sqlite3.connect(':memory:').enable_load_extension(True))"
 
+RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-14 100
+
+# Then make sure it’s executable by all:
+RUN chmod a+rx /usr/bin/llvm-config-14 /usr/bin/llvm-config
+
+# (Optionally confirm it’s set up)
+RUN ls -l /usr/bin/llvm-config* && /usr/bin/llvm-config --version
+
 # Ensure pipx is in the PATH for root and appuser
 ENV PATH="/root/.local/bin:$PATH"
 
