@@ -8,7 +8,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
-    pipx
+    pipx \
+    build-essential \
+    python3-dev \
+    llvm-14 \
+    llvm-14-dev \
+    clang-14 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify that llvm-config is on PATH
+RUN which llvm-config || true
+RUN llvm-config --version || true
 
 # Verify that Python has _sqlite3 with loadable extensions enabled
 RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
