@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import logging
 import os
 import sqlite3
@@ -148,6 +149,31 @@ def get_item_id(conn: sqlite3.Connection, sha256: str) -> int | None:
         return item_id[0]
     return None
 
+@contextmanager
+def atomic_transaction(connection: sqlite3.Connection, logger: logging.Logger):
+    """
+    Context manager for an atomic transaction in SQLite.
+    Commits the transaction on success.
+    Rolls back the transaction on any exception.
+    """
+    try:
+        connection.execute('BEGIN IMMEDIATE')
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        logger.exception("Rolling back transaction")
+        raise
+
+@contextmanager
+def ensure_close(connection: sqlite3.Connection):
+    """
+    Context manager to ensure the connection is closed.
+    """
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 ItemIdentifierType = Literal[
     "item_id", "file_id", "data_id", "path", "sha256", "md5"

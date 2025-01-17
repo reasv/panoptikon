@@ -22,6 +22,7 @@ from panoptikon.data_extractors.types import (
     ExtractionJobStart,
     JobInputData,
 )
+from panoptikon.db import atomic_transaction
 from panoptikon.db.extraction_log import (
     add_data_log,
     get_items_missing_data_extraction,
@@ -58,7 +59,10 @@ def run_extraction_job(
     Run a job that processes items in the database
     using the given batch inference function and item extractor.
     """
-    remove_incomplete_jobs(conn)
+    # Commit the current transaction
+    conn.commit()
+    with atomic_transaction(conn, logger):
+        remove_incomplete_jobs(conn)
 
     def get_remaining():
         # Get first item to obtain the total number of items remaining
@@ -93,23 +97,19 @@ def run_extraction_job(
         0,
     )
     data_load_time, inference_time = 0.0, 0.0
-    job_id = add_data_log(
-        conn,
-        scan_time,
-        threshold,
-        [model_opts.data_type()],
-        model_opts.setter_name(),
-        batch_size,
-    )
-    upsert_setter(
-        conn,
-        model_opts.setter_name(),
-    )
-    transaction_per_item = True  # Now hardcoded to True
-    if transaction_per_item:
-        # Commit the current transaction after adding the log
-        conn.commit()
-
+    with atomic_transaction(conn, logger):
+        job_id = add_data_log(
+            conn,
+            scan_time,
+            threshold,
+            [model_opts.data_type()],
+            model_opts.setter_name(),
+            batch_size,
+        )
+        upsert_setter(
+            conn,
+            model_opts.setter_name(),
+        )
     yield ExtractionJobStart(
         start_time,
         initial_remaining,
@@ -129,14 +129,12 @@ def run_extraction_job(
             nonlocal data_load_time
             load_start = datetime.now()
             
-            conn.execute("BEGIN IMMEDIATE")  # Start transaction for potential frame extraction
-            o = input_transform(item)
-            conn.commit()  # Commit any frame cache updates
-                
+            with atomic_transaction(conn, logger):
+                o = input_transform(item)
+   
             data_load_time += (datetime.now() - load_start).total_seconds()
             return o
         except Exception as e:
-            conn.rollback()  # Roll back if anything failed
             logger.error(
                 f"Error processing item {item.path}: {e}", exc_info=True
             )
@@ -158,30 +156,52 @@ def run_extraction_job(
         if get_item_failed(failed_items, item):
             # Skip items that have already failed
             continue
-        if transaction_per_item:
-            # Start a new transaction for each item
-            conn.execute("BEGIN IMMEDIATE")
-        try:
-            output_handler(job_id, item, inputs, outputs)
-        except Exception as e:
-            logger.error(f"Error handling item {item.path}: {e}")
-            failed_items = add_failed_item(failed_items, item)
-            if transaction_per_item:
+
+        with atomic_transaction(conn, logger):
+            try:
+                output_handler(job_id, item, inputs, outputs)
+            except Exception as e:
+                logger.error(f"Error handling item {item.path}: {e}")
+                failed_items = add_failed_item(failed_items, item)
                 conn.rollback()
-            continue
-        if item.type.startswith("video"):
-            videos += 1
-        elif item.type.startswith("image"):
-            images += 1
-        else:
-            other += 1
-        total_items = remaining + processed_items
-        eta_str = estimate_eta(scan_time, processed_items, remaining)
-        logger.info(
-            f"{model_opts.setter_name()}: ({processed_items}/{total_items}) "
-            + f"(ETA: {eta_str}) "
-            + f"Processed ({item.type}) {item.path}"
-        )
+                continue
+            if item.type.startswith("video"):
+                videos += 1
+            elif item.type.startswith("image"):
+                images += 1
+            else:
+                other += 1
+            total_items = remaining + processed_items
+            eta_str = estimate_eta(scan_time, processed_items, remaining)
+            logger.info(
+                f"{model_opts.setter_name()}: ({processed_items}/{total_items}) "
+                + f"(ETA: {eta_str}) "
+                + f"Processed ({item.type}) {item.path}"
+            )
+            update_log(
+                conn,
+                job_id,
+                image_files=images,
+                video_files=videos,
+                other_files=other,
+                total_segments=total_processed_units,
+                errors=len(failed_items.keys()),
+                total_remaining=remaining,
+                data_load_time=data_load_time,
+                inference_time=inference_time,
+                finished=False,
+            )
+            yield ExtractionJobProgress(
+                start_time, processed_items, total_items, eta_str, item, job_id
+            )
+
+    logger.info(
+        f"Processed {processed_items} items:"
+        + f" {images} images and {videos} videos "
+        + f"totalling {total_processed_units} frames"
+    )
+    remaining_paths = get_remaining()
+    with atomic_transaction(conn, logger):
         update_log(
             conn,
             job_id,
@@ -190,47 +210,12 @@ def run_extraction_job(
             other_files=other,
             total_segments=total_processed_units,
             errors=len(failed_items.keys()),
-            total_remaining=remaining,
+            total_remaining=remaining_paths,
             data_load_time=data_load_time,
             inference_time=inference_time,
-            finished=False,
+            finished=True,
         )
-        if transaction_per_item:
-            # Commit the transaction after updating the log
-            conn.commit()
-        yield ExtractionJobProgress(
-            start_time, processed_items, total_items, eta_str, item, job_id
-        )
-
-    logger.info(
-        f"Processed {processed_items} items:"
-        + f" {images} images and {videos} videos "
-        + f"totalling {total_processed_units} frames"
-    )
-    remaining_paths = get_remaining()
-    if transaction_per_item:
-        # Start a new transaction to update the log with the final results
-        conn.execute("BEGIN IMMEDIATE")
-    update_log(
-        conn,
-        job_id,
-        image_files=images,
-        video_files=videos,
-        other_files=other,
-        total_segments=total_processed_units,
-        errors=len(failed_items.keys()),
-        total_remaining=remaining_paths,
-        data_load_time=data_load_time,
-        inference_time=inference_time,
-        finished=True,
-    )
-    if transaction_per_item:
-        # Commit the transaction after updating the log
-        conn.commit()
-    logger.info("Updated log with scan results")
-    if transaction_per_item:
-        # The transaction will be committed by the caller
-        conn.execute("BEGIN IMMEDIATE")
+        logger.info("Updated log with scan results")
 
     failed_paths = [item.path for item in failed_items.values()]
     final_callback()

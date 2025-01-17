@@ -107,7 +107,10 @@ class JinaClipModel(InferenceModel):
         text_map = []
         image_map = []
         
-
+        # Log the first 10 characters of the 10 text inputs
+        shortened_text_inputs = [(idx, txt[:10]) for idx, txt in text_inputs[0:10]]
+        logger.debug(f"First text inputs in batch:  {shortened_text_inputs}")
+        
         for idx, txt in text_inputs:
             text_map.append(idx)
             jina_input.append({"text": txt})
