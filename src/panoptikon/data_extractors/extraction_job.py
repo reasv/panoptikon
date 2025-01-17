@@ -129,7 +129,7 @@ def run_extraction_job(
             nonlocal data_load_time
             load_start = datetime.now()
             
-            conn.execute("BEGIN TRANSACTION")  # Start transaction for potential frame extraction
+            conn.execute("BEGIN IMMEDIATE")  # Start transaction for potential frame extraction
             o = input_transform(item)
             conn.commit()  # Commit any frame cache updates
                 
@@ -160,7 +160,7 @@ def run_extraction_job(
             continue
         if transaction_per_item:
             # Start a new transaction for each item
-            conn.execute("BEGIN TRANSACTION")
+            conn.execute("BEGIN IMMEDIATE")
         try:
             output_handler(job_id, item, inputs, outputs)
         except Exception as e:
@@ -210,7 +210,7 @@ def run_extraction_job(
     remaining_paths = get_remaining()
     if transaction_per_item:
         # Start a new transaction to update the log with the final results
-        conn.execute("BEGIN TRANSACTION")
+        conn.execute("BEGIN IMMEDIATE")
     update_log(
         conn,
         job_id,
@@ -230,7 +230,7 @@ def run_extraction_job(
     logger.info("Updated log with scan results")
     if transaction_per_item:
         # The transaction will be committed by the caller
-        conn.execute("BEGIN TRANSACTION")
+        conn.execute("BEGIN IMMEDIATE")
 
     failed_paths = [item.path for item in failed_items.values()]
     final_callback()

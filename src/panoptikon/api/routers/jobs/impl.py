@@ -32,7 +32,7 @@ def run_folder_update(conn_args: Dict[str, Any]):
         persist_system_config(conn_args["index_db"], system_config)
         cursor = conn.cursor()
         # Begin a transaction
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         update_result = update_folder_lists(conn, system_config)
         logger.info(
             f"""
@@ -107,7 +107,7 @@ def rescan_folders(conn_args: Dict[str, Any]):
             run_folder_update(conn_args)
 
         cursor = conn.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         ids, files_deleted, items_deleted, rule_files_deleted = (
             rescan_all_folders(conn, system_config=system_config)
         )
@@ -133,7 +133,7 @@ def delete_model_data(
     try:
         logger.info(f"Running data deletion job for model {model}")
         cursor = conn.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         report_str = model.delete_extracted_data(conn)
         logger.info(report_str)
         conn.commit()
@@ -151,7 +151,7 @@ def delete_job_data(
     try:
         logger.info(f"Running data deletion job log id {log_id}")
         cursor = conn.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         delete_data_job_by_log_id(conn, log_id)
         logger.info(f"Deleted data for job log id {log_id}")
         conn.commit()
@@ -185,7 +185,7 @@ def run_data_extraction_job(
     conn = get_database_connection(**conn_args)
     try:
         cursor = conn.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         failed, images, videos, other, units = [], 0, 0, 0, 0
         start_time = datetime.datetime.now()
         for progress in model.run_extractor(
@@ -227,7 +227,7 @@ def run_data_extraction_job(
         )
         conn.rollback()
         cursor = conn.cursor()
-        cursor.execute("BEGIN")
+        cursor.execute("BEGIN IMMEDIATE")
         remove_incomplete_jobs(conn)
         conn.commit()
         logger.info("Removed incomplete jobs from the database")
