@@ -101,14 +101,15 @@ def run_node_client(hostname: str, port: int):
         logger.info("Starting the Node.js client server...")
         if public_api := os.getenv("PANOPTIKON_API_URL"):
             logger.info(f"API URL for client: {public_api}")
+        
+        other_values = {}
         if os.name == "nt":
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
-        else:
-            creationflags = None
+            other_values["creationflags"] = creationflags
         npx(
             ["--yes", "next", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
-            creationflags=creationflags,
+            **other_values
         )
 
     # Start the server in a new thread
