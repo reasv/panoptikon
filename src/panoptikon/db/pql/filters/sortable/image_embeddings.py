@@ -87,7 +87,7 @@ Otherwise, it will be ignored, as it only applies to text embeddings.
 
 class SemanticImageSearch(SortableFilter):
     order_by: bool = get_order_by_field(True)
-    direction: OrderTypeNN = get_order_direction_field("asc")
+    direction = get_order_direction_field("asc")
     image_embeddings: SemanticImageArgs = Field(
         ...,
         title="Search Image Embeddings",
@@ -320,7 +320,8 @@ def get_clip_embed(
         )[0]
         embed = deserialize_array(embed_bytes)
         assert isinstance(embed, np.ndarray)
-        return serialize_f32(embed.tolist())
+        embed_list: List[float] = embed.tolist() # type: ignore
+        return serialize_f32(embed_list)
     else:  # input is an image
         # Save image into a buffer
         image_buffer = io.BytesIO()
@@ -335,4 +336,5 @@ def get_clip_embed(
         )[0]
         embed = deserialize_array(embed_bytes)
         assert isinstance(embed, np.ndarray)
-        return serialize_f32(embed.tolist())
+        embed_list: List[float] = embed.tolist() # type: ignore
+        return serialize_f32(embed_list)

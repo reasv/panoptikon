@@ -245,7 +245,7 @@ def get_order_by_field(default: bool):
     )
 
 
-def get_order_direction_field(default: OrderTypeNN):
+def get_order_direction_field(default: OrderTypeNN) -> Literal["asc", "desc"]:
     return Field(
         default=default,
         title="Order Direction",
@@ -274,7 +274,7 @@ they will have the same order direction.
     )
 
 
-def get_order_direction_field_rownum(default: OrderTypeNN):
+def get_order_direction_field_rownum(default: OrderTypeNN) -> Literal["asc", "desc"]:
     return Field(
         default=default,
         title="Order Direction For Row Number",

@@ -310,7 +310,9 @@ def get_embed(
     # Set as persistent so that the model is not reloaded every time the function is called
     last_embedded_text = text
     last_used_model = model_name
-    last_embedded_text_embed = serialize_f32(text_embed.tolist())
+    embed_list = text_embed.tolist()
+    assert isinstance(embed_list, list), "Expected a list"
+    last_embedded_text_embed = serialize_f32(embed_list)
     logger.debug(
         f"Embedding generation took {time.time() - start_time} seconds"
     )

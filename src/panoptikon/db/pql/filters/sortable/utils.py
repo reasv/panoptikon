@@ -20,6 +20,8 @@ def extract_embeddings(buffer: str) -> bytes:
     # Check the number of dimensions
     if len(numpy_array.shape) == 1:
         # If it is a 1D array, it is a single embedding
-        return serialize_f32(numpy_array.tolist())
+        array_list = numpy_array.tolist()
+        assert isinstance(array_list, list), "Expected a list"
+        return serialize_f32(array_list)
     # If it is a 2D array, it is a list of embeddings, get the first one
     return serialize_f32(numpy_array[0].tolist())
