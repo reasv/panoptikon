@@ -103,6 +103,8 @@ def run_node_client(hostname: str, port: int):
             logger.info(f"API URL for client: {public_api}")
         if os.name == "nt":
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
+        else:
+            creationflags = None
         npx(
             ["--yes", "next", "start", "-p", str(port), "-H", hostname],
             cwd=client_dir,
