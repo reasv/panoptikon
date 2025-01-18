@@ -160,11 +160,14 @@ class ModelOpts(ABC):
     def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
         raise NotImplementedError
 
-    @classmethod
     @abstractmethod
-    def model_metadata(cls, model_name) -> Sequence[str]:
+    def metadata(self) -> Dict[str, str | Dict[str, str] | None | List[str] | int | float]:
         raise NotImplementedError
 
+    @classmethod
+    @abstractmethod
+    def metadata_for_model(cls, model_name: str)  -> Dict[str, str | Dict[str, str] | None | List[str] | int | float]:
+        raise NotImplementedError
 
 class ModelGroup(ModelOpts):
     _group: str
@@ -184,13 +187,10 @@ class ModelGroup(ModelOpts):
     @classmethod
     def _models(cls):
         return ModelOptsFactory.get_group_models(cls._group)
-
+    
     @classmethod
-    def model_metadata(cls, model_name) -> Sequence[str]:
-        meta = ModelOptsFactory.get_inference_id_metadata(
-            cls._group, model_name
-        )
-        return meta.get("description", ""), meta.get("link", {})
+    def metadata_for_model(cls, model_name: str):
+        return ModelOptsFactory.get_inference_id_metadata(cls._group, model_name)
 
     @classmethod
     def target_entities(cls) -> List[TargetEntityType]:
@@ -207,6 +207,9 @@ class ModelGroup(ModelOpts):
     @classmethod
     def default_threshold(cls) -> float | None:
         return cls._meta().get("default_threshold")
+    
+    def metadata(self):
+        return self._id_meta()
 
     def input_spec(self) -> Tuple[str, dict]:
         spec = self._id_meta().get("input_spec", None)
@@ -363,7 +366,7 @@ class ModelOptsFactory:
 
     @classmethod
     def get_inference_id_metadata(
-        cls, group_name, inference_id
+        cls, group_name: str, inference_id: str
     ) -> Dict[str, Any]:
         group_metadata = cls.get_group_metadata(group_name)
         item_meta: Dict[str, Any] = cls.get_metadata()[group_name][

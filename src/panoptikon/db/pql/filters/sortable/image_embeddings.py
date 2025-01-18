@@ -16,6 +16,7 @@ from panoptikon.db.pql.filters.sortable.text_embeddings import (
     EmbedArgs,
     extract_embeddings,
 )
+from panoptikon.db.pql.filters.sortable.utils import get_distance_func_override
 from panoptikon.db.pql.types import (
     OrderTypeNN,
     QueryState,
@@ -41,6 +42,7 @@ to supply an embedding directly.
     )
 
     _embedding: Optional[bytes] = PrivateAttr(None)
+    _distance_func_override: Optional[Literal["L2", "COSINE"]] = PrivateAttr(None)
 
     model: str = Field(
         title="The image embedding model to use",
@@ -87,7 +89,7 @@ Otherwise, it will be ignored, as it only applies to text embeddings.
 
 class SemanticImageSearch(SortableFilter):
     order_by: bool = get_order_by_field(True)
-    direction = get_order_direction_field("asc")
+    direction: OrderTypeNN = get_order_direction_field("asc")
     image_embeddings: SemanticImageArgs = Field(
         ...,
         title="Search Image Embeddings",
@@ -110,6 +112,11 @@ Search for image using semantic search on image embeddings.
             self.image_embeddings._embedding = extract_embeddings(
                 self.image_embeddings.query
             )
+        
+        self.image_embeddings._distance_func_override = get_distance_func_override(
+            self.image_embeddings.model
+        )
+
         if (
             not self.image_embeddings.clip_xmodal
             and self.image_embeddings.src_text is not None
@@ -247,11 +254,18 @@ Search for image using semantic search on image embeddings.
         # Image embeddings are connected to items via item_data
         # We want to do distance calculation on all unique item_id, embedding pairs
         # and then order by the distance
-
-        vec_distance = func.vec_distance_cosine(
-            embeddings.c.embedding,
-            literal(args._embedding),
-        )
+        if args._distance_func_override == "L2":
+            vec_distance = func.vec_distance_l2(
+                embeddings.c.embedding,
+                literal(args._embedding),
+            )
+            logger.debug("Using L2 distance for image embeddings due to model override")
+        else:
+            # We use the cosine distance as the default distance function
+            vec_distance = func.vec_distance_cosine(
+                embeddings.c.embedding,
+                literal(args._embedding),
+            )
         if args.distance_aggregation == "MAX":
             rank_column = func.max(vec_distance)
         elif args.distance_aggregation == "AVG":

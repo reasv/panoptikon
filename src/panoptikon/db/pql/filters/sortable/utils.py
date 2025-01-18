@@ -1,5 +1,6 @@
 import base64
 import io
+from typing import Literal, Optional
 
 import numpy as np
 
@@ -25,3 +26,16 @@ def extract_embeddings(buffer: str) -> bytes:
         return serialize_f32(array_list)
     # If it is a 2D array, it is a list of embeddings, get the first one
     return serialize_f32(numpy_array[0].tolist())
+
+def get_distance_func_override(
+        model_name: str,
+) -> Optional[Literal["L2", "COSINE"]]:
+    from panoptikon.data_extractors.models import ModelOptsFactory
+
+    model = ModelOptsFactory.get_model(model_name)
+    distance_func_override = model.metadata().get("distance_func", None)
+    assert distance_func_override in [None, "L2", "cosine"], f"""
+    Invalid `distance_func` value for {model_name}: {distance_func_override}.
+    Must be one of: null, 'L2', 'cosine'
+    """  
+    return distance_func_override # type: ignore

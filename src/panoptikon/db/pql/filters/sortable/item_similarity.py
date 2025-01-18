@@ -1,10 +1,11 @@
 import logging
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import and_, func, not_, or_
 from sqlalchemy.sql.expression import CTE, select
 
+from panoptikon.db.pql.filters.sortable.utils import get_distance_func_override
 from panoptikon.db.pql.filters.sortable.sortable_filter import SortableFilter
 from panoptikon.db.pql.types import (
     OrderTypeNN,
@@ -111,6 +112,17 @@ class SimilarityArgs(BaseModel):
         default="L2",
         description="The distance function to use for similarity search. Default is L2.",
     )
+
+    force_distance_function: Optional[bool] = Field(
+        default=None,
+        description="""
+Force the use of the distance function specified in the `distance_function` field.
+If set to True, the distance function specified in the `distance_function` field will be used,
+even if the model used for similarity search has a different distance function override specified in its config.
+""")
+
+    _distance_func_override: Optional[Literal["L2", "cosine"]] = PrivateAttr(None)
+
     distance_aggregation: Literal["MIN", "MAX", "AVG"] = Field(
         default="AVG",
         description="The method to aggregate distances when an item has multiple embeddings. Default is AVG.",
@@ -183,6 +195,14 @@ Restricting similarity to a tagger model or a set of tagger models
 
         if len(self.similar_to.model.strip()) == 0:
             return self.set_validated(False)
+
+        if not self.similar_to.force_distance_function:
+            dist_override = get_distance_func_override(
+                self.similar_to.model,
+            )
+            if dist_override:
+                logger.debug(f"[ISS] Distance function override used: {dist_override} for model {self.similar_to.model}")
+                self.similar_to.distance_function = dist_override
 
         return self.set_validated(True)
 
