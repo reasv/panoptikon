@@ -56,6 +56,11 @@ def image_loader(
     item: JobInputData,
     slice_settings: ImageSliceSettings | None = ImageSliceSettings(),
 ) -> Sequence[bytes]:
+    if (item.width and item.height 
+        and 
+        (item.width < 3 or item.height < 3)):
+        logger.warning(f"Image is too small (w{item.width}xh{item.height}) (Path: {item.path} | SHA256: {item.sha256}), skipping...")
+        return []
     if item.type.startswith("image/gif"):
         return slice_target_size(
             [
