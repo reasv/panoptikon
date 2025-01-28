@@ -1,4 +1,3 @@
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/gh_banner_darkmode.png">
   <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/reasv/panoptikon/master/static/render/gh_banner_lightmode.png">
@@ -9,13 +8,13 @@
 
 Panoptikon indexes your local files using state-of-the-art AI and machine learning models, making difficult-to-search media such as images and videos easily findable.
 
-Combining OCR, Whisper Speech-to-Text, CLIP image embeddings, text embeddings, full-text search, automated tagging, and automated image captioning, Panoptikon is the *Swiss Army knife* of local media indexing.
+Combining OCR, Whisper Speech-to-Text, CLIP image embeddings, text embeddings, full-text search, automated tagging, and automated image captioning, Panoptikon is the _Swiss Army knife_ of local media indexing.
 
 Panoptikon aims to be the `text-generation-webui` or `stable-diffusion-webui` of local search. It is fully customizable, allowing you to easily configure custom models for any of the supported tasks. It comes with a wealth of capable models available out of the box, and adding another one or updating to a newer fine-tune is never more than a few TOML configuration lines away.
 
 As long as a model is supported by any of the built-in implementation classes (supporting, among others, OpenCLIP, Sentence Transformers, Faster Whisper, and Florence 2 via HF Transformers), you can simply add it to the inference server configuration by specifying the Hugging Face repo, and it will immediately be available for use.
 
-Panoptikon is designed to keep index data produced by multiple different models (or different configurations of the same model) **side by side**, letting you choose which one(s) to use *at search time*. As such, Panoptikon is an excellent tool for comparing the real-world performance of different methods of data extraction or embedding models, and allows you to leverage their combined power instead of relying on the accuracy of only one.
+Panoptikon is designed to keep index data produced by multiple different models (or different configurations of the same model) **side by side**, letting you choose which one(s) to use _at search time_. As such, Panoptikon is an excellent tool for comparing the real-world performance of different methods of data extraction or embedding models, and allows you to leverage their combined power instead of relying on the accuracy of only one.
 
 For example, when searching with a given tag, you can pick multiple tagging models from a list and choose whether to match an item if at least one model has set the tag(s) you're searching for, or require that all of them have.
 
@@ -89,17 +88,21 @@ Make sure the `cudnn` folder contains `bin`, `lib`, `include`, etc., as direct s
 This is only relevant if you intend to use Panoptikon with HTML files. Panoptikon uses [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/index.html) to handle HTML files. You have to follow their [Installation Guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation) to ensure all the external dependencies are present on your system. If they are present but not found, it's recommended to set the `WEASYPRINT_DLL_DIRECTORIES` environment variable to point to the correct folder.
 
 #### NoSuchOptionException (Poetry)
+
 ```bash
 $ poetry install --with inference
 NoSuchOptionException
 The "--with" option does not exist.
 ```
+
 This happens because you have an old version of poetry. Update it.
 
 #### enable_load_extension
+
 ```
 AttributeError: 'sqlite3.Connection' object has no attribute 'enable_load_extension'
 ```
+
 The SQLite version bundled with your python install doesn't support extensions.
 You need to install a version of SQLite that supports them.
 
@@ -138,8 +141,8 @@ Panoptikon accepts environment variables as config options. It uses dotenv, so y
 Default:
 
 ```env
-HOST="127.0.0.1"
-PORT="6342"
+HOST=127.0.0.1
+PORT=6342
 ```
 
 These determine where to bind the Panoptikon server, which delivers both the inference API and the search and configuration UI.
@@ -151,8 +154,8 @@ These determine where to bind the Panoptikon server, which delivers both the inf
 Default:
 
 ```env
-INFERIO_HOST="127.0.0.1"
-INFERIO_PORT="7777"
+INFERIO_HOST=127.0.0.1
+INFERIO_PORT=7777
 ```
 
 These **only** apply when the inference server (`inferio`) is run separately as a standalone application without Panoptikon. They determine where to bind the inference server, which runs the models.
@@ -176,7 +179,7 @@ Simply configure the desktop instance to run the inference server on an IP reach
 Default:
 
 ```env
-DATA_FOLDER="data"
+DATA_FOLDER=data
 ```
 
 Where to store the databases and logs. Defaults to "data" inside the current directory.
@@ -186,7 +189,7 @@ Where to store the databases and logs. Defaults to "data" inside the current dir
 Default:
 
 ```env
-LOGLEVEL="INFO"
+LOGLEVEL=INFO
 ```
 
 The log level for the logger. You can find the log file under `[DATA_FOLDER]/panoptikon.log`.
@@ -196,8 +199,8 @@ The log level for the logger. You can find the log file under `[DATA_FOLDER]/pan
 Default:
 
 ```env
-INDEX_DB="default"
-USER_DATA_DB="default"
+INDEX_DB=default
+USER_DATA_DB=default
 ```
 
 The names of the default databases to use for indexing (files and extracted data) and user data (bookmarks). These are the databases that are used by default when no database is specified in the API request. Regardless of what databases are specified in the environment variables, the API endpoints support specifying the database to use through the `index_db` and `user_data_db` query parameters, and the UI allows the creation of new index databases and the selection of which index database to use for search and other operations.
@@ -207,7 +210,7 @@ The names of the default databases to use for indexing (files and extracted data
 Default:
 
 ```env
-TEMP_DIR="./data/tmp"
+TEMP_DIR=./data/tmp
 ```
 
 Where to store temporary files. Defaults to `./data/tmp`. These files are generally short-lived and are cleaned up automatically, but if you're running out of space on `./data/tmp` you can set this to a different location.
@@ -222,14 +225,14 @@ Panoptikon has sane defaults for each platform (Windows, Linux, macOS), but you 
 
 The strings `{path}`, `{folder}`, `{filename}` within your command will be replaced with the full path to the file, the folder containing the file, and the filename with extension, respectively.
 
-You can also set these commands to no-ops by setting them to something like `echo {path}` or `echo {filename}` in order to disable the functionality. ***This is absolutely necessary if you intend to expose Panoptikon to the internet, as the default commands are shell commands that can be used to execute arbitrary code on your machine. By default, this effectively allows remote code execution as a service.***
+You can also set these commands to no-ops by setting them to something like `echo {path}` or `echo {filename}` in order to disable the functionality. **_This is absolutely necessary if you intend to expose Panoptikon to the internet, as the default commands are shell commands that can be used to execute arbitrary code on your machine. By default, this effectively allows remote code execution as a service._**
 
 ### ENABLE_CLIENT
 
 Default:
 
 ```env
-ENABLE_CLIENT="true"
+ENABLE_CLIENT=true
 ```
 
 Whether to run the Next.js UI. If you're running Panoptikon in a headless environment, you can set this to `false` to disable the UI and only run the API server, then host the UI separately.
@@ -252,7 +255,7 @@ Where to bind the Next.js UI. Defaults to the same host as the API server and po
 Default:
 
 ```env
-DISABLE_CLIENT_UPDATE="false"
+DISABLE_CLIENT_UPDATE=false
 ```
 
 Whether to disable the automatic update of the Next.js UI.
