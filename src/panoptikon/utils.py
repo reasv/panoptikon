@@ -72,12 +72,34 @@ def show_in_fm(path):
             # Using 'open' with '-R' to reveal the file in Finder
             subprocess.run(["open", "-R", path])
         elif system_name == "Linux":
-            # This is trickier on Linux, as it depends on the file manager.
-            # Here's a generic approach using 'xdg-open' to open the directory,
-            # followed by attempts to focus the file.
-            directory, _ = os.path.split(path)
-            subprocess.run(["xdg-open", directory])
-            # Additional steps might be required depending on the desktop environment and file manager.
+            # Check for specific file managers and use their select commands
+                try:
+                    # KDE - Dolphin
+                    if subprocess.run(["which", "dolphin"], capture_output=True).returncode == 0:
+                        subprocess.run(["dolphin", "--select", path])
+                        return
+
+                    # GNOME - Nautilus
+                    if subprocess.run(["which", "nautilus"], capture_output=True).returncode == 0:
+                        subprocess.run(["nautilus", "--select", path])
+                        return
+
+                    # XFCE - Thunar
+                    if subprocess.run(["which", "thunar"], capture_output=True).returncode == 0:
+                        subprocess.run(["thunar", "--select", path])
+                        return
+
+                    # Cinnamon/MATE - Nemo
+                    if subprocess.run(["which", "nemo"], capture_output=True).returncode == 0:
+                        subprocess.run(["nemo", path])  # Note: Nemo lacks a direct select flag
+                        return
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(
+                        f"Failed to open path '{path}' in file explorer: {e}"
+                    )
+                # Fallback to xdg-open for directory
+                directory = os.path.dirname(path)
+                subprocess.run(["xdg-open", directory])
         else:
             raise OSError(f"Unsupported operating system: {system_name}")
     except subprocess.CalledProcessError as e:
