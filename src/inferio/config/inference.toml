@@ -39,7 +39,7 @@ danbooru-saucenao = { config = { sauce_nao_enabled = true }, metadata = { input_
 config = { impl_class = "doctr" }
 [group.doctr.metadata]
 description = "Extract text from images, videos, and documents through OCR"
-name = "DocTR"
+name = "OCR"
 default_threshold = 0
 default_batch_size = 64
 default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
@@ -84,7 +84,7 @@ input_spec = { handler = "image_frames" }
 msft_large-more-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
 msft_large-caption = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<CAPTION>" }, metadata = { description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
 msft_large-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<DETAILED_CAPTION>" }, metadata = { description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model" } }
-msft_large-ocr = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large)  Microsoft's original Florence 2 Large Model" } }
+msft_large-ocr = { config = { model_name = "microsoft/Florence-2-large", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model" } }
 # Fine-tuned models
 gokaygokay_SD3-Caption = { config = { model_name = "gokaygokay/Florence-2-SD3-Captioner", task_prompt = "<DESCRIPTION>", text_input = "Describe this image in great detail." }, metadata = { description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion" } }
 DocVQA-Caption = { config = { model_name = "HuggingFaceM4/Florence-2-DocVQA", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering" } }
