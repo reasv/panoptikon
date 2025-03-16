@@ -49,6 +49,9 @@ input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 input_spec = { handler = "image_frames" }
 
 [group.doctr.inference_ids]
+easyocr_standard_en = { config = { impl_class = "easyocr", languages = [
+    "en",
+] }, metadata = { description = "(Recommended) EasyOCR - Standard Recog Network" } }
 db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
 db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "CRNN MobileNet V3 Large" } }
 db_resnet50_crnn_vgg16_bn = { config = { detection_model = "db_resnet50", recognition_model = "crnn_vgg16_bn" }, metadata = { description = "CRNN VGG16 BN OCR" } }

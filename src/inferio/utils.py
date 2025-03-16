@@ -102,6 +102,38 @@ def parse_input_request(data: str, files: List[UploadFile]):
             )
     return prediction_inputs
 
+def clean_dict(obj: dict) -> dict:
+    """
+    Recursively converts dictionary values to standard Python types.
+    Specifically converts any non-string/dict/bytes iterables to Python lists.
+    
+    Args:
+        obj: The object to clean (dict, list, or other value)
+        
+    Returns:
+        A new object with all custom iterables converted to standard Python types
+    """
+    # Call the recursive helper function
+    ress = clean_dict_inner(obj)
+    assert isinstance(ress, dict), "Expected a dictionary as the result"
+    return ress 
+
+def clean_dict_inner(obj):
+    
+    if isinstance(obj, dict):
+        return {k: clean_dict_inner(v) for k, v in obj.items()}
+    
+    # Convert any iterable (but not strings, dicts, or bytes) to a list
+    elif hasattr(obj, '__iter__') and not isinstance(obj, (str, dict, bytes)):
+        return [clean_dict_inner(item) for item in obj]
+    
+    # Handle nested lists - list comprehension
+    elif isinstance(obj, list):
+        return [clean_dict_inner(item) for item in obj]
+    
+    # Base case: return the object itself
+    else:
+        return obj
 
 def add_cudnn_to_path():
     # Get the absolute path to the inferio directory
@@ -119,3 +151,4 @@ def add_cudnn_to_path():
     # If you have other directories like include or lib that need to be added, you can add them similarly.
     # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
     os.environ["CUDA_PATH"] = cudnn_path
+

@@ -11,7 +11,8 @@ from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Sequence, Type, Union
 
-from inferio.types import PredictionInput  # Ensure this is correctly imported
+from inferio.types import PredictionInput
+from inferio.utils import clean_dict  # Ensure this is correctly imported
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             load_request_id = str(uuid.uuid4())
             # Send load command with kwargs and request_id
             load_msg = LoadMessage(
-                request_id=load_request_id, kwargs=self._kwargs
+                request_id=load_request_id, kwargs=clean_dict(self._kwargs) if self._kwargs else None
             )
             self._parent_conn.send(asdict(load_msg))
             try:
