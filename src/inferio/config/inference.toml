@@ -1,7 +1,7 @@
 [group.tags]
 config = { impl_class = "wd_tagger" }
 [group.tags.metadata]
-description = "Danbooru style taggers"
+description = "Danbooru style taggers, and moondream (VLM) based general item taggers."
 name = "Tags"
 default_threshold = 0.1
 default_batch_size = 64
@@ -18,7 +18,8 @@ wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagge
 wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
 wd-eva02-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-eva02-large-tagger-v3" }, metadata = { description = "(Recommended Large) Eva02 Based Tagger (Large Version)" } }
 wd-vit-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-large-tagger-v3" }, metadata = { description = "ViT Based Tagger (Large Version)" } }
-
+moondream-2b-2025-03 = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "general", enable_rating = true }, metadata = { description = "Moondream 2B Based Tagger. This tagger works for general items and has an open vocabulary as it is a VLM" } }
+moondream-2b-2025-03-clothing = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "clothing", enable_rating = false, prompt = "List all visible articles of clothing in this image. Return the result as a JSON array." }, metadata = { description = "Moondream 2B Based Tagger prompted to only list items of clothing as tags. This tagger works for general items and has an open vocabulary as it is a VLM" } }
 [group.tagmatch]
 config = { impl_class = "danbooru_tagger" }
 [group.tagmatch.metadata]

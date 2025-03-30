@@ -85,3 +85,74 @@ def deserialize_array(buffer: bytes) -> np.ndarray:
     bio = io.BytesIO(buffer)
     bio.seek(0)
     return np.load(bio, allow_pickle=False)
+
+
+import json
+import re
+from typing import List, Optional
+
+def extract_partial_json_array(json_str: str) -> Optional[List[str]]:
+    """
+    Attempts to extract a partial JSON array from a potentially truncated string.
+    Returns the longest valid prefix of the array that can be parsed.
+    """
+    # Find the first opening bracket to start parsing
+    start_idx = json_str.find('[')
+    if start_idx == -1:
+        return None  # No array found
+    
+    # Extract from first [ to end
+    partial_str = json_str[start_idx:]
+    
+    # First try parsing the complete JSON
+    try:
+        return json.loads(partial_str)
+    except json.JSONDecodeError:
+        pass  # We'll handle this below
+    
+    # If we're here, the JSON is incomplete. We'll try to find the longest valid prefix.
+    # We'll work backwards from the end, removing characters until we get valid JSON
+    for end_idx in range(len(partial_str), start_idx + 1, -1):
+        test_str = partial_str[:end_idx] + ']'  # Close the array
+        try:
+            result = json.loads(test_str)
+            if isinstance(result, list):
+                # Verify all elements are strings (as per your requirement)
+                if all(isinstance(item, str) for item in result):
+                    return result
+        except (json.JSONDecodeError, TypeError):
+            continue
+    
+    # Try one more approach - extract individual elements
+    # This handles cases where the array is cut off in the middle of an element
+    elements = []
+    current_pos = start_idx + 1  # position after '['
+    while current_pos < len(partial_str):
+        # Try to parse from current position to end
+        try:
+            # Attempt to parse a complete JSON string
+            end_of_str = current_pos
+            while True:
+                next_quote = partial_str.find('"', end_of_str)
+                if next_quote == -1:
+                    break  # No closing quote found
+                
+                # Check if this is an unescaped quote
+                if partial_str[next_quote-1] != '\\':
+                    # Try to parse from current_pos to next_quote+1
+                    test_str = '[' + partial_str[current_pos:next_quote+1] + ']'
+                    try:
+                        element = json.loads(test_str)[0]
+                        elements.append(element)
+                        current_pos = next_quote + 2  # move past quote and comma/whitespace
+                        break
+                    except json.JSONDecodeError:
+                        pass
+                end_of_str = next_quote + 1
+            else:
+                break
+        except (IndexError, json.JSONDecodeError):
+            break
+    
+    return elements if elements else None
+
