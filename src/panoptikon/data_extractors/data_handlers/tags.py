@@ -111,6 +111,7 @@ def handle_tag_result(
         # This way, it will be processed again next time
         logger.info(f"Skipping item {item.sha256}")
         return []
+    # Check if the results are empty or contain no tags
     total_tag_groups = sum([len(tag_result["tags"]) for tag_result in results])
     if total_tag_groups == 0:
         add_item_data(
