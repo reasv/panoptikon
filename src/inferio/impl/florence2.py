@@ -6,7 +6,6 @@ from typing import Dict, List, Sequence, Tuple, Type
 from unittest.mock import patch
 
 from PIL import Image as PILImage
-from transformers.dynamic_module_utils import get_imports
 
 from inferio.impl.utils import clear_cache, get_device
 from inferio.model import InferenceModel
@@ -18,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
     # workaround for unnecessary flash_attn requirement
+    from transformers.dynamic_module_utils import get_imports
 
     if not str(filename).endswith("modeling_florence2.py"):
         return get_imports(filename)
