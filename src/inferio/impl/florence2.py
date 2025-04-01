@@ -1,8 +1,7 @@
 import logging
 import os
-import re
 from io import BytesIO
-from typing import Dict, List, Sequence, Tuple, Type
+from typing import Dict, List, Sequence, Type
 from unittest.mock import patch
 
 from PIL import Image as PILImage
