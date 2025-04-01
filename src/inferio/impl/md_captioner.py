@@ -5,7 +5,7 @@ from typing import List, Sequence, Type
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clear_cache, get_device
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class MoondreamCaptioner(InferenceModel):
     def __init__(
         self,
-        model_name: str = "vikhyatk/moondream2",
+        model_repo: str = "vikhyatk/moondream2",
         model_revision: str = "2025-03-27",
         task: str = "caption",
         caption_length: str = "normal",
@@ -26,7 +26,7 @@ class MoondreamCaptioner(InferenceModel):
         max_output: int = 1024,
         init_args: dict = {},
     ):
-        self.model_name: str = model_name
+        self.model_repo: str = model_repo
         self.model_revision: str = model_revision
         self.task: str = task
         self.prompt: str = prompt
@@ -48,7 +48,7 @@ class MoondreamCaptioner(InferenceModel):
         if language is not None and len(language) > 0:
             self.language: str = language
         else:
-            self.language: str = f"moondream-{self.task}-{self.caption_length}"
+            self.language: str = f"moondream-{self.task}-{self.caption_length}" if self.task == "caption" else f"moondream-{self.task}"
         self.max_output: int = max_output
         self.init_args = init_args
         self._model_loaded: bool = False
@@ -76,7 +76,7 @@ class MoondreamCaptioner(InferenceModel):
         if ACCELERATE_AVAILABLE and device == "cuda":
             # Optimized loading for GPU using accelerate
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
+                self.model_repo,
                 revision=self.model_revision,
                 trust_remote_code=True,
                 device_map={"": "cuda"},
@@ -85,12 +85,12 @@ class MoondreamCaptioner(InferenceModel):
         else:
             # Fallback loading (standard PyTorch)
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
+                self.model_repo,
                 revision=self.model_revision,
                 trust_remote_code=True,
                 **self.init_args,
             ).to(device).eval()
-        logger.debug(f"Model {self.model_name} loaded.")
+        logger.debug(f"Model {self.model_repo} loaded.")
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
@@ -153,14 +153,6 @@ class MoondreamCaptioner(InferenceModel):
             del self.model
             clear_cache()
             self._model_loaded = False
-
-
-def clean_whitespace(input_string: str) -> str:
-    # Replace three or more consecutive whitespaces with just two
-    cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
-
-    return cleaned_string
-
 
 class MoondreamCaptionerIsolated(ProcessIsolatedInferenceModel):
     @classmethod

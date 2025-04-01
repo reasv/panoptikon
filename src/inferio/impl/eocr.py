@@ -4,7 +4,7 @@ from io import BytesIO
 from typing import List, Sequence, Type
 import numpy as np
 from PIL import Image as PILImage
-from inferio.impl.utils import clear_cache, get_device
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
@@ -214,12 +214,6 @@ class EasyOCRModel(InferenceModel):
             del self.model
             clear_cache()
             self._model_loaded = False
-
-def clean_whitespace(input_string: str) -> str:
-    # Replace three or more consecutive whitespaces with just two
-    cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
-    return cleaned_string
-
 
 def pad_images_to_same_size(images: List[np.ndarray]) -> List[np.ndarray]:
         """

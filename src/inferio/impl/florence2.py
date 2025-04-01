@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clear_cache, get_device
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
@@ -182,14 +182,6 @@ class Florence2(InferenceModel):
             del self.processor
             clear_cache()
             self._model_loaded = False
-
-
-def clean_whitespace(input_string: str) -> str:
-    # Replace three or more consecutive whitespaces with just two
-    cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
-
-    return cleaned_string
-
 
 class Florence2Isolated(ProcessIsolatedInferenceModel):
     @classmethod

@@ -156,3 +156,8 @@ def extract_partial_json_array(json_str: str) -> Optional[List[str]]:
     
     return elements if elements else None
 
+def clean_whitespace(input_string: str) -> str:
+    # Replace three or more consecutive whitespaces with just two
+    cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
+
+    return cleaned_string
