@@ -14,6 +14,7 @@ from inferio.impl.danbooru import DanbooruIsolated, DanbooruTagger
 from inferio.impl.eocr import EasyOCRModel, EasyOCRModelIsolated
 from inferio.impl.florence2 import Florence2, Florence2Isolated
 from inferio.impl.jina_clip import JinaCLIPIsolated, JinaClipModel
+from inferio.impl.md_captioner import MoondreamCaptioner, MoondreamCaptionerIsolated
 from inferio.impl.md_tagger import MoondreamTagger, MoondreamTaggerIsolated
 from inferio.impl.ocr import DoctrModel, DoctrModelIsolated
 from inferio.impl.sentence_transformers import (
@@ -47,6 +48,7 @@ if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
     ModelRegistry.register_model(JinaClipModel)
     ModelRegistry.register_model(EasyOCRModel)
     ModelRegistry.register_model(MoondreamTagger)
+    ModelRegistry.register_model(MoondreamCaptioner)
 else:
     ModelRegistry.register_model(WDTaggerIsolated)
     ModelRegistry.register_model(DoctrModelIsolated)
@@ -60,6 +62,7 @@ else:
     ModelRegistry.register_model(JinaCLIPIsolated)
     ModelRegistry.register_model(EasyOCRModelIsolated)
     ModelRegistry.register_model(MoondreamTaggerIsolated)
+    ModelRegistry.register_model(MoondreamCaptionerIsolated)
 
 router = APIRouter(
     prefix="/api/inference",
