@@ -14,19 +14,6 @@ from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
 
-
-def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
-    # workaround for unnecessary flash_attn requirement
-    from transformers.dynamic_module_utils import get_imports
-
-    if not str(filename).endswith("modeling_florence2.py"):
-        return get_imports(filename)
-    imports = get_imports(filename)
-    if "flash_attn" in imports:
-        imports.remove("flash_attn")
-    return imports
-
-
 class Florence2(InferenceModel):
     def __init__(
         self,
@@ -62,6 +49,18 @@ class Florence2(InferenceModel):
         device = self.devices[0]
         # Set to True if you want to use Flash Attention instead of SDPA
         if not self.flash_attention:
+            from transformers.dynamic_module_utils import get_imports
+            def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
+                # workaround for unnecessary flash_attn requirement
+
+                if not str(filename).endswith("modeling_florence2.py"):
+                    return get_imports(filename)
+                imports = get_imports(filename)
+                if "flash_attn" in imports:
+                    imports.remove("flash_attn")
+                return imports
+
+            # Patch the get_imports function to remove flash_attn from imports
             with patch(
                 "transformers.dynamic_module_utils.get_imports",
                 fixed_get_imports,
@@ -91,6 +90,7 @@ class Florence2(InferenceModel):
         self.processor = AutoProcessor.from_pretrained(
             self.model_name, trust_remote_code=True
         )
+        self.model = torch.compile(self.model, mode="reduce-overhead")
         logger.debug(f"Model {self.model_name} loaded.")
         self._model_loaded = True
 
