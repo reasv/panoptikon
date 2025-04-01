@@ -197,7 +197,8 @@ class MoondreamTagger(InferenceModel):
                     logger.debug(f"Rating found: {found_rating}")
 
                 assert found_rating is not None, "Rating not found."
-                tags.append((self.rating_name, {found_rating: self.confidence}))
+                # Insert as first element
+                tags.insert(0, (self.rating_name, {found_rating: self.confidence}))
             outputs.append(
                 {
                     "namespace": self.namespace,

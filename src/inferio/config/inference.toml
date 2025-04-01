@@ -18,8 +18,9 @@ wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagge
 wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
 wd-eva02-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-eva02-large-tagger-v3" }, metadata = { description = "(Recommended Large) Eva02 Based Tagger (Large Version)" } }
 wd-vit-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-large-tagger-v3" }, metadata = { description = "ViT Based Tagger (Large Version)" } }
-moondream-2b-2025-03 = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "general", enable_rating = true }, metadata = { description = "Moondream 2B Based Tagger. This tagger works for general items and has an open vocabulary as it is a VLM" } }
-moondream-2b-2025-03-clothing = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "clothing", enable_rating = false, prompt = "List all visible articles of clothing in this image. Return the result as a JSON array." }, metadata = { description = "Moondream 2B Based Tagger prompted to only list items of clothing as tags. This tagger works for general items and has an open vocabulary as it is a VLM" } }
+moondream-2b-25-03 = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "general", enable_rating = true }, metadata = { description = "(Experimental) Moondream 2B Based Tagger. This tagger works for general items and has an open vocabulary as it is a VLM" } }
+moondream-2b-25-03-clothing = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "clothing", enable_rating = false, prompt = "List all visible articles of clothing in this image. Return the result as a JSON array." }, metadata = { description = "(Experimental) Moondream 2B Based Tagger prompted to only list items of clothing as tags. This tagger works for general items and has an open vocabulary as it is a VLM" } }
+
 [group.tagmatch]
 config = { impl_class = "danbooru_tagger" }
 [group.tagmatch.metadata]
@@ -101,6 +102,25 @@ MiaoshouAI_base-PromptGen = { config = { model_name = "MiaoshouAI/Florence-2-bas
 ljnlonoljpiljm_large-docci-caption = { config = { model_name = "ljnlonoljpiljm/florence-2-large-docci-caption", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci" } }
 aniketVerma07_finetuned = { config = { model_name = "aniketVerma07/finetuned_florence_2", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) Florence 2 Finetune" } }
 Oysiyl_OCR-Cauldron-IAM = { config = { model_name = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM", task_prompt = "<OCR>" }, metadata = { description = "(OCR) OCR Finetune" } }
+
+[group.vlm]
+config = { impl_class = "moondream_captioner" }
+[group.vlm.metadata]
+description = "Image captioning and OCR through Vision-Language Models like Moondream 2B."
+name = "VLMs"
+default_batch_size = 4
+default_inference_id = "moondream-2b-25-03-ocr"
+target_entities = ["items"]
+output_type = "text"
+input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
+input_spec = { handler = "image_frames" }
+
+[group.vlm.inference_ids]
+moondream-2b-25-03-ocr = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "query", prompt = "Transcribe all text from this image. If there is no text, output nothing.", confidence = 0.6, language = "moondream-ocr" }, metadata = { description = "(Recommended) Moondream 2B (v2025/03) OCR" } }
+moondream-2b-25-03-tags = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "query", prompt = "List all visible objects, features, and characteristics of this image. Return the result as a comma-separated list.", confidence = 0.6, language = "moondream-keywords" }, metadata = { description = "(Recommdended) Moondream 2B (v2025/03) captioning model that outputs a list of keywords for each image" } }
+moondream-2b-25-03-short = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "short", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) short captions" } }
+moondream-2b-25-03-norm = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "normal", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) normal-length captions" } }
+moondream-2b-25-03-long = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "long", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) long captions" } }
 
 [group.textembed]
 config = { impl_class = "sentence_transformers" }
