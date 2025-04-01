@@ -108,6 +108,9 @@ class MoondreamTagger(InferenceModel):
                 **self.init_args,
             ).to(device).eval()
         logger.debug(f"Model {self.model_repo} loaded.")
+        logger.debug(f"Compiling model...")
+        self.model.compile()
+        logger.debug(f"Model compiled.")
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
