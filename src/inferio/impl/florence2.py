@@ -128,13 +128,13 @@ class Florence2(InferenceModel):
                 k: v.half() if v.dtype == torch.float else v
                 for k, v in processed_inputs.items()
             }
-
-            generated_ids = self.model.generate(
-                input_ids=processed_inputs["input_ids"],
-                pixel_values=processed_inputs["pixel_values"],
-                max_new_tokens=self.max_output,
-                num_beams=self.num_beams,
-            )
+            with torch.no_grad():
+                generated_ids = self.model.generate( # type: ignore
+                    input_ids=processed_inputs["input_ids"],
+                    pixel_values=processed_inputs["pixel_values"],
+                    max_new_tokens=self.max_output,
+                    num_beams=self.num_beams,
+                )
 
             generated_text = self.processor.batch_decode(
                 generated_ids, skip_special_tokens=False
