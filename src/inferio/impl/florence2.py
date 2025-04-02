@@ -22,6 +22,8 @@ class Florence2(InferenceModel):
         flash_attention: bool = False,
         max_output: int = 1024,
         num_beams: int = 3,
+        do_sample: bool = False,
+        enable_batch: bool = True,
         init_args: dict = {},
     ):
         self.model_name: str = model_name
@@ -31,6 +33,8 @@ class Florence2(InferenceModel):
         self.max_output: int = max_output
         self.num_beams: int = num_beams
         self.init_args = init_args
+        self.do_sample: bool = do_sample
+        self.enable_batch: bool = enable_batch
         self._model_loaded: bool = False
 
     @classmethod
@@ -94,8 +98,6 @@ class Florence2(InferenceModel):
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
-        import torch
-
         self.load()
         image_inputs: List[PILImage.Image] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
@@ -114,43 +116,13 @@ class Florence2(InferenceModel):
             prompt = self.task_prompt + self.text_input
 
         results: List[str] = []
-        for image in image_inputs:
-            # Ensure the image is in RGB mode
-            if image.mode != "RGB":
-                image = image.convert("RGB")
 
-            # Process the inputs and ensure they are in the correct dtype and device
-            device = self.devices[0]
-            processed_inputs = self.processor(
-                text=prompt, images=image, return_tensors="pt"
-            ).to(device)
-            processed_inputs = {
-                k: v.half() if v.dtype == torch.float else v
-                for k, v in processed_inputs.items()
-            }
-            with torch.no_grad():
-                generated_ids = self.model.generate( # type: ignore
-                    input_ids=processed_inputs["input_ids"],
-                    pixel_values=processed_inputs["pixel_values"],
-                    max_new_tokens=self.max_output,
-                    num_beams=self.num_beams,
-                )
-
-            generated_text = self.processor.batch_decode(
-                generated_ids, skip_special_tokens=False
-            )[0]
-            parsed_answer: Dict[str, str] = (
-                self.processor.post_process_generation(
-                    generated_text,
-                    task=self.task_prompt,
-                    image_size=(image.width, image.height),
-                )
-            )
-            assert (
-                parsed_answer.get(self.task_prompt) is not None
-            ), f"No output found. (Result: {parsed_answer})"
-            logger.debug(f"Output: {parsed_answer}")
-            results.append(parsed_answer[self.task_prompt])
+        if self.enable_batch:
+            results = self.batch_predict(prompt, image_inputs)
+        else:
+            for image in image_inputs:
+                result = self.single_predict(prompt, image)
+                results.append(result)
 
         assert len(results) == len(
             image_inputs
@@ -174,6 +146,83 @@ class Florence2(InferenceModel):
         ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
 
         return outputs
+
+    def batch_predict(self, prompt: str, image_inputs: List[PILImage.Image]) -> List[str]:
+        import torch
+        device = self.devices[0]
+        processed_inputs = self.processor(
+            text=[prompt] * len(image_inputs), images=image_inputs, return_tensors="pt"
+        ).to(device)
+        processed_inputs = {
+            k: v.half() if v.dtype == torch.float else v
+            for k, v in processed_inputs.items()
+        }
+        with torch.no_grad():
+            generated_ids = self.model.generate( # type: ignore
+                input_ids=processed_inputs["input_ids"],
+                pixel_values=processed_inputs["pixel_values"],
+                max_new_tokens=self.max_output,
+                num_beams=self.num_beams,
+                do_sample=self.do_sample,
+            )
+
+        generated_texts = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )
+        parsed_answers: List[Dict[str, str]] = [
+            self.processor.post_process_generation(
+                text,
+                task=self.task_prompt,
+                image_size=(image.width, image.height),
+            ) for text, image in zip(generated_texts, image_inputs)
+        ]
+
+        results: List[str] = []
+        for answer in parsed_answers:
+            assert (
+                answer.get(self.task_prompt) is not None
+            ), f"No output found. (Result: {answer})"
+            logger.debug(f"Output: {answer}")
+            task_answer = answer.get(self.task_prompt, "")
+            # Clean the output text
+            task_answer = task_answer.replace("</s>", "").replace("<s>", "").replace("<pad>", "")
+            results.append(task_answer)
+        return results
+    
+    def single_predict(self, prompt: str, image: PILImage.Image) -> str:
+        import torch
+        # Process the inputs and ensure they are in the correct dtype and device
+        device = self.devices[0]
+        processed_inputs = self.processor(
+            text=prompt, images=image, return_tensors="pt"
+        ).to(device)
+        processed_inputs = {
+            k: v.half() if v.dtype == torch.float else v
+            for k, v in processed_inputs.items()
+        }
+        with torch.no_grad():
+            generated_ids = self.model.generate( # type: ignore
+                input_ids=processed_inputs["input_ids"],
+                pixel_values=processed_inputs["pixel_values"],
+                max_new_tokens=self.max_output,
+                num_beams=self.num_beams,
+            )
+
+        generated_text = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )[0]
+        parsed_answer: Dict[str, str] = (
+            self.processor.post_process_generation(
+                generated_text,
+                task=self.task_prompt,
+                image_size=(image.width, image.height),
+            )
+        )
+        assert (
+            parsed_answer.get(self.task_prompt) is not None
+        ), f"No output found. (Result: {parsed_answer})"
+        logger.debug(f"Output: {parsed_answer}")
+        return parsed_answer[self.task_prompt]
 
     def unload(self) -> None:
         if self._model_loaded:
