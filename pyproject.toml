@@ -1,67 +1,85 @@
-[tool.poetry]
+[project]
 name = "panoptikon"
 version = "1.0.0"
 description = "AI-based media indexing, tagging, and semantic search engine for local files"
-authors = ["reasv"]
-license = "AGPL"
+authors = [{ name = "reasv" }]
+requires-python = "~=3.12"
 readme = "README.md"
-packages = [
-    { include = "panoptikon", from = "src" },
-    { include = "inferio", from = "src" },
-    { include = "searchui", from = "src" },
+license = "AGPL"
+dependencies = [
+    "pillow>=10.4.0,<11",
+    "imageio-ffmpeg[ffmpeg]>=0.5.1,<0.6",
+    "python-dotenv>=1.0.1,<2",
+    "sqlite-vec>=0.1.6,<0.2",
+    "fastapi-utilities>=0.2.0,<0.3",
+    "mutagen>=1.47.0,<2",
+    "toml>=0.10.2,<0.11",
+    "weasyprint~=62.3",
+    "pypdfium2>=4.30.0,<5",
+    "alembic>=1.13.2,<2",
+    "fastapi-proxy-lib>=0.1.0,<0.2",
+    "nodejs-wheel>=20.17.0,<21",
+    "sqlalchemy>=2.0.34,<3",
+    "tomlkit>=0.13.2,<0.14",
+    "uvicorn>=0.32.0,<0.33",
+    "python-multipart>=0.0.12,<0.0.13",
+    "tomli>=2.0.2,<3",
+    "tomli-w>=1.0.0,<2",
+    "blurhash>=1.1.4,<2",
+    "aiohttp>=3.11.0,<4",
+    "more-itertools>=10.5.0,<11",
+    "pandas>=2.2.3,<3",
+    "httpx>=0.27.2,<0.28",
 ]
+
+[project.scripts]
+panoptikon = "panoptikon.__main__:launch_app"
+inferio = "inferio.__main__:launch_app"
+
+[dependency-groups]
+inference = [
+    "open-clip-torch>=2.26.1,<3",
+    "python-doctr[torch]>=0.10.0,<0.11",
+    "timm>=1.0.7,<2",
+    "faster-whisper>=1.1.1,<2",
+    "sentence-transformers>=3.0.1,<4",
+    "transformers>=4.49.0,<5",
+    "pyvips-binary>=8.16.1,<9",
+    "pyvips>=2.2.3,<3",
+    "easyocr>=1.7.2,<2",
+]
+
+[tool.uv]
+default-groups = ["inference"]
+
+[tool.hatch.build.targets.sdist]
 include = [
+    "src/panoptikon",
+    "src/inferio",
+    "src/searchui",
     "src/panoptikon/ui/static/**/*",
     "src/panoptikon/api/templates/**/*",
     "src/inferio/config/**/*",
 ]
 
-[tool.poetry.dependencies]
-python = "^3.12"
-pillow = "^10.4.0"
-imageio-ffmpeg = { extras = ["ffmpeg"], version = "^0.5.1" }
-python-dotenv = "^1.0.1"
-sqlite-vec = "^0.1.6"
-fastapi-utilities = "^0.2.0"
-mutagen = "^1.47.0"
-toml = "^0.10.2"
-weasyprint = "^62.3"
-pypdfium2 = "^4.30.0"
-alembic = "^1.13.2"
-fastapi-proxy-lib = "^0.1.0"
-nodejs-wheel = "^20.17.0"
-sqlalchemy = "^2.0.34"
-tomlkit = "^0.13.2"
-uvicorn = "^0.32.0"
-python-multipart = "^0.0.12"
-tomli = "^2.0.2"
-tomli-w = "^1.0.0"
-blurhash = "^1.1.4"
-aiohttp = "^3.11.0"
-more-itertools = "^10.5.0"
-pandas = "^2.2.3"
-httpx = "^0.27.2"
+[tool.hatch.build.targets.wheel]
+include = [
+    "src/panoptikon",
+    "src/inferio",
+    "src/searchui",
+    "src/panoptikon/ui/static/**/*",
+    "src/panoptikon/api/templates/**/*",
+    "src/inferio/config/**/*",
+]
 
-[tool.poetry.group.inference]
-optional = true
+[tool.hatch.build.targets.wheel.sources]
+"src/panoptikon" = "panoptikon"
+"src/inferio" = "inferio"
+"src/searchui" = "searchui"
 
-[tool.poetry.group.inference.dependencies]
-open-clip-torch = "^2.26.1"
-python-doctr = { extras = ["torch"], version = "^0.10.0" }
-timm = "^1.0.7"
-faster-whisper = "^1.1.1"
-sentence-transformers = "^3.0.1"
-transformers = "^4.49.0"
-pyvips-binary = "^8.16.1"
-pyvips = "^2.2.3"
-easyocr = "^1.7.2"
-
-[tool.poetry.scripts]
-panoptikon = "panoptikon.__main__:launch_app"
-inferio = "inferio.__main__:launch_app"
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.black]
 line-length = 80
