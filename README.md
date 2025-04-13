@@ -158,7 +158,7 @@ If you still encounter issues with cuDNN, you may need to set the `LD_LIBRARY_PA
 In order to do this, edit or create a file called just `.env` in the root of this repository and add the following line:
 
 ```env
-LD_LIBRARY_PATH='cudnn/bin':$LD_LIBRARY_PATH
+LD_LIBRARY_PATH=cudnn/bin:$LD_LIBRARY_PATH
 ```
 
 See issue: https://github.com/reasv/panoptikon/issues/5
