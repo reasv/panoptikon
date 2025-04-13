@@ -353,3 +353,9 @@ You can set this to `true` to disable the automatic update of the UI when the se
 This might break Panoptikon if the UI is not compatible with the current version of the server. If you're not planning on constantly keeping Panoptikon up to date, you should set this to `true` after the first run to prevent the UI from being updated to a version that is incompatible with the server.
 
 After every update, you can set it to `false` again once to allow the UI to be updated on the next restart.
+
+# Docker
+
+This project includes a `docker-compose.yml` file and a `Dockerfile` that can be used to run Panoptikon in a Docker container. This is useful for running Panoptikon in a headless environment or on a server without having to install all the dependencies manually.
+
+Note that while there is a docker image provided for the _frontend_ which is built from the latest commit, the _backend_ must be built locally on your machine using `docker compose build`.
