@@ -92,7 +92,7 @@ uv python install 3.12
 ### macOS / Linux
 
 ```bash
-uv venv
+uv venv -p 3.12
 source .venv/bin/activate
 uv pip install --group inference
 ```
@@ -106,7 +106,7 @@ This will create a virtual environment in `.venv` and install all dependencies, 
 If you want to run inference on GPU (CUDA), install PyTorch with the appropriate CUDA wheels:
 
 ```powershell
-uv venv
+uv venv -p 3.12
 . .venv\Scripts\Activate.ps1
 
 uv pip install --group inference --extra-index-url https://download.pytorch.org/whl/cu124
