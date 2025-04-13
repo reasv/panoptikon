@@ -30,9 +30,9 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 
 Panoptikon is designed to be used as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features and exposes, among other things, an API that can be abused for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
 
-### Public Instance
+### Public Instance (panoptikon.dev)
 
-The only configuration that we endorse for a public Panoptikon instance is the provided docker-compose file, which exposes two separate services running on ports 6339 and 6340, respectively. The former is meant to be exposed publicly and blocks access to all dangerous APIs, while the second one is to be used as a private admin panel and has no restrictions on usage or API access. There is no authentication, although HTTP Basic Auth can easily be added to the Nginx configuration file if needed.
+The **only** configuration that we endorse for a public Panoptikon instance is the provided docker-compose file, which exposes two separate services running on ports 6339 and 6340, respectively. The former is meant to be exposed publicly and blocks access to all dangerous APIs, while the second one is to be used as a private admin panel and has no restrictions on usage or API access. There is no authentication, although HTTP Basic Auth can easily be added to the Nginx configuration file if needed.
 
 This exact docker-compose configuration is currently running at [panoptikon.dev](https://panoptikon.dev/search) as a public demonstration instance for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
 
@@ -40,9 +40,9 @@ Panoptikon is also not designed with high concurrency in mind, and the public in
 
 The public instance is meant for demonstration purposes only, to show the capabilities of Panoptikon to interested users. If you wanted to host a public Panoptikon instance for real-world use, it would be necessary to add authentication and rate limiting to the API, optimize the inference server for high concurrency, and possibly add a caching layer.
 
-Panoptikon's search API is not tightly coupled to the inference server. It is possible to implement a caching layer or a distributed queue system to handle inference requests more efficiently. Without modifying Panoptikon's source code, you could use a different inference server implementation that supports batching and concurrency, then simply pass the embeddings it outputs to Panoptikon's search API.
+> 💡 Panoptikon's search API is not tightly coupled to the inference server. It is possible to implement a caching layer or a distributed queue system to handle inference requests more efficiently. Without modifying Panoptikon's source code, you could use a different inference server implementation that scales better, then simply pass the embeddings it outputs to Panoptikon's search API.
 
-The public instance currently contains a small subset of images from the [latentcat/animesfw](https://huggingface.co/datasets/latentcat/animesfw) dataset.
+> ℹ️ The public instance currently contains a small subset of images from the [latentcat/animesfw](https://huggingface.co/datasets/latentcat/animesfw) dataset.
 
 Although large parts of the API are disabled in the public instance, you can still consult the full API documentation at [panoptikon.dev/docs](https://panoptikon.dev/docs).
 
@@ -56,24 +56,94 @@ API endpoints support specifying the name of the `index` and `user_data` databas
 
 This is done through the `index_db` and `user_data_db` query parameters. If not specified, the databases specified in environment variables are used by default.
 
-## Installation
+## 🛠 Installation
+
+This project uses [**UV**](https://github.com/astral-sh/uv) for dependency management — a Python package manager that works with `pyproject.toml`.
+
+### ✅ Prerequisites
+
+Install **UV**:
+
+#### macOS (via Homebrew)
 
 ```bash
-poetry install --with inference
+brew install astral-sh/uv/uv
 ```
 
-To install the full system including the inference server dependencies. If you're running the inference server on a different machine, you can omit the `--with inference` flag and set the `INFERENCE_API_URL` environment variable to point to the URL of the inference server (see below).
-
-### CUDA on Windows
-
-If you're on Windows and want CUDA GPU acceleration, you have to uninstall the default PyTorch and install the correct version after running `poetry install`:
+#### Ubuntu / Linux
 
 ```bash
-poetry run pip3 uninstall torch torchvision torchaudio -y
-poetry run pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+curl -Ls https://astral.sh/uv/install.sh | sh
 ```
 
-You may have to repeat these steps after updates.
+#### Windows (PowerShell)
+
+```powershell
+irm https://astral.sh/uv/install.ps1 | iex
+```
+
+You must also have Python 3.8–3.12 installed. We recommend using [pyenv](https://github.com/pyenv/pyenv) or [pyenv-win](https://github.com/pyenv-win/pyenv-win) for managing Python versions.
+
+---
+
+## 💻 Installing the Project
+
+> ❗ You may have to re-run the `uv pip install` command **any time** panoptikon is updated
+
+### macOS / Linux
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install --group inference
+```
+
+This will create a virtual environment in `.venv` and install all dependencies, including the inference server.
+
+---
+
+### Windows (with NVIDIA GPU acceleration)
+
+If you want to run inference on GPU (CUDA), install PyTorch with the appropriate CUDA wheels:
+
+```powershell
+uv venv
+. .venv\Scripts\Activate.ps1
+
+uv pip install --group inference --extra-index-url https://download.pytorch.org/whl/cu124
+```
+
+This ensures `torch`, `torchvision`, and `torchaudio` are installed with **CUDA 12.4** support.
+
+> 💡 Make sure your system has the matching CUDA runtime installed. See [PyTorch's CUDA compatibility table](https://pytorch.org/get-started/locally/) for guidance.
+
+### Windows (CPU only)
+
+```powershell
+uv venv
+. .venv\Scripts\Activate.ps1
+uv pip install --group inference
+```
+
+This installs the CPU versions of all dependencies. If you're **not running the inference server** on this machine, you can omit the `--group inference` flag.
+
+## 🌐 Running Inference on a Separate Server
+
+If you're running the inference server on a **different machine**, you can omit the `--group inference` flag during installation and set the `INFERENCE_API_URL` environment variable to point to the server before running Panoptikon:
+
+```bash
+export INFERENCE_API_URL=http://inference-server:5000
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:INFERENCE_API_URL = "http://inference-server:5000"
+```
+
+Every Panoptikon instance exposes the inference server API by default, which means you can point `INFERENCE_API_URL` to another Panoptikon instance to leverage its inference server.
+
+> 💡 This is useful if you have a powerful machine with a GPU running the inference server + Panoptikon, and a less powerful machine without a GPU running only Panoptikon's core, for example, a desktop and a laptop.
 
 ### Other Dependency Issues
 
@@ -83,19 +153,19 @@ When running the Whisper implementation, which is based on [CTranslate2](https:/
 
 Make sure the `cudnn` folder contains `bin`, `lib`, `include`, etc., as direct subfolders.
 
+If you still encounter issues with cuDNN, you may need to set the `LD_LIBRARY_PATH` environment variable to point to the cuDNN library `bin` folder.
+
+In order to do this, edit or create a file called just `.env` in the root of this repository and add the following line:
+
+```env
+LD_LIBRARY_PATH='cudnn/bin':$LD_LIBRARY_PATH
+```
+
+See issue: https://github.com/reasv/panoptikon/issues/5
+
 #### WeasyPrint
 
 This is only relevant if you intend to use Panoptikon with HTML files. Panoptikon uses [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/index.html) to handle HTML files. You have to follow their [Installation Guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation) to ensure all the external dependencies are present on your system. If they are present but not found, it's recommended to set the `WEASYPRINT_DLL_DIRECTORIES` environment variable to point to the correct folder.
-
-#### NoSuchOptionException (Poetry)
-
-```bash
-$ poetry install --with inference
-NoSuchOptionException
-The "--with" option does not exist.
-```
-
-This happens because you have an old version of poetry. Update it.
 
 #### enable_load_extension
 
@@ -108,11 +178,29 @@ You need to install a version of SQLite that supports them.
 
 ## Running Panoptikon
 
-```bash
-poetry run panoptikon
+Ensure the virtual environment is activated:
+
+### Windows (PowerShell)
+
+```powershell
+. .venv\Scripts\Activate.ps1
 ```
 
-This will start Panoptikon along with its inference server, listening by default at `http://127.0.0.1:6342/`.
+### macOS / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+### Running the Server
+
+Then run the following command to start the server:
+
+```bash
+panoptikon
+```
+
+This will start Panoptikon along with its inference server, listening by default at `http://127.0.0.1:6342/` (API).
 
 Everything except for adding new AI models and customizing existing ones can be done through the Next.js UI available at `http://127.0.0.1:6339` by default.
 
@@ -160,7 +248,7 @@ INFERIO_PORT=7777
 
 These **only** apply when the inference server (`inferio`) is run separately as a standalone application without Panoptikon. They determine where to bind the inference server, which runs the models.
 
-To run the inference server separately, you can run `poetry run inferio`.
+To run the inference server separately, you can run `inferio` (ensure the venv is activated).
 
 ### INFERENCE_API_URL
 
