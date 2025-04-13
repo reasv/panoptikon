@@ -64,25 +64,20 @@ This project uses [**UV**](https://github.com/astral-sh/uv) for dependency manag
 
 Install **UV**:
 
-#### macOS (via Homebrew)
+#### MacOS / Linux
 
 ```bash
-brew install astral-sh/uv/uv
-```
-
-#### Ubuntu / Linux
-
-```bash
-curl -Ls https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 #### Windows (PowerShell)
 
 ```powershell
-irm https://astral.sh/uv/install.ps1 | iex
+# On Windows.
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-You must also have Python 3.8–3.12 installed. We recommend using [pyenv](https://github.com/pyenv/pyenv) or [pyenv-win](https://github.com/pyenv-win/pyenv-win) for managing Python versions.
+You must also have Python 3.12 installed. We recommend using [pyenv](https://github.com/pyenv/pyenv) or [pyenv-win](https://github.com/pyenv-win/pyenv-win) for managing Python versions.
 
 ---
 
