@@ -77,7 +77,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-You must also have Python 3.12 installed. We recommend using [pyenv](https://github.com/pyenv/pyenv) or [pyenv-win](https://github.com/pyenv-win/pyenv-win) for managing Python versions.
+You must also have Python 3.12 installed. [UV can handle that for you](https://github.com/astral-sh/uv?tab=readme-ov-file#python-versions):
+
+```bash
+uv python install 3.12
+```
 
 ---
 
