@@ -60,4 +60,4 @@ ENV DISABLE_CLIENT_UPDATE=true
 EXPOSE 6342
 
 # Run the app with UV
-CMD ["panoptikon"]
+CMD ["uv", "run", "panoptikon"]

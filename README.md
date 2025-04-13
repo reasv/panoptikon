@@ -177,26 +177,10 @@ You need to install a version of SQLite that supports them.
 
 ## Running Panoptikon
 
-Ensure the virtual environment is activated:
-
-### Windows (PowerShell)
-
-```powershell
-. .venv\Scripts\Activate.ps1
-```
-
-### macOS / Linux
+In the root of the repository, run:
 
 ```bash
-source .venv/bin/activate
-```
-
-### Running the Server
-
-Then run the following command to start the server:
-
-```bash
-panoptikon
+uv run panoptikon
 ```
 
 This will start Panoptikon along with its inference server, listening by default at `http://127.0.0.1:6342/` (API).
@@ -247,7 +231,7 @@ INFERIO_PORT=7777
 
 These **only** apply when the inference server (`inferio`) is run separately as a standalone application without Panoptikon. They determine where to bind the inference server, which runs the models.
 
-To run the inference server separately, you can run `inferio` (ensure the venv is activated).
+To run the inference server separately, you can run `uv run inferio` in the root of this repository.
 
 ### INFERENCE_API_URL
 
