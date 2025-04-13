@@ -4,11 +4,11 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu24.04
 # Set DEBIAN_FRONTEND to noninteractive to avoid timezone configuration prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Update package lists and install Python 3, pip, and pipx
+# Update package lists and install Python 3, curl (for UV), and build tools
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
-    pipx \
+    curl \
     build-essential \
     python3-dev \
     llvm-14 \
@@ -24,20 +24,16 @@ RUN llvm-config --version || true
 RUN python3 -c "import sqlite3; print('SQLite version:', sqlite3.sqlite_version)"
 RUN python3 -c "import sqlite3; print('SQLite has loadable extensions:', sqlite3.connect(':memory:').enable_load_extension(True))"
 
+# Set up llvm-config properly
 RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-14 100
-
-# Then make sure it’s executable by all:
 RUN chmod a+rx /usr/bin/llvm-config-14 /usr/bin/llvm-config
-
-# (Optionally confirm it’s set up)
 RUN ls -l /usr/bin/llvm-config* && /usr/bin/llvm-config --version
 
-# Ensure pipx is in the PATH for root and appuser
-ENV PATH="/root/.local/bin:$PATH"
+# Install UV (https://github.com/astral-sh/uv)
+RUN curl -Ls https://astral.sh/uv/install.sh | sh
 
 # Create a directory for the application and adjust permissions for the existing user
-RUN mkdir /app && \
-    chown -R 1000:1000 /app
+RUN mkdir /app && chown -R 1000:1000 /app
 
 # Set the working directory in the container
 WORKDIR /app
@@ -45,27 +41,23 @@ WORKDIR /app
 # Switch to the existing user with UID 1000
 USER 1000
 
-# Ensure pipx is in the PATH for the existing user
-ENV PATH="/home/ubuntu/.local/bin:$PATH"
+# Add UV to PATH (uv installs to ~/.cargo/bin/uv usually, but this handles both possible locations)
+ENV PATH="/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:$PATH"
 
-# Install pipx and install poetry via pipx for the existing user
-RUN pipx install poetry
+# Copy the project into the container
+COPY --chown=1000:1000 . /app
 
-# Set environment variables for Poetry to enable virtual environments
-ENV POETRY_VIRTUALENVS_CREATE=true \
-    POETRY_CACHE_DIR=/home/ubuntu/.cache/pypoetry
+# Create virtual environment and install dependencies with CUDA-enabled PyTorch
+RUN uv venv && \
+    source .venv/bin/activate && \
+    uv pip install --group inference
 
-# Copy the current directory contents into the container
-COPY . /app
-
-# Install dependencies using Poetry
-RUN poetry install --with inference
-
+# Optional app config env vars
 ENV ENABLE_CLIENT=false
 ENV DISABLE_CLIENT_UPDATE=true
 
-# Expose the port for the application
+# Expose the app port
 EXPOSE 6342
 
-# Run the application within the virtual environment
-CMD ["poetry", "run", "panoptikon"]
+# Run the app with UV
+CMD ["panoptikon"]
