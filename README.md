@@ -389,7 +389,3 @@ After every update, you can set it to `false` again once to allow the UI to be u
 This project includes a `docker-compose.yml` file and a `Dockerfile` that can be used to run Panoptikon in a Docker container. This is useful for running Panoptikon in a headless environment or on a server without having to install all the dependencies manually.
 
 Note that while there is a docker image provided for the _frontend_ which is built from the latest commit, the _backend_ must be built locally on your machine using `docker compose build`.
-
-```
-
-```
