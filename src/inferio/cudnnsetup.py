@@ -72,10 +72,10 @@ def extract_tar_cudnn(src_tar, dst_folder):
     dst_folder = Path(dst_folder)
     with tempfile.TemporaryDirectory() as tempdir:
         tempdir = Path(tempdir)  # ensure pathlib
-        print(f"Extracting entire archive to tempdir: {tempdir}")
+        logger.info(f"Extracting entire archive to tempdir: {tempdir}")
         with tarfile.open(src_tar, "r:*") as tar:
             tar.extractall(tempdir)
-        print("Extraction complete.")
+        logger.info("Extraction complete.")
         # Find the first-level extracted directory (archive usually contains one root folder)
         extracted_dirs = [p for p in tempdir.iterdir() if p.is_dir()]
         if not extracted_dirs:
@@ -88,9 +88,9 @@ def extract_tar_cudnn(src_tar, dst_folder):
                 dst = dst_folder / subdir
                 if dst.exists():
                     shutil.rmtree(dst)
-                print(f"Copying {src} -> {dst}")
+                logger.info(f"Copying {src} -> {dst}")
                 shutil.copytree(src, dst)
-        print("Copy complete.")
+        logger.info("Copy complete.")
     # Optionally delete the original archive
     os.remove(src_tar)
 
