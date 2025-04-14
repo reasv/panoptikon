@@ -94,14 +94,16 @@ uv python install 3.12
 ```bash
 uv venv -p 3.12
 source .venv/bin/activate
+
 uv pip install --group inference
+uv pip install -e .
 ```
 
 This will create a virtual environment in `.venv` and install all dependencies, including the inference server.
 
 ---
 
-### Windows (with NVIDIA GPU acceleration)
+### Windows
 
 If you want to run inference on GPU (CUDA), install PyTorch with the appropriate CUDA wheels:
 
@@ -109,22 +111,21 @@ If you want to run inference on GPU (CUDA), install PyTorch with the appropriate
 uv venv -p 3.12
 . .venv\Scripts\Activate.ps1
 
-uv pip install --group inference --extra-index-url https://download.pytorch.org/whl/cu124
+uv pip install --group inference
+uv pip install -e .
 ```
+
+If you have an Nvidia GPU and want to use it (highly recommended), you **MUST** install the CUDA wheels for PyTorch with the following command, after completing the previous step:
+
+```powershell
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+> ❗ You will have to re-run the previous command any time you run `uv pip install --group inference` again. Eg., after updating Panoptikon.
 
 This ensures `torch`, `torchvision`, and `torchaudio` are installed with **CUDA 12.4** support.
 
 > 💡 Make sure your system has the matching CUDA runtime installed. See [PyTorch's CUDA compatibility table](https://pytorch.org/get-started/locally/) for guidance.
-
-### Windows (CPU only)
-
-```powershell
-uv venv
-. .venv\Scripts\Activate.ps1
-uv pip install --group inference
-```
-
-This installs the CPU versions of all dependencies. If you're **not running the inference server** on this machine, you can omit the `--group inference` flag.
 
 ## 🌐 Running Inference on a Separate Server
 
