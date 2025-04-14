@@ -3,6 +3,7 @@ import sys
 import platform
 import shutil
 from pathlib import Path
+import tempfile
 
 try:
     import requests
@@ -64,30 +65,34 @@ def extract_zip_cudnn(src_zip, dst_folder):
 
 
 def extract_tar_cudnn(src_tar, dst_folder):
-    with tarfile.open(src_tar, "r:*") as tar:
-        # Find archive root directory containing lib (no bin on linux)
-        root_members = set(m.name.split('/')[0] for m in tar.getmembers())
-        archive_root = None
-        for root in root_members:
-            subdirs = [m for m in tar.getmembers() if m.name.startswith(root + "/lib")]
-            if subdirs:
-                archive_root = root
-                break
-        if archive_root is None:
-            raise RuntimeError("Could not find cuDNN archive structure in tar")
-        # Extract lib, include into dst_folder
-        for m in tar.getmembers():
-            rel_name = Path(m.name).relative_to(archive_root)
-            if str(rel_name).startswith("lib") or str(rel_name).startswith("include"):
-                outpath = dst_folder / rel_name
-                if m.isdir():
-                    outpath.mkdir(parents=True, exist_ok=True)
-                else:
-                    outpath.parent.mkdir(parents=True, exist_ok=True)
-                    with tar.extractfile(m) as src, open(outpath, "wb") as dst:
-                        if src is not None:
-                            shutil.copyfileobj(src, dst)
-
+    """
+    Extracts all from tarfile to temp folder, then copies just lib and include folders
+    into dst_folder. Cleans up after itself.
+    """
+    dst_folder = Path(dst_folder)
+    with tempfile.TemporaryDirectory() as tempdir:
+        tempdir = Path(tempdir)  # ensure pathlib
+        print(f"Extracting entire archive to tempdir: {tempdir}")
+        with tarfile.open(src_tar, "r:*") as tar:
+            tar.extractall(tempdir)
+        print("Extraction complete.")
+        # Find the first-level extracted directory (archive usually contains one root folder)
+        extracted_dirs = [p for p in tempdir.iterdir() if p.is_dir()]
+        if not extracted_dirs:
+            raise RuntimeError("No directory found in cuDNN archive after extraction!")
+        archive_root = extracted_dirs[0]  # usually only one, per Nvidia's style
+        # Find lib and include folders under that root (could be deeper, so generalize)
+        for subdir in ("lib", "include"):
+            found = list(archive_root.glob(f"**/{subdir}"))  # search recursively
+            for src in found:
+                dst = dst_folder / subdir
+                if dst.exists():
+                    shutil.rmtree(dst)
+                print(f"Copying {src} -> {dst}")
+                shutil.copytree(src, dst)
+        print("Copy complete.")
+    # Optionally delete the original archive
+    os.remove(src_tar)
 
 def ensure_cudnn():
     project_root = Path(__file__).resolve().parent.parent.parent
