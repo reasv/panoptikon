@@ -178,10 +178,16 @@ You need to install a version of SQLite that supports them.
 
 ## Running Panoptikon
 
-In the root of the repository, run:
+On Linux and macOS, run:
 
 ```bash
-uv run panoptikon
+./start.sh
+```
+
+For Windows, run:
+
+```bash
+.\start.bat
 ```
 
 This will start Panoptikon along with its inference server, listening by default at `http://127.0.0.1:6342/` (API).
@@ -232,7 +238,7 @@ INFERIO_PORT=7777
 
 These **only** apply when the inference server (`inferio`) is run separately as a standalone application without Panoptikon. They determine where to bind the inference server, which runs the models.
 
-To run the inference server separately, you can run `uv run inferio` in the root of this repository.
+To run the inference server separately, you can run `inferio-start.sh` on Linux/MacOS or `inferio-start.bat` on Windows from the root of this repository.
 
 ### INFERENCE_API_URL
 
