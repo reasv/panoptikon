@@ -1,3 +1,6 @@
+import static_ffmpeg
+static_ffmpeg.add_paths()  # blocks until files are downloaded
+
 from dotenv import load_dotenv
 
 load_dotenv()
