@@ -7,7 +7,6 @@ from fastapi_utilities.repeat.repeat_every import repeat_every
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
-from inferio.cudnnsetup import cudnn_setup
 from inferio.impl.clap import ClapModel, ClapModelIsolated
 from inferio.impl.clip import CLIPIsolated, ClipModel
 from inferio.impl.clip_inf import InfinityCLIP
@@ -30,8 +29,9 @@ from inferio.utils import (
     encode_output_response,
     parse_input_request,
 )
+from inferio.cudnnsetup import cudnn_setup
 
-# cudnn_setup()
+cudnn_setup()
 logger = logging.getLogger(__name__)
 ModelRegistry.set_user_folder("config/inference")
 

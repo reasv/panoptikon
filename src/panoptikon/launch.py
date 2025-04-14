@@ -3,16 +3,15 @@ import os
 import sqlite3
 
 import uvicorn
-
-from panoptikon.api.app import get_app
-from panoptikon.db import run_migrations
-from panoptikon.db.pql.build_table_meta import build_metadata
 from panoptikon.log import setup_logging
 
 setup_logging()
 
-logger = logging.getLogger(__name__)
+from panoptikon.api.app import get_app
+from panoptikon.db import run_migrations
+from panoptikon.db.pql.build_table_meta import build_metadata
 
+logger = logging.getLogger(__name__)
 
 def launch_app():
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
