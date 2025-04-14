@@ -1,4 +1,5 @@
 import logging
+import platform
 import os
 from io import BytesIO
 from typing import Dict, List, Sequence, Type
@@ -93,7 +94,8 @@ class Florence2(InferenceModel):
         self.processor = AutoProcessor.from_pretrained(
             self.model_name, trust_remote_code=True
         )
-        self.model = torch.compile(self.model, mode="reduce-overhead")
+        if platform.system() != "Darwin":  # Don't use torch.compile on macOS
+            self.model = torch.compile(self.model, mode="reduce-overhead")
         logger.debug(f"Model {self.model_name} loaded.")
         self._model_loaded = True
 
