@@ -31,7 +31,7 @@ from inferio.utils import (
     parse_input_request,
 )
 
-cudnn_setup()
+# cudnn_setup()
 logger = logging.getLogger(__name__)
 ModelRegistry.set_user_folder("config/inference")
 
