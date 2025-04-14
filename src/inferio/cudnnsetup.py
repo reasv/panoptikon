@@ -169,9 +169,7 @@ def cudnn_setup():
     Downloads and extracts cuDNN if not already present.
     Adds cuDNN to PATH and LD_LIBRARY_PATH (Linux).
     """
-    logger.info("Setting up cuDNN...")
     if ensure_cudnn():
         add_cudnn_to_path()
-        logger.info("cuDNN ready.")
     else:
         logger.error("cuDNN setup could not be completed. Please install it manually.")
