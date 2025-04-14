@@ -17,11 +17,15 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo Creating .venv with Python %PYTHON_VERSION% (if needed)...
-uv venv -p %PYTHON_VERSION%
-if %errorlevel% neq 0 (
-    echo Failed to create venv. Make sure UV and Python %PYTHON_VERSION% are installed.
-    exit /b 1
+if not exist "%VENV%\" (
+    echo Creating .venv with Python %PYTHON_VERSION%...
+    uv venv -p %PYTHON_VERSION%
+    if %errorlevel% neq 0 (
+        echo Failed to create venv. Make sure UV and Python %PYTHON_VERSION% are installed.
+        exit /b 1
+    )
+) else (
+    echo .venv already exists, reusing it.
 )
 
 call %VENV%\Scripts\activate

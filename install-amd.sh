@@ -17,8 +17,12 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Creating .venv with Python $PYTHON_VERSION (if not exists)..."
-uv venv -p "$PYTHON_VERSION"
+if [ ! -d "$VENV" ]; then
+  echo "Creating .venv with Python $PYTHON_VERSION..."
+  uv venv -p "$PYTHON_VERSION"
+else
+  echo ".venv already exists, reusing it."
+fi
 
 echo "Activating virtual environment..."
 source "$VENV/bin/activate"
