@@ -1,5 +1,6 @@
 import logging
 import platform
+import resource
 import os
 from io import BytesIO
 from typing import Dict, List, Sequence, Type
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device, print_resource_usage
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.types import PredictionInput
@@ -97,6 +98,7 @@ class Florence2(InferenceModel):
         if platform.system() != "Darwin":  # Don't use torch.compile on macOS
             self.model = torch.compile(self.model, mode="reduce-overhead")
         logger.debug(f"Model {self.model_name} loaded.")
+        print_resource_usage(logger=logger)
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:

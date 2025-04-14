@@ -30,6 +30,7 @@ dependencies = [
     "pandas>=2.2.3,<3",
     "httpx>=0.27.2,<0.28",
     "static-ffmpeg>=2.13",
+    "psutil>=7.0.0",
 ]
 
 [project.scripts]

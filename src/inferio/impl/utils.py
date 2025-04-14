@@ -1,7 +1,11 @@
 import io
+import sys
+import os
+import logging
 
 import numpy as np
 from PIL import Image
+
 
 
 def get_device():
@@ -24,15 +28,16 @@ def get_device():
 
 def clear_cache() -> None:
     """
-    Clears the GPU cache if applicable. Supports CUDA and ROCm.
-    For MPS (Apple Silicon) and CPU, no operation is needed.
+    Clears the torch memory cache if applicable:
+    - CUDA (NVIDIA and ROCm): uses torch.cuda.empty_cache()
+    - MPS (Apple Silicon): uses torch.mps.empty_cache()
     """
     import torch
 
-    if torch.cuda.is_available():  # This covers both CUDA and ROCm
-        return torch.cuda.empty_cache()
-    # No need to clear cache for MPS or CPU as they handle memory differently
-
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 def mcut_threshold(probs: np.ndarray) -> float:
     """
@@ -161,3 +166,49 @@ def clean_whitespace(input_string: str) -> str:
     cleaned_string = re.sub(r"(\s)\1{2,}", r"\1\1", input_string)
 
     return cleaned_string
+
+
+def print_resource_usage(logger: logging.Logger | None = None):
+    """
+    Logs process resource usage.
+    - On Unix (Linux/macOS): tries to use `resource` for max RSS.
+    - On all platforms: uses `psutil` (if available) for RSS, VMS, threads, and CPU.
+    - Falls back to `print()` if no logger is given.
+    """
+    def log(msg):
+        if logger is not None:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    log(f"Resource usage for PID {os.getpid()}:")
+
+    # Try using resource for max RSS on Unix platforms
+    if sys.platform != 'win32':
+        try:
+            import resource
+            maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # On Mac, this is bytes; on Linux, it's kilobytes
+            if sys.platform == "darwin":
+                maxrss_mb = maxrss / (1024*1024)
+                log(f"  [resource] Max Resident Set Size (Mac): {maxrss_mb:.2f} MB")
+            else:
+                maxrss_mb = maxrss / 1024
+                log(f"  [resource] Max Resident Set Size (Linux): {maxrss_mb:.2f} MB")
+        except Exception as e:
+            log(f"  [resource] Unable to get max RSS via resource module: {e}")
+
+    # Universal: try psutil for more detail
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss / (1024 ** 2)  # MB
+        vms = proc.memory_info().vms / (1024 ** 2)  # MB
+        threads = proc.num_threads()
+        cpu = proc.cpu_percent(interval=0.1)
+        log(f"  [psutil] Resident RAM (RSS):  {rss:.2f} MB")
+        log(f"  [psutil] Virtual Memory (VMS): {vms:.2f} MB")
+        log(f"  [psutil] Num Threads:          {threads}")
+        log(f"  [psutil] CPU usage:            {cpu:.1f}%")
+    except ImportError:
+        log("  [psutil] psutil not installed. Install with `pip install psutil` for more details.")
