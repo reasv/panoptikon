@@ -4,11 +4,15 @@ setlocal
 set VENV=.venv
 set PYTHON_VERSION=3.12
 
-REM Check for uv
+REM Add .local\bin to PATH in case just installed UV (first thing!)
+set "PATH=%USERPROFILE%\.local\bin;%PATH%"
+
+REM Check for uv (will print nothing if found, error if not)
 where uv >nul 2>nul
 if %errorlevel% neq 0 (
     echo UV not found, installing UV...
     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 )
 
 where uv >nul 2>nul
