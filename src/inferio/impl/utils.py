@@ -2,11 +2,12 @@ import io
 import sys
 import os
 import logging
+import json
+import re
+from typing import List, Optional
 
 import numpy as np
 from PIL import Image
-
-
 
 def get_device():
     import torch
@@ -92,9 +93,6 @@ def deserialize_array(buffer: bytes) -> np.ndarray:
     return np.load(bio, allow_pickle=False)
 
 
-import json
-import re
-from typing import List, Optional
 
 def extract_partial_json_array(json_str: str) -> Optional[List[str]]:
     """
