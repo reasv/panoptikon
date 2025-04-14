@@ -56,7 +56,40 @@ API endpoints support specifying the name of the `index` and `user_data` databas
 
 This is done through the `index_db` and `user_data_db` query parameters. If not specified, the databases specified in environment variables are used by default.
 
-## 🛠 Installation
+## ⏩ Installation (Automated)
+
+Run the appropriate automated installation script for your platform.
+If this doesn't work, you can always install manually (see below).
+
+For MacOS / Linux (CPU only or Nvidia GPU):
+
+```bash
+./install.sh
+```
+
+For AMD GPU on Linux (experimental):
+
+```bash
+./install-amd.sh
+```
+
+For Windows (Nvidia GPU):
+
+```powershell
+.\install-nvidia.bat
+```
+
+For Windows (CPU only):
+
+```powershell
+.\install-cpu.bat
+```
+
+Afterwards, run `start.sh` (linux/macos) or `start.bat` (windows) to start the server.
+
+> ❗ You may have to re-run the installation script whenever Panoptikon is updated
+
+## 🛠 Installation (Manual)
 
 This project uses [**UV**](https://github.com/astral-sh/uv) for dependency management — a Python package manager that works with `pyproject.toml`.
 
@@ -73,7 +106,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 #### Windows (PowerShell)
 
 ```powershell
-# On Windows.
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
@@ -87,7 +119,7 @@ uv python install 3.12
 
 ## 💻 Installing the Project
 
-> ❗ You may have to re-run the `uv pip install` command **any time** panoptikon is updated
+> ❗ You may have to re-run the `uv pip install` command(s) **any time** panoptikon is updated
 
 ### macOS / Linux
 
@@ -100,6 +132,14 @@ uv pip install -e .
 ```
 
 This will create a virtual environment in `.venv` and install all dependencies, including the inference server.
+This will work for CPU and GPU (Nvidia/CUDA) installations. For AMD GPUs on linux (experimental),
+run the following command after the previous step:
+
+```bash
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2.4
+```
+
+> ❗ You will have to re-run this command any time you run `uv pip install --group inference` again. Eg., after updating Panoptikon.
 
 ---
 
@@ -349,3 +389,7 @@ After every update, you can set it to `false` again once to allow the UI to be u
 This project includes a `docker-compose.yml` file and a `Dockerfile` that can be used to run Panoptikon in a Docker container. This is useful for running Panoptikon in a headless environment or on a server without having to install all the dependencies manually.
 
 Note that while there is a docker image provided for the _frontend_ which is built from the latest commit, the _backend_ must be built locally on your machine using `docker compose build`.
+
+```
+
+```
