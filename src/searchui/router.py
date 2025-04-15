@@ -169,6 +169,7 @@ def fetch_or_pull_repo(repo_url, repo_dir):
     """
     Fetch the Git repository. If it doesn't exist, clone it. Otherwise, pull the latest changes.
     """
+    ensure_git_available()
     if not os.path.exists(os.path.join(repo_dir, ".git")):
         logger.info(f"Cloning repository from {repo_url}...")
         subprocess.run(
@@ -183,3 +184,13 @@ def fetch_or_pull_repo(repo_url, repo_dir):
             check=True,
             stdout=subprocess.DEVNULL,
         )
+
+def ensure_git_available():
+    if shutil.which("git") is None:
+        logger.error(
+            "'git' is required to download and update the frontend UI.\n"
+            "Please install git and try to start Panoptikon again.\n"
+            "https://git-scm.com/downloads"
+            "Alternatively, you can set the environment variable ENABLE_CLIENT=false to disable the UI client entirely."
+        )
+        raise RuntimeError("git is not installed")
