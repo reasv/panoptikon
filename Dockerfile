@@ -48,9 +48,10 @@ ENV PATH="/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:$PATH"
 COPY --chown=1000:1000 . /app
 
 # Create virtual environment and install dependencies with CUDA-enabled PyTorch
-RUN uv venv && \
+RUN uv venv -p "3.12" && \
     source .venv/bin/activate && \
-    uv pip install --group inference
+    uv pip install --group inference \
+    uv pip install -e .
 
 # Optional app config env vars
 ENV ENABLE_CLIENT=false
@@ -60,4 +61,4 @@ ENV DISABLE_CLIENT_UPDATE=true
 EXPOSE 6342
 
 # Run the app with UV
-CMD ["uv", "run", "panoptikon"]
+CMD ["bash", "./start.sh"]
