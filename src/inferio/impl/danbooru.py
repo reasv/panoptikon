@@ -60,6 +60,7 @@ async def get_danbooru_post_async(
             async with session.get(api_url, params=params) as response:
                 response.raise_for_status()
                 posts = await response.json()
+                break
         except Exception as e:
             logger.error(f"Error fetching data: {e}")
             if attempts <= 4:
