@@ -60,11 +60,8 @@ def run_dynamic_extraction_job(
             slice_frames = handler_opts.get("slice_frames", True)
             slice_settings = None
             if slice_frames:
-                slice_settings = ImageSliceSettings(
-                    ratio_larger=16,
-                    ratio_smaller=9,
-                    max_multiplier=1.6,
-                    target_multiplier=1.5,
+                slice_settings = ImageSliceSettings.from_dict(
+                    handler_opts.get("slice_settings", {})
                 )
             frames = image_loader(conn, item, slice_settings=slice_settings)
             return [({}, frame) for frame in frames[:max_frames]]

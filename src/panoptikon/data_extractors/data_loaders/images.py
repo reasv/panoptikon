@@ -49,7 +49,17 @@ class ImageSliceSettings:
     ratio_smaller: int = 9
     max_multiplier: float = 2.0
     target_multiplier: float = 1.5
-
+    minimum_size: int = 1000  # Minimum size (of longest side) in pixels for slicing
+    @classmethod
+    def from_dict(cls, settings: dict[str, Any]) -> "ImageSliceSettings":
+        """Create an instance of ImageSliceSettings from a dictionary."""
+        return cls(
+            ratio_larger=settings.get("ratio_larger", 16),
+            ratio_smaller=settings.get("ratio_smaller", 9),
+            max_multiplier=settings.get("max_multiplier", 2.0),
+            target_multiplier=settings.get("target_multiplier", 1.5),
+            minimum_size=settings.get("minimum_size", 1000),
+        )
 
 def image_loader(
     conn: sqlite3.Connection,
@@ -211,6 +221,7 @@ def slice_target_size(
         width is None
         or height is None
         or settings is None
+        or (width < settings.minimum_size and height < settings.minimum_size)
         or not is_excessive_ratio(width, height, settings)
     ):
         return input_images

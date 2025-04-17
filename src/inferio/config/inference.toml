@@ -10,7 +10,7 @@ target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
-input_spec = { handler = "image_frames", opts = { max_frames = 4 } } # { handler="image_frames", opts={ max_frames = 4 }}
+input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 4096 } } }
 
 [group.tags.inference_ids]
 wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "(Recommended) SwinV2 Based Tagger" } }
@@ -40,7 +40,7 @@ danbooru-saucenao = { config = { sauce_nao_enabled = true }, metadata = { input_
 [group.doctr]
 config = { impl_class = "doctr" }
 [group.doctr.metadata]
-description = "Extract text from images, videos, and documents through OCR"
+description = "Extract text from images, videos, and documents through OCR using DocTR or EasyOCR."
 name = "OCR"
 default_threshold = 0
 default_batch_size = 64
@@ -48,7 +48,7 @@ default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames" }
+input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 4096 } } }
 
 [group.doctr.inference_ids]
 easyocr_standard_en = { config = { impl_class = "easyocr", languages = [
@@ -80,7 +80,7 @@ default_inference_id = "msft_large-more-detailed"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames" }
+input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 4096 } } }
 
 [group.florence2.inference_ids]
 msft_large-more-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
@@ -114,7 +114,7 @@ default_inference_id = "moondream-2b-25-03-ocr"
 target_entities = ["items"]
 output_type = "text"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames" }
+input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 4096 } } }
 
 [group.vlm.inference_ids]
 moondream-2b-25-03-ocr = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "query", prompt = "extract all text from this image", confidence = 0.6, language = "moondream-ocr" }, metadata = { description = "(Recommended) Moondream 2B (v2025/03) OCR" } }
@@ -180,7 +180,7 @@ default_batch_size = 64
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities = ["items"]
 output_type = "clip"
-input_spec = { handler = "image_frames" }
+input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 4096 } } }
 [group.clip.inference_ids]
 ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)." } }
 ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
