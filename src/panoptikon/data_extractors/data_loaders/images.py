@@ -1,8 +1,9 @@
 import io
 import logging
+import math
 import os
 import sqlite3
-from typing import Any, List, Sequence, Union
+from typing import Any, List, Literal, Sequence, Union
 
 import numpy as np
 from attr import dataclass
@@ -45,20 +46,38 @@ def gif_to_frames(path: str) -> List[PILImage.Image]:
 
 @dataclass
 class ImageSliceSettings:
+    """
+    Slicing parameters.
+
+    mode == "aspect-ratio"
+        • Image is sliced only along *one* axis until its AR ≤ target_AR.
+
+    mode == "pixels"
+        • Ignores aspect ratio.
+        • If the longest side > pixel_max_size, the image is chopped into a
+          rows×cols grid such that *every* tile’s longest side ≤ pixel_target_size.
+    """
+    mode: Literal["aspect-ratio", "pixels"] = "aspect-ratio"
+    # ― aspect‑ratio mode settings
     ratio_larger: int = 16
     ratio_smaller: int = 9
     max_multiplier: float = 2.0
     target_multiplier: float = 1.5
-    minimum_size: int = 1000  # Minimum size (of longest side) in pixels for slicing
+    minimum_size: int = 1024  # Minimum size (of longest side) in pixels for slicing
+    # ― pixels mode settings
+    pixel_target_size: int = 1024  # Target size of resulting patches in pixels for slicing
+    pixel_max_size: int = 4096  # Maximum size of an image in pixels before it is sliced
     @classmethod
     def from_dict(cls, settings: dict[str, Any]) -> "ImageSliceSettings":
-        """Create an instance of ImageSliceSettings from a dictionary."""
         return cls(
             ratio_larger=settings.get("ratio_larger", 16),
             ratio_smaller=settings.get("ratio_smaller", 9),
             max_multiplier=settings.get("max_multiplier", 2.0),
             target_multiplier=settings.get("target_multiplier", 1.5),
-            minimum_size=settings.get("minimum_size", 1000),
+            minimum_size=settings.get("minimum_size", 1024),
+            mode=settings.get("mode", "aspect-ratio"),
+            pixel_target_size=settings.get("pixel_target_size", 1024),
+            pixel_max_size=settings.get("pixel_max_size", 4096),
         )
 
 def image_loader(
@@ -210,33 +229,51 @@ def generate_thumbnail(
     img.thumbnail(max_dimensions, PILImage.Resampling.LANCZOS)
     return img
 
-
 def slice_target_size(
     input_images: List[bytes],
     width: int | None,
     height: int | None,
     settings: ImageSliceSettings | None,
 ) -> List[bytes]:
-    if (
-        width is None
-        or height is None
-        or settings is None
-        or (width < settings.minimum_size and height < settings.minimum_size)
-        or not is_excessive_ratio(width, height, settings)
-    ):
+    """
+    Slice `input_images` according to `settings`.
+
+    • mode == "aspect-ratio": slice along the longest axis to achieve target aspect ratio.
+    • mode == "pixels"      : slice into a grid so that every tile’s longest
+                              side ≤ `pixel_target_size` if
+                              original longest side > `pixel_max_size`.
+    """
+    if width is None or height is None or settings is None:
         return input_images
 
-    n_slices = calculate_slices_needed(width, height, settings)
-    logger.debug(
-        f"Image has an excessive aspect ratio ({width}x{height}), slicing into {n_slices} pieces..."
-    )
-    output_slices = []
-    for image in input_images:
-        slices = slice_image(image, n_slices)
-        for s in slices:
-            output_slices.append(s)
-    return output_slices
+    match settings.mode:
+        case "aspect-ratio":
+            if (
+                max(width, height) <= settings.minimum_size
+                or not is_excessive_ratio(width, height, settings)
+            ):
+                return input_images
 
+            n_slices = calculate_slices_needed(width, height, settings)
+            logger.debug(f"Image has an excessive aspect ratio ({width}x{height}), slicing into {n_slices} pieces...")
+            out: List[bytes] = []
+            for im in input_images:
+                out.extend(slice_image(im, n_slices))
+            return out
+
+        case "pixels":
+            if max(width, height) <= settings.pixel_max_size:
+                return input_images
+
+            rows, cols = grid_for_pixels(width, height, settings)
+            logger.debug(f"Image is too large ({width}x{height}), slicing into {rows}x{cols} grid...")
+            out: List[bytes] = []
+            for im in input_images:
+                out.extend(slice_image_grid(im, rows, cols))
+            return out
+        case _:
+            logger.warning("Unknown slice mode '%s'; skipping.", settings.mode)
+            return input_images
 
 def is_excessive_ratio(
     image_width: int,
@@ -388,3 +425,71 @@ def save_images_to_disk(images: List[bytes], name: str = "slice") -> None:
     for i, image in enumerate(images):
         with open(f"scripts/slices/{name}-s_{i}.jpg", "wb") as f:
             f.write(image)
+
+def grid_for_pixels(w: int, h: int, cfg: ImageSliceSettings) -> tuple[int, int]:
+    """
+    Return rows, cols so every tile’s longest edge ≤ pixel_target_size.
+    """
+    rows = math.ceil(h / cfg.pixel_target_size)
+    cols = math.ceil(w / cfg.pixel_target_size)
+    return rows, cols
+
+def slice_image_grid(
+    image: Union[str, bytes, PILImage.Image],
+    rows: int,
+    cols: int,
+) -> List[bytes]:
+    """
+    Split `img_bytes` into `rows × cols` tiles.
+
+    Parameters
+    ----------
+    img_bytes : bytes
+        Raw image in any Pillow‑readable format.
+    rows, cols : int
+        Number of tiles on the y‑ and x‑axes.
+    format : str, default "PNG"
+        Output encoding for each tile.
+
+    Returns
+    -------
+    List[bytes]
+        List of length `rows * cols`, row‑major order.
+    """
+     # Convert input to PIL Image if needed
+    if isinstance(image, str):
+        img = PILImage.open(image)
+        format = img.format
+    elif isinstance(image, bytes):
+        img = PILImage.open(io.BytesIO(image))
+        format = img.format
+    elif isinstance(image, PILImage.Image):
+        format = image.format
+        img = image
+    else:
+        raise ValueError(
+            "Image must be a file path, bytes, or PIL Image object"
+        )
+    if format is None:
+        format = "PNG" # Default to PNG if format is None
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows and cols must be positive integers")
+    
+    w, h = img.size
+    tw, th = w / cols, h / rows
+
+    out: list[bytes] = []
+    for r in range(rows):
+        for c in range(cols):
+            left   = int(round(c * tw))
+            upper  = int(round(r * th))
+            right  = int(round((c + 1) * tw))
+            lower  = int(round((r + 1) * th))
+
+            tile = img.crop((left, upper, right, lower))
+
+            buf = io.BytesIO()
+            tile.save(buf, format=format, optimize=False)
+            out.append(buf.getvalue())
+
+    return out
