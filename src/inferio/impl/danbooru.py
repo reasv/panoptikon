@@ -228,6 +228,7 @@ class DanbooruTagger(InferenceModel):
                         threshold = 0.5
                         if isinstance(input_item.data, dict):
                             md5 = input_item.data.get("md5", None)
+                            assert md5, "Danbooru requires md5 hashes"
                             threshold = input_item.data.get("threshold", 0.5)
                         else:
                             md5 = input_item.data

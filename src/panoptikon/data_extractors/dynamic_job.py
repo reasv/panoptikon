@@ -121,7 +121,7 @@ def run_dynamic_extraction_job(
         def get_md5(
             item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], None]]:
-            assert item.md5 is not None, "Md5 must be present"
+            assert item.md5 is not None, "MD5 must be present"
             return [({"md5": item.md5}, None)]
 
         data_loader = get_md5
@@ -130,7 +130,7 @@ def run_dynamic_extraction_job(
         def get_md5_image(
             item: JobInputData,
         ) -> Sequence[Tuple[Dict[str, Any], None | bytes]]:
-            assert item.md5 is not None, "Md5 must be present"
+            assert item.md5 is not None, "MD5 must be present"
             frames = image_loader(conn, item, slice_settings=None)
             frame = None
             if frames:
