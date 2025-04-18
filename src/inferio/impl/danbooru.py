@@ -181,7 +181,7 @@ async def find_on_sauce_nao_async(
             
             if attempt > 4:
                 raise SauceNaoError("Failed to search on SauceNAO")
-            logger.info("Retrying...")
+            logger.info("Retrying SauceNAO search...")
             await asyncio.sleep(1)
             attempt += 1
 
