@@ -29,9 +29,6 @@ RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm
 RUN chmod a+rx /usr/bin/llvm-config-14 /usr/bin/llvm-config
 RUN ls -l /usr/bin/llvm-config* && /usr/bin/llvm-config --version
 
-# Install UV (https://github.com/astral-sh/uv)
-RUN curl -Ls https://astral.sh/uv/install.sh | sh
-
 # Create a directory for the application and adjust permissions for the existing user
 RUN mkdir /app && chown -R 1000:1000 /app
 
@@ -48,10 +45,7 @@ ENV PATH="/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:$PATH"
 COPY --chown=1000:1000 . /app
 
 # Create virtual environment and install dependencies with CUDA-enabled PyTorch
-RUN uv venv -p "3.12" && \
-    source .venv/bin/activate && \
-    uv pip install --group inference \
-    uv pip install -e .
+RUN bash ./install.sh
 
 # Optional app config env vars
 ENV ENABLE_CLIENT=false
