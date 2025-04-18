@@ -250,7 +250,7 @@ class DanbooruTagger(InferenceModel):
                         images[md5] = input_item.file
                     elif self.sauce_nao_enabled:
                         raise ValueError(
-                            "SauceNAO requires image data to be provided"
+                            f"SauceNAO requires image data to be provided (md5: {md5})"
                         )
                 else:
                     raise ValueError("Danbooru requires md5 hashes")
