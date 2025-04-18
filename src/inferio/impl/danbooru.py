@@ -1,13 +1,13 @@
 import asyncio
 import logging
 import os
-import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Dict, List, Optional, Sequence, Tuple, Type
 
 import aiohttp
 
+from inferio.impl.saucenao.containers import SauceResponse
 from inferio.impl.saucenao.errors import (
     LongLimitReachedError,
     ShortLimitReachedError,
@@ -19,6 +19,8 @@ from inferio.types import PredictionInput
 
 logger = logging.getLogger(__name__)
 
+CONNECT_TIMEOUT = 15
+TOTAL_TIMEOUT = 75
 
 @dataclass
 class DanbooruPost:
@@ -52,22 +54,23 @@ async def get_danbooru_post_async(
     else:
         params = {"tags": f"md5:{id_or_hash}"}
 
-    attempts = 0
+    attempt = 0
     posts = None
-    while attempts <= 4:
-        attempts += 1
+    while attempt <= 4:
         try:
-            async with session.get(api_url, params=params) as response:
+            async with session.get(api_url, params=params, timeout=aiohttp.ClientTimeout(connect=CONNECT_TIMEOUT, total=TOTAL_TIMEOUT)) as response:
                 response.raise_for_status()
                 posts = await response.json()
                 break
         except Exception as e:
             logger.error(f"Error fetching data: {e}")
-            if attempts <= 4:
-                logger.info("Retrying...")
-                await asyncio.sleep(2 * attempts)
-            else:
-                raise DanbooruFetchError("Failed to fetch data from Danbooru")
+
+        wait_time = 2 ** attempt
+        logger.info(f"Retrying in {wait_time}s...")
+        await asyncio.sleep(wait_time)
+        attempt += 1
+        if attempt > 4:
+            raise DanbooruFetchError("Failed to fetch data from Danbooru")
     try:
         if not posts:
             return None
@@ -102,6 +105,13 @@ async def get_danbooru_post_async(
         logger.error(f"Error processing data: {e}")
         return None
 
+_RATINGS = {
+        "g": "general",
+        "s": "safe",
+        "n": "sensitive",
+        "q": "questionable",
+        "e": "explicit",
+}
 
 def translate_rating(rating_letter: str) -> str:
     """
@@ -113,14 +123,8 @@ def translate_rating(rating_letter: str) -> str:
     Returns:
         str: Full rating name
     """
-    ratings = {
-        "g": "general",
-        "s": "safe",
-        "n": "sensitive",
-        "q": "questionable",
-        "e": "explicit",
-    }
-    return ratings.get(rating_letter.lower(), "unknown")
+
+    return _RATINGS.get(rating_letter.lower(), "unknown")
 
 
 def add_confidence_level(
@@ -157,10 +161,9 @@ async def find_on_sauce_nao_async(
         Tuple[str, float]: Best match URL and similarity score
     """
     async with AIOSauceNao(api_key=saucenao_api_key) as sauce:
-        attempts = 0
-        results = None
-        while attempts <= 4:
-            attempts += 1
+        attempt = 0
+        results: SauceResponse | None = None
+        while attempt <= 4:
             try:
                 results = await sauce.from_file(BytesIO(image))
                 break
@@ -174,9 +177,12 @@ async def find_on_sauce_nao_async(
                 raise SauceNaoError("24 hour limit reached on SauceNAO")
             except Exception as e:
                 logger.error(f"Error searching on SauceNAO: {e}")
-                if attempts <= 4:
-                    logger.info("Retrying...")
-                    await asyncio.sleep(1)
+            
+            if attempt > 4:
+                raise SauceNaoError("Failed to search on SauceNAO")
+            logger.info("Retrying...")
+            await asyncio.sleep(1)
+            attempt += 1
 
     if results is None:
         raise SauceNaoError("Failed to search on SauceNAO")
