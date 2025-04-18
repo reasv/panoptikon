@@ -230,6 +230,8 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
         from dotenv import load_dotenv
 
         load_dotenv()
+        from panoptikon.log import setup_logging
+        setup_logging()
         try:
             model_class = cls.concrete_class()
             logger.debug(f"{model_class.name()} - Resolving concrete class.")
