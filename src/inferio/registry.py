@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional, Type
 
-import tomlkit
+import tomli
 
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
@@ -101,8 +101,8 @@ class ModelRegistry:
                 folder.glob("*.toml")
             ):  # Sort files for predictable loading
                 try:
-                    with open(file, "r") as f:
-                        data = tomlkit.load(f)
+                    with open(file, "rb") as f:
+                        data = tomli.load(f)
                         logger.debug(f"Loading TOML file: {file}")
 
                     self.allow_inference_id_overrides = data.get(
