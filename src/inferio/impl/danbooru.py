@@ -64,7 +64,7 @@ async def get_danbooru_post_async(
                 posts = await response.json()
                 break
         except Exception as e:
-            logger.error(f"Error fetching data: {e}")
+            logger.error(f"Error fetching data from danbooru: {e}")
 
         wait_time = 2 ** attempt
         logger.info(f"Retrying in {wait_time}s...")
@@ -346,7 +346,7 @@ class DanbooruTagger(InferenceModel):
             return {"skip": True}
 
         if not danbooru_id:
-            logger.warning(f"Failed to find {md5} through SauceNAO")
+            logger.info(f"Failed to find {md5} through SauceNAO")
             return {"namespace": "danbooru", "tags": []}
 
         logger.info(
