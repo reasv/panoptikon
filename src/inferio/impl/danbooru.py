@@ -208,6 +208,7 @@ class DanbooruTagger(InferenceModel):
         self._model_loaded: bool = False
         self.saucenao_daily_limit_reached: bool = False
         self.limit_reached_time: Optional[float] = None
+        self.last_saucenao_request_time: Optional[float] = None
 
     @classmethod
     def name(cls) -> str:
@@ -321,7 +322,17 @@ class DanbooruTagger(InferenceModel):
         Finds the image hash on SauceNAO.
         """
         logger.debug(f"Searching on SauceNAO for md5: {md5}")
+        if self.last_saucenao_request_time is not None:
+            elapsed_time = time.time() - self.last_saucenao_request_time
+            time_between_requests = 1.77 # SauceNAO's rate limit is 1 request every ~1.76 seconds (17 in 30 seconds)
+            if elapsed_time < time_between_requests:
+                wait_time = time_between_requests - elapsed_time
+                logger.debug(
+                    f"Waiting for {wait_time:.2f} seconds before next SauceNAO request."
+                )
+                await asyncio.sleep(wait_time)
         try:
+            self.last_saucenao_request_time = time.time()
             danbooru_id, confidence = await find_on_sauce_nao_async(
                 image, threshold, saucenao_api_key=saucenao_api_key
             )
