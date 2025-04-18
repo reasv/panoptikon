@@ -9,7 +9,7 @@ services:
       - LOGS_FILE=/logs/inferio.log
     volumes:
       - ./inferio:/logs
-    entrypoint: [ "poetry", "run", "inferio" ]
+    entrypoint: [ "bash", "./inferio-start.sh" ]
     deploy:
       resources:
         reservations:
