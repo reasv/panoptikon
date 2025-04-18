@@ -382,8 +382,6 @@ class DanbooruTagger(InferenceModel):
         """
         Processes the result from Danbooru and returns a structured response.
         """
-
-        logger.debug(f"Post: {post.danbooru_url} (md5: {md5})")
         metadata = {
             "source_url": post.source,
             "danbooru_url": post.danbooru_url,
