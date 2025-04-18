@@ -332,7 +332,6 @@ class DanbooruTagger(InferenceModel):
                 )
                 await asyncio.sleep(wait_time)
         try:
-            self.last_saucenao_request_time = time.time()
             danbooru_id, confidence = await find_on_sauce_nao_async(
                 image, threshold, saucenao_api_key=saucenao_api_key
             )
@@ -344,6 +343,8 @@ class DanbooruTagger(InferenceModel):
                 f"Skipping {md5} after SauceNAO search failed."
             )
             return {"skip": True}
+        finally:
+            self.last_saucenao_request_time = time.time()
 
         if not danbooru_id:
             logger.info(f"Failed to find {md5} through SauceNAO")
