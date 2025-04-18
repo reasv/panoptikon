@@ -248,10 +248,6 @@ class DanbooruTagger(InferenceModel):
                     thresholds[md5] = threshold
                     if input_item.file:
                         images[md5] = input_item.file
-                    elif self.sauce_nao_enabled:
-                        raise ValueError(
-                            f"SauceNAO requires image data to be provided (md5: {md5})"
-                        )
                 else:
                     raise ValueError("Danbooru requires md5 hashes")
 
@@ -284,13 +280,18 @@ class DanbooruTagger(InferenceModel):
                     # Already found on Danbooru, add to final results
                     final_results.append(result)
                     continue
-                
+                md5 = md5_inputs[i]
+                if images.get(md5) is None:
+                    # No image data available, cannot search SauceNAO
+                    logger.debug(f"Skipping SauceNAO search for {md5_inputs[i]} due to missing image data.")
+                    final_results.append({"namespace": "danbooru", "tags": []})
+                    continue
+
                 if self.saucenao_daily_limit_reached:
                     # Stop trying SauceNAO for other images
                     final_results.append({"skip": True})
                     continue
                 # If the result is None, try SauceNAO
-                md5 = md5_inputs[i]
                 try:
                     sn_result = await self.try_sauce_nao_async(
                         md5_inputs[i],
@@ -299,6 +300,7 @@ class DanbooruTagger(InferenceModel):
                         sauce_nao_key,
                         session,
                     )
+                    final_results.append(sn_result)
                 except LongLimitReachedError:
                     # Stop trying SauceNAO for other images
                     logger.error(
@@ -306,8 +308,6 @@ class DanbooruTagger(InferenceModel):
                     )
                     self.register_limit_reached()
                     final_results.append({"skip": True})
-                    continue
-                final_results.append(sn_result)
 
             return final_results
 
