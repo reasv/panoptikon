@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Dict, List, Optional, Sequence, Tuple, Type
@@ -173,8 +174,8 @@ async def find_on_sauce_nao_async(
                 )
                 await asyncio.sleep(31)
             except LongLimitReachedError:
-                logger.error("24 hour limit reached on SauceNAO...")
-                raise SauceNaoError("24 hour limit reached on SauceNAO")
+                # Propagate the error to stop trying SauceNAO for other images
+                raise LongLimitReachedError
             except Exception as e:
                 logger.error(f"Error searching on SauceNAO: {e}")
             
@@ -205,6 +206,8 @@ class DanbooruTagger(InferenceModel):
     def __init__(self, sauce_nao_enabled: bool = False):
         self.sauce_nao_enabled: bool = sauce_nao_enabled
         self._model_loaded: bool = False
+        self.saucenao_daily_limit_reached: bool = False
+        self.limit_reached_time: Optional[float] = None
 
     @classmethod
     def name(cls) -> str:
@@ -220,6 +223,8 @@ class DanbooruTagger(InferenceModel):
             raise ValueError(
                 "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
             )
+        
+        self.reset_limit_reached()
 
         return asyncio.run(self.predict_async(inputs))
     
@@ -278,16 +283,29 @@ class DanbooruTagger(InferenceModel):
                     # Already found on Danbooru, add to final results
                     final_results.append(result)
                     continue
-
+                
+                if self.saucenao_daily_limit_reached:
+                    # Stop trying SauceNAO for other images
+                    final_results.append({"skip": True})
+                    continue
                 # If the result is None, try SauceNAO
                 md5 = md5_inputs[i]
-                sn_result = await self.try_sauce_nao_async(
-                    md5_inputs[i],
-                    images[md5],
-                    thresholds[md5],
-                    sauce_nao_key,
-                    session,
-                )
+                try:
+                    sn_result = await self.try_sauce_nao_async(
+                        md5_inputs[i],
+                        images[md5],
+                        thresholds[md5],
+                        sauce_nao_key,
+                        session,
+                    )
+                except LongLimitReachedError:
+                    # Stop trying SauceNAO for other images
+                    logger.error(
+                        "24 hour limit reached on SauceNAO. Stopping further searches."
+                    )
+                    self.register_limit_reached()
+                    final_results.append({"skip": True})
+                    continue
                 final_results.append(sn_result)
 
             return final_results
@@ -307,6 +325,9 @@ class DanbooruTagger(InferenceModel):
             danbooru_id, confidence = await find_on_sauce_nao_async(
                 image, threshold, saucenao_api_key=saucenao_api_key
             )
+        except LongLimitReachedError:
+            # Propagate the error to stop trying SauceNAO for other images
+            raise LongLimitReachedError
         except SauceNaoError:
             logger.warning(
                 f"Skipping {md5} after SauceNAO search failed."
@@ -407,11 +428,34 @@ class DanbooruTagger(InferenceModel):
             "metadata_score": confidence,
             "metadata": metadata,
         }
+    
+    def register_limit_reached(self) -> None:
+        """
+        Register that the SauceNAO daily limit has been reached.
+        """
+        self.saucenao_daily_limit_reached = True
+        self.limit_reached_time = time.time()
+
+    def reset_limit_reached(self) -> None:
+        """
+        Reset the SauceNAO daily limit reached status if the time since it was reached is greater than 3 hours.
+        """
+        if self.limit_reached_time:
+            elapsed_time = time.time() - self.limit_reached_time
+            if elapsed_time > 3 * 60 * 60:
+                logger.debug(
+                    "Resetting SauceNAO daily limit reached status after 3 hours."
+                )
+                self.saucenao_daily_limit_reached = False
+                self.limit_reached_time = None
+            else:
+                logger.debug(
+                    f"Still within 3 hours of SauceNAO daily limit reached. Elapsed time: {elapsed_time} seconds."
+                )
 
     def unload(self) -> None:
         if self._model_loaded:
             self._model_loaded = False
-
 
 class DanbooruIsolated(ProcessIsolatedInferenceModel):
     @classmethod
