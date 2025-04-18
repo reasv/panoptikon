@@ -10,7 +10,6 @@ from urllib3.util import Retry
 
 logger = logging.getLogger(__name__)
 
-
 class InferenceAPIClient:
     def __init__(self, base_url: str, retries: int = 3):
         self.base_url = base_url
