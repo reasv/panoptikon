@@ -169,6 +169,10 @@ def cudnn_setup():
     Downloads and extracts cuDNN if not already present.
     Adds cuDNN to PATH and LD_LIBRARY_PATH (Linux).
     """
+    if os.getenv("NO_CUDNN", "false").lower() in ("1", "true"):
+        # User has disabled cuDNN setup via environment variable 
+        logger.info("cuDNN setup is disabled by environment variable NO_CUDNN=true")
+        return
     if ensure_cudnn():
         add_cudnn_to_path()
     else:

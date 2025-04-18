@@ -10,8 +10,10 @@ services:
       - LOGS_FILE=/logs/inferio.log
       #- JINA_API_KEY=${JINA_API}
       #- JINA_TIMEOUT=15
+      #- NO_CUDNN=true
     volumes:
       - ./inferio:/logs
+      - ./cudnn:/app/cudnn
     entrypoint: [ "bash", "./inferio-start.sh" ]
     deploy:
       resources:
@@ -31,6 +33,7 @@ services:
       - LOGLEVEL=INFO
       - ENABLE_CLIENT=false
       - DISABLE_CLIENT_UPDATE=true
+      - NO_CUDNN=true
       - INFERENCE_API_URL=http://inferio:7777
     volumes:
       - ./data:/app/data
