@@ -5,6 +5,7 @@ import platform
 import shlex
 import subprocess
 from datetime import datetime
+from typing import List, Union
 
 mimetypes.add_type("image/webp", ".webp")
 from PIL import Image, ImageDraw, ImageFont
@@ -335,3 +336,46 @@ def parse_tags(tags_str: str):
     tags, negative_tags_match_all = extract_tags_subtype(tags, "~")
     tags, tags_match_any = extract_tags_subtype(tags, "*")
     return tags, tags_match_any, negative_tags, negative_tags_match_all
+
+def get_inference_api_url(all: bool = False) -> Union[str, List[str]]:
+    """
+    Return the inference‑server URL(s).
+
+    Environment variable precedence
+    -------------------------------
+    1. INFERENCE_API_URL          – may contain one URL or a comma‑separated list.
+    2. HOST / PORT fallback       – if INFERENCE_API_URL is unset.
+
+    Parameters
+    ----------
+    all : bool, default False
+        • False → keep the historical behaviour (return first URL as str)  
+        • True  → return *all* URLs as a list[str]
+
+    Examples
+    --------
+    >>> os.environ["INFERENCE_API_URL"] = "http://gpu0:6342,http://gpu1:6342"
+    >>> get_inference_api_url()
+    'http://gpu0:6342'
+    >>> get_inference_api_url(all=True)
+    ['http://gpu0:6342', 'http://gpu1:6342']
+    """
+    raw = os.getenv("INFERENCE_API_URL")
+    if raw:
+        urls = [u.strip() for u in raw.split(",") if u.strip()]
+    else:
+        hostname = os.getenv("HOST", "127.0.0.1")
+        if hostname == "0.0.0.0":
+            hostname = "127.0.0.1"
+        port = int(os.getenv("PORT", 6342))
+        urls = [f"http://{hostname}:{port}"]
+
+    return urls if all else urls[0]
+
+def get_inference_api_urls() -> List[str]:
+    """Convenience wrapper that **always** returns a list."""
+
+    urls = get_inference_api_url(all=True)
+    if isinstance(urls, str):
+        return [urls]
+    return urls

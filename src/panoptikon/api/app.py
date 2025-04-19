@@ -30,7 +30,7 @@ from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
 )
-from panoptikon.utils import open_file, show_in_fm
+from panoptikon.utils import get_inference_api_url, open_file, show_in_fm
 from searchui.router import get_routers
 
 logger = logging.getLogger(__name__)
@@ -250,7 +250,7 @@ def get_app(hostname: str, port: int) -> FastAPI:
             proxy_url = client_url
             # If the request is for the inference API, and we are using a custom URL for it, proxy it to the inference API
             if request.url.path.startswith("/api/inference"):
-                proxy_url = os.getenv("INFERENCE_API_URL")
+                proxy_url = get_inference_api_url()
                 timeout = None
             # Otherwise, proxy the request to the Next.js frontend
             async with httpx.AsyncClient() as client:

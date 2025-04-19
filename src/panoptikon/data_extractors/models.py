@@ -18,6 +18,7 @@ import panoptikon.data_extractors.types as job_types
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
 from panoptikon.types import OutputDataType, TargetEntityType
+from panoptikon.utils import get_inference_api_urls
 
 if TYPE_CHECKING:
     from panoptikon.config_type import SystemConfig
@@ -388,12 +389,6 @@ class ModelOptsFactory:
 
 def get_inference_api_client():
     from inferio.client import DistributedInferenceAPIClient
-    
-    inference_api_url = os.getenv("INFERENCE_API_URL")
-    if not inference_api_url:
-        hostname = os.getenv("HOST", "127.0.0.1")
-        if hostname == "0.0.0.0":
-            hostname = "127.0.0.1"
-        port = int(os.getenv("PORT", 6342))
-        inference_api_url = f"http://{hostname}:{port}"
-    return DistributedInferenceAPIClient(f"{inference_api_url}/api/inference")
+
+    inference_api_urls = get_inference_api_urls()
+    return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls])
