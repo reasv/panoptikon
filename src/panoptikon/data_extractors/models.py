@@ -387,8 +387,8 @@ class ModelOptsFactory:
 
 
 def get_inference_api_client():
-    from inferio.client import InferenceAPIClient
-
+    from inferio.client import DistributedInferenceAPIClient
+    
     inference_api_url = os.getenv("INFERENCE_API_URL")
     if not inference_api_url:
         hostname = os.getenv("HOST", "127.0.0.1")
@@ -396,4 +396,4 @@ def get_inference_api_client():
             hostname = "127.0.0.1"
         port = int(os.getenv("PORT", 6342))
         inference_api_url = f"http://{hostname}:{port}"
-    return InferenceAPIClient(f"{inference_api_url}/api/inference")
+    return DistributedInferenceAPIClient(f"{inference_api_url}/api/inference")
