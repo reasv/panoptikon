@@ -127,7 +127,7 @@ class DistributedInferenceAPIClient:
         # Reassemble
         flat_outputs: list = list(
             itertools.chain.from_iterable(
-                partial_outputs[i] for i in range(len(shards))
+                partial_outputs.get(i, []) for i in range(len(shards))
             )
         )
         ordered_outputs = [None] * len(inputs)
@@ -167,7 +167,8 @@ class DistributedInferenceAPIClient:
     # Weight helpers
     def _normalise_weights(self, w: Sequence[float] | None) -> list[float]:
         if w is None:
-            return [1.0] * len(self._urls)
+            equal = 1.0 / len(self._urls)
+            return [equal] * len(self._urls)
         if len(w) != len(self._urls):
             raise ValueError("Weights must match number of URLs")
         if any(x <= 0 for x in w):
