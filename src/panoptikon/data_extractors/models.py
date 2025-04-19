@@ -18,7 +18,7 @@ import panoptikon.data_extractors.types as job_types
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
 from panoptikon.types import OutputDataType, TargetEntityType
-from panoptikon.utils import get_inference_api_urls
+from panoptikon.utils import get_inference_api_url_weights, get_inference_api_urls
 
 if TYPE_CHECKING:
     from panoptikon.config_type import SystemConfig
@@ -397,8 +397,9 @@ def get_inference_api_client():
             f"Using single inference API client for {inference_api_url}"
         )
         return InferenceAPIClient(f"{inference_api_url}/api/inference")
-    
+    weights = get_inference_api_url_weights()
+
     logger.info(
-        f"Using distributed inference API client for {inference_api_urls}"
+        f"Using distributed inference API client for {inference_api_urls} with weights {weights or '(No weights supplied)'}"
     )
-    return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls])
+    return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls], weights=weights)

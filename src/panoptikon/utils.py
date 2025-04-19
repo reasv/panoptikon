@@ -404,3 +404,16 @@ def is_external_inference_api() -> bool:
             return False
     return True
     
+def get_inference_api_url_weights() -> List[float] | None:
+    """
+    Get the weights for the URLs of the inference API.
+    """
+    weight_string_list = os.getenv("INFERENCE_API_URL_WEIGHTS")
+    if weight_string_list is None:
+        return None
+    weight_list = [float(w) for w in weight_string_list.split(",")]
+    if len(weight_list) != len(get_inference_api_urls()):
+        raise ValueError(
+            "The number of weights must match the number of URLs."
+        )
+    return weight_list
