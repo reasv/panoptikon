@@ -30,7 +30,7 @@ from panoptikon.db.files import (
     get_existing_file_for_sha256,
     get_item_metadata_by_sha256,
 )
-from panoptikon.utils import get_inference_api_url, open_file, show_in_fm
+from panoptikon.utils import get_inference_api_url, is_external_inference_api, open_file, show_in_fm
 from searchui.router import get_routers
 
 logger = logging.getLogger(__name__)
@@ -243,7 +243,9 @@ def get_app(hostname: str, port: int) -> FastAPI:
             ):
                 if not request.url.path.startswith(
                     "/api/inference"
-                ) or not os.getenv("INFERENCE_API_URL"):
+                ) or not os.getenv(
+                    "INFERENCE_API_URL"
+                ) or not is_external_inference_api():
                     return await call_next(request)
 
             timeout = 60

@@ -379,3 +379,28 @@ def get_inference_api_urls() -> List[str]:
     if isinstance(urls, str):
         return [urls]
     return urls
+
+def is_external_inference_api() -> bool:
+    """
+    Check if the inference API is external (not local).
+
+    Returns
+    -------
+    bool
+        True if the inference API is external, False otherwise.
+    """
+    urls = get_inference_api_urls()
+    # Filter out local URLs (having the same host and port as the current node)
+    hostname = os.getenv("HOST", "127.0.0.1")
+    if hostname == "0.0.0.0":
+        hostname = "127.0.0.1"
+    port = int(os.getenv("PORT", 6342))
+    # Remove trailing slashes from URLs
+    urls = [url.rstrip("/") for url in urls]
+    # Check if there is a single URL with the current node's host and port
+    for url in urls:
+        if f"{hostname}:{port}" in url:
+            # If the URL contains the current node's host and port, it's not external
+            return False
+    return True
+    
