@@ -230,14 +230,9 @@ class DistributedInferenceAPIClient:
                 logger.info("%s failed on %s, trying next… (%s)", method_name, url, e)
         raise RuntimeError(f"All servers unavailable for {method_name}")
 
-# -----------------------------------------------------------------------------------------
-# USAGE
-# -----------------------------------------------------------------------------------------
-#
 # >>> client = DistributedInferenceAPIClient(
 # ...     ["http://gpu‑0.local:9000", "http://gpu‑1.local:9000"],
 # ...     weights=[2, 1],   # optional
 # ... )
 #
 # >>> outs = client.predict(inference_id, cache_key, lru_size, ttl_seconds, inputs)
-
