@@ -254,6 +254,8 @@ See `config/inference/example.toml` for examples on how to add custom models fro
 
 Panoptikon accepts environment variables as config options. It uses dotenv, so you can create a file called `.env` in this folder with all the environment variables and their values, and it will be automatically applied at runtime.
 
+Some of these environment variables are explained here, for a more complete guide, read the `.env.example` file in this repository.
+
 ### HOST and PORT
 
 Default:
