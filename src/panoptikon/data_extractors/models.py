@@ -393,5 +393,12 @@ def get_inference_api_client():
     inference_api_urls = get_inference_api_urls()
     if len(inference_api_urls) == 1:
         inference_api_url = inference_api_urls[0]
+        logger.debug(
+            f"Using single inference API client for {inference_api_url}"
+        )
         return InferenceAPIClient(f"{inference_api_url}/api/inference")
+    
+    logger.info(
+        f"Using distributed inference API client for {inference_api_urls}"
+    )
     return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls])
