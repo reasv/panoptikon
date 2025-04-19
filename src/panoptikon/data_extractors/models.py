@@ -388,7 +388,10 @@ class ModelOptsFactory:
 
 
 def get_inference_api_client():
-    from inferio.client import DistributedInferenceAPIClient
+    from inferio.client import DistributedInferenceAPIClient, InferenceAPIClient
 
     inference_api_urls = get_inference_api_urls()
+    if len(inference_api_urls) == 1:
+        inference_api_url = inference_api_urls[0]
+        return InferenceAPIClient(f"{inference_api_url}/api/inference")
     return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls])
