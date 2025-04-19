@@ -21,14 +21,13 @@ class DistributedInferenceAPIClient:
 
     def __init__(
         self,
-        base_urls: Union[str, Sequence[str]],
-        *,
+        base_url: Union[str, Sequence[str]],
         weights: Sequence[float] | None = None,
         max_workers: int | None = None,
         retries: int = 3,
     ):
         self._urls: List[str] = (
-            [base_urls] if isinstance(base_urls, str) else list(base_urls)
+            [base_url] if isinstance(base_url, str) else list(base_url)
         )
         if not self._urls:
             raise ValueError("At least one base URL is required")
