@@ -1,5 +1,7 @@
+import multiprocessing
 import signal
 import atexit
+import subprocess
 import sys
 import os
 import time
@@ -16,39 +18,78 @@ def register_child(proc):
     with child_procs_lock:
         child_procs.append(proc)
 
-def cleanup_children():
+def cleanup_children(grace_period=3.0):
     with child_procs_lock:
         logger.debug(f"Cleaning up {len(child_procs)} child processes...")
+        term_time = {}  # pid: time we sent term
+        # 1. First: Try graceful terminate everywhere
         for proc in child_procs:
-            if proc.poll() is None:
-                try:
-                    logger.debug(f"Terminating {proc.pid} (args: {proc.args})...")
-                    if os.name == 'posix':
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    else:
-                        # Send CTRL_BREAK_EVENT if in new process group (required for .cmd etc!)
-                        kill_process_tree(proc.pid)
-                except Exception as e:
-                    logger.error(f"Failed to terminate {proc}: {e}")
-        # Check if they are still alive
-        is_proc_alive = [proc for proc in child_procs if proc.poll() is None]
-        if is_proc_alive:
-            logger.debug(f"Waiting for {len(is_proc_alive)} child processes to exit...")
-        else:
-            logger.debug("No child processes to wait for.")
-            return
-        # Wait for them to exit
-        time.sleep(2)
-        # Force kill as last resort
+            try:
+                # subprocess.Popen
+                if isinstance(proc, subprocess.Popen):
+                    if proc.poll() is None:
+                        logger.debug(f"Terminating Popen {proc.pid} (args: {getattr(proc, 'args', '')})...")
+                        if os.name == 'posix':
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        else:
+                            kill_process_tree(proc.pid)
+                        term_time[proc.pid] = True
+                # multiprocessing.Process
+                elif isinstance(proc, multiprocessing.Process):
+                    if proc.is_alive():
+                        logger.debug(f"Terminating multiprocessing.Process {proc.pid}...")
+                        proc.terminate()
+                        term_time[proc.pid] = True
+            except Exception as e:
+                logger.error(f"Failed to terminate {proc}: {e}", exc_info=True)
+
+        # 2. Wait up to grace_period for everyone to exit—check periodically
+        deadline = grace_period
+        poll_interval = 0.1
+        waited = 0.0
+        while waited < deadline:
+            still_running = []
+            for proc in child_procs:
+                alive = False
+                if isinstance(proc, subprocess.Popen):
+                    alive = proc.poll() is None
+                elif isinstance(proc, multiprocessing.Process):
+                    alive = proc.is_alive()
+                if alive:
+                    still_running.append(proc)
+            if not still_running:
+                break  # All done!
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        # 3. Any still alive? Force kill
         for proc in child_procs:
-            if proc.poll() is None:
-                try:
-                    if os.name == 'posix':
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    else:
-                        proc.kill()
-                except Exception as e:
-                    logger.error(f"Failed to kill {proc}: {e}")
+            try:
+                alive = False
+                if isinstance(proc, subprocess.Popen):
+                    alive = proc.poll() is None
+                elif isinstance(proc, multiprocessing.Process):
+                    alive = proc.is_alive()
+                if alive:
+                    logger.debug(f"Forcibly killing {proc.pid} ...")
+                    if isinstance(proc, subprocess.Popen):
+                        if os.name == 'posix':
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        else:
+                            kill_process_tree(proc.pid)
+                    elif isinstance(proc, multiprocessing.Process):
+                        force_kill_process(proc)
+            except Exception as e:
+                logger.error(f"Failed to force kill {proc}: {e}", exc_info=True)
+
+def force_kill_process(process):
+    if sys.platform == "win32":
+        process.terminate()
+    else:
+        try:
+            os.kill(process.pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 def handle_signal(sig, frame):
     logger.info(f"Received signal {sig}, cleaning up...")

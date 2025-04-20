@@ -18,6 +18,7 @@ from panoptikon.api.routers.jobs.impl import (
     run_folder_update,
 )
 from panoptikon.log import setup_logging
+from panoptikon.signal_handler import register_child
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class JobManager:
                 process = multiprocessing.Process(
                     target=execute_job, args=(job,)
                 )
+                register_child(process)
                 running_job = RunningJob(job=job, process=process)
                 with self.lock:
                     self.running_job = running_job

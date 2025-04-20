@@ -12,7 +12,8 @@ from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Sequence, Type, Union
 
 from inferio.types import PredictionInput
-from inferio.utils import clean_dict  # Ensure this is correctly imported
+from inferio.utils import clean_dict
+from panoptikon.signal_handler import register_child  # Ensure this is correctly imported
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -492,6 +493,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             args=(self._child_conn, self._kwargs),
             daemon=True,
         )
+        register_child(self._process)
         self._process.start()
 
     def _handle_subprocess_crash(self) -> None:
