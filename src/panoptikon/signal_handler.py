@@ -3,8 +3,10 @@ import atexit
 import sys
 import os
 import time
+import logging
 from threading import Lock
 
+logger = logging.getLogger(__name__)
 # Track all children
 child_procs = []
 child_procs_lock = Lock()
@@ -18,15 +20,16 @@ def cleanup_children():
         for proc in child_procs:
             if proc.poll() is None:
                 try:
-                    # Unix: Send SIGTERM to process group
                     if os.name == 'posix':
                         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                     else:
-                        proc.terminate()
+                        # Send CTRL_BREAK_EVENT if in new process group (required for .cmd etc!)
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
                 except Exception as e:
-                    print(f"Failed to terminate {proc}: {e}")
-        # Wait and force kill if needed
+                    logger.error(f"Failed to terminate {proc}: {e}")
+        # Wait for them to exit
         time.sleep(2)
+        # Force kill as last resort
         for proc in child_procs:
             if proc.poll() is None:
                 try:
@@ -35,10 +38,10 @@ def cleanup_children():
                     else:
                         proc.kill()
                 except Exception as e:
-                    print(f"Failed to kill {proc}: {e}")
+                    logger.error(f"Failed to kill {proc}: {e}")
 
 def handle_signal(sig, frame):
-    print(f"Received signal {sig}, cleaning up...")
+    logger.info(f"Received signal {sig}, cleaning up...")
     cleanup_children()
     sys.exit(0)
 
@@ -47,3 +50,4 @@ def setup_signal_handlers():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
     atexit.register(cleanup_children)
+    logger.debug("Signal handlers set up")

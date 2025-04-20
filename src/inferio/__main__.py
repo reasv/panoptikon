@@ -1,27 +1,24 @@
+import os
+
 import static_ffmpeg
-static_ffmpeg.add_paths()  # blocks until files are downloaded
-
+from fastapi import FastAPI
+from fastapi.concurrency import asynccontextmanager
 from dotenv import load_dotenv
-
 load_dotenv()
+
 from panoptikon.log import setup_logging
 setup_logging()
 from panoptikon.signal_handler import setup_signal_handlers
-import os
-
-from fastapi import FastAPI
-from fastapi.concurrency import asynccontextmanager
-
 from inferio.router import check_ttl, router
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await check_ttl()
     yield
 
-
 def launch_app():
+    setup_signal_handlers()
+    static_ffmpeg.add_paths()  # blocks until files are downloaded
     app = FastAPI(
         lifespan=lifespan,
         separate_input_output_schemas=False,
@@ -35,5 +32,4 @@ def launch_app():
 
 
 if __name__ == "__main__":
-    setup_signal_handlers()
     launch_app()
