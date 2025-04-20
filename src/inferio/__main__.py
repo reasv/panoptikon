@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from panoptikon.log import setup_logging
-
 setup_logging()
+from panoptikon.signal_handler import setup_signal_handlers
 import os
 
 from fastapi import FastAPI
@@ -35,4 +35,5 @@ def launch_app():
 
 
 if __name__ == "__main__":
+    setup_signal_handlers()
     launch_app()
