@@ -291,12 +291,12 @@ def get_embed(
     ):
         return last_embedded_text_embed
 
-    from panoptikon.data_extractors.models import ModelOptsFactory
+    from panoptikon.data_extractors.models import run_batch_inference
 
     logger.debug(f"Getting embedding for text: {text}")
     start_time = time.time()
-    model = ModelOptsFactory.get_model(model_name)
-    embed_bytes: bytes = model.run_batch_inference(
+    embed_bytes: bytes = run_batch_inference(
+        model_name,
         cache_args.cache_key,
         cache_args.lru_size,
         cache_args.ttl_seconds,

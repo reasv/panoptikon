@@ -15,12 +15,12 @@ from typing import (
     TypeVar,
 )
 
-import panoptikon.data_extractors.models as models
 from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
     ExtractionJobStart,
     JobInputData,
+    ModelMetadata,
 )
 from panoptikon.db import atomic_transaction
 from panoptikon.db.extraction_log import (
@@ -44,7 +44,7 @@ I = TypeVar("I")
 def run_extraction_job(
     conn: sqlite3.Connection,
     config: "SystemConfig",
-    model_opts: models.ModelOpts,
+    model: ModelMetadata,
     batch_size: int,
     threshold: float | None,
     input_transform: Callable[[JobInputData], Sequence[I]],
@@ -71,7 +71,7 @@ def run_extraction_job(
                 get_items_missing_data_extraction(
                     conn,
                     config,
-                    model_opts=model_opts,
+                    model=model,
                 ),
                 [None, -1],
             )[1]
@@ -80,7 +80,7 @@ def run_extraction_job(
 
     initial_remaining = get_remaining()
     if initial_remaining < 1:
-        logger.info(f"No items to process, aborting {model_opts.setter_name()}")
+        logger.info(f"No items to process, aborting {model.setter_name}")
         return
 
     load_callback()
@@ -102,13 +102,13 @@ def run_extraction_job(
             conn,
             scan_time,
             threshold,
-            [model_opts.data_type()],
-            model_opts.setter_name(),
+            [model.output_type],
+            model.setter_name,
             batch_size,
         )
         upsert_setter(
             conn,
-            model_opts.setter_name(),
+            model.setter_name,
         )
     yield ExtractionJobStart(
         start_time,
@@ -146,7 +146,7 @@ def run_extraction_job(
         get_items_missing_data_extraction(
             conn,
             config,
-            model_opts=model_opts,
+            model=model,
         ),
         batch_size,
         transform_input_handle_error,
@@ -174,7 +174,7 @@ def run_extraction_job(
             total_items = remaining + processed_items
             eta_str = estimate_eta(scan_time, processed_items, remaining)
             logger.info(
-                f"{model_opts.setter_name()}: ({processed_items}/{total_items}) "
+                f"{model.setter_name}: ({processed_items}/{total_items}) "
                 + f"(ETA: {eta_str}) "
                 + f"Processed ({item.type}) {item.path}"
             )

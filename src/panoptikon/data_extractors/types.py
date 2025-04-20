@@ -4,6 +4,8 @@ from typing import List, Optional, Tuple
 
 from pydantic import BaseModel
 
+from panoptikon.db.pql.pql_model import AndOperator
+from panoptikon.types import OutputDataType, TargetEntityType
 
 @dataclass
 class ExtractionJobStart:
@@ -62,3 +64,28 @@ class TagResult:
     rating_severity: List[str]
     metadata: dict[str, str]
     metadata_score: float = 0.0
+
+@dataclass
+class ModelMetadata:
+    group: str
+    inference_id: str
+    setter_name: str
+    input_handler: str
+    input_handler_opts: dict
+    output_type: OutputDataType
+    input_query: AndOperator
+    raw_metadata: dict
+    raw_group_metadata: dict
+    default_batch_size: int = 64
+    default_threshold: float | None = None
+    input_mime_types: List[str] | None = None
+    target_entities: List[TargetEntityType] | None = None
+    name: str | None = None
+    description: str | None = None
+    link: str | None = None
+
+    def __post_init__(self):
+        if self.target_entities is None:
+            self.target_entities = ["items"]
+        if self.input_mime_types is None:
+            self.input_mime_types = []

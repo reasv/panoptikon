@@ -1,391 +1,26 @@
 import logging
-import os
 import sqlite3
-from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
-    DefaultDict,
-    Dict,
     Generator,
     List,
     Sequence,
     Tuple,
-    Type,
 )
 
 import panoptikon.data_extractors.types as job_types
+from panoptikon.db.extraction_log import get_setter_data_types
 from panoptikon.db.setters import delete_setter_by_name
 from panoptikon.db.tags import delete_orphan_tags
-from panoptikon.types import OutputDataType, TargetEntityType
+from panoptikon.types import OutputDataType
 from panoptikon.utils import get_inference_api_url_weights, get_inference_api_urls
 
 if TYPE_CHECKING:
     from panoptikon.config_type import SystemConfig
     from panoptikon.db.pql.pql_model import AndOperator
 
-
 logger = logging.getLogger(__name__)
-
-
-class ModelOpts(ABC):
-
-    def __init__(self, model_name: str | None = None):
-        if model_name is None:
-            model_name = self.default_model()
-        assert self.valid_model(model_name), f"Invalid model {model_name}"
-
-        self._init(model_name)
-
-    def __str__(self):
-        return self.setter_name()
-
-    def __repr__(self):
-        return self.setter_name()
-
-    @classmethod
-    def target_entities(cls) -> List[TargetEntityType]:
-        return ["items"]
-
-    @classmethod
-    @abstractmethod
-    def available_models(cls) -> List[str]:
-        raise NotImplementedError
-
-    @classmethod
-    def default_batch_size(cls) -> int:
-        return 64
-
-    @classmethod
-    def default_threshold(cls) -> float | None:
-        return None
-
-    @classmethod
-    def valid_model(cls, model_name: str) -> bool:
-        return model_name in cls.available_models()
-
-    @classmethod
-    def default_model(cls) -> str:
-        return cls.available_models()[0]
-
-    def delete_extracted_data(self, conn: sqlite3.Connection):
-        delete_setter_by_name(conn, self.setter_name())
-        return f"Deleted data extracted from items by model {self.setter_name()}.\n"
-
-    @classmethod
-    def supported_mime_types(cls) -> List[str] | None:
-        return None
-
-    def item_extraction_rules(self) -> "AndOperator":
-        from panoptikon.db.pql.filters.kvfilters import (
-            Match,
-            MatchOps,
-            MatchValues,
-        )
-        from panoptikon.db.pql.filters.processed_by import ProcessedBy
-        from panoptikon.db.pql.pql_model import AndOperator, NotOperator
-
-        item_filter = AndOperator(and_=[])
-        mime_types = self.supported_mime_types()
-        if mime_types:
-            item_filter.and_.append(
-                Match(
-                    match=MatchOps(
-                        startswith=MatchValues(
-                            type=mime_types,
-                        )
-                    )
-                )
-            )
-        item_filter.and_.append(
-            NotOperator(not_=ProcessedBy(processed_by=self.setter_name()))
-        )
-
-        return item_filter
-
-    @classmethod
-    @abstractmethod
-    def data_type(cls) -> OutputDataType:
-        raise NotImplementedError
-
-    @abstractmethod
-    def run_extractor(
-        self,
-        conn: sqlite3.Connection,
-        config: "SystemConfig",
-        batch_size: int | None = None,
-        threshold: float | None = None,
-    ) -> Generator[
-        job_types.ExtractionJobProgress
-        | job_types.ExtractionJobReport
-        | job_types.ExtractionJobStart,
-        Any,
-        None,
-    ]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def setter_name(self) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _init(self, model_name: str):
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def name(cls) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def description(cls) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def group_name(cls) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    def run_batch_inference(
-        self,
-        cache_key: str,
-        lru_size: int,
-        ttl_seconds: int,
-        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
-    ):
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
-        raise NotImplementedError
-
-    @abstractmethod
-    def metadata(self) -> Dict[str, str | Dict[str, str] | None | List[str] | int | float]:
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def metadata_for_model(cls, model_name: str)  -> Dict[str, str | Dict[str, str] | None | List[str] | int | float]:
-        raise NotImplementedError
-
-class ModelGroup(ModelOpts):
-    _group: str
-
-    def _init(self, model_name: str):
-        self._inference_id = model_name
-
-    @classmethod
-    def _meta(cls):
-        return ModelOptsFactory.get_group_metadata(cls._group)
-
-    def _id_meta(self):
-        return ModelOptsFactory.get_inference_id_metadata(
-            self._group, self._inference_id
-        )
-
-    @classmethod
-    def _models(cls):
-        return ModelOptsFactory.get_group_models(cls._group)
-    
-    @classmethod
-    def metadata_for_model(cls, model_name: str):
-        return ModelOptsFactory.get_inference_id_metadata(cls._group, model_name)
-
-    @classmethod
-    def target_entities(cls) -> List[TargetEntityType]:
-        return cls._meta().get("target_entities", ["items"])
-
-    @classmethod
-    def available_models(cls) -> List[str]:
-        return list(cls._models().keys())
-
-    @classmethod
-    def default_batch_size(cls) -> int:
-        return cls._meta().get("default_batch_size", 64)
-
-    @classmethod
-    def default_threshold(cls) -> float | None:
-        return cls._meta().get("default_threshold")
-    
-    def metadata(self):
-        return self._id_meta()
-
-    def input_spec(self) -> Tuple[str, dict]:
-        spec = self._id_meta().get("input_spec", None)
-        assert (
-            spec is not None
-        ), f"Input spec not found for {self.setter_name()}"
-        handler_name = spec.get("handler", None)
-        assert (
-            handler_name is not None
-        ), f"Input handler not found for {self.setter_name()}"
-        opts = spec.get("opts", {})
-        return handler_name, opts
-
-    @classmethod
-    def default_model(cls) -> str:
-        return cls._meta().get(
-            "default_inference_id", cls.available_models()[0]
-        )
-
-    @classmethod
-    def supported_mime_types(cls) -> List[str] | None:
-        return cls._meta().get("input_mime_types")
-
-    @classmethod
-    def data_type(cls) -> OutputDataType:
-        return cls._meta().get("output_type", "text")
-
-    def setter_name(self) -> str:
-        return self._group + "/" + self._inference_id
-
-    @classmethod
-    def name(cls) -> str:
-        return cls._meta().get("name", cls._group)
-
-    @classmethod
-    def description(cls) -> str:
-        return cls._meta().get("description", f"Run {cls._group} extractor")
-
-    @classmethod
-    def group_name(cls) -> str:
-        return cls._group
-
-    def load_model(self, cache_key: str, lru_size: int, ttl_seconds: int):
-        get_inference_api_client().load_model(
-            self.setter_name(), cache_key, lru_size, ttl_seconds
-        )
-
-    def unload_model(self, cache_key: str):
-        get_inference_api_client().unload_model(self.setter_name(), cache_key)
-
-    def delete_extracted_data(self, conn: sqlite3.Connection):
-        msg = super().delete_extracted_data(conn)
-        if self.data_type() == "tags":
-            orphans_deleted = delete_orphan_tags(conn)
-            msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
-        return msg
-
-    def run_extractor(
-        self,
-        conn: sqlite3.Connection,
-        config: "SystemConfig",
-        batch_size: int | None = None,
-        threshold: float | None = None,
-    ):
-        from panoptikon.data_extractors.dynamic_job import (
-            run_dynamic_extraction_job,
-        )
-
-        if batch_size is None:
-            batch_size = self.default_batch_size()
-
-        if threshold is None:
-            threshold = self.default_threshold()
-        elif self.default_threshold() is None:
-            logger.warning(
-                f"Threshold {threshold} set for model {self.setter_name()} "
-                "but model does not accept thresholds."
-            )
-            threshold = None
-
-        return run_dynamic_extraction_job(
-            conn, config, self, batch_size=batch_size, threshold=threshold
-        )
-
-    def run_batch_inference(
-        self,
-        cache_key: str,
-        lru_size: int,
-        ttl_seconds: int,
-        inputs: Sequence[Tuple[str | dict | None, bytes | None]],
-    ):
-        result = get_inference_api_client().predict(
-            self.setter_name(), cache_key, lru_size, ttl_seconds, inputs
-        )
-        return result
-
-
-class ModelOptsFactory:
-    _group_metadata = {}
-    _api_models: Dict[str, Type["ModelGroup"]] = {}
-
-    @classmethod
-    def get_all_model_opts(cls) -> List[Type[ModelOpts]]:
-        api_modelopts = []
-        try:
-            cls.refetch_metadata()
-            api_modelopts = cls.get_api_model_opts()
-        except Exception as e:
-            logger.error(f"Failed to load API model opts: {e}", exc_info=True)
-        return api_modelopts
-
-    @classmethod
-    def get_api_model_opts(cls) -> List[Type[ModelOpts]]:
-        for group_name, _ in cls.get_metadata().items():
-            if group_name in cls._api_models:
-                continue
-            cls._api_models[group_name] = type(
-                f"Group_{group_name}",
-                (ModelGroup,),
-                {"_group": group_name},
-            )
-        return list(cls._api_models.values())
-
-    @classmethod
-    def get_model_opts(cls, setter_name: str) -> Type[ModelOpts]:
-        for model_opts in cls.get_all_model_opts():
-            if model_opts.valid_model(setter_name):
-                return model_opts
-        raise ValueError(f"Invalid model name {setter_name}")
-
-    @classmethod
-    def get_model(cls, setter_name: str) -> ModelOpts:
-        s = setter_name.split("/", 1)
-        if len(s) == 2:
-            group_name, inference_id = s
-        else:
-            group_name, inference_id = None, None
-        if not cls._api_models:
-            cls.get_api_model_opts()
-        if group_name in cls._api_models:
-            return cls._api_models[group_name](model_name=inference_id)
-        model_opts = cls.get_model_opts(setter_name)
-        return model_opts(setter_name)
-
-    @classmethod
-    def get_metadata(cls) -> Dict[str, Any]:
-        if not cls._group_metadata:
-            cls._group_metadata = get_inference_api_client().get_metadata()
-        return cls._group_metadata
-
-    @classmethod
-    def get_group_metadata(cls, group_name) -> Dict[str, Any]:
-        return cls.get_metadata()[group_name]["group_metadata"]
-
-    @classmethod
-    def get_inference_id_metadata(
-        cls, group_name: str, inference_id: str
-    ) -> Dict[str, Any]:
-        group_metadata = cls.get_group_metadata(group_name)
-        item_meta: Dict[str, Any] = cls.get_metadata()[group_name][
-            "inference_ids"
-        ][inference_id]
-        return {
-            **group_metadata,
-            **item_meta,
-        }
-
-    @classmethod
-    def get_group_models(cls, group_name) -> Dict[str, Any]:
-        return cls.get_metadata()[group_name]["inference_ids"]
-
-    @classmethod
-    def refetch_metadata(cls):
-        cls._group_metadata = get_inference_api_client().get_metadata()
-
 
 def get_inference_api_client():
     from inferio.client import DistributedInferenceAPIClient, InferenceAPIClient
@@ -403,3 +38,157 @@ def get_inference_api_client():
         f"Using distributed inference API client for {inference_api_urls} with weights {weights or '(No weights supplied)'}"
     )
     return DistributedInferenceAPIClient([f"{inference_api_url}/api/inference" for inference_api_url in inference_api_urls], weights=weights)
+
+class MissingModelException(Exception):
+    """Exception raised when a model or group is not found."""
+    pass
+
+def get_model_metadata(group_or_setter_name: str, inference_id: str | None = None) -> job_types.ModelMetadata:
+    """
+    Get the model metadata for a given group and inference_id or full setter name.
+    """
+    if inference_id is None:
+        setter_name = group_or_setter_name
+        group_name, inference_id = setter_name.split("/", 1)
+    else:
+        group_name = group_or_setter_name
+        setter_name = f"{group_name}/{inference_id}"
+
+    groups_metadata = get_inference_api_client().get_metadata()
+
+    if group_name not in groups_metadata:
+        raise MissingModelException(f"Group does not exist: {group_name}")
+    
+    if inference_id not in groups_metadata[group_name]["inference_ids"]:
+        raise MissingModelException(f"Inference ID does not exist: {group_name}/{inference_id}")
+
+    group_metadata = groups_metadata[group_name]["group_metadata"]
+    model_metadata = {
+        **group_metadata,
+        **groups_metadata[group_name]["inference_ids"][inference_id],
+    }
+    return job_types.ModelMetadata(
+        group=group_name,
+        inference_id=inference_id,
+        setter_name=setter_name,
+        input_handler=model_metadata["input_spec"]["handler"],
+        input_handler_opts=model_metadata["input_spec"].get("opts", {}),
+        target_entities=model_metadata.get("target_entities", ["items"]),
+        output_type=model_metadata.get("output_type", "text"),
+        default_batch_size=model_metadata.get("default_batch_size", 64),
+        default_threshold=model_metadata.get("default_threshold"),
+        input_mime_types=model_metadata.get("input_mime_types", []),
+        name=model_metadata.get("name"),
+        description=model_metadata.get("description"),
+        link=model_metadata.get("link"),
+        input_query=build_input_query(setter_name, model_metadata),
+        raw_metadata=model_metadata,
+        raw_group_metadata=group_metadata,
+    )
+
+def model_exists(group_or_setter_name: str, inference_id: str | None = None) -> bool:
+    """
+    Check if a model exists for a given group and inference_id or full setter name.
+    """
+    try:
+        get_model_metadata(group_or_setter_name, inference_id)
+        return True
+    except MissingModelException:
+        return False
+
+def build_input_query(setter_name: str, raw_metadata: dict) -> "AndOperator":
+    """
+    Build the input query from a model's raw metadata.
+    """
+    from panoptikon.db.pql.filters.kvfilters import (
+        Match,
+        MatchOps,
+        MatchValues,
+    )
+    from panoptikon.db.pql.filters.processed_by import ProcessedBy
+    from panoptikon.db.pql.pql_model import AndOperator, NotOperator
+
+    item_filter = AndOperator(and_=[])
+    mime_types = raw_metadata.get("input_mime_types", [])
+    if mime_types:
+        item_filter.and_.append(
+            Match(
+                match=MatchOps(
+                    startswith=MatchValues(
+                        type=mime_types,
+                    )
+                )
+            )
+        )
+    item_filter.and_.append(
+        NotOperator(not_=ProcessedBy(processed_by=setter_name))
+    )
+
+    return item_filter
+
+def run_model_extractor(
+    conn: sqlite3.Connection,
+    config: "SystemConfig",
+    model: job_types.ModelMetadata,
+    batch_size: int | None = None,
+    threshold: float | None = None,
+) -> Generator[
+    job_types.ExtractionJobProgress
+    | job_types.ExtractionJobReport
+    | job_types.ExtractionJobStart,
+    Any,
+    None,
+]:
+    """
+    Run the model extractor for a given model.
+    """
+    from panoptikon.data_extractors.dynamic_job import run_dynamic_extraction_job
+
+    return run_dynamic_extraction_job(
+        conn,
+        config,
+        model,
+        batch_size=batch_size or model.default_batch_size,
+        threshold=threshold or model.default_threshold,
+    )
+
+def load_model(setter_name: str, cache_key: str, lru_size: int, ttl_seconds: int):
+    """ Ask the inference API to load a model into memory """
+    get_inference_api_client().load_model(
+        setter_name, cache_key, lru_size, ttl_seconds
+    )
+
+def unload_model(setter_name: str, cache_key: str):
+    """
+    Signal to the inference API that the model is no longer needed.
+    This will unload the model from the inference API and free up resources.
+    """
+    get_inference_api_client().unload_model(setter_name, cache_key)
+
+def run_batch_inference(
+    setter_name: str,
+    cache_key: str,
+    lru_size: int,
+    ttl_seconds: int,
+    inputs: Sequence[Tuple[str | dict | None, bytes | None]],
+) -> Any:
+    """
+    Run batch inference for a given model.
+    """
+    return get_inference_api_client().predict(
+        setter_name, cache_key, lru_size, ttl_seconds, inputs
+    )
+
+def delete_extracted_data(conn: sqlite3.Connection, setter_name: str):
+    """
+    Delete all data generated by a given model.
+    This includes the data extracted from items and any orphaned tags resulting
+    from the deletion of the extracted data.
+    """
+    data_types: List[OutputDataType] = get_setter_data_types(conn, setter_name)
+    delete_setter_by_name(conn, setter_name)
+    msg =  f"Deleted data extracted from items by model {setter_name}.\n"
+    if "tags" in data_types:
+        orphans_deleted = delete_orphan_tags(conn)
+        msg += f"\nDeleted {orphans_deleted} orphaned tags.\n"
+    return msg

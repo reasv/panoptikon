@@ -4,14 +4,13 @@ from typing import List
 from panoptikon.api.routers.jobs.manager import Job
 from panoptikon.api.routers.jobs.router import job_manager
 from panoptikon.api.routers.utils import get_db_system_wl
-from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.types import CronJob
 
 logger = logging.getLogger(__name__)
 
-
 def run_cronjob(index_db: str):
     from panoptikon.config import retrieve_system_config
+    from panoptikon.data_extractors.models import get_model_metadata, MissingModelException
 
     try:
         logger.info("Running cronjob")
@@ -36,8 +35,24 @@ def run_cronjob(index_db: str):
         src_jobs: List[CronJob] = []
         derived_data_jobs: List[CronJob] = []
         for scheduled_job in system_config.cron_jobs:
-            model = ModelOptsFactory.get_model(scheduled_job.inference_id)
-            if model.target_entities() == ["items"]:
+            try:
+                model = get_model_metadata(scheduled_job.inference_id)
+            except MissingModelException:
+                logger.error(
+                    f"Model {scheduled_job.inference_id} is in the cron schedule, but not available on the inference server, skipping..."
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Error retrieving model metadata for {scheduled_job.inference_id}: {e}",
+                    exc_info=True,
+                )
+                logger.warning(
+                    f"Skipping {scheduled_job.inference_id} extraction job due to error."
+                )
+                continue
+
+            if model.target_entities == ["items"]:
                 src_jobs.append(scheduled_job)
             else:
                 logger.debug(

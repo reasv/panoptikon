@@ -13,7 +13,6 @@ from panoptikon.api.routers.jobs.manager import (
 from panoptikon.api.routers.utils import get_db_readonly, get_db_system_wl
 from panoptikon.config import persist_system_config, retrieve_system_config
 from panoptikon.config_type import SystemConfig
-from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.db import get_database_connection
 from panoptikon.db.extraction_log import (
     get_all_data_logs,
@@ -96,16 +95,17 @@ def enqueue_data_extraction_job(
 def get_default_config(
     inference_id: str, index_db: str
 ) -> Tuple[int, float | None]:
-    model = ModelOptsFactory.get_model(inference_id)
+    from panoptikon.data_extractors.models import get_model_metadata
+    model = get_model_metadata(inference_id)
     batch_size, threshold = (
-        model.default_batch_size(),
-        model.default_threshold(),
+        model.default_batch_size,
+        model.default_threshold,
     )
     system_config = retrieve_system_config(index_db)
     job_settings = system_config.job_settings
     for setting in job_settings:
         if (
-            setting.group_name == model.group_name()
+            setting.group_name == model.group
             and setting.inference_id == None
         ):
             batch_size = (
@@ -114,7 +114,7 @@ def get_default_config(
                 else batch_size
             )
             # Model accepts threshold as a parameter
-            if model.default_threshold() is not None:
+            if model.default_threshold is not None:
                 threshold = (
                     setting.default_threshold
                     if setting.default_threshold is not None
@@ -122,8 +122,8 @@ def get_default_config(
                 )
     for setting in job_settings:
         if (
-            setting.group_name == model.group_name()
-            and setting.inference_id == model.setter_name()
+            setting.group_name == model.group
+            and setting.inference_id == model.setter_name
         ):
             batch_size = (
                 setting.default_batch_size
@@ -131,7 +131,7 @@ def get_default_config(
                 else batch_size
             )
             # Model accepts threshold as a parameter
-            if model.default_threshold() is not None:
+            if model.default_threshold is not None:
                 threshold = (
                     setting.default_threshold
                     if setting.default_threshold is not None

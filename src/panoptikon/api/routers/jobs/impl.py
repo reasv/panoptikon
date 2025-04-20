@@ -2,7 +2,6 @@ import datetime
 import logging
 from typing import Any, Dict
 
-from panoptikon.data_extractors.models import ModelOptsFactory
 from panoptikon.data_extractors.types import (
     ExtractionJobProgress,
     ExtractionJobReport,
@@ -112,11 +111,11 @@ def delete_model_data(
     inference_id: str,
     conn_args: Dict[str, Any],
 ):
-    model = ModelOptsFactory.get_model(inference_id)
+    from panoptikon.data_extractors.models import delete_extracted_data
     with ensure_close(get_database_connection(**conn_args)) as conn:
-        logger.info(f"Running data deletion job for model {model}")
+        logger.info(f"Running data deletion job for model {inference_id}")
         with atomic_transaction(conn, logger):
-            report_str = model.delete_extracted_data(conn)
+            report_str = delete_extracted_data(conn, inference_id)
             logger.info(report_str)
         vacuum_database(conn)
         analyze_database(conn)
@@ -141,6 +140,7 @@ def run_data_extraction_job(
     conn_args: Dict[str, Any],
 ):
     from panoptikon.config import retrieve_system_config
+    from panoptikon.data_extractors.models import run_model_extractor, get_model_metadata, MissingModelException
     with ensure_close(get_database_connection(**conn_args)) as conn:
         system_config = retrieve_system_config(conn_args["index_db"])
         resync_needed = is_resync_needed(conn, system_config)
@@ -151,14 +151,21 @@ def run_data_extraction_job(
         )
         run_folder_update(conn_args)
 
-    model = ModelOptsFactory.get_model(inference_id)
+    try:
+        model = get_model_metadata(inference_id)
+    except MissingModelException:
+        logger.error(
+            f"Model {inference_id} is not available on the inference server, skipping job..."
+        )
+        return
+
     with ensure_close(get_database_connection(**conn_args)) as conn:
         try:
             with atomic_transaction(conn, logger):
                 failed, images, videos, other, units = [], 0, 0, 0, 0
                 start_time = datetime.datetime.now()
-                for progress in model.run_extractor(
-                    conn, system_config, batch_size, threshold
+                for progress in run_model_extractor(
+                    conn, system_config, model, batch_size, threshold
                 ):
                     if type(progress) == ExtractionJobProgress:
                         # Job is in progress

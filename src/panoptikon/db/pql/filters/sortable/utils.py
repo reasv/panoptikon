@@ -30,10 +30,10 @@ def extract_embeddings(buffer: str) -> bytes:
 def get_distance_func_override(
         model_name: str,
 ) -> Optional[Literal["L2", "COSINE"]]:
-    from panoptikon.data_extractors.models import ModelOptsFactory
+    from panoptikon.data_extractors.models import get_model_metadata
 
-    model = ModelOptsFactory.get_model(model_name)
-    distance_func_override = model.metadata().get("distance_func", None)
+    model = get_model_metadata(model_name)
+    distance_func_override = model.raw_metadata.get("distance_func", None)
     assert distance_func_override in [None, "L2", "cosine"], f"""
     Invalid `distance_func` value for {model_name}: {distance_func_override}.
     Must be one of: null, 'L2', 'cosine'

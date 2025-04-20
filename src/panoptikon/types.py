@@ -3,12 +3,6 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, Union
 
 from pydantic import BaseModel, Field
 
-# from panoptikon.db.pql.pql_model import QueryElement
-
-if TYPE_CHECKING:
-    from panoptikon.data_extractors.models import ModelOpts
-
-
 @dataclass
 class ItemScanMeta:
     md5: str
@@ -19,7 +13,6 @@ class ItemScanMeta:
     audio_tracks: int | None = None
     video_tracks: int | None = None
     subtitle_tracks: int | None = None
-
 
 @dataclass
 class ItemRecord:
@@ -152,14 +145,6 @@ class SearchStats:
     file_types: List[str] = field(default_factory=list)
     folders: List[str] = field(default_factory=list)
     loaded: bool = False
-
-
-@dataclass
-class RuleStats:
-    folders: List[str] = field(default_factory=list)
-    file_types: List[str] = field(default_factory=list)
-    model_types: List[Type["ModelOpts"]] = field(default_factory=list)
-
 
 class JobSettings(BaseModel):
     group_name: str

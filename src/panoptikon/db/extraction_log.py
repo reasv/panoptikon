@@ -3,6 +3,8 @@ import sqlite3
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Tuple
 
+from panoptikon.data_extractors.types import ModelMetadata
+
 if TYPE_CHECKING:
     import panoptikon.data_extractors.models as models
 
@@ -279,7 +281,7 @@ def add_item_data(
 def get_items_missing_data_extraction(
     conn: sqlite3.Connection,
     config: SystemConfig,
-    model_opts: "models.ModelOpts",
+    model: ModelMetadata,
 ):
     """
     Get all items that should be processed by the given setter.
@@ -296,7 +298,7 @@ def get_items_missing_data_extraction(
         f.pql_query
         for f in config.job_filters
         if (
-            f.setter_names.index(model_opts.setter_name()) != -1
+            f.setter_names.index(model.setter_name) != -1
             or f.setter_names.index("*") != -1
         )
     ]
@@ -308,7 +310,7 @@ def get_items_missing_data_extraction(
         else:
             flattened_user_filters.append(f)
 
-    model_filters = model_opts.item_extraction_rules()
+    model_filters = model.input_query
     model_filters.and_.extend(flattened_user_filters)
 
     query = PQLQuery(
@@ -319,7 +321,7 @@ def get_items_missing_data_extraction(
     logger.debug(
         f"Job Item Query: {(query.query or query).model_dump(exclude_defaults=True)}"
     )
-    if model_opts.target_entities() == ["items"]:
+    if model.target_entities == ["items"]:
         query.entity = "file"
         query.partition_by = ["item_id"]
         query.select = [
@@ -335,7 +337,7 @@ def get_items_missing_data_extraction(
             "video_tracks",
             "subtitle_tracks",
         ]
-    elif model_opts.target_entities() == ["text"]:
+    elif model.target_entities == ["text"]:
         query.entity = "text"
         query.partition_by = ["data_id"]
         query.select = [
@@ -396,6 +398,30 @@ def get_existing_setters(
 
     return results
 
+def get_setter_data_types(conn: sqlite3.Connection, setter_name: str) -> List[OutputDataType]:
+    """
+    Returns all the currently existing data types for a given setter.
+
+    Args:
+        conn (sqlite3.Connection): The SQLite database connection.
+        setter_name (str): The name of the setter.
+
+    Returns:
+        List[str]: A list of data types for the given setter.
+    """
+    query = """
+    SELECT DISTINCT ie.data_type
+    FROM item_data ie
+    JOIN setters s ON ie.setter_id = s.id
+    WHERE s.name = ?;
+    """
+
+    cursor = conn.cursor()
+    cursor.execute(query, (setter_name,))
+    results = cursor.fetchall()
+    cursor.close()
+
+    return [result[0] for result in results]
 
 def get_setters_total_data(
     conn: sqlite3.Connection,

@@ -19,8 +19,8 @@ from panoptikon.data_extractors.data_loaders.images import (
     image_loader,
 )
 from panoptikon.data_extractors.extraction_job import run_extraction_job
-from panoptikon.data_extractors.models import ModelGroup
-from panoptikon.data_extractors.types import JobInputData
+from panoptikon.data_extractors.types import JobInputData, ModelMetadata
+from panoptikon.data_extractors import models
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 def run_dynamic_extraction_job(
     conn: sqlite3.Connection,
     config: SystemConfig,
-    model: ModelGroup,
+    model: ModelMetadata,
     batch_size: int,
     threshold: float | None,
 ):
@@ -41,15 +41,16 @@ def run_dynamic_extraction_job(
         logger.info("No score threshold set")
     inference_opts = {"threshold": threshold} if threshold else {}
 
-    cache_args = "batch", 1, 60
+    cache_key = "batch"
+    cache_args = cache_key, 1, 60
 
     def load_model():
-        model.load_model(*cache_args)
+        models.load_model(model.setter_name, *cache_args)
 
     def cleanup():
-        model.unload_model("batch")
+        models.unload_model(model.setter_name, cache_key)
 
-    handler_name, handler_opts = model.input_spec()
+    handler_name, handler_opts = model.input_handler, model.input_handler_opts
 
     if handler_name == "image_frames":
 
@@ -144,12 +145,13 @@ def run_dynamic_extraction_job(
     def batch_inference_func(
         batch: Sequence[Tuple[Dict[str, Any], bytes | None]],
     ) -> List[Dict[str, Any]] | List[bytes]:
-        return model.run_batch_inference(
+        return models.run_batch_inference(
+            model.setter_name,
             *cache_args,
             [({**data, **inference_opts}, file) for data, file in batch],
         )
 
-    if model.data_type() == "tags":
+    if model.output_type == "tags":
 
         def tag_handler(
             job_id: int,
@@ -157,11 +159,11 @@ def run_dynamic_extraction_job(
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
-            handle_tag_result(conn, job_id, model.setter_name(), item, outputs)
+            handle_tag_result(conn, job_id, model.setter_name, item, outputs)
 
         result_handler = tag_handler
 
-    elif model.data_type() == "text":
+    elif model.output_type == "text":
 
         def text_handler(
             job_id: int,
@@ -169,11 +171,11 @@ def run_dynamic_extraction_job(
             _: Sequence[Any],
             outputs: Sequence[Dict[str, Any]],
         ):
-            handle_text(conn, job_id, model.setter_name(), item, outputs)
+            handle_text(conn, job_id, model.setter_name, item, outputs)
 
         result_handler = text_handler
 
-    elif model.data_type() == "clip":
+    elif model.output_type == "clip":
 
         def clip_handler(
             job_id: int,
@@ -181,11 +183,11 @@ def run_dynamic_extraction_job(
             _: Sequence[Any],
             embeddings: Sequence[bytes],
         ):
-            handle_clip(conn, job_id, model.setter_name(), item, embeddings)
+            handle_clip(conn, job_id, model.setter_name, item, embeddings)
 
         result_handler = clip_handler
 
-    elif model.data_type() == "text-embedding":
+    elif model.output_type == "text-embedding":
 
         def text_emb_handler(
             job_id: int,
@@ -194,12 +196,12 @@ def run_dynamic_extraction_job(
             embeddings: Sequence[bytes],
         ):
             handle_text_embeddings(
-                conn, job_id, model.setter_name(), item, embeddings
+                conn, job_id, model.setter_name, item, embeddings
             )
 
         result_handler = text_emb_handler
     else:
-        raise ValueError(f"Data handler not found for {model.data_type()}")
+        raise ValueError(f"Data handler not found for {model.output_type}")
 
     return run_extraction_job(
         conn,

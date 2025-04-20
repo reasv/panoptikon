@@ -321,12 +321,12 @@ def get_clip_embed(
     embed_args: EmbedArgs,
 ):
 
-    from panoptikon.data_extractors.models import ModelOptsFactory
+    from panoptikon.data_extractors.models import run_batch_inference
 
-    model = ModelOptsFactory.get_model(model_name)
 
     if isinstance(input, str):
-        embed_bytes: bytes = model.run_batch_inference(
+        embed_bytes: bytes = run_batch_inference(
+            model_name,
             embed_args.cache_key,
             embed_args.lru_size,
             embed_args.ttl_seconds,
@@ -342,7 +342,8 @@ def get_clip_embed(
         input.save(image_buffer, format="PNG")
         input_bytes = image_buffer.getvalue()
 
-        embed_bytes: bytes = model.run_batch_inference(
+        embed_bytes: bytes = run_batch_inference(
+            model_name,
             embed_args.cache_key,
             embed_args.lru_size,
             embed_args.ttl_seconds,

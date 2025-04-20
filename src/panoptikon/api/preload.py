@@ -42,7 +42,7 @@ def preload_embedding_models(index_db: str, ttl: int = 3600):
     preload_status[index_db] = True
     with ensure_close(get_database_connection(**get_db_readonly(index_db, None))) as conn:
         try:
-            from panoptikon.data_extractors.models import ModelOptsFactory
+            from panoptikon.data_extractors.models import load_model
 
             embedding_setters = [
                 setter
@@ -60,14 +60,11 @@ def preload_embedding_models(index_db: str, ttl: int = 3600):
                 next_renewal_time = next_renewal_times[index_db].get(setter)
                 if not next_renewal_time or current_time >= next_renewal_time:
                     try:
-                        model = ModelOptsFactory.get_model(setter)
+                       load_model(setter, f"preload[{index_db}]", len(embedding_setters), ttl)
                     except Exception as e:
                         logger.error(
                             f"Failed to preload embedding model for {setter}: {e}")
                         continue
-                    model.load_model(
-                        f"preload[{index_db}]", len(embedding_setters), ttl
-                    )
                     next_renewal_times[index_db][setter] = current_time + timedelta(
                         seconds=max(ttl - 130, 60)  # Renew >2 minutes before expiry
                     )
