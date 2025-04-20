@@ -9,7 +9,6 @@ from venv import logger
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 from nodejs_wheel import npm, npx
-import nodejs_wheel
 import subprocess
 import os
 from panoptikon.signal_handler import register_child
@@ -120,16 +119,16 @@ def run_node_client_server(client_dir, port, hostname):
 
     cmd = [next_bin, "start", "-p", str(port), "-H", hostname]
     kwargs = dict(cwd=client_dir)
-    # Pass through parent's env, or add NODE_ENV, etc if desired
+    # Pass through parent's env
+    kwargs["env"] = os.environ.copy()
 
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        # You may need to specify shell=True so .cmd/.ps1 resolution works
+        # Need to specify shell=True so .cmd/.ps1 resolution works
         kwargs["shell"] = True
     else:
         kwargs["preexec_fn"] = os.setsid
 
-    # Capture output to debug why it fails
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -138,15 +137,13 @@ def run_node_client_server(client_dir, port, hostname):
         encoding="utf-8",
         **kwargs
     )
-    from panoptikon.signal_handler import register_child
     register_child(proc)
 
-    # Print lines as they appear (optional: background thread or poll)
-    import threading
+    # Print lines as they appear
     def log_output(stream, logger_method):
         for line in iter(stream.readline, ''):
             logger_method(f'{line.strip()}')
-    import logging
+
     logger = logging.getLogger("panoptikon.webui")
     t1 = threading.Thread(target=log_output, args=(proc.stdout, logger.info))
     t1.daemon = True
