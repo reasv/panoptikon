@@ -9,6 +9,10 @@ from venv import logger
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 from nodejs_wheel import npm, npx
+import nodejs_wheel
+import subprocess
+import os
+from panoptikon.signal_handler import register_child
 
 logger = logging.getLogger(__name__)
 
@@ -96,28 +100,60 @@ def run_node_client(hostname: str, port: int):
         else:
             logger.info("Build is up to date. Skipping build step.")
 
-    # Function to start the server in a separate thread
-    def start_server():
-        logger.info("Starting the Node.js client server...")
-        if public_api := os.getenv("PANOPTIKON_API_URL"):
-            logger.info(f"API URL for client: {public_api}")
-        
-        other_values = {}
-        if os.name == "nt":
-            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
-            other_values["creationflags"] = creationflags
-        npx(
-            ["--yes", "next", "start", "-p", str(port), "-H", hostname],
-            cwd=client_dir,
-            **other_values
-        )
+    logger.info(f"Launching the webui on http://{hostname}:{port} ...")
+    if public_api := os.getenv("PANOPTIKON_API_URL"):
+        logger.info(f"API URL for client: {public_api}")
+    
+    run_node_client_server(client_dir, port, hostname)
 
-    # Start the server in a new thread
-    server_thread = threading.Thread(target=start_server)
-    server_thread.start()
+def get_next_bin(client_dir):
+    bin_dir = os.path.join(client_dir, "node_modules", ".bin")
+    # On Windows: .cmd or .ps1, on UNIX: symlink/executable script
+    for suffix in (".cmd", ".ps1", "") if os.name == "nt" else ("",):
+        path = os.path.join(bin_dir, "next" + suffix)
+        if os.path.exists(path):
+            return path
+    raise RuntimeError("Could not find node_modules/.bin/next script")
 
-    logger.info(f"Node.js client started on {hostname}:{port}")
+def run_node_client_server(client_dir, port, hostname):
+    next_bin = get_next_bin(client_dir)
 
+    cmd = [next_bin, "start", "-p", str(port), "-H", hostname]
+    kwargs = dict(cwd=client_dir)
+    # Pass through parent's env, or add NODE_ENV, etc if desired
+
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        # You may need to specify shell=True so .cmd/.ps1 resolution works
+        kwargs["shell"] = True
+    else:
+        kwargs["preexec_fn"] = os.setsid
+
+    # Capture output to debug why it fails
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        **kwargs
+    )
+    from panoptikon.signal_handler import register_child
+    register_child(proc)
+
+    # Print lines as they appear (optional: background thread or poll)
+    import threading
+    def log_output(stream, logger_method):
+        for line in iter(stream.readline, ''):
+            logger_method(f'{line.strip()}')
+    import logging
+    logger = logging.getLogger("panoptikon.webui")
+    t1 = threading.Thread(target=log_output, args=(proc.stdout, logger.info))
+    t1.daemon = True
+    t1.start()
+    t2 = threading.Thread(target=log_output, args=(proc.stderr, logger.error))
+    t2.daemon = True
+    t2.start()
 
 def delete_build_directory(build_dir):
     """
