@@ -230,9 +230,9 @@ def get_app(hostname: str, port: int) -> FastAPI:
 
         @app.middleware("http")
         async def proxy_middleware(request: Request, call_next):
-            logger.debug(
-                f"Received request: {request.method} {request.url.path}"
-            )
+            # logger.debug(
+            #     f"Received request: {request.method} {request.url.path}"
+            # )
 
             # If the request is for the API, let FastAPI handle it
             if (
