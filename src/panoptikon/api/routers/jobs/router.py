@@ -34,6 +34,10 @@ router = APIRouter(
 # Initialize FastAPI app and JobManager
 job_manager = JobManager()
 
+@router.on_event("shutdown")
+def shutdown_event():
+    job_manager.shutdown_event.set()
+    logger.debug("Job manager shutdown complete.")
 
 # Endpoint to get queue status
 @router.get(

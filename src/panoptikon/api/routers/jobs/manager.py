@@ -106,6 +106,7 @@ class JobManager:
         self.queued_jobs: Dict[int, Job] = {}
         self.job_counter: int = 0
         self.lock = threading.RLock()
+        self.shutdown_event = threading.Event()
         self.worker_thread = threading.Thread(
             target=self.job_consumer, daemon=True
         )
@@ -124,7 +125,7 @@ class JobManager:
             logger.info(f"Enqueued job {job.queue_id}: {job.job_type}")
 
     def job_consumer(self):
-        while True:
+        while not self.shutdown_event.is_set():
             job = None
             with self.lock:
                 if self.running_job is None and self.job_queue:
@@ -134,7 +135,9 @@ class JobManager:
 
             if job:
                 process = multiprocessing.Process(
-                    target=execute_job, args=(job,)
+                    target=execute_job,
+                    args=(job,),
+                    daemon=True
                 )
                 register_child(process)
                 running_job = RunningJob(job=job, process=process)
@@ -144,7 +147,19 @@ class JobManager:
                     f"Starting job {job.queue_id} in process {process.pid}"
                 )
                 process.start()
-                process.join()
+                try:
+                    while process.is_alive() and not self.shutdown_event.is_set():
+                        process.join(timeout=0.5)
+                except KeyboardInterrupt:
+                    logger.warning("KeyboardInterrupt: terminating child process")
+                    process.terminate()
+                    process.join(timeout=1.5)
+                    if process.is_alive():
+                        logger.error(
+                            f"Failed to terminate job {job.queue_id} with PID {process.pid}"
+                        )
+                        force_kill_process(process)
+                        process.join(timeout=5)
                 with self.lock:
                     if (
                         self.running_job
@@ -154,7 +169,7 @@ class JobManager:
                         self.running_job = None
             else:
                 # No job to process, sleep briefly to prevent tight loop
-                threading.Event().wait(1)
+                self.shutdown_event.wait(1)
 
     def get_queue_status(self) -> QueueStatusModel:
         with self.lock:
