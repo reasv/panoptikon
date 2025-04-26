@@ -120,7 +120,7 @@ def build_input_query(setter_name: str, raw_metadata: dict) -> "AndOperator":
                 )
             )
         )
-    if raw_metadata.get("skip_processed_items", True) == False:
+    if raw_metadata.get("skip_processed_items", True) == True:
         item_filter.and_.append(
             NotOperator(not_=ProcessedBy(processed_by=setter_name))
         )
