@@ -38,4 +38,5 @@ def launch_app():
         host=hostname,
         port=port,
         log_level="error",
+        workers=int(os.getenv("UVICORN_WORKERS", "8")),
     )
