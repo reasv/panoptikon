@@ -224,7 +224,9 @@ app.include_router(inferio.router)
 app.include_router(jobs.router)
 
 
-def get_app(hostname: str, port: int) -> FastAPI:
+def get_app() -> FastAPI:
+    hostname = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", 6342))
     if os.getenv("ENABLE_CLIENT", "true").lower() == "true":
         client_redirect_router, client_url = get_routers(hostname, port)
 
