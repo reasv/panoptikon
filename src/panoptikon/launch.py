@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 def launch_app():
     static_ffmpeg.add_paths()  # blocks until files are downloaded
+    from inferio.cudnnsetup import cudnn_setup
+    cudnn_setup()
     setup_signal_handlers()
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
     if not readonly_mode:

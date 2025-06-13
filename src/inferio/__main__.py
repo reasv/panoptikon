@@ -19,6 +19,8 @@ async def lifespan(app: FastAPI):
 def launch_app():
     setup_signal_handlers()
     static_ffmpeg.add_paths()  # blocks until files are downloaded
+    from inferio.cudnnsetup import cudnn_setup
+    cudnn_setup()
     app = FastAPI(
         lifespan=lifespan,
         separate_input_output_schemas=False,

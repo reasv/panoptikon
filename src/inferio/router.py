@@ -26,14 +26,16 @@ from inferio.impl.whisper import FasterWhisperModel, FasterWhisperModelIsolated
 from inferio.manager import InferenceModel, ModelManager
 from inferio.registry import ModelRegistry
 from inferio.utils import (
+    add_cudnn_to_path,
     encode_output_response,
     parse_input_request,
 )
-from inferio.cudnnsetup import cudnn_setup
 
-cudnn_setup()
 logger = logging.getLogger(__name__)
 ModelRegistry.set_user_folder("config/inference")
+
+if os.getenv("NO_CUDNN", "false").lower() in ("0", "false"):
+    add_cudnn_to_path()
 
 if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
     ModelRegistry.register_model(WDTagger)
