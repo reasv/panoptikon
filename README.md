@@ -46,6 +46,29 @@ The public instance is meant for demonstration purposes only, to show the capabi
 
 Although large parts of the API are disabled in the public instance, you can still consult the full API documentation at [panoptikon.dev/docs](https://panoptikon.dev/docs).
 
+## Optional Companion: Panoptikon Relay (NEW)
+
+In scenarios where Panoptikon is running on a remote server, inside a container, or in any environment where it cannot directly access your local file system to open files or reveal them in your file manager, **Panoptikon Relay** comes to the rescue.
+
+If you can access the files indexed by Panoptikon directly on your client machine (e.g., via network shares like SMB/NFS), Panoptikon Relay bridges this gap. It's a lightweight tray icon application and local HTTP server that runs on your client machine.
+
+**How it works with Panoptikon:**
+
+1.  You run Panoptikon Relay on your client machine.
+2.  In Panoptikon's web UI (under "File Details" -> "File Open Relay"), you configure Panoptikon to use the Relay by providing its address (e.g., `http://127.0.0.1:17600`) and an API key.
+3.  When you click "Open File" or "Show in Folder" in Panoptikon, the request is sent to Panoptikon Relay.
+4.  The Relay authenticates the request, translates the server-side path (as Panoptikon sees it) to a local client-side path using configurable mappings, and then executes local commands to open the file or show it in your file manager.
+
+**Key Features of Panoptikon Relay:**
+
+- **Tray Icon:** For easy access to API key, configuration, and logs.
+- **Secure API:** Uses a Bearer Token (API Key) for authentication.
+- **Path Mapping:** Flexible `config.toml` to map server paths to client paths.
+- **Customizable Commands:** Define your own shell commands for opening/showing files.
+- **Platform-Aware Defaults:** Sensible default commands for Windows, macOS, and Linux.
+
+For more details, installation instructions, and configuration options, please visit the [Panoptikon Relay GitHub repository](https://github.com/reasv/panoptikon-relay).
+
 ## REST API
 
 Panoptikon exposes a REST API that can be used to interact with the search and bookmarking functionality programmatically, as well as to retrieve the indexed data, the actual files, and their associated metadata. Additionally, `inferio`, the inference server, exposes an API under `/api/inference` that can be used to run batch inference using the available models.
