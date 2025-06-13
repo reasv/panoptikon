@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import logging
 import os
 import sqlite3
+import time
 from typing import List, Literal, Tuple
 
 import sqlite_vec
@@ -21,8 +22,11 @@ def get_database_connection(
 ) -> sqlite3.Connection:
     db_file, user_db_file, storage_db_file = get_db_paths(
         index_db=index_db,
-        user_data_db=user_data_db,  # Overwrite the default database names
+        user_data_db=user_data_db,  # Override the default database names
     )
+    logger.debug(f"Connecting to index database: {db_file}")
+    logger.debug(f"Connecting to user data database: {user_db_file}")
+    start_time = time.time()
 
     readonly_mode = os.environ.get("READONLY", "false").lower() in ["true", "1"]
     # Attach index database
@@ -61,6 +65,10 @@ def get_database_connection(
     cursor.execute("PRAGMA foreign_keys = ON")
     cursor.execute("PRAGMA case_sensitive_like = ON")
     load_sqlite_vec(conn)
+
+    logger.debug(
+        f"Connected to databases (wl: {write_lock} uwl: {user_data_wl}) in {time.time() - start_time:.2f} seconds"
+    )
     return conn
 
 
