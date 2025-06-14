@@ -50,7 +50,8 @@ RUN bash ./install.sh
 # Optional app config env vars
 ENV ENABLE_CLIENT=false
 ENV DISABLE_CLIENT_UPDATE=true
-
+ENV HF_HOME=/home/ubuntu/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/home/ubuntu/.cache/huggingface
 # Expose the app port
 EXPOSE 6342
 
