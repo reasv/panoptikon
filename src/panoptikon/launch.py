@@ -56,5 +56,5 @@ def launch_app():
         port=port,
         log_level="error",
         factory=True,
-        workers=int(os.getenv("UVICORN_WORKERS", "8")),
+        workers=int(os.getenv("UVICORN_WORKERS", f"{workers}")),
     )
