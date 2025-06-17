@@ -9,7 +9,6 @@ from pydantic.dataclasses import dataclass
 
 from inferio.impl.clap import ClapModel, ClapModelIsolated
 from inferio.impl.clip import CLIPIsolated, ClipModel
-from inferio.impl.clip_inf import InfinityCLIP
 from inferio.impl.danbooru import DanbooruIsolated, DanbooruTagger
 from inferio.impl.eocr import EasyOCRModel, EasyOCRModelIsolated
 from inferio.impl.florence2 import Florence2, Florence2Isolated
@@ -45,7 +44,6 @@ if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
     ModelRegistry.register_model(ClipModel)
     ModelRegistry.register_model(Florence2)
     ModelRegistry.register_model(DanbooruTagger)
-    # ModelRegistry.register_model(InfinityCLIP)
     ModelRegistry.register_model(ClapModel)
     ModelRegistry.register_model(JinaClipModel)
     ModelRegistry.register_model(EasyOCRModel)
