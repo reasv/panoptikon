@@ -1,12 +1,16 @@
 import base64
+import importlib
 import json
+import logging
 import os
 from io import BytesIO
+import pkgutil
 from typing import List, Optional, Union
 
 from fastapi import HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from inferio.model import InferenceModel
 from inferio.types import PredictionInput
 
 
@@ -152,3 +156,20 @@ def add_cudnn_to_path():
     # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
     os.environ["CUDA_PATH"] = cudnn_path
 
+
+def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
+    import inferio.impl
+    result = []
+    for finder, name, ispkg in pkgutil.iter_modules(inferio.impl.__path__, inferio.impl.__name__ + "."):
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "IMPL_CLASS"):
+                if isinstance(getattr(mod, "IMPL_CLASS"), type) and issubclass(getattr(mod, "IMPL_CLASS"), InferenceModel):
+                    logger.info(f"Found implementation class: {name}.IMPL_CLASS")
+                else:
+                    logger.warning(f"Module {name} does not have a valid IMPL_CLASS.")
+                result.append(getattr(mod, "IMPL_CLASS"))
+        except Exception as e:
+            logger.error(f"Failed to import module inferio.impl.{name}: {e}", exc_info=True)
+            pass
+    return result
