@@ -152,3 +152,5 @@ class FasterWhisperModelIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[FasterWhisperModel]:  # type: ignore
         return FasterWhisperModel
+
+IMPL_CLASS = FasterWhisperModel

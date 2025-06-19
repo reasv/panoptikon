@@ -121,7 +121,7 @@ class DoctrModel(InferenceModel):
             del self.model
             clear_cache()
             self._model_loaded = False
-
+IMPL_CLASS = DoctrModel
 class DoctrModelIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[DoctrModel]:  # type: ignore

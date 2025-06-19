@@ -234,6 +234,7 @@ class Florence2(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
+IMPL_CLASS = Florence2
 class Florence2Isolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[Florence2]:  # type: ignore

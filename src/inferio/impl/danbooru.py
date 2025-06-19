@@ -467,6 +467,8 @@ class DanbooruTagger(InferenceModel):
         if self._model_loaded:
             self._model_loaded = False
 
+IMPL_CLASS = DanbooruTagger
+
 class DanbooruIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[DanbooruTagger]:  # type: ignore

@@ -214,7 +214,7 @@ class JinaClipModel(InferenceModel):
         if self._model_loaded:
             self._model_loaded = False
 
-
+IMPL_CLASS = JinaClipModel
 class JinaCLIPIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[JinaClipModel]:  # type: ignore

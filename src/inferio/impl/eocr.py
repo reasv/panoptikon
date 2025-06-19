@@ -244,6 +244,7 @@ def pad_images_to_same_size(images: List[np.ndarray]) -> List[np.ndarray]:
             
         return padded_images
 
+IMPL_CLASS = EasyOCRModel
 class EasyOCRModelIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[EasyOCRModel]:  # type: ignore

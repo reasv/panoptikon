@@ -157,6 +157,8 @@ class MoondreamCaptioner(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
+IMPL_CLASS = MoondreamCaptioner
+
 class MoondreamCaptionerIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[MoondreamCaptioner]:  # type: ignore

@@ -122,6 +122,7 @@ class ClapModel(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
+IMPL_CLASS = ClapModel
 
 class ClapModelIsolated(ProcessIsolatedInferenceModel):
     @classmethod

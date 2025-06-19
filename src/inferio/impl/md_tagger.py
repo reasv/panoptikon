@@ -224,6 +224,8 @@ class MoondreamTagger(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
+IMPL_CLASS = MoondreamTagger
+
 class MoondreamTaggerIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[MoondreamTagger]:  # type: ignore

@@ -129,7 +129,7 @@ class ClipModel(InferenceModel):
             clear_cache()
             self._model_loaded = False
 
-
+IMPL_CLASS = ClipModel
 class CLIPIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[ClipModel]:  # type: ignore

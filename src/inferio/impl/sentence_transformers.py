@@ -180,6 +180,7 @@ def split_text_by_tokens(text, tokenizer, max_tokens):
         tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks
     ]
 
+IMPL_CLASS = SentenceTransformersModel
 
 class SentenceTransformersModelIsolated(ProcessIsolatedInferenceModel):
     @classmethod

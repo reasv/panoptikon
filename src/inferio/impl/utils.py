@@ -5,9 +5,13 @@ import logging
 import json
 import re
 from typing import List, Optional
+import importlib
+import pkgutil
 
 import numpy as np
 from PIL import Image
+
+from inferio.model import InferenceModel
 
 def get_device():
     import torch
@@ -210,3 +214,20 @@ def print_resource_usage(logger: logging.Logger | None = None):
         log(f"  [psutil] CPU usage:            {cpu:.1f}%")
     except ImportError:
         log("  [psutil] psutil not installed. Install with `pip install psutil` for more details.")
+
+def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
+    import inferio.impl
+    result = []
+    for finder, name, ispkg in pkgutil.iter_modules(inferio.impl.__path__, inferio.impl.__name__ + "."):
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "IMPL_CLASS"):
+                if isinstance(getattr(mod, "IMPL_CLASS"), type) and issubclass(getattr(mod, "IMPL_CLASS"), InferenceModel):
+                    logger.info(f"Found implementation class: {name}.IMPL_CLASS")
+                else:
+                    logger.warning(f"Module {name} does not have a valid IMPL_CLASS.")
+                result.append(getattr(mod, "IMPL_CLASS"))
+        except Exception as e:
+            logger.error(f"Failed to import module inferio.impl.{name}: {e}", exc_info=True)
+            pass
+    return result

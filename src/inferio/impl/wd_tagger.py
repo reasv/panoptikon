@@ -259,7 +259,7 @@ class WDTagger(InferenceModel):
             logger.debug(f"Model {self.model_repo} unloaded")
             self._model_loaded = False
 
-
+IMPL_CLASS = WDTagger
 @dataclass
 class TagResult:
     rating: Dict[str, float]
@@ -273,3 +273,4 @@ class WDTaggerIsolated(ProcessIsolatedInferenceModel):
     @classmethod
     def concrete_class(cls) -> Type[WDTagger]:  # type: ignore
         return WDTagger
+
