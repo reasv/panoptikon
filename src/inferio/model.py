@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Sequence
 
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 
 
 class InferenceModel(ABC):

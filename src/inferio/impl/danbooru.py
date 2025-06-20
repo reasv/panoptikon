@@ -16,7 +16,7 @@ from inferio.impl.saucenao.errors import (
 from inferio.impl.saucenao.saucenao_api import AIOSauceNao
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
 

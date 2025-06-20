@@ -11,7 +11,7 @@ from fastapi import HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from inferio.model import InferenceModel
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 
 
 def extract_index_from_content_disposition(header: str) -> Optional[int]:
@@ -155,7 +155,6 @@ def add_cudnn_to_path():
     # If you have other directories like include or lib that need to be added, you can add them similarly.
     # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
     os.environ["CUDA_PATH"] = cudnn_path
-
 
 def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
     import inferio.impl

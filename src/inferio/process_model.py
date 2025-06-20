@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Sequence, Type, Union
 
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 from inferio.utils import clean_dict
 from panoptikon.signal_handler import register_child  # Ensure this is correctly imported
 

@@ -11,7 +11,7 @@ from PIL import ImageFile
 from inferio.impl.utils import serialize_array
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 import logging
 
 logger = logging.getLogger(__name__)

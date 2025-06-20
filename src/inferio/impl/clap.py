@@ -10,7 +10,7 @@ from inferio.impl.utils import (
 )
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 
 
 class ClapModel(InferenceModel):

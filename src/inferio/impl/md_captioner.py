@@ -8,7 +8,7 @@ from PIL import Image as PILImage
 from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
 from inferio.process_model import ProcessIsolatedInferenceModel
-from inferio.types import PredictionInput
+from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
 
