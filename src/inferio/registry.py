@@ -1,8 +1,9 @@
-import logging
 import os
-from collections import defaultdict
+import logging
 from pathlib import Path
 from threading import Lock
+from collections import defaultdict
+from tokenize import String
 from typing import Any, Dict, Optional, Type
 
 import tomli
@@ -68,7 +69,6 @@ class ModelRegistry:
                 if file_time > latest_time:
                     latest_time = file_time
         return latest_time
-
     def reload_registry(self) -> None:
         """Reload the registry if TOML files have been modified."""
         with self._lock:
