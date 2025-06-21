@@ -138,7 +138,7 @@ def get_metadata(
 def get_model_config(
     full_inference_id: str,
     config: Dict[str, Dict[str, Any]],
-) -> Tuple[str, Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Retrieve the model class name and configuration for a given inference ID."""
     group_name, inference_id = full_inference_id.split("/", 1)
     if group_name not in config:
@@ -150,11 +150,9 @@ def get_model_config(
         )
     inference_id_config = group_data["inference_ids"][inference_id]
     model_config = inference_id_config["config"]
-    model_class_name = model_config["impl_class"]
     # Copy the config to avoid modifying the original
     model_config = dict(model_config)
-    model_config.pop("impl_class", None)
-    return model_class_name, model_config
+    return model_config
 
 def get_base_config_folder() -> Path:
     """Return the path to the base configuration folder inside the source directory."""
