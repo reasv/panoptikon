@@ -1,171 +1,24 @@
-import os
 import asyncio
 from typing import Any, Dict, List
 from fastapi import FastAPI
-import ray
 from ray import serve
 from ray.serve.handle import DeploymentHandle
-import logging
-from inferio.config import get_model_config, list_inference_ids, load_config
-from inferio.impl.utils import get_device
-from inferio.inferio_types import PredictionInput
-from inferio.model import InferenceModel
-from inferio.utils import encode_output_response, parse_input_request
-os.environ["RAY_TMPDIR"] = "Q:/projects/panoptikon/.ray_tmp"
-def build_inference_deployment(inference_id: str, global_config: Dict[str, Any]):
-    config = get_model_config(inference_id, global_config)
-    impl_class_name = config.pop("impl_class", None)
-    if impl_class_name is None:
-        raise ValueError(f"Model class name not found in config for inference_id: {inference_id}")
-    devices = get_device()
-    max_replicas = config.pop(
-        "max_replicas",
-        len(devices)
-    )
-    batch_wait_timeout_s = config.pop(
-        "batch_wait_timeout_s", 
-        float(os.getenv("BATCH_WAIT_TIMEOUT_S", "0.1"))
-    )
-    max_batch_size = config.pop(
-        "max_batch_size",
-        int(os.getenv("MAX_BATCH_SIZE", "64"))
-    )
-    clean_id= inference_id.replace("/", "_")
 
-    @serve.deployment(
-        name=f"{clean_id}_deployment",
-        ray_actor_options={
-            "num_cpus": 0.1,
-        },
-        autoscaling_config={
-            "min_replicas": 0,
-            "max_replicas": max_replicas,
-            "initial_replicas": 1,
-            "target_ongoing_requests": 2,
-            "upscale_delay_s": 10,
-            "downscale_delay_s": 30
-        }
-    )
-    class InferenceDeployment:
-        logger: logging.Logger
-        model: InferenceModel
-        def __init__(self):
-            """Initialize the inference deployment."""
-            import logging
-            from dotenv import load_dotenv
-            from inferio.utils import get_impl_classes
-            from panoptikon.log import setup_logging
-            load_dotenv()
-            setup_logging()
-            self.logger = logging.getLogger(f"deployments.{inference_id}")
-            impl_classes = get_impl_classes(self.logger)
-            for cls in impl_classes:
-                if cls.name() == impl_class_name:
-                    self.model = cls(**config)
-                    break
-            else:
-                raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
-            self.logger.info(f"[{inference_id}] init in PID {os.getpid()} with impl_class {impl_class_name}")
-        
-        @serve.batch(max_batch_size=max_batch_size, batch_wait_timeout_s=batch_wait_timeout_s)
-        async def __call__(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
-            self.logger.debug(f"Received {len(inputs)} batch inputs")
-            return list(self.model.predict(inputs))
-
-        @serve.batch(max_batch_size=max_batch_size, batch_wait_timeout_s=batch_wait_timeout_s)
-        async def predict(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
-            self.logger.debug(f"Received {len(inputs)} inputs for prediction")
-            return list(self.model.predict(inputs))
-        
-        async def load(self) -> None:
-            """Load the model."""
-            self.logger.info(f"Loading model")
-            self.model.load()
-        
-        async def keepalive(self) -> None:
-            """Keep the model alive."""
-            self.logger.info(f"Keeping model alive")
-            # This can be used to keep the model loaded or perform any periodic tasks.
-        
-    app = InferenceDeployment.bind()
-    handle = serve.run(app, name=f"{clean_id}_app", blocking=False, route_prefix=None)
-
-    return handle
-
-@serve.deployment(
-    name="ModelRouter",
-    ray_actor_options={
-        "num_cpus": 0.1,
-    },
-    autoscaling_config={
-        "min_replicas": 1,
-        "initial_replicas": 1,
-        "target_ongoing_requests": 2,
-        "upscale_delay_s": 10,
-        "downscale_delay_s": 10
-    }
-)
-class ModelRouter:
-    def __init__(self):
-        import logging
-        from dotenv import load_dotenv
-        from panoptikon.log import setup_logging
-        load_dotenv()
-        setup_logging()
-        self._handles: dict[str, DeploymentHandle] = {}
-        self._lock = asyncio.Lock()
-        self.logger = logging.getLogger("ModelRouter")
-        self._config, self._mtime = load_config()
-        self.logger.info(f"ModelRouter initialized")
-
-    async def get_config(self):
-        """Reload the configuration if it has changed."""
-        self._config, self._mtime = load_config(self._config, self._mtime)
-        return self._config
-
-    async def _ensure(self, inference_id: str):
-        if inference_id in self._handles:
-            return self._handles[inference_id]
-
-        async with self._lock:
-            if inference_id in self._handles:
-                return self._handles[inference_id]
-            self.logger.info(f"Building deployment for {inference_id}")
-            handle = build_inference_deployment(inference_id, self._config)
-            self._handles[inference_id] = handle
-            return handle
-
-    async def __call__(self, inference_id: str, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
-        h = await self._ensure(inference_id)
-        return await h.remote(inputs)
-    
-    async def load(self, inference_id: str) -> None:
-        """Load the model for the given inference ID."""
-        h = await self._ensure(inference_id)
-        h = h.options(method_name="load")
-        await h.remote()
-
-    async def keepalive(self, inference_id: str) -> None:
-        """Keep the model alive for the given inference ID."""
-        h = await self._ensure(inference_id)
-        h = h.options(method_name="keepalive")
-        await h.remote()
-
-import logging
-import os
-from typing import Any, Dict, List
-
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi_utilities.repeat.repeat_every import repeat_every
+from fastapi import File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
+
+from inferio.config import list_inference_ids, load_config
+from inferio.inferio_ray.create_deployment import build_inference_deployment
+from inferio.inferio_ray.deployment_config import get_deployment_config
+from inferio.utils import encode_output_response, parse_input_request
 
 app = FastAPI(
     prefix="/api/inference",
     tags=["inference"],
     responses={404: {"description": "Not found"}},
 )
-logger = logging.getLogger(__name__)
+
 @dataclass
 class StatusResponse:
     status: str
@@ -174,22 +27,43 @@ class StatusResponse:
 class CacheListResponse:
     cache: Dict[str, List[str]]
 
-
-
 class CacheKeyResponse(BaseModel):
     expirations: Dict[str, str]
+
 @serve.deployment
 @serve.ingress(app)
-class FastAPIDeployment:
-    def __init__(self, router: DeploymentHandle):
+class InferioIngress:
+    def __init__(self):
         import logging
         from dotenv import load_dotenv
         from panoptikon.log import setup_logging
         load_dotenv()
         setup_logging()
-        self.logger = logging.getLogger("inferio")
-        self.logger.info("FastAPIDeployment initialized")
-        self.router = router
+        self.logger = logging.getLogger("inferio.ingress")
+        self.logger.info("Ingress Deployment initialized")
+        self._handles: dict[str, DeploymentHandle] = {}
+        self._lock = asyncio.Lock()
+        self._config, self._mtime = load_config()
+
+    async def get_config(self):
+        """Reload the configuration if it has changed."""
+        self._config, self._mtime = load_config(self._config, self._mtime)
+        return self._config
+    
+    async def _ensure(self, inference_id: str):
+        if inference_id in self._handles:
+            return self._handles[inference_id]
+
+        async with self._lock:
+            if inference_id in self._handles:
+                return self._handles[inference_id]
+            
+            self.logger.info(f"Building deployment for {inference_id}")
+            deployment_config = get_deployment_config(inference_id, await self.get_config())
+            handle = build_inference_deployment(inference_id, deployment_config)
+            self._handles[inference_id] = handle
+            return handle
+
     @app.post(
         "/predict/{group}/{inference_id}",
         summary="Run batch inference on a model by its `inference_id`",
@@ -264,15 +138,16 @@ class FastAPIDeployment:
         ),  # The binary files
     ):
         inputs = parse_input_request(data, files)
-        logger.debug(
-            f"Processing {len(inputs)} ({len(files)} files) inputs for model {group}/{inference_id}"
+        full_inference_id = f"{group}/{inference_id}"
+        self.logger.debug(
+            f"Processing {len(inputs)} ({len(files)} files) inputs for model {full_inference_id}"
         )
-
         try:
             # Perform prediction
-            outputs: List[bytes | dict | list | str] = list(await self.router.remote(f"{group}/{inference_id}", inputs))
+            model_handle = await self._ensure(full_inference_id)
+            outputs: List[bytes | dict | list | str] = list(await model_handle.remote(inputs))
         except Exception as e:
-            logger.error(f"Prediction failed for model {inference_id}: {e}")
+            self.logger.error(f"Prediction failed for model {inference_id}: {e}")
             raise HTTPException(status_code=500, detail="Prediction failed")
         finally:
             pass
@@ -310,10 +185,12 @@ class FastAPIDeployment:
         ttl_seconds: int,
     ):
         try:
-            await self.router.options(method_name="load").remote(f"{group}/{inference_id}")
+            full_inference_id = f"{group}/{inference_id}"
+            model_handle = await self._ensure(full_inference_id)
+            await model_handle.options(method_name="load").remote()
             return StatusResponse(status="loaded")
         except Exception as e:
-            logger.error(f"Failed to load model {inference_id}: {e}")
+            self.logger.error(f"Failed to load model {inference_id}: {e}")
             raise HTTPException(status_code=500, detail="Failed to load model")
 
 
@@ -378,9 +255,9 @@ class FastAPIDeployment:
         description="Returns metadata for all available `inference_id`s, divided by group.",
         response_model=Dict[str, Dict[str, Any]],
     )
-    def get_metadata(self) -> Dict[str, Dict[str, Any]]:
-        config, mtime = load_config()
-        return list_inference_ids(config)
+    async def get_metadata(self) -> Dict[str, Dict[str, Any]]:
+        global_config = await self.get_config()
+        return list_inference_ids(global_config)
 
 
-ray_app = FastAPIDeployment.bind(ModelRouter.bind()) # type: ignore
+ray_app = InferioIngress.bind() # type: ignore

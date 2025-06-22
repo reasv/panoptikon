@@ -1,0 +1,82 @@
+import os
+from typing import List
+import logging
+
+from ray import serve
+from ray.serve.handle import DeploymentHandle
+
+from inferio.inferio_ray.rtypes import DeploymentConfig
+from inferio.inferio_types import PredictionInput
+from inferio.model import InferenceModel
+
+def build_inference_deployment(
+        model_inference_id: str,
+        deployment_config: DeploymentConfig,
+    ) -> DeploymentHandle:
+    clean_id = model_inference_id.replace("/", "_")
+    @serve.deployment(
+        name=f"{clean_id}_deployment",
+        ray_actor_options={
+            "num_cpus": 0.1,
+        },
+        autoscaling_config={
+            "min_replicas": 0,
+            "max_replicas": deployment_config.max_replicas,
+            "initial_replicas": 1,
+            "target_ongoing_requests": 2,
+            "upscale_delay_s": 10,
+            "downscale_delay_s": 30
+        }
+    )
+    class InferenceDeployment:
+        logger: logging.Logger
+        model: InferenceModel
+        def __init__(self, inference_id: str):
+            """Initialize the inference deployment."""
+            import logging
+            from dotenv import load_dotenv
+            from inferio.utils import get_impl_classes
+            from inferio.config import get_model_config, load_config
+            from panoptikon.log import setup_logging
+            load_dotenv()
+            setup_logging()
+            self.logger = logging.getLogger(f"deployments.{inference_id}")
+            global_config, _ = load_config()
+            model_config = get_model_config(inference_id, global_config)
+            impl_class_name = model_config.pop("impl_class", None)
+            # Remove all the external config keys
+            model_config = {k: v for k, v in model_config.items() if k not in ["impl_class", "max_replicas", "batch_wait_timeout_s", "max_batch_size"]}
+            self.logger.info("Initializing deployment")
+            impl_classes = get_impl_classes(self.logger)
+            for cls in impl_classes:
+                if cls.name() == impl_class_name:
+                    self.model = cls(**model_config)
+                    break
+            else:
+                raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
+            self.logger.info(f"init in PID {os.getpid()} with impl_class {impl_class_name}")
+        
+        @serve.batch(max_batch_size=deployment_config.max_batch_size, batch_wait_timeout_s=deployment_config.batch_wait_timeout_s)
+        async def __call__(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
+            self.logger.debug(f"Received {len(inputs)} batch inputs")
+            return list(self.model.predict(inputs))
+
+        @serve.batch(max_batch_size=deployment_config.max_batch_size, batch_wait_timeout_s=deployment_config.batch_wait_timeout_s)
+        async def predict(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
+            self.logger.debug(f"Received {len(inputs)} inputs for prediction")
+            return list(self.model.predict(inputs))
+        
+        async def load(self) -> None:
+            """Load the model."""
+            self.logger.info(f"Loading model")
+            self.model.load()
+        
+        async def keepalive(self) -> None:
+            """Keep the model alive."""
+            self.logger.info(f"Keeping model alive")
+            # This can be used to keep the model loaded or perform any periodic tasks.
+        
+    app = InferenceDeployment.bind(model_inference_id)
+    handle = serve.run(app, name=f"{clean_id}_app", blocking=False, route_prefix=None)
+
+    return handle
