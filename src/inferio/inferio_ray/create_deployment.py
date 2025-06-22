@@ -63,15 +63,32 @@ def build_inference_deployment(
                 raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
             self.logger.info(f"init in PID {os.getpid()} with impl_class {impl_class_name}")
         
-        @serve.batch(max_batch_size=deployment_config.max_batch_size, batch_wait_timeout_s=deployment_config.batch_wait_timeout_s)
-        async def __call__(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
-            self.logger.debug(f"Received {len(inputs)} batch inputs")
-            return list(self.model.predict(inputs))
+        def _process_batch(self, inputs: List[List[PredictionInput]]) -> List[List[bytes | dict | list | str]]:
+            # Flatten the batch of inputs into a single list for the model
+            batch_sizes = [len(batch) for batch in inputs]
+            flattened_inputs = [item for batch in inputs for item in batch]
+
+            # Get predictions for the flattened list
+            predictions = list(self.model.predict(flattened_inputs))
+
+            # Unflatten the predictions to match the original batch structure
+            output = []
+            start = 0
+            for size in batch_sizes:
+                output.append(predictions[start:start + size])
+                start += size
+            
+            return output
 
         @serve.batch(max_batch_size=deployment_config.max_batch_size, batch_wait_timeout_s=deployment_config.batch_wait_timeout_s)
-        async def predict(self, inputs: List[PredictionInput]) -> List[bytes | dict | list | str]:
+        async def __call__(self, inputs: List[List[PredictionInput]]) -> List[List[bytes | dict | list | str]]:
+            self.logger.debug(f"Received {len(inputs)} batch inputs")
+            return self._process_batch(inputs)
+
+        @serve.batch(max_batch_size=deployment_config.max_batch_size, batch_wait_timeout_s=deployment_config.batch_wait_timeout_s)
+        async def predict(self, inputs: List[List[PredictionInput]]) -> List[List[bytes | dict | list | str]]:
             self.logger.debug(f"Received {len(inputs)} inputs for prediction")
-            return list(self.model.predict(inputs))
+            return self._process_batch(inputs)
         
         async def load(self) -> None:
             """Load the model."""
@@ -80,7 +97,7 @@ def build_inference_deployment(
         
         async def keepalive(self) -> None:
             """Keep the model alive."""
-            self.logger.info(f"Keeping model alive")
+            self.logger.debug(f"Keeping model alive")
         
     app = InferenceDeployment.bind(model_inference_id)
     handle = serve.run(app, name=f"{clean_id}_app", blocking=False, route_prefix=None)
