@@ -54,7 +54,7 @@ def build_inference_deployment(
             model_config = get_model_config(inference_id, global_config)
             impl_class_name = model_config.pop("impl_class", None)
             # Remove all the external config keys
-            model_config = {k: v for k, v in model_config.items() if k not in ["impl_class", "max_replicas", "batch_wait_timeout_s", "max_batch_size"]}
+            model_config = {k: v for k, v in model_config.items() if k not in ["impl_class", "ray_config"]}
             self.logger.info("Initializing deployment")
             impl_classes = get_impl_classes(self.logger)
             for cls in impl_classes:
