@@ -6,12 +6,12 @@ from typing import Dict, List, Set
 
 from ray import serve
 from ray.serve.handle import DeploymentHandle
+from dotenv import load_dotenv
 
 from inferio.config import load_config
 from inferio.inferio_ray.create_deployment import build_inference_deployment
 from inferio.inferio_ray.deployment_config import get_deployment_config
 
-logger = logging.getLogger(__name__)
 
 def never() -> datetime:
     return datetime.max
@@ -22,7 +22,9 @@ def never() -> datetime:
 )
 class ModelManager:
     def __init__(self) -> None:
-        logger.debug("Initializing ModelManager")
+        load_dotenv()
+        self.logger = logging.getLogger("inferio.ModelManager")
+        self.logger.debug("Initializing ModelManager")
         self._handles: Dict[str, DeploymentHandle] = {}
         self._lru_caches: Dict[str, OrderedDict[str, datetime]] = defaultdict(
             OrderedDict
@@ -49,16 +51,16 @@ class ModelManager:
             async with self._lock:
                 handles = dict(self._handles)
                 for inference_id, handle in handles.items():
-                    logger.debug(f"Sending keepalive to {inference_id}")
+                    self.logger.debug(f"Sending keepalive to {inference_id}")
                     try:
                         await handle.options(method_name="keepalive").remote()
                     except Exception as e:
-                        logger.warning(f"Keepalive for {inference_id} failed: {e}")
+                        self.logger.warning(f"Keepalive for {inference_id} failed: {e}")
 
     async def _remove_from_lru(self, cache_key: str, inference_id: str) -> None:
         """Remove a model from the LRU cache."""
         if inference_id in self._lru_caches[cache_key]:
-            logger.debug(f"Removing model {inference_id} from cache {cache_key}")
+            self.logger.debug(f"Removing model {inference_id} from cache {cache_key}")
             del self._lru_caches[cache_key][inference_id]
             self._cache_key_map[inference_id].discard(cache_key)
             if not self._cache_key_map.get(inference_id):
@@ -68,7 +70,7 @@ class ModelManager:
         """Unload the model when no cache keys reference it."""
         if inference_id in self._handles:
             self._handles.pop(inference_id)
-            logger.debug(f"Unloading model {inference_id} by deleting application")
+            self.logger.debug(f"Unloading model {inference_id} by deleting application")
             clean_id = inference_id.replace("/", "_")
             serve.delete(f"{clean_id}_app", _blocking=False)
             if inference_id in self._cache_key_map:
@@ -84,13 +86,13 @@ class ModelManager:
         async with self._lock:
             is_new = inference_id not in self._handles
             if is_new:
-                logger.info(f"Model {inference_id} not loaded. Creating deployment.")
+                self.logger.info(f"Model {inference_id} not loaded. Creating deployment.")
                 config = await self.get_config()
                 deployment_config = get_deployment_config(inference_id, config)
                 handle = build_inference_deployment(inference_id, deployment_config)
                 self._handles[inference_id] = handle
             else:
-                logger.debug(f"Model {inference_id} already loaded. Returning handle.")
+                self.logger.debug(f"Model {inference_id} already loaded. Returning handle.")
                 handle = self._handles[inference_id]
 
             self._cache_key_map[inference_id].add(cache_key)
@@ -108,7 +110,7 @@ class ModelManager:
             await self._resize_lru(cache_key, lru_size)
 
             if is_new:
-                logger.info(f"Calling load() for the first time for {inference_id}")
+                self.logger.info(f"Calling load() for the first time for {inference_id}")
                 await handle.options(method_name="load").remote()
 
             return handle
@@ -120,7 +122,7 @@ class ModelManager:
             oldest_inference_id, _ = lru_cache.popitem(last=False)
             self._cache_key_map[oldest_inference_id].discard(cache_key)
             if not self._cache_key_map.get(oldest_inference_id):
-                logger.debug(
+                self.logger.debug(
                     f"{oldest_inference_id} evicted from LRU cache {cache_key}"
                 )
                 await self._unload_model(oldest_inference_id)
@@ -128,13 +130,13 @@ class ModelManager:
     async def unload_model(self, cache_key: str, inference_id: str) -> None:
         """Explicitly unload a model and remove it from the cache."""
         async with self._lock:
-            logger.debug(f"{inference_id} unload requested")
+            self.logger.debug(f"{inference_id} unload requested")
             await self._remove_from_lru(cache_key, inference_id)
 
     async def clear_cache(self, cache_key: str) -> None:
         """Clear the entire LRU cache for a specific cache key."""
         async with self._lock:
-            logger.debug(f"Clearing cache {cache_key}")
+            self.logger.debug(f"Clearing cache {cache_key}")
             if cache_key in self._lru_caches:
                 lru_cache = self._lru_caches.pop(cache_key)
                 for inference_id in list(lru_cache.keys()):
@@ -162,5 +164,5 @@ class ModelManager:
                     if now > exp_time
                 ]
                 for inference_id in expired_models:
-                    logger.debug(f"{inference_id} TTL expired in cache {cache_key}")
+                    self.logger.debug(f"{inference_id} TTL expired in cache {cache_key}")
                     await self._remove_from_lru(cache_key, inference_id)
