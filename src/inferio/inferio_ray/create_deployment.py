@@ -36,12 +36,14 @@ def build_inference_deployment(
         def __init__(self, inference_id: str):
             """Initialize the inference deployment."""
             import logging
+            import asyncio
             from dotenv import load_dotenv
             from inferio.utils import get_impl_classes
             from inferio.config import get_model_config, load_config
             from panoptikon.log import setup_logging
             load_dotenv()
             setup_logging()
+            self._load_lock = asyncio.Lock()
             self.logger = logging.getLogger(f"deployments.{inference_id}")
             if os.getenv("NO_CUDNN", "false").lower() not in ("1", "true"):
                 self.logger.info("Setting up cuDNN")
@@ -92,9 +94,10 @@ def build_inference_deployment(
         
         async def load(self) -> None:
             """Load the model."""
-            self.logger.info(f"Loading model")
-            self.model.load()
-        
+            async with self._load_lock:
+                self.logger.info(f"Loading model")
+                self.model.load()
+
         async def keepalive(self) -> None:
             """Keep the model alive."""
             self.logger.debug(f"Keeping model alive")

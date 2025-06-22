@@ -33,7 +33,6 @@ class ModelManager:
         self._lock = asyncio.Lock()
         self._config, self._mtime = load_config()
         asyncio.create_task(self._ttl_check_loop())
-        #asyncio.create_task(self._keepalive_loop())
 
     async def _ttl_check_loop(self):
         while True:
@@ -44,18 +43,6 @@ class ModelManager:
         """Reload the configuration if it has changed."""
         self._config, self._mtime = load_config(self._config, self._mtime)
         return self._config
-
-    # async def _keepalive_loop(self):
-    #     while True:
-    #         await asyncio.sleep(5)
-    #         async with self._lock:
-    #             handles = dict(self._handles)
-    #             for inference_id, handle in handles.items():
-    #                 self.logger.debug(f"Sending keepalive to {inference_id}")
-    #                 try:
-    #                     await handle.options(method_name="keepalive").remote()
-    #                 except Exception as e:
-    #                     self.logger.warning(f"Keepalive for {inference_id} failed: {e}")
 
     async def _remove_from_lru(self, cache_key: str, inference_id: str) -> None:
         """Remove a model from the LRU cache."""
@@ -98,7 +85,18 @@ class ModelManager:
             self._cache_key_map[inference_id].add(cache_key)
             if inference_id in self._lru_caches[cache_key]:
                 self._lru_caches[cache_key].move_to_end(inference_id)
+            # Before the model is loaded, we set the expiration time to never
+            self._lru_caches[cache_key][inference_id] = never()
+            await self._resize_lru(cache_key, lru_size)
+            # Release the lock on the cache configs before calling load to avoid locking for too long
 
+        if is_new:
+            # Call the load method on the handle if it's a new model
+            self.logger.info(f"Calling load() for the first time for {inference_id}")
+            await handle.options(method_name="load").remote()
+        
+        # After the model is loaded, we set the expiration time based on the TTL
+        async with self._lock:
             # Calculate the new expiration time
             expiration_time = (
                 (datetime.now() + timedelta(seconds=ttl_seconds))
@@ -106,14 +104,8 @@ class ModelManager:
                 else never()
             )
             self._lru_caches[cache_key][inference_id] = expiration_time
-
-            await self._resize_lru(cache_key, lru_size)
-
-            if is_new:
-                self.logger.info(f"Calling load() for the first time for {inference_id}")
-                await handle.options(method_name="load").remote()
-
-            return handle
+        
+        return handle
 
     async def _resize_lru(self, cache_key: str, lru_size: int) -> None:
         """Ensure the LRU cache does not exceed its size."""
