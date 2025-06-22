@@ -1,19 +1,21 @@
 import asyncio
+import logging
 from typing import Any, Dict, List
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel
+from pydantic.dataclasses import dataclass
 from ray import serve
 from ray.serve.handle import DeploymentHandle
 
-from fastapi import File, Form, HTTPException, Query, UploadFile
-from pydantic import BaseModel
-from pydantic.dataclasses import dataclass
-
 from inferio.config import list_inference_ids, load_config
+from inferio.cudnnsetup import cudnn_setup
 from inferio.inferio_ray.create_deployment import build_inference_deployment
 from inferio.inferio_ray.deployment_config import get_deployment_config
+from inferio.inferio_ray.manager import ModelManager
 from inferio.utils import encode_output_response, parse_input_request
-from inferio.cudnnsetup import cudnn_setup
+
 load_dotenv()
 cudnn_setup()
 
@@ -33,13 +35,18 @@ class CacheListResponse:
 class CacheKeyResponse(BaseModel):
     expirations: Dict[str, str]
 
-@serve.deployment
+@serve.deployment(
+    name="InferioIngress",
+    autoscaling_config={
+        "min_replicas": 1,
+    }
+)
 @serve.ingress(app)
 class InferioIngress:
-    def __init__(self):
-        import logging
+    def __init__(self, manager_handle: DeploymentHandle):
         from dotenv import load_dotenv
         from panoptikon.log import setup_logging
+
         load_dotenv()
         setup_logging()
         self.logger = logging.getLogger("inferio.ingress")
@@ -47,6 +54,7 @@ class InferioIngress:
         self._handles: dict[str, DeploymentHandle] = {}
         self._lock = asyncio.Lock()
         self._config, self._mtime = load_config()
+        self.manager = manager_handle
 
     async def get_config(self):
         """Reload the configuration if it has changed."""
@@ -148,12 +156,13 @@ class InferioIngress:
         try:
             # Perform prediction
             model_handle = await self._ensure(full_inference_id)
+            await self.manager.options(method_name="load_model").remote(
+                full_inference_id, model_handle, cache_key, lru_size, ttl_seconds
+            )
             outputs: List[bytes | dict | list | str] = list(await model_handle.remote(inputs))
         except Exception as e:
             self.logger.error(f"Prediction failed for model {inference_id}: {e}")
             raise HTTPException(status_code=500, detail="Prediction failed")
-        finally:
-            pass
         return encode_output_response(outputs)
 
 
@@ -190,7 +199,9 @@ class InferioIngress:
         try:
             full_inference_id = f"{group}/{inference_id}"
             model_handle = await self._ensure(full_inference_id)
-            await model_handle.options(method_name="load").remote()
+            await self.manager.options(method_name="load_model").remote(
+                full_inference_id, model_handle, cache_key, lru_size, ttl_seconds
+            )
             return StatusResponse(status="loaded")
         except Exception as e:
             self.logger.error(f"Failed to load model {inference_id}: {e}")
@@ -206,13 +217,9 @@ class InferioIngress:
         """,
         response_model=StatusResponse,
     )
-    async def unload_model(
-        self,
-        group: str,
-        inference_id: str,
-        cache_key: str,
-    ):
-        # ModelManager().unload_model(cache_key, f"{group}/{inference_id}")
+    async def unload_model(self, cache_key: str, group: str, inference_id: str):
+        full_inference_id = f"{group}/{inference_id}"
+        await self.manager.options(method_name="unload_model").remote(cache_key, full_inference_id)
         return StatusResponse(status="unloaded")
 
 
@@ -226,7 +233,7 @@ class InferioIngress:
         response_model=StatusResponse,
     )
     async def clear_cache(self, cache_key: str):
-        # ModelManager().clear_cache(cache_key)
+        await self.manager.options(method_name="clear_cache").remote(cache_key)
         return StatusResponse(status="cleared")
 
     @app.get(
@@ -235,11 +242,11 @@ class InferioIngress:
         description="Returns a mapping of `inference_id`s for all models in the cache to their expiration times.",
     )
     async def get_cache_expiration(self, cache_key: str) -> CacheKeyResponse:
-        #expire_dict = ModelManager().get_ttl_expiration(cache_key)
+        expire_dict = await self.manager.options(method_name="get_ttl_expiration").remote(cache_key)
         return CacheKeyResponse(
             expirations={
-                # inference_id: expiration_time.isoformat()
-                # for inference_id, expiration_time in expire_dict.items()
+                inference_id: expiration_time.isoformat()
+                for inference_id, expiration_time in expire_dict.items()
             }
         )
 
@@ -249,8 +256,9 @@ class InferioIngress:
         description="Returns a mapping of `inference_id`s for all loaded models to the lists of `cache_key`s that reference them.",
         response_model=CacheListResponse,
     )
-    async def get_cached_models(self):
-        return CacheListResponse(cache={})
+    async def list_caches(self) -> CacheListResponse:
+        cache = await self.manager.options(method_name="list_loaded_models").remote()
+        return CacheListResponse(cache=cache)
 
     @app.get(
         "/metadata",
@@ -259,7 +267,9 @@ class InferioIngress:
         response_model=Dict[str, Dict[str, Any]],
     )
     async def get_metadata(self) -> Dict[str, Dict[str, Any]]:
-        global_config = await self.get_config()
-        return list_inference_ids(global_config)
+        config = await self.get_config()
+        return list_inference_ids(config)
 
-serve_app = InferioIngress.bind() # type: ignore
+
+manager_app = ModelManager.bind()
+serve_app = InferioIngress.bind(manager_app) # type: ignore
