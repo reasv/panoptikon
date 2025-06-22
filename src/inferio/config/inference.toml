@@ -1,8 +1,14 @@
+# ===================================================================
+#  Tagger Group: Danbooru style and VLM-based general taggers
+# ===================================================================
+
 [group.tags]
-config = { impl_class = "wd_tagger" }
+config.impl_class = "wd_tagger"
+
 [group.tags.metadata]
-description = "Danbooru style taggers, and moondream (VLM) based general item taggers."
 name = "Tags"
+description = """Danbooru style taggers, and moondream (VLM) based \
+  general item taggers."""
 default_threshold = 0.1
 default_batch_size = 64
 default_inference_id = "wd-swinv2-tagger-v3"
@@ -10,263 +16,974 @@ target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
-input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { mode = "aspect-ratio", ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 2048 } } }
+[group.tags.metadata.input_spec]
+handler = "image_frames"
+opts.max_frames = 4
+opts.slice_frames = true
+opts.slice_settings.mode = "aspect-ratio"
+opts.slice_settings.ratio_larger = 16
+opts.slice_settings.ratio_smaller = 9
+opts.slice_settings.max_multiplier = 2.0
+opts.slice_settings.target_multiplier = 1.5
+opts.slice_settings.minimum_size = 2048
 
-[group.tags.inference_ids]
-wd-swinv2-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-swinv2-tagger-v3" }, metadata = { description = "(Recommended) SwinV2 Based Tagger" } }
-wd-convnext-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-convnext-tagger-v3" }, metadata = { description = "ConvNext Based Tagger" } }
-wd-vit-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-tagger-v3" }, metadata = { description = "ViT Based Tagger" } }
-wd-eva02-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-eva02-large-tagger-v3" }, metadata = { description = "(Recommended Large) Eva02 Based Tagger (Large Version)" } }
-wd-vit-large-tagger-v3 = { config = { model_repo = "SmilingWolf/wd-vit-large-tagger-v3" }, metadata = { description = "ViT Based Tagger (Large Version)" } }
-moondream-2b-25-03 = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "general", enable_rating = true }, metadata = { description = "(Experimental) Moondream 2B Based Tagger. This tagger works for general items and has an open vocabulary as it is a VLM" } }
-moondream-2b-25-03-clothing = { config = { impl_class = "moondream_tagger", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", namespace = "moondream", sub_namespace = "clothing", enable_rating = false, prompt = "List all visible articles of clothing in this image. Return the result as a JSON array." }, metadata = { description = "(Experimental) Moondream 2B Based Tagger prompted to only list items of clothing as tags. This tagger works for general items and has an open vocabulary as it is a VLM" } }
+# --- Inference IDs for Tags ---
+
+[group.tags.inference_ids.wd-swinv2-tagger-v3]
+config.model_repo = "SmilingWolf/wd-swinv2-tagger-v3"
+metadata.description = "(Recommended) SwinV2 Based Tagger"
+
+[group.tags.inference_ids.wd-convnext-tagger-v3]
+config.model_repo = "SmilingWolf/wd-convnext-tagger-v3"
+metadata.description = "ConvNext Based Tagger"
+
+[group.tags.inference_ids.wd-vit-tagger-v3]
+config.model_repo = "SmilingWolf/wd-vit-tagger-v3"
+metadata.description = "ViT Based Tagger"
+
+[group.tags.inference_ids.wd-eva02-large-tagger-v3]
+config.model_repo = "SmilingWolf/wd-eva02-large-tagger-v3"
+metadata.description = "(Recommended Large) Eva02 Based Tagger (Large Version)"
+
+[group.tags.inference_ids.wd-vit-large-tagger-v3]
+config.model_repo = "SmilingWolf/wd-vit-large-tagger-v3"
+metadata.description = "ViT Based Tagger (Large Version)"
+
+[group.tags.inference_ids."moondream-2b-25-03"]
+config.impl_class = "moondream_tagger"
+config.model_repo = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.namespace = "moondream"
+config.sub_namespace = "general"
+config.enable_rating = true
+metadata.description = """(Experimental) Moondream 2B Based Tagger. This tagger works \
+  for general items and has an open vocabulary as it is a VLM"""
+
+[group.tags.inference_ids."moondream-2b-25-03-clothing"]
+config.impl_class = "moondream_tagger"
+config.model_repo = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.namespace = "moondream"
+config.sub_namespace = "clothing"
+config.enable_rating = false
+config.prompt = """List all visible articles of clothing in this image. \
+  Return the result as a JSON array."""
+metadata.description = """(Experimental) Moondream 2B Based Tagger prompted to only \
+  list items of clothing as tags. This tagger works for general items and \
+  has an open vocabulary as it is a VLM"""
+
+
+# ===================================================================
+#  Tag Matching Group: Finds images on Danbooru and similar sites
+# ===================================================================
 
 [group.tagmatch]
-config = { impl_class = "danbooru_tagger" }
+config.impl_class = "danbooru_tagger"
+
 [group.tagmatch.metadata]
-description = "Matches your images to those uploaded to places like Danbooru and returns the tags associated with them."
 name = "Tag Matching"
+description = """Matches your images to those uploaded to places like Danbooru \
+  and returns the tags associated with them."""
 default_batch_size = 5
 default_threshold = 0.5
 default_inference_id = "danbooru"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/"]
-input_spec = { handler = "md5" }
-[group.tagmatch.inference_ids]
-danbooru = { config = {}, metadata = { description = "Finds your images and videos on Danbooru and downloads the tags. Ignores the confidence threshold." } }
-danbooru-saucenao = { config = { sauce_nao_enabled = true }, metadata = { input_spec = { handler = "md5_image" }, description = "Requires SAUCENAO_API_KEY environment variable to be set. Falls back to SauceNAO if it can't find your exact image on Danbooru. Finds your images and videos on Danbooru and downloads the tags. Applies the confidence threshold to the SauceNAO similarity level." } }
+
+[group.tagmatch.metadata.input_spec]
+handler = "md5"
+
+# --- Inference IDs for Tag Matching ---
+
+[group.tagmatch.inference_ids.danbooru]
+config = {}
+metadata.description = """Finds your images and videos on Danbooru and downloads \
+  the tags. Ignores the confidence threshold."""
+
+[group.tagmatch.inference_ids.danbooru-saucenao]
+config.sauce_nao_enabled = true
+metadata.input_spec.handler = "md5_image"
+metadata.description = """Requires SAUCENAO_API_KEY environment variable to be set. \
+  Falls back to SauceNAO if it can't find your exact image on Danbooru. \
+  Finds your images and videos on Danbooru and downloads the tags. \
+  Applies the confidence threshold to the SauceNAO similarity level."""
+
+# ===================================================================
+#  OCR Group: Text extraction from images and documents
+# ===================================================================
 
 [group.doctr]
-config = { impl_class = "doctr" }
-[group.doctr.metadata]
-description = "Extract text from images, videos, and documents through OCR using DocTR or EasyOCR."
-name = "OCR"
-default_threshold = 0
-default_batch_size = 64
-default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
-target_entities = ["items"]
-output_type = "text"
-input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { mode = "pixels", pixel_target_size = 1536, pixel_max_size = 4608 } } }
+config.impl_class = "doctr"
 
-[group.doctr.inference_ids]
-easyocr_standard_en = { config = { impl_class = "easyocr", languages = [
-    "en",
-] }, metadata = { description = "(Recommended) EasyOCR - English Text, Standard Recog Network" } }
-easyocr_standard_en_ja = { config = { impl_class = "easyocr", languages = [
-    "en",
-    "ja",
-] }, metadata = { description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network" } }
-easyocr_standard_en_ch_sim = { config = { impl_class = "easyocr", languages = [
-    "en",
-    "ch_sim",
-] }, metadata = { description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network" } }
-db_resnet50_crnn_mobilenet_v3_small = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_small" }, metadata = { description = "(Recommended) CRNN MobileNet V3 Small" } }
-db_resnet50_crnn_mobilenet_v3_large = { config = { detection_model = "db_resnet50", recognition_model = "crnn_mobilenet_v3_large" }, metadata = { description = "CRNN MobileNet V3 Large" } }
-db_resnet50_crnn_vgg16_bn = { config = { detection_model = "db_resnet50", recognition_model = "crnn_vgg16_bn" }, metadata = { description = "CRNN VGG16 BN OCR" } }
-db_resnet50_master = { config = { detection_model = "db_resnet50", recognition_model = "master" }, metadata = { description = "MASTER" } }
-db_resnet50_vitstr_small = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_small" }, metadata = { description = "ViTSTR Small" } }
-db_resnet50_vitstr_base = { config = { detection_model = "db_resnet50", recognition_model = "vitstr_base" }, metadata = { description = "ViTSTR Base" } }
-db_resnet50_parseq = { config = { detection_model = "db_resnet50", recognition_model = "parseq" }, metadata = { description = "PARSEQ" } }
+[group.doctr.metadata]
+name                 = "OCR"
+description          = """Extract text from images, videos, and documents through \
+  OCR using DocTR or EasyOCR."""
+default_threshold    = 0
+default_batch_size   = 64
+default_inference_id = "db_resnet50_crnn_mobilenet_v3_small"
+target_entities      = ["items"]
+output_type          = "text"
+input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
+
+[group.doctr.metadata.input_spec]
+handler = "image_frames"
+opts.max_frames                = 4
+opts.slice_frames              = true
+opts.slice_settings.mode       = "pixels"
+opts.slice_settings.pixel_target_size = 1536
+opts.slice_settings.pixel_max_size    = 4608
+
+# --- Inference IDs for OCR ---
+
+[group.doctr.inference_ids.easyocr_standard_en]
+config.impl_class = "easyocr"
+config.languages  = ["en"]
+metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
+
+[group.doctr.inference_ids.easyocr_standard_en_ja]
+config.impl_class = "easyocr"
+config.languages  = ["en", "ja"]
+metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
+
+[group.doctr.inference_ids.easyocr_standard_en_ch_sim]
+config.impl_class = "easyocr"
+config.languages  = ["en", "ch_sim"]
+metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
+
+[group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "crnn_mobilenet_v3_small"
+metadata.description    = "(Recommended) CRNN MobileNet V3 Small"
+
+[group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_large]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "crnn_mobilenet_v3_large"
+metadata.description    = "CRNN MobileNet V3 Large"
+
+[group.doctr.inference_ids.db_resnet50_crnn_vgg16_bn]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "crnn_vgg16_bn"
+metadata.description    = "CRNN VGG16 BN OCR"
+
+[group.doctr.inference_ids.db_resnet50_master]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "master"
+metadata.description    = "MASTER"
+
+[group.doctr.inference_ids.db_resnet50_vitstr_small]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "vitstr_small"
+metadata.description    = "ViTSTR Small"
+
+[group.doctr.inference_ids.db_resnet50_vitstr_base]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "vitstr_base"
+metadata.description    = "ViTSTR Base"
+
+[group.doctr.inference_ids.db_resnet50_parseq]
+config.detection_model  = "db_resnet50"
+config.recognition_model = "parseq"
+metadata.description    = "PARSEQ"
+
+
+# ===================================================================
+#  Florence 2 Group: Captioning and OCR
+# ===================================================================
 
 [group.florence2]
-config = { impl_class = "florence2" }
+config.impl_class = "florence2"
+
 [group.florence2.metadata]
-description = "Image captioning and OCR through Microsoft's Florence2 models"
-name = "Florence 2"
-default_batch_size = 4
+name                 = "Florence 2"
+description          = "Image captioning and OCR through Microsoft's Florence2 models"
+default_batch_size   = 4
 default_inference_id = "msft_large-more-detailed"
-target_entities = ["items"]
-output_type = "text"
-input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { mode = "pixels", pixel_target_size = 8192, pixel_max_size = 10000 } } }
+target_entities      = ["items"]
+output_type          = "text"
+input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
-[group.florence2.inference_ids]
-msft_large-more-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
-msft_large-caption = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<CAPTION>" }, metadata = { description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model" } }
-msft_large-detailed = { config = { model_name = "microsoft/Florence-2-large-ft", task_prompt = "<DETAILED_CAPTION>" }, metadata = { description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model" } }
-msft_large-ocr = { config = { model_name = "microsoft/Florence-2-large", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model" } }
+[group.florence2.metadata.input_spec]
+handler = "image_frames"
+opts.max_frames                = 4
+opts.slice_frames              = true
+opts.slice_settings.mode       = "pixels"
+opts.slice_settings.pixel_target_size = 8192
+opts.slice_settings.pixel_max_size    = 10000
 
-# Fine-tuned models
-gokaygokay_SD3-Caption = { config = { model_name = "gokaygokay/Florence-2-SD3-Captioner", task_prompt = "<DESCRIPTION>", text_input = "Describe this image in great detail." }, metadata = { description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion" } }
-DocVQA-Caption = { config = { model_name = "HuggingFaceM4/Florence-2-DocVQA", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering" } }
-yayayaaa_large-moredetailed = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Generates extremely verbose descriptions" } }
-yayayaaa_large-moredetailed-m = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<DETAILED_CAPTION>" }, metadata = { description = "(Medium Detail Captioning) (Size: Large) Generates extremely verbose descriptions" } }
-yayayaaa_large-moredetailed-s = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<CAPTION>" }, metadata = { description = "(Captioning) (Size: Large) Generates extremely verbose descriptions" } }
-yayayaaa_large-moredetailed-ocr = { config = { model_name = "yayayaaa/florence-2-large-ft-moredetailed", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) Generates extremely verbose descriptions" } }
-ljnlonoljpiljm_base-ft-keywords = { config = { model_name = "ljnlonoljpiljm/florence-2-base-ft-keywords-caption-interleaved", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Keyword-based captions" } }
-andito_large = { config = { model_name = "andito/Florence-2-large-ft", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model" } }
-andito_large-ocr = { config = { model_name = "andito/Florence-2-large-ft", task_prompt = "<OCR>" }, metadata = { description = "(OCR) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model" } }
-MiaoshouAI_base-PromptGen-Caption = { config = { model_name = "MiaoshouAI/Florence-2-base-PromptGen", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Trained for the MiaoshouAI Tagger for ComfyUI" } }
-MiaoshouAI_base-PromptGen = { config = { model_name = "MiaoshouAI/Florence-2-base-PromptGen", task_prompt = "<GENERATE_PROMPT>" }, metadata = { description = "(Detailed Captioning) (Size: Base) Stable Diffusion Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI" } }
-ljnlonoljpiljm_large-docci-caption = { config = { model_name = "ljnlonoljpiljm/florence-2-large-docci-caption", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci" } }
-aniketVerma07_finetuned = { config = { model_name = "aniketVerma07/finetuned_florence_2", task_prompt = "<MORE_DETAILED_CAPTION>" }, metadata = { description = "(Detailed Captioning) Florence 2 Finetune" } }
-Oysiyl_OCR-Cauldron-IAM = { config = { model_name = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM", task_prompt = "<OCR>" }, metadata = { description = "(OCR) OCR Finetune" } }
+# --- Inference IDs for Florence 2 ---
+
+[group.florence2.inference_ids.msft_large-more-detailed]
+config.model_name  = "microsoft/Florence-2-large-ft"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
+
+[group.florence2.inference_ids.msft_large-caption]
+config.model_name  = "microsoft/Florence-2-large-ft"
+config.task_prompt = "<CAPTION>"
+metadata.description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
+
+[group.florence2.inference_ids.msft_large-detailed]
+config.model_name  = "microsoft/Florence-2-large-ft"
+config.task_prompt = "<DETAILED_CAPTION>"
+metadata.description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model"
+
+[group.florence2.inference_ids.msft_large-ocr]
+config.model_name  = "microsoft/Florence-2-large"
+config.task_prompt = "<OCR>"
+metadata.description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model"
+
+# --- Fine-tuned Florence 2 Models ---
+
+[group.florence2.inference_ids.gokaygokay_SD3-Caption]
+config.model_name  = "gokaygokay/Florence-2-SD3-Captioner"
+config.task_prompt = "<DESCRIPTION>"
+config.text_input  = "Describe this image in great detail."
+metadata.description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion"
+
+[group.florence2.inference_ids.DocVQA-Caption]
+config.model_name  = "HuggingFaceM4/Florence-2-DocVQA"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering"
+
+[group.florence2.inference_ids.yayayaaa_large-moredetailed]
+config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Large) Generates extremely verbose descriptions"
+
+[group.florence2.inference_ids.yayayaaa_large-moredetailed-m]
+config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+config.task_prompt = "<DETAILED_CAPTION>"
+metadata.description = "(Medium Detail Captioning) (Size: Large) Generates extremely verbose descriptions"
+
+[group.florence2.inference_ids.yayayaaa_large-moredetailed-s]
+config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+config.task_prompt = "<CAPTION>"
+metadata.description = "(Captioning) (Size: Large) Generates extremely verbose descriptions"
+
+[group.florence2.inference_ids.yayayaaa_large-moredetailed-ocr]
+config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+config.task_prompt = "<OCR>"
+metadata.description = "(OCR) (Size: Large) Generates extremely verbose descriptions"
+
+[group.florence2.inference_ids.ljnlonoljpiljm_base-ft-keywords]
+config.model_name  = "ljnlonoljpiljm/florence-2-base-ft-keywords-caption-interleaved"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Base) Keyword-based captions"
+
+[group.florence2.inference_ids.andito_large]
+config.model_name  = "andito/Florence-2-large-ft"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
+
+[group.florence2.inference_ids.andito_large-ocr]
+config.model_name  = "andito/Florence-2-large-ft"
+config.task_prompt = "<OCR>"
+metadata.description = "(OCR) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
+
+[group.florence2.inference_ids.MiaoshouAI_base-PromptGen-Caption]
+config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = """(Detailed Captioning) (Size: Base) Trained for the \
+  MiaoshouAI Tagger for ComfyUI"""
+
+[group.florence2.inference_ids.MiaoshouAI_base-PromptGen]
+config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
+config.task_prompt = "<GENERATE_PROMPT>"
+metadata.description = """(Detailed Captioning) (Size: Base) Stable Diffusion \
+  Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI"""
+
+[group.florence2.inference_ids.ljnlonoljpiljm_large-docci-caption]
+config.model_name  = "ljnlonoljpiljm/florence-2-large-docci-caption"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci"
+
+[group.florence2.inference_ids.aniketVerma07_finetuned]
+config.model_name  = "aniketVerma07/finetuned_florence_2"
+config.task_prompt = "<MORE_DETAILED_CAPTION>"
+metadata.description = "(Detailed Captioning) Florence 2 Finetune"
+
+[group.florence2.inference_ids.Oysiyl_OCR-Cauldron-IAM]
+config.model_name  = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM"
+config.task_prompt = "<OCR>"
+metadata.description = "(OCR) OCR Finetune"
+
+
+# ===================================================================
+#  VLM Group: General Vision-Language Models
+# ===================================================================
 
 [group.vlm]
-config = { impl_class = "moondream_captioner" }
-[group.vlm.metadata]
-description = "Image captioning and OCR through Vision-Language Models like Moondream 2B."
-name = "VLMs"
-default_batch_size = 4
-default_inference_id = "moondream-2b-25-03-ocr"
-target_entities = ["items"]
-output_type = "text"
-input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
-input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { mode = "pixels", pixel_target_size = 8192, pixel_max_size = 10000 } } }
+config.impl_class = "moondream_captioner"
 
-[group.vlm.inference_ids]
-moondream-2b-25-03-ocr = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "query", prompt = "extract all text from this image", confidence = 0.6, language = "moondream-ocr" }, metadata = { description = "(Recommended) Moondream 2B (v2025/03) OCR" } }
-moondream-2b-25-03-tags = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "query", prompt = "List all visible objects, features, and characteristics of this image. Return the result as a comma-separated list.", confidence = 0.6, language = "moondream-keywords" }, metadata = { description = "(Recommdended) Moondream 2B (v2025/03) captioning model that outputs a list of keywords for each image" } }
-moondream-2b-25-03-short = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "short", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) short captions" } }
-moondream-2b-25-03-norm = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "normal", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) normal-length captions" } }
-moondream-2b-25-03-long = { config = { impl_class = "moondream_captioner", model_repo = "vikhyatk/moondream2", model_revision = "2025-03-27", task = "caption", caption_length = "long", confidence = 0.6 }, metadata = { description = "Moondream 2B (v2025/03) long captions" } }
+[group.vlm.metadata]
+name                 = "VLMs"
+description          = """Image captioning and OCR through Vision-Language \
+  Models like Moondream 2B."""
+default_batch_size   = 4
+default_inference_id = "moondream-2b-25-03-ocr"
+target_entities      = ["items"]
+output_type          = "text"
+input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
+
+[group.vlm.metadata.input_spec]
+handler = "image_frames"
+opts.max_frames                = 4
+opts.slice_frames              = true
+opts.slice_settings.mode       = "pixels"
+opts.slice_settings.pixel_target_size = 8192
+opts.slice_settings.pixel_max_size    = 10000
+
+# --- Inference IDs for VLMs ---
+
+[group.vlm.inference_ids."moondream-2b-25-03-ocr"]
+config.impl_class    = "moondream_captioner"
+config.model_repo    = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.task          = "query"
+config.prompt        = "extract all text from this image"
+config.confidence    = 0.6
+config.language      = "moondream-ocr"
+metadata.description = "(Recommended) Moondream 2B (v2025/03) OCR"
+
+[group.vlm.inference_ids."moondream-2b-25-03-tags"]
+config.impl_class    = "moondream_captioner"
+config.model_repo    = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.task          = "query"
+config.prompt        = """List all visible objects, features, and characteristics \
+  of this image. Return the result as a comma-separated list."""
+config.confidence    = 0.6
+config.language      = "moondream-keywords"
+metadata.description = """(Recommended) Moondream 2B (v2025/03) captioning model \
+  that outputs a list of keywords for each image"""
+
+[group.vlm.inference_ids."moondream-2b-25-03-short"]
+config.impl_class    = "moondream_captioner"
+config.model_repo    = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.task          = "caption"
+config.caption_length = "short"
+config.confidence    = 0.6
+metadata.description = "Moondream 2B (v2025/03) short captions"
+
+[group.vlm.inference_ids."moondream-2b-25-03-norm"]
+config.impl_class    = "moondream_captioner"
+config.model_repo    = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.task          = "caption"
+config.caption_length = "normal"
+config.confidence    = 0.6
+metadata.description = "Moondream 2B (v2025/03) normal-length captions"
+
+[group.vlm.inference_ids."moondream-2b-25-03-long"]
+config.impl_class    = "moondream_captioner"
+config.model_repo    = "vikhyatk/moondream2"
+config.model_revision = "2025-03-27"
+config.task          = "caption"
+config.caption_length = "long"
+config.confidence    = 0.6
+metadata.description = "Moondream 2B (v2025/03) long captions"
+
+
+# ===================================================================
+#  Text Embedding Group (for Semantic Search)
+# ===================================================================
 
 [group.textembed]
-config = { impl_class = "sentence_transformers" }
+config.impl_class = "sentence_transformers"
+
 [group.textembed.metadata]
-description = "Generate Text Embeddings from extracted text using Sentence Transformers. Enables semantic text search. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
-name = "Text Embeddings"
-default_batch_size = 64
+name                 = "Text Embeddings"
+description          = """Generate Text Embeddings from extracted text using \
+  Sentence Transformers. Enables semantic text search. This will generate \
+  embeddings for text already extracted by other models such as Whisper \
+  Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."""
+default_batch_size   = 64
 default_inference_id = "all-mpnet-base-v2"
-target_entities = ["text"]
-output_type = "text-embedding"
-input_spec = { handler = "extracted_text" }
-[group.textembed.inference_ids]
-all-mpnet-base-v2 = { config = { model_name = "all-mpnet-base-v2" }, metadata = { description = "MPNet-based Sentence Transformer (Recommended)" } }
-all-MiniLM-L6-v2 = { config = { model_name = "all-MiniLM-L6-v2" }, metadata = { description = "MiniLM-based Sentence Transformer" } }
-stella_en_400M_v5 = { config = { model_name = "dunzhang/stella_en_400M_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" } }, metadata = { description = "Stella English 400M Sentence Transformer" } }
-"stella_en_1.5B_v5" = { config = { model_name = "dunzhang/stella_en_1.5B_v5", query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" } }, metadata = { description = "Stella English 1.5B Sentence Transformer" } }
-jina-embeddings-v3-api = { config = { model_name = "jina-embeddings-v3", impl_class = "jina-clip-api", dimensions = 1024, embedding_type = "float", task = "text-matching" }, metadata = { description = "Not local (API-based). You must set the JINA_API_KEY env var before using this model. jina-embeddings-v3 is a multilingual multi-task text embedding model designed for a variety of NLP applications." } }
+target_entities      = ["text"]
+output_type          = "text-embedding"
+
+[group.textembed.metadata.input_spec]
+handler = "extracted_text"
+
+# --- Inference IDs for Text Embeddings ---
+
+[group.textembed.inference_ids.all-mpnet-base-v2]
+config.model_name  = "all-mpnet-base-v2"
+metadata.description = "MPNet-based Sentence Transformer (Recommended)"
+
+[group.textembed.inference_ids.all-MiniLM-L6-v2]
+config.model_name  = "all-MiniLM-L6-v2"
+metadata.description = "MiniLM-based Sentence Transformer"
+
+[group.textembed.inference_ids.stella_en_400M_v5]
+config.model_name = "dunzhang/stella_en_400M_v5"
+config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
+metadata.description = "Stella English 400M Sentence Transformer"
+
+[group.textembed.inference_ids."stella_en_1.5B_v5"] # Quotes required due to '.'
+config.model_name = "dunzhang/stella_en_1.5B_v5"
+config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
+metadata.description = "Stella English 1.5B Sentence Transformer"
+
+[group.textembed.inference_ids.jina-embeddings-v3-api]
+config.model_name    = "jina-embeddings-v3"
+config.impl_class    = "jina-clip-api"
+config.dimensions    = 1024
+config.embedding_type = "float"
+config.task          = "text-matching"
+metadata.description = """Not local (API-based). You must set the JINA_API_KEY \
+  env var before using this model. jina-embeddings-v3 is a multilingual \
+  multi-task text embedding model designed for a variety of NLP applications."""
+
+
+# ===================================================================
+#  Whisper Group: Speech-to-Text
+# ===================================================================
 
 [group.whisper]
-config = { impl_class = "faster_whisper" }
-[group.whisper.metadata]
-description = "Extract text from audio using OpenAI's Whisper model"
-name = "Whisper Speech-to-Text"
-default_threshold = 0
-default_batch_size = 4
-default_inference_id = "distill-large-v3"
-target_entities = ["items"]
-output_type = "text"
-input_mime_types = ["video/", "audio/"]
-input_spec = { handler = "audio_tracks" }                            # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
-[group.whisper.inference_ids]
-"tiny.en" = { config = { model_name = "Systran/faster-whisper-tiny.en" }, metadata = { description = "Tiny English Whisper Model" } }
-tiny = { config = { model_name = "Systran/faster-whisper-tiny" }, metadata = { description = "Tiny Whisper Model" } }
-"base.en" = { config = { model_name = "Systran/faster-whisper-base.en" }, metadata = { description = "Base English Whisper Model" } }
-base = { config = { model_name = "Systran/faster-whisper-base" }, metadata = { description = "Base Whisper Model" } }
-"small.en" = { config = { model_name = "Systran/faster-whisper-small.en" }, metadata = { description = "Small English Whisper Model" } }
-small = { config = { model_name = "Systran/faster-whisper-small" }, metadata = { description = "Small Whisper Model" } }
-"medium.en" = { config = { model_name = "Systran/faster-whisper-medium.en" }, metadata = { description = "Medium English Whisper Model" } }
-medium = { config = { model_name = "Systran/faster-whisper-medium" }, metadata = { description = "Medium Whisper Model" } }
-large-v1 = { config = { model_name = "Systran/faster-whisper-large-v1" }, metadata = { description = "Large Whisper Model v1" } }
-large-v2 = { config = { model_name = "Systran/faster-whisper-large-v2" }, metadata = { description = "Large Whisper Model v2" } }
-large-v3 = { config = { model_name = "Systran/faster-whisper-large-v3" }, metadata = { description = "Large Whisper Model v3" } }
-large = { config = { model_name = "Systran/faster-whisper-large-v3" }, metadata = { description = "Large Whisper Model" } }
-distil-large-v2 = { config = { model_name = "Systran/faster-distil-whisper-large-v2" }, metadata = { description = "Distilled Large Whisper Model v2" } }
-"distil-medium.en" = { config = { model_name = "Systran/faster-distil-whisper-medium.en" }, metadata = { description = "Distilled Medium English Whisper Model" } }
-"distil-small.en" = { config = { model_name = "Systran/faster-distil-whisper-small.en" }, metadata = { description = "Distilled Small English Whisper Model" } }
-distill-large-v3 = { config = { model_name = "Systran/faster-distil-whisper-large-v3" }, metadata = { description = "Distilled Large Whisper Model v3" } }
+config.impl_class = "faster_whisper"
 
+[group.whisper.metadata]
+name                 = "Whisper Speech-to-Text"
+description          = "Extract text from audio using OpenAI's Whisper model"
+default_threshold    = 0
+default_batch_size   = 4
+default_inference_id = "distill-large-v3"
+target_entities      = ["items"]
+output_type          = "text"
+input_mime_types     = ["video/", "audio/"]
+
+[group.whisper.metadata.input_spec]
+handler = "audio_tracks" # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
+
+# --- Inference IDs for Whisper ---
+
+[group.whisper.inference_ids."tiny.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-whisper-tiny.en"
+metadata.description = "Tiny English Whisper Model"
+
+[group.whisper.inference_ids.tiny]
+config.model_name  = "Systran/faster-whisper-tiny"
+metadata.description = "Tiny Whisper Model"
+
+[group.whisper.inference_ids."base.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-whisper-base.en"
+metadata.description = "Base English Whisper Model"
+
+[group.whisper.inference_ids.base]
+config.model_name  = "Systran/faster-whisper-base"
+metadata.description = "Base Whisper Model"
+
+[group.whisper.inference_ids."small.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-whisper-small.en"
+metadata.description = "Small English Whisper Model"
+
+[group.whisper.inference_ids.small]
+config.model_name  = "Systran/faster-whisper-small"
+metadata.description = "Small Whisper Model"
+
+[group.whisper.inference_ids."medium.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-whisper-medium.en"
+metadata.description = "Medium English Whisper Model"
+
+[group.whisper.inference_ids.medium]
+config.model_name  = "Systran/faster-whisper-medium"
+metadata.description = "Medium Whisper Model"
+
+[group.whisper.inference_ids.large-v1]
+config.model_name  = "Systran/faster-whisper-large-v1"
+metadata.description = "Large Whisper Model v1"
+
+[group.whisper.inference_ids.large-v2]
+config.model_name  = "Systran/faster-whisper-large-v2"
+metadata.description = "Large Whisper Model v2"
+
+[group.whisper.inference_ids.large-v3]
+config.model_name  = "Systran/faster-whisper-large-v3"
+metadata.description = "Large Whisper Model v3"
+
+[group.whisper.inference_ids.large]
+config.model_name  = "Systran/faster-whisper-large-v3"
+metadata.description = "Large Whisper Model"
+
+[group.whisper.inference_ids.distil-large-v2]
+config.model_name  = "Systran/faster-distil-whisper-large-v2"
+metadata.description = "Distilled Large Whisper Model v2"
+
+[group.whisper.inference_ids."distil-medium.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-distil-whisper-medium.en"
+metadata.description = "Distilled Medium English Whisper Model"
+
+[group.whisper.inference_ids."distil-small.en"] # Quotes required due to '.'
+config.model_name  = "Systran/faster-distil-whisper-small.en"
+metadata.description = "Distilled Small English Whisper Model"
+
+[group.whisper.inference_ids.distill-large-v3]
+config.model_name  = "Systran/faster-distil-whisper-large-v3"
+metadata.description = "Distilled Large Whisper Model v3"
+
+
+# ===================================================================
+#  CLIP Group: Image Embeddings
+# ===================================================================
 
 [group.clip]
-config = { impl_class = "openclip" }
+config.impl_class = "openclip"
+
 [group.clip.metadata]
-description = "Generate Image Embeddings using OpenAI's CLIP model for semantic image search"
-name = "CLIP Image Embeddings"
-default_batch_size = 64
+name                 = "CLIP Image Embeddings"
+description          = """Generate Image Embeddings using OpenAI's CLIP model \
+  for semantic image search"""
+default_batch_size   = 64
 default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
-target_entities = ["items"]
-output_type = "clip"
-input_spec = { handler = "image_frames", opts = { max_frames = 4, slice_frames = true, slice_settings = { mode = "aspect-ratio", ratio_larger = 16, ratio_smaller = 9, max_multiplier = 2.0, target_multiplier = 1.5, minimum_size = 2048 } } }
-[group.clip.inference_ids]
-ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)." } }
-ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
+target_entities      = ["items"]
+output_type          = "clip"
+
+[group.clip.metadata.input_spec]
+handler = "image_frames"
+opts.max_frames                = 4
+opts.slice_frames              = true
+opts.slice_settings.mode       = "aspect-ratio"
+opts.slice_settings.ratio_larger      = 16
+opts.slice_settings.ratio_smaller     = 9
+opts.slice_settings.max_multiplier    = 2.0
+opts.slice_settings.target_multiplier = 1.5
+opts.slice_settings.minimum_size      = 2048
+
+# --- Inference IDs for CLIP Image Embeddings ---
+
+[group.clip.inference_ids.ViT-H-14-378-quickgelu_dfn5b]
+config.model_name = "ViT-H-14-378-quickgelu"
+config.pretrained = "dfn5b"
+metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
+  DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)."""
+
+[group.clip.inference_ids.ViT-H-14-quickgelu_dfn5b]
+config.model_name = "ViT-H-14-quickgelu"
+config.pretrained = "dfn5b"
+metadata.description = "ViT-H-14 (224px) model pretrained on DFN5B"
+
+[group.clip.inference_ids.apple_MobileCLIP-B-LT]
+config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
+  (77.2%) for the size. Recommended if resources are limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+
+[group.clip.inference_ids.apple_MobileCLIP-S2]
+config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
+metadata.description = """MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy \
+  (74.4%) for the size. Recommended if resources are limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP"
+
+[group.clip.inference_ids.apple_MobileCLIP-S1]
+config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
+metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
+  accuracy (72.6%) for the size. Recommended if resources are very limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+
+[group.clip.inference_ids.jina-clip-v2-api]
+config.model_name     = "jina-clip-v2"
+config.impl_class     = "jina-clip-api"
+config.dimensions     = 1024
+config.normalized     = true
+config.embedding_type = "float"
+metadata.distance_func = "L2"
+metadata.description  = """Not local (API-based). You must set the JINA_API_KEY \
+  env var before using this model. jina-clip-v2 is a general-purpose \
+  multilingual multimodal embedding model for text & images."""
+
+[group.clip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
+config.model_name = "ViT-SO400M-14-SigLIP-384"
+config.pretrained = "webli"
+metadata.description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI"
+
+[group.clip.inference_ids.ViT-SO400M-14-SigLIP_webli]
+config.model_name = "ViT-SO400M-14-SigLIP"
+config.pretrained = "webli"
+metadata.description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI"
+
+[group.clip.inference_ids.ViT-B-32-256_datacomp_s34b_b86k]
+config.model_name = "ViT-B-32-256"
+config.pretrained = "datacomp_s34b_b86k"
+metadata.description = """ViT-B-32-256 model pretrained on DataComp S34B (b86k). \
+  ViT-B-32 are the least resource intensive ViT model type."""
+
+[group.clip.inference_ids.ViT-B-32_datacomp_xl_s13b_b90k]
+config.model_name = "ViT-B-32"
+config.pretrained = "datacomp_xl_s13b_b90k"
+metadata.description = """ViT-B-32 model pretrained on DataComp XL (s13b_b90k). \
+  ViT-B-32 are the least resource intensive ViT model type."""
+
+[group.clip.inference_ids.ViT-g-14_laion2b_s34b_b88k]
+config.model_name = "ViT-g-14"
+config.pretrained = "laion2b_s34b_b88k"
+metadata.description = """ViT-g-14 model pretrained on LAION2B (s34b_b88k). \
+  ViT-G-14 are the largest ViT model type, however not currently the best performing."""
+
+[group.clip.inference_ids.ViT-L-14_openai]
+config.model_name = "ViT-L-14"
+config.pretrained = "openai"
+metadata.description = "Original CLIP model trained by OpenAI"
+
+[group.clip.inference_ids.ViT-B-32_openai]
+config.model_name = "ViT-B-32"
+config.pretrained = "openai"
+metadata.description = """ViT-B-32 model trained by OpenAI. ViT-B-32 are the \
+  least resource intensive ViT model type."""
+
+[group.clip.inference_ids.coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k]
+config.model_name = "coca_ViT-B-32"
+config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
+metadata.description = "CoCa ViT-B-32 model fine-tuned on MSCOCO"
+
+[group.clip.inference_ids.coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k]
+config.model_name = "coca_ViT-L-14"
+config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
+metadata.description = "CoCa ViT-L-14 model fine-tuned on MSCOCO"
+
+[group.clip.inference_ids.convnext_xxlarge_laion2b_s34b_b82k_augreg_soup]
+config.model_name = "convnext_xxlarge"
+config.pretrained = "laion2b_s34b_b82k_augreg_soup"
+metadata.description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)"
+
+[group.clip.inference_ids.convnext_large_d_320_laion2b_s29b_b131k_ft_soup]
+config.model_name = "convnext_large_d_320"
+config.pretrained = "laion2b_s29b_b131k_ft_soup"
+metadata.description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)"
+
+[group.clip.inference_ids.convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg]
+config.model_name = "convnext_base_w_320"
+config.pretrained = "laion_aesthetic_s13b_b82k_augreg"
+metadata.description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)"
+
+[group.clip.inference_ids.convnext_base_w_laion2b_s13b_b82k_augreg]
+config.model_name = "convnext_base_w"
+config.pretrained = "laion2b_s13b_b82k_augreg"
+metadata.description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)"
+
+[group.clip.inference_ids.convnext_base_laion400m_s13b_b51k]
+config.model_name = "convnext_base"
+config.pretrained = "laion400m_s13b_b51k"
+metadata.description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)"
+
+[group.clip.inference_ids.mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384]
+config.model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.description = """A simple open-sourced SigLIP model fine-tuned on \
+  Genshin Impact's image-text pairs."""
+metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+
+[group.clip.inference_ids.mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K]
+config.model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K"
+metadata.description = """Much smaller variant of the ViT-SO400M-14 size model. \
+  A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's \
+  image-text pairs."""
+metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+
+[group.clip.inference_ids.marqo-fashionCLIP]
+config.model_name = "hf-hub:Marqo/marqo-fashionCLIP"
+metadata.description = """Marqo-FashionCLIP leverages Generalised Contrastive \
+  Learning (GCL) which allows the model to be trained on not just text \
+  descriptions but also categories, style, colors, materials, keywords and \
+  fine-details to provide highly relevant search results on fashion products. \
+  The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k)."""
+metadata.link = "https://huggingface.co/Marqo/marqo-fashionCLIP"
+
+[group.clip.inference_ids.marqo-fashionSigLIP]
+config.model_name = "hf-hub:Marqo/marqo-fashionSigLIP"
+metadata.description = """Marqo-FashionSigLIP leverages Generalised Contrastive \
+  Learning (GCL) which allows the model to be trained on not just text \
+  descriptions but also categories, style, colors, materials, keywords and \
+  fine-details to provide highly relevant search results on fashion products. \
+  The model was fine-tuned from ViT-B-16-SigLIP (webli)."""
+metadata.link = "https://huggingface.co/Marqo/marqo-fashionSigLIP"
+
+[group.clip.inference_ids.open-clip-vit-h-nsfw-finetune]
+config.model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune"
+metadata.description = "CLIP model finetuned for NSFW detection."
+metadata.link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true"
+
+[group.clip.inference_ids.imageomics_bioclip]
+config.model_name = "hf-hub:imageomics/bioclip"
+metadata.description = """BioCLIP is a foundation model for the tree of life, \
+  built using CLIP architecture as a vision model for general organismal biology. \
+  It is trained on TreeOfLife-10M, our specially-created dataset covering over \
+  450K taxa--the most biologically diverse ML-ready dataset available to date. \
+  Through rigorous benchmarking on a diverse set of fine-grained biological \
+  classification tasks, BioCLIP consistently outperformed existing baselines \
+  by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP \
+  learned a hierarchical representation aligned to the tree of life, which \
+  demonstrates its potential for robust generalizability."""
+metadata.link = "https://huggingface.co/imageomics/bioclip"
+
+[group.clip.inference_ids.microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224]
+config.model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+metadata.description = """BiomedCLIP is a biomedical vision-language foundation \
+  model that is pretrained on PMC-15M, a dataset of 15 million figure-caption \
+  pairs extracted from biomedical research articles in PubMed Central, using \
+  contrastive learning. It uses PubMedBERT as the text encoder and Vision \
+  Transformer as the image encoder, with domain-specific adaptations. It can \
+  perform various vision-language processing (VLP) tasks such as cross-modal \
+  retrieval, image classification, and visual question answering."""
+metadata.link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
+# ===================================================================
+#  TCLIP Group: CLIP Text Embeddings (for Cross-Modal Search)
+# ===================================================================
+
+[group.tclip]
+config.impl_class = "openclip"
+
+[group.tclip.metadata]
+name                 = "CLIP Text Embeddings"
+description          = """Generate Text Embeddings from extracted text using \
+  OpenAI's CLIP model. This is exclusively meant for cross-modal item \
+  similarity search. For semantic text search, use the `Text Embeddings` \
+  model group. This will generate embeddings for text already extracted by \
+  other models such as Whisper Speech-to-Text, or OCR. If you haven't run \
+  those models yet, you should do so first."""
+default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
+default_batch_size   = 64
+target_entities      = ["text"]
+output_type          = "text-embedding"
+
+[group.tclip.metadata.input_spec]
+handler = "extracted_text"
+
+# --- Inference IDs for CLIP Text Embeddings ---
+
+[group.tclip.inference_ids.ViT-H-14-378-quickgelu_dfn5b]
+config.model_name = "ViT-H-14-378-quickgelu"
+config.pretrained = "dfn5b"
+metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
+  DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)."""
+
+[group.tclip.inference_ids.ViT-H-14-quickgelu_dfn5b]
+config.model_name = "ViT-H-14-quickgelu"
+config.pretrained = "dfn5b"
+metadata.description = "ViT-H-14 (224px) model pretrained on DFN5B"
+
+[group.tclip.inference_ids.apple_MobileCLIP-B-LT]
+config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
+  (77.2%) for the size. Recommended if resources are limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+
+[group.tclip.inference_ids.apple_MobileCLIP-S2]
+config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
+metadata.description = """MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy \
+  (74.4%) for the size. Recommended if resources are limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP"
+
+[group.tclip.inference_ids.apple_MobileCLIP-S1]
+config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
+metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
+  accuracy (72.6%) for the size. Recommended if resources are very limited."""
+metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+
+[group.tclip.inference_ids.jina-clip-v2-api]
+config.model_name     = "jina-clip-v2"
+config.impl_class     = "jina-clip-api"
+config.dimensions     = 1024
+config.normalized     = true
+config.embedding_type = "float"
+metadata.distance_func = "L2"
+metadata.description  = """Not local (API-based). You must set the JINA_API_KEY \
+  env var before using this model. jina-clip-v2 is a general-purpose \
+  multilingual multimodal embedding model for text & images."""
+
+[group.tclip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
+config.model_name = "ViT-SO400M-14-SigLIP-384"
+config.pretrained = "webli"
+metadata.description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI"
+
+[group.tclip.inference_ids.ViT-SO400M-14-SigLIP_webli]
+config.model_name = "ViT-SO400M-14-SigLIP"
+config.pretrained = "webli"
+metadata.description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI"
+
+[group.tclip.inference_ids.ViT-B-32-256_datacomp_s34b_b86k]
+config.model_name = "ViT-B-32-256"
+config.pretrained = "datacomp_s34b_b86k"
+metadata.description = """ViT-B-32-256 model pretrained on DataComp S34B (b86k). \
+  ViT-B-32 are the least resource intensive ViT model type."""
+
+[group.tclip.inference_ids.ViT-B-32_datacomp_xl_s13b_b90k]
+config.model_name = "ViT-B-32"
+config.pretrained = "datacomp_xl_s13b_b90k"
+metadata.description = """ViT-B-32 model pretrained on DataComp XL (s13b_b90k). \
+  ViT-B-32 are the least resource intensive ViT model type."""
+
+[group.tclip.inference_ids.ViT-g-14_laion2b_s34b_b88k]
+config.model_name = "ViT-g-14"
+config.pretrained = "laion2b_s34b_b88k"
+metadata.description = """ViT-g-14 model pretrained on LAION2B (s34b_b88k). \
+  ViT-G-14 are the largest ViT model type, however not currently the best performing."""
+
+[group.tclip.inference_ids.ViT-L-14_openai]
+config.model_name = "ViT-L-14"
+config.pretrained = "openai"
+metadata.description = "Original CLIP model trained by OpenAI"
+
+[group.tclip.inference_ids.ViT-B-32_openai]
+config.model_name = "ViT-B-32"
+config.pretrained = "openai"
+metadata.description = """ViT-B-32 model trained by OpenAI. ViT-B-32 are the \
+  least resource intensive ViT model type."""
+
+[group.tclip.inference_ids.coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k]
+config.model_name = "coca_ViT-B-32"
+config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
+metadata.description = "CoCa ViT-B-32 model fine-tuned on MSCOCO"
+
+[group.tclip.inference_ids.coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k]
+config.model_name = "coca_ViT-L-14"
+config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
+metadata.description = "CoCa ViT-L-14 model fine-tuned on MSCOCO"
+
+[group.tclip.inference_ids.convnext_xxlarge_laion2b_s34b_b82k_augreg_soup]
+config.model_name = "convnext_xxlarge"
+config.pretrained = "laion2b_s34b_b82k_augreg_soup"
+metadata.description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)"
+
+[group.tclip.inference_ids.convnext_large_d_320_laion2b_s29b_b131k_ft_soup]
+config.model_name = "convnext_large_d_320"
+config.pretrained = "laion2b_s29b_b131k_ft_soup"
+metadata.description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)"
+
+[group.tclip.inference_ids.convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg]
+config.model_name = "convnext_base_w_320"
+config.pretrained = "laion_aesthetic_s13b_b82k_augreg"
+metadata.description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)"
+
+[group.tclip.inference_ids.convnext_base_w_laion2b_s13b_b82k_augreg]
+config.model_name = "convnext_base_w"
+config.pretrained = "laion2b_s13b_b82k_augreg"
+metadata.description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)"
+
+[group.tclip.inference_ids.convnext_base_laion400m_s13b_b51k]
+config.model_name = "convnext_base"
+config.pretrained = "laion400m_s13b_b51k"
+metadata.description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)"
+
+[group.tclip.inference_ids.mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384]
+config.model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.description = """A simple open-sourced SigLIP model fine-tuned on \
+  Genshin Impact's image-text pairs."""
+metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+
+[group.tclip.inference_ids.mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K]
+config.model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K"
+metadata.description = """Much smaller variant of the ViT-SO400M-14 size model. \
+  A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's \
+  image-text pairs."""
+metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+
+[group.tclip.inference_ids.marqo-fashionCLIP]
+config.model_name = "hf-hub:Marqo/marqo-fashionCLIP"
+metadata.description = """Marqo-FashionCLIP leverages Generalised Contrastive \
+  Learning (GCL) which allows the model to be trained on not just text \
+  descriptions but also categories, style, colors, materials, keywords and \
+  fine-details to provide highly relevant search results on fashion products. \
+  The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k)."""
+metadata.link = "https://huggingface.co/Marqo/marqo-fashionCLIP"
+
+[group.tclip.inference_ids.marqo-fashionSigLIP]
+config.model_name = "hf-hub:Marqo/marqo-fashionSigLIP"
+metadata.description = """Marqo-FashionSigLIP leverages Generalised Contrastive \
+  Learning (GCL) which allows the model to be trained on not just text \
+  descriptions but also categories, style, colors, materials, keywords and \
+  fine-details to provide highly relevant search results on fashion products. \
+  The model was fine-tuned from ViT-B-16-SigLIP (webli)."""
+metadata.link = "https://huggingface.co/Marqo/marqo-fashionSigLIP"
+
+[group.tclip.inference_ids.open-clip-vit-h-nsfw-finetune]
+config.model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune"
+metadata.description = "CLIP model finetuned for NSFW detection."
+metadata.link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true"
+
+[group.tclip.inference_ids.imageomics_bioclip]
+config.model_name = "hf-hub:imageomics/bioclip"
+metadata.description = """BioCLIP is a foundation model for the tree of life, \
+  built using CLIP architecture as a vision model for general organismal biology. \
+  It is trained on TreeOfLife-10M, our specially-created dataset covering over \
+  450K taxa--the most biologically diverse ML-ready dataset available to date. \
+  Through rigorous benchmarking on a diverse set of fine-grained biological \
+  classification tasks, BioCLIP consistently outperformed existing baselines \
+  by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP \
+  learned a hierarchical representation aligned to the tree of life, which \
+  demonstrates its potential for robust generalizability."""
+metadata.link = "https://huggingface.co/imageomics/bioclip"
+
+[group.tclip.inference_ids.microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224]
+config.model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+metadata.description = """BiomedCLIP is a biomedical vision-language foundation \
+  model that is pretrained on PMC-15M, a dataset of 15 million figure-caption \
+  pairs extracted from biomedical research articles in PubMed Central, using \
+  contrastive learning. It uses PubMedBERT as the text encoder and Vision \
+  Transformer as the image encoder, with domain-specific adaptations. It can \
+  perform various vision-language processing (VLP) tasks such as cross-modal \
+  retrieval, image classification, and visual question answering."""
+metadata.link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
+# ===================================================================
+#  CLAP Group: Audio Embeddings
+# ===================================================================
+
+[group.clap]
+config.impl_class = "clap"
+
+[group.clap.metadata]
+name                 = "CLAP Audio Embeddings"
+description          = """(Experimental) Generate Audio Embeddings using CLAP \
+  models for semantic audio search."""
+default_batch_size   = 64
+default_inference_id = "clap-htsat-unfused"
+target_entities      = ["items"]
+output_type          = "clip"
+input_mime_types     = ["video/", "audio/"]
+
+[group.clap.metadata.input_spec]
+handler = "audio_tracks"
+
+# --- Inference IDs for CLAP Audio Embeddings ---
+
+[group.clap.inference_ids.clap-htsat-unfused]
+config.model_name = "laion/clap-htsat-unfused"
+metadata.description = "CLAP: Contrastive Language-Audio Pretraining"
+
+[group.clap.inference_ids.larger_clap_music]
+config.model_name = "laion/larger_clap_music"
+metadata.description = "This is an improved CLAP checkpoint, specifically trained on music"
+
+[group.clap.inference_ids.larger_clap_music_and_speech]
+config.model_name = "laion/larger_clap_music_and_speech"
+metadata.description = """This is an improved CLAP checkpoint, specifically trained \
+  on music and speech."""
+
+[group.clap.inference_ids.larger_clap_general]
+config.model_name = "laion/larger_clap_general"
+metadata.description = """This is an improved CLAP checkpoint, specifically trained \
+  on general audio, music and speech."""
+
+# More CLIP models
+
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
-apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
-apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
-apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-S1-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
-jina-clip-v2-api = { config = { model_name = "jina-clip-v2", impl_class = "jina-clip-api", dimensions = 1024, normalized = true, embedding_type = "float" }, metadata = { distance_func = "L2", description = "Not local (API-based). You must set the JINA_API_KEY env var before using this model. jina-clip-v2 is a general-purpose multilingual multimodal embedding model for text & images." } }
+# MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
+# MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
 
 # TinyCLIP-ViT-39M-16-Text-19M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-39M-16-Text-19M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 63.5%)" } }
 # TinyCLIP-ViT-8M-16-Text-3M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 41.1%)" } }
 # jina-clip-v1 = { config = { model_name = "jinaai/jina-clip-v1", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) jina-clip-v1 is a state-of-the-art English multimodal (text-image) embedding model." } }
-
-ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
-ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
-ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
-ViT-B-32_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp XL (s13b_b90k). ViT-B-32 are the least resource intensive ViT model type." } }
-ViT-g-14_laion2b_s34b_b88k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s34b_b88k). ViT-G-14 are the largest ViT model type, however not currently the best performing." } }
-ViT-L-14_openai = { config = { model_name = "ViT-L-14", pretrained = "openai" }, metadata = { description = "Original CLIP model trained by OpenAI" } }
-ViT-B-32_openai = { config = { model_name = "ViT-B-32", pretrained = "openai" }, metadata = { description = "ViT-B-32 model trained by OpenAI. ViT-B-32 are the least resource intensive ViT model type." } }
 # MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
 # MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
-coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model fine-tuned on MSCOCO" } }
-coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model fine-tuned on MSCOCO" } }
-convnext_xxlarge_laion2b_s34b_b82k_augreg_soup = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_soup" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)" } }
-convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft_soup" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)" } }
-convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
-convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
-convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
-mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link = "https://huggingface.co/Marqo/marqo-fashionCLIP" } }
-marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link = "https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
-open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
-imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link = "https://huggingface.co/imageomics/bioclip" } }
-microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" }, metadata = { description = "BiomedCLIP is a biomedical vision-language foundation model that is pretrained on PMC-15M, a dataset of 15 million figure-caption pairs extracted from biomedical research articles in PubMed Central, using contrastive learning. It uses PubMedBERT as the text encoder and Vision Transformer as the image encoder, with domain-specific adaptations. It can perform various vision-language processing (VLP) tasks such as cross-modal retrieval, image classification, and visual question answering.", link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" } }
-
-
-[group.tclip]
-config = { impl_class = "openclip" }
-[group.tclip.metadata]
-description = "Generate Text Embeddings from extracted text using OpenAI's CLIP model. This is exclusively meant for cross-modal item similarity search. For semantic text search, use the `Text Embeddings` model group. This will generate embeddings for text already extracted by other models such as Whisper Speech-to-Text, or OCR. If you haven't run those models yet, you should do so first."
-name = "CLIP Text Embeddings"
-default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
-default_batch_size = 64
-target_entities = ["text"]
-output_type = "text-embedding"
-input_spec = { handler = "extracted_text" }
-[group.tclip.inference_ids]
-ViT-H-14-378-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-378-quickgelu", pretrained = "dfn5b" }, metadata = { description = "(Recommended) ViT-H-14 (378px) model pretrained on DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)." } }
-ViT-H-14-quickgelu_dfn5b = { config = { model_name = "ViT-H-14-quickgelu", pretrained = "dfn5b" }, metadata = { description = "ViT-H-14 (224px) model pretrained on DFN5B" } }
 # apple_ViT-H-14-378_dfn5b = { config = { model_name = "hf-hub:apple/DFN5B-CLIP-ViT-H-14-378" }, metadata = { description = "ViT-H-14 (378px) model by Apple pretrained on DFN5B", link="https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378" } }
-apple_MobileCLIP-B-LT = { config = { model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP" }, metadata = { description = "MobileCLIP-B-LT model by Apple. Great 0-shot accuracy (77.2%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP" } }
-apple_MobileCLIP-S2 = { config = { model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP" }, metadata = { description = "MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy (74.4%) for the size. Recommended if resources are limited.", link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP" } }
-apple_MobileCLIP-S1 = { config = { model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP" }, metadata = { description = "MobileCLIP-S1-LT model by Apple. Adequate 0-shot accuracy (72.6%) for the size. Recommended if resources are very limited.", link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP" } }
-jina-clip-v2-api = { config = { model_name = "jina-clip-v2", impl_class = "jina-clip-api", dimensions = 1024, normalized = true, embedding_type = "float" }, metadata = { distance_func = "L2", description = "Not local (API-based). You must set the JINA_API_KEY env var before using this model. jina-clip-v2 is a general-purpose multilingual multimodal embedding model for text & images." } }
-
 # TinyCLIP-ViT-39M-16-Text-19M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-39M-16-Text-19M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 63.5%)" } }
 # TinyCLIP-ViT-8M-16-Text-3M-inf = { config = { model_name = "wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M", impl_class = "clip_infinity" }, metadata = { description = "(Experimental Engine) TinyCLIP is a novel cross-modal distillation method for large-scale language-image pre-trained models. (IN1K 41.1%)" } }
 # jina-clip-v1 = { config = { model_name = "jinaai/jina-clip-v1", impl_class = "jina-clip-api" }, metadata = { description = "(Experimental Engine) jina-clip-v1 is a state-of-the-art English multimodal (text-image) embedding model." } }
 
-ViT-SO400M-14-SigLIP-384_webli = { config = { model_name = "ViT-SO400M-14-SigLIP-384", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI" } }
-ViT-SO400M-14-SigLIP_webli = { config = { model_name = "ViT-SO400M-14-SigLIP", pretrained = "webli" }, metadata = { description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI" } }
-ViT-B-32-256_datacomp_s34b_b86k = { config = { model_name = "ViT-B-32-256", pretrained = "datacomp_s34b_b86k" }, metadata = { description = "ViT-B-32-256 model pretrained on DataComp S34B (b86k). ViT-B-32 are the least resource intensive ViT model type." } }
-ViT-B-32_datacomp_xl_s13b_b90k = { config = { model_name = "ViT-B-32", pretrained = "datacomp_xl_s13b_b90k" }, metadata = { description = "ViT-B-32 model pretrained on DataComp XL (s13b_b90k). ViT-B-32 are the least resource intensive ViT model type." } }
-ViT-g-14_laion2b_s34b_b88k = { config = { model_name = "ViT-g-14", pretrained = "laion2b_s34b_b88k" }, metadata = { description = "ViT-g-14 model pretrained on LAION2B (s34b_b88k). ViT-G-14 are the largest ViT model type, however not currently the best performing." } }
-ViT-L-14_openai = { config = { model_name = "ViT-L-14", pretrained = "openai" }, metadata = { description = "Original CLIP model trained by OpenAI" } }
-ViT-B-32_openai = { config = { model_name = "ViT-B-32", pretrained = "openai" }, metadata = { description = "ViT-B-32 model trained by OpenAI. ViT-B-32 are the least resource intensive ViT model type." } }
-# MobileCLIP-B_datacompdr_lt = { config = { model_name = "MobileCLIP-B", pretrained = "datacompdr_lt" }, metadata = { description = "MobileCLIP-B model pretrained on DataCompDR LT" } }
-# MobileCLIP-S2_datacompdr = { config = { model_name = "MobileCLIP-S2", pretrained = "datacompdr" }, metadata = { description = "MobileCLIP-S2 model pretrained on DataCompDR" } }
-coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-B-32", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-B-32 model fine-tuned on MSCOCO" } }
-coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k = { config = { model_name = "coca_ViT-L-14", pretrained = "mscoco_finetuned_laion2b_s13b_b90k" }, metadata = { description = "CoCa ViT-L-14 model fine-tuned on MSCOCO" } }
-convnext_xxlarge_laion2b_s34b_b82k_augreg_soup = { config = { model_name = "convnext_xxlarge", pretrained = "laion2b_s34b_b82k_augreg_soup" }, metadata = { description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)" } }
-convnext_large_d_320_laion2b_s29b_b131k_ft_soup = { config = { model_name = "convnext_large_d_320", pretrained = "laion2b_s29b_b131k_ft_soup" }, metadata = { description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)" } }
-convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg = { config = { model_name = "convnext_base_w_320", pretrained = "laion_aesthetic_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)" } }
-convnext_base_w_laion2b_s13b_b82k_augreg = { config = { model_name = "convnext_base_w", pretrained = "laion2b_s13b_b82k_augreg" }, metadata = { description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)" } }
-convnext_base_laion400m_s13b_b51k = { config = { model_name = "convnext_base", pretrained = "laion400m_s13b_b51k" }, metadata = { description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)" } }
-mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384 = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" }, metadata = { description = "A simple open-sourced SigLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K = { config = { model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K" }, metadata = { description = "Much smaller variant of the ViT-SO400M-14 size model. A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's image-text pairs.", link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384" } }
-marqo-fashionCLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionCLIP" }, metadata = { description = "Marqo-FashionCLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k).", link = "https://huggingface.co/Marqo/marqo-fashionCLIP" } }
-marqo-fashionSigLIP = { config = { model_name = "hf-hub:Marqo/marqo-fashionSigLIP" }, metadata = { description = "Marqo-FashionSigLIP leverages Generalised Contrastive Learning (GCL) which allows the model to be trained on not just text descriptions but also categories, style, colors, materials, keywords and fine-details to provide highly relevant search results on fashion products. The model was fine-tuned from ViT-B-16-SigLIP (webli).", link = "https://huggingface.co/Marqo/marqo-fashionSigLIP" } }
-open-clip-vit-h-nsfw-finetune = { config = { model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune" }, metadata = { description = "CLIP model finetuned for NSFW detection.", link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true" } }
-imageomics_bioclip = { config = { model_name = "hf-hub:imageomics/bioclip" }, metadata = { description = "BioCLIP is a foundation model for the tree of life, built using CLIP architecture as a vision model for general organismal biology. It is trained on TreeOfLife-10M, our specially-created dataset covering over 450K taxa--the most biologically diverse ML-ready dataset available to date. Through rigorous benchmarking on a diverse set of fine-grained biological classification tasks, BioCLIP consistently outperformed existing baselines by 16% to 17% absolute. Through intrinsic evaluation, we found that BioCLIP learned a hierarchical representation aligned to the tree of life, which demonstrates its potential for robust generalizability.", link = "https://huggingface.co/imageomics/bioclip" } }
-microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" }, metadata = { description = "BiomedCLIP is a biomedical vision-language foundation model that is pretrained on PMC-15M, a dataset of 15 million figure-caption pairs extracted from biomedical research articles in PubMed Central, using contrastive learning. It uses PubMedBERT as the text encoder and Vision Transformer as the image encoder, with domain-specific adaptations. It can perform various vision-language processing (VLP) tasks such as cross-modal retrieval, image classification, and visual question answering.", link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224" } }
-
-# More CLIP models
 # RN50_openai = { config = { model_name = "RN50", pretrained = "openai" }, metadata = { description = "RN50 model trained by OpenAI" } }
 # RN50_yfcc15m = { config = { model_name = "RN50", pretrained = "yfcc15m" }, metadata = { description = "RN50 model pretrained on YFCC15M" } }
 # RN50_cc12m = { config = { model_name = "RN50", pretrained = "cc12m" }, metadata = { description = "RN50 model pretrained on CC12M" } }
@@ -406,20 +1123,3 @@ microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 = { config = { model_na
 # ViTamin-L2-256_datacomp1b = { config = { model_name = "ViTamin-L2-256", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-256 model pretrained on DataComp1B" } }
 # ViTamin-L2-336_datacomp1b = { config = { model_name = "ViTamin-L2-336", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-336 model pretrained on DataComp1B" } }
 # ViTamin-L2-384_datacomp1b = { config = { model_name = "ViTamin-L2-384", pretrained = "datacomp1b" }, metadata = { description = "ViTamin-L2-384 model pretrained on DataComp1B" } }
-
-[group.clap]
-config = { impl_class = "clap" }
-[group.clap.metadata]
-description = "(Experimental) Generate Audio Embeddings using CLAP models for semantic audio search."
-name = "CLAP Audio Embeddings"
-default_batch_size = 64
-default_inference_id = "clap-htsat-unfused"
-target_entities = ["items"]
-output_type = "clip"
-input_spec = { handler = "audio_tracks" }
-input_mime_types = ["video/", "audio/"]
-[group.clap.inference_ids]
-clap-htsat-unfused = { config = { model_name = "laion/clap-htsat-unfused" }, metadata = { description = "CLAP: Contrastive Language-Audio Pretraining" } }
-larger_clap_music = { config = { model_name = "laion/larger_clap_music" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on music" } }
-larger_clap_music_and_speech = { config = { model_name = "laion/larger_clap_music_and_speech" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on music and speech." } }
-larger_clap_general = { config = { model_name = "laion/larger_clap_general" }, metadata = { description = "This is an improved CLAP checkpoint, specifically trained on general audio, music and speech." } }
