@@ -11,8 +11,6 @@ from ray.serve.handle import DeploymentHandle
 
 from inferio.config import list_inference_ids, load_config
 from inferio.cudnnsetup import cudnn_setup
-from inferio.inferio_ray.create_deployment import build_inference_deployment
-from inferio.inferio_ray.deployment_config import get_deployment_config
 from inferio.inferio_ray.manager import ModelManager
 from inferio.utils import encode_output_response, parse_input_request
 
@@ -51,8 +49,6 @@ class InferioIngress:
         setup_logging()
         self.logger = logging.getLogger("inferio.ingress")
         self.logger.info("Ingress Deployment initialized")
-        self._handles: dict[str, DeploymentHandle] = {}
-        self._lock = asyncio.Lock()
         self._config, self._mtime = load_config()
         self.manager = manager_handle
 
@@ -60,20 +56,6 @@ class InferioIngress:
         """Reload the configuration if it has changed."""
         self._config, self._mtime = load_config(self._config, self._mtime)
         return self._config
-    
-    async def _ensure(self, inference_id: str):
-        if inference_id in self._handles:
-            return self._handles[inference_id]
-
-        async with self._lock:
-            if inference_id in self._handles:
-                return self._handles[inference_id]
-            
-            self.logger.info(f"Building deployment for {inference_id}")
-            deployment_config = get_deployment_config(inference_id, await self.get_config())
-            handle = build_inference_deployment(inference_id, deployment_config)
-            self._handles[inference_id] = handle
-            return handle
 
     @app.post(
         "/predict/{group}/{inference_id}",
@@ -155,16 +137,16 @@ class InferioIngress:
         )
         try:
             # Perform prediction
-            model_handle = await self._ensure(full_inference_id)
-            await self.manager.options(method_name="load_model").remote(
-                full_inference_id, model_handle, cache_key, lru_size, ttl_seconds
+            model_handle = await self.manager.options(method_name="load_model").remote(
+                full_inference_id, cache_key, lru_size, ttl_seconds
             )
-            outputs: List[bytes | dict | list | str] = list(await model_handle.remote(inputs))
+            outputs: List[bytes | dict | list | str] = list(
+                await model_handle.remote(inputs)
+            )
         except Exception as e:
             self.logger.error(f"Prediction failed for model {inference_id}: {e}")
             raise HTTPException(status_code=500, detail="Prediction failed")
         return encode_output_response(outputs)
-
 
     @app.put(
         "/load/{group}/{inference_id}",
@@ -198,9 +180,8 @@ class InferioIngress:
     ):
         try:
             full_inference_id = f"{group}/{inference_id}"
-            model_handle = await self._ensure(full_inference_id)
             await self.manager.options(method_name="load_model").remote(
-                full_inference_id, model_handle, cache_key, lru_size, ttl_seconds
+                full_inference_id, cache_key, lru_size, ttl_seconds
             )
             return StatusResponse(status="loaded")
         except Exception as e:
