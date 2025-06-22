@@ -37,7 +37,7 @@ def load_config_folder(
                 data = tomli.load(f)
                 logger.debug(f"Loading TOML file: {file}")
             allow_inference_id_overrides = data.get("allow_override", False)
-            groups: Dict[str, Dict[str, Any]] = data.get("groups", {})
+            groups: Dict[str, Dict[str, Any]] = data.get("group", {})
             for group_name, group_data in groups.items():
                 # Store or merge group-level config and metadata separately
                 # Merge group config, giving precedence to the latest loaded
