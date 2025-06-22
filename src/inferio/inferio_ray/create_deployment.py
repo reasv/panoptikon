@@ -19,6 +19,7 @@ def build_inference_deployment(
         name=f"{clean_id}_deployment",
         ray_actor_options={
             "num_cpus": 0.1,
+            "num_gpus": deployment_config.num_gpus,
         },
         autoscaling_config={
             "min_replicas": 0,

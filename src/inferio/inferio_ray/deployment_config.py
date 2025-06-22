@@ -24,9 +24,14 @@ def get_deployment_config(model_inference_id: str, global_config: Dict[str, Any]
         "max_batch_size",
         int(os.getenv("MAX_BATCH_SIZE", "64"))
     )
+    num_gpus = config.pop(
+        "num_gpus",
+        int(os.getenv("MODEL_NUM_GPUS", "1"))
+    )
     return DeploymentConfig(
         model_inference_id=model_inference_id,
         max_replicas=max_replicas,
         batch_wait_timeout_s=batch_wait_timeout_s,
-        max_batch_size=max_batch_size
+        max_batch_size=max_batch_size,
+        num_gpus=num_gpus
     )
