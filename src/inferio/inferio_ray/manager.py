@@ -33,7 +33,7 @@ class ModelManager:
         self._lock = asyncio.Lock()
         self._config, self._mtime = load_config()
         asyncio.create_task(self._ttl_check_loop())
-        asyncio.create_task(self._keepalive_loop())
+        #asyncio.create_task(self._keepalive_loop())
 
     async def _ttl_check_loop(self):
         while True:
@@ -45,17 +45,17 @@ class ModelManager:
         self._config, self._mtime = load_config(self._config, self._mtime)
         return self._config
 
-    async def _keepalive_loop(self):
-        while True:
-            await asyncio.sleep(5)
-            async with self._lock:
-                handles = dict(self._handles)
-                for inference_id, handle in handles.items():
-                    self.logger.debug(f"Sending keepalive to {inference_id}")
-                    try:
-                        await handle.options(method_name="keepalive").remote()
-                    except Exception as e:
-                        self.logger.warning(f"Keepalive for {inference_id} failed: {e}")
+    # async def _keepalive_loop(self):
+    #     while True:
+    #         await asyncio.sleep(5)
+    #         async with self._lock:
+    #             handles = dict(self._handles)
+    #             for inference_id, handle in handles.items():
+    #                 self.logger.debug(f"Sending keepalive to {inference_id}")
+    #                 try:
+    #                     await handle.options(method_name="keepalive").remote()
+    #                 except Exception as e:
+    #                     self.logger.warning(f"Keepalive for {inference_id} failed: {e}")
 
     async def _remove_from_lru(self, cache_key: str, inference_id: str) -> None:
         """Remove a model from the LRU cache."""

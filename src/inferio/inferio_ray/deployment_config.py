@@ -48,11 +48,6 @@ def get_deployment_config(model_inference_id: str, global_config: Dict[str, Any]
         "downscale_delay_s",
         int(os.getenv("RAY_DOWNSCALE_DELAY_S", "30"))
     )
-    if downscale_delay_s < 10:
-        downscale_delay_s = 10
-        logger.warning(
-            "Downscale delay cannot be less than 10 seconds. Overriding to 10 seconds."
-        )
     initial_replicas = ray_config.pop(
         "initial_replicas",
         int(os.getenv("RAY_INITIAL_REPLICAS", "1"))
@@ -60,7 +55,7 @@ def get_deployment_config(model_inference_id: str, global_config: Dict[str, Any]
 
     min_replicas = ray_config.pop(
         "min_replicas",
-        int(os.getenv("RAY_MIN_REPLICAS", "0"))
+        int(os.getenv("RAY_MIN_REPLICAS", "1"))
     )
 
     return DeploymentConfig(
