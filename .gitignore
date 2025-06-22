@@ -175,3 +175,5 @@ data/
 
 /src/searchui/panoptikon-ui/
 .infinity_cache/
+
+/.ray_tmp
