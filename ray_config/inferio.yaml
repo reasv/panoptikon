@@ -1,0 +1,36 @@
+# This file was generated using the `serve build` command on Ray v2.44.0.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+
+  port: 7777
+
+grpc_options:
+  port: 9000
+
+  grpc_servicer_functions: []
+
+logging_config:
+  encoding: TEXT
+
+  log_level: INFO
+
+  logs_dir: null
+
+  enable_access_log: true
+
+  additional_log_standard_attrs: []
+
+applications:
+  - name: inferio
+
+    route_prefix: /api/inference
+
+    import_path: inferio.inferio_ray.ingress:serve_app
+
+    runtime_env: {}
+
+    deployments:
+      - name: InferioIngress

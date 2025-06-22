@@ -1,5 +1,6 @@
 import asyncio
 from typing import Any, Dict, List
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from ray import serve
 from ray.serve.handle import DeploymentHandle
@@ -12,9 +13,11 @@ from inferio.config import list_inference_ids, load_config
 from inferio.inferio_ray.create_deployment import build_inference_deployment
 from inferio.inferio_ray.deployment_config import get_deployment_config
 from inferio.utils import encode_output_response, parse_input_request
+from inferio.cudnnsetup import cudnn_setup
+load_dotenv()
+cudnn_setup()
 
 app = FastAPI(
-    prefix="/api/inference",
     tags=["inference"],
     responses={404: {"description": "Not found"}},
 )
@@ -259,5 +262,4 @@ class InferioIngress:
         global_config = await self.get_config()
         return list_inference_ids(global_config)
 
-
-ray_app = InferioIngress.bind() # type: ignore
+serve_app = InferioIngress.bind() # type: ignore

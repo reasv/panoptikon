@@ -5,6 +5,7 @@ import logging
 from ray import serve
 from ray.serve.handle import DeploymentHandle
 
+from inferio.cudnnsetup import add_cudnn_to_path
 from inferio.inferio_ray.rtypes import DeploymentConfig
 from inferio.inferio_types import PredictionInput
 from inferio.model import InferenceModel
@@ -41,6 +42,11 @@ def build_inference_deployment(
             load_dotenv()
             setup_logging()
             self.logger = logging.getLogger(f"deployments.{inference_id}")
+            if os.getenv("NO_CUDNN", "false").lower() not in ("1", "true"):
+                self.logger.info("Setting up cuDNN")
+                add_cudnn_to_path()
+            else:
+                self.logger.info("Skipping cuDNN setup as per NO_CUDNN environment variable")
             global_config, _ = load_config()
             model_config = get_model_config(inference_id, global_config)
             impl_class_name = model_config.pop("impl_class", None)
