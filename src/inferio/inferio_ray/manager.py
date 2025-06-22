@@ -7,12 +7,14 @@ from typing import Dict, List, Set
 from ray import serve
 from ray.serve.handle import DeploymentHandle
 
-logger = logging.getLogger(__name__)
+from inferio.config import load_config
+from inferio.inferio_ray.create_deployment import build_inference_deployment
+from inferio.inferio_ray.deployment_config import get_deployment_config
 
+logger = logging.getLogger(__name__)
 
 def never() -> datetime:
     return datetime.max
-
 
 @serve.deployment(
     name="ModelManager",
@@ -27,6 +29,7 @@ class ModelManager:
         )
         self._cache_key_map: Dict[str, Set[str]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        self._config, self._mtime = load_config()
         asyncio.create_task(self._ttl_check_loop())
         asyncio.create_task(self._keepalive_loop())
 
@@ -35,11 +38,17 @@ class ModelManager:
             await asyncio.sleep(10)
             await self.check_ttl_expired()
 
+    async def get_config(self):
+        """Reload the configuration if it has changed."""
+        self._config, self._mtime = load_config(self._config, self._mtime)
+        return self._config
+
     async def _keepalive_loop(self):
         while True:
             await asyncio.sleep(5)
             async with self._lock:
-                for inference_id, handle in self._handles.items():
+                handles = dict(self._handles)
+                for inference_id, handle in handles.items():
                     logger.debug(f"Sending keepalive to {inference_id}")
                     try:
                         await handle.options(method_name="keepalive").remote()
@@ -68,14 +77,21 @@ class ModelManager:
     async def load_model(
         self,
         inference_id: str,
-        handle: DeploymentHandle,
         cache_key: str,
         lru_size: int,
         ttl_seconds: int,
-    ) -> None:
+    ) -> DeploymentHandle:
         async with self._lock:
             is_new = inference_id not in self._handles
-            self._handles[inference_id] = handle
+            if is_new:
+                logger.info(f"Model {inference_id} not loaded. Creating deployment.")
+                config = await self.get_config()
+                deployment_config = get_deployment_config(inference_id, config)
+                handle = build_inference_deployment(inference_id, deployment_config)
+                self._handles[inference_id] = handle
+            else:
+                logger.debug(f"Model {inference_id} already loaded. Returning handle.")
+                handle = self._handles[inference_id]
 
             self._cache_key_map[inference_id].add(cache_key)
             if inference_id in self._lru_caches[cache_key]:
@@ -94,6 +110,8 @@ class ModelManager:
             if is_new:
                 logger.info(f"Calling load() for the first time for {inference_id}")
                 await handle.options(method_name="load").remote()
+
+            return handle
 
     async def _resize_lru(self, cache_key: str, lru_size: int) -> None:
         """Ensure the LRU cache does not exceed its size."""
@@ -137,7 +155,7 @@ class ModelManager:
         """Check for expired TTLs and remove them from the cache."""
         async with self._lock:
             now = datetime.now()
-            for cache_key, lru_cache in self._lru_caches.items():
+            for cache_key, lru_cache in list(self._lru_caches.items()):
                 expired_models = [
                     inf_id
                     for inf_id, exp_time in lru_cache.items()
