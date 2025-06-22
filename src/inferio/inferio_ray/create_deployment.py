@@ -18,16 +18,16 @@ def build_inference_deployment(
     @serve.deployment(
         name=f"{clean_id}_deployment",
         ray_actor_options={
-            "num_cpus": 0.1,
+            "num_cpus": deployment_config.num_cpus,
             "num_gpus": deployment_config.num_gpus,
         },
         autoscaling_config={
-            "min_replicas": 0,
+            "min_replicas":  deployment_config.min_replicas,
             "max_replicas": deployment_config.max_replicas,
-            "initial_replicas": 1,
-            "target_ongoing_requests": 2,
-            "upscale_delay_s": 10,
-            "downscale_delay_s": 30
+            "initial_replicas": deployment_config.initial_replicas,
+            "target_ongoing_requests": deployment_config.target_ongoing_requests,
+            "upscale_delay_s": deployment_config.upscale_delay_s,
+            "downscale_delay_s": deployment_config.downscale_delay_s,
         }
     )
     class InferenceDeployment:
@@ -81,7 +81,6 @@ def build_inference_deployment(
         async def keepalive(self) -> None:
             """Keep the model alive."""
             self.logger.info(f"Keeping model alive")
-            # This can be used to keep the model loaded or perform any periodic tasks.
         
     app = InferenceDeployment.bind(model_inference_id)
     handle = serve.run(app, name=f"{clean_id}_app", blocking=False, route_prefix=None)
