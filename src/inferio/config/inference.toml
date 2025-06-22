@@ -79,6 +79,9 @@ metadata.description = """(Experimental) Moondream 2B Based Tagger prompted to o
 
 [group.tagmatch]
 config.impl_class = "danbooru_tagger"
+[group.tagmatch.config.ray_config]
+num_gpus = 0
+max_replicas = 1 # Set to 0 to disable Ray autoscaling
 
 [group.tagmatch.metadata]
 name = "Tag Matching"
