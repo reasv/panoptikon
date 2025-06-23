@@ -6,7 +6,6 @@ from croniter import croniter
 
 from panoptikon.api.cronjob.job import run_cronjob
 from panoptikon.config import retrieve_system_config
-from panoptikon.db import get_db_lists
 
 logger = logging.getLogger(__name__)
 
