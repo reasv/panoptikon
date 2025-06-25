@@ -176,6 +176,8 @@ class ModelRegistry:
             # Copy the config to avoid modifying the original
             model_config = dict(model_config)
             model_config.pop("impl_class", None)
+            model_config.pop("ray_config", None)  # Remove ray_config if present
+            # Instantiate the model class with the provided configuration
             model_instance = model_class(**model_config)
             return model_instance
 
