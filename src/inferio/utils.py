@@ -7,7 +7,7 @@ import os
 from io import BytesIO
 from pathlib import Path
 import pkgutil
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from fastapi import HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -158,10 +158,10 @@ def add_cudnn_to_path():
     # For example, if you want to set up the CUDA_PATH to point to your cudnn directory (if needed):
     os.environ["CUDA_PATH"] = cudnn_path
 
-def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
+def get_impl_classes(logger: logging.Logger) -> Dict[str, type[InferenceModel]]:
     import inferio.impl
     import sys
-    result = []
+    built_ins: Dict[str, type[InferenceModel]] = {}
     # Discover built-in impls
     for finder, name, ispkg in pkgutil.iter_modules(inferio.impl.__path__, inferio.impl.__name__ + "."):
         try:
@@ -171,7 +171,23 @@ def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
                     logger.info(f"Found implementation class: {name}.IMPL_CLASS")
                 else:
                     logger.warning(f"Module {name} does not have a valid IMPL_CLASS.")
-                result.append(getattr(mod, "IMPL_CLASS"))
+                # Check if the class has a name method
+                if hasattr(getattr(mod, "IMPL_CLASS"), "name"):
+                    impl_name = getattr(getattr(mod, "IMPL_CLASS"), "name")()
+                    if not impl_name:
+                        logger.warning(f"Implementation class {name}.IMPL_CLASS has no name method or it returned an empty string. Skipping.")
+                        continue
+                else:
+                    logger.warning(f"Implementation class {name}.IMPL_CLASS does not have a name method. Skipping.")
+                    continue  # Skip if no name method is found
+
+                logger.info(f"Implementation class {name}.IMPL_CLASS has name: {impl_name}")
+                # Check if the name is already registered
+                if impl_name in built_ins:
+                    logger.error(f"Built-in implementation class {impl_name} is already registered. Skipping duplicate.")
+                    continue
+                # Store the class in the built_ins dictionary
+                built_ins[impl_name] = getattr(mod, "IMPL_CLASS")
         except Exception as e:
             logger.error(f"Failed to import module inferio.impl.{name}: {e}", exc_info=True)
             pass
@@ -186,6 +202,9 @@ def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
     project_root = Path(__file__).resolve().parent.parent.parent
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
+
+    custom_impls: Dict[str, type[InferenceModel]] = {}
+
     if custom_impl_path.exists() and custom_impl_path.is_dir():
         for pyfile in custom_impl_path.glob("*.py"):
             if pyfile.name == "__init__.py":
@@ -202,8 +221,43 @@ def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
                             logger.info(f"Found custom implementation class: {module_name}.IMPL_CLASS")
                         else:
                             logger.warning(f"Custom module {module_name} does not have a valid IMPL_CLASS.")
-                        result.append(getattr(mod, "IMPL_CLASS"))
+                        # Check if the class has a name method
+                        if hasattr(getattr(mod, "IMPL_CLASS"), "name"):
+                            impl_name = getattr(getattr(mod, "IMPL_CLASS"), "name")()
+                            if not impl_name:
+                                logger.error(f"Implementation class {module_name}.IMPL_CLASS has no name method or it returned an empty string. Skipping.")
+                                continue
+                        else:
+                            logger.error(f"Implementation class {module_name}.IMPL_CLASS does not have a name method. Skipping.")
+                            continue  # Skip if no name method is found
+
+                        logger.info(f"Implementation class {module_name}.IMPL_CLASS has name: {impl_name}")
+                        # Check if the name is already registered
+                        if impl_name in custom_impls:
+                            logger.error(f"Custom implementation class {impl_name} is already registered. Skipping duplicate.")
+                            continue
+                        # Store the class in the custom_impls dictionary
+                        custom_impls[impl_name] = getattr(mod, "IMPL_CLASS")
                 except Exception as e:
                     logger.error(f"Failed to import custom module {module_name}: {e}", exc_info=True)
                     pass
-    return result
+    allow_built_in_override = os.environ.get("INFERIO_ALLOW_BUILT_IN_OVERRIDE", "false").lower() in ["true", "1", "yes"]
+    if allow_built_in_override:
+        logger.info("""
+        The INFERIO_ALLOW_BUILT_IN_OVERRIDE environment variable is set to 'true'.
+        Built-in implementations can be overridden by custom implementations.
+        Custom implementations will take precedence over built-in implementations with the same name().
+        """)
+    else:
+        # Check if there are common keys between the two 
+        for key in built_ins.keys():
+            if key in custom_impls:
+                logger.warning("""
+                    The INFERIO_ALLOW_BUILT_IN_OVERRIDE environment variable is not set to 'true'.
+                    Built-in implementations cannot be overridden by custom implementations.
+                """)
+                logger.error(f"Custom implementation {key} overrides built-in implementation. Skipping custom implementation.")
+                del custom_impls[key]
+
+    combined_impls: Dict[str, type[InferenceModel]] = {**built_ins, **custom_impls}
+    return combined_impls

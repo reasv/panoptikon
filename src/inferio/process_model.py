@@ -212,13 +212,10 @@ class ProcessIsolatedInferenceModel():
             model_config = clean_dict(model_config)
             logger.debug(f"{impl_class_name} - Resolving concrete class.")
             impl_classes = get_impl_classes(logger)
-            for icls in impl_classes:
-                if icls.name() == impl_class_name:
-                    model_class = icls
-                    model_instance = icls(**model_config)
-                    break
-            else:
+            model_class = impl_classes.get(impl_class_name)
+            if model_class is None:
                 raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
+            model_instance: InferenceModel = model_class(**model_config)
         except Exception as e:
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))

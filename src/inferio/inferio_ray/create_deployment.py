@@ -57,12 +57,11 @@ def build_inference_deployment(
             model_config = {k: v for k, v in model_config.items() if k not in ["impl_class", "ray_config"]}
             self.logger.info("Initializing deployment")
             impl_classes = get_impl_classes(self.logger)
-            for cls in impl_classes:
-                if cls.name() == impl_class_name:
-                    self.model = cls(**model_config)
-                    break
-            else:
+            impl_cls = impl_classes.get(impl_class_name)
+            if impl_cls is None:
                 raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
+            self.logger.info(f"Using implementation class: {impl_class_name}")
+            self.model = impl_cls(**model_config)
             self.logger.info(f"init in PID {os.getpid()} with impl_class {impl_class_name}")
         
         def _process_batch(self, inputs: List[List[PredictionInput]]) -> List[List[bytes | dict | list | str]]:
