@@ -1,9 +1,11 @@
 import base64
 import importlib
+import importlib.util
 import json
 import logging
 import os
 from io import BytesIO
+from pathlib import Path
 import pkgutil
 from typing import List, Optional, Union
 
@@ -158,7 +160,9 @@ def add_cudnn_to_path():
 
 def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
     import inferio.impl
+    import sys
     result = []
+    # Discover built-in impls
     for finder, name, ispkg in pkgutil.iter_modules(inferio.impl.__path__, inferio.impl.__name__ + "."):
         try:
             mod = importlib.import_module(name)
@@ -171,4 +175,30 @@ def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
         except Exception as e:
             logger.error(f"Failed to import module inferio.impl.{name}: {e}", exc_info=True)
             pass
+    # Discover custom impls
+    custom_impl_path = Path(os.environ.get("INFERIO_CUSTOM_IMPL_PATH", "./inferio_custom/"))
+    # Ensure project root is in sys.path for absolute imports
+    project_root = Path(__file__).resolve().parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    if custom_impl_path.exists() and custom_impl_path.is_dir():
+        for pyfile in custom_impl_path.glob("*.py"):
+            if pyfile.name == "__init__.py":
+                continue
+            module_name = f"inferio_custom.{pyfile.stem}"
+            spec = importlib.util.spec_from_file_location(module_name, pyfile)
+            if spec and spec.loader:
+                try:
+                    mod = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = mod
+                    spec.loader.exec_module(mod)
+                    if hasattr(mod, "IMPL_CLASS"):
+                        if isinstance(getattr(mod, "IMPL_CLASS"), type) and issubclass(getattr(mod, "IMPL_CLASS"), InferenceModel):
+                            logger.info(f"Found custom implementation class: {module_name}.IMPL_CLASS")
+                        else:
+                            logger.warning(f"Custom module {module_name} does not have a valid IMPL_CLASS.")
+                        result.append(getattr(mod, "IMPL_CLASS"))
+                except Exception as e:
+                    logger.error(f"Failed to import custom module {module_name}: {e}", exc_info=True)
+                    pass
     return result

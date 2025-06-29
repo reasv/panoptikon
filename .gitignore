@@ -177,3 +177,8 @@ data/
 .infinity_cache/
 
 /.ray_tmp
+
+/inferio_custom/*
+!/inferio_custom/__init__.py
+!/inferio_custom/example.py
+!/inferio_custom/README.md
