@@ -177,6 +177,11 @@ def get_impl_classes(logger: logging.Logger) -> List[type[InferenceModel]]:
             pass
     # Discover custom impls
     custom_impl_path = Path(os.environ.get("INFERIO_CUSTOM_IMPL_PATH", "./inferio_custom/"))
+    # Ensure __init__.py exists in the custom impl directory
+    if custom_impl_path.exists() and custom_impl_path.is_dir():
+        init_file = custom_impl_path / "__init__.py"
+        if not init_file.exists():
+            init_file.touch()
     # Ensure project root is in sys.path for absolute imports
     project_root = Path(__file__).resolve().parent.parent.parent
     if str(project_root) not in sys.path:
