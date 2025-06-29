@@ -1,5 +1,4 @@
 import os
-import sys
 import platform
 import shutil
 from pathlib import Path
@@ -21,7 +20,6 @@ CUDNN_URLS = {
     "windows_amd64": "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.8.0.87_cuda12-archive.zip",
 }
 
-
 def platform_key():
     system = platform.system().lower()
     machine = platform.machine().lower()
@@ -32,7 +30,6 @@ def platform_key():
         return "windows_amd64"
     return None
 
-
 def download_file(url, dest_path):
     if requests is None:
         raise RuntimeError("requests library is required to download cuDNN")
@@ -41,7 +38,6 @@ def download_file(url, dest_path):
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
-
 
 def extract_zip_cudnn(src_zip, dst_folder):
     with zipfile.ZipFile(src_zip, "r") as z:
@@ -62,7 +58,6 @@ def extract_zip_cudnn(src_zip, dst_folder):
                 if not name.endswith('/'):
                     with z.open(name) as src, open(dest_path, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-
 
 def extract_tar_cudnn(src_tar, dst_folder):
     """
@@ -142,7 +137,6 @@ def ensure_cudnn():
 
     return True
 
-
 def add_cudnn_to_path():
     project_root = Path(__file__).resolve().parent.parent.parent
     cudnn_path = project_root / "cudnn"
@@ -161,7 +155,6 @@ def add_cudnn_to_path():
         os.environ["PATH"] = str(cudnn_lib_path) + env_sep + os.environ.get("PATH", "")
 
     os.environ["CUDA_PATH"] = str(cudnn_path)
-
 
 def cudnn_setup():
     """

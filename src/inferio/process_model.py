@@ -6,25 +6,24 @@ import signal
 import sys
 import threading
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Sequence, Type, Union
+from typing import Any, Dict, List, Optional, Sequence
+from inferio.config import get_model_config, load_config
 
+from inferio.cudnnsetup import add_cudnn_to_path
 from inferio.inferio_types import PredictionInput
+from inferio.model import InferenceModel
 from inferio.utils import clean_dict
 from panoptikon.signal_handler import register_child  # Ensure this is correctly imported
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class LoadMessage:
     command: str = "load"
     request_id: str = ""
-    kwargs: Optional[Dict[str, Any]] = None
-
 
 @dataclass
 class PredictMessage:
@@ -32,12 +31,10 @@ class PredictMessage:
     request_id: str = ""
     inputs: Sequence[dict] = ()  # Changed to dict for serialization
 
-
 @dataclass
 class UnloadMessage:
     command: str = "unload"
     request_id: str = ""
-
 
 @dataclass
 class ResponseMessage:
@@ -46,55 +43,23 @@ class ResponseMessage:
     error: Optional[str] = None
     status: Optional[str] = None
 
-
-class InferenceModel(ABC):
-    @classmethod
-    @abstractmethod
-    def name(cls) -> str:
-        pass
-
-    @abstractmethod
-    def load(self) -> None:
-        pass
-
-    @abstractmethod
-    def predict(
-        self, inputs: Sequence[PredictionInput]
-    ) -> Sequence[Union[bytes, dict, list, str]]:
-        pass
-
-    @abstractmethod
-    def unload(self) -> None:
-        pass
-
-    def __del__(self):
-        self.unload()
-
-
-class ProcessIsolatedInferenceModel(InferenceModel, ABC):
-    @classmethod
-    @abstractmethod
-    def concrete_class(cls) -> Type["InferenceModel"]:
-        """Return the concrete InferenceModel class to instantiate in the process."""
-        pass
-
-    def __init__(self, **kwargs: Any) -> None:
+class ProcessIsolatedInferenceModel():
+    def __init__(self, inference_id: str) -> None:
         super().__init__()
-        self._kwargs: Dict[str, Any] = kwargs
         self._process: Optional[multiprocessing.Process] = None
         self._parent_conn, self._child_conn = multiprocessing.Pipe()
         self._response_handlers: Dict[str, queue.Queue] = {}
         self._listener_thread: threading.Thread = threading.Thread(
             target=self._listen_responses, daemon=True
         )
+        self._inference_id = inference_id
         self._listener_thread.start()
         logger.debug(
-            f"{self.__class__.name()} - Initialized ProcessIsolatedInferenceModel with kwargs: {self._kwargs}"
+            f"{self.name()} - Initialized ProcessIsolatedInferenceModel with inference_id: {self._inference_id}"
         )
-
-    @classmethod
-    def name(cls) -> str:
-        return cls.concrete_class().name()
+    
+    def name(self):
+        return self._inference_id
 
     def load(self) -> None:
         if self._process is None or not self._process.is_alive():
@@ -106,10 +71,8 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             )
             # Generate a unique request_id for the load operation
             load_request_id = str(uuid.uuid4())
-            # Send load command with kwargs and request_id
-            load_msg = LoadMessage(
-                request_id=load_request_id, kwargs=clean_dict(self._kwargs) if self._kwargs else None
-            )
+            # Send load command with request_id
+            load_msg = LoadMessage(request_id=load_request_id)
             self._parent_conn.send(asdict(load_msg))
             try:
                 response = self._get_response(load_request_id)
@@ -226,23 +189,41 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             logger.debug(f"{self.name()} - Subprocess is not running.")
 
     @classmethod
-    def _model_process(cls, conn: Connection, kwargs: Dict[str, Any]) -> None:
+    def _model_process(cls, conn: Connection, inference_id: str) -> None:
         """Run in the subprocess: instantiate and manage the concrete InferenceModel."""
         from dotenv import load_dotenv
-
+        from inferio.utils import get_impl_classes
         load_dotenv()
         from panoptikon.log import setup_logging
         setup_logging()
+        if os.getenv("NO_CUDNN", "false").lower() not in ("1", "true"):
+            logger.info("Setting up cuDNN")
+            add_cudnn_to_path()
+        else:
+            logger.info("Skipping cuDNN setup as per NO_CUDNN environment variable")
+        logger.debug(f"{inference_id} - Subprocess started.")
         try:
-            model_class = cls.concrete_class()
-            logger.debug(f"{model_class.name()} - Resolving concrete class.")
-            model_instance = model_class(**kwargs)
-            logger.debug(f"{model_class.name()} - Subprocess started.")
+            logger.debug(f"Loading configuration for {inference_id}")
+            global_config, _ = load_config()
+            model_config = get_model_config(inference_id, global_config)
+            impl_class_name = model_config.pop("impl_class", None)
+            logger.debug(f"Found impl class name {impl_class_name} for {inference_id}")
+            model_config = {k: v for k, v in model_config.items() if k not in ["impl_class", "ray_config"]}
+            model_config = clean_dict(model_config)
+            logger.debug(f"{impl_class_name} - Resolving concrete class.")
+            impl_classes = get_impl_classes(logger)
+            for icls in impl_classes:
+                if icls.name() == impl_class_name:
+                    model_class = icls
+                    model_instance = icls(**model_config)
+                    break
+            else:
+                raise ValueError(f"Model class {impl_class_name} not found in impl_classes")
         except Exception as e:
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))
             logger.error(
-                f"{cls.name()} - Error instantiating concrete class: {e}",
+                f"{inference_id} - Error instantiating concrete class: {e}",
                 exc_info=True,
             )
             conn.close()
@@ -331,7 +312,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             error_response = ResponseMessage(error=str(e))
             conn.send(asdict(error_response))
             logger.error(
-                f"{cls.name()} - Critical error in subprocess: {e}",
+                f"{inference_id} - Critical error in subprocess: {e}",
                 exc_info=True,
             )
         finally:
@@ -490,7 +471,7 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
     def _start_subprocess(self) -> None:
         self._process = multiprocessing.Process(
             target=self._model_process,
-            args=(self._child_conn, self._kwargs),
+            args=(self._child_conn, self._inference_id),
             daemon=True,
         )
         register_child(self._process)
@@ -528,7 +509,6 @@ class ProcessIsolatedInferenceModel(InferenceModel, ABC):
             self.unload()
         except Exception as e:
             logger.error(f"{self.name()} - Exception during __del__: {e}")
-
 
 def force_kill_process(process: multiprocessing.Process) -> None:
     if sys.platform == "win32":

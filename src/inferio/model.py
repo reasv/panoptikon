@@ -3,7 +3,6 @@ from typing import List, Sequence
 
 from inferio.inferio_types import PredictionInput
 
-
 class InferenceModel(ABC):
     @classmethod
     @abstractmethod

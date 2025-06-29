@@ -3,18 +3,13 @@ from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from threading import Lock
 from typing import Dict, List, Optional, Set
-
-import inferio.model
 from inferio.process_model import ProcessIsolatedInferenceModel
-from inferio.registry import ModelRegistry
 
-InferenceModel = inferio.model.InferenceModel | ProcessIsolatedInferenceModel
+InferenceModel = ProcessIsolatedInferenceModel
 logger = logging.getLogger(__name__)
-
 
 def never() -> datetime:
     return datetime.max
-
 
 class ModelManager:
     _instance: Optional["ModelManager"] = None
@@ -92,9 +87,7 @@ class ModelManager:
             # Load the model only after managing the LRU cache
             if inference_id not in self._models:
                 try:
-                    model_instance = ModelRegistry().get_model_instance(
-                        inference_id
-                    )
+                    model_instance = ProcessIsolatedInferenceModel(inference_id)
                     model_instance.load()
                 except Exception as e:
                     logger.error(f"Failed to load model {inference_id}: {e}")

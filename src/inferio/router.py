@@ -7,23 +7,8 @@ from fastapi_utilities.repeat.repeat_every import repeat_every
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
 
-from inferio.impl.clap import ClapModel, ClapModelIsolated
-from inferio.impl.clip import CLIPIsolated, ClipModel
-from inferio.impl.danbooru import DanbooruIsolated, DanbooruTagger
-from inferio.impl.eocr import EasyOCRModel, EasyOCRModelIsolated
-from inferio.impl.florence2 import Florence2, Florence2Isolated
-from inferio.impl.jina_clip import JinaCLIPIsolated, JinaClipModel
-from inferio.impl.md_captioner import MoondreamCaptioner, MoondreamCaptionerIsolated
-from inferio.impl.md_tagger import MoondreamTagger, MoondreamTaggerIsolated
-from inferio.impl.ocr import DoctrModel, DoctrModelIsolated
-from inferio.impl.sentence_transformers import (
-    SentenceTransformersModel,
-    SentenceTransformersModelIsolated,
-)
-from inferio.impl.wd_tagger import WDTagger, WDTaggerIsolated
-from inferio.impl.whisper import FasterWhisperModel, FasterWhisperModelIsolated
+from inferio.config import list_inference_ids, load_config
 from inferio.manager import InferenceModel, ModelManager
-from inferio.registry import ModelRegistry
 from inferio.utils import (
     add_cudnn_to_path,
     encode_output_response,
@@ -31,45 +16,15 @@ from inferio.utils import (
 )
 
 logger = logging.getLogger(__name__)
-ModelRegistry.set_user_folder("config/inference")
 
 if os.getenv("NO_CUDNN", "false").lower() in ("0", "false"):
     add_cudnn_to_path()
-
-if os.getenv("INFERENCE_PROCESS_ISOLATION", "true").lower() in ["false", "0"]:
-    ModelRegistry.register_model(WDTagger)
-    ModelRegistry.register_model(DoctrModel)
-    ModelRegistry.register_model(SentenceTransformersModel)
-    ModelRegistry.register_model(FasterWhisperModel)
-    ModelRegistry.register_model(ClipModel)
-    ModelRegistry.register_model(Florence2)
-    ModelRegistry.register_model(DanbooruTagger)
-    ModelRegistry.register_model(ClapModel)
-    ModelRegistry.register_model(JinaClipModel)
-    ModelRegistry.register_model(EasyOCRModel)
-    ModelRegistry.register_model(MoondreamTagger)
-    ModelRegistry.register_model(MoondreamCaptioner)
-else:
-    ModelRegistry.register_model(WDTaggerIsolated)
-    ModelRegistry.register_model(DoctrModelIsolated)
-    ModelRegistry.register_model(SentenceTransformersModelIsolated)
-    ModelRegistry.register_model(FasterWhisperModelIsolated)
-    ModelRegistry.register_model(CLIPIsolated)
-    ModelRegistry.register_model(Florence2Isolated)
-    ModelRegistry.register_model(DanbooruIsolated)
-    # ModelRegistry.register_model(InfinityCLIPIsolated)
-    ModelRegistry.register_model(ClapModelIsolated)
-    ModelRegistry.register_model(JinaCLIPIsolated)
-    ModelRegistry.register_model(EasyOCRModelIsolated)
-    ModelRegistry.register_model(MoondreamTaggerIsolated)
-    ModelRegistry.register_model(MoondreamCaptionerIsolated)
 
 router = APIRouter(
     prefix="/api/inference",
     tags=["inference"],
     responses={404: {"description": "Not found"}},
 )
-
 
 @router.post(
     "/predict/{group}/{inference_id}",
@@ -170,11 +125,9 @@ Files may be optional depending on the model, some do not operate on binary data
 
     return encode_output_response(outputs)
 
-
 @dataclass
 class StatusResponse:
     status: str
-
 
 @router.put(
     "/load/{group}/{inference_id}",
@@ -283,6 +236,7 @@ class CacheListResponse:
 async def get_cached_models():
     return CacheListResponse(cache=ModelManager().list_loaded_models())
 
+global_config, mtime = load_config()
 
 @router.get(
     "/metadata",
@@ -291,8 +245,9 @@ async def get_cached_models():
     response_model=Dict[str, Dict[str, Any]],
 )
 def get_metadata() -> Dict[str, Dict[str, Any]]:
-    return ModelRegistry().list_inference_ids()
-
+    global global_config, mtime
+    global_config, mtime = load_config(global_config, mtime)
+    return list_inference_ids(global_config)
 
 @repeat_every(seconds=10, logger=logger)
 async def check_ttl():
