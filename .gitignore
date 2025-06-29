@@ -182,3 +182,6 @@ data/
 !/inferio_custom/__init__.py
 !/inferio_custom/example.py
 !/inferio_custom/README.md
+
+/config/inference/*
+!/config/inference/example.toml
