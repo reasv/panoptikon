@@ -6,7 +6,6 @@ from PIL import ImageFile
 
 from inferio.impl.utils import clear_cache, get_device, serialize_array
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -130,7 +129,3 @@ class ClipModel(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = ClipModel
-class CLIPIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[ClipModel]:  # type: ignore
-        return ClipModel

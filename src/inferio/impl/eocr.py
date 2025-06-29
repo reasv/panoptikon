@@ -6,7 +6,6 @@ import numpy as np
 from PIL import Image as PILImage
 from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -245,7 +244,3 @@ def pad_images_to_same_size(images: List[np.ndarray]) -> List[np.ndarray]:
         return padded_images
 
 IMPL_CLASS = EasyOCRModel
-class EasyOCRModelIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[EasyOCRModel]:  # type: ignore
-        return EasyOCRModel

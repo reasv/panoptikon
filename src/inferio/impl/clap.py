@@ -9,7 +9,6 @@ from inferio.impl.utils import (
     serialize_array,
 )
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 
@@ -123,8 +122,3 @@ class ClapModel(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = ClapModel
-
-class ClapModelIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[ClapModel]:  # type: ignore
-        return ClapModel

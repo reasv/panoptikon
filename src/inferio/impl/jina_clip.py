@@ -10,7 +10,6 @@ from PIL import ImageFile
 
 from inferio.impl.utils import serialize_array
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 import logging
 
@@ -215,7 +214,3 @@ class JinaClipModel(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = JinaClipModel
-class JinaCLIPIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[JinaClipModel]:  # type: ignore
-        return JinaClipModel

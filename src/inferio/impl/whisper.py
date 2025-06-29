@@ -7,10 +7,8 @@ import numpy as np
 
 from inferio.impl.utils import clear_cache, get_device
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 from panoptikon.data_extractors.data_handlers.utils import deserialize_array
-
 
 class FasterWhisperModel(InferenceModel):
     def __init__(
@@ -146,11 +144,5 @@ class FasterWhisperModel(InferenceModel):
                 }
             )
         return outputs
-
-
-class FasterWhisperModelIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[FasterWhisperModel]:  # type: ignore
-        return FasterWhisperModel
 
 IMPL_CLASS = FasterWhisperModel

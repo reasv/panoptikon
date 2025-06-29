@@ -9,7 +9,6 @@ from PIL import Image as PILImage
 
 from inferio.impl.utils import clean_whitespace, clear_cache, get_device, print_resource_usage
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -235,7 +234,3 @@ class Florence2(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = Florence2
-class Florence2Isolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[Florence2]:  # type: ignore
-        return Florence2

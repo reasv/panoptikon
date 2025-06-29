@@ -8,7 +8,6 @@ from PIL import Image as PILImage
 
 from inferio.impl.utils import clear_cache, extract_partial_json_array, get_device
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -225,11 +224,6 @@ class MoondreamTagger(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = MoondreamTagger
-
-class MoondreamTaggerIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[MoondreamTagger]:  # type: ignore
-        return MoondreamTagger
 
 def format_tag(tag: str) -> str:
     """

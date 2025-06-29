@@ -3,7 +3,6 @@ from typing import Dict, List, Sequence, Type
 
 from inferio.impl.utils import clear_cache, get_device, serialize_array
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -181,8 +180,3 @@ def split_text_by_tokens(text, tokenizer, max_tokens):
     ]
 
 IMPL_CLASS = SentenceTransformersModel
-
-class SentenceTransformersModelIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[SentenceTransformersModel]:  # type: ignore
-        return SentenceTransformersModel

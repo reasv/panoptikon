@@ -7,7 +7,6 @@ from PIL import Image as PILImage
 
 from inferio.impl.utils import clean_whitespace, clear_cache, get_device
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 
@@ -122,7 +121,3 @@ class DoctrModel(InferenceModel):
             clear_cache()
             self._model_loaded = False
 IMPL_CLASS = DoctrModel
-class DoctrModelIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[DoctrModel]:  # type: ignore
-        return DoctrModel

@@ -15,7 +15,6 @@ from inferio.impl.saucenao.errors import (
 )
 from inferio.impl.saucenao.saucenao_api import AIOSauceNao
 from inferio.model import InferenceModel
-from inferio.process_model import ProcessIsolatedInferenceModel
 from inferio.inferio_types import PredictionInput
 
 logger = logging.getLogger(__name__)
@@ -468,8 +467,3 @@ class DanbooruTagger(InferenceModel):
             self._model_loaded = False
 
 IMPL_CLASS = DanbooruTagger
-
-class DanbooruIsolated(ProcessIsolatedInferenceModel):
-    @classmethod
-    def concrete_class(cls) -> Type[DanbooruTagger]:  # type: ignore
-        return DanbooruTagger
