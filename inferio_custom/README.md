@@ -21,6 +21,8 @@ class MyModel(InferenceModel):
 IMPL_CLASS = MyModel
 ```
 
+See `example.py` in this folder.
+
 ## Notes
 
 - This folder must contain an `__init__.py` file (even if empty).
