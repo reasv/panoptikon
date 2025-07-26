@@ -80,6 +80,49 @@ class ImageSliceSettings:
             pixel_max_size=settings.get("pixel_max_size", 4096),
         )
 
+
+def is_image_readable(
+    buf: bytes,
+    *,
+    accept_truncated: bool = True,
+    try_fix_jpeg: bool = True,
+) -> bool:
+    """
+    Quick pre‑flight check: return True if `load_image_from_buffer()` will
+    almost certainly succeed, False otherwise.
+
+    • Uses Pillow only → lightweight (≈ 3 ms for a 1 MB JPEG on a laptop).
+    • Does **not** pull pixel data – it calls `Image.verify()` which stops
+      after parsing the headers and scanlines checksum.
+
+    Parameters
+    ----------
+    buf : bytes
+        Raw image data.
+    accept_truncated : bool, default True
+        Mirror the server flag: if True, sets LOAD_TRUNCATED_IMAGES before
+        verifying.
+    try_fix_jpeg : bool, default True
+        Append missing JPEG EOI 0xFFD9 first (same heuristic as the server).
+    """
+    try:
+        from PIL import Image as PILImage
+        from PIL import ImageFile
+
+        if accept_truncated:
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+        raw = buf
+        if try_fix_jpeg and not raw.endswith(b"\xFF\xD9"):
+            raw += b"\xFF\xD9"
+
+        with PILImage.open(io.BytesIO(raw)) as im:
+            im.verify()            # lightweight header/CRC check
+        return True
+
+    except Exception:              # any OSError, UnidentifiedImageError, etc.
+        return False
+
 def image_loader(
     conn: sqlite3.Connection,
     item: JobInputData,
@@ -103,12 +146,18 @@ def image_loader(
     if item.type.startswith("image"):
         # Load image as bytes
         with open(item.path, "rb") as f:
-            return slice_target_size(
-                [f.read()],
-                item.width,
-                item.height,
-                slice_settings,
+            image_buffer = f.read()
+        if not is_image_readable(image_buffer):
+            logger.warning(
+                f"Image {item.path} is not readable, skipping"
             )
+            return []
+        return slice_target_size(
+            [f.read()],
+            item.width,
+            item.height,
+            slice_settings,
+        )
     if item.type.startswith("video"):
         if frames := get_frames_bytes(conn, item.sha256):
             logger.debug(f"Loaded {len(frames)} frames from database")
