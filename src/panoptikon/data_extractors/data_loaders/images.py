@@ -148,10 +148,12 @@ def image_loader(
         with open(item.path, "rb") as f:
             image_buffer = f.read()
         if not is_image_readable(image_buffer):
-            logger.warning(
-                f"Image {item.path} is not readable, skipping"
+            logger.error(
+                f"Image {item.path} is not readable"
             )
-            return []
+            raise ValueError(
+                f"Image {item.path} is not readable"
+            )
         return slice_target_size(
             [image_buffer],
             item.width,
