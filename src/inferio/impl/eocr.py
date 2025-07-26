@@ -4,7 +4,7 @@ from io import BytesIO
 from typing import List, Sequence, Type
 import numpy as np
 from PIL import Image as PILImage
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device, load_image_from_buffer
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -77,7 +77,7 @@ class EasyOCRModel(InferenceModel):
         image_inputs: List[np.ndarray] = []
         for input_item in inputs:
             if input_item.file:
-                image = PILImage.open(BytesIO(input_item.file)).convert("RGB")
+                image = load_image_from_buffer(input_item.file)
                 image_inputs.append(np.array(image))
             else:
                 raise ValueError("OCR requires image inputs.")

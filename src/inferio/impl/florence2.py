@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device, print_resource_usage
+from inferio.impl.utils import clean_whitespace, clear_cache, get_device, load_image_from_buffer, print_resource_usage
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -105,9 +105,7 @@ class Florence2(InferenceModel):
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
         for input_item in inputs:
             if input_item.file:
-                image: PILImage.Image = PILImage.open(
-                    BytesIO(input_item.file)
-                ).convert("RGB")
+                image: PILImage.Image = load_image_from_buffer(input_item.file)
                 image_inputs.append(image)
             else:
                 raise ValueError("Florence2 requires image inputs.")

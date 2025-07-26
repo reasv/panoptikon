@@ -5,9 +5,11 @@ import logging
 import json
 import re
 from typing import List, Optional
-
 import numpy as np
 from PIL import Image
+import PIL.Image
+from io import BytesIO
+from typing import Optional
 
 def get_device():
     import torch
@@ -210,3 +212,73 @@ def print_resource_usage(logger: logging.Logger | None = None):
         log(f"  [psutil] CPU usage:            {cpu:.1f}%")
     except ImportError:
         log("  [psutil] psutil not installed. Install with `pip install psutil` for more details.")
+
+def load_image_from_buffer(
+    buf: bytes,
+    *,
+    accept_truncated: bool = True,
+    try_fix_jpeg: bool = True,
+    fallback_opencv: bool = True,
+) -> "PIL.Image.Image":
+    """
+    Load an image from a raw byte buffer and return a Pillow Image in RGB mode.
+
+    Parameters
+    ----------
+    buf : bytes
+        Raw image data.
+    accept_truncated : bool, default True
+        If True, sets PIL.ImageFile.LOAD_TRUNCATED_IMAGES so Pillow will
+        return partially‑decoded images instead of raising OSError.
+    try_fix_jpeg : bool, default True
+        If True, appends the JPEG end‑of‑image marker 0xFF 0xD9 if it is missing.
+    fallback_opencv : bool, default True
+        If Pillow still cannot decode, fall back to OpenCV and convert the
+        result back to Pillow.
+
+    Raises
+    ------
+    ValueError
+        If the image is unreadable by all enabled back‑ends.
+    """
+    # ––––– 1.  Pillow first –––––
+    try:
+        from PIL import Image as PILImage
+        from PIL import ImageFile
+
+        if accept_truncated:
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+        raw = buf
+        if try_fix_jpeg and not raw.endswith(b"\xFF\xD9"):  # add missing EOI
+            raw += b"\xFF\xD9"
+
+        with PILImage.open(BytesIO(raw)) as im:
+            im.load()                   # force decoding now
+            return im.convert("RGB")
+
+    except (ModuleNotFoundError, ImportError):
+        raise ValueError("Pillow is not installed") from None
+    except Exception as err:
+        # Any other OSError & friends fall through to optional fallback
+        last_err: Optional[Exception] = err
+
+    # ––––– 2.  OpenCV fallback –––––
+    if fallback_opencv:
+        try:
+            import cv2
+            import numpy as np
+
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            img_cv = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+            if img_cv is None:
+                raise ValueError("OpenCV could not decode image")
+            # BGR ➜ RGB and back to Pillow
+            img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            from PIL import Image as PILImage
+            return PILImage.fromarray(img_cv)
+        except Exception as err:
+            last_err = err
+
+    # ––––– 3.  Give up –––––
+    raise ValueError("Unreadable image") from last_err

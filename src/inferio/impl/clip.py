@@ -4,7 +4,7 @@ from typing import List, Sequence, Type, Union
 from PIL import Image as PILImage
 from PIL import ImageFile
 
-from inferio.impl.utils import clear_cache, get_device, serialize_array
+from inferio.impl.utils import clear_cache, get_device, load_image_from_buffer, serialize_array
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -69,7 +69,7 @@ class ClipModel(InferenceModel):
         # Separate text and image inputs, storing their original indices
         for idx, input_item in enumerate(inputs):
             if input_item.file:
-                image = PILImage.open(BytesIO(input_item.file)).convert("RGB")
+                image = load_image_from_buffer(input_item.file)
                 image_inputs.append((idx, image))
             else:
                 assert isinstance(

@@ -8,7 +8,7 @@ from typing import List, Sequence, Type, Union
 from PIL import Image as PILImage
 from PIL import ImageFile
 
-from inferio.impl.utils import serialize_array
+from inferio.impl.utils import load_image_from_buffer, serialize_array
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 import logging
@@ -82,7 +82,7 @@ class JinaClipModel(InferenceModel):
             if input_item.file:
                 # Convert raw bytes to base64 data URL
                 image_bytes = input_item.file
-                image = PILImage.open(BytesIO(image_bytes)).convert("RGB")
+                image = load_image_from_buffer(input_item.file)
 
                 # If the format is unknown, fallback to 'png'
                 mime = image.format.lower() if image.format else "png"

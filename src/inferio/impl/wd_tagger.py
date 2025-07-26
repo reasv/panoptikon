@@ -10,6 +10,7 @@ from PIL import Image as PILImage
 from inferio.impl.utils import (
     clear_cache,
     get_device,
+    load_image_from_buffer,
     mcut_threshold,
     pil_ensure_rgb,
     pil_pad_square,
@@ -118,9 +119,7 @@ class WDTagger(InferenceModel):
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
         for input_item in inputs:
             if input_item.file:
-                image: PILImage.Image = PILImage.open(
-                    BytesIO(input_item.file)
-                ).convert("RGB")
+                image: PILImage.Image = load_image_from_buffer(input_item.file)
                 image_inputs.append(image)
             else:
                 raise ValueError("Tagger requires image inputs.")
