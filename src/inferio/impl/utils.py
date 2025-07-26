@@ -281,4 +281,4 @@ def load_image_from_buffer(
             last_err = err
 
     # ––––– 3.  Give up –––––
-    raise ValueError("Unreadable image") from last_err
+    raise ValueError(f"Unreadable image: {last_err}") from last_err
