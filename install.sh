@@ -34,6 +34,8 @@ source "$VENV/bin/activate"
 echo "Installing dependencies for inference & development (CPU or system GPU as available)..."
 uv pip install --group inference
 uv pip install -e .
+uv pip uninstall torch torchvision torchaudio
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 echo
 echo "✅ Install complete. To run Panoptikon:"

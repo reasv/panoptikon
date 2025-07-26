@@ -1,5 +1,5 @@
 # Use an NVIDIA CUDA base image with Debian
-FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 # Set DEBIAN_FRONTEND to noninteractive to avoid timezone configuration prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,6 +14,11 @@ RUN apt-get update && apt-get install -y \
     llvm-14 \
     llvm-14-dev \
     clang-14 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify that llvm-config is on PATH
