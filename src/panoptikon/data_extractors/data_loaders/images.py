@@ -153,7 +153,7 @@ def image_loader(
             )
             return []
         return slice_target_size(
-            [f.read()],
+            [image_buffer],
             item.width,
             item.height,
             slice_settings,
