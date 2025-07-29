@@ -45,7 +45,7 @@ inference = [
     "timm>=1.0.7,<2",
     "faster-whisper>=1.1.1,<2",
     "sentence-transformers>=3.0.1,<4",
-    "transformers>=4.49.0,<4.50.0",
+    "transformers==4.49.0",
     "pyvips-binary>=8.16.1,<9",
     "pyvips>=2.2.3,<3",
     "easyocr>=1.7.2,<2",
