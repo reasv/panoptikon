@@ -139,6 +139,14 @@ def run_dynamic_extraction_job(
             return [({"md5": item.md5}, frame)]
 
         data_loader = get_md5_image
+    elif handler_name == "sha256_md5_path":
+        def get_sha256_paths(
+            item: JobInputData,
+        ) -> Sequence[Tuple[Dict[str, Any], None]]:
+            assert item.sha256 is not None, "SHA256 must be present"
+            return [({"sha256": item.sha256,"md5": item.md5, "path": item.path}, None)]
+
+        data_loader = get_sha256_paths
     else:
         raise ValueError(f"Data loader {handler_name} not found")
 
