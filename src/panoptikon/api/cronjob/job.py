@@ -52,7 +52,7 @@ def run_cronjob(index_db: str):
                 )
                 continue
 
-            if model.target_entities == ["items"]:
+            if model.target_entities == ["items"] or model.target_entities == ["files"]:
                 src_jobs.append(scheduled_job)
             else:
                 logger.debug(

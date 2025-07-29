@@ -160,4 +160,4 @@ class CronJob(BaseModel):
 
 
 OutputDataType = Literal["tags", "text", "clip", "text-embedding"]
-TargetEntityType = Literal["items", "text", "tags"]
+TargetEntityType = Literal["items", "text", "tags", "files"]

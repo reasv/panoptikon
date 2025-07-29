@@ -351,6 +351,22 @@ def get_items_missing_data_extraction(
             "data_id",
             "text",
         ]
+    elif model.target_entities == ["files"]:
+        query.entity = "file"
+        #query.partition_by = ["file_id"]
+        query.select = [
+            "sha256",
+            "path",
+            "last_modified",
+            "type",
+            "md5",
+            "width",
+            "height",
+            "duration",
+            "audio_tracks",
+            "video_tracks",
+            "subtitle_tracks",
+        ]
     else:
         raise ValueError("Only Items and Text target entities are supported")
 
