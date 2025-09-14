@@ -39,7 +39,7 @@ uv pip install --group inference
 uv pip install -e .
 
 echo Installing PyTorch with CUDA support (CUDA 12.4 wheels)...
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 echo Installation complete. To run Panoptikon:
 echo    start.bat
