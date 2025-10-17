@@ -147,7 +147,7 @@ config.max_new_tokens = 128
 config.do_sample = true
 config.temperature = 0.7
 config.top_p = 0.9
-metadata.description = "DotsOCR - rednote-hilab/dots.ocr"
+metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is required for this model!)"
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
