@@ -51,6 +51,9 @@ inference = [
     "easyocr>=1.7.2,<2",
     "einops>=0.8.1",
 ]
+test = [
+    "pytest>=8.3.4,<9",
+]
 
 [tool.uv]
 default-groups = ["inference"]
@@ -86,3 +89,9 @@ build-backend = "hatchling.build"
 
 [tool.black]
 line-length = 80
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: integration tests that download models or call external services",
+]
