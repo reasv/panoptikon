@@ -227,99 +227,99 @@ opts.slice_settings.pixel_max_size    = 10000
 # --- Inference IDs for Florence 2 ---
 
 [group.florence2.inference_ids.msft_large-more-detailed]
-config.model_name  = "microsoft/Florence-2-large-ft"
+config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<MORE_DETAILED_CAPTION>"
 metadata.description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
 
 [group.florence2.inference_ids.msft_large-caption]
-config.model_name  = "microsoft/Florence-2-large-ft"
+config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<CAPTION>"
 metadata.description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
 
 [group.florence2.inference_ids.msft_large-detailed]
-config.model_name  = "microsoft/Florence-2-large-ft"
+config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<DETAILED_CAPTION>"
 metadata.description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model"
 
 [group.florence2.inference_ids.msft_large-ocr]
-config.model_name  = "microsoft/Florence-2-large"
+config.model_name  = "florence-community/Florence-2-large"
 config.task_prompt = "<OCR>"
 metadata.description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model"
 
-# --- Fine-tuned Florence 2 Models ---
+# --- Fine-tuned Florence 2 Models (Deprecated due to changes in HF Transformers making them incompatible)---
 
-[group.florence2.inference_ids.gokaygokay_SD3-Caption]
-config.model_name  = "gokaygokay/Florence-2-SD3-Captioner"
-config.task_prompt = "<DESCRIPTION>"
-config.text_input  = "Describe this image in great detail."
-metadata.description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion"
+# [group.florence2.inference_ids.gokaygokay_SD3-Caption]
+# config.model_name  = "gokaygokay/Florence-2-SD3-Captioner"
+# config.task_prompt = "<DESCRIPTION>"
+# config.text_input  = "Describe this image in great detail."
+# metadata.description = "(Detailed Captioning) Captioner trained for use with Stable Diffusion"
 
-[group.florence2.inference_ids.DocVQA-Caption]
-config.model_name  = "HuggingFaceM4/Florence-2-DocVQA"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering"
+# [group.florence2.inference_ids.DocVQA-Caption]
+# config.model_name  = "HuggingFaceM4/Florence-2-DocVQA"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) (Size: Large) Captioner trained for use Visual Question Answering"
 
-[group.florence2.inference_ids.yayayaaa_large-moredetailed]
-config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) (Size: Large) Generates extremely verbose descriptions"
+# [group.florence2.inference_ids.yayayaaa_large-moredetailed]
+# config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) (Size: Large) Generates extremely verbose descriptions"
 
-[group.florence2.inference_ids.yayayaaa_large-moredetailed-m]
-config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
-config.task_prompt = "<DETAILED_CAPTION>"
-metadata.description = "(Medium Detail Captioning) (Size: Large) Generates extremely verbose descriptions"
+# [group.florence2.inference_ids.yayayaaa_large-moredetailed-m]
+# config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+# config.task_prompt = "<DETAILED_CAPTION>"
+# metadata.description = "(Medium Detail Captioning) (Size: Large) Generates extremely verbose descriptions"
 
-[group.florence2.inference_ids.yayayaaa_large-moredetailed-s]
-config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
-config.task_prompt = "<CAPTION>"
-metadata.description = "(Captioning) (Size: Large) Generates extremely verbose descriptions"
+# [group.florence2.inference_ids.yayayaaa_large-moredetailed-s]
+# config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+# config.task_prompt = "<CAPTION>"
+# metadata.description = "(Captioning) (Size: Large) Generates extremely verbose descriptions"
 
-[group.florence2.inference_ids.yayayaaa_large-moredetailed-ocr]
-config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
-config.task_prompt = "<OCR>"
-metadata.description = "(OCR) (Size: Large) Generates extremely verbose descriptions"
+# [group.florence2.inference_ids.yayayaaa_large-moredetailed-ocr]
+# config.model_name  = "yayayaaa/florence-2-large-ft-moredetailed"
+# config.task_prompt = "<OCR>"
+# metadata.description = "(OCR) (Size: Large) Generates extremely verbose descriptions"
 
-[group.florence2.inference_ids.ljnlonoljpiljm_base-ft-keywords]
-config.model_name  = "ljnlonoljpiljm/florence-2-base-ft-keywords-caption-interleaved"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) (Size: Base) Keyword-based captions"
+# [group.florence2.inference_ids.ljnlonoljpiljm_base-ft-keywords]
+# config.model_name  = "ljnlonoljpiljm/florence-2-base-ft-keywords-caption-interleaved"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) (Size: Base) Keyword-based captions"
 
-[group.florence2.inference_ids.andito_large]
-config.model_name  = "andito/Florence-2-large-ft"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
+# [group.florence2.inference_ids.andito_large]
+# config.model_name  = "andito/Florence-2-large-ft"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
 
-[group.florence2.inference_ids.andito_large-ocr]
-config.model_name  = "andito/Florence-2-large-ft"
-config.task_prompt = "<OCR>"
-metadata.description = "(OCR) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
+# [group.florence2.inference_ids.andito_large-ocr]
+# config.model_name  = "andito/Florence-2-large-ft"
+# config.task_prompt = "<OCR>"
+# metadata.description = "(OCR) (Size: Large) Slight finetune of Microsoft's Florence 2 Large model"
 
-[group.florence2.inference_ids.MiaoshouAI_base-PromptGen-Caption]
-config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = """(Detailed Captioning) (Size: Base) Trained for the \
-  MiaoshouAI Tagger for ComfyUI"""
+# [group.florence2.inference_ids.MiaoshouAI_base-PromptGen-Caption]
+# config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = """(Detailed Captioning) (Size: Base) Trained for the \
+#   MiaoshouAI Tagger for ComfyUI"""
 
-[group.florence2.inference_ids.MiaoshouAI_base-PromptGen]
-config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
-config.task_prompt = "<GENERATE_PROMPT>"
-metadata.description = """(Detailed Captioning) (Size: Base) Stable Diffusion \
-  Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI"""
+# [group.florence2.inference_ids.MiaoshouAI_base-PromptGen]
+# config.model_name  = "MiaoshouAI/Florence-2-base-PromptGen"
+# config.task_prompt = "<GENERATE_PROMPT>"
+# metadata.description = """(Detailed Captioning) (Size: Base) Stable Diffusion \
+#   Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI"""
 
-[group.florence2.inference_ids.ljnlonoljpiljm_large-docci-caption]
-config.model_name  = "ljnlonoljpiljm/florence-2-large-docci-caption"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci"
+# [group.florence2.inference_ids.ljnlonoljpiljm_large-docci-caption]
+# config.model_name  = "ljnlonoljpiljm/florence-2-large-docci-caption"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) (Size: Large) Captioner finetuned on Docci"
 
-[group.florence2.inference_ids.aniketVerma07_finetuned]
-config.model_name  = "aniketVerma07/finetuned_florence_2"
-config.task_prompt = "<MORE_DETAILED_CAPTION>"
-metadata.description = "(Detailed Captioning) Florence 2 Finetune"
+# [group.florence2.inference_ids.aniketVerma07_finetuned]
+# config.model_name  = "aniketVerma07/finetuned_florence_2"
+# config.task_prompt = "<MORE_DETAILED_CAPTION>"
+# metadata.description = "(Detailed Captioning) Florence 2 Finetune"
 
-[group.florence2.inference_ids.Oysiyl_OCR-Cauldron-IAM]
-config.model_name  = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM"
-config.task_prompt = "<OCR>"
-metadata.description = "(OCR) OCR Finetune"
+# [group.florence2.inference_ids.Oysiyl_OCR-Cauldron-IAM]
+# config.model_name  = "Oysiyl/Florence-2-FT-OCR-Cauldron-IAM"
+# config.task_prompt = "<OCR>"
+# metadata.description = "(OCR) OCR Finetune"
 
 
 # ===================================================================
