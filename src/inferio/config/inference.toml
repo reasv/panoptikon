@@ -791,6 +791,25 @@ config.pretrained = "dfn5b"
 metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
   DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)."""
 
+[group.tclip.inference_ids.qwen3-vl-embedding-8b]
+config.impl_class = "qwen3-vl-embedding"
+config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
+config.attn_implementation = "sdpa"
+metadata.distance_func = "L2"
+metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
+  model. Heavier than CLIP; consider smaller batch sizes."""
+metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
+
+
+[group.tclip.inference_ids.qwen3-vl-embedding-2b]
+config.impl_class = "qwen3-vl-embedding"
+config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
+config.attn_implementation = "sdpa"
+metadata.distance_func = "L2"
+metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
+  model. Heavier than CLIP; consider smaller batch sizes."""
+metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+
 [group.tclip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
 config.pretrained = "dfn5b"
