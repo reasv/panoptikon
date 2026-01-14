@@ -149,7 +149,11 @@ async fn proxy_request(
     }
 
     let mut db_action = DbAction::Skipped;
-    if upstream_kind == UpstreamKind::Api && needs_db_params(&path) {
+    let apply_db_params = match upstream_kind {
+        UpstreamKind::Api => needs_db_params(&path),
+        UpstreamKind::Ui => true,
+    };
+    if apply_db_params {
         match enforce_db_params(policy, &mut req) {
             Ok(action) => db_action = action,
             Err(error) => {
