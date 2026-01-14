@@ -1,0 +1,138 @@
+# Panoptikon Gateway default configuration
+# The Gateway loads [cwd]/config/gateway/default.toml by default.
+
+[server]
+# Bind address for the gateway listener.
+host = "127.0.0.1"
+# Port for the gateway listener.
+port = 8080
+# If true, use X-Forwarded-Host / Forwarded to select policy host.
+trust_forwarded_headers = true
+
+[upstreams.ui]
+# Next.js frontend base URL.
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+# FastAPI backend base URL.
+base_url = "http://127.0.0.1:6342"
+
+# --------- Routes (optional, for future use) ---------
+# Routes are currently not used by the router, but are validated and reserved
+# for a future dynamic router configuration.
+#
+# [[routes]]
+# name = "api"
+# path_prefix = "/api/"
+# upstream = "api"
+#
+# [[routes]]
+# name = "ui"
+# path_prefix = "/"
+# upstream = "ui"
+
+# --------- Rulesets ---------
+# Rulesets define which methods + paths are allowed for a policy.
+# If a policy references a ruleset, anything not matched is denied.
+
+[rulesets.allow_all]
+allow_all = true
+
+# This still allows bookmarks (safe for public demos).
+[rulesets.restricted_demo]
+allow = [
+    { methods = [
+        "GET",
+    ], path_prefix = "/docs" },
+    { methods = [
+        "GET",
+    ], path = "/openapi.json" },
+
+    { methods = [
+        "GET",
+        "POST",
+    ], path_prefix = "/api/search/" },
+    { methods = [
+        "GET",
+    ], path_prefix = "/api/items/" },
+
+    { methods = [
+        "GET",
+        "POST",
+        "DELETE",
+        "PUT",
+    ], path_prefix = "/api/bookmarks/" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/db" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/inference/cache" },
+]
+
+# --------- Policies ---------
+# Policies are checked in order. First match wins.
+
+[[policies]]
+name = "localhost"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+
+[policies.defaults]
+index_db = "default"
+user_data_db = "default"
+
+[policies.index_db]
+allow = "*"
+
+[policies.user_data_db]
+allow = "*"
+
+# Example: public demo policy with a restricted ruleset.
+#
+# [[policies]]
+# name = "public_demo"
+# ruleset = "restricted_demo"
+#
+# [policies.match]
+# hosts = ["public.example.com"]
+#
+# [policies.defaults]
+# index_db = "public"
+# user_data_db = "default"
+#
+# [policies.index_db]
+# allow = ["public"]
+#
+# [policies.user_data_db]
+# allow = ["default"]
+
+# Example: multi-tenant policy using a username header.
+#
+# [[policies]]
+# name = "private_multi_tenant"
+# ruleset = "allow_all"
+#
+# [policies.match]
+# hosts = ["private.example.com"]
+#
+# [policies.identity]
+# user_header = "X-Forwarded-User"
+#
+# [policies.defaults]
+# index_db = "default"
+# user_data_db = "default"
+#
+# [policies.index_db]
+# allow = ["default", "shared_images", "shared_docs"]
+# tenant_default_template = "user_{username}"
+# tenant_template = "user_{username}_{db}"
+#
+# [policies.user_data_db]
+# allow = ["default"]
+# tenant_default_template = "user_{username}"
+# tenant_template = "user_{username}"
