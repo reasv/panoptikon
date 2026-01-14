@@ -18,7 +18,7 @@ from panoptikon.db.extraction_log import get_existing_setters
 from panoptikon.db.files import get_all_mime_types, get_file_stats
 from panoptikon.db.folders import get_folders_from_database
 from panoptikon.db.pql.pql_model import PQLQuery
-from panoptikon.db.pql.search import SearchMetrics, search_pql
+from panoptikon.db.pql.search import PQLBuilderResult, SearchMetrics, build_pql, search_pql
 from panoptikon.db.pql.types import SearchResult
 from panoptikon.db.tags import find_tags, get_all_tag_namespaces
 from panoptikon.db.tagstats import (
@@ -70,7 +70,7 @@ def extract_embeddings(buffer: bytes) -> bytes:
     # Check the number of dimensions
     if len(numpy_array.shape) == 1:
         # If it is a 1D array, it is a single embedding
-        return serialize_f32(numpy_array.tolist())
+        return serialize_f32(numpy_array.tolist()) # type: ignore
     # If it is a 2D array, it is a list of embeddings, get the first one
     return serialize_f32(numpy_array[0].tolist())
 
@@ -114,6 +114,28 @@ def pql(
     finally:
         conn.close()
 
+@router.post(
+    "/pql/build",
+    summary="Build PQL search queries without executing them",
+    description="""
+Build the SQL queries for the provided PQL search query without executing them.
+    """,
+    response_model=PQLBuilderResult,
+    response_model_exclude_none=True,
+)
+def pql_build(
+    search_query: PQLQuery = Body(
+        default_factory=lambda: PQLQuery(),
+        description="The PQL Search query to execute",
+    ),
+    conn_args: Dict[str, Any] = Depends(get_db_readonly),
+) -> PQLBuilderResult:
+    conn = get_database_connection(**conn_args)
+    try:
+        logger.debug(f"Building SQL queries for: {search_query}")
+        return build_pql(conn, search_query)
+    finally:
+        conn.close()
 
 @dataclass
 class TagStats:

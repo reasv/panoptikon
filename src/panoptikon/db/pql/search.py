@@ -168,3 +168,66 @@ def search_pql(
         result_query_metrics,
         count_query_metrics,
     )
+
+class CompiledQuery(BaseModel):
+    sql: str
+    params: List[Any]
+
+class PQLBuilderResult(BaseModel):
+    compiled_query: CompiledQuery | None
+    compiled_count_query: CompiledQuery | None
+    result_metrics: SearchMetrics
+    count_metrics: SearchMetrics
+
+def build_pql(
+    conn: sqlite3.Connection,
+    query: PQLQuery,
+):
+    count_query_metrics = SearchMetrics(build=0, compile=0, execute=0)
+    result_query_metrics = SearchMetrics(build=0, compile=0, execute=0)
+    if not query.results and not query.count:
+        return PQLBuilderResult(
+            compiled_query=None,
+            compiled_count_query=None,
+            result_metrics=result_query_metrics,
+            count_metrics=count_query_metrics,
+        )
+    if query.count:
+        start_time = time.time()
+        count_stmt, _ = build_query(query, count_query=True)
+        count_query_metrics.build = td_rounded(start_time)
+        start_time = time.time()
+        count_sql_string, count_params_ordered = get_sql(count_stmt)
+        count_query_metrics.compile = td_rounded(start_time)
+        if not query.results:
+            return PQLBuilderResult(
+                compiled_query=None,
+                compiled_count_query=CompiledQuery(
+                    sql=count_sql_string,
+                    params=count_params_ordered,
+                ),
+                result_metrics=result_query_metrics,
+                count_metrics=count_query_metrics,
+            )
+    else:
+        count_sql_string = ""
+        count_params_ordered = []
+    start_time = time.time()
+    stmt, extra_columns = build_query(query, count_query=False)
+    result_query_metrics.build = td_rounded(start_time)
+    start_time = time.time()
+    sql_string, params_ordered = get_sql(stmt)
+    result_query_metrics.compile = td_rounded(start_time)
+    
+    return PQLBuilderResult(
+        compiled_query=CompiledQuery(
+            sql=sql_string,
+            params=params_ordered,
+        ),
+        compiled_count_query=CompiledQuery(
+            sql=count_sql_string,
+            params=count_params_ordered,
+        ) if query.count else None,
+        result_metrics=result_query_metrics,
+        count_metrics=count_query_metrics,
+    )
