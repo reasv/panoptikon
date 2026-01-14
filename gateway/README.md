@@ -33,9 +33,11 @@ policy (including optional multi-tenant templates).
 
 ## Configuration
 
-Configuration is TOML and/or environment variables only.
+Configuration is TOML and/or environment variables only. By default the
+gateway reads `[cwd]/config/gateway/default.toml`. Override the path with
+`--config` or the `GATEWAY_CONFIG_PATH` environment variable.
 
-Create `gateway/config.toml`:
+Create `config/gateway/default.toml`:
 
 ```toml
 [server]
@@ -73,11 +75,18 @@ allow = "*"
 Environment variables override the file:
 
 ```bash
+GATEWAY_CONFIG_PATH=Q:\projects\panoptikon\config\gateway\default.toml
 GATEWAY__SERVER_HOST=0.0.0.0
 GATEWAY__SERVER_PORT=8080
 GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAM_UI=http://127.0.0.1:6339
 GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
+```
+
+CLI override example:
+
+```bash
+cargo run -p gateway -- --config Q:\projects\panoptikon\config\gateway\default.toml
 ```
 
 The nested style supported by the config crate also works:

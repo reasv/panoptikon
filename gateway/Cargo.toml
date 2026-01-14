@@ -21,3 +21,4 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 anyhow = "1"
 config = "0.14"
 url = "2"
+clap = { version = "4", features = ["derive"] }

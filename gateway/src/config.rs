@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use axum::http::Method;
-use serde::Deserialize;
 use serde::de::{self, SeqAccess, Visitor};
+use serde::Deserialize;
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
+pub const CONFIG_PATH_ENV: &str = "GATEWAY_CONFIG_PATH";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
@@ -135,8 +136,11 @@ impl MethodsSpec {
 }
 
 impl Settings {
-    pub fn load() -> Result<Self> {
-        let config_path = PathBuf::from("gateway").join("config.toml");
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
+        let config_path = match config_path {
+            Some(path) => path,
+            None => default_config_path()?,
+        };
         let builder = config::Config::builder()
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 8080)?
@@ -235,6 +239,11 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+fn default_config_path() -> Result<PathBuf> {
+    let cwd = env::current_dir().context("failed to resolve current directory")?;
+    Ok(cwd.join("config").join("gateway").join("default.toml"))
 }
 
 fn validate_db_defaults(defaults: &DbDefaults, policy_name: &str) -> Result<()> {

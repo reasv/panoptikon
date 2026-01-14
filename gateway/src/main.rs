@@ -2,9 +2,17 @@ mod config;
 mod proxy;
 
 use axum::{routing::any, Router};
-use std::{net::SocketAddr, sync::Arc};
+use clap::Parser;
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[command(name = "panoptikon-gateway", about = "Panoptikon reverse proxy gateway")]
+struct Args {
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,7 +20,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
-    let settings = Arc::new(config::Settings::load()?);
+    let args = Args::parse();
+    let config_path = args
+        .config
+        .or_else(|| env::var(config::CONFIG_PATH_ENV).ok().map(PathBuf::from));
+    let settings = Arc::new(config::Settings::load(config_path)?);
     let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;
     let api_upstream = proxy::Upstream::parse("api", &settings.upstreams.api.base_url)?;
     let state = Arc::new(proxy::ProxyState::new(
