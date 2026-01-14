@@ -1,7 +1,7 @@
 mod config;
 mod proxy;
 
-use axum::{Router, routing::any};
+use axum::{routing::any, Router};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -12,10 +12,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
-    let settings = config::Settings::load()?;
-    let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui)?;
-    let api_upstream = proxy::Upstream::parse("api", &settings.upstreams.api)?;
-    let state = Arc::new(proxy::ProxyState::new(ui_upstream, api_upstream));
+    let settings = Arc::new(config::Settings::load()?);
+    let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;
+    let api_upstream = proxy::Upstream::parse("api", &settings.upstreams.api.base_url)?;
+    let state = Arc::new(proxy::ProxyState::new(
+        ui_upstream,
+        api_upstream,
+        Arc::clone(&settings),
+    ));
 
     let app = Router::new()
         .route("/api", any(proxy::proxy_api))
