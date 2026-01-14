@@ -185,3 +185,6 @@ data/
 
 /config/inference/*
 !/config/inference/example.toml
+
+/target
+gateway/target
