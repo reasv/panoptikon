@@ -232,6 +232,37 @@ pub(crate) async fn get_item_metadata(
     })
 }
 
+pub(crate) async fn get_thumbnail_bytes(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    idx: i64,
+) -> ApiResult<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        r#"
+        SELECT thumbnail
+        FROM thumbnails
+        WHERE item_sha256 = ? AND idx = ?
+        "#,
+    )
+    .bind(sha256)
+    .bind(idx)
+    .fetch_optional(conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read thumbnail bytes");
+        ApiError::internal("Failed to load thumbnail")
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = row.try_get("thumbnail").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse thumbnail bytes");
+        ApiError::internal("Failed to load thumbnail")
+    })?;
+    Ok(Some(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
     if settings.upstreams.api.local {
         app = app
             .route("/api/db", get(api::db::db_info))
-            .route("/api/items/item/file", get(api::items::item_file));
+            .route("/api/items/item/file", get(api::items::item_file))
+            .route("/api/items/item/thumbnail", get(api::items::item_thumbnail));
     }
 
     let app = app
