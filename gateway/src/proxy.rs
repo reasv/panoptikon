@@ -14,7 +14,6 @@ use hyper_util::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
-use crate::config::Settings;
 use crate::policy::PolicyContext;
 
 #[derive(Clone)]
@@ -41,18 +40,16 @@ pub struct ProxyState {
     pub ui: Upstream,
     pub api: Upstream,
     pub inference: Upstream,
-    pub settings: Arc<Settings>,
 }
 
 impl ProxyState {
-    pub fn new(ui: Upstream, api: Upstream, inference: Upstream, settings: Arc<Settings>) -> Self {
+    pub fn new(ui: Upstream, api: Upstream, inference: Upstream) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self {
             client,
             ui,
             api,
             inference,
-            settings,
         }
     }
 }

@@ -45,7 +45,6 @@ async fn main() -> anyhow::Result<()> {
         ui_upstream,
         api_upstream,
         inference_upstream,
-        Arc::clone(&settings),
     ));
 
     let mut app = Router::new()
