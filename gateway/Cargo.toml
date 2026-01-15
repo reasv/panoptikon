@@ -24,3 +24,4 @@ url = "2"
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 sha2 = "0.10"
+tower = "0.4"

@@ -1,5 +1,6 @@
 mod config;
 mod local_api;
+mod policy;
 mod proxy;
 
 use axum::{
@@ -60,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         app = app.route("/api/db", get(local_api::db_info));
     }
 
-    let app = app.with_state(state).layer(TraceLayer::new_for_http());
+    let app = app
+        .with_state(state)
+        .layer(TraceLayer::new_for_http())
+        .layer(policy::PolicyLayer::new(Arc::clone(&settings)));
 
     let listen_addr = settings.listen_addr();
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

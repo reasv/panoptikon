@@ -1,63 +1,10 @@
 use anyhow::{Context, Result};
-use axum::{
-    Json,
-    body::Body,
-    extract::State,
-    http::{Request, StatusCode},
-    response::IntoResponse,
-};
-use std::{env, fs, path::PathBuf, sync::Arc};
+use axum::{Json, response::IntoResponse, http::StatusCode};
+use std::{env, fs, path::PathBuf};
 
-use crate::proxy::{
-    DbInfo, ProxyState, SingleDbInfo, extract_username, filter_db_info_payload,
-    resolve_effective_host, ruleset_allows, select_policy,
-};
+use crate::policy::{DbInfo, SingleDbInfo};
 
-pub async fn db_info(
-    State(state): State<Arc<ProxyState>>,
-    req: Request<Body>,
-) -> impl IntoResponse {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let effective_host =
-        resolve_effective_host(&req, state.settings.server.trust_forwarded_headers);
-    let policy = match select_policy(&state.settings, effective_host.as_deref()) {
-        Some(policy) => policy,
-        None => {
-            tracing::warn!(
-                method = %method,
-                path = %path,
-                host = effective_host.as_deref().unwrap_or("<missing>"),
-                "request denied: no policy matched"
-            );
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    };
-
-    if !ruleset_allows(&state.settings, policy, &method, &path) {
-        tracing::warn!(
-            method = %method,
-            path = %path,
-            policy = %policy.name,
-            "request denied: ruleset"
-        );
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let username = match extract_username(policy, &req) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                method = %method,
-                path = %path,
-                policy = %policy.name,
-                reason = error.reason,
-                "request denied: invalid username"
-            );
-            return error.status.into_response();
-        }
-    };
-
+pub async fn db_info() -> impl IntoResponse {
     let info = match load_db_info() {
         Ok(info) => info,
         Err(err) => {
@@ -65,27 +12,6 @@ pub async fn db_info(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-
-    let info = match filter_db_info_payload(info, policy, username.as_deref()) {
-        Ok(info) => info,
-        Err(error) => {
-            tracing::warn!(
-                method = %method,
-                path = %path,
-                policy = %policy.name,
-                reason = error.reason,
-                "request denied: db info filtering"
-            );
-            return error.status.into_response();
-        }
-    };
-
-    tracing::info!(
-        method = %method,
-        path = %path,
-        policy = %policy.name,
-        "served local /api/db"
-    );
 
     Json(info).into_response()
 }
