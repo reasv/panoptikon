@@ -428,6 +428,7 @@ fn is_db_create_path(path: &str) -> bool {
     path == "/api/db/create"
 }
 
+#[derive(Debug)]
 struct EnforcementError {
     status: StatusCode,
     reason: &'static str,
@@ -593,7 +594,7 @@ async fn filter_db_info_response(
         return Response::from_parts(parts, Body::from(bytes));
     }
 
-    let mut info: DbInfo = match serde_json::from_slice(&bytes) {
+    let info: DbInfo = match serde_json::from_slice(&bytes) {
         Ok(info) => info,
         Err(err) => {
             tracing::warn!(error = %err, "failed to parse db info response");
@@ -601,28 +602,13 @@ async fn filter_db_info_response(
         }
     };
 
-    let index_current =
-        match resolve_default_db(&policy.index_db, &policy.index_db.default, username)
-    {
-        Ok(value) => value,
+    let info = match filter_db_info_payload(info, policy, username) {
+        Ok(info) => info,
         Err(error) => {
-            tracing::warn!(reason = error.reason, "invalid index db default");
+            tracing::warn!(reason = error.reason, "invalid db info payload");
             return error.status.into_response();
         }
     };
-    let user_current =
-        match resolve_default_db(&policy.user_data_db, &policy.user_data_db.default, username) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(reason = error.reason, "invalid user data db default");
-                return error.status.into_response();
-            }
-        };
-
-    info.index.current = index_current;
-    info.user_data.current = user_current;
-    info.index.all = filter_db_list(info.index.all, &policy.index_db, username);
-    info.user_data.all = filter_db_list(info.user_data.all, &policy.user_data_db, username);
 
     let body = match serde_json::to_vec(&info) {
         Ok(bytes) => bytes,
@@ -638,6 +624,22 @@ async fn filter_db_info_response(
         "filtered db info response"
     );
     Response::from_parts(parts, Body::from(body))
+}
+
+fn filter_db_info_payload(
+    mut info: DbInfo,
+    policy: &PolicyConfig,
+    username: Option<&str>,
+) -> std::result::Result<DbInfo, EnforcementError> {
+    let index_current = resolve_default_db(&policy.index_db, &policy.index_db.default, username)?;
+    let user_current =
+        resolve_default_db(&policy.user_data_db, &policy.user_data_db.default, username)?;
+
+    info.index.current = index_current;
+    info.user_data.current = user_current;
+    info.index.all = filter_db_list(info.index.all, &policy.index_db, username);
+    info.user_data.all = filter_db_list(info.user_data.all, &policy.user_data_db, username);
+    Ok(info)
 }
 
 struct DbResolution {
@@ -877,6 +879,265 @@ fn strip_tenant_prefix(
         return None;
     }
     Some(rest.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AllowList, DbPolicy, PolicyConfig, PolicyMatch};
+    use axum::http::Request;
+    use std::collections::BTreeMap;
+
+    fn policy_with(
+        index_db: DbPolicy,
+        user_data_db: DbPolicy,
+    ) -> PolicyConfig {
+        PolicyConfig {
+            name: "test".to_string(),
+            ruleset: None,
+            match_rule: PolicyMatch {
+                hosts: vec!["localhost".to_string()],
+            },
+            index_db,
+            user_data_db,
+            identity: None,
+        }
+    }
+
+    fn db_policy(
+        default: &str,
+        allow: AllowList,
+        tenant_default: Option<&str>,
+        tenant_prefix_template: Option<&str>,
+    ) -> DbPolicy {
+        DbPolicy {
+            default: default.to_string(),
+            allow,
+            tenant_default: tenant_default.map(|value| value.to_string()),
+            tenant_prefix_template: tenant_prefix_template.map(|value| value.to_string()),
+        }
+    }
+
+    fn parse_query(req: &Request<Body>) -> BTreeMap<String, Vec<String>> {
+        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(query) = req.uri().query() {
+            for (key, value) in form_urlencoded::parse(query.as_bytes()).into_owned() {
+                map.entry(key).or_default().push(value);
+            }
+        }
+        map
+    }
+
+    #[test]
+    // Ensures requests without DB params get both defaults injected, producing explicit
+    // index_db + user_data_db query values and reporting an injected action.
+    fn injects_defaults_without_username() {
+        let policy = policy_with(
+            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+        );
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items")
+            .body(Body::empty())
+            .unwrap();
+
+        let action = enforce_db_params(&policy, &mut req, None).unwrap();
+        let query = parse_query(&req);
+
+        assert!(matches!(action, DbAction::Injected));
+        assert_eq!(query.get("index_db").unwrap(), &vec!["default".to_string()]);
+        assert_eq!(
+            query.get("user_data_db").unwrap(),
+            &vec!["default".to_string()]
+        );
+    }
+
+    #[test]
+    // Verifies a disallowed DB name is rewritten with the tenant prefix when a username is
+    // provided, while allowed names remain untouched.
+    fn rewrites_disallowed_with_prefix() {
+        let policy = policy_with(
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+        );
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items?index_db=private&user_data_db=default")
+            .body(Body::empty())
+            .unwrap();
+
+        let action = enforce_db_params(&policy, &mut req, Some("alice")).unwrap();
+        let query = parse_query(&req);
+
+        assert!(matches!(action, DbAction::Rewritten));
+        assert_eq!(
+            query.get("index_db").unwrap(),
+            &vec!["user_alice_private".to_string()]
+        );
+        assert_eq!(
+            query.get("user_data_db").unwrap(),
+            &vec!["default".to_string()]
+        );
+    }
+
+    #[test]
+    // Confirms tenant_default values are used when params are missing, and the defaults are
+    // prefixed with the tenant prefix for both DB kinds.
+    fn tenant_default_is_prefixed_on_missing_param() {
+        let policy = policy_with(
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                Some("images"),
+                Some("user_{username}_"),
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                Some("bookmarks"),
+                Some("user_{username}_"),
+            ),
+        );
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items")
+            .body(Body::empty())
+            .unwrap();
+
+        let action = enforce_db_params(&policy, &mut req, Some("alice")).unwrap();
+        let query = parse_query(&req);
+
+        assert!(matches!(action, DbAction::Injected));
+        assert_eq!(
+            query.get("index_db").unwrap(),
+            &vec!["user_alice_images".to_string()]
+        );
+        assert_eq!(
+            query.get("user_data_db").unwrap(),
+            &vec!["user_alice_bookmarks".to_string()]
+        );
+    }
+
+    #[test]
+    // Ensures disallowed DB names are rejected when no tenant prefix template is configured.
+    fn rejects_disallowed_without_prefix() {
+        let policy = policy_with(
+            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+        );
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items?index_db=private")
+            .body(Body::empty())
+            .unwrap();
+
+        let err = enforce_db_params(&policy, &mut req, None).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    // Validates /api/db/create query enforcement: rewrite new_* params with tenant prefix,
+    // drop any index_db/user_data_db params, and report a rewritten action.
+    fn enforces_db_create_params() {
+        let policy = policy_with(
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+        );
+        let mut req = Request::builder()
+            .uri("http://localhost/api/db/create?new_index_db=private&index_db=default&new_user_data_db=bookmarks")
+            .body(Body::empty())
+            .unwrap();
+
+        let action = enforce_db_create_params(&policy, &mut req, Some("alice")).unwrap();
+        let query = parse_query(&req);
+
+        assert!(matches!(action, DbAction::Rewritten));
+        assert_eq!(
+            query.get("new_index_db").unwrap(),
+            &vec!["user_alice_private".to_string()]
+        );
+        assert_eq!(
+            query.get("new_user_data_db").unwrap(),
+            &vec!["user_alice_bookmarks".to_string()]
+        );
+        assert!(query.get("index_db").is_none());
+        assert!(query.get("user_data_db").is_none());
+    }
+
+    #[test]
+    // Filters /api/db output for a tenant: only allowed + tenant-prefixed DBs remain and
+    // all prefixed names are stripped before returning to the client, including defaults.
+    fn filters_db_info_and_strips_prefix() {
+        let policy = policy_with(
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                Some("images"),
+                Some("user_{username}_"),
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                Some("bookmarks"),
+                Some("user_{username}_"),
+            ),
+        );
+        let info = DbInfo {
+            index: SingleDbInfo {
+                current: "default".to_string(),
+                all: vec![
+                    "default".to_string(),
+                    "user_alice_images".to_string(),
+                    "user_alice_private".to_string(),
+                    "user_bob_images".to_string(),
+                ],
+            },
+            user_data: SingleDbInfo {
+                current: "default".to_string(),
+                all: vec![
+                    "default".to_string(),
+                    "user_alice_bookmarks".to_string(),
+                    "user_bob_bookmarks".to_string(),
+                ],
+            },
+        };
+
+        let filtered = filter_db_info_payload(info, &policy, Some("alice")).unwrap();
+
+        assert_eq!(filtered.index.current, "images");
+        assert_eq!(filtered.user_data.current, "bookmarks");
+
+        let mut index_all = filtered.index.all;
+        index_all.sort();
+        assert_eq!(
+            index_all,
+            vec!["default".to_string(), "images".to_string(), "private".to_string()]
+        );
+
+        let mut user_all = filtered.user_data.all;
+        user_all.sort();
+        assert_eq!(
+            user_all,
+            vec!["bookmarks".to_string(), "default".to_string()]
+        );
+    }
 }
 
 fn strip_query_params(req: &mut Request<Body>, keys: &[&str]) -> Result<()> {
