@@ -129,10 +129,10 @@ allow = "*"
 #
 # [policies.index_db]
 # allow = ["default", "shared_images", "shared_docs"]
-# tenant_default_template = "user_{username}"
-# tenant_template = "user_{username}_{db}"
+# tenant_default = "images"
+# tenant_prefix_template = "user_{username}_"
 #
 # [policies.user_data_db]
 # allow = ["default"]
-# tenant_default_template = "user_{username}"
-# tenant_template = "user_{username}"
+# tenant_default = "bookmarks"
+# tenant_prefix_template = "user_{username}_"

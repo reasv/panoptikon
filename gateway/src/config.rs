@@ -96,9 +96,9 @@ pub struct DbDefaults {
 pub struct DbPolicy {
     pub allow: AllowList,
     #[serde(default)]
-    pub tenant_default_template: Option<String>,
+    pub tenant_default: Option<String>,
     #[serde(default)]
-    pub tenant_template: Option<String>,
+    pub tenant_prefix_template: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +259,7 @@ fn validate_db_defaults(defaults: &DbDefaults, policy_name: &str) -> Result<()> 
 fn validate_db_policy(label: &str, policy: &DbPolicy, default_value: &str) -> Result<()> {
     match &policy.allow {
         AllowList::All => {
-            if policy.tenant_default_template.is_some() || policy.tenant_template.is_some() {
+            if policy.tenant_default.is_some() || policy.tenant_prefix_template.is_some() {
                 anyhow::bail!(
                     "{} allow='*' cannot be combined with tenant templates",
                     label
@@ -272,30 +272,50 @@ fn validate_db_policy(label: &str, policy: &DbPolicy, default_value: &str) -> Re
                     anyhow::bail!("{} allow entry '{}' is invalid", label, entry);
                 }
             }
-            if !items.iter().any(|entry| entry == default_value) {
-                anyhow::bail!(
-                    "{} default '{}' must appear in allow list",
-                    label,
-                    default_value
-                );
-            }
         }
     }
 
-    if let Some(template) = &policy.tenant_default_template {
-        validate_template(template, label)?;
+    if let AllowList::List(items) = &policy.allow {
+        if !items.iter().any(|entry| entry == default_value) {
+            anyhow::bail!(
+                "{} default '{}' must appear in allow list",
+                label,
+                default_value
+            );
+        }
     }
-    if let Some(template) = &policy.tenant_template {
-        validate_template(template, label)?;
+
+    if let Some(tenant_default) = &policy.tenant_default {
+        if !is_safe_identifier(tenant_default, MAX_DB_NAME_LEN) {
+            anyhow::bail!("{} tenant_default '{}' is invalid", label, tenant_default);
+        }
+        if tenant_default == default_value {
+            anyhow::bail!(
+                "{} tenant_default must not match the global default",
+                label
+            );
+        }
+        if policy.tenant_prefix_template.is_none() {
+            anyhow::bail!(
+                "{} tenant_default requires tenant_prefix_template",
+                label
+            );
+        }
+    }
+    if let Some(template) = &policy.tenant_prefix_template {
+        validate_prefix_template(template, label)?;
     }
 
     Ok(())
 }
 
-fn validate_template(template: &str, label: &str) -> Result<()> {
-    let rendered = template.replace("{username}", "user").replace("{db}", "db");
+fn validate_prefix_template(template: &str, label: &str) -> Result<()> {
+    if template.contains("{db}") {
+        anyhow::bail!("{} prefix template must not include {{db}}", label);
+    }
+    let rendered = template.replace("{username}", "user");
     if !is_safe_identifier(&rendered, MAX_DB_NAME_LEN) {
-        anyhow::bail!("{} template '{}' is invalid", label, template);
+        anyhow::bail!("{} prefix template '{}' is invalid", label, template);
     }
     Ok(())
 }

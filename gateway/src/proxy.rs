@@ -633,11 +633,23 @@ fn resolve_db_param(
 ) -> std::result::Result<DbResolution, EnforcementError> {
     match provided {
         None => {
-            let value = if let (Some(username), Some(template)) =
-                (username, policy.tenant_default_template.as_deref())
+            let value = if let (Some(username), Some(tenant_default)) =
+                (username, policy.tenant_default.as_deref())
             {
-                // If {db} is present in the tenant default template, use the policy default.
-                render_template(template, username, default_value)
+                format!(
+                    "{}{}",
+                    render_prefix(
+                        policy
+                            .tenant_prefix_template
+                            .as_deref()
+                            .ok_or(EnforcementError {
+                                status: StatusCode::BAD_REQUEST,
+                                reason: "invalid_db_template",
+                            })?,
+                        username,
+                    )?,
+                    tenant_default
+                )
             } else {
                 default_value.to_string()
             };
@@ -665,10 +677,14 @@ fn resolve_db_param(
                     action: DbAction::Unchanged,
                 });
             }
-            if let (Some(username), Some(template)) =
-                (username, policy.tenant_template.as_deref())
+            if let (Some(username), Some(prefix)) =
+                (username, policy.tenant_prefix_template.as_deref())
             {
-                let rewritten = render_template(template, username, &value);
+                let rewritten = format!(
+                    "{}{}",
+                    render_prefix(prefix, username)?,
+                    value
+                );
                 if !is_safe_identifier(&rewritten, MAX_DB_NAME_LEN) {
                     return Err(EnforcementError {
                         status: StatusCode::BAD_REQUEST,
@@ -693,10 +709,10 @@ fn resolve_default_db(
     default_value: &str,
     username: Option<&str>,
 ) -> std::result::Result<String, EnforcementError> {
-    let value = if let (Some(username), Some(template)) =
-        (username, policy.tenant_default_template.as_deref())
+    let value = if let (Some(_username), Some(tenant_default)) =
+        (username, policy.tenant_default.as_deref())
     {
-        render_template(template, username, default_value)
+        tenant_default.to_string()
     } else {
         default_value.to_string()
     };
@@ -718,7 +734,7 @@ fn filter_db_list(
     if policy.allow.is_all() {
         return names;
     }
-    names
+    let mut filtered: Vec<String> = names
         .into_iter()
         .filter(|name| {
             if policy.allow.allows(name) {
@@ -727,32 +743,49 @@ fn filter_db_list(
             let Some(username) = username else {
                 return false;
             };
-            matches_template(policy.tenant_template.as_deref(), username, name)
-                || matches_template(policy.tenant_default_template.as_deref(), username, name)
+            matches_prefix(policy.tenant_prefix_template.as_deref(), username, name)
         })
-        .collect()
+        .collect();
+
+    if let (Some(_username), Some(tenant_default)) =
+        (username, policy.tenant_default.as_deref())
+    {
+        if !filtered.iter().any(|entry| entry == tenant_default) {
+            filtered.push(tenant_default.to_string());
+        }
+    }
+
+    let mut deduped = Vec::with_capacity(filtered.len());
+    for name in filtered {
+        if let Some(stripped) = strip_tenant_prefix(&name, policy, username) {
+            if !deduped.iter().any(|entry| entry == &stripped) {
+                deduped.push(stripped);
+            }
+            continue;
+        }
+        if !deduped.iter().any(|entry| entry == &name) {
+            deduped.push(name);
+        }
+    }
+
+    deduped
 }
 
-fn matches_template(template: Option<&str>, username: &str, candidate: &str) -> bool {
-    let Some(template) = template else {
+fn matches_prefix(template: Option<&str>, username: &str, candidate: &str) -> bool {
+    let Some(prefix) = template else {
         return false;
     };
-    if candidate.len() > MAX_DB_NAME_LEN {
+    let Ok(prefix) = render_prefix(prefix, username) else {
+        return false;
+    };
+    if candidate.len() <= prefix.len() || candidate.len() > MAX_DB_NAME_LEN {
         return false;
     }
-    let with_user = template.replace("{username}", username);
-    if let Some((prefix, suffix)) = with_user.split_once("{db}") {
-        if !candidate.starts_with(prefix) || !candidate.ends_with(suffix) {
-            return false;
-        }
-        if candidate.len() < prefix.len() + suffix.len() {
-            return false;
-        }
-        let middle_len = candidate.len() - prefix.len() - suffix.len();
-        let middle = &candidate[prefix.len()..prefix.len() + middle_len];
-        return is_safe_identifier(middle, MAX_DB_NAME_LEN);
+    if !candidate.starts_with(&prefix) {
+        return false;
     }
-    candidate == with_user
+    let rest = &candidate[prefix.len()..];
+    is_safe_identifier(rest, MAX_DB_NAME_LEN)
 }
 
 fn extract_username(
@@ -788,6 +821,41 @@ fn render_template(template: &str, username: &str, db: &str) -> String {
     template
         .replace("{username}", username)
         .replace("{db}", db)
+}
+
+fn render_prefix(template: &str, username: &str) -> std::result::Result<String, EnforcementError> {
+    if template.contains("{db}") {
+        return Err(EnforcementError {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_db_template",
+        });
+    }
+    let rendered = template.replace("{username}", username);
+    if !is_safe_identifier(&rendered, MAX_DB_NAME_LEN) {
+        return Err(EnforcementError {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_db_value",
+        });
+    }
+    Ok(rendered)
+}
+
+fn strip_tenant_prefix(
+    value: &str,
+    policy: &DbPolicy,
+    username: Option<&str>,
+) -> Option<String> {
+    let username = username?;
+    let template = policy.tenant_prefix_template.as_deref()?;
+    let prefix = render_prefix(template, username).ok()?;
+    if !value.starts_with(&prefix) {
+        return None;
+    }
+    let rest = &value[prefix.len()..];
+    if rest.is_empty() || !is_safe_identifier(rest, MAX_DB_NAME_LEN) {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 fn strip_query_params(req: &mut Request<Body>, keys: &[&str]) -> Result<()> {
