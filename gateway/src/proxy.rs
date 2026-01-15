@@ -844,10 +844,6 @@ fn extract_username(
     Ok(Some(normalized))
 }
 
-fn render_template(template: &str, username: &str, db: &str) -> String {
-    template.replace("{username}", username).replace("{db}", db)
-}
-
 fn render_prefix(template: &str, username: &str) -> std::result::Result<String, EnforcementError> {
     if template.contains("{db}") {
         return Err(EnforcementError {
@@ -971,7 +967,7 @@ mod tests {
     // Verifies a disallowed DB name is rewritten with the tenant prefix when a username is
     // provided, while allowed names remain untouched.
     fn rewrites_disallowed_with_prefix() {
-        let mut policy = policy_with(
+        let policy = policy_with(
             db_policy(
                 "default",
                 AllowList::List(vec!["default".to_string()]),
