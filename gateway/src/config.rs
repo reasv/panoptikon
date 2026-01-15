@@ -13,8 +13,6 @@ pub struct Settings {
     pub server: ServerConfig,
     pub upstreams: UpstreamsConfig,
     #[serde(default)]
-    pub routes: Vec<RouteConfig>,
-    #[serde(default)]
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
@@ -42,15 +40,6 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub local: bool,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RouteConfig {
-    pub name: String,
-    pub path: Option<String>,
-    pub path_prefix: Option<String>,
-    pub upstream: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleSetConfig {
     #[serde(default)]

@@ -24,24 +24,11 @@ base_url = "http://127.0.0.1:6342"
 # base_url = "http://127.0.0.1:6342"
 # local = false
 
-# --------- Routes (optional, for future use) ---------
-# Routes are currently not used by the router, but are validated and reserved
-# for a future dynamic router configuration.
-#
-# [[routes]]
-# name = "api"
-# path_prefix = "/api/"
-# upstream = "api"
-#
-# [[routes]]
-# name = "ui"
-# path_prefix = "/"
-# upstream = "ui"
-
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
 # If a policy references a ruleset, anything not matched is denied.
 
+# Example: allow access to all paths and methods.
 [rulesets.allow_all]
 allow_all = true
 
@@ -129,11 +116,11 @@ allow = "*"
 # [policies.index_db]
 # default = "default"
 # allow = ["default", "shared_images", "shared_docs"]
-# tenant_default = "images"
+# tenant_default = "personal_images"
 # tenant_prefix_template = "user_{username}_"
 #
 # [policies.user_data_db]
 # default = "default"
 # allow = ["default"]
-# tenant_default = "bookmarks"
+# tenant_default = "personal_bookmarks"
 # tenant_prefix_template = "user_{username}_"
