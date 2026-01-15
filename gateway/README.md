@@ -29,7 +29,14 @@ Paths, methods, headers, and bodies are forwarded as-is.
 Policies are selected by host, then optionally restrict API routes via reusable
 rulesets. DB-aware API routes always receive explicit `index_db` and
 `user_data_db` query parameters, and the gateway validates or rewrites them per
-policy (including optional multi-tenant templates).
+policy (including optional multi-tenant prefixing).
+
+Special handling:
+
+- `/api/db` is filtered so only allowed DB names are returned; tenant-prefixed
+  DBs are reported without the prefix, and `current` defaults reflect the policy.
+- `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
+  enforcement rules as normal DB parameters.
 
 ## Configuration
 
