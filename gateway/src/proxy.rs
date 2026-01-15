@@ -8,11 +8,12 @@ use axum::{
     },
     response::IntoResponse,
 };
-use hyper::body::{to_bytes, Incoming};
+use hyper::body::Incoming;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 use url::form_urlencoded;
@@ -561,8 +562,8 @@ async fn filter_db_info_response(
 ) -> Response<Body> {
     let status = response.status();
     let (mut parts, body) = response.into_parts();
-    let bytes = match to_bytes(body).await {
-        Ok(bytes) => bytes,
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
         Err(err) => {
             tracing::error!(error = %err, "failed to read db info response body");
             return StatusCode::BAD_GATEWAY.into_response();
