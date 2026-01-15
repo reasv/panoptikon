@@ -8,10 +8,12 @@ use axum::{
     },
     response::IntoResponse,
 };
+use hyper::body::{to_bytes, Incoming};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
+use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 use url::form_urlencoded;
 
@@ -149,12 +151,40 @@ async fn proxy_request(
     }
 
     let mut db_action = DbAction::Skipped;
+    let is_db_info = upstream_kind == UpstreamKind::Api && is_db_info_path(&path);
+    let is_db_create = upstream_kind == UpstreamKind::Api && is_db_create_path(&path);
     let apply_db_params = match upstream_kind {
         UpstreamKind::Api => needs_db_params(&path),
         UpstreamKind::Ui => true,
     };
+    let needs_identity = apply_db_params || is_db_info || is_db_create;
+    let username = if needs_identity {
+        match extract_username(policy, &req) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    method = %method,
+                    path = %path,
+                    policy = %policy.name,
+                    reason = error.reason,
+                    "request denied: invalid username"
+                );
+                return error.status.into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    if is_db_info {
+        if let Err(err) = strip_query_params(&mut req, &["index_db", "user_data_db"]) {
+            tracing::error!(error = %err, "failed to strip db params for db info");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
+
     if apply_db_params {
-        match enforce_db_params(policy, &mut req) {
+        match enforce_db_params(policy, &mut req, username.as_deref()) {
             Ok(action) => db_action = action,
             Err(error) => {
                 tracing::warn!(
@@ -163,6 +193,22 @@ async fn proxy_request(
                     policy = %policy.name,
                     reason = error.reason,
                     "request denied: db enforcement"
+                );
+                return error.status.into_response();
+            }
+        }
+    }
+
+    if is_db_create {
+        match enforce_db_create_params(policy, &mut req, username.as_deref()) {
+            Ok(action) => db_action = db_action.combine(action),
+            Err(error) => {
+                tracing::warn!(
+                    method = %method,
+                    path = %path,
+                    policy = %policy.name,
+                    reason = error.reason,
+                    "request denied: db create enforcement"
                 );
                 return error.status.into_response();
             }
@@ -204,6 +250,21 @@ async fn proxy_request(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+
+    if is_db_info {
+        let filtered = filter_db_info_response(response, policy, username.as_deref()).await;
+        let status = filtered.status();
+        tracing::info!(
+            method = %method,
+            path = %path_and_query,
+            upstream = %upstream.name,
+            status = %status,
+            policy = %policy.name,
+            db_params = %db_action,
+            "proxied request"
+        );
+        return filtered;
+    }
 
     let status = response.status();
     tracing::info!(
@@ -333,7 +394,18 @@ fn needs_db_params(path: &str) -> bool {
     if path == "/docs" || path == "/openapi.json" {
         return false;
     }
+    if path == "/api/db" || path == "/api/db/create" {
+        return false;
+    }
     path == "/api" || path.starts_with("/api/")
+}
+
+fn is_db_info_path(path: &str) -> bool {
+    path == "/api/db"
+}
+
+fn is_db_create_path(path: &str) -> bool {
+    path == "/api/db/create"
 }
 
 struct EnforcementError {
@@ -341,15 +413,23 @@ struct EnforcementError {
     reason: &'static str,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DbInfo {
+    index: SingleDbInfo,
+    user_data: SingleDbInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SingleDbInfo {
+    current: String,
+    all: Vec<String>,
+}
+
 fn enforce_db_params(
     policy: &PolicyConfig,
     req: &mut Request<Body>,
+    username: Option<&str>,
 ) -> std::result::Result<DbAction, EnforcementError> {
-    let username = match extract_username(policy, req) {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-    };
-
     let mut pairs: Vec<(String, String)> = req
         .uri()
         .query()
@@ -381,14 +461,14 @@ fn enforce_db_params(
         index_db,
         &policy.defaults.index_db,
         &policy.index_db,
-        username.as_deref(),
+        username,
     )?;
     let user_resolution = resolve_db_param(
         "user_data_db",
         user_data_db,
         &policy.defaults.user_data_db,
         &policy.user_data_db,
-        username.as_deref(),
+        username,
     )?;
 
     retained.push(("index_db".to_string(), index_resolution.value));
@@ -406,6 +486,137 @@ fn enforce_db_params(
     Ok(index_resolution
         .action
         .combine(user_resolution.action))
+}
+
+fn enforce_db_create_params(
+    policy: &PolicyConfig,
+    req: &mut Request<Body>,
+    username: Option<&str>,
+) -> std::result::Result<DbAction, EnforcementError> {
+    let mut pairs: Vec<(String, String)> = req
+        .uri()
+        .query()
+        .map(|query| form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+
+    let mut retained: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    let mut new_index_db = None;
+    let mut new_user_data_db = None;
+
+    for (key, value) in pairs.drain(..) {
+        if key == "new_index_db" {
+            if new_index_db.is_none() {
+                new_index_db = Some(value);
+            }
+            continue;
+        }
+        if key == "new_user_data_db" {
+            if new_user_data_db.is_none() {
+                new_user_data_db = Some(value);
+            }
+            continue;
+        }
+        if key == "index_db" || key == "user_data_db" {
+            continue;
+        }
+        retained.push((key, value));
+    }
+
+    let index_resolution = resolve_db_param(
+        "new_index_db",
+        new_index_db,
+        &policy.defaults.index_db,
+        &policy.index_db,
+        username,
+    )?;
+    let user_resolution = resolve_db_param(
+        "new_user_data_db",
+        new_user_data_db,
+        &policy.defaults.user_data_db,
+        &policy.user_data_db,
+        username,
+    )?;
+
+    retained.push(("new_index_db".to_string(), index_resolution.value));
+    retained.push(("new_user_data_db".to_string(), user_resolution.value));
+
+    let query = build_query(retained);
+    if let Err(err) = set_query(req, query.as_deref()) {
+        tracing::error!(error = %err, "failed to apply db create query params");
+        return Err(EnforcementError {
+            status: StatusCode::BAD_GATEWAY,
+            reason: "query_rewrite_failed",
+        });
+    }
+
+    Ok(index_resolution
+        .action
+        .combine(user_resolution.action))
+}
+
+async fn filter_db_info_response(
+    response: Response<Incoming>,
+    policy: &PolicyConfig,
+    username: Option<&str>,
+) -> Response<Body> {
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to read db info response body");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    if !status.is_success() {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+
+    let mut info: DbInfo = match serde_json::from_slice(&bytes) {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse db info response");
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+    };
+
+    let index_current = match resolve_default_db(&policy.index_db, &policy.defaults.index_db, username)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(reason = error.reason, "invalid index db default");
+            return error.status.into_response();
+        }
+    };
+    let user_current =
+        match resolve_default_db(&policy.user_data_db, &policy.defaults.user_data_db, username) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(reason = error.reason, "invalid user data db default");
+                return error.status.into_response();
+            }
+        };
+
+    info.index.current = index_current;
+    info.user_data.current = user_current;
+    info.index.all = filter_db_list(info.index.all, &policy.index_db, username);
+    info.user_data.all = filter_db_list(info.user_data.all, &policy.user_data_db, username);
+
+    let body = match serde_json::to_vec(&info) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to serialize filtered db info");
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+    };
+
+    parts.headers.remove(header::CONTENT_LENGTH);
+    tracing::info!(
+        policy = %policy.name,
+        "filtered db info response"
+    );
+    Response::from_parts(parts, Body::from(body))
 }
 
 struct DbResolution {
@@ -477,6 +688,73 @@ fn resolve_db_param(
     }
 }
 
+fn resolve_default_db(
+    policy: &DbPolicy,
+    default_value: &str,
+    username: Option<&str>,
+) -> std::result::Result<String, EnforcementError> {
+    let value = if let (Some(username), Some(template)) =
+        (username, policy.tenant_default_template.as_deref())
+    {
+        render_template(template, username, default_value)
+    } else {
+        default_value.to_string()
+    };
+
+    if !is_safe_identifier(&value, MAX_DB_NAME_LEN) {
+        return Err(EnforcementError {
+            status: StatusCode::BAD_REQUEST,
+            reason: "invalid_db_value",
+        });
+    }
+    Ok(value)
+}
+
+fn filter_db_list(
+    names: Vec<String>,
+    policy: &DbPolicy,
+    username: Option<&str>,
+) -> Vec<String> {
+    if policy.allow.is_all() {
+        return names;
+    }
+    names
+        .into_iter()
+        .filter(|name| {
+            if policy.allow.allows(name) {
+                return true;
+            }
+            let Some(username) = username else {
+                return false;
+            };
+            matches_template(policy.tenant_template.as_deref(), username, name)
+                || matches_template(policy.tenant_default_template.as_deref(), username, name)
+        })
+        .collect()
+}
+
+fn matches_template(template: Option<&str>, username: &str, candidate: &str) -> bool {
+    let Some(template) = template else {
+        return false;
+    };
+    if candidate.len() > MAX_DB_NAME_LEN {
+        return false;
+    }
+    let with_user = template.replace("{username}", username);
+    if let Some((prefix, suffix)) = with_user.split_once("{db}") {
+        if !candidate.starts_with(prefix) || !candidate.ends_with(suffix) {
+            return false;
+        }
+        if candidate.len() < prefix.len() + suffix.len() {
+            return false;
+        }
+        let middle_len = candidate.len() - prefix.len() - suffix.len();
+        let middle = &candidate[prefix.len()..prefix.len() + middle_len];
+        return is_safe_identifier(middle, MAX_DB_NAME_LEN);
+    }
+    candidate == with_user
+}
+
 fn extract_username(
     policy: &PolicyConfig,
     req: &Request<Body>,
@@ -510,6 +788,24 @@ fn render_template(template: &str, username: &str, db: &str) -> String {
     template
         .replace("{username}", username)
         .replace("{db}", db)
+}
+
+fn strip_query_params(req: &mut Request<Body>, keys: &[&str]) -> Result<()> {
+    let mut pairs: Vec<(String, String)> = req
+        .uri()
+        .query()
+        .map(|query| form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    let mut retained: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs.drain(..) {
+        if keys.iter().any(|entry| entry == &key) {
+            continue;
+        }
+        retained.push((key, value));
+    }
+    let query = build_query(retained);
+    set_query(req, query.as_deref())?;
+    Ok(())
 }
 
 fn build_query(pairs: Vec<(String, String)>) -> Option<String> {
