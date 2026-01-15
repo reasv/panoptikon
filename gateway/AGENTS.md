@@ -43,5 +43,6 @@ Tests
 
 When you change behavior
 - Update this file to document new behavior, config knobs, and any new routes or policy rules.
-- Keep the “Behavior” section authoritative; if behavior changes, update it.
+- Keep the "Behavior" section authoritative; if behavior changes, update it.
 - If the policy layer or proxy flow changes, also update `gateway/README.md`.
+- Keep DB connection/helpers/CRUD code inside `gateway/src/db/`.

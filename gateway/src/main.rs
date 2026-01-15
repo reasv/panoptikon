@@ -1,5 +1,6 @@
 mod api_error;
 mod config;
+#[path = "db/mod.rs"]
 mod db;
 mod local_api;
 mod policy;
