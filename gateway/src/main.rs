@@ -27,13 +27,25 @@ async fn main() -> anyhow::Result<()> {
     let settings = Arc::new(config::Settings::load(config_path)?);
     let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;
     let api_upstream = proxy::Upstream::parse("api", &settings.upstreams.api.base_url)?;
+    let inference_upstream = proxy::Upstream::parse(
+        "inference",
+        &settings
+            .upstreams
+            .inference
+            .as_ref()
+            .map(|config| config.base_url.as_str())
+            .unwrap_or(&settings.upstreams.api.base_url),
+    )?;
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
         api_upstream,
+        inference_upstream,
         Arc::clone(&settings),
     ));
 
     let app = Router::new()
+        .route("/api/inference", any(proxy::proxy_inference))
+        .route("/api/inference/*path", any(proxy::proxy_inference))
         .route("/api", any(proxy::proxy_api))
         .route("/api/*path", any(proxy::proxy_api))
         .route("/docs", any(proxy::proxy_api))

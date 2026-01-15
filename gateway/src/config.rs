@@ -32,6 +32,8 @@ pub struct ServerConfig {
 pub struct UpstreamsConfig {
     pub ui: UpstreamConfig,
     pub api: UpstreamConfig,
+    #[serde(default)]
+    pub inference: Option<UpstreamConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,11 +143,13 @@ impl Settings {
             .set_default("server.trust_forwarded_headers", false)?
             .set_default("upstreams.ui.base_url", "http://127.0.0.1:6339")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
+            .set_default("upstreams.inference.base_url", "http://127.0.0.1:6342")?
             .add_source(config::File::from(config_path).required(false))
             .add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
         settings.apply_env_overrides()?;
+        settings.apply_inference_default();
         settings.validate()?;
         Ok(settings)
     }
@@ -173,6 +177,9 @@ impl Settings {
         }
         if let Ok(value) = env::var("GATEWAY__UPSTREAM_API") {
             self.upstreams.api.base_url = value;
+        }
+        if let Ok(value) = env::var("GATEWAY__UPSTREAM_INFERENCE") {
+            self.upstreams.inference = Some(UpstreamConfig { base_url: value });
         }
         Ok(())
     }
@@ -230,6 +237,16 @@ impl Settings {
             )?;
         }
         Ok(())
+    }
+}
+
+impl Settings {
+    fn apply_inference_default(&mut self) {
+        if self.upstreams.inference.is_none() {
+            self.upstreams.inference = Some(UpstreamConfig {
+                base_url: self.upstreams.api.base_url.clone(),
+            });
+        }
     }
 }
 

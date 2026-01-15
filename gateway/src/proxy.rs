@@ -46,16 +46,18 @@ pub struct ProxyState {
     pub client: Client<HttpConnector, Body>,
     pub ui: Upstream,
     pub api: Upstream,
+    pub inference: Upstream,
     pub settings: Arc<Settings>,
 }
 
 impl ProxyState {
-    pub fn new(ui: Upstream, api: Upstream, settings: Arc<Settings>) -> Self {
+    pub fn new(ui: Upstream, api: Upstream, inference: Upstream, settings: Arc<Settings>) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self {
             client,
             ui,
             api,
+            inference,
             settings,
         }
     }
@@ -77,10 +79,19 @@ pub async fn proxy_api(
     proxy_request(addr, state, UpstreamKind::Api, req).await
 }
 
+pub async fn proxy_inference(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<ProxyState>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    proxy_request(addr, state, UpstreamKind::Inference, req).await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpstreamKind {
     Ui,
     Api,
+    Inference,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +149,7 @@ async fn proxy_request(
         }
     };
 
-    if upstream_kind == UpstreamKind::Api {
+    if matches!(upstream_kind, UpstreamKind::Api | UpstreamKind::Inference) {
         // Rulesets are intended to guard API surface without blocking the UI.
         if !ruleset_allows(&state.settings, policy, &method, &path) {
             tracing::warn!(
@@ -157,6 +168,7 @@ async fn proxy_request(
     let apply_db_params = match upstream_kind {
         UpstreamKind::Api => needs_db_params(&path),
         UpstreamKind::Ui => true,
+        UpstreamKind::Inference => false,
     };
     let needs_identity = apply_db_params || is_db_info || is_db_create;
     let username = if needs_identity {
@@ -180,6 +192,12 @@ async fn proxy_request(
     if is_db_info {
         if let Err(err) = strip_query_params(&mut req, &["index_db", "user_data_db"]) {
             tracing::error!(error = %err, "failed to strip db params for db info");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
+    if upstream_kind == UpstreamKind::Inference {
+        if let Err(err) = strip_query_params(&mut req, &["index_db", "user_data_db"]) {
+            tracing::error!(error = %err, "failed to strip db params for inference");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     }
@@ -219,6 +237,7 @@ async fn proxy_request(
     let upstream = match upstream_kind {
         UpstreamKind::Ui => state.ui.clone(),
         UpstreamKind::Api => state.api.clone(),
+        UpstreamKind::Inference => state.inference.clone(),
     };
 
     let path_and_query = req

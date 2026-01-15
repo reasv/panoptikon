@@ -19,6 +19,7 @@ added later.
 ## Routing
 
 - `/api/*` goes to the Python backend
+- `/api/inference/*` goes to the inference upstream (defaults to the API upstream)
 - `/docs` and `/openapi.json` go to the Python backend
 - everything else goes to the Next.js frontend
 
@@ -37,6 +38,7 @@ Special handling:
   DBs are reported without the prefix, and `current` defaults reflect the policy.
 - `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
   enforcement rules as normal DB parameters.
+- `/api/inference/*` never receives DB query parameters.
 
 ## Configuration
 
@@ -56,6 +58,10 @@ trust_forwarded_headers = false
 base_url = "http://127.0.0.1:6339"
 
 [upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[upstreams.inference]
+# Optional; defaults to the API upstream if omitted.
 base_url = "http://127.0.0.1:6342"
 
 [rulesets.allow_all]
@@ -86,6 +92,7 @@ GATEWAY__SERVER_PORT=8080
 GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAM_UI=http://127.0.0.1:6339
 GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
+GATEWAY__UPSTREAM_INFERENCE=http://127.0.0.1:6342
 ```
 
 CLI override example:
@@ -102,6 +109,7 @@ GATEWAY__SERVER__PORT=8080
 GATEWAY__SERVER__TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6339
 GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
+GATEWAY__UPSTREAMS__INFERENCE__BASE_URL=http://127.0.0.1:6342
 ```
 
 ## Running locally
