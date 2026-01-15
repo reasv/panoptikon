@@ -24,6 +24,8 @@ use crate::config::{
     is_safe_identifier,
 };
 
+const USERNAME_HASH_LEN: usize = 32;
+
 #[derive(Clone)]
 pub struct Upstream {
     name: String,
@@ -833,8 +835,9 @@ fn extract_username(
         });
     }
 
+    let hash_len = USERNAME_HASH_LEN;
     let needs_hash =
-        value.len() > (MAX_DB_NAME_LEN / 2) || !is_safe_identifier(value, MAX_USERNAME_LEN);
+        value.len() > hash_len.saturating_sub(2) || !is_safe_identifier(value, MAX_USERNAME_LEN);
     let normalized = if needs_hash {
         hash_username(value)
     } else {
@@ -877,7 +880,7 @@ fn strip_tenant_prefix(value: &str, policy: &DbPolicy, username: Option<&str>) -
 
 fn hash_username(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
-    let mut output = String::with_capacity(32);
+    let mut output = String::with_capacity(USERNAME_HASH_LEN);
     for byte in digest.iter().take(16) {
         use std::fmt::Write;
         let _ = write!(&mut output, "{:02x}", byte);
