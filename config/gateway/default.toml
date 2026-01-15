@@ -16,7 +16,7 @@ base_url = "http://127.0.0.1:6339"
 [upstreams.api]
 # FastAPI backend base URL.
 base_url = "http://127.0.0.1:6342"
-# local = false
+local = true
 
 # Optional inference upstream. Defaults to the API upstream if omitted.
 #

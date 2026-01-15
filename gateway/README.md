@@ -1,9 +1,9 @@
 # Panoptikon Gateway (Rust)
 
-This crate is the single HTTP entrypoint for Panoptikon. It is still a reverse
-proxy only: it forwards requests to the Next.js UI or the Python API based on
-path, with streaming request/response bodies, policy enforcement, and structured
-logging.
+This crate is the single HTTP entrypoint for Panoptikon. It forwards requests
+to the Next.js UI or the Python API based on path, with streaming
+request/response bodies, policy enforcement, structured logging, and optional
+local API handling when `upstreams.api.local = true`.
 
 ## Where it fits
 
@@ -18,7 +18,7 @@ added later.
 
 ## Routing
 
-- `/api/*` goes to the Python backend
+- `/api/*` goes to the Python backend, except local routes when enabled
 - `/api/inference/*` goes to the inference upstream (defaults to the API upstream)
 - `/docs` and `/openapi.json` go to the Python backend
 - everything else goes to the Next.js frontend
@@ -39,8 +39,9 @@ Special handling:
 - `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
   enforcement rules as normal DB parameters.
 - `/api/inference/*` never receives DB query parameters.
-- When `upstreams.api.local = true`, the gateway serves `/api/db` locally using
-  the same policy enforcement and filtering rules.
+- When `upstreams.api.local = true`, the gateway serves `/api/db` and
+  `/api/items/item/file` locally using the same policy enforcement and filtering
+  rules.
 
 ## Configuration
 

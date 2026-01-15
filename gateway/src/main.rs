@@ -1,4 +1,6 @@
+mod api_error;
 mod config;
+mod db;
 mod local_api;
 mod policy;
 mod proxy;
@@ -57,7 +59,9 @@ async fn main() -> anyhow::Result<()> {
         .fallback(any(proxy::proxy_ui));
 
     if settings.upstreams.api.local {
-        app = app.route("/api/db", get(local_api::db_info));
+        app = app
+            .route("/api/db", get(local_api::db_info))
+            .route("/api/items/item/file", get(local_api::item_file));
     }
 
     let app = app
