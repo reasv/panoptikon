@@ -1,27 +1,27 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
     http::{
-        header::{self, HeaderName, HeaderValue},
         Method, Request, Response, StatusCode, Uri,
+        header::{self, HeaderName, HeaderValue},
     },
     response::IntoResponse,
 };
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, sync::Arc};
 use url::form_urlencoded;
 
 use crate::config::{
-    is_safe_identifier, DbPolicy, PolicyConfig, RuleConfig, Settings, MAX_DB_NAME_LEN,
-    MAX_USERNAME_LEN,
+    DbPolicy, MAX_DB_NAME_LEN, MAX_USERNAME_LEN, PolicyConfig, RuleConfig, Settings,
+    is_safe_identifier,
 };
 
 #[derive(Clone)]
@@ -136,7 +136,8 @@ async fn proxy_request(
 ) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let effective_host = resolve_effective_host(&req, state.settings.server.trust_forwarded_headers);
+    let effective_host =
+        resolve_effective_host(&req, state.settings.server.trust_forwarded_headers);
     let policy = match select_policy(&state.settings, effective_host.as_deref()) {
         Some(policy) => policy,
         None => {
@@ -455,7 +456,11 @@ fn enforce_db_params(
     let mut pairs: Vec<(String, String)> = req
         .uri()
         .query()
-        .map(|query| form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut retained: Vec<(String, String)> = Vec::with_capacity(pairs.len());
@@ -505,9 +510,7 @@ fn enforce_db_params(
         });
     }
 
-    Ok(index_resolution
-        .action
-        .combine(user_resolution.action))
+    Ok(index_resolution.action.combine(user_resolution.action))
 }
 
 fn enforce_db_create_params(
@@ -518,7 +521,11 @@ fn enforce_db_create_params(
     let mut pairs: Vec<(String, String)> = req
         .uri()
         .query()
-        .map(|query| form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut retained: Vec<(String, String)> = Vec::with_capacity(pairs.len());
@@ -571,9 +578,7 @@ fn enforce_db_create_params(
         });
     }
 
-    Ok(index_resolution
-        .action
-        .combine(user_resolution.action))
+    Ok(index_resolution.action.combine(user_resolution.action))
 }
 
 async fn filter_db_info_response(
@@ -704,11 +709,7 @@ fn resolve_db_param(
             if let (Some(username), Some(prefix)) =
                 (username, policy.tenant_prefix_template.as_deref())
             {
-                let rewritten = format!(
-                    "{}{}",
-                    render_prefix(prefix, username)?,
-                    value
-                );
+                let rewritten = format!("{}{}", render_prefix(prefix, username)?, value);
                 if !is_safe_identifier(&rewritten, MAX_DB_NAME_LEN) {
                     return Err(EnforcementError {
                         status: StatusCode::BAD_REQUEST,
@@ -750,11 +751,7 @@ fn resolve_default_db(
     Ok(value)
 }
 
-fn filter_db_list(
-    names: Vec<String>,
-    policy: &DbPolicy,
-    username: Option<&str>,
-) -> Vec<String> {
+fn filter_db_list(names: Vec<String>, policy: &DbPolicy, username: Option<&str>) -> Vec<String> {
     if policy.allow.is_all() {
         return names;
     }
@@ -771,9 +768,7 @@ fn filter_db_list(
         })
         .collect();
 
-    if let (Some(_username), Some(tenant_default)) =
-        (username, policy.tenant_default.as_deref())
-    {
+    if let (Some(_username), Some(tenant_default)) = (username, policy.tenant_default.as_deref()) {
         if !filtered.iter().any(|entry| entry == tenant_default) {
             filtered.push(tenant_default.to_string());
         }
@@ -838,8 +833,8 @@ fn extract_username(
         });
     }
 
-    let needs_hash = value.len() > (MAX_DB_NAME_LEN / 2)
-        || !is_safe_identifier(value, MAX_USERNAME_LEN);
+    let needs_hash =
+        value.len() > (MAX_DB_NAME_LEN / 2) || !is_safe_identifier(value, MAX_USERNAME_LEN);
     let normalized = if needs_hash {
         hash_username(value)
     } else {
@@ -850,9 +845,7 @@ fn extract_username(
 }
 
 fn render_template(template: &str, username: &str, db: &str) -> String {
-    template
-        .replace("{username}", username)
-        .replace("{db}", db)
+    template.replace("{username}", username).replace("{db}", db)
 }
 
 fn render_prefix(template: &str, username: &str) -> std::result::Result<String, EnforcementError> {
@@ -872,11 +865,7 @@ fn render_prefix(template: &str, username: &str) -> std::result::Result<String, 
     Ok(rendered)
 }
 
-fn strip_tenant_prefix(
-    value: &str,
-    policy: &DbPolicy,
-    username: Option<&str>,
-) -> Option<String> {
+fn strip_tenant_prefix(value: &str, policy: &DbPolicy, username: Option<&str>) -> Option<String> {
     let username = username?;
     let template = policy.tenant_prefix_template.as_deref()?;
     let prefix = render_prefix(template, username).ok()?;
@@ -903,14 +892,11 @@ fn hash_username(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AllowList, DbPolicy, PolicyConfig, PolicyMatch};
+    use crate::config::{AllowList, DbPolicy, IdentityConfig, PolicyConfig, PolicyMatch};
     use axum::http::Request;
     use std::collections::BTreeMap;
 
-    fn policy_with(
-        index_db: DbPolicy,
-        user_data_db: DbPolicy,
-    ) -> PolicyConfig {
+    fn policy_with(index_db: DbPolicy, user_data_db: DbPolicy) -> PolicyConfig {
         PolicyConfig {
             name: "test".to_string(),
             ruleset: None,
@@ -952,8 +938,18 @@ mod tests {
     // index_db + user_data_db query values and reporting an injected action.
     fn injects_defaults_without_username() {
         let policy = policy_with(
-            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
-            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                None,
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                None,
+            ),
         );
         let mut req = Request::builder()
             .uri("http://localhost/api/items")
@@ -975,7 +971,7 @@ mod tests {
     // Verifies a disallowed DB name is rewritten with the tenant prefix when a username is
     // provided, while allowed names remain untouched.
     fn rewrites_disallowed_with_prefix() {
-        let policy = policy_with(
+        let mut policy = policy_with(
             db_policy(
                 "default",
                 AllowList::List(vec!["default".to_string()]),
@@ -1049,8 +1045,18 @@ mod tests {
     // Ensures disallowed DB names are rejected when no tenant prefix template is configured.
     fn rejects_disallowed_without_prefix() {
         let policy = policy_with(
-            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
-            db_policy("default", AllowList::List(vec!["default".to_string()]), None, None),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                None,
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                None,
+            ),
         );
         let mut req = Request::builder()
             .uri("http://localhost/api/items?index_db=private")
@@ -1147,7 +1153,11 @@ mod tests {
         index_all.sort();
         assert_eq!(
             index_all,
-            vec!["default".to_string(), "images".to_string(), "private".to_string()]
+            vec![
+                "default".to_string(),
+                "images".to_string(),
+                "private".to_string()
+            ]
         );
 
         let mut user_all = filtered.user_data.all;
@@ -1157,13 +1167,58 @@ mod tests {
             vec!["bookmarks".to_string(), "default".to_string()]
         );
     }
+
+    #[test]
+    // Verifies unsafe usernames are hashed before use, and the resulting hash is used in
+    // the tenant prefix when rewriting DB parameters.
+    fn hashes_unsafe_username() {
+        let mut policy = policy_with(
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+            db_policy(
+                "default",
+                AllowList::List(vec!["default".to_string()]),
+                None,
+                Some("user_{username}_"),
+            ),
+        );
+        policy.identity = Some(IdentityConfig {
+            user_header: "X-Forwarded-User".to_string(),
+        });
+        let unsafe_name = "alice@example.com";
+        let hashed = hash_username(unsafe_name);
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items?index_db=private")
+            .header("X-Forwarded-User", unsafe_name)
+            .body(Body::empty())
+            .unwrap();
+
+        let username = extract_username(&policy, &req).unwrap().unwrap();
+        assert_eq!(username, hashed);
+        let action = enforce_db_params(&policy, &mut req, Some(&username)).unwrap();
+        let query = parse_query(&req);
+
+        assert!(matches!(action, DbAction::Rewritten));
+        assert_eq!(
+            query.get("index_db").unwrap(),
+            &vec![format!("user_{}_private", hashed)]
+        );
+    }
 }
 
 fn strip_query_params(req: &mut Request<Body>, keys: &[&str]) -> Result<()> {
     let mut pairs: Vec<(String, String)> = req
         .uri()
         .query()
-        .map(|query| form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
         .unwrap_or_default();
     let mut retained: Vec<(String, String)> = Vec::with_capacity(pairs.len());
     for (key, value) in pairs.drain(..) {
@@ -1222,15 +1277,15 @@ fn build_upstream_request(
     }
 
     if let Some(original_host) = original_host {
-        let value = HeaderValue::from_str(&original_host)
-            .context("invalid original host header")?;
+        let value =
+            HeaderValue::from_str(&original_host).context("invalid original host header")?;
         req.headers_mut()
             .insert(HeaderName::from_static("x-forwarded-host"), value);
     }
 
     let forwarded_proto = req.uri().scheme_str().unwrap_or("http");
-    let value = HeaderValue::from_str(forwarded_proto)
-        .context("invalid x-forwarded-proto header")?;
+    let value =
+        HeaderValue::from_str(forwarded_proto).context("invalid x-forwarded-proto header")?;
     req.headers_mut()
         .insert(HeaderName::from_static("x-forwarded-proto"), value);
 
@@ -1245,7 +1300,10 @@ fn build_uri(base: &Uri, path_and_query: &str) -> Result<Uri> {
     Ok(Uri::from_parts(parts)?)
 }
 
-fn append_forwarded_for(headers: &mut axum::http::HeaderMap, client_addr: SocketAddr) -> Result<()> {
+fn append_forwarded_for(
+    headers: &mut axum::http::HeaderMap,
+    client_addr: SocketAddr,
+) -> Result<()> {
     let name = HeaderName::from_static("x-forwarded-for");
     let client_ip = client_addr.ip();
     let value = match headers.get(&name).and_then(|value| value.to_str().ok()) {
