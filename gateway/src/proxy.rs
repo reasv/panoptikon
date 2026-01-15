@@ -305,7 +305,7 @@ async fn proxy_request(
     Response::from_parts(parts, Body::new(body))
 }
 
-fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
+pub(crate) fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded")) {
             if let Some(host) = parse_forwarded_host(value) {
@@ -357,7 +357,12 @@ fn normalize_host(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn ruleset_allows(settings: &Settings, policy: &PolicyConfig, method: &Method, path: &str) -> bool {
+pub(crate) fn ruleset_allows(
+    settings: &Settings,
+    policy: &PolicyConfig,
+    method: &Method,
+    path: &str,
+) -> bool {
     let ruleset_name = match policy.ruleset.as_deref() {
         None => return true,
         Some("allow_all") => return true,
@@ -392,7 +397,10 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
     false
 }
 
-fn select_policy<'a>(settings: &'a Settings, host: Option<&str>) -> Option<&'a PolicyConfig> {
+pub(crate) fn select_policy<'a>(
+    settings: &'a Settings,
+    host: Option<&str>,
+) -> Option<&'a PolicyConfig> {
     let host = host?;
     for policy in &settings.policies {
         if policy
@@ -433,21 +441,21 @@ fn is_db_create_path(path: &str) -> bool {
 }
 
 #[derive(Debug)]
-struct EnforcementError {
-    status: StatusCode,
-    reason: &'static str,
+pub(crate) struct EnforcementError {
+    pub(crate) status: StatusCode,
+    pub(crate) reason: &'static str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DbInfo {
-    index: SingleDbInfo,
-    user_data: SingleDbInfo,
+pub(crate) struct DbInfo {
+    pub(crate) index: SingleDbInfo,
+    pub(crate) user_data: SingleDbInfo,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SingleDbInfo {
-    current: String,
-    all: Vec<String>,
+pub(crate) struct SingleDbInfo {
+    pub(crate) current: String,
+    pub(crate) all: Vec<String>,
 }
 
 fn enforce_db_params(
@@ -634,7 +642,7 @@ async fn filter_db_info_response(
     Response::from_parts(parts, Body::from(body))
 }
 
-fn filter_db_info_payload(
+pub(crate) fn filter_db_info_payload(
     mut info: DbInfo,
     policy: &PolicyConfig,
     username: Option<&str>,
@@ -809,7 +817,7 @@ fn matches_prefix(template: Option<&str>, username: &str, candidate: &str) -> bo
     is_safe_identifier(rest, MAX_DB_NAME_LEN)
 }
 
-fn extract_username(
+pub(crate) fn extract_username(
     policy: &PolicyConfig,
     req: &Request<Body>,
 ) -> std::result::Result<Option<String>, EnforcementError> {

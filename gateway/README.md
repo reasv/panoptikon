@@ -39,6 +39,8 @@ Special handling:
 - `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
   enforcement rules as normal DB parameters.
 - `/api/inference/*` never receives DB query parameters.
+- When `upstreams.api.local = true`, the gateway serves `/api/db` locally using
+  the same policy enforcement and filtering rules.
 
 ## Configuration
 
@@ -59,10 +61,12 @@ base_url = "http://127.0.0.1:6339"
 
 [upstreams.api]
 base_url = "http://127.0.0.1:6342"
+local = false
 
 [upstreams.inference]
 # Optional; defaults to the API upstream if omitted.
 base_url = "http://127.0.0.1:6342"
+local = false
 
 [rulesets.allow_all]
 allow_all = true
@@ -86,19 +90,21 @@ allow = "*"
 Environment variables override the file:
 
 ```bash
-GATEWAY_CONFIG_PATH=Q:\projects\panoptikon\config\gateway\default.toml
+GATEWAY_CONFIG_PATH=config\gateway\default.toml
 GATEWAY__SERVER_HOST=0.0.0.0
 GATEWAY__SERVER_PORT=8080
 GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAM_UI=http://127.0.0.1:6339
 GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
+GATEWAY__UPSTREAM_API_LOCAL=false
 GATEWAY__UPSTREAM_INFERENCE=http://127.0.0.1:6342
+GATEWAY__UPSTREAM_INFERENCE_LOCAL=false
 ```
 
 CLI override example:
 
 ```bash
-cargo run -p gateway -- --config Q:\projects\panoptikon\config\gateway\default.toml
+cargo run -p gateway -- --config config\gateway\userconfig.toml
 ```
 
 The nested style supported by the config crate also works:
@@ -109,7 +115,9 @@ GATEWAY__SERVER__PORT=8080
 GATEWAY__SERVER__TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6339
 GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
+GATEWAY__UPSTREAMS__API__LOCAL=false
 GATEWAY__UPSTREAMS__INFERENCE__BASE_URL=http://127.0.0.1:6342
+GATEWAY__UPSTREAMS__INFERENCE__LOCAL=false
 ```
 
 ## Running locally

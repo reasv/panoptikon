@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::http::Method;
-use serde::de::{self, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{self, SeqAccess, Visitor};
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
 pub const MAX_DB_NAME_LEN: usize = 64;
@@ -39,6 +39,8 @@ pub struct UpstreamsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,7 +145,6 @@ impl Settings {
             .set_default("server.trust_forwarded_headers", false)?
             .set_default("upstreams.ui.base_url", "http://127.0.0.1:6339")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
-            .set_default("upstreams.inference.base_url", "http://127.0.0.1:6342")?
             .add_source(config::File::from(config_path).required(false))
             .add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
 
@@ -175,11 +176,38 @@ impl Settings {
         if let Ok(value) = env::var("GATEWAY__UPSTREAM_UI") {
             self.upstreams.ui.base_url = value;
         }
+        if let Ok(value) = env::var("GATEWAY__UPSTREAM_UI_LOCAL") {
+            self.upstreams.ui.local = value
+                .parse()
+                .context("GATEWAY__UPSTREAM_UI_LOCAL must be a boolean")?;
+        }
         if let Ok(value) = env::var("GATEWAY__UPSTREAM_API") {
             self.upstreams.api.base_url = value;
         }
+        if let Ok(value) = env::var("GATEWAY__UPSTREAM_API_LOCAL") {
+            self.upstreams.api.local = value
+                .parse()
+                .context("GATEWAY__UPSTREAM_API_LOCAL must be a boolean")?;
+        }
         if let Ok(value) = env::var("GATEWAY__UPSTREAM_INFERENCE") {
-            self.upstreams.inference = Some(UpstreamConfig { base_url: value });
+            self.upstreams.inference = Some(UpstreamConfig {
+                base_url: value,
+                local: false,
+            });
+        }
+        if let Ok(value) = env::var("GATEWAY__UPSTREAM_INFERENCE_LOCAL") {
+            let local = value
+                .parse()
+                .context("GATEWAY__UPSTREAM_INFERENCE_LOCAL must be a boolean")?;
+            match self.upstreams.inference.as_mut() {
+                Some(config) => config.local = local,
+                None => {
+                    self.upstreams.inference = Some(UpstreamConfig {
+                        base_url: self.upstreams.api.base_url.clone(),
+                        local,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -231,10 +259,7 @@ impl Settings {
             }
 
             validate_db_policy("index_db", &policy.index_db)?;
-            validate_db_policy(
-                "user_data_db",
-                &policy.user_data_db,
-            )?;
+            validate_db_policy("user_data_db", &policy.user_data_db)?;
         }
         Ok(())
     }
@@ -245,6 +270,7 @@ impl Settings {
         if self.upstreams.inference.is_none() {
             self.upstreams.inference = Some(UpstreamConfig {
                 base_url: self.upstreams.api.base_url.clone(),
+                local: self.upstreams.api.local,
             });
         }
     }
@@ -292,16 +318,10 @@ fn validate_db_policy(label: &str, policy: &DbPolicy) -> Result<()> {
             anyhow::bail!("{} tenant_default '{}' is invalid", label, tenant_default);
         }
         if tenant_default == &policy.default {
-            anyhow::bail!(
-                "{} tenant_default must not match the global default",
-                label
-            );
+            anyhow::bail!("{} tenant_default must not match the global default", label);
         }
         if policy.tenant_prefix_template.is_none() {
-            anyhow::bail!(
-                "{} tenant_default requires tenant_prefix_template",
-                label
-            );
+            anyhow::bail!("{} tenant_default requires tenant_prefix_template", label);
         }
     }
     if let Some(template) = &policy.tenant_prefix_template {

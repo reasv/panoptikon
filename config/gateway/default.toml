@@ -16,11 +16,13 @@ base_url = "http://127.0.0.1:6339"
 [upstreams.api]
 # FastAPI backend base URL.
 base_url = "http://127.0.0.1:6342"
+# local = false
 
 # Optional inference upstream. Defaults to the API upstream if omitted.
 #
 # [upstreams.inference]
 # base_url = "http://127.0.0.1:6342"
+# local = false
 
 # --------- Routes (optional, for future use) ---------
 # Routes are currently not used by the router, but are validated and reserved
