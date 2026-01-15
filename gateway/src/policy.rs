@@ -567,7 +567,7 @@ async fn filter_db_info_response(
     Response::from_parts(parts, Body::from(body))
 }
 
-pub(crate) fn filter_db_info_payload(
+fn filter_db_info_payload(
     mut info: DbInfo,
     policy: &PolicyConfig,
     username: Option<&str>,
@@ -741,7 +741,7 @@ fn matches_prefix(template: Option<&str>, username: &str, candidate: &str) -> bo
     is_safe_identifier(rest, MAX_DB_NAME_LEN)
 }
 
-pub(crate) fn extract_username(
+fn extract_username(
     policy: &PolicyConfig,
     req: &Request<Body>,
 ) -> std::result::Result<Option<String>, EnforcementError> {
