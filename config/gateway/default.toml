@@ -82,14 +82,12 @@ ruleset = "allow_all"
 [policies.match]
 hosts = ["localhost", "127.0.0.1"]
 
-[policies.defaults]
-index_db = "default"
-user_data_db = "default"
-
 [policies.index_db]
+default = "default"
 allow = "*"
 
 [policies.user_data_db]
+default = "default"
 allow = "*"
 
 # Example: public demo policy with a restricted ruleset.
@@ -101,14 +99,12 @@ allow = "*"
 # [policies.match]
 # hosts = ["public.example.com"]
 #
-# [policies.defaults]
-# index_db = "public"
-# user_data_db = "default"
-#
 # [policies.index_db]
+# default = "public"
 # allow = ["public"]
 #
 # [policies.user_data_db]
+# default = "default"
 # allow = ["default"]
 
 # Example: multi-tenant policy using a username header.
@@ -123,16 +119,14 @@ allow = "*"
 # [policies.identity]
 # user_header = "X-Forwarded-User"
 #
-# [policies.defaults]
-# index_db = "default"
-# user_data_db = "default"
-#
 # [policies.index_db]
+# default = "default"
 # allow = ["default", "shared_images", "shared_docs"]
 # tenant_default = "images"
 # tenant_prefix_template = "user_{username}_"
 #
 # [policies.user_data_db]
+# default = "default"
 # allow = ["default"]
 # tenant_default = "bookmarks"
 # tenant_prefix_template = "user_{username}_"

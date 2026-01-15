@@ -69,7 +69,6 @@ pub struct PolicyConfig {
     pub ruleset: Option<String>,
     #[serde(rename = "match")]
     pub match_rule: PolicyMatch,
-    pub defaults: DbDefaults,
     pub index_db: DbPolicy,
     pub user_data_db: DbPolicy,
     #[serde(default)]
@@ -87,13 +86,8 @@ pub struct IdentityConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DbDefaults {
-    pub index_db: String,
-    pub user_data_db: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct DbPolicy {
+    pub default: String,
     pub allow: AllowList,
     #[serde(default)]
     pub tenant_default: Option<String>,
@@ -229,12 +223,10 @@ impl Settings {
                 }
             }
 
-            validate_db_defaults(&policy.defaults, &policy.name)?;
-            validate_db_policy("index_db", &policy.index_db, &policy.defaults.index_db)?;
+            validate_db_policy("index_db", &policy.index_db)?;
             validate_db_policy(
                 "user_data_db",
                 &policy.user_data_db,
-                &policy.defaults.user_data_db,
             )?;
         }
         Ok(())
@@ -246,17 +238,10 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(cwd.join("config").join("gateway").join("default.toml"))
 }
 
-fn validate_db_defaults(defaults: &DbDefaults, policy_name: &str) -> Result<()> {
-    if !is_safe_identifier(&defaults.index_db, MAX_DB_NAME_LEN) {
-        anyhow::bail!("policy '{}' default index_db is invalid", policy_name);
+fn validate_db_policy(label: &str, policy: &DbPolicy) -> Result<()> {
+    if !is_safe_identifier(&policy.default, MAX_DB_NAME_LEN) {
+        anyhow::bail!("{} default '{}' is invalid", label, policy.default);
     }
-    if !is_safe_identifier(&defaults.user_data_db, MAX_DB_NAME_LEN) {
-        anyhow::bail!("policy '{}' default user_data_db is invalid", policy_name);
-    }
-    Ok(())
-}
-
-fn validate_db_policy(label: &str, policy: &DbPolicy, default_value: &str) -> Result<()> {
     match &policy.allow {
         AllowList::All => {
             if policy.tenant_default.is_some() || policy.tenant_prefix_template.is_some() {
@@ -276,11 +261,11 @@ fn validate_db_policy(label: &str, policy: &DbPolicy, default_value: &str) -> Re
     }
 
     if let AllowList::List(items) = &policy.allow {
-        if !items.iter().any(|entry| entry == default_value) {
+        if !items.iter().any(|entry| entry == &policy.default) {
             anyhow::bail!(
                 "{} default '{}' must appear in allow list",
                 label,
-                default_value
+                policy.default
             );
         }
     }
@@ -289,7 +274,7 @@ fn validate_db_policy(label: &str, policy: &DbPolicy, default_value: &str) -> Re
         if !is_safe_identifier(tenant_default, MAX_DB_NAME_LEN) {
             anyhow::bail!("{} tenant_default '{}' is invalid", label, tenant_default);
         }
-        if tenant_default == default_value {
+        if tenant_default == &policy.default {
             anyhow::bail!(
                 "{} tenant_default must not match the global default",
                 label

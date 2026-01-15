@@ -459,14 +459,14 @@ fn enforce_db_params(
     let index_resolution = resolve_db_param(
         "index_db",
         index_db,
-        &policy.defaults.index_db,
+        &policy.index_db.default,
         &policy.index_db,
         username,
     )?;
     let user_resolution = resolve_db_param(
         "user_data_db",
         user_data_db,
-        &policy.defaults.user_data_db,
+        &policy.user_data_db.default,
         &policy.user_data_db,
         username,
     )?;
@@ -525,14 +525,14 @@ fn enforce_db_create_params(
     let index_resolution = resolve_db_param(
         "new_index_db",
         new_index_db,
-        &policy.defaults.index_db,
+        &policy.index_db.default,
         &policy.index_db,
         username,
     )?;
     let user_resolution = resolve_db_param(
         "new_user_data_db",
         new_user_data_db,
-        &policy.defaults.user_data_db,
+        &policy.user_data_db.default,
         &policy.user_data_db,
         username,
     )?;
@@ -581,7 +581,8 @@ async fn filter_db_info_response(
         }
     };
 
-    let index_current = match resolve_default_db(&policy.index_db, &policy.defaults.index_db, username)
+    let index_current =
+        match resolve_default_db(&policy.index_db, &policy.index_db.default, username)
     {
         Ok(value) => value,
         Err(error) => {
@@ -590,7 +591,7 @@ async fn filter_db_info_response(
         }
     };
     let user_current =
-        match resolve_default_db(&policy.user_data_db, &policy.defaults.user_data_db, username) {
+        match resolve_default_db(&policy.user_data_db, &policy.user_data_db.default, username) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(reason = error.reason, "invalid user data db default");

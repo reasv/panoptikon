@@ -68,14 +68,12 @@ ruleset = "allow_all"
 [policies.match]
 hosts = ["localhost", "127.0.0.1", "panoptikon.local"]
 
-[policies.defaults]
-index_db = "default"
-user_data_db = "default"
-
 [policies.index_db]
+default = "default"
 allow = "*"
 
 [policies.user_data_db]
+default = "default"
 allow = "*"
 ```
 
