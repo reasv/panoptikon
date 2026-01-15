@@ -15,6 +15,7 @@ use hyper_util::{
 };
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, sync::Arc};
 use url::form_urlencoded;
 
@@ -830,14 +831,22 @@ fn extract_username(
         reason: "invalid_user_header",
     })?;
     let value = raw.split(',').next().unwrap_or(raw).trim();
-    if value.is_empty() || !is_safe_identifier(value, MAX_USERNAME_LEN) {
+    if value.is_empty() {
         return Err(EnforcementError {
             status: StatusCode::BAD_REQUEST,
             reason: "invalid_username",
         });
     }
 
-    Ok(Some(value.to_string()))
+    let needs_hash = value.len() > (MAX_DB_NAME_LEN / 2)
+        || !is_safe_identifier(value, MAX_USERNAME_LEN);
+    let normalized = if needs_hash {
+        hash_username(value)
+    } else {
+        value.to_string()
+    };
+
+    Ok(Some(normalized))
 }
 
 fn render_template(template: &str, username: &str, db: &str) -> String {
@@ -879,6 +888,16 @@ fn strip_tenant_prefix(
         return None;
     }
     Some(rest.to_string())
+}
+
+fn hash_username(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut output = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(&mut output, "{:02x}", byte);
+    }
+    output
 }
 
 #[cfg(test)]
