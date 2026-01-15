@@ -40,8 +40,9 @@ Special handling:
   enforcement rules as normal DB parameters.
 - `/api/inference/*` never receives DB query parameters.
 - When `upstreams.api.local = true`, the gateway serves `/api/db`,
-  `/api/items/item/file`, and `/api/items/item/thumbnail` locally using the same
-  policy enforcement and filtering rules.
+  `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`,
+  `/api/items/item/text`, `/api/items/item/tags`, and `/api/items/text/any`
+  locally using the same policy enforcement and filtering rules.
 
 ## Configuration
 

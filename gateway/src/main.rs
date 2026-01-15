@@ -62,7 +62,11 @@ async fn main() -> anyhow::Result<()> {
         app = app
             .route("/api/db", get(api::db::db_info))
             .route("/api/items/item/file", get(api::items::item_file))
-            .route("/api/items/item/thumbnail", get(api::items::item_thumbnail));
+            .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))
+            .route("/api/items/item", get(api::items::item_meta))
+            .route("/api/items/item/text", get(api::items::item_text))
+            .route("/api/items/item/tags", get(api::items::item_tags))
+            .route("/api/items/text/any", get(api::items::texts_any));
     }
 
     let app = app

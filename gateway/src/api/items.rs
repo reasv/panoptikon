@@ -1,20 +1,18 @@
 use axum::{
+    Json,
     body::Body,
     extract::Query,
     http::{Response, header},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio_util::io::ReaderStream;
 
 use crate::api::utils::{content_disposition_value, iso_to_system_time, strip_non_latin1_chars};
 use crate::api_error::ApiError;
 use crate::db::items::{
-    FileRecord,
-    ItemIdentifierType,
-    ItemRecord,
-    get_item_metadata,
-    get_thumbnail_bytes,
+    ExtractedTextRecord, FileRecord, ItemIdentifierType, ItemRecord, get_all_tags_for_item,
+    get_extracted_text_for_item, get_item_metadata, get_text_by_ids, get_thumbnail_bytes,
 };
 use crate::db::{DbConnection, ReadOnly};
 
@@ -26,6 +24,78 @@ const PLACEHOLDER_PNG: &[u8] = include_bytes!("assets/placeholder.png");
 pub(crate) struct ItemQuery {
     id: String,
     id_type: ItemIdentifierType,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ItemTextQuery {
+    id: String,
+    id_type: ItemIdentifierType,
+    #[serde(default)]
+    setters: Vec<String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    truncate_length: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ItemTagsQuery {
+    id: String,
+    id_type: ItemIdentifierType,
+    #[serde(default)]
+    setters: Vec<String>,
+    #[serde(default)]
+    namespaces: Vec<String>,
+    #[serde(default)]
+    confidence_threshold: f64,
+    limit_per_namespace: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TextAnyQuery {
+    text_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ItemMetadataResponse {
+    item: ItemRecordResponse,
+    files: Vec<FileRecordResponse>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ItemRecordResponse {
+    id: i64,
+    sha256: String,
+    md5: String,
+    #[serde(rename = "type")]
+    item_type: String,
+    size: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    duration: Option<f64>,
+    audio_tracks: Option<i64>,
+    video_tracks: Option<i64>,
+    subtitle_tracks: Option<i64>,
+    blurhash: Option<String>,
+    time_added: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FileRecordResponse {
+    id: i64,
+    sha256: String,
+    path: String,
+    last_modified: String,
+    filename: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TextResponse {
+    text: Vec<ExtractedTextRecord>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TagResponse {
+    tags: Vec<(String, String, f64, String)>,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +126,85 @@ pub async fn item_file(
     }
 
     file_response(&item, file, &filename, "inline").await
+}
+
+pub async fn item_meta(
+    mut db: DbConnection<ReadOnly>,
+    Query(query): Query<ItemQuery>,
+) -> ApiResult<Json<ItemMetadataResponse>> {
+    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    let Some(item) = item_data.item else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let response = ItemMetadataResponse {
+        item: map_item_record(&item),
+        files: item_data.files.into_iter().map(map_file_record).collect(),
+    };
+
+    Ok(Json(response))
+}
+
+pub async fn item_text(
+    mut db: DbConnection<ReadOnly>,
+    Query(query): Query<ItemTextQuery>,
+) -> ApiResult<Json<TextResponse>> {
+    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    let Some(item) = item_data.item else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let mut text =
+        get_extracted_text_for_item(&mut db.conn, item.id, query.truncate_length).await?;
+    if !query.setters.is_empty() {
+        text.retain(|entry| {
+            query
+                .setters
+                .iter()
+                .any(|setter| setter == &entry.setter_name)
+        });
+    }
+    if !query.languages.is_empty() {
+        text.retain(|entry| {
+            entry
+                .language
+                .as_ref()
+                .map(|language| query.languages.iter().any(|entry| entry == language))
+                .unwrap_or(false)
+        });
+    }
+
+    Ok(Json(TextResponse { text }))
+}
+
+pub async fn item_tags(
+    mut db: DbConnection<ReadOnly>,
+    Query(query): Query<ItemTagsQuery>,
+) -> ApiResult<Json<TagResponse>> {
+    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    let Some(item) = item_data.item else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let tags = get_all_tags_for_item(
+        &mut db.conn,
+        item.id,
+        &query.setters,
+        query.confidence_threshold,
+        &query.namespaces,
+        query.limit_per_namespace,
+    )
+    .await?;
+
+    Ok(Json(TagResponse { tags }))
+}
+
+pub async fn texts_any(
+    mut db: DbConnection<ReadOnly>,
+    Query(query): Query<TextAnyQuery>,
+) -> ApiResult<Json<TextResponse>> {
+    let text = get_text_by_ids(&mut db.conn, &query.text_ids).await?;
+    Ok(Json(TextResponse { text }))
 }
 
 pub async fn item_thumbnail(
@@ -185,6 +334,34 @@ fn bytes_response(bytes: Vec<u8>, media_type: &str, filename: &str) -> ApiResult
     }
 
     Ok(response)
+}
+
+fn map_item_record(item: &ItemRecord) -> ItemRecordResponse {
+    ItemRecordResponse {
+        id: item.id,
+        sha256: item.sha256.clone(),
+        md5: item.md5.clone(),
+        item_type: item.mime_type.clone(),
+        size: item.size,
+        width: item.width,
+        height: item.height,
+        duration: item.duration,
+        audio_tracks: item.audio_tracks,
+        video_tracks: item.video_tracks,
+        subtitle_tracks: item.subtitle_tracks,
+        blurhash: item.blurhash.clone(),
+        time_added: item.time_added.clone(),
+    }
+}
+
+fn map_file_record(file: FileRecord) -> FileRecordResponse {
+    FileRecordResponse {
+        id: file.id,
+        sha256: file.sha256,
+        path: file.path,
+        last_modified: file.last_modified,
+        filename: file.filename,
+    }
 }
 
 fn default_true() -> bool {

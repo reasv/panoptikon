@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::api_error::ApiError;
 
@@ -44,6 +44,18 @@ pub(crate) struct FileRecord {
 pub(crate) struct ItemMetadata {
     pub item: Option<ItemRecord>,
     pub files: Vec<FileRecord>,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct ExtractedTextRecord {
+    pub id: i64,
+    pub item_sha256: String,
+    pub setter_name: String,
+    pub language: Option<String>,
+    pub language_confidence: Option<f64>,
+    pub text: String,
+    pub confidence: Option<f64>,
+    pub length: i64,
 }
 
 pub(crate) async fn get_item_metadata(
@@ -230,6 +242,296 @@ pub(crate) async fn get_item_metadata(
         item: item_record,
         files,
     })
+}
+
+pub(crate) async fn get_extracted_text_for_item(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: i64,
+    max_length: Option<usize>,
+) -> ApiResult<Vec<ExtractedTextRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            items.sha256 AS item_sha256,
+            setters.name AS setter_name,
+            language,
+            text,
+            confidence,
+            language_confidence,
+            text_length,
+            extracted_text.id AS id
+        FROM extracted_text
+        JOIN item_data
+            ON extracted_text.id = item_data.id
+        JOIN setters AS setters
+            ON item_data.setter_id = setters.id
+        JOIN items
+            ON item_data.item_id = items.id
+        WHERE item_data.item_id = ?
+        ORDER BY setters.name, item_data.source_id, item_data.idx
+        "#,
+    )
+    .bind(item_id)
+    .fetch_all(conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read extracted text");
+        ApiError::internal("Failed to get text")
+    })?;
+
+    let mut extracted = Vec::with_capacity(rows.len());
+    for row in rows {
+        let original_text: String = row.try_get("text").map_err(|err| {
+            tracing::error!(error = %err, "failed to read text");
+            ApiError::internal("Failed to get text")
+        })?;
+        let text = match max_length {
+            Some(max) if original_text.chars().count() > max => {
+                original_text.chars().take(max).collect()
+            }
+            _ => original_text.clone(),
+        };
+
+        let record = ExtractedTextRecord {
+            item_sha256: row.try_get("item_sha256").map_err(|err| {
+                tracing::error!(error = %err, "failed to read item sha256");
+                ApiError::internal("Failed to get text")
+            })?,
+            setter_name: row.try_get("setter_name").map_err(|err| {
+                tracing::error!(error = %err, "failed to read setter name");
+                ApiError::internal("Failed to get text")
+            })?,
+            language: row.try_get("language").map_err(|err| {
+                tracing::error!(error = %err, "failed to read language");
+                ApiError::internal("Failed to get text")
+            })?,
+            text,
+            confidence: row.try_get("confidence").map_err(|err| {
+                tracing::error!(error = %err, "failed to read confidence");
+                ApiError::internal("Failed to get text")
+            })?,
+            language_confidence: row.try_get("language_confidence").map_err(|err| {
+                tracing::error!(error = %err, "failed to read language confidence");
+                ApiError::internal("Failed to get text")
+            })?,
+            length: row.try_get("text_length").map_err(|err| {
+                tracing::error!(error = %err, "failed to read text length");
+                ApiError::internal("Failed to get text")
+            })?,
+            id: row.try_get("id").map_err(|err| {
+                tracing::error!(error = %err, "failed to read text id");
+                ApiError::internal("Failed to get text")
+            })?,
+        };
+        extracted.push(record);
+    }
+
+    Ok(extracted)
+}
+
+pub(crate) async fn get_text_by_ids(
+    conn: &mut sqlx::SqliteConnection,
+    text_ids: &[i64],
+) -> ApiResult<Vec<ExtractedTextRecord>> {
+    if text_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(text_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+            items.sha256 AS item_sha256,
+            setters.name AS setter_name,
+            language,
+            text,
+            confidence,
+            language_confidence,
+            extracted_text.id AS id
+        FROM extracted_text
+        JOIN item_data
+            ON extracted_text.id = item_data.id
+        JOIN setters AS setters
+            ON item_data.setter_id = setters.id
+        JOIN items
+            ON item_data.item_id = items.id
+        WHERE extracted_text.id IN ({placeholders})
+        "#
+    );
+
+    let mut query = sqlx::query(&sql);
+    for text_id in text_ids {
+        query = query.bind(text_id);
+    }
+
+    let rows = query.fetch_all(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to read text by ids");
+        ApiError::internal("Failed to get text")
+    })?;
+
+    let mut extracted = Vec::with_capacity(rows.len());
+    for row in rows {
+        let text: String = row.try_get("text").map_err(|err| {
+            tracing::error!(error = %err, "failed to read text");
+            ApiError::internal("Failed to get text")
+        })?;
+        let length = text.chars().count() as i64;
+        let record = ExtractedTextRecord {
+            id: row.try_get("id").map_err(|err| {
+                tracing::error!(error = %err, "failed to read text id");
+                ApiError::internal("Failed to get text")
+            })?,
+            item_sha256: row.try_get("item_sha256").map_err(|err| {
+                tracing::error!(error = %err, "failed to read item sha256");
+                ApiError::internal("Failed to get text")
+            })?,
+            setter_name: row.try_get("setter_name").map_err(|err| {
+                tracing::error!(error = %err, "failed to read setter name");
+                ApiError::internal("Failed to get text")
+            })?,
+            language: row.try_get("language").map_err(|err| {
+                tracing::error!(error = %err, "failed to read language");
+                ApiError::internal("Failed to get text")
+            })?,
+            text,
+            confidence: row.try_get("confidence").map_err(|err| {
+                tracing::error!(error = %err, "failed to read confidence");
+                ApiError::internal("Failed to get text")
+            })?,
+            language_confidence: row.try_get("language_confidence").map_err(|err| {
+                tracing::error!(error = %err, "failed to read language confidence");
+                ApiError::internal("Failed to get text")
+            })?,
+            length,
+        };
+        extracted.push(record);
+    }
+
+    Ok(extracted)
+}
+
+pub(crate) async fn get_all_tags_for_item(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: i64,
+    setters: &[String],
+    confidence_threshold: f64,
+    namespaces: &[String],
+    limit_per_namespace: Option<usize>,
+) -> ApiResult<Vec<(String, String, f64, String)>> {
+    let mut sql = String::from(
+        r#"
+        SELECT tags.namespace, tags.name, tags_items.confidence, setters.name AS setter_name
+        FROM item_data
+        JOIN tags_items
+            ON tags_items.item_data_id = item_data.id
+        JOIN tags
+            ON tags_items.tag_id = tags.id
+        JOIN setters
+            ON item_data.setter_id = setters.id
+        WHERE item_data.item_id = ?
+        "#,
+    );
+
+    if !setters.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(setters.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND setters.name IN ({placeholders})"));
+    }
+
+    if confidence_threshold > 0.0 {
+        sql.push_str(" AND tags_items.confidence >= ?");
+    }
+
+    if !namespaces.is_empty() {
+        let conditions = std::iter::repeat("tags.namespace LIKE ? || '%'")
+            .take(namespaces.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        sql.push_str(&format!(" AND ({conditions})"));
+    }
+
+    sql.push_str(" ORDER BY tags_items.rowid");
+
+    let mut query = sqlx::query(&sql).bind(item_id);
+    for setter in setters {
+        query = query.bind(setter);
+    }
+    if confidence_threshold > 0.0 {
+        query = query.bind(confidence_threshold);
+    }
+    for namespace in namespaces {
+        query = query.bind(namespace);
+    }
+
+    let rows = query.fetch_all(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to read tags for item");
+        ApiError::internal("Failed to get tags")
+    })?;
+
+    let mut tags = Vec::with_capacity(rows.len());
+    for row in rows {
+        let namespace: String = row.try_get("namespace").map_err(|err| {
+            tracing::error!(error = %err, "failed to read tag namespace");
+            ApiError::internal("Failed to get tags")
+        })?;
+        let name: String = row.try_get("name").map_err(|err| {
+            tracing::error!(error = %err, "failed to read tag name");
+            ApiError::internal("Failed to get tags")
+        })?;
+        let confidence: f64 = row.try_get("confidence").map_err(|err| {
+            tracing::error!(error = %err, "failed to read tag confidence");
+            ApiError::internal("Failed to get tags")
+        })?;
+        let setter_name: String = row.try_get("setter_name").map_err(|err| {
+            tracing::error!(error = %err, "failed to read setter name");
+            ApiError::internal("Failed to get tags")
+        })?;
+        tags.push((namespace, name, confidence, setter_name));
+    }
+
+    if let Some(limit) = limit_per_namespace {
+        Ok(limit_tags_by_namespace(tags, limit))
+    } else {
+        Ok(tags)
+    }
+}
+
+fn limit_tags_by_namespace(
+    tags: Vec<(String, String, f64, String)>,
+    limit: usize,
+) -> Vec<(String, String, f64, String)> {
+    let mut tags_with_index: Vec<(usize, (String, String, f64, String))> =
+        tags.into_iter().enumerate().collect();
+    tags_with_index.sort_by(|a, b| {
+        let cmp = b.1 .2
+            .partial_cmp(&a.1 .2)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if cmp == std::cmp::Ordering::Equal {
+            a.0.cmp(&b.0)
+        } else {
+            cmp
+        }
+    });
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut limited: Vec<(usize, (String, String, f64, String))> = Vec::new();
+
+    for (index, tag) in tags_with_index {
+        let key = format!("{}:{}", tag.3, tag.0);
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        if *count <= limit {
+            limited.push((index, tag));
+        }
+    }
+
+    limited.sort_by_key(|(index, _)| *index);
+    limited.into_iter().map(|(_, tag)| tag).collect()
 }
 
 pub(crate) async fn get_thumbnail_bytes(
