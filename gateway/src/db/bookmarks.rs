@@ -10,6 +10,41 @@ pub(crate) struct BookmarkEntry {
     pub metadata: Option<Value>,
 }
 
+pub(crate) async fn delete_bookmark(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    namespace: &str,
+    user: &str,
+) -> ApiResult<u64> {
+    let query = if namespace == "*" {
+        sqlx::query(
+            r#"
+            DELETE FROM user_data.bookmarks
+            WHERE sha256 = ? AND user = ?
+            "#,
+        )
+        .bind(sha256)
+        .bind(user)
+    } else {
+        sqlx::query(
+            r#"
+            DELETE FROM user_data.bookmarks
+            WHERE sha256 = ? AND user = ? AND namespace = ?
+            "#,
+        )
+        .bind(sha256)
+        .bind(user)
+        .bind(namespace)
+    };
+
+    let result = query.execute(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to delete bookmark");
+        ApiError::internal("Failed to delete bookmark")
+    })?;
+
+    Ok(result.rows_affected())
+}
+
 pub(crate) async fn get_bookmarks_item(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,

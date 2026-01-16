@@ -7,7 +7,7 @@ mod proxy;
 
 use axum::{
     Router,
-    routing::{any, get},
+    routing::{any, delete, get},
 };
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/bookmarks/item/{sha256}",
                 get(api::bookmarks::bookmarks_item),
+            )
+            .route(
+                "/api/bookmarks/ns/{namespace}/{sha256}",
+                delete(api::bookmarks::delete_bookmark_by_sha256),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))
