@@ -1,5 +1,4 @@
 use axum::{
-    async_trait,
     extract::{FromRequestParts, Query},
     http::request::Parts,
 };
@@ -57,7 +56,6 @@ struct DbPaths {
     storage_db_file: PathBuf,
 }
 
-#[async_trait]
 impl<S, M> FromRequestParts<S> for DbConnection<M>
 where
     S: Send + Sync,

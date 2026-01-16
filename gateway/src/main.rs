@@ -51,9 +51,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = Router::new()
         .route("/api/inference", any(proxy::proxy_inference))
-        .route("/api/inference/*path", any(proxy::proxy_inference))
+        .route("/api/inference/{*path}", any(proxy::proxy_inference))
         .route("/api", any(proxy::proxy_api))
-        .route("/api/*path", any(proxy::proxy_api))
+        .route("/api/{*path}", any(proxy::proxy_api))
         .route("/docs", any(proxy::proxy_api))
         .route("/openapi.json", any(proxy::proxy_api))
         .fallback(any(proxy::proxy_ui));

@@ -4,15 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
     "process",
 ] }
 hyper = { version = "1", features = ["http1", "http2", "client"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
-tower-http = { version = "0.5", features = ["trace"] }
+hyper-util = { version = "0.1", features = [
+    "client-legacy",
+    "http1",
+    "http2",
+    "tokio",
+] }
+tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +29,7 @@ url = "2"
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 sha2 = "0.10"
-tower = "0.4"
+tower = "0.5"
 tokio-util = { version = "0.7", features = ["io"] }
 httpdate = "1"
+axum-extra = { version = "0.12.5", features = ["query"] }
