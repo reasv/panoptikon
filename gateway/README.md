@@ -40,7 +40,8 @@ Special handling:
   enforcement rules as normal DB parameters.
 - `/api/inference/*` never receives DB query parameters.
 - When `upstreams.api.local = true`, the gateway serves `/api/db`,
-  `/api/bookmarks/item/{sha256}`, `/api/bookmarks/ns/{namespace}/{sha256}`,
+  `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`,
+  `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`,
   `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`,
   `/api/items/item/text`, `/api/items/item/tags`, and `/api/items/text/any`
   locally using the same policy enforcement and filtering rules.

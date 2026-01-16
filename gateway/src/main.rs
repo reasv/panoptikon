@@ -7,7 +7,7 @@ mod proxy;
 
 use axum::{
     Router,
-    routing::{any, delete, get},
+    routing::{any, get},
 };
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -61,13 +61,23 @@ async fn main() -> anyhow::Result<()> {
     if settings.upstreams.api.local {
         app = app
             .route("/api/db", get(api::db::db_info))
+            .route("/api/bookmarks/ns", get(api::bookmarks::bookmark_namespaces))
+            .route("/api/bookmarks/users", get(api::bookmarks::bookmark_users))
+            .route(
+                "/api/bookmarks/ns/{namespace}",
+                get(api::bookmarks::bookmarks_by_namespace)
+                    .post(api::bookmarks::add_bookmarks_by_namespace)
+                    .delete(api::bookmarks::delete_bookmarks_by_namespace),
+            )
             .route(
                 "/api/bookmarks/item/{sha256}",
                 get(api::bookmarks::bookmarks_item),
             )
             .route(
                 "/api/bookmarks/ns/{namespace}/{sha256}",
-                delete(api::bookmarks::delete_bookmark_by_sha256),
+                get(api::bookmarks::get_bookmark)
+                    .put(api::bookmarks::add_bookmark_by_sha256)
+                    .delete(api::bookmarks::delete_bookmark_by_sha256),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))
