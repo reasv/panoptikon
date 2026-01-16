@@ -550,7 +550,8 @@ mod tests {
                 namespace TEXT NOT NULL,
                 sha256 TEXT NOT NULL,
                 time_added TEXT NOT NULL,
-                metadata TEXT
+                metadata TEXT,
+                UNIQUE(user, namespace, sha256)
             )
             "#,
         )
