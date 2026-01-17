@@ -128,14 +128,9 @@ def pql_build(
         default_factory=lambda: PQLQuery(),
         description="The PQL Search query to execute",
     ),
-    conn_args: Dict[str, Any] = Depends(get_db_readonly),
 ) -> PQLBuilderResult:
-    conn = get_database_connection(**conn_args)
-    try:
-        logger.debug(f"Building SQL queries for: {search_query}")
-        return build_pql(conn, search_query)
-    finally:
-        conn.close()
+    logger.debug(f"Building SQL queries for: {search_query}")
+    return build_pql(search_query)
 
 @dataclass
 class TagStats:

@@ -180,7 +180,6 @@ class PQLBuilderResult(BaseModel):
     count_metrics: SearchMetrics
 
 def build_pql(
-    conn: sqlite3.Connection,
     query: PQLQuery,
 ):
     count_query_metrics = SearchMetrics(build=0, compile=0, execute=0)
