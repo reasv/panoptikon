@@ -33,3 +33,4 @@ tower = "0.5"
 tokio-util = { version = "0.7", features = ["io"] }
 httpdate = "1"
 axum-extra = { version = "0.12.5", features = ["query"] }
+sqlite-vec = "0.1.7-alpha.2"
