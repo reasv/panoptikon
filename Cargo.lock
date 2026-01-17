@@ -637,6 +637,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sha2",

@@ -33,6 +33,8 @@ rulesets. DB-aware API routes always receive explicit `index_db` and
 policy (including optional multi-tenant prefixing).
 Local user-data write endpoints open a read-write connection to allow bookmark
 updates while still reading from the index database.
+When local endpoints need vector search, the gateway registers the sqlite-vec
+extension via the bundled Rust crate.
 
 Special handling:
 

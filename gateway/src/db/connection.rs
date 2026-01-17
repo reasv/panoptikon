@@ -3,8 +3,10 @@ use axum::{
     http::request::Parts,
 };
 use serde::Deserialize;
+use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
-use std::{env, fs, marker::PhantomData, path::PathBuf};
+use sqlite_vec::sqlite3_vec_init;
+use std::{env, fs, marker::PhantomData, path::PathBuf, sync::OnceLock};
 
 use crate::api_error::ApiError;
 
@@ -204,6 +206,7 @@ async fn connect_db(
     write_lock: bool,
     user_data_wl: bool,
 ) -> Result<SqliteConnection, ApiError> {
+    ensure_sqlite_vec_loaded()?;
     let readonly_mode = env::var("READONLY")
         .ok()
         .map(|value| {
@@ -309,4 +312,23 @@ async fn connect_db(
         })?;
 
     Ok(conn)
+}
+
+fn ensure_sqlite_vec_loaded() -> Result<(), ApiError> {
+    static EXT_LOADED: OnceLock<()> = OnceLock::new();
+    if EXT_LOADED.get().is_some() {
+        return Ok(());
+    }
+
+    let status = unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite3_vec_init as *const (),
+        )))
+    };
+    if status != SQLITE_OK {
+        tracing::error!(status, "failed to register sqlite-vec extension");
+        return Err(ApiError::internal("Failed to load sqlite-vec extension"));
+    }
+    let _ = EXT_LOADED.set(());
+    Ok(())
 }
