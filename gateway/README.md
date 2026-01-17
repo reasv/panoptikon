@@ -54,6 +54,24 @@ Special handling:
   `/api/search/pql` compiles queries via the upstream `/api/search/pql/build`
   response to apply extra column aliases and the `check_path` behavior.
 
+## Database migrations
+
+The gateway tracks three SQLite schemas (index, storage, user_data) using SQLx
+migrations stored in `gateway/migrations/index`, `gateway/migrations/storage`,
+and `gateway/migrations/user_data`. The initial migrations mirror the schema
+dumps produced by the Python backend, with `BEGIN`/`COMMIT` stripped to avoid
+nested transactions under SQLx.
+
+To add migrations, use SQLx's CLI against the appropriate source directory:
+
+```bash
+sqlx migrate add --source gateway/migrations/index add_new_table
+```
+
+Programmatic creation and migration lives in `gateway/src/db/migrations.rs`
+(`migrate_databases`) and supports both on-disk databases and shared
+in-memory databases for tests.
+
 ## Configuration
 
 Configuration is TOML and/or environment variables only. By default the

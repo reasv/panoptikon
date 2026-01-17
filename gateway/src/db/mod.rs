@@ -5,6 +5,7 @@ pub(crate) mod tags;
 pub(crate) mod extraction_log;
 pub(crate) mod folders;
 pub(crate) mod pql;
+pub(crate) mod migrations;
 mod connection;
 
 pub(crate) use connection::{DbConnection, ReadOnly, UserDataWrite};

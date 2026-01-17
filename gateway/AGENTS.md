@@ -29,6 +29,9 @@ Behavior (important)
   - Read-only connections attach `storage` and `user_data` databases, mirroring Python behavior.
   - User-data write handlers open a read-write connection so bookmarks can be updated.
   - SQLite extensions (sqlite-vec) are registered via the bundled Rust crate.
+- Local DB migrations:
+  - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
+  - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.
 - Local PQL search:
   - `/api/search/pql` compiles PQL queries via the upstream `/api/search/pql/build` endpoint.
   - The compiled SQL and parameters are executed against the local database.
