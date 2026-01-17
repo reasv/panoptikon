@@ -27,6 +27,7 @@ Behavior (important)
 - Local DB access:
   - Local handlers use a shared extractor to read `index_db`/`user_data_db` query params.
   - Read-only connections attach `storage` and `user_data` databases, mirroring Python behavior.
+  - User-data write handlers open a read-write connection so bookmarks can be updated.
 - Local PQL search:
   - `/api/search/pql` compiles PQL queries via the upstream `/api/search/pql/build` endpoint.
   - The compiled SQL and parameters are executed against the local database.

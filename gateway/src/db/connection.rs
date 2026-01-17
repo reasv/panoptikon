@@ -213,35 +213,9 @@ async fn connect_db(
         .unwrap_or(false);
     let write_lock = write_lock && !readonly_mode;
     let user_data_wl = user_data_wl && !readonly_mode;
+    let open_readonly = !write_lock && !user_data_wl;
 
-    let mut conn = if write_lock {
-        let options = SqliteConnectOptions::new()
-            .filename(&paths.index_db_file)
-            .create_if_missing(true);
-        let mut conn = SqliteConnection::connect_with(&options)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to open index database");
-                ApiError::internal("Failed to open database")
-            })?;
-
-        sqlx::query("ATTACH DATABASE ? AS storage")
-            .bind(paths.storage_db_file.to_string_lossy().to_string())
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to attach storage database");
-                ApiError::internal("Failed to open database")
-            })?;
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to enable WAL mode");
-                ApiError::internal("Failed to open database")
-            })?;
-        conn
-    } else {
+    let mut conn = if open_readonly {
         let options = SqliteConnectOptions::new()
             .filename(&paths.index_db_file)
             .read_only(true);
@@ -260,6 +234,35 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
+        conn
+    } else {
+        let options = SqliteConnectOptions::new()
+            .filename(&paths.index_db_file)
+            .create_if_missing(write_lock);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to open index database");
+                ApiError::internal("Failed to open database")
+            })?;
+
+        sqlx::query("ATTACH DATABASE ? AS storage")
+            .bind(paths.storage_db_file.to_string_lossy().to_string())
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to attach storage database");
+                ApiError::internal("Failed to open database")
+            })?;
+        if write_lock {
+            sqlx::query("PRAGMA journal_mode=WAL")
+                .execute(&mut conn)
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to enable WAL mode");
+                    ApiError::internal("Failed to open database")
+                })?;
+        }
         conn
     };
 

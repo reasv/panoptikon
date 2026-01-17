@@ -31,6 +31,8 @@ Policies are selected by host, then optionally restrict API routes via reusable
 rulesets. DB-aware API routes always receive explicit `index_db` and
 `user_data_db` query parameters, and the gateway validates or rewrites them per
 policy (including optional multi-tenant prefixing).
+Local user-data write endpoints open a read-write connection to allow bookmark
+updates while still reading from the index database.
 
 Special handling:
 
