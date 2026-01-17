@@ -1,4 +1,5 @@
 use serde_json::Value;
+use base64::{Engine as _, engine::general_purpose};
 use sqlx::{Row, sqlite::SqliteArguments};
 
 use crate::api_error::ApiError;
@@ -70,7 +71,23 @@ fn bind_param<'q>(
             }
         }
         Value::String(value) => Ok(query.bind(value.clone())),
-        Value::Array(_) | Value::Object(_) => {
+        Value::Object(map) => {
+            if let Some(Value::String(encoded)) = map.get("__bytes__") {
+                let decoded = general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
+                    .map_err(|err| {
+                        tracing::error!(error = %err, "failed to decode pql bytes param");
+                        ApiError::bad_request("Invalid PQL parameters")
+                    })?;
+                return Ok(query.bind(decoded));
+            }
+            let encoded = serde_json::to_string(param).map_err(|err| {
+                tracing::error!(error = %err, "failed to encode pql param");
+                ApiError::bad_request("Invalid PQL parameters")
+            })?;
+            Ok(query.bind(encoded))
+        }
+        Value::Array(_) => {
             let encoded = serde_json::to_string(param).map_err(|err| {
                 tracing::error!(error = %err, "failed to encode pql param");
                 ApiError::bad_request("Invalid PQL parameters")

@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import sqlite3
@@ -215,7 +216,7 @@ def build_pql(
                 compiled_query=None,
                 compiled_count_query=CompiledQuery(
                     sql=count_sql_string,
-                    params=count_params_ordered,
+                    params=encode_params(count_params_ordered),
                 ),
                 result_metrics=result_query_metrics,
                 count_metrics=count_query_metrics,
@@ -235,14 +236,26 @@ def build_pql(
     return PQLBuilderResult(
         compiled_query=CompiledQuery(
             sql=sql_string,
-            params=params_ordered,
+            params=encode_params(params_ordered),
         ),
         compiled_count_query=CompiledQuery(
             sql=count_sql_string,
-            params=count_params_ordered,
+            params=encode_params(count_params_ordered),
         ) if query.count else None,
         result_metrics=result_query_metrics,
         count_metrics=count_query_metrics,
         extra_columns=extra_columns,
         check_path=query.check_path,
     )
+
+def encode_params(params: List[Any]) -> List[Any]:
+    encoded: List[Any] = []
+    for param in params:
+        if isinstance(param, (bytes, bytearray, memoryview)):
+            data = bytes(param)
+            encoded.append(
+                {"__bytes__": base64.b64encode(data).decode("ascii")}
+            )
+        else:
+            encoded.append(param)
+    return encoded
