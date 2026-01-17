@@ -84,7 +84,8 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/items/item", get(api::items::item_meta))
             .route("/api/items/item/text", get(api::items::item_text))
             .route("/api/items/item/tags", get(api::items::item_tags))
-            .route("/api/items/text/any", get(api::items::texts_any));
+            .route("/api/items/text/any", get(api::items::texts_any))
+            .route("/api/search/tags", get(api::search::get_tags));
     }
 
     let app = app

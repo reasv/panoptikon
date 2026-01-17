@@ -43,7 +43,8 @@ Special handling:
   `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`,
   `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`,
   `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`,
-  `/api/items/item/text`, `/api/items/item/tags`, and `/api/items/text/any`
+  `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, and
+  `/api/search/tags`
   locally using the same policy enforcement and filtering rules.
 
 ## Configuration
