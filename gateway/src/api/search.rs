@@ -1,21 +1,133 @@
-use axum::Json;
-use axum_extra::extract::Query;
-use serde::{Deserialize, Serialize};
-
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
 use crate::db::extraction_log::get_existing_setters;
 use crate::db::folders::get_folders_from_database;
-use crate::db::items::{TextStats, get_all_mime_types, get_file_stats, get_text_stats};
+use crate::db::items::{
+    TextStats, get_all_mime_types, get_existing_file_for_item_id, get_file_stats, get_text_stats,
+};
+use crate::db::pql::{run_compiled_count, run_compiled_query};
 use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
 };
 use crate::db::{DbConnection, ReadOnly};
+use crate::proxy::ProxyState;
+use axum::{
+    Json,
+    body::Body,
+    extract::State,
+    http::{Request, header},
+};
+use axum_extra::extract::Query;
+use http_body_util::BodyExt;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::Column;
+use sqlx::Row;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const DEFAULT_LIMIT: i64 = 10;
 const DEFAULT_USER: &str = "user";
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SearchMetrics {
+    build: f64,
+    compile: f64,
+    execute: f64,
+}
+
+#[derive(Deserialize)]
+struct CompiledQuery {
+    sql: String,
+    params: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct PqlBuilderResult {
+    compiled_query: Option<CompiledQuery>,
+    compiled_count_query: Option<CompiledQuery>,
+    result_metrics: SearchMetrics,
+    count_metrics: SearchMetrics,
+    #[serde(default)]
+    extra_columns: HashMap<String, String>,
+    #[serde(default)]
+    check_path: bool,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct SearchResult {
+    file_id: i64,
+    item_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_added: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    md5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_tracks: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_tracks: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtitle_tracks: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blurhash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_length: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setter_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setter_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra: Option<HashMap<String, Value>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FileSearchResponse {
+    count: i64,
+    results: Vec<SearchResult>,
+    count_metrics: SearchMetrics,
+    result_metrics: SearchMetrics,
+}
 
 #[derive(Deserialize)]
 pub(crate) struct TagSearchQuery {
@@ -121,6 +233,53 @@ pub async fn get_stats(
     Ok(Json(stats))
 }
 
+pub async fn search_pql(
+    State(state): State<Arc<ProxyState>>,
+    mut db: DbConnection<ReadOnly>,
+    body: Option<Json<Value>>,
+) -> ApiResult<Json<FileSearchResponse>> {
+    let payload = body
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let builder = compile_pql(&state, &payload).await?;
+
+    let mut count_metrics = builder.count_metrics.clone();
+    let mut result_metrics = builder.result_metrics.clone();
+
+    let count = if let Some(compiled) = builder.compiled_count_query.as_ref() {
+        let start = Instant::now();
+        let total = run_compiled_count(&mut db.conn, &compiled.sql, &compiled.params).await?;
+        count_metrics.execute = elapsed_seconds(start);
+        total
+    } else {
+        0
+    };
+
+    let results = if let Some(compiled) = builder.compiled_query.as_ref() {
+        let start = Instant::now();
+        let rows = run_compiled_query(&mut db.conn, &compiled.sql, &compiled.params).await?;
+        result_metrics.execute = elapsed_seconds(start);
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut result = map_search_result(&row, &builder.extra_columns)?;
+            if builder.check_path && !apply_check_path(&mut db.conn, &mut result).await? {
+                continue;
+            }
+            results.push(result);
+        }
+        results
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(FileSearchResponse {
+        count,
+        results,
+        count_metrics,
+        result_metrics,
+    }))
+}
+
 async fn load_tags(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
@@ -178,6 +337,235 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
         lowest_language_confidence: stats.lowest_language_confidence,
         lowest_confidence: stats.lowest_confidence,
     }
+}
+
+async fn compile_pql(state: &ProxyState, payload: &Value) -> ApiResult<PqlBuilderResult> {
+    let body = serde_json::to_vec(payload).map_err(|err| {
+        tracing::error!(error = %err, "failed to encode pql payload");
+        ApiError::bad_request("Invalid PQL payload")
+    })?;
+    let uri = state.api.uri_for("/api/search/pql/build").map_err(|err| {
+        tracing::error!(error = %err, "failed to build pql upstream uri");
+        ApiError::internal("Failed to compile search query")
+    })?;
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to build pql upstream request");
+            ApiError::internal("Failed to compile search query")
+        })?;
+    let response = state.client.request(request).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to call pql build upstream");
+        ApiError::internal("Failed to compile search query")
+    })?;
+
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to read pql build response");
+            ApiError::internal("Failed to compile search query")
+        })?
+        .to_bytes();
+
+    if !status.is_success() {
+        let detail = parse_upstream_error(bytes.as_ref());
+        return Err(ApiError::new(status, detail));
+    }
+
+    let result: PqlBuilderResult = serde_json::from_slice(bytes.as_ref()).map_err(|err| {
+        tracing::error!(error = %err, "failed to parse pql build response");
+        ApiError::internal("Failed to compile search query")
+    })?;
+    Ok(result)
+}
+
+fn parse_upstream_error(bytes: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return String::from_utf8_lossy(bytes).to_string();
+    };
+    if let Some(detail) = value.get("detail") {
+        if let Some(text) = detail.as_str() {
+            return text.to_string();
+        }
+        return detail.to_string();
+    }
+    value.to_string()
+}
+
+async fn apply_check_path(
+    conn: &mut sqlx::SqliteConnection,
+    result: &mut SearchResult,
+) -> ApiResult<bool> {
+    let Some(path) = result.path.as_deref() else {
+        return Ok(true);
+    };
+    if Path::new(path).exists() {
+        return Ok(true);
+    }
+
+    tracing::warn!(
+        path = %path,
+        item_id = %result.item_id,
+        "pql result path missing"
+    );
+    let Some(file) = get_existing_file_for_item_id(conn, result.item_id).await? else {
+        return Ok(false);
+    };
+    result.path = Some(file.path);
+    if result.last_modified.is_none() {
+        result.last_modified = Some(file.last_modified);
+    }
+    if result.filename.is_none() {
+        result.filename = Some(file.filename);
+    }
+    Ok(true)
+}
+
+fn map_search_result(
+    row: &sqlx::sqlite::SqliteRow,
+    extra_columns: &HashMap<String, String>,
+) -> ApiResult<SearchResult> {
+    let columns: HashSet<&str> = row.columns().iter().map(|column| column.name()).collect();
+    let file_id = read_required_i64(row, "file_id")?;
+    let item_id = read_required_i64(row, "item_id")?;
+    let mut result = SearchResult {
+        file_id,
+        item_id,
+        ..SearchResult::default()
+    };
+
+    result.path = read_optional(row, &columns, "path")?;
+    result.filename = read_optional(row, &columns, "filename")?;
+    result.sha256 = read_optional(row, &columns, "sha256")?;
+    result.last_modified = read_optional(row, &columns, "last_modified")?;
+    result.item_type = read_optional(row, &columns, "type")?;
+    result.size = read_optional(row, &columns, "size")?;
+    result.width = read_optional(row, &columns, "width")?;
+    result.height = read_optional(row, &columns, "height")?;
+    result.duration = read_optional(row, &columns, "duration")?;
+    result.time_added = read_optional(row, &columns, "time_added")?;
+    result.md5 = read_optional(row, &columns, "md5")?;
+    result.audio_tracks = read_optional(row, &columns, "audio_tracks")?;
+    result.video_tracks = read_optional(row, &columns, "video_tracks")?;
+    result.subtitle_tracks = read_optional(row, &columns, "subtitle_tracks")?;
+    result.blurhash = read_optional(row, &columns, "blurhash")?;
+    result.data_id = read_optional(row, &columns, "data_id")?;
+    result.language = read_optional(row, &columns, "language")?;
+    result.language_confidence = read_optional(row, &columns, "language_confidence")?;
+    result.text = read_optional(row, &columns, "text")?;
+    result.confidence = read_optional(row, &columns, "confidence")?;
+    result.text_length = read_optional(row, &columns, "text_length")?;
+    result.job_id = read_optional(row, &columns, "job_id")?;
+    result.setter_id = read_optional(row, &columns, "setter_id")?;
+    result.setter_name = read_optional(row, &columns, "setter_name")?;
+    result.data_index = read_optional(row, &columns, "data_index")?;
+    result.source_id = read_optional(row, &columns, "source_id")?;
+
+    let mut extras = HashMap::new();
+    for column in columns {
+        if is_known_column(column) {
+            continue;
+        }
+        if let Some(value) = read_extra_value(row, column)? {
+            let alias = extra_columns
+                .get(column)
+                .map(|alias| alias.as_str())
+                .unwrap_or(column);
+            extras.insert(alias.to_string(), value);
+        }
+    }
+    if !extras.is_empty() {
+        result.extra = Some(extras);
+    }
+
+    Ok(result)
+}
+
+fn read_required_i64(row: &sqlx::sqlite::SqliteRow, field: &str) -> ApiResult<i64> {
+    row.try_get(field).map_err(|err| {
+        tracing::error!(error = %err, field = %field, "failed to read pql result");
+        ApiError::internal("Failed to read search results")
+    })
+}
+
+fn read_optional<T>(
+    row: &sqlx::sqlite::SqliteRow,
+    columns: &HashSet<&str>,
+    field: &str,
+) -> ApiResult<Option<T>>
+where
+    for<'r> T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    if !columns.contains(field) {
+        return Ok(None);
+    }
+    let value: Option<T> = row.try_get(field).map_err(|err| {
+        tracing::error!(error = %err, field = %field, "failed to read pql result");
+        ApiError::internal("Failed to read search results")
+    })?;
+    Ok(value)
+}
+
+fn read_extra_value(row: &sqlx::sqlite::SqliteRow, field: &str) -> ApiResult<Option<Value>> {
+    if let Ok(value) = row.try_get::<Option<f64>, _>(field) {
+        return Ok(value.map(Value::from));
+    }
+    if let Ok(value) = row.try_get::<Option<i64>, _>(field) {
+        return Ok(value.map(Value::from));
+    }
+    if let Ok(value) = row.try_get::<Option<String>, _>(field) {
+        return Ok(value.map(Value::from));
+    }
+    if let Ok(value) = row.try_get::<Option<bool>, _>(field) {
+        return Ok(value.map(Value::from));
+    }
+    tracing::error!(field = %field, "failed to decode extra pql column");
+    Ok(None)
+}
+
+fn is_known_column(name: &str) -> bool {
+    matches!(
+        name,
+        "file_id"
+            | "item_id"
+            | "path"
+            | "filename"
+            | "sha256"
+            | "last_modified"
+            | "type"
+            | "size"
+            | "width"
+            | "height"
+            | "duration"
+            | "time_added"
+            | "md5"
+            | "audio_tracks"
+            | "video_tracks"
+            | "subtitle_tracks"
+            | "blurhash"
+            | "data_id"
+            | "language"
+            | "language_confidence"
+            | "text"
+            | "confidence"
+            | "text_length"
+            | "job_id"
+            | "setter_id"
+            | "setter_name"
+            | "data_index"
+            | "source_id"
+    )
+}
+
+fn elapsed_seconds(start: Instant) -> f64 {
+    let seconds = start.elapsed().as_secs_f64();
+    (seconds * 1000.0).round() / 1000.0
 }
 
 fn default_limit() -> i64 {

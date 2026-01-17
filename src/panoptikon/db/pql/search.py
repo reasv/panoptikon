@@ -178,6 +178,16 @@ class PQLBuilderResult(BaseModel):
     compiled_count_query: CompiledQuery | None
     result_metrics: SearchMetrics
     count_metrics: SearchMetrics
+    extra_columns: dict[str, str] = Field(
+        default_factory=dict,
+        title="Extra Column Aliases",
+        description="Mapping of SQL column labels to their user-facing aliases.",
+    )
+    check_path: bool = Field(
+        default=False,
+        title="Check Paths Exist",
+        description="Whether to validate paths after executing search queries.",
+    )
 
 def build_pql(
     query: PQLQuery,
@@ -190,6 +200,8 @@ def build_pql(
             compiled_count_query=None,
             result_metrics=result_query_metrics,
             count_metrics=count_query_metrics,
+            extra_columns={},
+            check_path=query.check_path,
         )
     if query.count:
         start_time = time.time()
@@ -207,6 +219,8 @@ def build_pql(
                 ),
                 result_metrics=result_query_metrics,
                 count_metrics=count_query_metrics,
+                extra_columns={},
+                check_path=query.check_path,
             )
     else:
         count_sql_string = ""
@@ -229,4 +243,6 @@ def build_pql(
         ) if query.count else None,
         result_metrics=result_query_metrics,
         count_metrics=count_query_metrics,
+        extra_columns=extra_columns,
+        check_path=query.check_path,
     )

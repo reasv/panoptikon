@@ -250,6 +250,61 @@ pub(crate) async fn get_item_metadata(
     })
 }
 
+pub(crate) async fn get_existing_file_for_item_id(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: i64,
+) -> ApiResult<Option<FileRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, sha256, path, last_modified, filename
+        FROM files
+        WHERE item_id = ?
+        ORDER BY available DESC
+        "#,
+    )
+    .bind(item_id)
+    .fetch_all(conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read files for item");
+        ApiError::internal("Failed to read file metadata")
+    })?;
+
+    for row in rows {
+        let path: String = row.try_get("path").map_err(|err| {
+            tracing::error!(error = %err, "failed to read file path");
+            ApiError::internal("Failed to read file metadata")
+        })?;
+        if PathBuf::from(&path).exists() {
+            let id: i64 = row.try_get("id").map_err(|err| {
+                tracing::error!(error = %err, "failed to read file id");
+                ApiError::internal("Failed to read file metadata")
+            })?;
+            let sha256: String = row.try_get("sha256").map_err(|err| {
+                tracing::error!(error = %err, "failed to read file sha256");
+                ApiError::internal("Failed to read file metadata")
+            })?;
+            let last_modified: String = row.try_get("last_modified").map_err(|err| {
+                tracing::error!(error = %err, "failed to read file last_modified");
+                ApiError::internal("Failed to read file metadata")
+            })?;
+            let filename: String = row.try_get("filename").map_err(|err| {
+                tracing::error!(error = %err, "failed to read file filename");
+                ApiError::internal("Failed to read file metadata")
+            })?;
+            return Ok(Some(FileRecord {
+                id,
+                sha256,
+                path,
+                last_modified,
+                filename,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
 pub(crate) async fn get_extracted_text_for_item(
     conn: &mut sqlx::SqliteConnection,
     item_id: i64,

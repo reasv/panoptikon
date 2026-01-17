@@ -8,7 +8,7 @@ Architecture (current)
 - Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
@@ -27,6 +27,10 @@ Behavior (important)
 - Local DB access:
   - Local handlers use a shared extractor to read `index_db`/`user_data_db` query params.
   - Read-only connections attach `storage` and `user_data` databases, mirroring Python behavior.
+- Local PQL search:
+  - `/api/search/pql` compiles PQL queries via the upstream `/api/search/pql/build` endpoint.
+  - The compiled SQL and parameters are executed against the local database.
+  - Extra columns use the upstream alias map, and `check_path` results are validated with fallback file lookup.
 - Streaming:
   - All responses are streamed except `/api/db`, which is buffered so it can be filtered.
 

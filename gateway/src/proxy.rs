@@ -33,6 +33,10 @@ impl Upstream {
             base_uri,
         })
     }
+
+    pub(crate) fn uri_for(&self, path_and_query: &str) -> Result<Uri> {
+        build_uri(&self.base_uri, path_and_query)
+    }
 }
 
 pub struct ProxyState {
