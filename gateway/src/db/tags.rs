@@ -155,6 +155,66 @@ pub(crate) async fn get_most_common_tags_frequency(
     Ok(results)
 }
 
+pub(crate) async fn get_all_tag_namespaces(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT namespace
+        FROM tags
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read tag namespaces");
+        ApiError::internal("Failed to get tag namespaces")
+    })?;
+
+    let mut namespaces = Vec::with_capacity(rows.len());
+    for row in rows {
+        let namespace: String = row.try_get("namespace").map_err(|err| {
+            tracing::error!(error = %err, "failed to read tag namespace");
+            ApiError::internal("Failed to get tag namespaces")
+        })?;
+        namespaces.push(namespace);
+    }
+
+    let mut prefixes = std::collections::HashSet::new();
+    for namespace in &namespaces {
+        if let Some(prefix) = namespace.split(':').next() {
+            prefixes.insert(prefix.to_string());
+        }
+    }
+    namespaces.extend(prefixes.into_iter());
+    namespaces.sort();
+    Ok(namespaces)
+}
+
+pub(crate) async fn get_min_tag_confidence(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<f64> {
+    let row = sqlx::query(
+        r#"
+        SELECT MIN(confidence) AS min_confidence
+        FROM tags_items
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read tag confidence");
+        ApiError::internal("Failed to get tag confidence")
+    })?;
+
+    let min_confidence: Option<f64> = row.try_get("min_confidence").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse tag confidence");
+        ApiError::internal("Failed to get tag confidence")
+    })?;
+
+    Ok(min_confidence.unwrap_or(0.0))
+}
+
 async fn get_most_common_tags(
     conn: &mut sqlx::SqliteConnection,
     namespace: Option<&str>,
@@ -361,6 +421,37 @@ mod tests {
                 ("ns".to_string(), "caterpillar".to_string(), 1)
             ]
         );
+    }
+
+    // Ensures tag namespaces include colon prefixes for search stats.
+    #[tokio::test]
+    async fn get_all_tag_namespaces_includes_prefixes() {
+        let mut conn = setup_tag_db().await;
+        sqlx::query("INSERT INTO tags (id, namespace, name) VALUES (4, 'ns:sub', 'lion')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let mut namespaces = get_all_tag_namespaces(&mut conn).await.unwrap();
+        namespaces.sort();
+
+        assert_eq!(
+            namespaces,
+            vec![
+                "ns".to_string(),
+                "ns".to_string(),
+                "ns:sub".to_string()
+            ]
+        );
+    }
+
+    // Ensures the minimum tag confidence is returned for stats.
+    #[tokio::test]
+    async fn get_min_tag_confidence_returns_minimum() {
+        let mut conn = setup_tag_db().await;
+        let min_confidence = get_min_tag_confidence(&mut conn).await.unwrap();
+
+        assert!((min_confidence - 0.5).abs() < 1e-6);
     }
 
     // Ensures top tags include frequency based on distinct item-setter pairs.

@@ -58,6 +58,12 @@ pub(crate) struct ExtractedTextRecord {
     pub length: i64,
 }
 
+pub(crate) struct TextStats {
+    pub languages: Vec<String>,
+    pub lowest_language_confidence: Option<f64>,
+    pub lowest_confidence: Option<f64>,
+}
+
 pub(crate) async fn get_item_metadata(
     conn: &mut sqlx::SqliteConnection,
     identifier: &str,
@@ -413,6 +419,61 @@ pub(crate) async fn get_text_by_ids(
     Ok(extracted)
 }
 
+pub(crate) async fn get_text_stats(conn: &mut sqlx::SqliteConnection) -> ApiResult<TextStats> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT language
+        FROM extracted_text
+        WHERE language IS NOT NULL
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read text languages");
+        ApiError::internal("Failed to get text stats")
+    })?;
+
+    let mut languages = Vec::with_capacity(rows.len());
+    for row in rows {
+        let language: String = row.try_get("language").map_err(|err| {
+            tracing::error!(error = %err, "failed to read language");
+            ApiError::internal("Failed to get text stats")
+        })?;
+        languages.push(language);
+    }
+
+    let row = sqlx::query(
+        r#"
+        SELECT MIN(language_confidence) AS min_language_confidence,
+               MIN(confidence) AS min_confidence
+        FROM extracted_text
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read text confidence stats");
+        ApiError::internal("Failed to get text stats")
+    })?;
+
+    let lowest_language_confidence: Option<f64> =
+        row.try_get("min_language_confidence").map_err(|err| {
+            tracing::error!(error = %err, "failed to parse language confidence");
+            ApiError::internal("Failed to get text stats")
+        })?;
+    let lowest_confidence: Option<f64> = row.try_get("min_confidence").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse text confidence");
+        ApiError::internal("Failed to get text stats")
+    })?;
+
+    Ok(TextStats {
+        languages,
+        lowest_language_confidence,
+        lowest_confidence,
+    })
+}
+
 pub(crate) async fn get_all_tags_for_item(
     conn: &mut sqlx::SqliteConnection,
     item_id: i64,
@@ -532,6 +593,80 @@ fn limit_tags_by_namespace(
 
     limited.sort_by_key(|(index, _)| *index);
     limited.into_iter().map(|(_, tag)| tag).collect()
+}
+
+pub(crate) async fn get_all_mime_types(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT type
+        FROM items
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read mime types");
+        ApiError::internal("Failed to get mime types")
+    })?;
+
+    let mut mime_types = Vec::with_capacity(rows.len());
+    let mut general_types = std::collections::HashSet::new();
+    for row in rows {
+        let mime_type: String = row.try_get("type").map_err(|err| {
+            tracing::error!(error = %err, "failed to read mime type");
+            ApiError::internal("Failed to get mime types")
+        })?;
+        if let Some(prefix) = mime_type.split('/').next() {
+            general_types.insert(format!("{prefix}/"));
+        }
+        mime_types.push(mime_type);
+    }
+
+    mime_types.extend(general_types.into_iter());
+    mime_types.sort();
+    Ok(mime_types)
+}
+
+pub(crate) async fn get_file_stats(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<(i64, i64)> {
+    let file_row = sqlx::query(
+        r#"
+        SELECT COUNT(*) AS total_files
+        FROM files
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read file stats");
+        ApiError::internal("Failed to get file stats")
+    })?;
+    let total_files: i64 = file_row.try_get("total_files").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse file stats");
+        ApiError::internal("Failed to get file stats")
+    })?;
+
+    let item_row = sqlx::query(
+        r#"
+        SELECT COUNT(*) AS total_items
+        FROM items
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read item stats");
+        ApiError::internal("Failed to get file stats")
+    })?;
+    let total_items: i64 = item_row.try_get("total_items").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse item stats");
+        ApiError::internal("Failed to get file stats")
+    })?;
+
+    Ok((total_files, total_items))
 }
 
 pub(crate) async fn get_thumbnail_bytes(
@@ -675,5 +810,126 @@ mod tests {
         assert!(result.item.is_some());
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, file_path.to_string_lossy());
+    }
+
+    // Ensures mime type stats include general type prefixes.
+    #[tokio::test]
+    async fn get_all_mime_types_includes_general_types() {
+        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO items (id, type) VALUES (1, 'image/png'), (2, 'video/mp4')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let types = get_all_mime_types(&mut conn).await.unwrap();
+
+        assert_eq!(
+            types,
+            vec![
+                "image/".to_string(),
+                "image/png".to_string(),
+                "video/".to_string(),
+                "video/mp4".to_string()
+            ]
+        );
+    }
+
+    // Ensures file stats count both files and items.
+    #[tokio::test]
+    async fn get_file_stats_counts_rows() {
+        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO items (id, type) VALUES (1, 'image/png'), (2, 'video/mp4')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, item_id)
+            VALUES
+                (10, 1),
+                (11, 1),
+                (12, 2)
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let (files, items) = get_file_stats(&mut conn).await.unwrap();
+
+        assert_eq!(files, 3);
+        assert_eq!(items, 2);
+    }
+
+    // Ensures text stats return available languages and minimum confidences.
+    #[tokio::test]
+    async fn get_text_stats_returns_languages_and_mins() {
+        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE extracted_text (
+                id INTEGER PRIMARY KEY,
+                language TEXT,
+                language_confidence REAL,
+                confidence REAL
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO extracted_text (id, language, language_confidence, confidence)
+            VALUES
+                (1, 'en', 0.8, 0.9),
+                (2, 'fr', 0.6, 0.4),
+                (3, NULL, NULL, NULL)
+            "#,
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let stats = get_text_stats(&mut conn).await.unwrap();
+        let mut languages = stats.languages.clone();
+        languages.sort();
+
+        assert_eq!(languages, vec!["en".to_string(), "fr".to_string()]);
+        assert_eq!(stats.lowest_language_confidence, Some(0.6));
+        assert_eq!(stats.lowest_confidence, Some(0.4));
     }
 }
