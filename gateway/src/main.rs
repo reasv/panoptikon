@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     if settings.upstreams.api.local {
         app = app
             .route("/api/db", get(api::db::db_info))
+            .route("/api/db/create", post(api::db::db_create))
             .route("/api/bookmarks/ns", get(api::bookmarks::bookmark_namespaces))
             .route("/api/bookmarks/users", get(api::bookmarks::bookmark_users))
             .route(

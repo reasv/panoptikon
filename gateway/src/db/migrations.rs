@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use sqlx::{Connection, SqliteConnection, migrate::Migrator, sqlite::SqliteConnectOptions};
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +41,20 @@ pub(crate) enum MigratedDatabases {
     Memory(InMemoryDatabases),
 }
 
+pub(crate) async fn migrate_databases_on_disk(
+    index_db: Option<&str>,
+    user_data_db: Option<&str>,
+) -> Result<DbPaths> {
+    let (default_index, default_user) = db_default_names();
+    let index_db = index_db.unwrap_or(&default_index).to_string();
+    let user_data_db = user_data_db.unwrap_or(&default_user).to_string();
+    let paths = db_paths(&index_db, &user_data_db)?;
+    migrate_path(&paths.index_db_file, &INDEX_MIGRATOR).await?;
+    migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR).await?;
+    migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR).await?;
+    Ok(paths)
+}
+
 pub(crate) async fn migrate_databases(
     index_db: Option<&str>,
     user_data_db: Option<&str>,
@@ -53,10 +66,7 @@ pub(crate) async fn migrate_databases(
 
     match target {
         MigrationTarget::Disk => {
-            let paths = db_paths(&index_db, &user_data_db)?;
-            migrate_path(&paths.index_db_file, &INDEX_MIGRATOR).await?;
-            migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR).await?;
-            migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR).await?;
+            let paths = migrate_databases_on_disk(Some(&index_db), Some(&user_data_db)).await?;
             Ok(MigratedDatabases::Disk(paths))
         }
         MigrationTarget::Memory => {
@@ -79,8 +89,12 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
 
     fs::create_dir_all(&index_db_dir)
         .with_context(|| format!("failed to create index dir {}", index_db_dir.display()))?;
-    fs::create_dir_all(&user_data_db_dir)
-        .with_context(|| format!("failed to create user data dir {}", user_data_db_dir.display()))?;
+    fs::create_dir_all(&user_data_db_dir).with_context(|| {
+        format!(
+            "failed to create user data dir {}",
+            user_data_db_dir.display()
+        )
+    })?;
 
     let index_dir = index_db_dir.join(index_db);
     fs::create_dir_all(&index_dir)
@@ -119,9 +133,12 @@ async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InM
     let user_data_key = memory_key(&format!("user-data-{user_data_db}"), suffix);
 
     // Use shared-cache in-memory database names so separate connections can attach to them.
-    let index_url = format!("sqlite://{index_key}?mode=memory&cache=shared");
-    let storage_url = format!("sqlite://{storage_key}?mode=memory&cache=shared");
-    let user_data_url = format!("sqlite://{user_data_key}?mode=memory&cache=shared");
+    let index_uri = format!("{index_key}?mode=memory&cache=shared");
+    let storage_uri = format!("{storage_key}?mode=memory&cache=shared");
+    let user_data_uri = format!("{user_data_key}?mode=memory&cache=shared");
+    let index_url = format!("sqlite://{index_uri}");
+    let storage_url = format!("sqlite://{storage_uri}");
+    let user_data_url = format!("sqlite://{user_data_uri}");
 
     let mut index_conn = SqliteConnection::connect(&index_url)
         .await
@@ -147,12 +164,12 @@ async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InM
         .context("failed to migrate in-memory user data db")?;
 
     sqlx::query("ATTACH DATABASE ? AS storage")
-        .bind(&storage_key)
+        .bind(&storage_uri)
         .execute(&mut index_conn)
         .await
         .context("failed to attach in-memory storage db")?;
     sqlx::query("ATTACH DATABASE ? AS user_data")
-        .bind(&user_data_key)
+        .bind(&user_data_uri)
         .execute(&mut index_conn)
         .await
         .context("failed to attach in-memory user data db")?;
