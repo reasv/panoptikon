@@ -32,6 +32,7 @@ Behavior (important)
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.
+  - Existing Python-created DBs without `_sqlx_migrations` are baselined to the first migration so future migrations can apply.
 - Local PQL search:
   - `/api/search/pql` compiles PQL queries via the upstream `/api/search/pql/build` endpoint.
   - The compiled SQL and parameters are executed against the local database.

@@ -1,7 +1,7 @@
+mod api;
 mod api_error;
 mod config;
 mod db;
-mod api;
 mod policy;
 mod proxy;
 
@@ -62,7 +62,10 @@ async fn main() -> anyhow::Result<()> {
         app = app
             .route("/api/db", get(api::db::db_info))
             .route("/api/db/create", post(api::db::db_create))
-            .route("/api/bookmarks/ns", get(api::bookmarks::bookmark_namespaces))
+            .route(
+                "/api/bookmarks/ns",
+                get(api::bookmarks::bookmark_namespaces),
+            )
             .route("/api/bookmarks/users", get(api::bookmarks::bookmark_users))
             .route(
                 "/api/bookmarks/ns/{namespace}",

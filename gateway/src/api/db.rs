@@ -46,11 +46,11 @@ pub async fn db_create(
     })
     .await
     .map_err(|err| {
-        tracing::error!(error = %err, "failed to join database migration task");
+        tracing::error!(error = ?err, "failed to join database migration task");
         ApiError::internal("Failed to create databases")
     })?
     .map_err(|err| {
-        tracing::error!(error = %err, "failed to create databases");
+        tracing::error!(error = ?err, "failed to create databases");
         ApiError::internal("Failed to create databases")
     })?;
 

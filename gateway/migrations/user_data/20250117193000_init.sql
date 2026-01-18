@@ -1,5 +1,4 @@
 -- Generated from user_data.sqlite_master; do not edit by hand.
-PRAGMA foreign_keys=OFF;
 CREATE TABLE alembic_version (
 	version_num VARCHAR(32) NOT NULL, 
 	CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
@@ -17,4 +16,3 @@ CREATE INDEX idx_bookmarks_namespace ON bookmarks(namespace);
 CREATE INDEX idx_bookmarks_sha256 ON bookmarks(sha256);
 CREATE INDEX idx_bookmarks_time_added ON bookmarks(time_added);
 CREATE INDEX idx_bookmarks_user ON bookmarks(user);
-PRAGMA foreign_keys=ON;

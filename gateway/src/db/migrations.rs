@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sqlx::{Connection, SqliteConnection, migrate::Migrator, sqlite::SqliteConnectOptions};
+use sqlx::{Connection, SqliteConnection, migrate::{Migrator, Migrate}, sqlite::SqliteConnectOptions};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -116,11 +116,84 @@ async fn migrate_path(path: &Path, migrator: &Migrator) -> Result<()> {
     let mut conn = SqliteConnection::connect_with(&options)
         .await
         .with_context(|| format!("failed to open database {}", path.display()))?;
+    ensure_baseline_if_needed(&mut conn, migrator).await?;
     migrator
         .run(&mut conn)
         .await
         .with_context(|| format!("failed to migrate database {}", path.display()))?;
     Ok(())
+}
+
+async fn ensure_baseline_if_needed(conn: &mut SqliteConnection, migrator: &Migrator) -> Result<()> {
+    let has_user_tables = has_user_tables(conn).await?;
+    if !has_user_tables {
+        return Ok(());
+    }
+
+    let has_migrations_table = table_exists(conn, "_sqlx_migrations").await?;
+    let applied_count = if has_migrations_table {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&mut *conn)
+            .await
+            .context("failed to read applied migrations count")?;
+        row.0
+    } else {
+        0
+    };
+
+    if applied_count > 0 {
+        return Ok(());
+    }
+
+    conn.ensure_migrations_table()
+        .await
+        .context("failed to ensure migrations table")?;
+
+    let baseline = migrator
+        .iter()
+        .find(|migration| !migration.migration_type.is_down_migration());
+    if let Some(migration) = baseline {
+        sqlx::query(
+            r#"
+INSERT OR IGNORE INTO _sqlx_migrations (
+    version,
+    description,
+    success,
+    checksum,
+    execution_time
+) VALUES (?1, ?2, TRUE, ?3, 0)
+            "#,
+        )
+        .bind(migration.version)
+        .bind(migration.description.as_ref())
+        .bind(migration.checksum.as_ref())
+        .execute(&mut *conn)
+        .await
+        .context("failed to record baseline migration")?;
+    }
+
+    Ok(())
+}
+
+async fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+    )
+    .bind(table_name)
+    .fetch_optional(conn)
+    .await
+    .context("failed to check for migrations table")?;
+    Ok(row.is_some())
+}
+
+async fn has_user_tables(conn: &mut SqliteConnection) -> Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != '_sqlx_migrations' LIMIT 1",
+    )
+    .fetch_optional(conn)
+    .await
+    .context("failed to inspect sqlite_master tables")?;
+    Ok(row.is_some())
 }
 
 async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InMemoryDatabases> {

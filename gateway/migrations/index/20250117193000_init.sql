@@ -1,5 +1,4 @@
 -- Generated from main.sqlite_master; do not edit by hand.
-PRAGMA foreign_keys=OFF;
 CREATE TABLE alembic_version (
 	version_num VARCHAR(32) NOT NULL, 
 	CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
@@ -47,10 +46,6 @@ CREATE VIRTUAL TABLE extracted_text_fts
             content_rowid="id",
             tokenize="trigram case_sensitive 0"
         );
-CREATE TABLE 'extracted_text_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID;
-CREATE TABLE 'extracted_text_fts_data'(id INTEGER PRIMARY KEY, block BLOB);
-CREATE TABLE 'extracted_text_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB);
-CREATE TABLE 'extracted_text_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID;
 CREATE TABLE file_scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         start_time TEXT NOT NULL,         -- Using TEXT to store ISO-8601 formatted datetime
@@ -77,7 +72,7 @@ CREATE TABLE files (
         last_modified TEXT NOT NULL,      -- Using TEXT to store ISO-8601 formatted datetime
         scan_id INTEGER NOT NULL,
         available BOOLEAN NOT NULL,       -- BOOLEAN to indicate if the path is available
-        FOREIGN KEY(item_id) REFERENCES items(id)
+        FOREIGN KEY(item_id) REFERENCES items(id),
         FOREIGN KEY(scan_id) REFERENCES file_scans(id) ON DELETE CASCADE
     );
 CREATE VIRTUAL TABLE files_path_fts
@@ -88,10 +83,6 @@ CREATE VIRTUAL TABLE files_path_fts
             content_rowid='id',
             tokenize='trigram case_sensitive 0'
         );
-CREATE TABLE 'files_path_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID;
-CREATE TABLE 'files_path_fts_data'(id INTEGER PRIMARY KEY, block BLOB);
-CREATE TABLE 'files_path_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB);
-CREATE TABLE 'files_path_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID;
 CREATE TABLE folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time_added TEXT NOT NULL,               -- Using TEXT to store ISO-8601 formatted datetime
@@ -146,7 +137,7 @@ CREATE TABLE tags_items (
         tag_id INTEGER NOT NULL,
         confidence REAL DEFAULT 1.0,
         UNIQUE(item_data_id, tag_id),
-        FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE
+        FOREIGN KEY(item_data_id) REFERENCES item_data(id) ON DELETE CASCADE,
         FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
     );
 CREATE TRIGGER extracted_text_ad AFTER DELETE ON extracted_text BEGIN
@@ -236,4 +227,3 @@ CREATE INDEX idx_tags_namespace ON tags(namespace);
 CREATE INDEX idx_tags_namespace_name ON tags(namespace, name);
 CREATE INDEX ix_file_scans_blurhash_time ON file_scans (blurhash_time);
 CREATE INDEX ix_items_blurhash ON items (blurhash);
-PRAGMA foreign_keys=ON;

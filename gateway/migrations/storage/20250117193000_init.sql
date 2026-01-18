@@ -1,5 +1,4 @@
 -- Generated from storage.sqlite_master; do not edit by hand.
-PRAGMA foreign_keys=OFF;
 CREATE TABLE alembic_version (
 	version_num VARCHAR(32) NOT NULL, 
 	CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
@@ -38,4 +37,3 @@ CREATE INDEX idx_thumbnails_item_mime_type ON thumbnails(item_mime_type);
 CREATE INDEX idx_thumbnails_item_sha256 ON thumbnails(item_sha256);
 CREATE INDEX idx_thumbnails_version ON thumbnails(version);
 CREATE INDEX idx_thumbnails_width ON thumbnails(width);
-PRAGMA foreign_keys=ON;

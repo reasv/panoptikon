@@ -70,7 +70,9 @@ sqlx migrate add --source gateway/migrations/index add_new_table
 
 Programmatic creation and migration lives in `gateway/src/db/migrations.rs`
 (`migrate_databases`) and supports both on-disk databases and shared
-in-memory databases for tests.
+in-memory databases for tests. Existing Python-created DBs that predate
+SQLx migrations are baselined to the first migration so later migrations
+can still apply.
 
 ## Configuration
 
