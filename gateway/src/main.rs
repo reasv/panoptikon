@@ -14,6 +14,17 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+fn env_truthy(key: &str) -> bool {
+    match env::var(key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" | "" => false,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "panoptikon-gateway",
@@ -60,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback(any(proxy::proxy_ui));
 
     if settings.upstreams.api.local {
-        let enable_db_create = env::var("EXPERIMENTAL_RUST_DB_CREATION").is_ok();
+        let enable_db_create = env_truthy("EXPERIMENTAL_RUST_DB_CREATION");
         app = app.route("/api/db", get(api::db::db_info));
         if enable_db_create {
             app = app.route("/api/db/create", post(api::db::db_create));

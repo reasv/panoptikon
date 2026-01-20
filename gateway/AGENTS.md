@@ -15,6 +15,7 @@ Behavior (important)
 - Policy selection by effective host (`Host`, optionally forwarded headers).
 - Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/openapi.json`).
 - `.env` is loaded at startup (if present) so env-based config can be set via dotenv files.
+- `EXPERIMENTAL_RUST_DB_CREATION` is treated as truthy only for `1`, `true`, `yes`, or `on` (case-insensitive).
 - DB param enforcement:
   - Enforces `index_db` and `user_data_db` for DB-aware routes.
   - Strips DB params for `/api/inference/*`, `/api/db`, and `/api/db/create`.
