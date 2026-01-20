@@ -279,3 +279,14 @@ fn memory_key(label: &str, suffix: u128) -> String {
     }
     format!("file:panoptikon-{normalized}-{suffix}")
 }
+
+#[cfg(test)]
+pub(crate) async fn setup_test_databases() -> InMemoryDatabases {
+    match migrate_databases(None, None, MigrationTarget::Memory)
+        .await
+        .expect("failed to create in-memory test databases")
+    {
+        MigratedDatabases::Memory(databases) => databases,
+        MigratedDatabases::Disk(_) => unreachable!("expected in-memory databases for tests"),
+    }
+}

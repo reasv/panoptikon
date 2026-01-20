@@ -38,38 +38,30 @@ pub(crate) async fn get_folders_from_database(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Connection;
+    use crate::db::migrations::setup_test_databases;
 
     // Ensures folder queries return only included entries by default.
     #[tokio::test]
     async fn get_folders_from_database_filters_included() {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE folders (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL,
-                included BOOLEAN NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO folders (path, included) VALUES (?, ?)")
+        let mut dbs = setup_test_databases().await;
+        sqlx::query("INSERT INTO folders (time_added, path, included) VALUES (?, ?, ?)")
+            .bind("2024-01-01T00:00:00")
             .bind(r"C:\data")
             .bind(1_i64)
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO folders (path, included) VALUES (?, ?)")
+        sqlx::query("INSERT INTO folders (time_added, path, included) VALUES (?, ?, ?)")
+            .bind("2024-01-01T00:00:00")
             .bind(r"C:\excluded")
             .bind(0_i64)
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
 
-        let folders = get_folders_from_database(&mut conn, true).await.unwrap();
+        let folders = get_folders_from_database(&mut dbs.index_conn, true)
+            .await
+            .unwrap();
 
         assert_eq!(folders, vec![r"C:\data".to_string()]);
     }

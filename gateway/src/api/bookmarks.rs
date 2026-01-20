@@ -530,67 +530,56 @@ async fn rollback_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::migrations::setup_test_databases;
     use serde_json::json;
-    use sqlx::{Connection, Row};
+    use sqlx::Row;
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    async fn setup_user_data_db() -> sqlx::SqliteConnection {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
-        sqlx::query("ATTACH DATABASE ':memory:' AS user_data")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE user_data.bookmarks (
-                user TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                time_added TEXT NOT NULL,
-                metadata TEXT,
-                UNIQUE(user, namespace, sha256)
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        conn
+    async fn setup_user_data_db() -> crate::db::migrations::InMemoryDatabases {
+        setup_test_databases().await
     }
 
-    async fn setup_bookmarks_db() -> sqlx::SqliteConnection {
-        let mut conn = setup_user_data_db().await;
+    async fn insert_scan(conn: &mut sqlx::SqliteConnection, id: i64, path: &str) {
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind("2024-01-01T00:00:00")
+            .bind(path)
+            .execute(conn)
+            .await
+            .unwrap();
+    }
+
+    async fn setup_bookmarks_db() -> crate::db::migrations::InMemoryDatabases {
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                sha256 TEXT NOT NULL,
-                type TEXT NOT NULL
-            )
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00'),
+                (2, 'sha_two', 'md5_two', 'image/jpeg', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
         sqlx::query(
             r#"
-            CREATE TABLE files (
-                id INTEGER PRIMARY KEY,
-                sha256 TEXT NOT NULL,
-                item_id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                last_modified TEXT NOT NULL,
-                available BOOLEAN NOT NULL
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
             )
+            VALUES
+                (10, 'sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', 1, 1),
+                (20, 'sha_two', 2, 'C:\data\two.png', 'two.png', '2024-01-02T00:00:00', 1, 1)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
-        conn
+        dbs
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -604,7 +593,7 @@ mod tests {
     // Ensures the bookmark namespaces response only returns namespaces for the default user.
     #[tokio::test]
     async fn load_bookmark_namespaces_returns_sorted_namespaces() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -616,7 +605,7 @@ mod tests {
         .bind("sha_z")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -630,7 +619,7 @@ mod tests {
         .bind("sha_a")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -644,7 +633,7 @@ mod tests {
         .bind("sha_other")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -658,11 +647,13 @@ mod tests {
         .bind("sha_b")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = load_bookmark_namespaces(&mut conn, "user").await.unwrap();
+        let response = load_bookmark_namespaces(&mut dbs.index_conn, "user")
+            .await
+            .unwrap();
 
         assert_eq!(response.namespaces, vec!["alpha", "beta", "zeta"]);
     }
@@ -670,7 +661,7 @@ mod tests {
     // Ensures the bookmark users response lists distinct users in order.
     #[tokio::test]
     async fn load_bookmark_users_returns_sorted_users() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -682,7 +673,7 @@ mod tests {
         .bind("sha_bob")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -696,11 +687,11 @@ mod tests {
         .bind("sha_alice")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = load_bookmark_users(&mut conn).await.unwrap();
+        let response = load_bookmark_users(&mut dbs.index_conn).await.unwrap();
 
         assert_eq!(response.users, vec!["alice", "bob"]);
     }
@@ -708,7 +699,7 @@ mod tests {
     // Ensures the bookmark metadata response reports existence and parses metadata JSON.
     #[tokio::test]
     async fn load_bookmark_metadata_returns_existing_bookmark() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -720,11 +711,11 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(r#"{"note":"hello"}"#)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = load_bookmark_metadata(&mut conn, "favorites", "sha256", "user")
+        let response = load_bookmark_metadata(&mut dbs.index_conn, "favorites", "sha256", "user")
             .await
             .unwrap();
 
@@ -736,16 +727,16 @@ mod tests {
     // Ensures adding a single bookmark stores metadata and returns the success message.
     #[tokio::test]
     async fn add_bookmark_entry_inserts_metadata() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         let metadata = json!({"note": "added"});
 
         let response =
-            add_bookmark_entry(&mut conn, "favorites", "sha256", "user", Some(&metadata))
+            add_bookmark_entry(&mut dbs.index_conn, "favorites", "sha256", "user", Some(&metadata))
                 .await
                 .unwrap();
 
         assert_eq!(response.message, "Added bookmark");
-        let saved = load_bookmark_metadata(&mut conn, "favorites", "sha256", "user")
+        let saved = load_bookmark_metadata(&mut dbs.index_conn, "favorites", "sha256", "user")
             .await
             .unwrap();
         assert_eq!(saved.metadata.as_ref(), Some(&metadata));
@@ -754,7 +745,7 @@ mod tests {
     // Ensures bulk bookmark creation applies per-item metadata overrides.
     #[tokio::test]
     async fn add_bookmarks_bulk_resolves_metadata() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         let items = ItemsMeta {
             sha256: vec!["sha_a".to_string(), "sha_b".to_string()],
             metadata: Some(json!({
@@ -763,16 +754,16 @@ mod tests {
             })),
         };
 
-        let response = add_bookmarks_bulk(&mut conn, "favorites", "user", &items)
+        let response = add_bookmarks_bulk(&mut dbs.index_conn, "favorites", "user", &items)
             .await
             .unwrap();
 
         assert_eq!(response.message, "Added 2 bookmarks");
-        let bookmark_a = load_bookmark_metadata(&mut conn, "favorites", "sha_a", "user")
+        let bookmark_a = load_bookmark_metadata(&mut dbs.index_conn, "favorites", "sha_a", "user")
             .await
             .unwrap();
         assert_eq!(bookmark_a.metadata, Some(json!({"note": "a"})));
-        let bookmark_b = load_bookmark_metadata(&mut conn, "favorites", "sha_b", "user")
+        let bookmark_b = load_bookmark_metadata(&mut dbs.index_conn, "favorites", "sha_b", "user")
             .await
             .unwrap();
         assert_eq!(
@@ -784,48 +775,28 @@ mod tests {
     // Ensures namespace queries include wildcard-user bookmarks when requested.
     #[tokio::test]
     async fn load_bookmarks_by_namespace_includes_wildcard_user() {
-        let mut conn = setup_bookmarks_db().await;
+        let mut dbs = setup_bookmarks_db().await;
         let path_one = temp_path("bookmark_one");
         let path_two = temp_path("bookmark_two");
         std::fs::write(&path_one, b"one").unwrap();
         std::fs::write(&path_two, b"two").unwrap();
 
-        sqlx::query("INSERT INTO items (id, sha256, type) VALUES (?, ?, ?)")
-            .bind(1_i64)
-            .bind("sha_one")
-            .bind("image/png")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO items (id, sha256, type) VALUES (?, ?, ?)")
-            .bind(2_i64)
-            .bind("sha_two")
-            .bind("image/jpeg")
-            .execute(&mut conn)
-            .await
-            .unwrap();
         sqlx::query(
-            "INSERT INTO files (id, sha256, item_id, path, last_modified, available) VALUES (?, ?, ?, ?, ?, ?)",
+            "UPDATE files SET path = ?, last_modified = ? WHERE id = ?",
         )
-        .bind(10_i64)
-        .bind("sha_one")
-        .bind(1_i64)
         .bind(path_one.to_string_lossy().to_string())
         .bind("2024-01-01T00:00:00")
-        .bind(1_i64)
-        .execute(&mut conn)
+        .bind(10_i64)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO files (id, sha256, item_id, path, last_modified, available) VALUES (?, ?, ?, ?, ?, ?)",
+            "UPDATE files SET path = ?, last_modified = ? WHERE id = ?",
         )
-        .bind(20_i64)
-        .bind("sha_two")
-        .bind(2_i64)
         .bind(path_two.to_string_lossy().to_string())
         .bind("2024-01-02T00:00:00")
-        .bind(1_i64)
-        .execute(&mut conn)
+        .bind(20_i64)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -839,7 +810,7 @@ mod tests {
         .bind("sha_one")
         .bind("2024-01-03T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -853,12 +824,12 @@ mod tests {
         .bind("sha_two")
         .bind("2024-01-04T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
         let response = load_bookmarks_by_namespace(
-            &mut conn,
+            &mut dbs.index_conn,
             "favorites",
             "user",
             1000,
@@ -877,7 +848,7 @@ mod tests {
     // Ensures deleting bookmarks by namespace with item list removes only those entries.
     #[tokio::test]
     async fn delete_bookmarks_namespace_deletes_selected_items() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -889,7 +860,7 @@ mod tests {
         .bind("sha_one")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -903,14 +874,20 @@ mod tests {
         .bind("sha_two")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
         let items = Items {
             sha256: vec!["sha_two".to_string()],
         };
-        let response = delete_bookmarks_namespace(&mut conn, "favorites", "user", 0, Some(&items))
+        let response = delete_bookmarks_namespace(
+            &mut dbs.index_conn,
+            "favorites",
+            "user",
+            0,
+            Some(&items),
+        )
             .await
             .unwrap();
 
@@ -924,7 +901,7 @@ mod tests {
         )
         .bind("user")
         .bind("favorites")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut dbs.index_conn)
         .await
         .unwrap();
         let count: i64 = remaining.try_get("count").unwrap();
@@ -934,7 +911,7 @@ mod tests {
     // Ensures namespace deletion keeps the most recent bookmarks when exclude_last_n is set.
     #[tokio::test]
     async fn delete_bookmarks_namespace_excludes_last_n() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         for (sha, ts) in [
             ("sha_one", "2024-01-01T00:00:00"),
             ("sha_two", "2024-01-02T00:00:00"),
@@ -951,12 +928,12 @@ mod tests {
             .bind(sha)
             .bind(ts)
             .bind(Option::<String>::None)
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
         }
 
-        let response = delete_bookmarks_namespace(&mut conn, "favorites", "user", 1, None)
+        let response = delete_bookmarks_namespace(&mut dbs.index_conn, "favorites", "user", 1, None)
             .await
             .unwrap();
 
@@ -970,7 +947,7 @@ mod tests {
         )
         .bind("user")
         .bind("favorites")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut dbs.index_conn)
         .await
         .unwrap();
         let count: i64 = remaining.try_get("count").unwrap();
@@ -980,7 +957,7 @@ mod tests {
     // Ensures the bookmarks response includes namespaces and parsed metadata for the item.
     #[tokio::test]
     async fn load_item_bookmarks_returns_metadata() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -992,11 +969,11 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(r#"{"note":"test"}"#)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = load_item_bookmarks(&mut conn, "sha256", "user")
+        let response = load_item_bookmarks(&mut dbs.index_conn, "sha256", "user")
             .await
             .unwrap();
 
@@ -1014,7 +991,7 @@ mod tests {
     // Ensures deleting with the wildcard namespace removes all matching bookmarks.
     #[tokio::test]
     async fn delete_bookmark_entry_removes_all_namespaces() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -1026,7 +1003,7 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -1040,11 +1017,11 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = delete_bookmark_entry(&mut conn, "sha256", "*", "user")
+        let response = delete_bookmark_entry(&mut dbs.index_conn, "sha256", "*", "user")
             .await
             .unwrap();
 
@@ -1058,7 +1035,7 @@ mod tests {
         )
         .bind("sha256")
         .bind("user")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut dbs.index_conn)
         .await
         .unwrap();
         let count: i64 = remaining.try_get("count").unwrap();
@@ -1068,7 +1045,7 @@ mod tests {
     // Ensures deleting a specific namespace leaves other namespaces intact.
     #[tokio::test]
     async fn delete_bookmark_entry_removes_single_namespace() {
-        let mut conn = setup_user_data_db().await;
+        let mut dbs = setup_user_data_db().await;
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -1080,7 +1057,7 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -1094,11 +1071,11 @@ mod tests {
         .bind("sha256")
         .bind("2024-01-01T00:00:00")
         .bind(Option::<String>::None)
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let response = delete_bookmark_entry(&mut conn, "sha256", "favorites", "user")
+        let response = delete_bookmark_entry(&mut dbs.index_conn, "sha256", "favorites", "user")
             .await
             .unwrap();
 
@@ -1112,7 +1089,7 @@ mod tests {
         )
         .bind("sha256")
         .bind("user")
-        .fetch_one(&mut conn)
+        .fetch_one(&mut dbs.index_conn)
         .await
         .unwrap();
         let count: i64 = remaining.try_get("count").unwrap();

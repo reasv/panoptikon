@@ -583,68 +583,19 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Connection;
+    use crate::db::migrations::setup_test_databases;
 
-    async fn setup_tag_db() -> sqlx::SqliteConnection {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+    async fn setup_tag_db() -> crate::db::migrations::InMemoryDatabases {
+        let mut dbs = setup_test_databases().await;
         sqlx::query(
             r#"
-            CREATE TABLE tags (
-                id INTEGER PRIMARY KEY,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE item_data (
-                id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL,
-                setter_id INTEGER NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE tags_items (
-                id INTEGER PRIMARY KEY,
-                item_data_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                confidence REAL NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE setters (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            INSERT INTO tags (id, namespace, name)
+            INSERT INTO items (id, sha256, md5, type, time_added)
             VALUES
-                (1, 'ns', 'cat'),
-                (2, 'ns', 'caterpillar')
+                (100, 'sha_100', 'md5_100', 'image/png', '2024-01-01T00:00:00'),
+                (101, 'sha_101', 'md5_101', 'image/png', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -654,18 +605,29 @@ mod tests {
                 (1, 'alpha')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO item_data (id, item_id, setter_id)
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
             VALUES
-                (10, 100, 1),
-                (11, 101, 1)
+                (10, 100, 1, 'tags', 0, 1),
+                (11, 101, 1, 'tags', 0, 1)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO tags (id, namespace, name)
+            VALUES
+                (1, 'ns', 'cat'),
+                (2, 'ns', 'caterpillar')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -677,18 +639,18 @@ mod tests {
                 (11, 1, 0.8)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        conn
+        dbs
     }
 
     // Ensures tags are sorted by descending count to match the FastAPI handler.
     #[tokio::test]
     async fn load_tags_sorts_by_frequency_desc() {
-        let mut conn = setup_tag_db().await;
-        let tags = load_tags(&mut conn, "cat", 10).await.unwrap();
+        let mut dbs = setup_tag_db().await;
+        let tags = load_tags(&mut dbs.index_conn, "cat", 10).await.unwrap();
 
         assert_eq!(
             tags,
@@ -702,8 +664,10 @@ mod tests {
     // Ensures top tag results include frequency fractions based on total taggable pairs.
     #[tokio::test]
     async fn load_top_tags_returns_frequency() {
-        let mut conn = setup_tag_db().await;
-        let tags = load_top_tags(&mut conn, None, &[], None, 10).await.unwrap();
+        let mut dbs = setup_tag_db().await;
+        let tags = load_top_tags(&mut dbs.index_conn, None, &[], None, 10)
+            .await
+            .unwrap();
 
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].0, "ns");
@@ -715,122 +679,18 @@ mod tests {
         assert!((tags[1].3 - 0.5).abs() < 1e-6);
     }
 
-    async fn setup_stats_db() -> sqlx::SqliteConnection {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
-        sqlx::query("ATTACH DATABASE ':memory:' AS user_data")
-            .execute(&mut conn)
+    async fn insert_scan(conn: &mut sqlx::SqliteConnection, id: i64, path: &str) {
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind("2024-01-01T00:00:00")
+            .bind(path)
+            .execute(conn)
             .await
             .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE user_data.bookmarks (
-                user TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                time_added TEXT NOT NULL,
-                metadata TEXT
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE files (
-                id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE tags (
-                id INTEGER PRIMARY KEY,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE setters (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE item_data (
-                id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL,
-                setter_id INTEGER NOT NULL,
-                data_type TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE tags_items (
-                id INTEGER PRIMARY KEY,
-                item_data_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                confidence REAL NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE extracted_text (
-                id INTEGER PRIMARY KEY,
-                language TEXT,
-                language_confidence REAL,
-                confidence REAL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE folders (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL,
-                included BOOLEAN NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
+    }
+
+    async fn setup_stats_db() -> crate::db::migrations::InMemoryDatabases {
+        let mut dbs = setup_test_databases().await;
 
         sqlx::query(
             r#"
@@ -841,23 +701,33 @@ mod tests {
                 ('other', 'skip', 'sha_c', '2024-01-01T00:00:00', NULL)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO items (id, type) VALUES (1, 'image/png'), (2, 'video/mp4')")
-            .execute(&mut conn)
-            .await
-            .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO files (id, item_id)
+            INSERT INTO items (id, sha256, md5, type, time_added)
             VALUES
-                (10, 1),
-                (11, 1),
-                (12, 2)
+                (1, 'sha_a', 'md5_a', 'image/png', '2024-01-01T00:00:00'),
+                (2, 'sha_b', 'md5_b', 'video/mp4', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_a', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_a', 1, 'C:\data\two.png', 'two.png', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_b', 2, 'C:\data\three.png', 'three.png', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -868,23 +738,23 @@ mod tests {
                 (2, 'other:tag', 'dog')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'alpha'), (2, 'beta')")
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO item_data (id, item_id, setter_id, data_type)
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
             VALUES
-                (10, 1, 1, 'text'),
-                (11, 2, 1, 'tags'),
-                (12, 2, 2, 'clip')
+                (10, 1, 1, 'text', 0, 1),
+                (11, 2, 1, 'tags', 0, 1),
+                (12, 2, 2, 'clip', 0, 1)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
@@ -895,41 +765,45 @@ mod tests {
                 (11, 2, 0.8)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO extracted_text (id, language, language_confidence, confidence)
+            INSERT INTO extracted_text (id, language, language_confidence, confidence, text, text_length)
             VALUES
-                (1, 'en', 0.9, 0.5),
-                (2, 'fr', 0.7, 0.4)
+                (10, 'en', 0.9, 0.5, 'hello', 5),
+                (12, 'fr', 0.7, 0.4, 'bonjour', 7)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO folders (path, included) VALUES (?, ?)")
+        sqlx::query("INSERT INTO folders (time_added, path, included) VALUES (?, ?, ?)")
+            .bind("2024-01-01T00:00:00")
             .bind(r"C:\data")
             .bind(1_i64)
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO folders (path, included) VALUES (?, ?)")
+        sqlx::query("INSERT INTO folders (time_added, path, included) VALUES (?, ?, ?)")
+            .bind("2024-01-01T00:00:00")
             .bind(r"C:\skip")
             .bind(0_i64)
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
 
-        conn
+        dbs
     }
 
     // Ensures search stats aggregate per-table information and bookmarks with wildcard support.
     #[tokio::test]
     async fn load_stats_aggregates_results() {
-        let mut conn = setup_stats_db().await;
-        let stats = load_stats(&mut conn, "user", true).await.unwrap();
+        let mut dbs = setup_stats_db().await;
+        let stats = load_stats(&mut dbs.index_conn, "user", true)
+            .await
+            .unwrap();
 
         assert_eq!(
             stats.bookmarks,

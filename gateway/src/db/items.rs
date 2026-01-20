@@ -758,7 +758,7 @@ pub(crate) async fn get_thumbnail_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Connection;
+    use crate::db::migrations::setup_test_databases;
     use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
     fn temp_path(label: &str) -> PathBuf {
@@ -769,51 +769,24 @@ mod tests {
         std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
     }
 
+    async fn insert_scan(conn: &mut sqlx::SqliteConnection, id: i64, path: &str) {
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind("2024-01-01T00:00:00")
+            .bind(path)
+            .execute(conn)
+            .await
+            .unwrap();
+    }
+
     // Ensures item metadata queries return the item plus only existing file paths.
     #[tokio::test]
     async fn item_metadata_returns_existing_file() {
         let file_path = temp_path("item_meta_file");
         std::fs::write(&file_path, b"test").unwrap();
 
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                sha256 TEXT NOT NULL,
-                md5 TEXT NOT NULL,
-                type TEXT NOT NULL,
-                size INTEGER,
-                width INTEGER,
-                height INTEGER,
-                duration REAL,
-                audio_tracks INTEGER,
-                video_tracks INTEGER,
-                subtitle_tracks INTEGER,
-                blurhash TEXT,
-                time_added TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE files (
-                id INTEGER PRIMARY KEY,
-                sha256 TEXT NOT NULL,
-                item_id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                last_modified TEXT NOT NULL,
-                available BOOLEAN NOT NULL
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        let mut dbs = setup_test_databases().await;
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
 
         sqlx::query(
             r#"
@@ -836,15 +809,15 @@ mod tests {
         .bind(0_i64)
         .bind(Option::<String>::None)
         .bind("2024-01-01T00:00:00")
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
         sqlx::query(
             r#"
             INSERT INTO files (
-                id, sha256, item_id, path, filename, last_modified, available
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(10_i64)
@@ -854,11 +827,12 @@ mod tests {
         .bind("file.png")
         .bind("2024-01-01T00:00:00")
         .bind(1_i64)
-        .execute(&mut conn)
+        .bind(1_i64)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let result = get_item_metadata(&mut conn, "1", ItemIdentifierType::ItemId)
+        let result = get_item_metadata(&mut dbs.index_conn, "1", ItemIdentifierType::ItemId)
             .await
             .unwrap();
 
@@ -870,24 +844,20 @@ mod tests {
     // Ensures mime type stats include general type prefixes.
     #[tokio::test]
     async fn get_all_mime_types_includes_general_types() {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        let mut dbs = setup_test_databases().await;
         sqlx::query(
             r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL
-            )
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (1, 'sha_1', 'md5_1', 'image/png', '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'video/mp4', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO items (id, type) VALUES (1, 'image/png'), (2, 'video/mp4')")
-            .execute(&mut conn)
-            .await
-            .unwrap();
 
-        let types = get_all_mime_types(&mut conn).await.unwrap();
+        let types = get_all_mime_types(&mut dbs.index_conn).await.unwrap();
 
         assert_eq!(
             types,
@@ -903,47 +873,35 @@ mod tests {
     // Ensures file stats count both files and items.
     #[tokio::test]
     async fn get_file_stats_counts_rows() {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        let mut dbs = setup_test_databases().await;
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
         sqlx::query(
             r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE files (
-                id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL
-            )
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO items (id, type) VALUES (1, 'image/png'), (2, 'video/mp4')")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO files (id, item_id)
+            INSERT INTO items (id, sha256, md5, type, time_added)
             VALUES
-                (10, 1),
-                (11, 1),
-                (12, 2)
+                (1, 'sha_1', 'md5_1', 'image/png', '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'video/mp4', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_1', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_1', 1, 'C:\data\two.png', 'two.png', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_2', 2, 'C:\data\three.png', 'three.png', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let (files, items) = get_file_stats(&mut conn).await.unwrap();
+        let (files, items) = get_file_stats(&mut dbs.index_conn).await.unwrap();
 
         assert_eq!(files, 3);
         assert_eq!(items, 2);
@@ -952,34 +910,49 @@ mod tests {
     // Ensures text stats return available languages and minimum confidences.
     #[tokio::test]
     async fn get_text_stats_returns_languages_and_mins() {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        let mut dbs = setup_test_databases().await;
         sqlx::query(
             r#"
-            CREATE TABLE extracted_text (
-                id INTEGER PRIMARY KEY,
-                language TEXT,
-                language_confidence REAL,
-                confidence REAL
-            )
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (1, 'sha_1', 'md5_1', 'image/png', '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'image/png', '2024-01-01T00:00:00'),
+                (3, 'sha_3', 'md5_3', 'image/png', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'alpha')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+            VALUES
+                (1, 1, 1, 'text', 0, 1),
+                (2, 2, 1, 'text', 0, 1),
+                (3, 3, 1, 'text', 0, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO extracted_text (id, language, language_confidence, confidence)
+            INSERT INTO extracted_text (id, language, language_confidence, confidence, text, text_length)
             VALUES
-                (1, 'en', 0.8, 0.9),
-                (2, 'fr', 0.6, 0.4),
-                (3, NULL, NULL, NULL)
+                (1, 'en', 0.8, 0.9, 'hello', 5),
+                (2, 'fr', 0.6, 0.4, 'bonjour', 7),
+                (3, NULL, NULL, NULL, 'empty', 5)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut dbs.index_conn)
         .await
         .unwrap();
 
-        let stats = get_text_stats(&mut conn).await.unwrap();
+        let stats = get_text_stats(&mut dbs.index_conn).await.unwrap();
         let mut languages = stats.languages.clone();
         languages.sort();
 

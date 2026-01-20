@@ -301,59 +301,46 @@ async fn get_most_common_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Connection;
+    use crate::db::migrations::setup_test_databases;
 
-    async fn setup_tag_db() -> sqlx::SqliteConnection {
-        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+    async fn setup_tag_db() -> crate::db::migrations::InMemoryDatabases {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
         sqlx::query(
             r#"
-            CREATE TABLE tags (
-                id INTEGER PRIMARY KEY,
-                namespace TEXT NOT NULL,
-                name TEXT NOT NULL
-            );
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (100, 'sha_100', 'md5_100', 'image/png', '2024-01-01T00:00:00'),
+                (101, 'sha_101', 'md5_101', 'image/png', '2024-01-01T00:00:00')
             "#,
         )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE item_data (
-                id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL,
-                setter_id INTEGER NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE tags_items (
-                id INTEGER PRIMARY KEY,
-                item_data_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                confidence REAL NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE setters (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .unwrap();
 
+        sqlx::query(
+            r#"
+            INSERT INTO setters (id, name)
+            VALUES
+                (1, 'alpha'),
+                (2, 'beta')
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+            VALUES
+                (10, 100, 1, 'tags', 0, 1),
+                (11, 101, 1, 'tags', 0, 1),
+                (12, 100, 2, 'tags', 0, 1)
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         sqlx::query(
             r#"
             INSERT INTO tags (id, namespace, name)
@@ -363,30 +350,7 @@ mod tests {
                 (3, 'ns', 'dog')
             "#,
         )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO setters (id, name)
-            VALUES
-                (1, 'alpha'),
-                (2, 'beta')
-            "#,
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO item_data (id, item_id, setter_id)
-            VALUES
-                (10, 100, 1),
-                (11, 101, 1),
-                (12, 100, 2)
-            "#,
-        )
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .unwrap();
         sqlx::query(
@@ -400,18 +364,18 @@ mod tests {
                 (11, 3, 0.5)
             "#,
         )
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await
         .unwrap();
 
-        conn
+        dbs
     }
 
     // Ensures tag search returns per-tag distinct item counts for matching names.
     #[tokio::test]
     async fn find_tags_returns_distinct_item_counts() {
-        let mut conn = setup_tag_db().await;
-        let mut tags = find_tags(&mut conn, "cat", 10).await.unwrap();
+        let mut dbs = setup_tag_db().await;
+        let mut tags = find_tags(&mut dbs.index_conn, "cat", 10).await.unwrap();
         tags.sort_by(|a, b| a.1.cmp(&b.1));
 
         assert_eq!(
@@ -426,13 +390,13 @@ mod tests {
     // Ensures tag namespaces include colon prefixes for search stats.
     #[tokio::test]
     async fn get_all_tag_namespaces_includes_prefixes() {
-        let mut conn = setup_tag_db().await;
+        let mut dbs = setup_tag_db().await;
         sqlx::query("INSERT INTO tags (id, namespace, name) VALUES (4, 'ns:sub', 'lion')")
-            .execute(&mut conn)
+            .execute(&mut dbs.index_conn)
             .await
             .unwrap();
 
-        let mut namespaces = get_all_tag_namespaces(&mut conn).await.unwrap();
+        let mut namespaces = get_all_tag_namespaces(&mut dbs.index_conn).await.unwrap();
         namespaces.sort();
 
         assert_eq!(
@@ -448,8 +412,8 @@ mod tests {
     // Ensures the minimum tag confidence is returned for stats.
     #[tokio::test]
     async fn get_min_tag_confidence_returns_minimum() {
-        let mut conn = setup_tag_db().await;
-        let min_confidence = get_min_tag_confidence(&mut conn).await.unwrap();
+        let mut dbs = setup_tag_db().await;
+        let min_confidence = get_min_tag_confidence(&mut dbs.index_conn).await.unwrap();
 
         assert!((min_confidence - 0.5).abs() < 1e-6);
     }
@@ -457,9 +421,11 @@ mod tests {
     // Ensures top tags include frequency based on distinct item-setter pairs.
     #[tokio::test]
     async fn get_most_common_tags_frequency_calculates_frequency() {
-        let mut conn = setup_tag_db().await;
+        let mut dbs = setup_tag_db().await;
         let tags =
-            get_most_common_tags_frequency(&mut conn, None, &[], None, 10).await.unwrap();
+            get_most_common_tags_frequency(&mut dbs.index_conn, None, &[], None, 10)
+                .await
+                .unwrap();
 
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0].1, "cat");
