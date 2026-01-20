@@ -78,9 +78,10 @@ can still apply.
 
 ## Configuration
 
-Configuration is TOML and/or environment variables only. By default the
-gateway reads `[cwd]/config/gateway/default.toml`. Override the path with
-`--config` or the `GATEWAY_CONFIG_PATH` environment variable.
+Configuration is TOML and/or environment variables only. The gateway loads
+`.env` at startup when present, then reads `[cwd]/config/gateway/default.toml`.
+Override the path with `--config` or the `GATEWAY_CONFIG_PATH` environment
+variable.
 
 Create `config/gateway/default.toml`:
 

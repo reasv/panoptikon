@@ -36,3 +36,4 @@ axum-extra = { version = "0.12.5", features = ["query"] }
 sqlite-vec = "0.1.7-alpha.2"
 libsqlite3-sys = "0.27"
 base64 = "0.22"
+dotenvy = "0.15"
