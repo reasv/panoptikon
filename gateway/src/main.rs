@@ -59,10 +59,12 @@ async fn main() -> anyhow::Result<()> {
         .fallback(any(proxy::proxy_ui));
 
     if settings.upstreams.api.local {
+        let enable_db_create = env::var("EXPERIMENTAL_RUST_DB_CREATION").is_ok();
+        app = app.route("/api/db", get(api::db::db_info));
+        if enable_db_create {
+            app = app.route("/api/db/create", post(api::db::db_create));
+        }
         app = app
-            .route("/api/db", get(api::db::db_info))
-            // Disable database creation endpoint until the rust implementation replaces python entirely
-            // .route("/api/db/create", post(api::db::db_create))
             .route(
                 "/api/bookmarks/ns",
                 get(api::bookmarks::bookmark_namespaces),

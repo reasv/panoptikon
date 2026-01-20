@@ -41,10 +41,12 @@ Special handling:
 - `/api/db` is filtered so only allowed DB names are returned; tenant-prefixed
   DBs are reported without the prefix, and `current` defaults reflect the policy.
 - `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
-  enforcement rules as normal DB parameters.
+  enforcement rules as normal DB parameters and is only available when
+  `EXPERIMENTAL_RUST_DB_CREATION` is set.
 - `/api/inference/*` never receives DB query parameters.
 - When `upstreams.api.local = true`, the gateway serves `/api/db`,
-  `/api/db/create`, `/api/bookmarks/ns`, `/api/bookmarks/users`,
+  `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set),
+  `/api/bookmarks/ns`, `/api/bookmarks/users`,
   `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`,
   `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`,
   `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`,
