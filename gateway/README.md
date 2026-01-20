@@ -76,6 +76,9 @@ Programmatic creation and migration lives in `gateway/src/db/migrations.rs`
 in-memory databases for tests. Existing Python-created DBs that predate
 SQLx migrations are baselined to the first migration so later migrations
 can still apply.
+Set `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` to a truthy value (`1`, `true`,
+`yes`, or `on`) to run migrations across every on-disk DB in `DATA_FOLDER`
+at startup, including baselining Python-created databases.
 
 ## Configuration
 

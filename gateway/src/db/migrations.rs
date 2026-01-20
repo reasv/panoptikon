@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use sqlx::{Connection, SqliteConnection, migrate::{Migrator, Migrate}, sqlite::SqliteConnectOptions};
+use sqlx::{
+    Connection, SqliteConnection,
+    migrate::{Migrate, Migrator},
+    sqlite::SqliteConnectOptions,
+};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -53,6 +57,60 @@ pub(crate) async fn migrate_databases_on_disk(
     migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR).await?;
     migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR).await?;
     Ok(paths)
+}
+
+pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
+    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let index_db_dir = data_dir.join("index");
+    let user_data_db_dir = data_dir.join("user_data");
+
+    if index_db_dir.is_dir() {
+        for entry in fs::read_dir(&index_db_dir)
+            .with_context(|| format!("failed to read index db dir {}", index_db_dir.display()))?
+        {
+            let entry = entry.context("failed to read index db dir entry")?;
+            let file_type = entry
+                .file_type()
+                .context("failed to read index db dir entry file type")?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let db_dir = entry.path();
+            let index_db_file = db_dir.join("index.db");
+            if index_db_file.is_file() {
+                migrate_path(&index_db_file, &INDEX_MIGRATOR).await?;
+            }
+            let storage_db_file = db_dir.join("storage.db");
+            if storage_db_file.is_file() {
+                migrate_path(&storage_db_file, &STORAGE_MIGRATOR).await?;
+            }
+        }
+    }
+
+    if user_data_db_dir.is_dir() {
+        for entry in fs::read_dir(&user_data_db_dir).with_context(|| {
+            format!(
+                "failed to read user data db dir {}",
+                user_data_db_dir.display()
+            )
+        })? {
+            let entry = entry.context("failed to read user data db dir entry")?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_db = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"));
+            if !is_db {
+                continue;
+            }
+            migrate_path(&path, &USER_DATA_MIGRATOR).await?;
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn migrate_databases(
@@ -176,13 +234,12 @@ INSERT OR IGNORE INTO _sqlx_migrations (
 }
 
 async fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> Result<bool> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-    )
-    .bind(table_name)
-    .fetch_optional(conn)
-    .await
-    .context("failed to check for migrations table")?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")
+            .bind(table_name)
+            .fetch_optional(conn)
+            .await
+            .context("failed to check for migrations table")?;
     Ok(row.is_some())
 }
 

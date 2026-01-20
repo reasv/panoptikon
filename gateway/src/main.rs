@@ -61,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
         inference_upstream,
     ));
 
+    if env_truthy("EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS") {
+        db::migrations::migrate_all_databases_on_disk().await?;
+    }
+
     let mut app = Router::new()
         .route("/api/inference", any(proxy::proxy_inference))
         .route("/api/inference/{*path}", any(proxy::proxy_inference))
