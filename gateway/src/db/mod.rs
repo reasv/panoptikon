@@ -7,6 +7,7 @@ pub(crate) mod folders;
 pub(crate) mod file_scans;
 pub(crate) mod files;
 pub(crate) mod storage;
+pub(crate) mod system_config;
 pub(crate) mod pql;
 pub(crate) mod migrations;
 mod connection;
