@@ -7,6 +7,7 @@ use sqlx::{
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -254,13 +255,17 @@ async fn has_user_tables(conn: &mut SqliteConnection) -> Result<bool> {
 }
 
 async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InMemoryDatabases> {
+    static MEMORY_KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("failed to read system clock")?
         .as_nanos();
-    let index_key = memory_key(&format!("index-{index_db}"), suffix);
-    let storage_key = memory_key(&format!("storage-{index_db}"), suffix);
-    let user_data_key = memory_key(&format!("user-data-{user_data_db}"), suffix);
+    let unique = MEMORY_KEY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let key_suffix = format!("{suffix}-{unique}");
+    let index_key = memory_key(&format!("index-{index_db}"), &key_suffix);
+    let storage_key = memory_key(&format!("storage-{index_db}"), &key_suffix);
+    let user_data_key = memory_key(&format!("user-data-{user_data_db}"), &key_suffix);
 
     // Use shared-cache in-memory database names so separate connections can attach to them.
     let index_uri = format!("{index_key}?mode=memory&cache=shared");
@@ -325,7 +330,7 @@ async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InM
     })
 }
 
-fn memory_key(label: &str, suffix: u128) -> String {
+fn memory_key(label: &str, suffix: &str) -> String {
     let mut normalized = String::with_capacity(label.len());
     for ch in label.chars() {
         if ch.is_ascii_alphanumeric() {
