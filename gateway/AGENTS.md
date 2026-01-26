@@ -1,10 +1,12 @@
 Panoptikon Gateway (Rust) - Agent Notes
 
 Purpose
+
 - This crate is the HTTP gateway for Panoptikon.
 - It is the single entrypoint for UI + API traffic and will gradually reimplement API routes locally while keeping proxy support for remote instances.
 
 Architecture (current)
+
 - Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
@@ -12,6 +14,7 @@ Architecture (current)
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
+
 - Policy selection by effective host (`Host`, optionally forwarded headers).
 - Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/openapi.json`).
 - `.env` is loaded at startup (if present) so env-based config can be set via dotenv files.
@@ -31,7 +34,12 @@ Behavior (important)
   - Local handlers use a shared extractor to read `index_db`/`user_data_db` query params.
   - Read-only connections attach `storage` and `user_data` databases, mirroring Python behavior.
   - User-data write handlers open a read-write connection so bookmarks can be updated.
+  - Index DB write connections (writer actors) attach `storage` only; `user_data` is not attached for write transactions.
   - SQLite extensions (sqlite-vec) are registered via the bundled Rust crate.
+- Index DB writer actors:
+  - All Index DB writes are serialized through a per-DB writer actor.
+  - Writers open short-lived write transactions and keep a cached connection with a 5-minute idle timeout.
+  - A supervisor actor spawns writers on demand and runs 5-minute health checks (index/storage file existence + index/storage read-only ping).
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.
@@ -44,17 +52,20 @@ Behavior (important)
   - All responses are streamed except `/api/db`, which is buffered so it can be filtered.
 
 Motivations (why it is built this way)
+
 - Keep policy enforcement in one place (layer) so local handlers can mirror upstream behavior.
 - Preserve proxy compatibility even as more routes are implemented locally.
 - Support multi-tenant DB selection safely and consistently across all API calls.
 
 Tests
+
 - Most behavior is tested in `gateway/src/policy.rs` under `mod tests`.
 - When adding policy/DB rules, add unit tests there using `axum::http::Request` to validate query rewriting and response filtering.
 - When adding local routes, add focused tests for handler outputs plus policy layer behavior if it transforms responses.
 - All tests must include a descriptive comment above each test explaining expected behavior and outcomes.
 
 When you change behavior
+
 - Update this file to document new behavior, config knobs, and any new routes or policy rules.
 - Keep the "Behavior" section authoritative; if behavior changes, update it.
 - If the policy layer or proxy flow changes, also update `gateway/README.md`.

@@ -65,6 +65,16 @@ and `gateway/migrations/user_data`. The initial migrations mirror the schema
 dumps produced by the Python backend, with `BEGIN`/`COMMIT` stripped to avoid
 nested transactions under SQLx.
 
+## Index DB write actors
+
+Index DB writes for long-running jobs are serialized through a per-index DB
+writer actor, supervised by a registry actor that spawns writers on demand.
+Writers keep a cached write connection with a 5-minute idle timeout, and the
+supervisor runs 5-minute health checks that verify `index.db`/`storage.db`
+existence plus a read-only ping against `index`/`storage` only.
+Writer connections attach `index` + `storage` only; `user_data` is not attached
+for write transactions.
+
 To add migrations, use SQLx's CLI against the appropriate source directory:
 
 ```bash

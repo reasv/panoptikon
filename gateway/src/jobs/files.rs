@@ -27,7 +27,13 @@ use walkdir::WalkDir;
 use crate::{
     api_error::ApiError,
     db::{
-        file_scans::{FileScanUpdate, add_file_scan, mark_unavailable_files, update_file_scan},
+        file_scans::{
+            FileScanUpdate,
+            add_file_scan,
+            delete_unavailable_files,
+            mark_unavailable_files,
+            update_file_scan,
+        },
         files::{
             FileScanData, ItemScanMeta, delete_files_not_allowed_stub, delete_items_without_files,
             get_file_by_path, get_item_id, has_blurhash, set_blurhash, update_file_data,
@@ -1330,23 +1336,6 @@ fn difference(current: &[String], existing: &[String]) -> Vec<String> {
         .filter(|entry| !existing.contains(entry))
         .cloned()
         .collect()
-}
-
-async fn delete_unavailable_files(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
-    let result = sqlx::query(
-        r#"
-DELETE FROM files
-WHERE available = 0
-        "#,
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to delete unavailable files");
-        ApiError::internal("Failed to delete unavailable files")
-    })?;
-
-    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

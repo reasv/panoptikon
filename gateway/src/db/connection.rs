@@ -3,10 +3,11 @@ use axum::{
     http::request::Parts,
 };
 use serde::Deserialize;
+use url::Url;
 use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use sqlite_vec::sqlite3_vec_init;
-use std::{env, fs, marker::PhantomData, path::PathBuf, sync::OnceLock};
+use std::{env, fs, marker::PhantomData, path::{Path, PathBuf}, sync::OnceLock};
 
 use crate::api_error::ApiError;
 
@@ -46,7 +47,7 @@ pub(crate) async fn open_index_db_read(
     user_data_db: &str,
 ) -> Result<SqliteConnection, ApiError> {
     let paths = db_paths(index_db, user_data_db)?;
-    connect_db(&paths, false, false).await
+    connect_db(&paths, false, false, true).await
 }
 
 pub(crate) async fn open_index_db_write(
@@ -54,7 +55,21 @@ pub(crate) async fn open_index_db_write(
     user_data_db: &str,
 ) -> Result<SqliteConnection, ApiError> {
     let paths = db_paths(index_db, user_data_db)?;
-    connect_db(&paths, true, false).await
+    connect_db(&paths, true, false, true).await
+}
+
+pub(crate) async fn open_index_db_read_no_user_data(
+    index_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths_index_only(index_db)?;
+    connect_db(&paths, false, false, false).await
+}
+
+pub(crate) async fn open_index_db_write_no_user_data(
+    index_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths_index_only(index_db)?;
+    connect_db(&paths, true, false, false).await
 }
 
 #[derive(Deserialize)]
@@ -68,10 +83,15 @@ struct DbNames {
     user_data_db: String,
 }
 
-struct DbPaths {
-    index_db_file: PathBuf,
-    user_db_file: PathBuf,
-    storage_db_file: PathBuf,
+pub(crate) struct DbPaths {
+    pub(crate) index_db_file: PathBuf,
+    pub(crate) user_db_file: PathBuf,
+    pub(crate) storage_db_file: PathBuf,
+}
+
+pub(crate) struct IndexStoragePaths {
+    pub(crate) index_db_file: PathBuf,
+    pub(crate) storage_db_file: PathBuf,
 }
 
 impl<S, M> FromRequestParts<S> for DbConnection<M>
@@ -86,7 +106,7 @@ where
             .map_err(|_| ApiError::bad_request("Invalid query parameters"))?;
         let names = resolve_db_names(query.0)?;
         let paths = db_paths(&names.index_db, &names.user_data_db)?;
-        let conn = connect_db(&paths, M::WRITE_LOCK, M::USER_DATA_WL).await?;
+        let conn = connect_db(&paths, M::WRITE_LOCK, M::USER_DATA_WL, true).await?;
 
         Ok(Self {
             conn,
@@ -112,29 +132,68 @@ fn db_default_names() -> (String, String) {
     (index_default, user_default)
 }
 
-fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
+pub(crate) fn db_paths_unchecked(index_db: &str, user_data_db: &str) -> DbPaths {
+    let index_paths = index_storage_paths_unchecked(index_db);
+    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let user_data_db_dir = data_dir.join("user_data");
+
+    DbPaths {
+        index_db_file: index_paths.index_db_file,
+        storage_db_file: index_paths.storage_db_file,
+        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
+    }
+}
+
+pub(crate) fn index_storage_paths_unchecked(index_db: &str) -> IndexStoragePaths {
     let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
     let index_db_dir = data_dir.join("index");
-    let user_data_db_dir = data_dir.join("user_data");
+    let index_dir = index_db_dir.join(index_db);
+    IndexStoragePaths {
+        index_db_file: index_dir.join("index.db"),
+        storage_db_file: index_dir.join("storage.db"),
+    }
+}
+
+fn index_storage_paths(index_db: &str) -> Result<IndexStoragePaths, ApiError> {
+    let index_paths = index_storage_paths_unchecked(index_db);
+    let index_db_dir = index_paths
+        .index_db_file
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     fs::create_dir_all(&index_db_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create index dir");
         ApiError::internal("Failed to prepare database directories")
     })?;
+
+    Ok(index_paths)
+}
+
+fn db_paths_index_only(index_db: &str) -> Result<DbPaths, ApiError> {
+    let index_paths = index_storage_paths(index_db)?;
+    Ok(DbPaths {
+        index_db_file: index_paths.index_db_file,
+        storage_db_file: index_paths.storage_db_file,
+        user_db_file: PathBuf::new(),
+    })
+}
+
+fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
+    let index_paths = index_storage_paths(index_db)?;
+    let user_data_db_dir = {
+        let data_dir =
+            PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+        data_dir.join("user_data")
+    };
     fs::create_dir_all(&user_data_db_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create user data dir");
         ApiError::internal("Failed to prepare database directories")
     })?;
 
-    let index_dir = index_db_dir.join(index_db);
-    fs::create_dir_all(&index_dir).map_err(|err| {
-        tracing::error!(error = %err, "failed to create index db dir");
-        ApiError::internal("Failed to prepare database directories")
-    })?;
-
     Ok(DbPaths {
-        index_db_file: index_dir.join("index.db"),
-        storage_db_file: index_dir.join("storage.db"),
+        index_db_file: index_paths.index_db_file,
+        storage_db_file: index_paths.storage_db_file,
         user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
     })
 }
@@ -221,6 +280,7 @@ async fn connect_db(
     paths: &DbPaths,
     write_lock: bool,
     user_data_wl: bool,
+    attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
     ensure_sqlite_vec_loaded()?;
     let readonly_mode = env::var("READONLY")
@@ -231,7 +291,7 @@ async fn connect_db(
         })
         .unwrap_or(false);
     let write_lock = write_lock && !readonly_mode;
-    let user_data_wl = user_data_wl && !readonly_mode;
+    let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
     let open_readonly = !write_lock && !user_data_wl;
 
     let mut conn = if open_readonly {
@@ -285,31 +345,27 @@ async fn connect_db(
         conn
     };
 
-    if user_data_wl {
-        sqlx::query("ATTACH DATABASE ? AS user_data")
-            .bind(paths.user_db_file.to_string_lossy().to_string())
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to attach user data database");
-                ApiError::internal("Failed to open database")
-            })?;
-        sqlx::query("PRAGMA user_data.journal_mode=WAL")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to enable WAL for user data");
-                ApiError::internal("Failed to open database")
-            })?;
-    } else if !write_lock {
-        sqlx::query("ATTACH DATABASE ? AS user_data")
-            .bind(paths.user_db_file.to_string_lossy().to_string())
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to attach user data database");
-                ApiError::internal("Failed to open database")
-            })?;
+    if attach_user_data {
+        if !write_lock || user_data_wl {
+            let user_data_path = user_data_attach_path(&paths.user_db_file, !user_data_wl);
+            sqlx::query("ATTACH DATABASE ? AS user_data")
+                .bind(user_data_path)
+                .execute(&mut conn)
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to attach user data database");
+                    ApiError::internal("Failed to open database")
+                })?;
+            if user_data_wl {
+                sqlx::query("PRAGMA user_data.journal_mode=WAL")
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        tracing::error!(error = %err, "failed to enable WAL for user data");
+                        ApiError::internal("Failed to open database")
+                    })?;
+            }
+        }
     }
 
     sqlx::query("PRAGMA foreign_keys = ON")
@@ -328,6 +384,18 @@ async fn connect_db(
         })?;
 
     Ok(conn)
+}
+
+fn user_data_attach_path(path: &Path, read_only: bool) -> String {
+    if !read_only {
+        return path.to_string_lossy().to_string();
+    }
+    if let Ok(mut url) = Url::from_file_path(path) {
+        url.set_query(Some("mode=ro"));
+        return url.to_string();
+    }
+    let path = path.to_string_lossy().replace('\\', "/");
+    format!("file:{path}?mode=ro")
 }
 
 fn ensure_sqlite_vec_loaded() -> Result<(), ApiError> {
