@@ -41,6 +41,22 @@ pub struct DbConnection<M: DbMode> {
     _mode: PhantomData<M>,
 }
 
+pub(crate) async fn open_index_db_read(
+    index_db: &str,
+    user_data_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths(index_db, user_data_db)?;
+    connect_db(&paths, false, false).await
+}
+
+pub(crate) async fn open_index_db_write(
+    index_db: &str,
+    user_data_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths(index_db, user_data_db)?;
+    connect_db(&paths, true, false).await
+}
+
 #[derive(Deserialize)]
 struct DbQuery {
     index_db: Option<String>,

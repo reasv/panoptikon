@@ -12,4 +12,4 @@ pub(crate) mod pql;
 pub(crate) mod migrations;
 mod connection;
 
-pub(crate) use connection::{DbConnection, ReadOnly, UserDataWrite};
+pub(crate) use connection::{DbConnection, ReadOnly, UserDataWrite, open_index_db_read, open_index_db_write};

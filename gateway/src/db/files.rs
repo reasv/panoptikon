@@ -4,6 +4,7 @@ use crate::api_error::ApiError;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+#[derive(Clone)]
 pub(crate) struct ItemScanMeta {
     pub md5: String,
     pub mime_type: String,
@@ -107,7 +108,10 @@ WHERE id = ?2
     Ok(result.rows_affected() > 0)
 }
 
-async fn get_item_id(conn: &mut sqlx::SqliteConnection, sha256: &str) -> ApiResult<Option<i64>> {
+pub(crate) async fn get_item_id(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM items WHERE sha256 = ?1")
         .bind(sha256)
         .fetch_optional(&mut *conn)
@@ -117,6 +121,40 @@ async fn get_item_id(conn: &mut sqlx::SqliteConnection, sha256: &str) -> ApiResu
             ApiError::internal("Failed to update file")
         })?;
     Ok(row.map(|(id,)| id))
+}
+
+pub(crate) async fn has_blurhash(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT blurhash FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read blurhash");
+                ApiError::internal("Failed to load blurhash")
+            })?;
+
+    Ok(row.and_then(|(value,)| value).is_some())
+}
+
+pub(crate) async fn set_blurhash(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    blurhash: &str,
+) -> ApiResult<()> {
+    sqlx::query("UPDATE items SET blurhash = ?1 WHERE sha256 = ?2")
+        .bind(blurhash)
+        .bind(sha256)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to update blurhash");
+            ApiError::internal("Failed to update blurhash")
+        })?;
+    Ok(())
 }
 
 pub(crate) async fn update_file_data(
@@ -290,6 +328,7 @@ WHERE rowid IN (
 pub(crate) async fn delete_files_not_allowed_stub(
     _conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<u64> {
+    // TODO: Implement PQL-based job_filters handling.
     Ok(0)
 }
 
@@ -484,4 +523,3 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
         assert_eq!(remaining.0, 1);
     }
 }
-
