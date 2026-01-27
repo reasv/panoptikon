@@ -105,7 +105,7 @@ pub(crate) enum IndexDbWriterMessage {
         batch_size: i64,
         reply: Reply<u64>,
     },
-    DeleteFilesNotAllowedStub {
+    DeleteFilesNotAllowed {
         reply: Reply<u64>,
     },
     DeleteOrphanedFrames {
@@ -366,7 +366,7 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
-            IndexDbWriterMessage::DeleteFilesNotAllowedStub { reply } => {
+            IndexDbWriterMessage::DeleteFilesNotAllowed { reply } => {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_files_not_allowed_stub(conn).await })

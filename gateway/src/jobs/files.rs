@@ -29,24 +29,18 @@ use crate::{
     db::{
         file_scans::{
             FileScanUpdate,
-            add_file_scan,
-            delete_unavailable_files,
-            mark_unavailable_files,
-            update_file_scan,
         },
         files::{
-            FileScanData, ItemScanMeta, delete_files_not_allowed_stub, delete_items_without_files,
-            get_file_by_path, get_item_id, has_blurhash, set_blurhash, update_file_data,
+            FileScanData, ItemScanMeta,
+            get_file_by_path, get_item_id, has_blurhash,
         },
         folders::{
-            add_folder_to_database, delete_files_not_under_included_folders,
-            delete_files_under_excluded_folders, delete_folders_not_in_list,
             get_folders_from_database,
         },
-        open_index_db_read, open_index_db_write,
+        index_writer::{call_index_db_writer, IndexDbWriterMessage},
+        open_index_db_read,
         storage::{
-            StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails, has_frame,
-            has_thumbnail, store_frames, store_thumbnails,
+            StoredImage, has_frame, has_thumbnail,
         },
         system_config::{SystemConfig, SystemConfigStore},
     },
@@ -140,30 +134,33 @@ impl FileScanService {
         )
         .await?;
 
-        let mut conn = open_index_db_write(&self.index_db, &self.user_data_db).await?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to begin rescan finalization");
-                ApiError::internal("Failed to finalize rescan")
-            })?;
         let unavailable_files_deleted = if config.remove_unavailable_files {
-            delete_unavailable_files(&mut conn).await?
+            call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::DeleteUnavailableFiles { reply }
+            })
+            .await?
         } else {
             0
         };
-        let rule_files_deleted = delete_files_not_allowed_stub(&mut conn).await?;
-        let orphan_items_deleted = delete_items_without_files(&mut conn, 10_000).await?;
-        let _ = delete_orphaned_frames(&mut conn).await?;
-        let _ = delete_orphaned_thumbnails(&mut conn).await?;
-        sqlx::query("COMMIT")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to commit rescan finalization");
-                ApiError::internal("Failed to finalize rescan")
-            })?;
+        let rule_files_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFilesNotAllowed { reply }
+        })
+        .await?;
+        let orphan_items_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteItemsWithoutFiles {
+                batch_size: 10_000,
+                reply,
+            }
+        })
+        .await?;
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteOrphanedFrames { reply }
+        })
+        .await?;
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
+        })
+        .await?;
 
         Ok(RescanResult {
             scan_ids,
@@ -196,46 +193,81 @@ impl FileScanService {
         .await?;
 
         let scan_time = current_iso_timestamp();
-        let mut conn = open_index_db_write(&self.index_db, &self.user_data_db).await?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to begin folder update finalization");
-                ApiError::internal("Failed to finalize folder update")
-            })?;
-
-        let included_deleted =
-            delete_folders_not_in_list(&mut conn, &config.included_folders, true).await?;
-        let excluded_deleted =
-            delete_folders_not_in_list(&mut conn, &config.excluded_folders, false).await?;
+        let included_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFoldersNotInList {
+                folder_paths: config.included_folders.clone(),
+                included: true,
+                reply,
+            }
+        })
+        .await?;
+        let excluded_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFoldersNotInList {
+                folder_paths: config.excluded_folders.clone(),
+                included: false,
+                reply,
+            }
+        })
+        .await?;
 
         for folder in &config.included_folders {
-            let _ = add_folder_to_database(&mut conn, &scan_time, folder, true).await?;
+            let _ = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::AddFolderToDatabase {
+                    time_added: scan_time.clone(),
+                    path: folder.clone(),
+                    included: true,
+                    reply,
+                }
+            })
+            .await?;
         }
         for folder in &config.excluded_folders {
-            let _ = add_folder_to_database(&mut conn, &scan_time, folder, false).await?;
+            let _ = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::AddFolderToDatabase {
+                    time_added: scan_time.clone(),
+                    path: folder.clone(),
+                    included: false,
+                    reply,
+                }
+            })
+            .await?;
         }
 
         let unavailable_files_deleted = if config.remove_unavailable_files {
-            delete_unavailable_files(&mut conn).await?
+            call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::DeleteUnavailableFiles { reply }
+            })
+            .await?
         } else {
             0
         };
-        let excluded_folder_files_deleted = delete_files_under_excluded_folders(&mut conn).await?;
-        let orphan_files_deleted = delete_files_not_under_included_folders(&mut conn).await?;
-        let rule_files_deleted = delete_files_not_allowed_stub(&mut conn).await?;
-        let orphan_items_deleted = delete_items_without_files(&mut conn, 10_000).await?;
-        let _ = delete_orphaned_frames(&mut conn).await?;
-        let _ = delete_orphaned_thumbnails(&mut conn).await?;
-
-        sqlx::query("COMMIT")
-            .execute(&mut conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to commit folder update finalization");
-                ApiError::internal("Failed to finalize folder update")
-            })?;
+        let excluded_folder_files_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFilesUnderExcludedFolders { reply }
+        })
+        .await?;
+        let orphan_files_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFilesNotUnderIncludedFolders { reply }
+        })
+        .await?;
+        let rule_files_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteFilesNotAllowed { reply }
+        })
+        .await?;
+        let orphan_items_deleted = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteItemsWithoutFiles {
+                batch_size: 10_000,
+                reply,
+            }
+        })
+        .await?;
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteOrphanedFrames { reply }
+        })
+        .await?;
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
+        })
+        .await?;
 
         Ok(FolderUpdateResult {
             included_deleted,
@@ -286,10 +318,15 @@ async fn execute_folder_scan(
     let mut scan_ids = Vec::new();
 
     for folder in starting_points {
-        let mut conn = open_index_db_write(index_db, user_data_db).await?;
-        let scan_id = add_file_scan(&mut conn, &scan_time, &folder).await?;
+        let scan_id = call_index_db_writer(index_db, |reply| {
+            IndexDbWriterMessage::AddFileScan {
+                scan_time: scan_time.clone(),
+                path: folder.clone(),
+                reply,
+            }
+        })
+        .await?;
         scan_ids.push(scan_id);
-        drop(conn);
 
         let excluded_paths = excluded_folders
             .iter()
@@ -308,26 +345,27 @@ async fn execute_folder_scan(
         )
         .await?;
 
-        let mut conn = open_index_db_write(index_db, user_data_db).await?;
-        update_file_scan(
-            &mut conn,
-            scan_id,
-            FileScanUpdate {
-                end_time: current_iso_timestamp(),
-                new_items: stats.new_items,
-                unchanged_files: stats.unchanged_files,
-                new_files: stats.new_files,
-                modified_files: stats.modified_files,
-                marked_unavailable: stats.marked_unavailable,
-                errors: stats.errors,
-                total_available: stats.total_available,
-                false_changes: stats.false_changes,
-                metadata_time: stats.metadata_time,
-                hashing_time: stats.hashing_time,
-                thumbgen_time: stats.thumbgen_time,
-                blurhash_time: stats.blurhash_time,
-            },
-        )
+        call_index_db_writer(index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileScan {
+                scan_id,
+                update: FileScanUpdate {
+                    end_time: current_iso_timestamp(),
+                    new_items: stats.new_items,
+                    unchanged_files: stats.unchanged_files,
+                    new_files: stats.new_files,
+                    modified_files: stats.modified_files,
+                    marked_unavailable: stats.marked_unavailable,
+                    errors: stats.errors,
+                    total_available: stats.total_available,
+                    false_changes: stats.false_changes,
+                    metadata_time: stats.metadata_time,
+                    hashing_time: stats.hashing_time,
+                    thumbgen_time: stats.thumbgen_time,
+                    blurhash_time: stats.blurhash_time,
+                },
+                reply,
+            }
+        })
         .await?;
     }
 
@@ -418,7 +456,7 @@ async fn scan_single_folder(
         blurhash_time: 0.0,
     };
 
-    let mut conn = open_index_db_write(index_db, user_data_db).await?;
+    let mut conn = open_index_db_read(index_db, user_data_db).await?;
 
     while let Some(result) = tasks.join_next().await {
         let processed = match result {
@@ -457,13 +495,15 @@ async fn scan_single_folder(
             match has_thumbnail(&mut conn, &file_data.sha256, 1).await {
                 Ok(has_thumb) => {
                     if !has_thumb {
-                        if let Err(err) = store_thumbnails(
-                            &mut conn,
-                            &file_data.sha256,
-                            &file_data.mime_type,
-                            1,
-                            &file_data.thumbnails,
-                        )
+                        if let Err(err) = call_index_db_writer(index_db, |reply| {
+                            IndexDbWriterMessage::StoreThumbnails {
+                                sha256: file_data.sha256.clone(),
+                                mime_type: file_data.mime_type.clone(),
+                                process_version: 1,
+                                thumbnails: file_data.thumbnails.clone(),
+                                reply,
+                            }
+                        })
                         .await
                         {
                             tracing::error!(error = ?err, "failed to store thumbnails");
@@ -480,13 +520,15 @@ async fn scan_single_folder(
             match has_frame(&mut conn, &file_data.sha256, 1).await {
                 Ok(has_frame) => {
                     if !has_frame {
-                        if let Err(err) = store_frames(
-                            &mut conn,
-                            &file_data.sha256,
-                            &file_data.mime_type,
-                            1,
-                            &file_data.frames,
-                        )
+                        if let Err(err) = call_index_db_writer(index_db, |reply| {
+                            IndexDbWriterMessage::StoreFrames {
+                                sha256: file_data.sha256.clone(),
+                                mime_type: file_data.mime_type.clone(),
+                                process_version: 1,
+                                frames: file_data.frames.clone(),
+                                reply,
+                            }
+                        })
                         .await
                         {
                             tracing::error!(error = ?err, "failed to store frames");
@@ -503,7 +545,14 @@ async fn scan_single_folder(
             match has_blurhash(&mut conn, &file_data.sha256).await {
                 Ok(has_value) => {
                     if !has_value {
-                        if let Err(err) = set_blurhash(&mut conn, &file_data.sha256, blurhash).await
+                        if let Err(err) = call_index_db_writer(index_db, |reply| {
+                            IndexDbWriterMessage::SetBlurhash {
+                                sha256: file_data.sha256.clone(),
+                                blurhash: blurhash.clone(),
+                                reply,
+                            }
+                        })
+                        .await
                         {
                             tracing::error!(error = ?err, "failed to set blurhash");
                         }
@@ -515,33 +564,23 @@ async fn scan_single_folder(
             }
         }
 
-        if let Err(err) = sqlx::query("BEGIN IMMEDIATE").execute(&mut conn).await {
-            tracing::error!(error = %err, "failed to begin file update transaction");
-            stats.errors += 1;
-            continue;
-        }
-        let result = match update_file_data(
-            &mut conn,
-            &file_data.time_added,
-            scan_id,
-            &file_data.data,
-        )
+        let result = match call_index_db_writer(index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileData {
+                time_added: file_data.time_added.clone(),
+                scan_id,
+                data: file_data.data.clone(),
+                reply,
+            }
+        })
         .await
         {
             Ok(result) => result,
             Err(err) => {
                 tracing::error!(error = ?err, "failed to update file data");
-                let _ = sqlx::query("ROLLBACK").execute(&mut conn).await;
                 stats.errors += 1;
                 continue;
             }
         };
-        if let Err(err) = sqlx::query("COMMIT").execute(&mut conn).await {
-            tracing::error!(error = %err, "failed to commit file update transaction");
-            let _ = sqlx::query("ROLLBACK").execute(&mut conn).await;
-            stats.errors += 1;
-            continue;
-        }
 
         if result.item_inserted {
             stats.new_items += 1;
@@ -556,7 +595,12 @@ async fn scan_single_folder(
     }
 
     let (marked_unavailable, total_available) =
-        mark_unavailable_files(&mut conn, scan_id, folder).await?;
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::MarkUnavailableFiles {
+            scan_id,
+            path: folder.to_string(),
+            reply,
+        })
+        .await?;
     stats.marked_unavailable = marked_unavailable;
     stats.total_available = total_available;
 

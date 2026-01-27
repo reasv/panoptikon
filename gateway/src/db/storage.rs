@@ -2,6 +2,7 @@ use crate::api_error::ApiError;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+#[derive(Clone)]
 pub(crate) struct StoredImage {
     pub idx: i64,
     pub width: i64,

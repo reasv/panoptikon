@@ -23,6 +23,7 @@ pub(crate) struct FileScanRecord {
     pub blurhash_time: f64,
 }
 
+#[derive(Clone)]
 pub(crate) struct FileScanUpdate {
     pub end_time: String,
     pub new_items: i64,

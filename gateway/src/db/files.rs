@@ -16,6 +16,7 @@ pub(crate) struct ItemScanMeta {
     pub subtitle_tracks: Option<i64>,
 }
 
+#[derive(Clone)]
 pub(crate) struct FileScanData {
     pub sha256: String,
     pub last_modified: String,

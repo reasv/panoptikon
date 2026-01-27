@@ -19,6 +19,5 @@ pub(crate) use connection::{
     UserDataWrite,
     open_index_db_read,
     open_index_db_read_no_user_data,
-    open_index_db_write,
     open_index_db_write_no_user_data,
 };
