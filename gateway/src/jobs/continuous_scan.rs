@@ -304,6 +304,9 @@ impl ContinuousScanState {
         if self.paused {
             return Ok(());
         }
+        if !self.config.remove_unavailable_files {
+            return Ok(());
+        }
         if path.exists() {
             return Ok(());
         }
