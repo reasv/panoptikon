@@ -284,7 +284,7 @@ impl FileScanService {
     }
 }
 
-async fn is_resync_needed(
+pub(crate) async fn is_resync_needed(
     index_db: &str,
     user_data_db: &str,
     config: &SystemConfig,

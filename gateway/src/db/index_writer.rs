@@ -42,6 +42,7 @@ use crate::db::{
         store_thumbnails,
         StoredImage,
     },
+    extraction_log::delete_data_job_by_log_id,
 };
 use crate::db::connection::index_storage_paths_unchecked;
 
@@ -113,6 +114,10 @@ pub(crate) enum IndexDbWriterMessage {
     },
     DeleteOrphanedThumbnails {
         reply: Reply<u64>,
+    },
+    DeleteJobData {
+        log_id: i64,
+        reply: Reply<()>,
     },
     AddFolderToDatabase {
         time_added: String,
@@ -386,6 +391,14 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_orphaned_thumbnails(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteJobData { log_id, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_data_job_by_log_id(conn, log_id).await })
                     })
                     .await;
                 let _ = reply.send(result);

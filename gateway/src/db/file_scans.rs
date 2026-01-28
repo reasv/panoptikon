@@ -1,9 +1,11 @@
 use sqlx::Row;
 
 use crate::api_error::ApiError;
+use serde::Serialize;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+#[derive(Serialize)]
 pub(crate) struct FileScanRecord {
     pub id: i64,
     pub start_time: String,

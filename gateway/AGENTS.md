@@ -10,7 +10,7 @@ Architecture (current)
 - Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
@@ -20,6 +20,7 @@ Behavior (important)
 - `.env` is loaded at startup (if present) so env-based config can be set via dotenv files.
 - `EXPERIMENTAL_RUST_DB_CREATION` is treated as truthy only for `1`, `true`, `yes`, or `on` (case-insensitive).
 - `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` runs migrations across all on-disk DBs in `DATA_FOLDER` and baselines Python-created DBs when truthy.
+- `EXPERIMENTAL_RUST_JOBS` gates local `/api/jobs/*` endpoints; when false, job routes are proxied to the Python backend.
 - DB param enforcement:
   - Enforces `index_db` and `user_data_db` for DB-aware routes.
   - Strips DB params for `/api/inference/*`, `/api/db`, and `/api/db/create`.
@@ -40,6 +41,13 @@ Behavior (important)
   - All Index DB writes are serialized through a per-DB writer actor.
   - Writers open short-lived write transactions and keep a cached connection with a 5-minute idle timeout.
   - A supervisor actor spawns writers on demand and runs 5-minute health checks (index/storage file existence + index/storage read-only ping).
+- Job system:
+  - `/api/jobs/*` is implemented locally only when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+  - A global `JobQueueActor` keeps an in-memory queue and running job state; a `JobRunnerActor` executes one job at a time.
+  - File scan jobs (`folder_rescan`, `folder_update`) run through `FileScanService` and the index writer actor for writes.
+  - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
+  - Queue cancel can target queued jobs and the running job (best-effort cancellation).
+  - Manual cronjob trigger enqueues configured cron jobs from the system config.
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.

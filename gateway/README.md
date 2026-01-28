@@ -75,6 +75,17 @@ existence plus a read-only ping against `index`/`storage` only.
 Writer connections attach `index` + `storage` only; `user_data` is not attached
 for write transactions.
 
+## Job system
+
+When `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is set to a
+truthy value (`1`, `true`, `yes`, or `on`), `/api/jobs/*` is implemented
+locally. A global job-queue actor holds the in-memory queue and running job
+state, and a job-runner actor executes one job at a time. File scan jobs
+(`folder_rescan`, `folder_update`) run through `FileScanService`, which writes
+via the index DB writer actor. Queue status mirrors Python semantics (running
+job first, then queued jobs), and queued/running jobs can be cancelled via the
+jobs API.
+
 To add migrations, use SQLx's CLI against the appropriate source directory:
 
 ```bash

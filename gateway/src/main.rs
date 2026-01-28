@@ -113,6 +113,39 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
             .route("/api/search/stats", get(api::search::get_stats));
+        if env_truthy("EXPERIMENTAL_RUST_JOBS") {
+            app = app
+                .route(
+                    "/api/jobs/queue",
+                    get(api::jobs::queue_status).delete(api::jobs::cancel_queued),
+                )
+                .route(
+                    "/api/jobs/data/extraction",
+                    post(api::jobs::enqueue_data_extraction)
+                        .delete(api::jobs::enqueue_delete_extracted_data),
+                )
+                .route("/api/jobs/folders/rescan", post(api::jobs::enqueue_folder_rescan))
+                .route(
+                    "/api/jobs/folders",
+                    get(api::jobs::get_folders).put(api::jobs::enqueue_update_folders),
+                )
+                .route("/api/jobs/cancel", post(api::jobs::cancel_current_job))
+                .route("/api/jobs/folders/history", get(api::jobs::get_scan_history))
+                .route(
+                    "/api/jobs/data/history",
+                    get(api::jobs::get_extraction_history)
+                        .delete(api::jobs::delete_scan_data),
+                )
+                .route(
+                    "/api/jobs/config",
+                    get(api::jobs::get_config).put(api::jobs::update_config),
+                )
+                .route(
+                    "/api/jobs/data/setters/total",
+                    get(api::jobs::get_setter_data_count),
+                )
+                .route("/api/jobs/cronjob/run", post(api::jobs::manual_trigger_cronjob));
+        }
     }
 
     let app = app
