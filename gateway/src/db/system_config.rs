@@ -58,6 +58,10 @@ pub(crate) struct SystemConfig {
     pub excluded_folders: Vec<String>,
     #[serde(default)]
     pub preload_embedding_models: bool,
+    #[serde(default)]
+    pub continuous_filescan: bool,
+    #[serde(default)]
+    pub continuous_filescan_poll_interval_secs: Option<u64>,
 
     /// Opaque TOML values (PQL objects); parsed but not interpreted yet.
     #[serde(default)]
@@ -95,6 +99,8 @@ impl Default for SystemConfig {
             included_folders: Vec::new(),
             excluded_folders: Vec::new(),
             preload_embedding_models: false,
+            continuous_filescan: false,
+            continuous_filescan_poll_interval_secs: None,
             job_filters: Vec::new(),
             filescan_filter: None,
             extra: BTreeMap::new(),
@@ -288,4 +294,3 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         );
     }
 }
-

@@ -86,6 +86,16 @@ via the index DB writer actor. Queue status mirrors Python semantics (running
 job first, then queued jobs), and queued/running jobs can be cancelled via the
 jobs API.
 
+Continuous file scanning is independent of the job queue and is controlled per
+index DB via the system config (`continuous_filescan = true`). A supervisor
+actor spawns one continuous scan actor per enabled DB. Each actor creates a
+`file_scans` row with path `"<continuous>"` while active, uses notify-based
+watchers to react to filesystem changes, and writes through the index DB writer
+actor. Continuous scanning pauses automatically when a full rescan or folder
+update job starts on the same DB and resumes afterward. To force polling (e.g.,
+for unreliable shares), set `continuous_filescan_poll_interval_secs` to a
+number of seconds (uses `notify::PollWatcher` instead of native watchers).
+
 To add migrations, use SQLx's CLI against the appropriate source directory:
 
 ```bash

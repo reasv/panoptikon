@@ -138,6 +138,53 @@ WHERE id = ?14
     Ok(())
 }
 
+pub(crate) async fn close_file_scan(
+    conn: &mut sqlx::SqliteConnection,
+    scan_id: i64,
+    end_time: &str,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+UPDATE file_scans
+SET end_time = ?1
+WHERE id = ?2
+        "#,
+    )
+    .bind(end_time)
+    .bind(scan_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, scan_id, "failed to close file scan");
+        ApiError::internal("Failed to close file scan")
+    })?;
+    Ok(())
+}
+
+pub(crate) async fn get_open_file_scan_id(
+    conn: &mut sqlx::SqliteConnection,
+    path: &str,
+) -> ApiResult<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT id
+FROM file_scans
+WHERE end_time IS NULL
+  AND path = ?1
+ORDER BY start_time DESC
+LIMIT 1
+        "#,
+    )
+    .bind(path)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to query open file scan");
+        ApiError::internal("Failed to query file scan")
+    })?;
+    Ok(row.map(|(id,)| id))
+}
+
 pub(crate) async fn get_all_file_scans(
     conn: &mut sqlx::SqliteConnection,
     page: i64,

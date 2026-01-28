@@ -607,37 +607,37 @@ async fn scan_single_folder(
     Ok(stats)
 }
 
-struct PreparedFile {
-    path: PathBuf,
-    last_modified: String,
-    file_size: i64,
-    md5: String,
-    sha256: String,
-    mime_type: String,
-    metadata: ItemScanMeta,
-    hash_time: f64,
-    metadata_time: f64,
-    thumb_time: f64,
-    blurhash_time: f64,
-    thumbnails: Vec<StoredImage>,
-    frames: Vec<StoredImage>,
-    blurhash: Option<String>,
+pub(crate) struct PreparedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) last_modified: String,
+    pub(crate) file_size: i64,
+    pub(crate) md5: String,
+    pub(crate) sha256: String,
+    pub(crate) mime_type: String,
+    pub(crate) metadata: ItemScanMeta,
+    pub(crate) hash_time: f64,
+    pub(crate) metadata_time: f64,
+    pub(crate) thumb_time: f64,
+    pub(crate) blurhash_time: f64,
+    pub(crate) thumbnails: Vec<StoredImage>,
+    pub(crate) frames: Vec<StoredImage>,
+    pub(crate) blurhash: Option<String>,
 }
 
-struct FileWriteData {
-    sha256: String,
-    mime_type: String,
-    data: FileScanData,
-    new_file_timestamp: bool,
-    new_file_hash: bool,
-    hash_time: f64,
-    metadata_time: f64,
-    thumb_time: f64,
-    blurhash_time: f64,
-    thumbnails: Vec<StoredImage>,
-    frames: Vec<StoredImage>,
-    blurhash: Option<String>,
-    time_added: String,
+pub(crate) struct FileWriteData {
+    pub(crate) sha256: String,
+    pub(crate) mime_type: String,
+    pub(crate) data: FileScanData,
+    pub(crate) new_file_timestamp: bool,
+    pub(crate) new_file_hash: bool,
+    pub(crate) hash_time: f64,
+    pub(crate) metadata_time: f64,
+    pub(crate) thumb_time: f64,
+    pub(crate) blurhash_time: f64,
+    pub(crate) thumbnails: Vec<StoredImage>,
+    pub(crate) frames: Vec<StoredImage>,
+    pub(crate) blurhash: Option<String>,
+    pub(crate) time_added: String,
 }
 
 impl FileWriteData {
@@ -668,7 +668,7 @@ impl FileWriteData {
     }
 }
 
-async fn build_file_scan_data(
+pub(crate) async fn build_file_scan_data(
     conn: &mut sqlx::SqliteConnection,
     prepared: PreparedFile,
     scan_time: &str,
@@ -741,13 +741,13 @@ async fn build_file_scan_data(
 }
 
 #[derive(Debug)]
-enum FileProcessError {
+pub(crate) enum FileProcessError {
     Worker(String),
     Io(String),
     Unsupported(String),
 }
 
-fn process_file(path: PathBuf, config: &SystemConfig) -> Result<PreparedFile, FileProcessError> {
+pub(crate) fn process_file(path: PathBuf, config: &SystemConfig) -> Result<PreparedFile, FileProcessError> {
     let (last_modified, file_size) = get_last_modified_time_and_size(&path)
         .map_err(|err| FileProcessError::Io(err.to_string()))?;
 
@@ -1222,7 +1222,7 @@ fn calculate_hashes(path: &Path) -> Result<(String, String, i64), io::Error> {
     Ok((md5, sha256, total_size))
 }
 
-fn get_last_modified_time_and_size(path: &Path) -> Result<(String, i64), io::Error> {
+pub(crate) fn get_last_modified_time_and_size(path: &Path) -> Result<(String, i64), io::Error> {
     let metadata = fs::metadata(path)?;
     let size = metadata.len() as i64;
     let modified = metadata.modified()?;
@@ -1238,7 +1238,7 @@ fn get_last_modified_time_and_size(path: &Path) -> Result<(String, i64), io::Err
     Ok((formatted, size))
 }
 
-fn current_iso_timestamp() -> String {
+pub(crate) fn current_iso_timestamp() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     now.format(iso_format())
         .unwrap_or_else(|_| OffsetDateTime::now_utc().format(iso_format()).unwrap())
@@ -1259,7 +1259,7 @@ fn temp_dir_path() -> PathBuf {
     PathBuf::from(base).join(format!("frames-{unique}"))
 }
 
-fn check_folder_validity(folder: &str) -> bool {
+pub(crate) fn check_folder_validity(folder: &str) -> bool {
     let path = Path::new(folder);
     if !path.exists() {
         tracing::error!(path = %path.display(), "path does not exist");
@@ -1278,7 +1278,7 @@ fn check_folder_validity(folder: &str) -> bool {
     }
 }
 
-fn deduplicate_paths(paths: &[String]) -> Vec<String> {
+pub(crate) fn deduplicate_paths(paths: &[String]) -> Vec<String> {
     let mut normalized = paths
         .iter()
         .map(|path| normalize_path(path, true).to_string_lossy().to_string())
@@ -1296,7 +1296,7 @@ fn deduplicate_paths(paths: &[String]) -> Vec<String> {
     deduped
 }
 
-fn normalize_path(path: &str, trailing: bool) -> PathBuf {
+pub(crate) fn normalize_path(path: &str, trailing: bool) -> PathBuf {
     let mut buf = PathBuf::from(path.trim());
     if !buf.is_absolute() {
         if let Ok(cwd) = env::current_dir() {
@@ -1323,7 +1323,7 @@ fn normalize_path(path: &str, trailing: bool) -> PathBuf {
     normalized
 }
 
-fn build_extension_set(config: &SystemConfig) -> HashSet<String> {
+pub(crate) fn build_extension_set(config: &SystemConfig) -> HashSet<String> {
     let mut extensions = HashSet::new();
     if config.scan_images {
         for ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"] {
@@ -1351,7 +1351,7 @@ fn build_extension_set(config: &SystemConfig) -> HashSet<String> {
     extensions
 }
 
-fn has_allowed_extension(path: &Path, extensions: &HashSet<String>) -> bool {
+pub(crate) fn has_allowed_extension(path: &Path, extensions: &HashSet<String>) -> bool {
     let ext = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1362,7 +1362,7 @@ fn has_allowed_extension(path: &Path, extensions: &HashSet<String>) -> bool {
     }
 }
 
-fn is_hidden_or_temp(path: &Path) -> bool {
+pub(crate) fn is_hidden_or_temp(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1370,7 +1370,7 @@ fn is_hidden_or_temp(path: &Path) -> bool {
     name.starts_with('.') || name.starts_with('~')
 }
 
-fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
+pub(crate) fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
     excluded.iter().any(|prefix| path.starts_with(prefix))
 }
 
@@ -1386,19 +1386,7 @@ fn difference(current: &[String], existing: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::db::migrations::migrate_databases_on_disk;
-    use std::sync::OnceLock;
-    use tempfile::TempDir;
-
-    fn test_root() -> &'static TempDir {
-        static ROOT: OnceLock<TempDir> = OnceLock::new();
-        ROOT.get_or_init(|| {
-            let dir = TempDir::new().unwrap();
-            unsafe {
-                std::env::set_var("DATA_FOLDER", dir.path());
-            }
-            dir
-        })
-    }
+    use crate::test_utils::test_data_dir;
 
     fn next_db_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1408,20 +1396,21 @@ mod tests {
     // Ensures rescans persist items, files, and blurhash data.
     #[tokio::test]
     async fn rescan_creates_items_and_files() {
-        let root = test_root();
+        let test_env = test_data_dir();
+        let root = test_env.path();
         let index_db = next_db_name();
         let user_data_db = next_db_name();
         migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
             .await
             .unwrap();
 
-        let media_dir = root.path().join("media");
+        let media_dir = root.join("media");
         fs::create_dir_all(&media_dir).unwrap();
         let image_path = media_dir.join("sample.png");
         let image = image::RgbImage::new(8, 8);
         image.save(&image_path).unwrap();
 
-        let store = SystemConfigStore::new(root.path().to_path_buf());
+        let store = SystemConfigStore::new(root.to_path_buf());
         let mut config = SystemConfig::default();
         config.included_folders = vec![media_dir.to_string_lossy().to_string()];
         store.save(&index_db, &config).unwrap();
@@ -1429,7 +1418,7 @@ mod tests {
         let service = FileScanService::new(
             index_db.clone(),
             user_data_db.clone(),
-            root.path().to_path_buf(),
+            root.to_path_buf(),
             ScanOptions { worker_count: 2 },
         );
 

@@ -2,18 +2,20 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use ractor::concurrency::Duration as RactorDuration;
 use sqlx::SqliteConnection;
-use tokio::sync::{OnceCell, oneshot};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::api_error::ApiError;
 use crate::db::{
     file_scans::{
         add_file_scan,
+        close_file_scan,
         delete_unavailable_files,
         mark_unavailable_files,
         update_file_scan,
@@ -22,6 +24,9 @@ use crate::db::{
     files::{
         delete_files_not_allowed_stub,
         delete_items_without_files,
+        delete_file_by_path,
+        delete_item_if_orphan,
+        rename_file_path,
         set_blurhash,
         update_file_data,
         FileScanData,
@@ -69,6 +74,11 @@ pub(crate) enum IndexDbWriterMessage {
         update: FileScanUpdate,
         reply: Reply<()>,
     },
+    CloseFileScan {
+        scan_id: i64,
+        end_time: String,
+        reply: Reply<()>,
+    },
     MarkUnavailableFiles {
         scan_id: i64,
         path: String,
@@ -93,6 +103,21 @@ pub(crate) enum IndexDbWriterMessage {
         process_version: i64,
         frames: Vec<StoredImage>,
         reply: Reply<()>,
+    },
+    RenameFilePath {
+        old_path: String,
+        new_path: String,
+        scan_id: i64,
+        last_modified: String,
+        reply: Reply<bool>,
+    },
+    DeleteFileByPath {
+        path: String,
+        reply: Reply<u64>,
+    },
+    DeleteItemIfOrphan {
+        item_id: i64,
+        reply: Reply<bool>,
     },
     SetBlurhash {
         sha256: String,
@@ -270,6 +295,18 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
+            IndexDbWriterMessage::CloseFileScan {
+                scan_id,
+                end_time,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { close_file_scan(conn, scan_id, &end_time).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
             IndexDbWriterMessage::MarkUnavailableFiles {
                 scan_id,
                 path,
@@ -339,6 +376,39 @@ impl Actor for IndexDbWriter {
                             )
                             .await
                         })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RenameFilePath {
+                old_path,
+                new_path,
+                scan_id,
+                last_modified,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            rename_file_path(conn, &old_path, &new_path, scan_id, &last_modified)
+                                .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteFileByPath { path, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_file_by_path(conn, &path).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteItemIfOrphan { item_id, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_item_if_orphan(conn, item_id).await })
                     })
                     .await;
                 let _ = reply.send(result);
@@ -582,7 +652,7 @@ impl Actor for IndexDbSupervisor {
     }
 }
 
-static SUPERVISOR: OnceCell<ActorRef<IndexDbSupervisorMessage>> = OnceCell::const_new();
+static SUPERVISOR: OnceLock<Mutex<Option<ActorRef<IndexDbSupervisorMessage>>>> = OnceLock::new();
 
 pub(crate) async fn get_index_db_writer(
     index_db: &str,
@@ -600,17 +670,28 @@ async fn get_index_db_writer_inner(
     index_db: &str,
     force_new: bool,
 ) -> ApiResult<ActorRef<IndexDbWriterMessage>> {
-    let supervisor = ensure_supervisor().await?;
-    let (reply, rx) = oneshot::channel();
-    supervisor
-        .send_message(IndexDbSupervisorMessage::GetWriter {
-            index_db: index_db.to_string(),
-            force_new,
-            reply,
-        })
-        .map_err(|_| ApiError::internal("Index DB supervisor unavailable"))?;
-    rx.await
-        .map_err(|_| ApiError::internal("Index DB supervisor dropped response"))?
+    for attempt in 0..CALL_RETRY_ATTEMPTS {
+        let supervisor = if attempt == 0 {
+            ensure_supervisor().await?
+        } else {
+            replace_supervisor().await?
+        };
+        let (reply, rx) = oneshot::channel();
+        if supervisor
+            .send_message(IndexDbSupervisorMessage::GetWriter {
+                index_db: index_db.to_string(),
+                force_new,
+                reply,
+            })
+            .is_err()
+        {
+            continue;
+        }
+        return rx
+            .await
+            .map_err(|_| ApiError::internal("Index DB supervisor dropped response"))?;
+    }
+    Err(ApiError::internal("Index DB supervisor unavailable"))
 }
 
 /// Sends a request to the writer with a single retry on writer death.
@@ -650,26 +731,36 @@ where
 }
 
 async fn ensure_supervisor() -> ApiResult<ActorRef<IndexDbSupervisorMessage>> {
-    SUPERVISOR
-        .get_or_try_init(|| async {
-            let args = IndexDbSupervisorArgs {
-                health_interval: HEALTH_CHECK_INTERVAL,
-                idle_timeout: IDLE_TIMEOUT,
-            };
-            let (actor, _handle) = Actor::spawn(
-                Some("index-db-supervisor".to_string()),
-                IndexDbSupervisor,
-                args,
-            )
-            .await
-            .map_err(|err| {
-                tracing::error!(error = ?err, "failed to start index db supervisor");
-                ApiError::internal("Failed to start index DB supervisor")
-            })?;
-            Ok(actor)
-        })
-        .await
-        .map(Clone::clone)
+    let cell = SUPERVISOR.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().await;
+    if let Some(actor) = guard.as_ref() {
+        return Ok(actor.clone());
+    }
+    let actor = spawn_supervisor().await?;
+    *guard = Some(actor.clone());
+    Ok(actor)
+}
+
+async fn replace_supervisor() -> ApiResult<ActorRef<IndexDbSupervisorMessage>> {
+    let cell = SUPERVISOR.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().await;
+    let actor = spawn_supervisor().await?;
+    *guard = Some(actor.clone());
+    Ok(actor)
+}
+
+async fn spawn_supervisor() -> ApiResult<ActorRef<IndexDbSupervisorMessage>> {
+    let args = IndexDbSupervisorArgs {
+        health_interval: HEALTH_CHECK_INTERVAL,
+        idle_timeout: IDLE_TIMEOUT,
+    };
+    let (actor, _handle) = Actor::spawn(None, IndexDbSupervisor, args)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = ?err, "failed to start index db supervisor");
+        ApiError::internal("Failed to start index DB supervisor")
+    })?;
+    Ok(actor)
 }
 
 async fn spawn_writer(

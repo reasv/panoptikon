@@ -78,3 +78,49 @@ When you change behavior
 - Keep the "Behavior" section authoritative; if behavior changes, update it.
 - If the policy layer or proxy flow changes, also update `gateway/README.md`.
 - Keep DB connection/helpers/CRUD code inside `gateway/src/db/`.
+
+Continuous File Scanning (Implemented)
+
+- Scope: optional continuous file scanning per index DB, controlled by `continuous_filescan = true` in the per-DB TOML SystemConfig. This feature is not part of the job queue.
+- Actor topology:
+  - `ContinuousScanSupervisor` (singleton actor) maintains `index_db -> ActorRef<ContinuousScanActor>`.
+  - One `ContinuousScanActor` per index DB when enabled in config.
+  - A ractor factory (per DB) runs per-file processing workers; DB writes still go through the index DB writer actor (serialized).
+- Startup + discovery:
+  - On startup, supervisor enumerates DBs in `DATA_FOLDER`, loads each config, and spawns per-DB actors when enabled.
+  - Supervisor watches `DATA_FOLDER/index` for FS changes to react to DB additions/removals and config edits.
+  - The config update API notifies the supervisor directly on changes (fast-path).
+- Pause/resume semantics (no job queue coupling, but reactive):
+  - Continuous scan runs concurrently with data extraction jobs and file scans on other DBs.
+  - It pauses when a `folder_rescan`/`folder_update` starts on the same DB.
+  - Job runner pauses before starting a file scan job and resumes after completion (if still enabled).
+- Epoch gating (write safety guarantee):
+  - Each `ContinuousScanActor` tracks `epoch: u64`, `paused: bool`, and `paused_for_job`.
+  - Every worker task is dispatched with the current epoch.
+  - Before any DB write, the actor checks `paused == false` and `task_epoch == current_epoch`.
+  - Pause increments `epoch` and sets `paused = true`, so stale results are dropped without writing.
+  - This guarantees no file/folder writes after a file scan job starts, without blocking on in-flight tasks.
+- File scan rows:
+  - Each continuous run creates a new `file_scans` row (path sentinel `"<continuous>"`).
+  - On pause/stop/config disable, close the row (`end_time = now`) and do not reuse it.
+  - On resume, create a new row with a new `scan_id`.
+  - On startup, any open continuous scan row is closed before creating a new one.
+- Allowed operations:
+  - Continuous scan can add new files/items and delete files it created in the current continuous session after verifying they are truly missing.
+  - No content-update semantics: file content change == delete old file row + create new file row (new hash -> new item).
+  - Items with no files are always deleted. If an item should survive, its file should not be deleted.
+  - No mark-unavailable + sweep deletes; those remain full scan responsibilities.
+- Deletion policy (conservative):
+  - Never delete on fs event alone; always verify on disk.
+  - Safe deletes:
+    - Files created in the current continuous scan (`scan_id == current_scan_id`).
+    - Duplicate files for an item (other file rows exist).
+  - Otherwise, avoid destructive deletes and defer to full scan.
+- Move handling:
+  - Rename events (old_path -> new_path) are safe to apply because they do not delete items; treat them as a path update on the file row.
+  - If a move appears as delete+create (no rename event), process it directly as delete+create.
+- Cross-platform file watching:
+  - Use `notify` with native backends (Windows/macOS/Linux).
+  - Optional polling mode when `continuous_filescan_poll_interval_secs` is set (uses `notify::PollWatcher`).
+  - Watcher overflow logs a warning (index_db + watched roots); no automatic recovery action.
+  - For unreliable shares (SMB/NFS), add an explicit config opt-in to use `notify::PollWatcher` with a configurable interval (e.g., `continuous_filescan_poll_interval_secs`); default remains native watchers.

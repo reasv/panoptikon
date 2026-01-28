@@ -10,6 +10,7 @@ use crate::api_error::ApiError;
 use crate::db::index_writer::IndexDbWriterMessage;
 use crate::db::index_writer::call_index_db_writer;
 use crate::jobs::files::FileScanService;
+use crate::jobs::continuous_scan;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -394,19 +395,23 @@ impl Actor for JobRunnerActor {
 async fn execute_job(job: Job) -> Result<(), String> {
     match job.job_type {
         JobType::FolderRescan => {
-            let service = FileScanService::from_env(job.index_db, job.user_data_db);
-            service
-                .rescan_folders()
+            continuous_scan::pause_for_job(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
+            let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
+            let result = service.rescan_folders().await;
+            let _ = continuous_scan::resume_after_job(&job.index_db).await;
+            result.map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
         JobType::FolderUpdate => {
-            let service = FileScanService::from_env(job.index_db, job.user_data_db);
-            service
-                .run_folder_update()
+            continuous_scan::pause_for_job(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
+            let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
+            let result = service.run_folder_update().await;
+            let _ = continuous_scan::resume_after_job(&job.index_db).await;
+            result.map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
         JobType::JobDataDeletion => {

@@ -5,6 +5,8 @@ mod db;
 mod jobs;
 mod policy;
 mod proxy;
+#[cfg(test)]
+mod test_utils;
 
 use axum::{
     Router,
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         if enable_db_create {
             app = app.route("/api/db/create", post(api::db::db_create));
         }
+        let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app
             .route(
                 "/api/bookmarks/ns",

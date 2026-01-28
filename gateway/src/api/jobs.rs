@@ -8,6 +8,7 @@ use crate::db::folders::get_folders_from_database;
 use crate::db::extraction_log::{get_all_data_logs, get_setters_total_data, LogRecord};
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::jobs::files::is_resync_needed;
+use crate::jobs::continuous_scan;
 use crate::jobs::queue::{
     JobModel,
     JobRequest,
@@ -225,6 +226,7 @@ pub(crate) async fn update_config(
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
     let config = store.load(&conn.index_db)?;
+    let _ = continuous_scan::notify_config_change(&conn.index_db).await;
     let resync_needed = is_resync_needed(&conn.index_db, &conn.user_data_db, &config).await?;
     if resync_needed {
         let _ = enqueue_job(JobRequest {
