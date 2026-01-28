@@ -27,7 +27,7 @@ walkdir = "2"
 mime_guess = "2"
 md-5 = "0.10"
 image = { version = "0.25", default-features = true }
-notify = "6.1"
+notify = "8.2.0"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 sqlx = { version = "0.7", features = [
     "runtime-tokio",
