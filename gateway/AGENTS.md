@@ -93,6 +93,10 @@ PQL Rewrite (Rust, Planned)
 - Initial filter subset (fully working core, no inference required):
   - `Match`, `MatchPath`, `MatchText`, `MatchTags`, `InBookmarks`, `ProcessedBy`, `HasUnprocessedData`.
   - Embedding-dependent filters are deferred until a Rust-side embedding/model-metadata layer exists.
+- Implementation status:
+  - `Match` is implemented with KV joins + recursive operator handling (eq/neq/in/nin/gt/gte/lt/lte/startswith/endswith/contains, plus nested and/or/not).
+  - `MatchPath` is implemented with FTS5 `MATCH`, `rank`-based `order_rank`, `row_n` windowing, and `gt`/`lt` cursor filtering.
+  - Remaining filters in the subset are still pending.
 - Test strategy (results + performance invariants):
   - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
   - Validate result equivalence and ordering on a fixed SQLite fixture DB.
