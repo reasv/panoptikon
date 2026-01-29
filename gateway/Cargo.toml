@@ -51,6 +51,15 @@ base64 = "0.22"
 dotenvy = "0.15"
 ractor = "0.15"
 blurhash = "0.2.3"
+sea-query = { version = "=1.0.0-rc.30", features = ["sqlx-utils"] }
+sea-query-sqlx = { version = "=0.8.0-rc.14", features = [
+    "sqlx-sqlite",
+    "with-chrono",
+    "with-json",
+    "with-uuid",
+    "with-time",
+    "runtime-async-std-native-tls",
+] }
 
 [dev-dependencies]
 tempfile = "3"
