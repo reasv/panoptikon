@@ -88,6 +88,7 @@ PQL Rewrite (Rust, Planned)
   - Schema/AST: `serde` models mirror the Pydantic union shapes and field names (`and_`, `or_`, `not_`, filter fields).
   - Preprocess/validation: matches Python behavior exactly, including filter-specific mutations (e.g., `MatchText.filter_only`).
   - Builder: SeaQuery-based query builder replicates `QueryState`, CTE chaining, root CTE unwrapping, join ordering rules, `order_by` + `partition_by`, and extra-column handling.
+  - Join tracking: filters record which base tables they already join so root CTE unwrapping does not introduce duplicate base-table joins (avoids ambiguous column errors).
   - Count queries: preserve count semantics (including partition-by counting and ignoring gt/lt cursor filters).
   - SQLite specifics: FTS5 `MATCH`, `snippet(...)`, and vector functions are emitted as raw SQL fragments where needed.
 - Initial filter subset (fully working core, no inference required):
@@ -105,6 +106,7 @@ PQL Rewrite (Rust, Planned)
 - Test strategy (results + performance invariants):
   - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
   - Validate result equivalence and ordering on a fixed SQLite fixture DB.
+  - Per-filter unit tests build a full PQL query and execute it against in-memory test databases to ensure the generated SQL is valid for our schema.
   - Validate SQL structure without relying on byte-for-byte SQL equality:
     - Normalize SQL (whitespace/casing) and compare key structural properties (CTE ordering, join graph, selected columns).
     - Track query plans as a diagnostic signal; do not rely on plan output alone, but use it to spot regressions in join/index usage.

@@ -5,8 +5,8 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    CteRef, ItemData, QueryState, Setters, apply_group_by, get_std_group_by, select_std_from_cte,
-    wrap_query,
+    BaseTable, CteRef, ItemData, JoinedTables, QueryState, Setters, apply_group_by,
+    get_std_group_by, select_std_from_cte, wrap_query,
 };
 
 impl FilterCompiler for ProcessedBy {
@@ -28,7 +28,10 @@ impl FilterCompiler for ProcessedBy {
 
         apply_group_by(&mut query, get_std_group_by(context, state));
 
-        let cte = wrap_query(state, query, context, cte_name);
+        let mut joined_tables = JoinedTables::default();
+        joined_tables.mark(BaseTable::ItemData);
+        joined_tables.mark(BaseTable::Setters);
+        let cte = wrap_query(state, query, context, cte_name, &joined_tables);
         state.cte_counter += 1;
         Ok(cte)
     }
@@ -37,10 +40,12 @@ impl FilterCompiler for ProcessedBy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn processed_by_builds_sql() {
@@ -53,5 +58,16 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("setters"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[tokio::test]
+    async fn processed_by_runs_full_query() {
+        let filter: ProcessedBy = serde_json::from_value(json!({
+            "processed_by": "file_scan"
+        }))
+        .expect("processed_by filter");
+        run_full_pql_query(QueryElement::ProcessedBy(filter), EntityType::File)
+            .await
+            .expect("processed_by query");
     }
 }

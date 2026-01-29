@@ -5,9 +5,9 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    CteRef, ExtraColumn, ItemData, OrderByFilter, QueryState, Setters, Tags, TagsItems,
-    add_rank_column_expr, apply_group_by, apply_sort_bounds, create_cte, get_std_group_by,
-    select_std_from_cte, wrap_query,
+    CteRef, ExtraColumn, ItemData, JoinedTables, OrderByFilter, QueryState, Setters, Tags,
+    TagsItems, add_rank_column_expr, apply_group_by, apply_sort_bounds, create_cte,
+    get_std_group_by, select_std_from_cte, wrap_query,
 };
 
 impl FilterCompiler for MatchTags {
@@ -127,7 +127,8 @@ impl FilterCompiler for MatchTags {
         let (query, context_for_wrap) =
             apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
 
-        let cte = wrap_query(state, query, &context_for_wrap, cte_name);
+        let joined_tables = JoinedTables::default();
+        let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
             if let Some(alias) = &self.sort.select_as {
@@ -153,10 +154,12 @@ impl FilterCompiler for MatchTags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn match_tags_builds_sql() {
@@ -169,5 +172,16 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("tags"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[tokio::test]
+    async fn match_tags_runs_full_query() {
+        let filter: MatchTags = serde_json::from_value(json!({
+            "match_tags": { "tags": ["cat"], "match_any": true }
+        }))
+        .expect("match_tags filter");
+        run_full_pql_query(QueryElement::MatchTags(filter), EntityType::File)
+            .await
+            .expect("match_tags query");
     }
 }

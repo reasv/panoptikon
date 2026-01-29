@@ -48,6 +48,7 @@ struct CteDefinition {
 struct FilterSelect {
     select: SelectStatement,
     context: CteRef,
+    joined_tables: JoinedTables,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +107,7 @@ enum BaseTable {
     Setters,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct JoinedTables {
     tables: HashSet<BaseTable>,
 }
@@ -223,7 +224,7 @@ pub(crate) fn build_query(
             data_id_ref = Some(root_context.column_ref("data_id"));
         }
 
-        joined_tables = JoinedTables::default();
+        joined_tables = root_select.joined_tables.clone();
     } else {
         let (query, file_id, item_id, data_id) =
             get_empty_query(&mut joined_tables, state.item_data_query, state.entity);
@@ -421,6 +422,7 @@ fn process_query_element(
                 FilterSelect {
                     select: select_std_from_cte(&or_cte, state),
                     context: or_cte.clone(),
+                    joined_tables: JoinedTables::default(),
                 },
             );
             Ok(or_cte)
@@ -452,6 +454,7 @@ fn process_query_element(
                 FilterSelect {
                     select: select_std_from_cte(&not_cte, state),
                     context: not_cte.clone(),
+                    joined_tables: JoinedTables::default(),
                 },
             );
             Ok(not_cte)
@@ -479,6 +482,7 @@ fn wrap_query(
     query: SelectStatement,
     context: &CteRef,
     cte_name: String,
+    joined_tables: &JoinedTables,
 ) -> CteRef {
     let cte = create_cte(state, cte_name.clone(), query.clone());
     state.selects.insert(
@@ -486,6 +490,7 @@ fn wrap_query(
         FilterSelect {
             select: query,
             context: context.clone(),
+            joined_tables: joined_tables.clone(),
         },
     );
     cte

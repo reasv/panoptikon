@@ -56,6 +56,8 @@ Special handling:
   locally using the same policy enforcement and filtering rules.
   `/api/search/pql` compiles queries via the upstream `/api/search/pql/build`
   response to apply extra column aliases and the `check_path` behavior.
+  The in-progress Rust PQL compiler tracks joined base tables to avoid duplicate
+  joins when the root CTE is unwrapped.
 
 ## Database migrations
 

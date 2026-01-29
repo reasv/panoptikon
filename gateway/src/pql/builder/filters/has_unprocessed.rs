@@ -5,8 +5,8 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    CteRef, ItemData, QueryState, Setters, apply_group_by, get_std_group_by, select_std_from_cte,
-    wrap_query,
+    CteRef, ItemData, JoinedTables, QueryState, Setters, apply_group_by, get_std_group_by,
+    select_std_from_cte, wrap_query,
 };
 
 impl FilterCompiler for HasUnprocessedData {
@@ -51,7 +51,8 @@ impl FilterCompiler for HasUnprocessedData {
         query.and_where(Expr::not_exists(not_exists_subquery.to_owned()));
         apply_group_by(&mut query, get_std_group_by(context, state));
 
-        let cte = wrap_query(state, query, context, cte_name);
+        let joined_tables = JoinedTables::default();
+        let cte = wrap_query(state, query, context, cte_name, &joined_tables);
         state.cte_counter += 1;
         Ok(cte)
     }
@@ -60,10 +61,12 @@ impl FilterCompiler for HasUnprocessedData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn has_unprocessed_builds_sql() {
@@ -79,5 +82,19 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("NOT EXISTS"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[tokio::test]
+    async fn has_unprocessed_runs_full_query() {
+        let filter: HasUnprocessedData = serde_json::from_value(json!({
+            "has_data_unprocessed": {
+                "setter_name": "ocr",
+                "data_types": ["text"]
+            }
+        }))
+        .expect("has_unprocessed filter");
+        run_full_pql_query(QueryElement::HasUnprocessedData(filter), EntityType::File)
+            .await
+            .expect("has_unprocessed query");
     }
 }

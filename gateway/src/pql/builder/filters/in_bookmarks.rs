@@ -5,8 +5,9 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    Bookmarks, CteRef, ExtraColumn, Files, OrderByFilter, QueryState, add_rank_column_expr,
-    apply_group_by, apply_sort_bounds, get_std_group_by, select_std_from_cte, wrap_query,
+    BaseTable, Bookmarks, CteRef, ExtraColumn, Files, JoinedTables, OrderByFilter, QueryState,
+    add_rank_column_expr, apply_group_by, apply_sort_bounds, get_std_group_by, select_std_from_cte,
+    wrap_query,
 };
 
 impl FilterCompiler for InBookmarks {
@@ -85,7 +86,9 @@ impl FilterCompiler for InBookmarks {
         let (query, context_for_wrap) =
             apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
 
-        let cte = wrap_query(state, query, &context_for_wrap, cte_name);
+        let mut joined_tables = JoinedTables::default();
+        joined_tables.mark(BaseTable::Files);
+        let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
             if let Some(alias) = &self.sort.select_as {
@@ -111,10 +114,12 @@ impl FilterCompiler for InBookmarks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn in_bookmarks_builds_sql() {
@@ -127,5 +132,16 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("bookmarks"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[tokio::test]
+    async fn in_bookmarks_runs_full_query() {
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "namespaces": ["demo"], "user": "alice", "sub_ns": true }
+        }))
+        .expect("in_bookmarks filter");
+        run_full_pql_query(QueryElement::InBookmarks(filter), EntityType::File)
+            .await
+            .expect("in_bookmarks query");
     }
 }

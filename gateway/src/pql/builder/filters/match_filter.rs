@@ -8,8 +8,8 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    CteRef, ExtractedText, Files, ItemData, Items, QueryState, Setters, get_column_expr,
-    is_text_column, select_std_from_cte, wrap_query,
+    BaseTable, CteRef, ExtractedText, Files, ItemData, Items, JoinedTables, QueryState, Setters,
+    get_column_expr, is_text_column, select_std_from_cte, wrap_query,
 };
 
 impl FilterCompiler for Match {
@@ -47,8 +47,17 @@ impl FilterCompiler for Match {
         }
         query.and_where(expression);
 
+        let mut joined_tables = JoinedTables::default();
+        joined_tables.mark(BaseTable::Items);
+        joined_tables.mark(BaseTable::Files);
+        if state.item_data_query {
+            joined_tables.mark(BaseTable::ItemData);
+            joined_tables.mark(BaseTable::Setters);
+            joined_tables.mark(BaseTable::ExtractedText);
+        }
+
         let cte_name = format!("n{}_Match", state.cte_counter);
-        let cte = wrap_query(state, query, context, cte_name);
+        let cte = wrap_query(state, query, context, cte_name, &joined_tables);
         state.cte_counter += 1;
         Ok(cte)
     }
@@ -57,10 +66,12 @@ impl FilterCompiler for Match {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn match_filter_builds_sql() {
@@ -73,6 +84,17 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("SELECT"));
         assert!(sql.contains("FROM"));
+    }
+
+    #[tokio::test]
+    async fn match_filter_runs_full_query() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "file_id": 1 } }
+        }))
+        .expect("match filter");
+        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+            .await
+            .expect("match query");
     }
 }
 

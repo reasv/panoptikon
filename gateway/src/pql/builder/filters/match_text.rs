@@ -8,9 +8,9 @@ use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
 use super::super::{
-    CteRef, ExtraColumn, ExtractedText, ExtractedTextFts, ItemData, OrderByFilter, QueryState,
-    Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds, create_cte, get_std_group_by,
-    select_std_from_cte, wrap_query,
+    BaseTable, CteRef, ExtraColumn, ExtractedText, ExtractedTextFts, ItemData, JoinedTables,
+    OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
+    create_cte, get_std_group_by, select_std_from_cte, wrap_query,
 };
 
 impl FilterCompiler for MatchText {
@@ -161,7 +161,11 @@ impl FilterCompiler for MatchText {
             let (final_query, context_for_wrap) =
                 apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &self.sort);
 
-            let cte = wrap_query(state, final_query, &context_for_wrap, cte_name);
+            let mut joined_tables = JoinedTables::default();
+            joined_tables.mark(BaseTable::ItemData);
+            joined_tables.mark(BaseTable::Setters);
+            joined_tables.mark(BaseTable::ExtractedText);
+            let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
             state.cte_counter += 1;
             if !state.is_count_query {
                 if let Some(alias) = &self.sort.select_as {
@@ -246,7 +250,11 @@ impl FilterCompiler for MatchText {
         let (final_query, context_for_wrap) =
             apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &self.sort);
 
-        let cte = wrap_query(state, final_query, &context_for_wrap, cte_name);
+        let mut joined_tables = JoinedTables::default();
+        joined_tables.mark(BaseTable::ItemData);
+        joined_tables.mark(BaseTable::Setters);
+        joined_tables.mark(BaseTable::ExtractedText);
+        let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
             if let Some(alias) = &self.sort.select_as {
@@ -279,10 +287,12 @@ impl FilterCompiler for MatchText {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pql::model::EntityType;
+    use crate::pql::model::{EntityType, QueryElement};
     use serde_json::json;
 
-    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+    use super::super::test_support::{
+        build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
+    };
 
     #[test]
     fn match_text_builds_sql() {
@@ -295,5 +305,16 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("extracted_text_fts"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[tokio::test]
+    async fn match_text_runs_full_query() {
+        let filter: MatchText = serde_json::from_value(json!({
+            "match_text": { "match": "hello world" }
+        }))
+        .expect("match_text filter");
+        run_full_pql_query(QueryElement::MatchText(filter), EntityType::Text)
+            .await
+            .expect("match_text query");
     }
 }

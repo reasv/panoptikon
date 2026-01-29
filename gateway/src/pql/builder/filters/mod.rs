@@ -18,8 +18,11 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
 
     use sea_query::{Alias, Cond, Expr, ExprTrait, Query, SqliteQueryBuilder};
+    use sea_query_sqlx::SqlxBinder;
 
-    use crate::pql::model::EntityType;
+    use crate::db::migrations::setup_test_databases;
+    use crate::pql::build_query;
+    use crate::pql::model::{EntityType, PqlQuery, QueryElement};
 
     use super::{CteRef, FilterCompiler, QueryState};
     use super::super::{
@@ -72,5 +75,29 @@ pub(crate) mod test_support {
         let select = select_std_from_cte(&cte, state);
         let with_clause = build_with_clause(state, None, None).expect("with clause");
         select.with(with_clause).to_string(SqliteQueryBuilder)
+    }
+
+    pub(crate) async fn run_full_pql_query(
+        filter: QueryElement,
+        entity: EntityType,
+    ) -> Result<(), sqlx::Error> {
+        let mut query = PqlQuery {
+            query: Some(filter),
+            entity,
+            ..Default::default()
+        };
+
+        let built = build_query(query, false).expect("build_query");
+        let mut dbs = setup_test_databases().await;
+
+        let (sql, values) = match built.with_clause {
+            Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
+            None => built.query.build_sqlx(SqliteQueryBuilder),
+        };
+
+        let _rows = sqlx::query_with(&sql, values)
+            .fetch_all(&mut dbs.index_conn)
+            .await?;
+        Ok(())
     }
 }
