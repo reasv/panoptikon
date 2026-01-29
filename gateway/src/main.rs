@@ -2,6 +2,7 @@ mod api;
 mod api_error;
 mod config;
 mod db;
+mod inferio_client;
 mod jobs;
 mod policy;
 mod proxy;

@@ -9,6 +9,7 @@ tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
     "process",
+    "fs",
 ] }
 hyper = { version = "1", features = ["http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = [
@@ -62,6 +63,9 @@ sea-query-sqlx = { version = "=0.8.0-rc.14", features = [
 ] }
 shell-words = "1"
 utoipa = "4"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+reqwest-middleware = { version = "0.3", features = ["multipart"] }
+reqwest-retry = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
