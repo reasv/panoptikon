@@ -60,6 +60,8 @@ sea-query-sqlx = { version = "=0.8.0-rc.14", features = [
     "with-time",
     "runtime-async-std-native-tls",
 ] }
+shell-words = "1"
+utoipa = "4"
 
 [dev-dependencies]
 tempfile = "3"

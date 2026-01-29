@@ -5,6 +5,7 @@ mod db;
 mod jobs;
 mod policy;
 mod proxy;
+mod pql;
 #[cfg(test)]
 mod test_utils;
 
