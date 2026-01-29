@@ -96,7 +96,12 @@ PQL Rewrite (Rust, Planned)
 - Implementation status:
   - `Match` is implemented with KV joins + recursive operator handling (eq/neq/in/nin/gt/gte/lt/lte/startswith/endswith/contains, plus nested and/or/not).
   - `MatchPath` is implemented with FTS5 `MATCH`, `rank`-based `order_rank`, `row_n` windowing, and `gt`/`lt` cursor filtering.
-  - Remaining filters in the subset are still pending.
+  - `MatchText` is implemented with FTS5 `MATCH`, setter/language/confidence filters, snippet extraction, and `row_n` windowing for best snippet selection.
+  - `MatchTags` is implemented with tag/name/namespace filters, setters, confidence thresholds, and exact/all-setter matching via HAVING clauses.
+  - `InBookmarks` is implemented with user + namespace filtering (including sub-namespaces) and ordering by latest bookmark timestamp.
+  - `ProcessedBy` is implemented with setter filtering over derived data per item/data row.
+  - `HasUnprocessedData` is implemented with derived-data `NOT EXISTS` checks and placeholder filtering.
+  - Wiring into `/api/search/pql` is still pending; the route continues to compile via upstream `/api/search/pql/build` until the Rust builder is turned on.
 - Test strategy (results + performance invariants):
   - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
   - Validate result equivalence and ordering on a fixed SQLite fixture DB.

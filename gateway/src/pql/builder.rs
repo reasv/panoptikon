@@ -680,45 +680,531 @@ fn build_match_path_filter(
 }
 
 fn build_match_text_filter(
-    _filter: &MatchText,
-    _context: &CteRef,
-    _state: &mut QueryState,
+    filter: &MatchText,
+    context: &CteRef,
+    state: &mut QueryState,
 ) -> Result<CteRef, PqlError> {
-    Err(PqlError::invalid("MatchText filter not implemented"))
+    let args = &filter.match_text;
+    let cte_name = format!("n{}_MatchText", state.cte_counter);
+    let want_snippet = args.select_snippet_as.is_some() && !state.is_count_query;
+
+    let mut criteria = Vec::new();
+    if !args.filter_only {
+        criteria.push(
+            Expr::col((ExtractedTextFts::Table, ExtractedTextFts::Text)).binary(
+                SqliteBinOper::Match,
+                Expr::val(args.r#match.clone()),
+            ),
+        );
+    }
+    if let Some(min_length) = args.min_length {
+        if min_length > 0 {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::TextLength)).gte(min_length),
+            );
+        }
+    }
+    if let Some(max_length) = args.max_length {
+        if max_length > 0 {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::TextLength)).lte(max_length),
+            );
+        }
+    }
+    if !args.setters.is_empty() {
+        let setters = args.setters.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+        criteria.push(Expr::col((Setters::Table, Setters::Name)).is_in(setters));
+    }
+    if !args.languages.is_empty() {
+        let languages = args
+            .languages
+            .iter()
+            .cloned()
+            .map(Expr::val)
+            .collect::<Vec<_>>();
+        criteria.push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(languages));
+    }
+    if let Some(min_language_confidence) = args.min_language_confidence {
+        if min_language_confidence > 0.0 {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence))
+                    .gte(min_language_confidence),
+            );
+        }
+    }
+    if let Some(min_confidence) = args.min_confidence {
+        if min_confidence > 0.0 {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::Confidence))
+                    .gte(min_confidence),
+            );
+        }
+    }
+
+    let snippet_expr: Expr = Func::cust("snippet")
+        .args([
+            Expr::cust("extracted_text_fts"),
+            Expr::val(-1),
+            Expr::val(args.s_start_tag.clone()),
+            Expr::val(args.s_end_tag.clone()),
+            Expr::val(args.s_ellipsis.clone()),
+            Expr::val(args.s_max_len),
+        ])
+        .into();
+
+    if !(state.item_data_query && matches!(state.entity, EntityType::Text)) {
+        let mut query = select_std_from_cte(context, state);
+        query.join(
+            JoinType::InnerJoin,
+            ItemData::Table,
+            Expr::col((ItemData::Table, ItemData::ItemId))
+                .equals(context.column_ref("item_id")),
+        );
+        query.join(
+            JoinType::InnerJoin,
+            Setters::Table,
+            Expr::col((Setters::Table, Setters::Id))
+                .equals((ItemData::Table, ItemData::SetterId)),
+        );
+        query.join(
+            JoinType::InnerJoin,
+            ExtractedText::Table,
+            Expr::col((ExtractedText::Table, ExtractedText::Id)).equals((ItemData::Table, ItemData::Id)),
+        );
+        query.join(
+            JoinType::InnerJoin,
+            ExtractedTextFts::Table,
+            Expr::cust("extracted_text_fts.rowid").equals((ExtractedText::Table, ExtractedText::Id)),
+        );
+        for condition in criteria {
+            query.and_where(condition);
+        }
+
+        let mut context_for_wrap = context.clone();
+        let mut final_query = query;
+
+        if want_snippet {
+            final_query.expr_as(snippet_expr, Alias::new("snip"));
+            final_query.expr_as(Expr::cust("rank"), Alias::new("rank"));
+
+            let match_cte = create_cte(state, format!("matchq_{cte_name}"), final_query.to_owned());
+            let mut rownum_query = Query::select();
+            rownum_query
+                .from(Alias::new(match_cte.name.as_str()))
+                .column((Alias::new(match_cte.name.as_str()), Asterisk));
+            let mut window = WindowStatement::new();
+            window.partition_by(match_cte.column_ref("file_id"));
+            window.order_by_expr(match_cte.column_expr("rank"), Order::Asc);
+            rownum_query.expr_window_as(Expr::cust("row_number()"), window, Alias::new("rn"));
+            let rownum_cte =
+                create_cte(state, format!("rownum_{cte_name}"), rownum_query.to_owned());
+
+            let mut select_query = Query::select();
+            select_query
+                .from(Alias::new(rownum_cte.name.as_str()))
+                .column((Alias::new(rownum_cte.name.as_str()), Asterisk))
+                .and_where(
+                    Expr::col((Alias::new(rownum_cte.name.as_str()), Alias::new("rn"))).eq(1),
+                );
+            final_query = select_query;
+            context_for_wrap = rownum_cte;
+
+            if !state.is_count_query {
+                add_rank_column_expr(&mut final_query, &filter.sort, Expr::cust("rank"))?;
+            }
+        } else {
+            apply_group_by(&mut final_query, get_std_group_by(context, state));
+            if !state.is_count_query {
+                let rank_expr = if args.filter_only {
+                    Expr::val(1)
+                } else {
+                    Func::min(Expr::cust("rank")).into()
+                };
+                add_rank_column_expr(&mut final_query, &filter.sort, rank_expr)?;
+            }
+        }
+
+        let (final_query, context_for_wrap) =
+            apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &filter.sort);
+
+        let cte = wrap_query(state, final_query, &context_for_wrap, cte_name);
+        state.cte_counter += 1;
+        if !state.is_count_query {
+            if let Some(alias) = &filter.sort.select_as {
+                state.extra_columns.push(ExtraColumn {
+                    column: "order_rank".to_string(),
+                    cte: cte.clone(),
+                    alias: alias.clone(),
+                });
+            }
+            if let Some(alias) = &args.select_snippet_as {
+                state.extra_columns.push(ExtraColumn {
+                    column: "snip".to_string(),
+                    cte: cte.clone(),
+                    alias: alias.clone(),
+                });
+            }
+        }
+        return Ok(cte);
+    }
+
+    let mut query = select_std_from_cte(context, state);
+    query.join(
+        JoinType::InnerJoin,
+        ItemData::Table,
+        Expr::col((ItemData::Table, ItemData::Id)).equals(context.column_ref("data_id")),
+    );
+    query.join(
+        JoinType::InnerJoin,
+        Setters::Table,
+        Expr::col((Setters::Table, Setters::Id)).equals((ItemData::Table, ItemData::SetterId)),
+    );
+    query.join(
+        JoinType::InnerJoin,
+        ExtractedText::Table,
+        Expr::col((ExtractedText::Table, ExtractedText::Id)).equals(context.column_ref("data_id")),
+    );
+    query.join(
+        JoinType::InnerJoin,
+        ExtractedTextFts::Table,
+        Expr::cust("extracted_text_fts.rowid").equals(context.column_ref("data_id")),
+    );
+    for condition in criteria {
+        query.and_where(condition);
+    }
+
+    let mut context_for_wrap = context.clone();
+    let mut final_query = query;
+    if want_snippet {
+        final_query.expr_as(snippet_expr, Alias::new("snip"));
+        final_query.expr_as(Expr::cust("rank"), Alias::new("rank"));
+        let match_cte = create_cte(state, format!("matchq_{cte_name}"), final_query.to_owned());
+        context_for_wrap = match_cte.clone();
+        let mut select_query = Query::select();
+        select_query
+            .from(Alias::new(match_cte.name.as_str()))
+            .column((Alias::new(match_cte.name.as_str()), Asterisk));
+        final_query = select_query;
+    }
+
+    if !state.is_count_query {
+        let rank_expr = if args.filter_only {
+            Expr::val(1)
+        } else {
+            Expr::cust("rank")
+        };
+        add_rank_column_expr(&mut final_query, &filter.sort, rank_expr)?;
+    }
+
+    let (final_query, context_for_wrap) =
+        apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &filter.sort);
+
+    let cte = wrap_query(state, final_query, &context_for_wrap, cte_name);
+    state.cte_counter += 1;
+    if !state.is_count_query {
+        if let Some(alias) = &filter.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+        if let Some(alias) = &args.select_snippet_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "snip".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+    }
+    Ok(cte)
 }
 
 fn build_match_tags_filter(
-    _filter: &MatchTags,
-    _context: &CteRef,
-    _state: &mut QueryState,
+    filter: &MatchTags,
+    context: &CteRef,
+    state: &mut QueryState,
 ) -> Result<CteRef, PqlError> {
-    Err(PqlError::invalid("MatchTags filter not implemented"))
+    let args = &filter.match_tags;
+    let cte_name = format!("n{}_MatchTags", state.cte_counter);
+
+    let mut conditions = Vec::new();
+    let tag_values = args
+        .tags
+        .iter()
+        .cloned()
+        .map(Expr::val)
+        .collect::<Vec<_>>();
+    conditions.push(Expr::col((Tags::Table, Tags::Name)).is_in(tag_values));
+    if args.min_confidence > 0.0 {
+        conditions.push(
+            Expr::col((TagsItems::Table, TagsItems::Confidence)).gte(args.min_confidence),
+        );
+    }
+    if !args.setters.is_empty() {
+        let setters = args.setters.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+        conditions.push(Expr::col((Setters::Table, Setters::Name)).is_in(setters));
+    }
+    if !args.namespaces.is_empty() {
+        let mut namespace_exprs = Vec::new();
+        for namespace in &args.namespaces {
+            namespace_exprs.push(
+                Expr::col((Tags::Table, Tags::Namespace)).like(format!("{namespace}%")),
+            );
+        }
+        conditions.push(combine_or(namespace_exprs)?);
+    }
+
+    let mut matching_items_select = select_std_from_cte(context, state);
+    let join_cond = Cond::all()
+        .add(
+            Expr::col((ItemData::Table, ItemData::ItemId))
+                .equals(context.column_ref("item_id")),
+        )
+        .add(Expr::col((ItemData::Table, ItemData::DataType)).eq("tags"));
+    matching_items_select.join(JoinType::InnerJoin, ItemData::Table, join_cond);
+    matching_items_select.join(
+        JoinType::InnerJoin,
+        Setters::Table,
+        Expr::col((Setters::Table, Setters::Id)).equals((ItemData::Table, ItemData::SetterId)),
+    );
+    matching_items_select.join(
+        JoinType::InnerJoin,
+        TagsItems::Table,
+        Expr::col((TagsItems::Table, TagsItems::ItemDataId)).equals((ItemData::Table, ItemData::Id)),
+    );
+    matching_items_select.join(
+        JoinType::InnerJoin,
+        Tags::Table,
+        Expr::col((Tags::Table, Tags::Id)).equals((TagsItems::Table, TagsItems::TagId)),
+    );
+    for condition in conditions {
+        matching_items_select.and_where(condition);
+    }
+    apply_group_by(&mut matching_items_select, get_std_group_by(context, state));
+
+    let mut having_clauses = Vec::new();
+    if args.all_setters_required {
+        let setter_tag = Expr::col((ItemData::Table, ItemData::SetterId))
+            .binary(BinOper::Custom("||"), Expr::val("-"))
+            .binary(BinOper::Custom("||"), Expr::col((Tags::Table, Tags::Name)));
+        let expected = (args.tags.len() * args.setters.len()) as i64;
+        having_clauses.push(Func::count_distinct(setter_tag).eq(expected));
+    } else {
+        let expected = args.tags.len() as i64;
+        having_clauses.push(
+            Func::count_distinct(Expr::col((Tags::Table, Tags::Name))).eq(expected),
+        );
+    }
+    if args.match_any && args.tags.len() > 1 {
+        having_clauses.clear();
+    }
+    for clause in having_clauses {
+        matching_items_select.and_having(clause);
+    }
+
+    if !state.is_count_query {
+        let avg_confidence =
+            Func::avg(Expr::col((TagsItems::Table, TagsItems::Confidence))).into();
+        add_rank_column_expr(&mut matching_items_select, &filter.sort, avg_confidence)?;
+    }
+
+    let matching_items =
+        create_cte(state, format!("match_{cte_name}"), matching_items_select.to_owned());
+
+    let mut query = select_std_from_cte(context, state);
+    if !state.is_count_query {
+        query.expr_as(matching_items.column_expr("order_rank"), Alias::new("order_rank"));
+    }
+    let join_condition = if state.item_data_query {
+        Expr::col(matching_items.column_ref("data_id")).equals(context.column_ref("data_id"))
+    } else {
+        Expr::col(matching_items.column_ref("file_id")).equals(context.column_ref("file_id"))
+    };
+    query.join(
+        JoinType::InnerJoin,
+        Alias::new(matching_items.name.as_str()),
+        join_condition,
+    );
+
+    let (query, context_for_wrap) =
+        apply_sort_bounds(state, query, context.clone(), &cte_name, &filter.sort);
+    let cte = wrap_query(state, query, &context_for_wrap, cte_name);
+    state.cte_counter += 1;
+    if !state.is_count_query {
+        if let Some(alias) = &filter.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+    }
+    Ok(cte)
 }
 
 fn build_in_bookmarks_filter(
-    _filter: &InBookmarks,
-    _context: &CteRef,
-    _state: &mut QueryState,
+    filter: &InBookmarks,
+    context: &CteRef,
+    state: &mut QueryState,
 ) -> Result<CteRef, PqlError> {
-    Err(PqlError::invalid("InBookmarks filter not implemented"))
+    let args = &filter.in_bookmarks;
+    let cte_name = format!("n{}_InBookmarks", state.cte_counter);
+    let user_data = Alias::new("user_data");
+
+    let mut criteria = Vec::new();
+    if !args.namespaces.is_empty() {
+        let namespaces = args
+            .namespaces
+            .iter()
+            .cloned()
+            .map(Expr::val)
+            .collect::<Vec<_>>();
+        let in_condition =
+            Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::Namespace))
+                .is_in(namespaces);
+        if args.sub_ns {
+            let mut namespace_exprs = Vec::new();
+            namespace_exprs.push(in_condition);
+            for namespace in &args.namespaces {
+                namespace_exprs.push(
+                    Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::Namespace))
+                        .like(format!("{namespace}.%")),
+                );
+            }
+            criteria.push(combine_or(namespace_exprs)?);
+        } else {
+            criteria.push(in_condition);
+        }
+    }
+
+    if args.include_wildcard {
+        let user_expr =
+            Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::User)).eq(args.user.clone());
+        let wildcard_expr =
+            Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::User)).eq("*");
+        criteria.push(user_expr.or(wildcard_expr));
+    } else {
+        criteria.push(
+            Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::User))
+                .eq(args.user.clone()),
+        );
+    }
+
+    let mut query = select_std_from_cte(context, state);
+    query.join(
+        JoinType::InnerJoin,
+        Files::Table,
+        Expr::col((Files::Table, Files::Id)).equals(context.column_ref("file_id")),
+    );
+    query.join(
+        JoinType::InnerJoin,
+        (user_data.clone(), Bookmarks::Table),
+        Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::Sha256))
+            .equals((Files::Table, Files::Sha256)),
+    );
+    for condition in criteria {
+        query.and_where(condition);
+    }
+    apply_group_by(&mut query, get_std_group_by(context, state));
+
+    if !state.is_count_query {
+        let rank_expr =
+            Func::max(Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::TimeAdded)))
+                .into();
+        add_rank_column_expr(&mut query, &filter.sort, rank_expr)?;
+    }
+
+    let (query, context_for_wrap) =
+        apply_sort_bounds(state, query, context.clone(), &cte_name, &filter.sort);
+    let cte = wrap_query(state, query, &context_for_wrap, cte_name);
+    state.cte_counter += 1;
+    if !state.is_count_query {
+        if let Some(alias) = &filter.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+    }
+    Ok(cte)
 }
 
 fn build_processed_by_filter(
-    _filter: &ProcessedBy,
-    _context: &CteRef,
-    _state: &mut QueryState,
+    filter: &ProcessedBy,
+    context: &CteRef,
+    state: &mut QueryState,
 ) -> Result<CteRef, PqlError> {
-    Err(PqlError::invalid("ProcessedBy filter not implemented"))
+    let cte_name = format!("n{}_ProcessedBy", state.cte_counter);
+    let mut query = select_std_from_cte(context, state);
+    let join_cond = if state.item_data_query {
+        Expr::col((ItemData::Table, ItemData::SourceId)).equals(context.column_ref("data_id"))
+    } else {
+        Expr::col((ItemData::Table, ItemData::ItemId)).equals(context.column_ref("item_id"))
+    };
+    query.join(JoinType::InnerJoin, ItemData::Table, join_cond);
+    query.join(
+        JoinType::InnerJoin,
+        Setters::Table,
+        Expr::col((Setters::Table, Setters::Id)).equals((ItemData::Table, ItemData::SetterId)),
+    );
+    query.and_where(Expr::col((Setters::Table, Setters::Name)).eq(filter.processed_by.clone()));
+    apply_group_by(&mut query, get_std_group_by(context, state));
+
+    let cte = wrap_query(state, query, context, cte_name);
+    state.cte_counter += 1;
+    Ok(cte)
 }
 
 fn build_has_unprocessed_filter(
-    _filter: &HasUnprocessedData,
-    _context: &CteRef,
-    _state: &mut QueryState,
+    filter: &HasUnprocessedData,
+    context: &CteRef,
+    state: &mut QueryState,
 ) -> Result<CteRef, PqlError> {
-    Err(PqlError::invalid(
-        "HasUnprocessedData filter not implemented",
-    ))
+    let args = &filter.has_data_unprocessed;
+    let cte_name = format!("n{}_HasUnprocessedData", state.cte_counter);
+
+    let src_alias = Alias::new("src_item_data");
+    let derived_alias = Alias::new("derived_data");
+
+    let mut not_exists_subquery = Query::select();
+    not_exists_subquery.expr(Expr::val(1));
+    not_exists_subquery.from_as(ItemData::Table, derived_alias.clone());
+    not_exists_subquery.join(
+        JoinType::InnerJoin,
+        Setters::Table,
+        Expr::col((Setters::Table, Setters::Id)).equals((derived_alias.clone(), ItemData::SetterId)),
+    );
+    not_exists_subquery.and_where(
+        Expr::col((derived_alias.clone(), ItemData::SourceId))
+            .equals((src_alias.clone(), ItemData::Id)),
+    );
+    not_exists_subquery.and_where(
+        Expr::col((Setters::Table, Setters::Name)).eq(args.setter_name.clone()),
+    );
+
+    let mut query = select_std_from_cte(context, state);
+    query.join_as(
+        JoinType::InnerJoin,
+        ItemData::Table,
+        src_alias.clone(),
+        Expr::col((src_alias.clone(), ItemData::ItemId)).equals(context.column_ref("item_id")),
+    );
+    let data_types = args
+        .data_types
+        .iter()
+        .cloned()
+        .map(Expr::val)
+        .collect::<Vec<_>>();
+    query.and_where(Expr::col((src_alias.clone(), ItemData::DataType)).is_in(data_types));
+    query.and_where(Expr::col((src_alias.clone(), ItemData::IsPlaceholder)).eq(0));
+    query.and_where(Expr::not_exists(not_exists_subquery.to_owned()));
+    apply_group_by(&mut query, get_std_group_by(context, state));
+
+    let cte = wrap_query(state, query, context, cte_name);
+    state.cte_counter += 1;
+    Ok(cte)
 }
 
 fn build_matches_expression(
@@ -1236,13 +1722,21 @@ fn add_sortable_rank_column(
     query: &mut SelectStatement,
     sort: &SortableOptions,
 ) -> Result<(), PqlError> {
+    add_rank_column_expr(query, sort, Expr::cust("rank"))
+}
+
+fn add_rank_column_expr(
+    query: &mut SelectStatement,
+    sort: &SortableOptions,
+    rank_expr: Expr,
+) -> Result<(), PqlError> {
     if sort.row_n && (sort.order_by || sort.select_as.is_some()) {
         let mut window = WindowStatement::new();
         let order = direction_to_order(sort.row_n_direction);
-        window.order_by_expr(Expr::cust("rank"), order);
+        window.order_by_expr(rank_expr, order);
         query.expr_window_as(Expr::cust("row_number()"), window, Alias::new("order_rank"));
     } else {
-        query.expr_as(Expr::cust("rank"), Alias::new("order_rank"));
+        query.expr_as(rank_expr, Alias::new("order_rank"));
     }
     Ok(())
 }
@@ -1255,6 +1749,38 @@ fn scalar_to_expr(value: &ScalarValue) -> Expr {
     }
 }
 
+fn apply_sort_bounds(
+    state: &mut QueryState,
+    query: SelectStatement,
+    context: CteRef,
+    cte_name: &str,
+    sort: &SortableOptions,
+) -> (SelectStatement, CteRef) {
+    if state.is_count_query || (sort.gt.is_none() && sort.lt.is_none()) {
+        return (query, context);
+    }
+
+    let wrapped_name = format!("wrapped_{cte_name}");
+    let wrapped_cte = create_cte(state, wrapped_name.clone(), query.to_owned());
+    let mut wrapped_query = Query::select();
+    wrapped_query
+        .from(Alias::new(wrapped_name.as_str()))
+        .column((Alias::new(wrapped_name.as_str()), Asterisk));
+    if let Some(gt) = &sort.gt {
+        wrapped_query.and_where(
+            Expr::col((Alias::new(wrapped_name.as_str()), Alias::new("order_rank")))
+                .gt(scalar_to_expr(gt)),
+        );
+    }
+    if let Some(lt) = &sort.lt {
+        wrapped_query.and_where(
+            Expr::col((Alias::new(wrapped_name.as_str()), Alias::new("order_rank")))
+                .lt(scalar_to_expr(lt)),
+        );
+    }
+    (wrapped_query, wrapped_cte)
+}
+
 fn select_std_from_cte(cte: &CteRef, state: &QueryState) -> SelectStatement {
     let mut query = Query::select();
     query
@@ -1265,6 +1791,20 @@ fn select_std_from_cte(cte: &CteRef, state: &QueryState) -> SelectStatement {
         query.column(cte.column_ref("data_id"));
     }
     query
+}
+
+fn get_std_group_by(cte: &CteRef, state: &QueryState) -> Vec<ColumnRef> {
+    if state.item_data_query {
+        vec![cte.column_ref("data_id"), cte.column_ref("file_id")]
+    } else {
+        vec![cte.column_ref("file_id")]
+    }
+}
+
+fn apply_group_by(query: &mut SelectStatement, columns: Vec<ColumnRef>) {
+    for column in columns {
+        query.group_by_col(column);
+    }
 }
 
 fn add_select_columns(
@@ -2065,6 +2605,7 @@ enum ItemData {
     SetterId,
     Idx,
     SourceId,
+    IsPlaceholder,
 }
 
 #[derive(sea_query::Iden)]
@@ -2086,8 +2627,39 @@ enum ExtractedText {
 }
 
 #[derive(sea_query::Iden)]
+enum ExtractedTextFts {
+    Table,
+    Text,
+}
+
+#[derive(sea_query::Iden)]
 enum Setters {
     Table,
     Id,
     Name,
+}
+
+#[derive(sea_query::Iden)]
+enum Tags {
+    Table,
+    Id,
+    Namespace,
+    Name,
+}
+
+#[derive(sea_query::Iden)]
+enum TagsItems {
+    Table,
+    ItemDataId,
+    TagId,
+    Confidence,
+}
+
+#[derive(sea_query::Iden)]
+enum Bookmarks {
+    Table,
+    User,
+    Namespace,
+    Sha256,
+    TimeAdded,
 }
