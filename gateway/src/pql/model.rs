@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub(crate) use crate::pql::builder::filters::{
+    DerivedDataArgs, HasUnprocessedData, InBookmarks, InBookmarksArgs, Match, MatchAnd, MatchNot,
+    MatchOps, MatchOr, MatchPath, MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue,
+    MatchValues, Matches, OneOrMany, ProcessedBy, TagsArgs,
+};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EntityType {
@@ -93,7 +99,19 @@ pub(crate) enum ScalarValue {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub(crate) struct Rrf {
+    /// Smoothing Constant
+    ///
+    /// The smoothing constant for the RRF function.
+    /// The formula is: 1 / (rank + k).
+    ///
+    /// Can be 0 for no smoothing.
+    ///
+    /// Smoothing reduces the impact of "high" ranks (close to 1) on the final rank value.
     pub k: i32,
+    /// Weight
+    ///
+    /// The weight to apply to this filter's rank value in the RRF function.
+    /// The formula is: weight * 1 / (rank + k).
     pub weight: f64,
 }
 
@@ -105,22 +123,91 @@ impl Default for Rrf {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SortableOptions {
+    /// Order by this filter's rank output
+    ///
+    /// This filter generates a value that can be used for ordering.
     #[serde(default)]
     pub order_by: bool,
+    /// Order Direction
+    ///
+    /// The order direction for this filter.
+    /// If not set, the default order direction for this field is used.
     #[serde(default = "default_direction")]
     pub direction: OrderDirection,
+    /// Order By Priority
+    ///
+    /// The priority of this filter in the order by clause.
+    /// If there are multiple filters with order_by set to True,
+    /// the priority is used to determine the order.
+    /// If two filter order bys have the same priority,
+    /// their values are coalesced into a single column to order by,
+    /// and the order direction is determined by the first filter that we find from this set.
+    ///
+    /// It's assumed that if the filters have the same priority, and should be coalesced,
+    /// they will have the same order direction.
     #[serde(default)]
     pub priority: i32,
+    /// Use Row Number for rank column
+    ///
+    /// Only applied if either order_by is True, or select_as is set.
+    ///
+    /// If True, internally sorts the filter's output by its rank_order
+    /// column and assigns a row number to each row.
+    ///
+    /// The row number is used to order the final query.
+    ///
+    /// This is useful for combining multiple filters with different
+    /// rank_order types that may not be directly comparable,
+    /// such as text search and embeddings search.
+    ///
+    /// See `RRF` for a way to combine heterogeneous rank_order filters when using row_n = True.
     #[serde(default)]
     pub row_n: bool,
+    /// Order Direction For Row Number
+    ///
+    /// The order direction (asc or desc) for the internal row number calculation.
+    /// Only used if `order_by_row_n` is True.
+    /// When `order_by_row_n` is True, the filter's output is sorted by its rank_order column
+    /// following this direction, and a row number is assigned to each row.
+    /// This row number is used to order the final query.
+    /// You should generally leave this as the default value.
     #[serde(default = "default_direction")]
     pub row_n_direction: OrderDirection,
+    /// Order By Greater Than
+    ///
+    /// If set, only include items with an order_rank greater than this value.
+    /// Can be used for cursor-based pagination.
+    /// The type depends on the filter.
+    /// Will be ignored in the count query, which is
+    /// used to determine the total number of results when count = True.
+    /// With cursor-based pagination, you should probably not rely on count = True anyhow.
     #[serde(default)]
     pub gt: Option<ScalarValue>,
+    /// Order By Less Than
+    ///
+    /// If set, only include items with an order_rank less than this value.
+    /// Can be used for cursor-based pagination.
+    /// The type depends on the filter.
+    /// Will be ignored in the count query, which is
+    /// used to determine the total number of results when count = True.
     #[serde(default)]
     pub lt: Option<ScalarValue>,
+    /// Order By Select As
+    ///
+    /// If set, the order_rank column will be returned with the results as this alias under the "extra" object.
     #[serde(default)]
     pub select_as: Option<String>,
+    /// Reciprocal Ranked Fusion Parameters
+    ///
+    /// Parameters for the Reciprocal Ranked Fusion.
+    /// If set, when coalescing multiple filters with the same priority,
+    /// the RRF function will be applied to the rank_order columns.
+    ///
+    /// If only one filter has RRF set, but multiple filters have the same priority,
+    /// RRF will be ignored.
+    ///
+    /// If using RRF, you should set row_n to True for all the filters involved.
+    /// Moreover, the correct direction for RRF is "desc" (higher is better).
     #[serde(default)]
     pub rrf: Option<Rrf>,
 }
@@ -147,6 +234,11 @@ pub(crate) struct OrderArgs {
     pub order_by: OrderByField,
     #[serde(default)]
     pub order: Option<OrderDirection>,
+    /// Order Priority
+    ///
+    /// The priority of this order by field. If multiple fields are ordered by,
+    /// the priority is used to determine the order they are applied in.
+    /// The order in the list is used if the priority is the same.
     #[serde(default)]
     pub priority: i32,
 }
@@ -165,14 +257,66 @@ impl Default for OrderArgs {
 #[serde(default)]
 pub(crate) struct PqlQuery {
     pub query: Option<QueryElement>,
+    /// Values to order results by
+    ///
+    /// The order_args field is a list of { order_by: [field name], order: ["asc" or "desc"] }
+    /// objects that define how the results should be ordered.
+    /// Results can be ordered by multiple fields by adding multiple objects.
     pub order_by: Vec<OrderArgs>,
+    /// Data to return
+    ///
+    /// The columns to return in the query.
+    /// The default columns are sha256, path, last_modified, and type.
+    /// Columns belonging to text can only be selected if the entity is "text".
     pub select: Vec<Column>,
+    /// Target Entity
+    ///
+    /// The entity to query on.
+    /// You can perform the search on either files or text.
+    /// This means that intermediate results will be one per file, or one per text-file pair.
+    /// There are generally more text-file pairs than files, so this incurs overhead.
+    ///
+    /// However, "text" queries allow you to include text-specific columns in the select list.
+    /// The final results will also be one for each text-file pair.
+    ///
+    /// Most of the same filters can be used on both.
+    /// "text" queries will include "data_id" in each result. "file_id" and "item_id" are always included.
     pub entity: EntityType,
+    /// Partition results By
+    ///
+    /// Group results by the values of the specified column(s) and return the first result
+    /// for each group according to all of the order settings of the query.
+    ///
+    /// For example, if you partition by "item_id", you'll get one result per unique item.
+    /// If you partition by "file_id", you'll get one result per unique file.
+    /// Multiple columns yield one result for each unique combination of values for those columns.
+    ///
+    /// You cannot partition by text columns if the entity is "file".
     pub partition_by: Option<Vec<Column>>,
     pub page: i64,
     pub page_size: i64,
+    /// Count Results
+    ///
+    /// If true, the query will return the total number of results that match the query.
+    /// This is useful for pagination, but it requires an additional query to be executed.
     pub count: bool,
+    /// Return Results
+    ///
+    /// If true, the query will return the results that match the query.
+    /// If false, only the total count will be returned, if requested.
     pub results: bool,
+    /// Check Paths Exist
+    ///
+    /// If true, the query will check if the path exists on disk before returning it.
+    ///
+    /// For `file` queries with no partition by,
+    /// the result will be omitted if the path does not exist.
+    /// This is because if another file exists, it will be included later in the results.
+    ///
+    /// In other cases, the system will try to find another file for the item and substitute it.
+    /// If no other working path is found, the result will be omitted.
+    ///
+    /// This is not reflected in the total count of results.
     pub check_path: bool,
 }
 
@@ -223,322 +367,12 @@ pub(crate) enum QueryElement {
     HasUnprocessedData(HasUnprocessedData),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub(crate) enum OneOrMany<T> {
-    One(T),
-    Many(Vec<T>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchValues {
-    #[serde(default)]
-    pub file_id: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub item_id: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub path: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub filename: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub sha256: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub last_modified: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub r#type: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub size: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub width: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub height: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub duration: Option<OneOrMany<f64>>,
-    #[serde(default)]
-    pub time_added: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub md5: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub audio_tracks: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub video_tracks: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub subtitle_tracks: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub blurhash: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub data_id: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub language: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub language_confidence: Option<OneOrMany<f64>>,
-    #[serde(default)]
-    pub text: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub confidence: Option<OneOrMany<f64>>,
-    #[serde(default)]
-    pub text_length: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub job_id: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub setter_id: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub setter_name: Option<OneOrMany<String>>,
-    #[serde(default)]
-    pub data_index: Option<OneOrMany<i64>>,
-    #[serde(default)]
-    pub source_id: Option<OneOrMany<i64>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchValue {
-    #[serde(default)]
-    pub file_id: Option<i64>,
-    #[serde(default)]
-    pub item_id: Option<i64>,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub filename: Option<String>,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub last_modified: Option<String>,
-    #[serde(default)]
-    pub r#type: Option<String>,
-    #[serde(default)]
-    pub size: Option<i64>,
-    #[serde(default)]
-    pub width: Option<i64>,
-    #[serde(default)]
-    pub height: Option<i64>,
-    #[serde(default)]
-    pub duration: Option<f64>,
-    #[serde(default)]
-    pub time_added: Option<String>,
-    #[serde(default)]
-    pub md5: Option<String>,
-    #[serde(default)]
-    pub audio_tracks: Option<i64>,
-    #[serde(default)]
-    pub video_tracks: Option<i64>,
-    #[serde(default)]
-    pub subtitle_tracks: Option<i64>,
-    #[serde(default)]
-    pub blurhash: Option<String>,
-    #[serde(default)]
-    pub data_id: Option<i64>,
-    #[serde(default)]
-    pub language: Option<String>,
-    #[serde(default)]
-    pub language_confidence: Option<f64>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub confidence: Option<f64>,
-    #[serde(default)]
-    pub text_length: Option<i64>,
-    #[serde(default)]
-    pub job_id: Option<i64>,
-    #[serde(default)]
-    pub setter_id: Option<i64>,
-    #[serde(default)]
-    pub setter_name: Option<String>,
-    #[serde(default)]
-    pub data_index: Option<i64>,
-    #[serde(default)]
-    pub source_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchOps {
-    #[serde(default)]
-    pub eq: Option<MatchValue>,
-    #[serde(default)]
-    pub neq: Option<MatchValue>,
-    #[serde(rename = "in_", default)]
-    pub in_: Option<MatchValues>,
-    #[serde(default)]
-    pub nin: Option<MatchValues>,
-    #[serde(default)]
-    pub gt: Option<MatchValue>,
-    #[serde(default)]
-    pub gte: Option<MatchValue>,
-    #[serde(default)]
-    pub lt: Option<MatchValue>,
-    #[serde(default)]
-    pub lte: Option<MatchValue>,
-    #[serde(default)]
-    pub startswith: Option<MatchValues>,
-    #[serde(default)]
-    pub not_startswith: Option<MatchValues>,
-    #[serde(default)]
-    pub endswith: Option<MatchValues>,
-    #[serde(default)]
-    pub not_endswith: Option<MatchValues>,
-    #[serde(default)]
-    pub contains: Option<MatchValues>,
-    #[serde(default)]
-    pub not_contains: Option<MatchValues>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchAnd {
-    pub and_: Vec<MatchOps>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchOr {
-    pub or_: Vec<MatchOps>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchNot {
-    pub not_: MatchOps,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub(crate) enum Matches {
-    Ops(MatchOps),
-    And(MatchAnd),
-    Or(MatchOr),
-    Not(MatchNot),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct Match {
-    #[serde(rename = "match")]
-    pub match_: Matches,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchPathArgs {
-    pub r#match: String,
-    #[serde(default)]
-    pub filename_only: bool,
-    #[serde(default = "default_true")]
-    pub raw_fts5_match: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchPath {
-    #[serde(flatten, default)]
-    pub sort: SortableOptions,
-    pub match_path: MatchPathArgs,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchTextArgs {
-    pub r#match: String,
-    #[serde(default)]
-    pub filter_only: bool,
-    #[serde(default)]
-    pub setters: Vec<String>,
-    #[serde(default)]
-    pub languages: Vec<String>,
-    #[serde(default)]
-    pub min_language_confidence: Option<f64>,
-    #[serde(default)]
-    pub min_confidence: Option<f64>,
-    #[serde(default = "default_true")]
-    pub raw_fts5_match: bool,
-    #[serde(default)]
-    pub min_length: Option<i64>,
-    #[serde(default)]
-    pub max_length: Option<i64>,
-    #[serde(default)]
-    pub select_snippet_as: Option<String>,
-    #[serde(default = "default_snippet_max_len")]
-    pub s_max_len: i64,
-    #[serde(default = "default_snippet_ellipsis")]
-    pub s_ellipsis: String,
-    #[serde(default = "default_snippet_start_tag")]
-    pub s_start_tag: String,
-    #[serde(default = "default_snippet_end_tag")]
-    pub s_end_tag: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchText {
-    #[serde(flatten, default)]
-    pub sort: SortableOptions,
-    pub match_text: MatchTextArgs,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct TagsArgs {
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub match_any: bool,
-    #[serde(default)]
-    pub min_confidence: f64,
-    #[serde(default)]
-    pub setters: Vec<String>,
-    #[serde(default)]
-    pub namespaces: Vec<String>,
-    #[serde(default)]
-    pub all_setters_required: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct MatchTags {
-    #[serde(flatten, default = "default_sort_desc")]
-    pub sort: SortableOptions,
-    pub match_tags: TagsArgs,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct InBookmarksArgs {
-    #[serde(default = "default_true")]
-    pub filter: bool,
-    #[serde(default)]
-    pub namespaces: Vec<String>,
-    #[serde(default)]
-    pub sub_ns: bool,
-    #[serde(default = "default_bookmarks_user")]
-    pub user: String,
-    #[serde(default = "default_true")]
-    pub include_wildcard: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct InBookmarks {
-    #[serde(flatten, default = "default_sort_desc")]
-    pub sort: SortableOptions,
-    pub in_bookmarks: InBookmarksArgs,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct ProcessedBy {
-    pub processed_by: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct DerivedDataArgs {
-    pub setter_name: String,
-    pub data_types: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct HasUnprocessedData {
-    pub has_data_unprocessed: DerivedDataArgs,
-}
-
 fn default_direction() -> OrderDirection {
     OrderDirection::Asc
 }
 
 fn default_order_by_field() -> OrderByField {
     OrderByField::LastModified
-}
-
-fn default_sort_desc() -> SortableOptions {
-    let mut options = SortableOptions::default();
-    options.direction = OrderDirection::Desc;
-    options.row_n_direction = OrderDirection::Desc;
-    options
 }
 
 fn default_order_args() -> Vec<OrderArgs> {
@@ -556,28 +390,4 @@ fn default_select_fields() -> Vec<Column> {
         Column::LastModified,
         Column::Type,
     ]
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_bookmarks_user() -> String {
-    "user".to_string()
-}
-
-fn default_snippet_max_len() -> i64 {
-    30
-}
-
-fn default_snippet_ellipsis() -> String {
-    "...".to_string()
-}
-
-fn default_snippet_start_tag() -> String {
-    "<b>".to_string()
-}
-
-fn default_snippet_end_tag() -> String {
-    "</b>".to_string()
 }

@@ -11,7 +11,7 @@ use crate::pql::model::{
 };
 use crate::pql::preprocess::{PqlError, preprocess_query};
 
-mod filters;
+pub(crate) mod filters;
 use self::filters::FilterCompiler;
 
 const VERY_LARGE_NUMBER: &str = "9223372036854775805";

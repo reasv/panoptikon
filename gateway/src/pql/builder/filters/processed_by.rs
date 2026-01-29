@@ -1,6 +1,7 @@
 use sea_query::{Expr, ExprTrait, JoinType};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::ProcessedBy;
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -8,6 +9,12 @@ use super::super::{
     BaseTable, CteRef, ItemData, JoinedTables, QueryState, Setters, apply_group_by,
     get_std_group_by, select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct ProcessedBy {
+    /// This Item or Item Data must have been processed by this setter name and have data derived from it
+    pub processed_by: String,
+}
 
 impl FilterCompiler for ProcessedBy {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

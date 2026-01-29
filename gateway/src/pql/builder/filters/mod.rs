@@ -9,6 +9,16 @@ mod processed_by;
 use super::{CteRef, QueryState};
 use crate::pql::preprocess::PqlError;
 
+pub(crate) use has_unprocessed::{DerivedDataArgs, HasUnprocessedData};
+pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};
+pub(crate) use match_filter::{
+    Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches, OneOrMany,
+};
+pub(crate) use match_path::{MatchPath, MatchPathArgs};
+pub(crate) use match_tags::{MatchTags, TagsArgs};
+pub(crate) use match_text::{MatchText, MatchTextArgs};
+pub(crate) use processed_by::ProcessedBy;
+
 pub(crate) trait FilterCompiler {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError>;
 }

@@ -1,6 +1,7 @@
 use sea_query::{Alias, Expr, ExprTrait, JoinType, Query};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::HasUnprocessedData;
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -8,6 +9,20 @@ use super::super::{
     CteRef, ItemData, JoinedTables, QueryState, Setters, apply_group_by, get_std_group_by,
     select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct DerivedDataArgs {
+    /// Name of the setter that would produce the derived data
+    pub setter_name: String,
+    /// Data types that the associated data must have
+    pub data_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct HasUnprocessedData {
+    /// Item must have item_data of given types that has not been processed by the given setter name
+    pub has_data_unprocessed: DerivedDataArgs,
+}
 
 impl FilterCompiler for HasUnprocessedData {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

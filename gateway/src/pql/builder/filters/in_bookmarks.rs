@@ -1,6 +1,8 @@
 use sea_query::{Alias, Expr, ExprTrait, JoinType};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::InBookmarks;
+use crate::pql::model::{OrderDirection, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -9,6 +11,60 @@ use super::super::{
     add_rank_column_expr, apply_group_by, apply_sort_bounds, get_std_group_by, select_std_from_cte,
     wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct InBookmarksArgs {
+    /// Enable the filter
+    ///
+    /// Must be set to True, this option only exists to make sure the filter is not empty,
+    /// given that that all fields are optional.
+    #[serde(default = "default_true")]
+    pub filter: bool,
+    /// Bookmark Namespaces
+    ///
+    /// List of bookmark namespaces to filter by. If sub_ns is set to True, the filter will also
+    /// include all sub-namespaces of the given namespaces (ie, namespace.*).
+    /// If empty, all bookmarks will be included.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Include Sub-namespaces
+    ///
+    /// Include all sub-namespaces of the given namespaces (namespace.*).
+    #[serde(default)]
+    pub sub_ns: bool,
+    #[serde(default = "default_bookmarks_user")]
+    pub user: String,
+    /// Include Wildcard User
+    ///
+    /// Include bookmarks set to the wildcard user ('*').
+    #[serde(default = "default_true")]
+    pub include_wildcard: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct InBookmarks {
+    #[serde(flatten, default = "default_sort_desc")]
+    pub sort: SortableOptions,
+    /// Restrict search to Bookmarks
+    ///
+    /// Only include items that are bookmarked.
+    pub in_bookmarks: InBookmarksArgs,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_bookmarks_user() -> String {
+    "user".to_string()
+}
+
+fn default_sort_desc() -> SortableOptions {
+    let mut options = SortableOptions::default();
+    options.direction = OrderDirection::Desc;
+    options.row_n_direction = OrderDirection::Desc;
+    options
+}
 
 impl FilterCompiler for InBookmarks {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

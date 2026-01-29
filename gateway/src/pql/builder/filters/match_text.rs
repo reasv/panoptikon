@@ -2,8 +2,10 @@ use sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, Order, OverStatement, Query, WindowStatement,
 };
 use sea_query::extension::sqlite::SqliteBinOper;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::{EntityType, MatchText};
+use crate::pql::model::{EntityType, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -12,6 +14,127 @@ use super::super::{
     OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
     create_cte, get_std_group_by, select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchTextArgs {
+    /// Match
+    ///
+    /// The query to match against text
+    pub r#match: String,
+    /// Filter Only
+    ///
+    /// Only filter out text based on the other criteria,
+    /// without actually matching the query.
+    ///
+    /// If set to True, the match field will be ignored.
+    /// Order by, select_as, and row_n will also be ignored.
+    ///
+    /// If set to False (default), and the match field is empty,
+    /// this filter will be skipped entirely.
+    #[serde(default)]
+    pub filter_only: bool,
+    /// Include text from these setters
+    ///
+    /// Filter out text that is was not set by these setters.
+    /// The setters are usually the names of the models that extracted or generated the text.
+    /// For example, the OCR model, the Whisper STT model, the captioning model or the tagger model.
+    #[serde(default)]
+    pub setters: Vec<String>,
+    /// Included languages
+    ///
+    /// Filter out text that is not in these languages
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// Minimum Confidence for Language Detection
+    ///
+    /// Filter out text that has a language confidence score below this threshold.
+    /// Must be a value between 0 and 1.
+    /// Language confidence scores are usually set by the model that extracted the text.
+    /// For tagging models, it's always 1.
+    #[serde(default)]
+    pub min_language_confidence: Option<f64>,
+    /// Minimum Confidence for the text
+    ///
+    /// Filter out text that has a confidence score below this threshold.
+    /// Must be a value between 0 and 1.
+    /// Confidence scores are usually set by the model that extracted the text.
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    /// Allow raw FTS5 MATCH Syntax
+    ///
+    /// If set to False, the query will be escaped before being passed to the FTS5 MATCH function
+    #[serde(default = "default_true")]
+    pub raw_fts5_match: bool,
+    /// Minimum Length
+    ///
+    /// Filter out text that is shorter than this. Inclusive.
+    #[serde(default)]
+    pub min_length: Option<i64>,
+    /// Maximum Length
+    ///
+    /// Filter out text that is longer than this. Inclusive.
+    #[serde(default)]
+    pub max_length: Option<i64>,
+    /// Return matching text snippet
+    ///
+    /// If set, the best matching text *snippet* will be included in the `extra` dict of each result under this key.
+    /// Works with any type of query, but it's best used with text-* queries.
+    ///
+    /// Otherwise, it's somewhat slow because of the contortions needed to get the best snippet per file.
+    #[serde(default)]
+    pub select_snippet_as: Option<String>,
+    /// Maximum Snippet Length
+    ///
+    /// The maximum length (in tokens) of the snippet returned by select_snippet_as
+    #[serde(default = "default_snippet_max_len")]
+    pub s_max_len: i64,
+    /// Snippet Ellipsis
+    ///
+    /// The ellipsis to use when truncating the snippet
+    #[serde(default = "default_snippet_ellipsis")]
+    pub s_ellipsis: String,
+    /// Snippet Start Tag
+    ///
+    /// The tag to use at the beginning of the snippet
+    #[serde(default = "default_snippet_start_tag")]
+    pub s_start_tag: String,
+    /// Snippet End Tag
+    ///
+    /// The tag to use at the end of the snippet
+    #[serde(default = "default_snippet_end_tag")]
+    pub s_end_tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchText {
+    #[serde(flatten, default)]
+    pub sort: SortableOptions,
+    /// Match Extracted Text
+    ///
+    /// Match a query against text extracted from files or associated with them,
+    /// including tags and OCR text
+    pub match_text: MatchTextArgs,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_snippet_max_len() -> i64 {
+    30
+}
+
+fn default_snippet_ellipsis() -> String {
+    "...".to_string()
+}
+
+fn default_snippet_start_tag() -> String {
+    "<b>".to_string()
+}
+
+fn default_snippet_end_tag() -> String {
+    "</b>".to_string()
+}
 
 impl FilterCompiler for MatchText {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

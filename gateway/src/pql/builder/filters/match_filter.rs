@@ -1,9 +1,8 @@
 use sea_query::{Expr, ExprTrait, JoinType};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::{
-    Column, Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches,
-    OneOrMany,
-};
+use crate::pql::model::Column;
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -11,6 +10,199 @@ use super::super::{
     BaseTable, CteRef, ExtractedText, Files, ItemData, Items, JoinedTables, QueryState, Setters,
     get_column_expr, is_text_column, select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchValues {
+    #[serde(default)]
+    pub file_id: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub item_id: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub path: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub filename: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub sha256: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub last_modified: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub r#type: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub size: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub width: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub height: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub duration: Option<OneOrMany<f64>>,
+    #[serde(default)]
+    pub time_added: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub md5: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub audio_tracks: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub video_tracks: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub subtitle_tracks: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub blurhash: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub data_id: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub language: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub language_confidence: Option<OneOrMany<f64>>,
+    #[serde(default)]
+    pub text: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub confidence: Option<OneOrMany<f64>>,
+    #[serde(default)]
+    pub text_length: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub job_id: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub setter_id: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub setter_name: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub data_index: Option<OneOrMany<i64>>,
+    #[serde(default)]
+    pub source_id: Option<OneOrMany<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchValue {
+    #[serde(default)]
+    pub file_id: Option<i64>,
+    #[serde(default)]
+    pub item_id: Option<i64>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub width: Option<i64>,
+    #[serde(default)]
+    pub height: Option<i64>,
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub time_added: Option<String>,
+    #[serde(default)]
+    pub md5: Option<String>,
+    #[serde(default)]
+    pub audio_tracks: Option<i64>,
+    #[serde(default)]
+    pub video_tracks: Option<i64>,
+    #[serde(default)]
+    pub subtitle_tracks: Option<i64>,
+    #[serde(default)]
+    pub blurhash: Option<String>,
+    #[serde(default)]
+    pub data_id: Option<i64>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub language_confidence: Option<f64>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub text_length: Option<i64>,
+    #[serde(default)]
+    pub job_id: Option<i64>,
+    #[serde(default)]
+    pub setter_id: Option<i64>,
+    #[serde(default)]
+    pub setter_name: Option<String>,
+    #[serde(default)]
+    pub data_index: Option<i64>,
+    #[serde(default)]
+    pub source_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchOps {
+    #[serde(default)]
+    pub eq: Option<MatchValue>,
+    #[serde(default)]
+    pub neq: Option<MatchValue>,
+    #[serde(rename = "in_", default)]
+    pub in_: Option<MatchValues>,
+    #[serde(default)]
+    pub nin: Option<MatchValues>,
+    #[serde(default)]
+    pub gt: Option<MatchValue>,
+    #[serde(default)]
+    pub gte: Option<MatchValue>,
+    #[serde(default)]
+    pub lt: Option<MatchValue>,
+    #[serde(default)]
+    pub lte: Option<MatchValue>,
+    #[serde(default)]
+    pub startswith: Option<MatchValues>,
+    #[serde(default)]
+    pub not_startswith: Option<MatchValues>,
+    #[serde(default)]
+    pub endswith: Option<MatchValues>,
+    #[serde(default)]
+    pub not_endswith: Option<MatchValues>,
+    #[serde(default)]
+    pub contains: Option<MatchValues>,
+    #[serde(default)]
+    pub not_contains: Option<MatchValues>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchAnd {
+    pub and_: Vec<MatchOps>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchOr {
+    pub or_: Vec<MatchOps>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchNot {
+    pub not_: MatchOps,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum Matches {
+    Ops(MatchOps),
+    And(MatchAnd),
+    Or(MatchOr),
+    Not(MatchNot),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct Match {
+    /// The match operations to apply. Match filters operate on key-value pairs representing
+    /// the primitive attributes of items, files, and extracted data.
+    /// For example, a match filter can be used to filter items
+    /// based on their type, size, or the path of the file they are associated with.
+    #[serde(rename = "match")]
+    pub match_: Matches,
+}
 
 impl FilterCompiler for Match {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

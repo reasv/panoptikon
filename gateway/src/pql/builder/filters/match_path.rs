@@ -1,7 +1,9 @@
 use sea_query::{Alias, Expr, ExprTrait, JoinType, Query};
 use sea_query::extension::sqlite::SqliteBinOper;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::MatchPath;
+use crate::pql::model::SortableOptions;
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -9,6 +11,36 @@ use super::super::{
     CteRef, ExtraColumn, FilesPathFts, JoinedTables, OrderByFilter, QueryState,
     add_sortable_rank_column, create_cte, scalar_to_expr, select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchPathArgs {
+    /// Match
+    ///
+    /// The query to match against file paths
+    pub r#match: String,
+    /// Match on filenames Only
+    #[serde(default)]
+    pub filename_only: bool,
+    /// Allow raw FTS5 MATCH Syntax
+    ///
+    /// If set to False, the query will be escaped before being passed to the FTS5 MATCH function
+    #[serde(default = "default_true")]
+    pub raw_fts5_match: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchPath {
+    #[serde(flatten, default)]
+    pub sort: SortableOptions,
+    /// Match Path
+    ///
+    /// Match a query against file paths
+    pub match_path: MatchPathArgs,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 impl FilterCompiler for MatchPath {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {

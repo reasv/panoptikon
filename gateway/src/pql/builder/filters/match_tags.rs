@@ -1,6 +1,8 @@
 use sea_query::{Alias, BinOper, Cond, Expr, ExprTrait, Func, JoinType};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::pql::model::MatchTags;
+use crate::pql::model::{OrderDirection, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -9,6 +11,53 @@ use super::super::{
     TagsItems, add_rank_column_expr, apply_group_by, apply_sort_bounds, create_cte,
     get_std_group_by, select_std_from_cte, wrap_query,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct TagsArgs {
+    /// List of tags to match
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Match any tag
+    ///
+    /// If true, match items with at least one of the given tags.
+    /// If false (default), only match items with all of the given tags.
+    #[serde(default)]
+    pub match_any: bool,
+    /// Minimum confidence
+    ///
+    /// Only consider tags with a confidence greater than or equal to this value
+    #[serde(default)]
+    pub min_confidence: f64,
+    /// Only consider tags set by these setters
+    #[serde(default)]
+    pub setters: Vec<String>,
+    /// Only consider tags in these namespaces (includes sub-namespaces)
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Require all setters to match
+    ///
+    /// Only consider tags that have been set by all of the given setters.
+    /// If match_any is true, and there is more than one tag, this will be ignored.
+    ///
+    /// If you really want to match any tag set by all of the given setters,
+    /// you can combine this with a separate filter for each tag in an OrOperator.
+    #[serde(default)]
+    pub all_setters_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct MatchTags {
+    #[serde(flatten, default = "default_sort_desc")]
+    pub sort: SortableOptions,
+    pub match_tags: TagsArgs,
+}
+
+fn default_sort_desc() -> SortableOptions {
+    let mut options = SortableOptions::default();
+    options.direction = OrderDirection::Desc;
+    options.row_n_direction = OrderDirection::Desc;
+    options
+}
 
 impl FilterCompiler for MatchTags {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
