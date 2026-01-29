@@ -79,6 +79,28 @@ When you change behavior
 - If the policy layer or proxy flow changes, also update `gateway/README.md`.
 - Keep DB connection/helpers/CRUD code inside `gateway/src/db/`.
 
+PQL Rewrite (Rust, Planned)
+
+- Goal: fully replace the Python PQL compiler with a Rust implementation that is behaviorally identical for both results and performance-critical SQL structure.
+- Rollout: gated by an explicit experimental env flag; when enabled, Rust PQL is the only path (no proxy fallback, no shadow mode).
+- OpenAPI: PQL types are annotated for OpenAPI generation from the start, but `/openapi.json` will remain proxied until the Rust API surface is complete.
+- Architecture:
+  - Schema/AST: `serde` models mirror the Pydantic union shapes and field names (`and_`, `or_`, `not_`, filter fields).
+  - Preprocess/validation: matches Python behavior exactly, including filter-specific mutations (e.g., `MatchText.filter_only`).
+  - Builder: SeaQuery-based query builder replicates `QueryState`, CTE chaining, root CTE unwrapping, join ordering rules, `order_by` + `partition_by`, and extra-column handling.
+  - Count queries: preserve count semantics (including partition-by counting and ignoring gt/lt cursor filters).
+  - SQLite specifics: FTS5 `MATCH`, `snippet(...)`, and vector functions are emitted as raw SQL fragments where needed.
+- Initial filter subset (fully working core, no inference required):
+  - `Match`, `MatchPath`, `MatchText`, `MatchTags`, `InBookmarks`, `ProcessedBy`, `HasUnprocessedData`.
+  - Embedding-dependent filters are deferred until a Rust-side embedding/model-metadata layer exists.
+- Test strategy (results + performance invariants):
+  - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
+  - Validate result equivalence and ordering on a fixed SQLite fixture DB.
+  - Validate SQL structure without relying on byte-for-byte SQL equality:
+    - Normalize SQL (whitespace/casing) and compare key structural properties (CTE ordering, join graph, selected columns).
+    - Track query plans as a diagnostic signal; do not rely on plan output alone, but use it to spot regressions in join/index usage.
+  - Maintain a golden fixture suite covering all implemented filters, text vs file entities, partitioning, and ordering edge cases.
+
 Continuous File Scanning (Implemented)
 
 - Scope: optional continuous file scanning per index DB, controlled by `continuous_filescan = true` in the per-DB TOML SystemConfig. This feature is not part of the job queue.
