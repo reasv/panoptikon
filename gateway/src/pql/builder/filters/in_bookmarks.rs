@@ -107,3 +107,25 @@ impl FilterCompiler for InBookmarks {
         Ok(cte)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn in_bookmarks_builds_sql() {
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "namespaces": ["demo"], "user": "alice", "sub_ns": true }
+        }))
+        .expect("in_bookmarks filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("bookmarks"));
+        assert!(sql.contains("SELECT"));
+    }
+}

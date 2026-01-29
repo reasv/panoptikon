@@ -275,3 +275,25 @@ impl FilterCompiler for MatchText {
         Ok(cte)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn match_text_builds_sql() {
+        let filter: MatchText = serde_json::from_value(json!({
+            "match_text": { "match": "hello world" }
+        }))
+        .expect("match_text filter");
+        let mut state = build_base_state(EntityType::Text, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("extracted_text_fts"));
+        assert!(sql.contains("SELECT"));
+    }
+}

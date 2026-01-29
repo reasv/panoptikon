@@ -56,3 +56,28 @@ impl FilterCompiler for HasUnprocessedData {
         Ok(cte)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn has_unprocessed_builds_sql() {
+        let filter: HasUnprocessedData = serde_json::from_value(json!({
+            "has_data_unprocessed": {
+                "setter_name": "ocr",
+                "data_types": ["text"]
+            }
+        }))
+        .expect("has_unprocessed filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("SELECT"));
+    }
+}

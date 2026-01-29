@@ -54,6 +54,28 @@ impl FilterCompiler for Match {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn match_filter_builds_sql() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "file_id": 1 } }
+        }))
+        .expect("match filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("SELECT"));
+        assert!(sql.contains("FROM"));
+    }
+}
+
 fn build_matches_expression(matches: &Matches, allow_text: bool) -> Result<Expr, PqlError> {
     match matches {
         Matches::Ops(ops) => build_match_ops_expression(ops, allow_text),

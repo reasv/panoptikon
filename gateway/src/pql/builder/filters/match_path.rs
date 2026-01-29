@@ -82,3 +82,25 @@ impl FilterCompiler for MatchPath {
         Ok(cte)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn match_path_builds_sql() {
+        let filter: MatchPath = serde_json::from_value(json!({
+            "match_path": { "match": "docs", "filename_only": true }
+        }))
+        .expect("match_path filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("files_path_fts"));
+        assert!(sql.contains("SELECT"));
+    }
+}

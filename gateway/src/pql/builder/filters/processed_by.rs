@@ -33,3 +33,25 @@ impl FilterCompiler for ProcessedBy {
         Ok(cte)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pql::model::EntityType;
+    use serde_json::json;
+
+    use super::super::test_support::{build_base_state, build_begin_cte, render_filter_sql};
+
+    #[test]
+    fn processed_by_builds_sql() {
+        let filter: ProcessedBy = serde_json::from_value(json!({
+            "processed_by": "file_scan"
+        }))
+        .expect("processed_by filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("setters"));
+        assert!(sql.contains("SELECT"));
+    }
+}
