@@ -1,20 +1,15 @@
+use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
+use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
-    InBookmarks,
-    Match,
-    MatchAnd,
-    MatchOps,
-    MatchOr,
-    MatchPath,
-    MatchTags,
-    MatchText,
-    MatchValue,
-    MatchValues,
-    Matches,
-    ProcessedBy,
-    QueryElement,
-    HasUnprocessedData,
+    DistanceFunction, EmbedArgs, HasUnprocessedData, InBookmarks, Match, MatchAnd, MatchOps,
+    MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches, ProcessedBy,
+    QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
 };
 use crate::pql::utils::parse_and_escape_query;
+use base64::{Engine as _, engine::general_purpose};
+use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 
 #[derive(Debug)]
 pub(crate) struct PqlError {
@@ -82,6 +77,15 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
         QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
         QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
         QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
+        QueryElement::SemanticTextSearch(filter) => filter
+            .validate_sync()
+            .map(|value| value.map(QueryElement::SemanticTextSearch)),
+        QueryElement::SemanticImageSearch(filter) => filter
+            .validate_sync()
+            .map(|value| value.map(QueryElement::SemanticImageSearch)),
+        QueryElement::SimilarTo(filter) => filter
+            .validate_sync()
+            .map(|value| value.map(QueryElement::SimilarTo)),
         QueryElement::MatchTags(filter) => Ok(filter.validate().map(QueryElement::MatchTags)),
         QueryElement::InBookmarks(filter) => Ok(filter.validate().map(QueryElement::InBookmarks)),
         QueryElement::ProcessedBy(filter) => Ok(filter.validate().map(QueryElement::ProcessedBy)),
@@ -89,6 +93,113 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
             Ok(filter.validate().map(QueryElement::HasUnprocessedData))
         }
     }
+}
+
+pub(crate) async fn preprocess_query_async(
+    el: QueryElement,
+    inference: &InferenceApiClient,
+) -> Result<Option<QueryElement>, PqlError> {
+    let mut state = AsyncPreprocessState {
+        inference,
+        metadata: None,
+    };
+    preprocess_query_async_inner(el, &mut state).await
+}
+
+struct AsyncPreprocessState<'a> {
+    inference: &'a InferenceApiClient,
+    metadata: Option<Value>,
+}
+
+impl<'a> AsyncPreprocessState<'a> {
+    async fn metadata(&mut self) -> Result<&Value, PqlError> {
+        if self.metadata.is_none() {
+            let value = self
+                .inference
+                .get_metadata()
+                .await
+                .map_err(|err| PqlError::invalid(format!("inference metadata error: {err}")))?;
+            self.metadata = Some(value);
+        }
+        Ok(self.metadata.as_ref().expect("metadata cached"))
+    }
+}
+
+fn preprocess_query_async_inner<'a, 'b>(
+    el: QueryElement,
+    state: &'b mut AsyncPreprocessState<'a>,
+) -> Pin<Box<dyn Future<Output = Result<Option<QueryElement>, PqlError>> + Send + 'b>> {
+    Box::pin(async move {
+        match el {
+            QueryElement::And(mut op) => {
+                let mut cleaned = Vec::new();
+                for sub_element in op.and_ {
+                    if let Some(subquery) = preprocess_query_async_inner(sub_element, state).await?
+                    {
+                        cleaned.push(subquery);
+                    }
+                }
+                if cleaned.is_empty() {
+                    Ok(None)
+                } else if cleaned.len() == 1 {
+                    Ok(Some(cleaned.remove(0)))
+                } else {
+                    op.and_ = cleaned;
+                    Ok(Some(QueryElement::And(op)))
+                }
+            }
+            QueryElement::Or(mut op) => {
+                let mut cleaned = Vec::new();
+                for sub_element in op.or_ {
+                    if let Some(subquery) = preprocess_query_async_inner(sub_element, state).await?
+                    {
+                        cleaned.push(subquery);
+                    }
+                }
+                if cleaned.is_empty() {
+                    Ok(None)
+                } else if cleaned.len() == 1 {
+                    Ok(Some(cleaned.remove(0)))
+                } else {
+                    op.or_ = cleaned;
+                    Ok(Some(QueryElement::Or(op)))
+                }
+            }
+            QueryElement::Not(mut op) => {
+                if let Some(subquery) = preprocess_query_async_inner(*op.not_, state).await? {
+                    op.not_ = Box::new(subquery);
+                    Ok(Some(QueryElement::Not(op)))
+                } else {
+                    Ok(None)
+                }
+            }
+            QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
+            QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
+            QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
+            QueryElement::SemanticTextSearch(filter) => filter
+                .validate_async(state)
+                .await
+                .map(|value| value.map(QueryElement::SemanticTextSearch)),
+            QueryElement::SemanticImageSearch(filter) => filter
+                .validate_async(state)
+                .await
+                .map(|value| value.map(QueryElement::SemanticImageSearch)),
+            QueryElement::SimilarTo(filter) => filter
+                .validate_async(state)
+                .await
+                .map(|value| value.map(QueryElement::SimilarTo)),
+            QueryElement::MatchTags(filter) => Ok(filter.validate().map(QueryElement::MatchTags)),
+            QueryElement::InBookmarks(filter) => {
+                Ok(filter.validate().map(QueryElement::InBookmarks))
+            }
+            QueryElement::ProcessedBy(filter) => {
+                Ok(filter.validate().map(QueryElement::ProcessedBy))
+            }
+            QueryElement::HasUnprocessedData(filter) => {
+                Ok(filter.validate().map(QueryElement::HasUnprocessedData))
+            }
+        }
+    })
 }
 
 impl Match {
@@ -174,6 +285,313 @@ impl HasUnprocessedData {
         }
         Some(self)
     }
+}
+
+impl SemanticTextSearch {
+    fn validate_sync(mut self) -> Result<Option<Self>, PqlError> {
+        if self.text_embeddings.query.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.text_embeddings._embedding.is_some() {
+            return Ok(Some(self));
+        }
+        if self.text_embeddings.embed.is_none() {
+            let embedding =
+                extract_embeddings(&self.text_embeddings.query).map_err(PqlError::invalid)?;
+            self.text_embeddings._embedding = Some(embedding);
+            return Ok(Some(self));
+        }
+        Err(PqlError::invalid(
+            "text_embeddings requires async preprocessing to embed the query",
+        ))
+    }
+
+    async fn validate_async(
+        mut self,
+        state: &mut AsyncPreprocessState<'_>,
+    ) -> Result<Option<Self>, PqlError> {
+        if self.text_embeddings.query.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.text_embeddings._embedding.is_none() {
+            if let Some(embed_args) = &self.text_embeddings.embed {
+                let embedding = embed_text_query(
+                    state,
+                    &self.text_embeddings.query,
+                    &self.text_embeddings.model,
+                    embed_args,
+                )
+                .await?;
+                self.text_embeddings._embedding = Some(embedding);
+            } else {
+                let embedding =
+                    extract_embeddings(&self.text_embeddings.query).map_err(PqlError::invalid)?;
+                self.text_embeddings._embedding = Some(embedding);
+            }
+        }
+        Ok(Some(self))
+    }
+}
+
+impl SemanticImageSearch {
+    fn validate_sync(mut self) -> Result<Option<Self>, PqlError> {
+        if self.image_embeddings.query.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.image_embeddings._embedding.is_none() {
+            if self.image_embeddings.embed.is_none() {
+                let embedding =
+                    extract_embeddings(&self.image_embeddings.query).map_err(PqlError::invalid)?;
+                self.image_embeddings._embedding = Some(embedding);
+            } else {
+                return Err(PqlError::invalid(
+                    "image_embeddings requires async preprocessing to embed the query",
+                ));
+            }
+        }
+        if !self.image_embeddings.clip_xmodal && self.image_embeddings.src_text.is_some() {
+            self.image_embeddings.src_text = None;
+        }
+        Ok(Some(self))
+    }
+
+    async fn validate_async(
+        mut self,
+        state: &mut AsyncPreprocessState<'_>,
+    ) -> Result<Option<Self>, PqlError> {
+        if self.image_embeddings.query.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.image_embeddings._embedding.is_none() {
+            if let Some(embed_args) = &self.image_embeddings.embed {
+                let embedding = embed_image_query(
+                    state,
+                    &self.image_embeddings.query,
+                    &self.image_embeddings.model,
+                    embed_args,
+                )
+                .await?;
+                self.image_embeddings._embedding = Some(embedding);
+            } else {
+                let embedding =
+                    extract_embeddings(&self.image_embeddings.query).map_err(PqlError::invalid)?;
+                self.image_embeddings._embedding = Some(embedding);
+            }
+        }
+
+        self.image_embeddings._distance_func_override =
+            get_distance_func_override(state, &self.image_embeddings.model).await?;
+
+        if !self.image_embeddings.clip_xmodal && self.image_embeddings.src_text.is_some() {
+            self.image_embeddings.src_text = None;
+        }
+        Ok(Some(self))
+    }
+}
+
+impl SimilarTo {
+    fn validate_sync(mut self) -> Result<Option<Self>, PqlError> {
+        if self.similar_to.target.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.similar_to.model.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.similar_to.force_distance_function.unwrap_or(false) {
+            return Ok(Some(self));
+        }
+        Err(PqlError::invalid(
+            "similar_to requires async preprocessing to apply distance function overrides",
+        ))
+    }
+
+    async fn validate_async(
+        mut self,
+        state: &mut AsyncPreprocessState<'_>,
+    ) -> Result<Option<Self>, PqlError> {
+        if self.similar_to.target.trim().is_empty() {
+            return Ok(None);
+        }
+        if self.similar_to.model.trim().is_empty() {
+            return Ok(None);
+        }
+        if !self.similar_to.force_distance_function.unwrap_or(false) {
+            if let Some(override_fn) =
+                get_distance_func_override(state, &self.similar_to.model).await?
+            {
+                self.similar_to.distance_function = override_fn;
+            }
+        }
+        Ok(Some(self))
+    }
+}
+
+async fn embed_text_query(
+    state: &AsyncPreprocessState<'_>,
+    query: &str,
+    model: &str,
+    embed: &EmbedArgs,
+) -> Result<Vec<u8>, PqlError> {
+    let inputs = [InferenceInput::new(
+        serde_json::json!({"text": query, "task": "s2s"}),
+        None,
+    )];
+    let output = state
+        .inference
+        .predict(
+            model,
+            &embed.cache_key,
+            embed.lru_size,
+            embed.ttl_seconds,
+            &inputs,
+        )
+        .await
+        .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+    embedding_from_predict(output)
+}
+
+async fn embed_image_query(
+    state: &AsyncPreprocessState<'_>,
+    query: &str,
+    model: &str,
+    embed: &EmbedArgs,
+) -> Result<Vec<u8>, PqlError> {
+    let inputs = [InferenceInput::new(
+        serde_json::json!({"text": query}),
+        None,
+    )];
+    let output = state
+        .inference
+        .predict(
+            model,
+            &embed.cache_key,
+            embed.lru_size,
+            embed.ttl_seconds,
+            &inputs,
+        )
+        .await
+        .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+    embedding_from_predict(output)
+}
+
+fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {
+    match output {
+        PredictOutput::Binary(values) => {
+            let first = values
+                .first()
+                .ok_or_else(|| PqlError::invalid("inference output missing"))?;
+            embedding_from_npy_bytes(first).map_err(PqlError::invalid)
+        }
+        PredictOutput::Json(values) => {
+            let first = values
+                .first()
+                .ok_or_else(|| PqlError::invalid("inference output missing"))?;
+            embedding_from_json_value(first)
+        }
+    }
+}
+
+fn embedding_from_json_value(value: &Value) -> Result<Vec<u8>, PqlError> {
+    if let Some(obj) = value.as_object() {
+        if let Some(Value::String(kind)) = obj.get("__type__") {
+            if kind == "base64" {
+                let content = obj
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| PqlError::invalid("base64 output missing content"))?;
+                let decoded = general_purpose::STANDARD
+                    .decode(content.as_bytes())
+                    .map_err(|err| PqlError::invalid(format!("invalid base64 output: {err}")))?;
+                return embedding_from_npy_bytes(&decoded).map_err(PqlError::invalid);
+            }
+        }
+        if let Some(Value::Array(array)) = obj.get("embedding") {
+            return embedding_from_json_array(array);
+        }
+    }
+    if let Some(array) = value.as_array() {
+        if array.is_empty() {
+            return Err(PqlError::invalid("inference output embedding is empty"));
+        }
+        if let Some(first) = array.first() {
+            if let Some(nested) = first.as_array() {
+                return embedding_from_json_array(nested);
+            }
+        }
+        return embedding_from_json_array(array);
+    }
+    Err(PqlError::invalid(
+        "unsupported inference JSON output for embedding",
+    ))
+}
+
+fn embedding_from_json_array(values: &[Value]) -> Result<Vec<u8>, PqlError> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let num = value
+            .as_f64()
+            .ok_or_else(|| PqlError::invalid("inference embedding JSON must be numeric"))?;
+        out.push(num as f32);
+    }
+    Ok(serialize_f32(&out))
+}
+
+async fn get_distance_func_override(
+    state: &mut AsyncPreprocessState<'_>,
+    model_name: &str,
+) -> Result<Option<DistanceFunction>, PqlError> {
+    let metadata = state.metadata().await?;
+    parse_distance_func_override(metadata, model_name)
+}
+
+fn parse_distance_func_override(
+    metadata: &Value,
+    model_name: &str,
+) -> Result<Option<DistanceFunction>, PqlError> {
+    let (group_name, inference_id) = model_name
+        .split_once('/')
+        .ok_or_else(|| PqlError::invalid(format!("invalid model name: {model_name}")))?;
+
+    let group = metadata
+        .get(group_name)
+        .ok_or_else(|| PqlError::invalid(format!("group does not exist: {group_name}")))?;
+    let inference_ids = group
+        .get("inference_ids")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| PqlError::invalid("inference metadata missing inference_ids"))?;
+    let group_metadata = group
+        .get("group_metadata")
+        .and_then(|value| value.as_object());
+    let inference_metadata = inference_ids
+        .get(inference_id)
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            PqlError::invalid(format!(
+                "inference id does not exist: {group_name}/{inference_id}"
+            ))
+        })?;
+
+    let distance_value = inference_metadata
+        .get("distance_func")
+        .or_else(|| group_metadata.and_then(|value| value.get("distance_func")));
+
+    let value = match distance_value {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(None),
+        Some(Value::String(value)) => value.as_str(),
+        Some(other) => {
+            return Err(PqlError::invalid(format!(
+                "Invalid `distance_func` value for {model_name}: {other}. Must be one of: null, 'L2', 'cosine'"
+            )));
+        }
+    };
+
+    let override_fn = DistanceFunction::from_override(value).ok_or_else(|| {
+        PqlError::invalid(format!(
+            "Invalid `distance_func` value for {model_name}: {value}. Must be one of: null, 'L2', 'cosine'"
+        ))
+    })?;
+    Ok(Some(override_fn))
 }
 
 fn clean_matches(matches: &mut Matches) -> bool {

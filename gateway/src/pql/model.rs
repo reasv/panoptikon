@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub(crate) use crate::pql::builder::filters::{
-    DerivedDataArgs, HasUnprocessedData, InBookmarks, InBookmarksArgs, Match, MatchAnd, MatchNot,
-    MatchOps, MatchOr, MatchPath, MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue,
-    MatchValues, Matches, OneOrMany, ProcessedBy, TagsArgs,
+    DerivedDataArgs, DistanceAggregation, DistanceFunction, EmbedArgs, HasUnprocessedData,
+    InBookmarks, InBookmarksArgs, Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchPath,
+    MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue, MatchValues, Matches,
+    OneOrMany, ProcessedBy, SemanticImageArgs, SemanticImageSearch, SemanticTextArgs,
+    SemanticTextSearch, SimilarTo, SimilarityArgs, SourceArgs, TagsArgs,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
@@ -361,6 +363,9 @@ pub(crate) enum QueryElement {
     Match(Match),
     MatchPath(MatchPath),
     MatchText(MatchText),
+    SemanticTextSearch(SemanticTextSearch),
+    SemanticImageSearch(SemanticImageSearch),
+    SimilarTo(SimilarTo),
     MatchTags(MatchTags),
     InBookmarks(InBookmarks),
     ProcessedBy(ProcessedBy),

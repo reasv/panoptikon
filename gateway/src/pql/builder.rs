@@ -462,6 +462,9 @@ fn process_query_element(
         QueryElement::Match(filter) => filter.build(context, state),
         QueryElement::MatchPath(filter) => filter.build(context, state),
         QueryElement::MatchText(filter) => filter.build(context, state),
+        QueryElement::SemanticTextSearch(filter) => filter.build(context, state),
+        QueryElement::SemanticImageSearch(filter) => filter.build(context, state),
+        QueryElement::SimilarTo(filter) => filter.build(context, state),
         QueryElement::MatchTags(filter) => filter.build(context, state),
         QueryElement::InBookmarks(filter) => filter.build(context, state),
         QueryElement::ProcessedBy(filter) => filter.build(context, state),
@@ -1360,6 +1363,7 @@ enum Files {
 enum Items {
     Table,
     Id,
+    Sha256,
     Md5,
     Type,
     Size,
@@ -1384,6 +1388,13 @@ enum ItemData {
     Idx,
     SourceId,
     IsPlaceholder,
+}
+
+#[derive(sea_query::Iden)]
+enum Embeddings {
+    Table,
+    Id,
+    Embedding,
 }
 
 #[derive(sea_query::Iden)]

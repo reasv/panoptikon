@@ -54,10 +54,13 @@ Special handling:
   `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`,
   `/api/search/tags/top`, and `/api/search/stats`
   locally using the same policy enforcement and filtering rules.
-  `/api/search/pql` compiles queries via the upstream `/api/search/pql/build`
-  response to apply extra column aliases and the `check_path` behavior.
-  The in-progress Rust PQL compiler tracks joined base tables to avoid duplicate
-  joins when the root CTE is unwrapped.
+  `/api/search/pql` still compiles queries via the upstream
+  `/api/search/pql/build` response to apply extra column aliases and the
+  `check_path` behavior. The Rust PQL compiler (SeaQuery) now mirrors the
+  Python implementation, including embedding filters and async preprocessing
+  that can call the inference upstream and parse `.npy`/JSON embeddings. It
+  tracks joined base tables to avoid duplicate joins when the root CTE is
+  unwrapped.
 
 ## Database migrations
 

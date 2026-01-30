@@ -1,16 +1,23 @@
+mod embedding_types;
 mod has_unprocessed;
+mod image_embeddings;
 mod in_bookmarks;
+mod item_similarity;
 mod match_filter;
 mod match_path;
 mod match_tags;
 mod match_text;
 mod processed_by;
+mod text_embeddings;
 
 use super::{CteRef, QueryState};
 use crate::pql::preprocess::PqlError;
 
+pub(crate) use embedding_types::{DistanceAggregation, DistanceFunction};
 pub(crate) use has_unprocessed::{DerivedDataArgs, HasUnprocessedData};
+pub(crate) use image_embeddings::{SemanticImageArgs, SemanticImageSearch};
 pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};
+pub(crate) use item_similarity::{SimilarTo, SimilarityArgs, SourceArgs};
 pub(crate) use match_filter::{
     Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches, OneOrMany,
 };
@@ -18,6 +25,7 @@ pub(crate) use match_path::{MatchPath, MatchPathArgs};
 pub(crate) use match_tags::{MatchTags, TagsArgs};
 pub(crate) use match_text::{MatchText, MatchTextArgs};
 pub(crate) use processed_by::ProcessedBy;
+pub(crate) use text_embeddings::{EmbedArgs, SemanticTextArgs, SemanticTextSearch};
 
 pub(crate) trait FilterCompiler {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError>;
@@ -26,18 +34,35 @@ pub(crate) trait FilterCompiler {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
+    use std::sync::OnceLock;
 
+    use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
     use sea_query::{Alias, Cond, Expr, ExprTrait, Query, SqliteQueryBuilder};
     use sea_query_sqlx::SqlxBinder;
+    use sqlite_vec::sqlite3_vec_init;
 
     use crate::db::migrations::setup_test_databases;
     use crate::pql::build_query;
     use crate::pql::model::{EntityType, PqlQuery, QueryElement};
 
-    use super::{CteRef, FilterCompiler, QueryState};
     use super::super::{
-        ItemData, Files, create_cte, entity_to_data_type, build_with_clause, select_std_from_cte,
+        Files, ItemData, build_with_clause, create_cte, entity_to_data_type, select_std_from_cte,
     };
+    use super::{CteRef, FilterCompiler, QueryState};
+
+    fn ensure_vec_extension_loaded() {
+        static EXT_LOADED: OnceLock<()> = OnceLock::new();
+        if EXT_LOADED.get().is_some() {
+            return;
+        }
+        let status = unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
+        };
+        if status != SQLITE_OK {
+            panic!("failed to register sqlite-vec extension for tests");
+        }
+        let _ = EXT_LOADED.set(());
+    }
 
     pub(crate) fn build_base_state(entity: EntityType, count_query: bool) -> QueryState {
         QueryState {
@@ -56,7 +81,10 @@ pub(crate) mod test_support {
         let mut start = Query::select();
         start
             .expr_as(Expr::col((Files::Table, Files::Id)), Alias::new("file_id"))
-            .expr_as(Expr::col((Files::Table, Files::ItemId)), Alias::new("item_id"))
+            .expr_as(
+                Expr::col((Files::Table, Files::ItemId)),
+                Alias::new("item_id"),
+            )
             .from(Files::Table);
 
         if state.item_data_query {
@@ -70,7 +98,10 @@ pub(crate) mod test_support {
                         .eq(entity_to_data_type(state.entity)),
                 );
             start.join(sea_query::JoinType::InnerJoin, ItemData::Table, join_cond);
-            start.expr_as(Expr::col((ItemData::Table, ItemData::Id)), Alias::new("data_id"));
+            start.expr_as(
+                Expr::col((ItemData::Table, ItemData::Id)),
+                Alias::new("data_id"),
+            );
         }
 
         create_cte(state, "begin_cte".to_string(), start.to_owned())
@@ -91,6 +122,7 @@ pub(crate) mod test_support {
         filter: QueryElement,
         entity: EntityType,
     ) -> Result<(), sqlx::Error> {
+        ensure_vec_extension_loaded();
         let mut query = PqlQuery {
             query: Some(filter),
             entity,

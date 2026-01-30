@@ -91,9 +91,9 @@ PQL Rewrite (Rust, Planned)
   - Join tracking: filters record which base tables they already join so root CTE unwrapping does not introduce duplicate base-table joins (avoids ambiguous column errors).
   - Count queries: preserve count semantics (including partition-by counting and ignoring gt/lt cursor filters).
   - SQLite specifics: FTS5 `MATCH`, `snippet(...)`, and vector functions are emitted as raw SQL fragments where needed.
-- Initial filter subset (fully working core, no inference required):
+- Initial filter subset (fully working core):
   - `Match`, `MatchPath`, `MatchText`, `MatchTags`, `InBookmarks`, `ProcessedBy`, `HasUnprocessedData`.
-  - Embedding-dependent filters are deferred until a Rust-side embedding/model-metadata layer exists.
+  - Embedding filters (`SemanticTextSearch`, `SemanticImageSearch`, `SimilarTo`) are implemented and require async preprocessing with the inference API for embeddings + distance function overrides.
 - Implementation status:
   - `Match` is implemented with KV joins + recursive operator handling (eq/neq/in/nin/gt/gte/lt/lte/startswith/endswith/contains, plus nested and/or/not).
   - `MatchPath` is implemented with FTS5 `MATCH`, `rank`-based `order_rank`, `row_n` windowing, and `gt`/`lt` cursor filtering.
@@ -102,6 +102,10 @@ PQL Rewrite (Rust, Planned)
   - `InBookmarks` is implemented with user + namespace filtering (including sub-namespaces) and ordering by latest bookmark timestamp.
   - `ProcessedBy` is implemented with setter filtering over derived data per item/data row.
   - `HasUnprocessedData` is implemented with derived-data `NOT EXISTS` checks and placeholder filtering.
+  - `SemanticTextSearch` is implemented with embeddings distance aggregation (MIN/MAX/AVG), optional source-text filters + weights, and per-entity join paths.
+  - `SemanticImageSearch` is implemented with CLIP cross-modal support, source-text filters, and model distance-function overrides.
+  - `SimilarTo` is implemented with an `unqemb` CTE, cross-modal constraints, and weighted distance aggregation when source-text weights are provided.
+  - `preprocess_query_async` embeds queries via the inference upstream and loads model metadata for distance-function overrides; the sync preprocessor accepts base64 embeddings or prefilled `_embedding` fields.
   - Wiring into `/api/search/pql` is still pending; the route continues to compile via upstream `/api/search/pql/build` until the Rust builder is turned on.
 - Test strategy (results + performance invariants):
   - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
