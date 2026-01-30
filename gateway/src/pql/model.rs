@@ -16,7 +16,7 @@ pub(crate) enum EntityType {
     Text,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Column {
     FileId,
@@ -370,6 +370,13 @@ pub(crate) enum QueryElement {
     InBookmarks(InBookmarks),
     ProcessedBy(ProcessedBy),
     HasUnprocessedData(HasUnprocessedData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct JobFilter {
+    #[serde(default)]
+    pub setter_names: Vec<String>,
+    pub pql_query: QueryElement,
 }
 
 fn default_direction() -> OrderDirection {

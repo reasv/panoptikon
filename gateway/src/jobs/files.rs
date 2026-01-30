@@ -44,6 +44,8 @@ use crate::{
         },
         system_config::{SystemConfig, SystemConfigStore},
     },
+    pql::builder::filters::evaluate_match,
+    pql::model::{Match, MatchValue},
 };
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -143,7 +145,10 @@ impl FileScanService {
             0
         };
         let rule_files_deleted = call_index_db_writer(&self.index_db, |reply| {
-            IndexDbWriterMessage::DeleteFilesNotAllowed { reply }
+            IndexDbWriterMessage::DeleteFilesNotAllowed {
+                job_filters: config.job_filters.clone(),
+                reply,
+            }
         })
         .await?;
         let orphan_items_deleted = call_index_db_writer(&self.index_db, |reply| {
@@ -250,7 +255,10 @@ impl FileScanService {
         })
         .await?;
         let rule_files_deleted = call_index_db_writer(&self.index_db, |reply| {
-            IndexDbWriterMessage::DeleteFilesNotAllowed { reply }
+            IndexDbWriterMessage::DeleteFilesNotAllowed {
+                job_filters: config.job_filters.clone(),
+                reply,
+            }
         })
         .await?;
         let orphan_items_deleted = call_index_db_writer(&self.index_db, |reply| {
@@ -398,9 +406,9 @@ async fn scan_single_folder(
     options: ScanOptions,
 ) -> ApiResult<FolderStats> {
     let allowed_extensions = build_extension_set(config);
+    let filescan_filter = parse_filescan_filter(config).map(Arc::new);
     let semaphore = Arc::new(Semaphore::new(options.worker_count));
     let mut tasks = JoinSet::new();
-    let config = Arc::new(config.clone());
 
     for entry in WalkDir::new(folder)
         .follow_links(true)
@@ -432,10 +440,10 @@ async fn scan_single_folder(
             .acquire_owned()
             .await
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
-        let config = Arc::clone(&config);
+        let filescan_filter = filescan_filter.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            tokio::task::spawn_blocking(move || process_file(path, &config))
+            tokio::task::spawn_blocking(move || process_file(path, filescan_filter))
                 .await
                 .map_err(|err| FileProcessError::Worker(err.to_string()))?
         });
@@ -747,11 +755,21 @@ pub(crate) enum FileProcessError {
     Unsupported(String),
 }
 
-pub(crate) fn process_file(path: PathBuf, config: &SystemConfig) -> Result<PreparedFile, FileProcessError> {
+pub(crate) fn process_file(
+    path: PathBuf,
+    filescan_filter: Option<Arc<Match>>,
+) -> Result<PreparedFile, FileProcessError> {
     let (last_modified, file_size) = get_last_modified_time_and_size(&path)
         .map_err(|err| FileProcessError::Io(err.to_string()))?;
 
-    if !passes_filescan_filter_stage1(config) {
+    let mime_type = infer_mime_type(&path)?;
+    if !passes_filescan_filter_stage1(
+        filescan_filter.as_deref(),
+        &path,
+        &last_modified,
+        file_size,
+        &mime_type,
+    ) {
         return Err(FileProcessError::Unsupported("filtered".to_string()));
     }
 
@@ -766,11 +784,19 @@ pub(crate) fn process_file(path: PathBuf, config: &SystemConfig) -> Result<Prepa
     let file_size = real_size;
 
     let metadata_start = Instant::now();
-    let mime_type = infer_mime_type(&path)?;
     let metadata = extract_item_metadata(&path, &mime_type, md5.clone())?;
     let metadata_time = metadata_start.elapsed().as_secs_f64();
 
-    if !passes_filescan_filter_stage2(config) {
+    if !passes_filescan_filter_stage2(
+        filescan_filter.as_deref(),
+        &path,
+        &last_modified,
+        file_size,
+        &mime_type,
+        &md5,
+        &sha256,
+        &metadata,
+    ) {
         return Err(FileProcessError::Unsupported("filtered".to_string()));
     }
 
@@ -801,14 +827,80 @@ pub(crate) fn process_file(path: PathBuf, config: &SystemConfig) -> Result<Prepa
     })
 }
 
-fn passes_filescan_filter_stage1(_config: &SystemConfig) -> bool {
-    // TODO: Implement filescan_filter stage 1 (PQL).
-    true
+fn passes_filescan_filter_stage1(
+    filter: Option<&Match>,
+    path: &Path,
+    last_modified: &str,
+    file_size: i64,
+    mime_type: &str,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+    let value = MatchValue {
+        last_modified: Some(last_modified.to_string()),
+        size: Some(file_size),
+        path: Some(path.to_string_lossy().to_string()),
+        filename: Some(filename),
+        r#type: Some(mime_type.to_string()),
+        ..Default::default()
+    };
+    evaluate_match(filter, &value)
 }
 
-fn passes_filescan_filter_stage2(_config: &SystemConfig) -> bool {
-    // TODO: Implement filescan_filter stage 2 (PQL).
-    true
+fn passes_filescan_filter_stage2(
+    filter: Option<&Match>,
+    path: &Path,
+    last_modified: &str,
+    file_size: i64,
+    mime_type: &str,
+    md5: &str,
+    sha256: &str,
+    metadata: &ItemScanMeta,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+    let value = MatchValue {
+        last_modified: Some(last_modified.to_string()),
+        size: Some(file_size),
+        path: Some(path.to_string_lossy().to_string()),
+        filename: Some(filename),
+        r#type: Some(mime_type.to_string()),
+        md5: Some(md5.to_string()),
+        sha256: Some(sha256.to_string()),
+        width: metadata.width,
+        height: metadata.height,
+        duration: metadata.duration,
+        audio_tracks: metadata.audio_tracks,
+        video_tracks: metadata.video_tracks,
+        subtitle_tracks: metadata.subtitle_tracks,
+        ..Default::default()
+    };
+    evaluate_match(filter, &value)
+}
+
+pub(crate) fn parse_filescan_filter(config: &SystemConfig) -> Option<Match> {
+    let Some(raw) = config.filescan_filter.as_ref() else {
+        return None;
+    };
+    match raw.clone().try_into::<Match>() {
+        Ok(filter) => Some(filter),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to parse filescan filter");
+            None
+        }
+    }
 }
 
 fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {

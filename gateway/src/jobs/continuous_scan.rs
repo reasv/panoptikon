@@ -32,8 +32,9 @@ use crate::jobs::files::{
     FileProcessError, PreparedFile, ScanOptions, build_extension_set,
     build_file_scan_data, check_folder_validity, current_iso_timestamp, deduplicate_paths,
     get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
-    normalize_path, process_file,
+    normalize_path, parse_filescan_filter, process_file,
 };
+use crate::pql::model::Match;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -43,7 +44,7 @@ const SUPERVISOR_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 struct FileWork {
     path: PathBuf,
-    config: Arc<SystemConfig>,
+    filescan_filter: Option<Arc<Match>>,
     epoch: u64,
     scan_time: String,
     reply_to: ActorRef<ContinuousScanMessage>,
@@ -74,13 +75,13 @@ impl Worker for ContinuousWorker {
     ) -> Result<Self::Key, ActorProcessingErr> {
         let FileWork {
             path,
-            config,
+            filescan_filter,
             epoch,
             scan_time,
             reply_to,
         } = job.msg;
 
-        let result = tokio::task::spawn_blocking(move || process_file(path, &config))
+        let result = tokio::task::spawn_blocking(move || process_file(path, filescan_filter))
             .await
             .map_err(|err| FileProcessError::Worker(err.to_string()))
             .and_then(|res| res);
@@ -180,6 +181,7 @@ pub(crate) struct ContinuousScanState {
     included_roots: Vec<PathBuf>,
     excluded_roots: Vec<PathBuf>,
     allowed_extensions: HashSet<String>,
+    filescan_filter: Option<Arc<Match>>,
     scan_id: Option<i64>,
     scan_time: Option<String>,
     stats: ScanStats,
@@ -213,6 +215,7 @@ impl ContinuousScanState {
             .map(|path| normalize_path(path, true))
             .collect();
         self.allowed_extensions = build_extension_set(&self.config);
+        self.filescan_filter = parse_filescan_filter(&self.config).map(Arc::new);
     }
 
     async fn start_scan(&mut self) -> ApiResult<()> {
@@ -402,7 +405,7 @@ impl ContinuousScanState {
         };
         let msg = FileWork {
             path,
-            config: Arc::new(self.config.clone()),
+            filescan_filter: self.filescan_filter.clone(),
             epoch: self.epoch,
             scan_time,
             reply_to: self.actor_ref.clone(),
@@ -498,6 +501,7 @@ impl Actor for ContinuousScanActor {
             included_roots: Vec::new(),
             excluded_roots: Vec::new(),
             allowed_extensions: HashSet::new(),
+            filescan_filter: None,
             scan_id: None,
             scan_time: None,
             stats: ScanStats::new(),
@@ -1131,7 +1135,11 @@ mod tests {
         .await
         .unwrap();
 
-        let prepared = process_file(file_path.clone(), &config).unwrap();
+        let prepared = process_file(
+            file_path.clone(),
+            parse_filescan_filter(&config).map(Arc::new),
+        )
+        .unwrap();
         actor
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,
@@ -1204,7 +1212,11 @@ mod tests {
         actor.cast(ContinuousScanMessage::Pause { reply: tx }).unwrap();
         let _ = rx.await;
 
-        let prepared = process_file(file_path.clone(), &config).unwrap();
+        let prepared = process_file(
+            file_path.clone(),
+            parse_filescan_filter(&config).map(Arc::new),
+        )
+        .unwrap();
         actor
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,

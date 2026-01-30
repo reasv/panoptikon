@@ -2,6 +2,8 @@ use sea_query::{Expr, ExprTrait, JoinType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use std::collections::HashMap;
+
 use crate::pql::model::Column;
 use crate::pql::preprocess::PqlError;
 
@@ -18,7 +20,7 @@ pub(crate) enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub(crate) struct MatchValues {
     #[serde(default)]
     pub file_id: Option<OneOrMany<i64>>,
@@ -78,7 +80,7 @@ pub(crate) struct MatchValues {
     pub source_id: Option<OneOrMany<i64>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub(crate) struct MatchValue {
     #[serde(default)]
     pub file_id: Option<i64>,
@@ -138,7 +140,7 @@ pub(crate) struct MatchValue {
     pub source_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub(crate) struct MatchOps {
     #[serde(default)]
     pub eq: Option<MatchValue>,
@@ -202,6 +204,13 @@ pub(crate) struct Match {
     /// based on their type, size, or the path of the file they are associated with.
     #[serde(rename = "match")]
     pub match_: Matches,
+}
+
+pub(crate) fn evaluate_match(filter: &Match, obj: &MatchValue) -> bool {
+    let obj_fields = collect_match_value_fields(obj)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    evaluate_matches(&filter.match_, &obj_fields)
 }
 
 impl FilterCompiler for Match {
@@ -288,6 +297,69 @@ mod tests {
             .await
             .expect("match query");
     }
+
+    #[test]
+    fn evaluate_match_checks_eq_and_contains() {
+        let filter = Match {
+            match_: Matches::Ops(MatchOps {
+                eq: Some(MatchValue {
+                    r#type: Some("image/png".to_string()),
+                    ..Default::default()
+                }),
+                contains: Some(MatchValues {
+                    path: Some(OneOrMany::Many(vec![
+                        "media".to_string(),
+                        "photos".to_string(),
+                    ])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let obj = MatchValue {
+            r#type: Some("image/png".to_string()),
+            path: Some("C:/media/sample.png".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_match(&filter, &obj));
+    }
+
+    #[test]
+    fn evaluate_match_handles_or_and_not() {
+        let filter = Match {
+            match_: Matches::Or(MatchOr {
+                or_: vec![
+                    MatchOps {
+                        eq: Some(MatchValue {
+                            filename: Some("keep.png".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    MatchOps {
+                        not_contains: Some(MatchValues {
+                            path: Some(OneOrMany::One("tmp".to_string())),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            }),
+        };
+        let obj = MatchValue {
+            filename: Some("other.png".to_string()),
+            path: Some("C:/data/other.png".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_match(&filter, &obj));
+
+        let blocked = MatchValue {
+            filename: Some("other.png".to_string()),
+            path: Some("C:/tmp/other.png".to_string()),
+            ..Default::default()
+        };
+        assert!(!evaluate_match(&filter, &blocked));
+    }
 }
 
 fn build_matches_expression(matches: &Matches, allow_text: bool) -> Result<Expr, PqlError> {
@@ -311,6 +383,208 @@ fn build_matches_expression(matches: &Matches, allow_text: bool) -> Result<Expr,
             let expr = build_match_ops_expression(not_, allow_text)?;
             Ok(expr.not())
         }
+    }
+}
+
+fn evaluate_matches(matches: &Matches, obj_fields: &HashMap<Column, FieldValue>) -> bool {
+    match matches {
+        Matches::Ops(ops) => evaluate_match_ops(ops, obj_fields),
+        Matches::And(MatchAnd { and_ }) => and_.iter().all(|ops| evaluate_match_ops(ops, obj_fields)),
+        Matches::Or(MatchOr { or_ }) => or_.iter().any(|ops| evaluate_match_ops(ops, obj_fields)),
+        Matches::Not(MatchNot { not_ }) => !evaluate_match_ops(not_, obj_fields),
+    }
+}
+
+fn evaluate_match_ops(ops: &MatchOps, obj_fields: &HashMap<Column, FieldValue>) -> bool {
+    let mut results = Vec::new();
+
+    if let Some(values) = &ops.eq {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Eq));
+    }
+    if let Some(values) = &ops.neq {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Neq));
+    }
+    if let Some(values) = &ops.in_ {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::In));
+    }
+    if let Some(values) = &ops.nin {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotIn));
+    }
+    if let Some(values) = &ops.gt {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Gt));
+    }
+    if let Some(values) = &ops.gte {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Gte));
+    }
+    if let Some(values) = &ops.lt {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Lt));
+    }
+    if let Some(values) = &ops.lte {
+        results.extend(evaluate_match_values(values, obj_fields, MatchOp::Lte));
+    }
+    if let Some(values) = &ops.startswith {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::StartsWith));
+    }
+    if let Some(values) = &ops.not_startswith {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotStartsWith));
+    }
+    if let Some(values) = &ops.endswith {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::EndsWith));
+    }
+    if let Some(values) = &ops.not_endswith {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotEndsWith));
+    }
+    if let Some(values) = &ops.contains {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::Contains));
+    }
+    if let Some(values) = &ops.not_contains {
+        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotContains));
+    }
+
+    if results.is_empty() {
+        return true;
+    }
+
+    results.into_iter().all(|value| value)
+}
+
+#[derive(Clone, Copy)]
+enum MatchOp {
+    Eq,
+    Neq,
+    In,
+    NotIn,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    StartsWith,
+    NotStartsWith,
+    EndsWith,
+    NotEndsWith,
+    Contains,
+    NotContains,
+}
+
+fn evaluate_match_values(
+    values: &MatchValue,
+    obj_fields: &HashMap<Column, FieldValue>,
+    op: MatchOp,
+) -> Vec<bool> {
+    let mut results = Vec::new();
+    for (column, value) in collect_match_value_fields(values) {
+        let Some(field_value) = obj_fields.get(&column) else {
+            continue;
+        };
+        results.push(compare_field(field_value, &value, op));
+    }
+    results
+}
+
+fn evaluate_match_value_lists(
+    values: &MatchValues,
+    obj_fields: &HashMap<Column, FieldValue>,
+    op: MatchOp,
+) -> Vec<bool> {
+    let mut results = Vec::new();
+    for (column, value) in collect_match_values_fields(values) {
+        let Some(field_value) = obj_fields.get(&column) else {
+            continue;
+        };
+        results.push(compare_field_list(field_value, &value, op));
+    }
+    results
+}
+
+fn compare_field(field_value: &FieldValue, value: &FieldValue, op: MatchOp) -> bool {
+    match op {
+        MatchOp::Eq => field_value == value,
+        MatchOp::Neq => field_value != value,
+        MatchOp::Gt => compare_ordered(field_value, value, |ord| ord.is_gt()),
+        MatchOp::Gte => compare_ordered(field_value, value, |ord| ord.is_gt() || ord.is_eq()),
+        MatchOp::Lt => compare_ordered(field_value, value, |ord| ord.is_lt()),
+        MatchOp::Lte => compare_ordered(field_value, value, |ord| ord.is_lt() || ord.is_eq()),
+        _ => false,
+    }
+}
+
+fn compare_field_list(field_value: &FieldValue, values: &FieldValues, op: MatchOp) -> bool {
+    match op {
+        MatchOp::In => {
+            let list = match values {
+                FieldValues::Many(values) => values,
+                FieldValues::Single(_) => return false,
+            };
+            list.iter().any(|value| field_value == value)
+        }
+        MatchOp::NotIn => {
+            let list = match values {
+                FieldValues::Many(values) => values,
+                FieldValues::Single(_) => return false,
+            };
+            list.iter().all(|value| field_value != value)
+        }
+        MatchOp::StartsWith | MatchOp::NotStartsWith => {
+            string_list_check(field_value, values, op, |value, pattern| value.starts_with(pattern))
+        }
+        MatchOp::EndsWith | MatchOp::NotEndsWith => {
+            string_list_check(field_value, values, op, |value, pattern| value.ends_with(pattern))
+        }
+        MatchOp::Contains | MatchOp::NotContains => {
+            string_list_check(field_value, values, op, |value, pattern| value.contains(pattern))
+        }
+        _ => false,
+    }
+}
+
+fn string_list_check(
+    field_value: &FieldValue,
+    values: &FieldValues,
+    op: MatchOp,
+    check: impl Fn(&str, &str) -> bool,
+) -> bool {
+    let FieldValue::String(field_str) = field_value else {
+        return false;
+    };
+    let list = match values {
+        FieldValues::Single(value) => vec![value.clone()],
+        FieldValues::Many(values) => values.clone(),
+    };
+
+    let negate = matches!(
+        op,
+        MatchOp::NotStartsWith | MatchOp::NotEndsWith | MatchOp::NotContains
+    );
+    let use_all = negate;
+
+    let mut results = list.iter().map(|value| match value {
+        FieldValue::String(pattern) => check(field_str, pattern),
+        _ => false,
+    });
+
+    if use_all {
+        results.all(|value| if negate { !value } else { value })
+    } else {
+        results.any(|value| if negate { !value } else { value })
+    }
+}
+
+fn compare_ordered(
+    left: &FieldValue,
+    right: &FieldValue,
+    check: impl Fn(std::cmp::Ordering) -> bool,
+) -> bool {
+    match (left, right) {
+        (FieldValue::Int(lhs), FieldValue::Int(rhs)) => check(lhs.cmp(rhs)),
+        (FieldValue::Float(lhs), FieldValue::Float(rhs)) => lhs.partial_cmp(rhs).map(check).unwrap_or(false),
+        (FieldValue::Int(lhs), FieldValue::Float(rhs)) => {
+            (*lhs as f64).partial_cmp(rhs).map(check).unwrap_or(false)
+        }
+        (FieldValue::Float(lhs), FieldValue::Int(rhs)) => {
+            lhs.partial_cmp(&(*rhs as f64)).map(check).unwrap_or(false)
+        }
+        (FieldValue::String(lhs), FieldValue::String(rhs)) => check(lhs.cmp(rhs)),
+        _ => false,
     }
 }
 
@@ -785,7 +1059,7 @@ fn map_float(value: &f64) -> FieldValue {
     FieldValue::Float(*value)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum FieldValue {
     Int(i64),
     Float(f64),

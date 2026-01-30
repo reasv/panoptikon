@@ -1,4 +1,9 @@
+use sea_query::SqliteQueryBuilder;
+use sea_query_sqlx::SqlxBinder;
 use sqlx::Row;
+
+use crate::pql::build_query;
+use crate::pql::model::{AndOperator, JobFilter, NotOperator, PqlQuery, QueryElement};
 
 use crate::api_error::ApiError;
 
@@ -464,11 +469,116 @@ WHERE rowid IN (
     Ok(total_deleted)
 }
 
-pub(crate) async fn delete_files_not_allowed_stub(
-    _conn: &mut sqlx::SqliteConnection,
+pub(crate) async fn delete_files_not_allowed(
+    conn: &mut sqlx::SqliteConnection,
+    job_filters: &[toml::Value],
 ) -> ApiResult<u64> {
-    // TODO: Implement PQL-based job_filters handling.
-    Ok(0)
+    let filters = parse_job_filters(job_filters);
+    let user_filters = filters
+        .into_iter()
+        .filter(|filter| filter.setter_names.iter().any(|name| name == "file_scan"))
+        .map(|filter| filter.pql_query)
+        .collect::<Vec<_>>();
+
+    let mut flattened_filters = Vec::new();
+    for filter in user_filters {
+        match filter {
+            QueryElement::And(and) => flattened_filters.extend(and.and_),
+            other => flattened_filters.push(other),
+        }
+    }
+
+    if flattened_filters.is_empty() {
+        return Ok(0);
+    }
+
+    let query = PqlQuery {
+        query: Some(QueryElement::Not(NotOperator {
+            not_: Box::new(QueryElement::And(AndOperator {
+                and_: flattened_filters,
+            })),
+        })),
+        page_size: 0,
+        check_path: false,
+        ..Default::default()
+    };
+
+    let total_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count files before job filter deletion");
+            ApiError::internal("Failed to delete files")
+        })?;
+
+    let built = build_query(query, false).map_err(|err| {
+        tracing::error!(error = ?err, "failed to compile job filter PQL query");
+        ApiError::internal("Failed to delete files")
+    })?;
+    let (sql, values) = match built.with_clause {
+        Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
+        None => built.query.build_sqlx(SqliteQueryBuilder),
+    };
+    let rows = sqlx::query_with(&sql, values)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to run job filter query");
+            ApiError::internal("Failed to delete files")
+        })?;
+
+    let result_count = rows.len() as i64;
+    if result_count > 0 {
+        tracing::warn!(
+            result_count,
+            total_files,
+            "files do not match job filter rules"
+        );
+    } else {
+        tracing::debug!(total_files, "all files match job filter rules");
+    }
+
+    for row in rows {
+        let file_id: i64 = row.try_get("file_id").map_err(|err| {
+            tracing::error!(error = %err, "failed to read file_id from job filter query");
+            ApiError::internal("Failed to delete files")
+        })?;
+        sqlx::query("DELETE FROM files WHERE id = ?1")
+            .bind(file_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, file_id, "failed to delete file via job filter");
+                ApiError::internal("Failed to delete files")
+            })?;
+    }
+
+    let total_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count files after job filter deletion");
+            ApiError::internal("Failed to delete files")
+        })?;
+
+    let deleted = total_files.saturating_sub(total_after);
+    if deleted > 0 {
+        tracing::warn!(deleted, "deleted files due to job filter rules");
+    }
+    Ok(deleted as u64)
+}
+
+fn parse_job_filters(job_filters: &[toml::Value]) -> Vec<JobFilter> {
+    let mut parsed = Vec::new();
+    for value in job_filters {
+        match value.clone().try_into::<JobFilter>() {
+            Ok(filter) => parsed.push(filter),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to parse job filter");
+            }
+        }
+    }
+    parsed
 }
 
 #[cfg(test)]

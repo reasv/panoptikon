@@ -45,6 +45,7 @@ Behavior (important)
   - `/api/jobs/*` is implemented locally only when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
   - A global `JobQueueActor` keeps an in-memory queue and running job state; a `JobRunnerActor` executes one job at a time.
   - File scan jobs (`folder_rescan`, `folder_update`) run through `FileScanService` and the index writer actor for writes.
+  - File scan jobs honor `filescan_filter` (PQL `Match`) during stage-1/2 file filtering and apply `job_filters` entries that include `file_scan` after scans to delete files that violate the rules.
   - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).
   - Manual cronjob trigger enqueues configured cron jobs from the system config.

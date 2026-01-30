@@ -20,6 +20,7 @@ pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};
 pub(crate) use item_similarity::{SimilarTo, SimilarityArgs, SourceArgs};
 pub(crate) use match_filter::{
     Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches, OneOrMany,
+    evaluate_match,
 };
 pub(crate) use match_path::{MatchPath, MatchPathArgs};
 pub(crate) use match_tags::{MatchTags, TagsArgs};

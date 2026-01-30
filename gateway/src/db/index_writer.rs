@@ -22,7 +22,7 @@ use crate::db::{
         FileScanUpdate,
     },
     files::{
-        delete_files_not_allowed_stub,
+        delete_files_not_allowed,
         delete_items_without_files,
         delete_file_by_path,
         delete_item_if_orphan,
@@ -132,6 +132,7 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<u64>,
     },
     DeleteFilesNotAllowed {
+        job_filters: Vec<toml::Value>,
         reply: Reply<u64>,
     },
     DeleteOrphanedFrames {
@@ -441,10 +442,10 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
-            IndexDbWriterMessage::DeleteFilesNotAllowed { reply } => {
+            IndexDbWriterMessage::DeleteFilesNotAllowed { job_filters, reply } => {
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { delete_files_not_allowed_stub(conn).await })
+                        Box::pin(async move { delete_files_not_allowed(conn, &job_filters).await })
                     })
                     .await;
                 let _ = reply.send(result);
