@@ -891,16 +891,7 @@ fn passes_filescan_filter_stage2(
 }
 
 pub(crate) fn parse_filescan_filter(config: &SystemConfig) -> Option<Match> {
-    let Some(raw) = config.filescan_filter.as_ref() else {
-        return None;
-    };
-    match raw.clone().try_into::<Match>() {
-        Ok(filter) => Some(filter),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to parse filescan filter");
-            None
-        }
-    }
+    config.filescan_filter.clone()
 }
 
 fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {

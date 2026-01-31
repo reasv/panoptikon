@@ -471,13 +471,12 @@ WHERE rowid IN (
 
 pub(crate) async fn delete_files_not_allowed(
     conn: &mut sqlx::SqliteConnection,
-    job_filters: &[toml::Value],
+    job_filters: &[JobFilter],
 ) -> ApiResult<u64> {
-    let filters = parse_job_filters(job_filters);
-    let user_filters = filters
+    let user_filters = job_filters
         .into_iter()
         .filter(|filter| filter.setter_names.iter().any(|name| name == "file_scan"))
-        .map(|filter| filter.pql_query)
+        .map(|filter| filter.pql_query.clone())
         .collect::<Vec<_>>();
 
     let mut flattened_filters = Vec::new();
@@ -566,19 +565,6 @@ pub(crate) async fn delete_files_not_allowed(
         tracing::warn!(deleted, "deleted files due to job filter rules");
     }
     Ok(deleted as u64)
-}
-
-fn parse_job_filters(job_filters: &[toml::Value]) -> Vec<JobFilter> {
-    let mut parsed = Vec::new();
-    for value in job_filters {
-        match value.clone().try_into::<JobFilter>() {
-            Ok(filter) => parsed.push(filter),
-            Err(err) => {
-                tracing::error!(error = %err, "failed to parse job filter");
-            }
-        }
-    }
-    parsed
 }
 
 #[cfg(test)]

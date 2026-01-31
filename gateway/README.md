@@ -93,6 +93,8 @@ jobs API.
 File scan jobs honor the `filescan_filter` (PQL `Match`) during stage-1/2
 filtering, and apply `job_filters` entries that include `file_scan` after
 scans to delete files that violate those rules.
+The system config now parses `job_filters`/`filescan_filter` as PQL objects;
+invalid PQL in config will fail to load (matching Python behavior).
 
 Continuous file scanning is independent of the job queue and is controlled per
 index DB via the system config (`continuous_filescan = true`). A supervisor

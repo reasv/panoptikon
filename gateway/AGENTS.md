@@ -49,6 +49,7 @@ Behavior (important)
   - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).
   - Manual cronjob trigger enqueues configured cron jobs from the system config.
+  - System config parses `job_filters` and `filescan_filter` as PQL objects; invalid PQL in config fails to load (mirrors Python).
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.

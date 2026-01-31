@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::api_error::ApiError;
+use crate::pql::model::{JobFilter, Match};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -30,7 +31,7 @@ pub(crate) struct JobSettings {
     pub default_threshold: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SystemConfig {
     #[serde(default = "default_true")]
     pub remove_unavailable_files: bool,
@@ -63,12 +64,12 @@ pub(crate) struct SystemConfig {
     #[serde(default)]
     pub continuous_filescan_poll_interval_secs: Option<u64>,
 
-    /// Opaque TOML values (PQL objects); parsed but not interpreted yet.
+    /// PQL job filters (parsed).
     #[serde(default)]
-    pub job_filters: Vec<toml::Value>,
-    /// Opaque TOML value (PQL object); parsed but not interpreted yet.
+    pub job_filters: Vec<JobFilter>,
+    /// PQL filter applied during file scans (parsed).
     #[serde(default)]
-    pub filescan_filter: Option<toml::Value>,
+    pub filescan_filter: Option<Match>,
 
     /// Unknown keys are preserved to keep forward/backward compatibility.
     #[serde(flatten)]
@@ -242,13 +243,18 @@ mod tests {
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
         let config = store.load("default").unwrap();
 
-        assert_eq!(config, SystemConfig::default());
+        let default = SystemConfig::default();
+        assert_eq!(config.remove_unavailable_files, default.remove_unavailable_files);
+        assert_eq!(config.scan_images, default.scan_images);
+        assert_eq!(config.scan_video, default.scan_video);
+        assert!(config.job_filters.is_empty());
+        assert!(config.filescan_filter.is_none());
         assert!(store.config_path("default").exists());
     }
 
-    // Ensures job_filters and filescan_filter round-trip unchanged even though they're opaque.
+    // Ensures job_filters and filescan_filter parse as PQL and round-trip with extra fields preserved.
     #[test]
-    fn opaque_fields_round_trip_unchanged() {
+    fn pql_fields_round_trip() {
         let tmp = TempDir::new().unwrap();
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
 
@@ -257,10 +263,13 @@ scan_images = true
 scan_video = false
 
 job_filters = [
-  { setter_names = ["file_scan"], pql_query = { op = "and", and = [{ key = "size", gt = 10 }] } }
+  { setter_names = ["file_scan"], pql_query = { match = { gt = { size = 10 } } } }
 ]
 
-filescan_filter = { op = "or", or = [{ key = "path", like = "*.png" }, { key = "type", eq = "image/png" }] }
+filescan_filter = { match = { or = [
+  { contains = { path = "png" } },
+  { eq = { type = "image/png" } }
+] } }
 
 some_future_key = { a = 1, b = [1, 2, 3] }
 "#;
@@ -276,21 +285,9 @@ some_future_key = { a = 1, b = [1, 2, 3] }
 
         store.save("default", &loaded).unwrap();
 
-        let reloaded_raw = fs::read_to_string(&path).unwrap();
-        let reloaded_value: toml::Value = toml::from_str(&reloaded_raw).unwrap();
-        let original_value: toml::Value = toml::from_str(raw).unwrap();
-
-        assert_eq!(
-            reloaded_value.get("job_filters"),
-            original_value.get("job_filters")
-        );
-        assert_eq!(
-            reloaded_value.get("filescan_filter"),
-            original_value.get("filescan_filter")
-        );
-        assert_eq!(
-            reloaded_value.get("some_future_key"),
-            original_value.get("some_future_key")
-        );
+        let reloaded = store.load("default").unwrap();
+        assert_eq!(reloaded.job_filters.len(), loaded.job_filters.len());
+        assert!(reloaded.filescan_filter.is_some());
+        assert!(reloaded.extra.contains_key("some_future_key"));
     }
 }

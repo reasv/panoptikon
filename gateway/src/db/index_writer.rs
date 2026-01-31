@@ -132,7 +132,7 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<u64>,
     },
     DeleteFilesNotAllowed {
-        job_filters: Vec<toml::Value>,
+        job_filters: Vec<crate::pql::model::JobFilter>,
         reply: Reply<u64>,
     },
     DeleteOrphanedFrames {
