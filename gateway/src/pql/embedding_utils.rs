@@ -21,29 +21,28 @@ pub(crate) fn serialize_f32(values: &[f32]) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum NpyDtype {
-    F32,
-    F64,
+enum NpyKind {
+    Float,
+    Int,
+    UInt,
+    Bool,
 }
 
-impl NpyDtype {
-    fn size(self) -> usize {
-        match self {
-            Self::F32 => 4,
-            Self::F64 => 8,
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+struct NpyDtype {
+    kind: NpyKind,
+    size: usize,
 }
 
 fn parse_npy_f32(buffer: &[u8]) -> Result<Vec<f32>, String> {
-    let (dtype, little_endian, shape, data_offset) = parse_npy_header(buffer)?;
+    let (dtype, little_endian, fortran, shape, data_offset) = parse_npy_header(buffer)?;
     if shape.is_empty() {
         return Err("Numpy array has empty shape".to_string());
     }
     if shape.len() > 2 {
         return Err("Only 1D or 2D embeddings are supported".to_string());
     }
-    let elem_size = dtype.size();
+    let elem_size = dtype.size;
     let total_len = shape.iter().product::<usize>();
     let total_bytes = total_len
         .checked_mul(elem_size)
@@ -58,20 +57,28 @@ fn parse_npy_f32(buffer: &[u8]) -> Result<Vec<f32>, String> {
     let row_len = if shape.len() == 1 { shape[0] } else { shape[1] };
     let mut values = Vec::with_capacity(row_len);
     for idx in 0..row_len {
-        let start = idx * elem_size;
+        let elem_index = if shape.len() == 1 {
+            idx
+        } else if !fortran {
+            idx
+        } else {
+            idx
+                .checked_mul(shape[0])
+                .ok_or_else(|| "Embedding index overflow".to_string())?
+        };
+        let start = elem_index * elem_size;
         let slice = data
             .get(start..start + elem_size)
             .ok_or_else(|| "Numpy data truncated".to_string())?;
-        let value = match dtype {
-            NpyDtype::F32 => parse_f32(slice, little_endian),
-            NpyDtype::F64 => parse_f64(slice, little_endian) as f32,
-        };
+        let value = parse_scalar(slice, dtype, little_endian)?;
         values.push(value);
     }
     Ok(values)
 }
 
-fn parse_npy_header(buffer: &[u8]) -> Result<(NpyDtype, bool, Vec<usize>, usize), String> {
+fn parse_npy_header(
+    buffer: &[u8],
+) -> Result<(NpyDtype, bool, bool, Vec<usize>, usize), String> {
     if buffer.len() < 10 {
         return Err("Numpy buffer too small".to_string());
     }
@@ -109,16 +116,22 @@ fn parse_npy_header(buffer: &[u8]) -> Result<(NpyDtype, bool, Vec<usize>, usize)
         parse_str_value(header, "descr").ok_or_else(|| "Numpy header missing descr".to_string())?;
     let fortran = parse_bool_value(header, "fortran_order")
         .ok_or_else(|| "Numpy header missing fortran_order".to_string())?;
-    if fortran {
-        return Err("Fortran-order embeddings are not supported".to_string());
-    }
     let shape = parse_shape(header).ok_or_else(|| "Numpy header missing shape".to_string())?;
 
     let (dtype, little_endian) = parse_descr(&descr)?;
-    Ok((dtype, little_endian, shape, header_end))
+    Ok((dtype, little_endian, fortran, shape, header_end))
 }
 
 fn parse_descr(descr: &str) -> Result<(NpyDtype, bool), String> {
+    if descr == "?" {
+        return Ok((
+            NpyDtype {
+                kind: NpyKind::Bool,
+                size: 1,
+            },
+            true,
+        ));
+    }
     let bytes = descr.as_bytes();
     if bytes.len() < 2 {
         return Err("Invalid numpy descr".to_string());
@@ -129,17 +142,31 @@ fn parse_descr(descr: &str) -> Result<(NpyDtype, bool), String> {
     let little_endian = match *endian_char as char {
         '<' | '|' => true,
         '>' => false,
+        '=' => cfg!(target_endian = "little"),
         _ => {
             return Err(format!("Unsupported numpy endian in descr: {descr}"));
         }
     };
     let type_str = std::str::from_utf8(type_str).map_err(|_| "Invalid numpy descr".to_string())?;
-    let dtype = match type_str {
-        "f4" => NpyDtype::F32,
-        "f8" => NpyDtype::F64,
+    if type_str.is_empty() {
+        return Err("Invalid numpy descr".to_string());
+    }
+    let mut chars = type_str.chars();
+    let kind_char = chars
+        .next()
+        .ok_or_else(|| "Invalid numpy descr".to_string())?;
+    let size: usize = chars
+        .as_str()
+        .parse()
+        .map_err(|_| format!("Unsupported numpy dtype: {descr}"))?;
+    let kind = match kind_char {
+        'f' => NpyKind::Float,
+        'i' => NpyKind::Int,
+        'u' => NpyKind::UInt,
+        'b' => NpyKind::Bool,
         _ => return Err(format!("Unsupported numpy dtype: {descr}")),
     };
-    Ok((dtype, little_endian))
+    Ok((NpyDtype { kind, size }, little_endian))
 }
 
 fn parse_str_value(header: &str, key: &str) -> Option<String> {
@@ -202,24 +229,116 @@ fn parse_shape(header: &str) -> Option<Vec<usize>> {
     Some(shape)
 }
 
-fn parse_f32(slice: &[u8], little_endian: bool) -> f32 {
-    let bytes: [u8; 4] = slice.try_into().unwrap_or([0, 0, 0, 0]);
-    let raw = if little_endian {
-        bytes
-    } else {
-        [bytes[3], bytes[2], bytes[1], bytes[0]]
-    };
-    f32::from_ne_bytes(raw)
+fn parse_scalar(slice: &[u8], dtype: NpyDtype, little_endian: bool) -> Result<f32, String> {
+    match dtype.kind {
+        NpyKind::Float => match dtype.size {
+            2 => {
+                let bits = read_u16(slice, little_endian)?;
+                Ok(f16_to_f32(bits))
+            }
+            4 => {
+                let bits = read_u32(slice, little_endian)?;
+                Ok(f32::from_bits(bits))
+            }
+            8 => {
+                let bits = read_u64(slice, little_endian)?;
+                Ok(f64::from_bits(bits) as f32)
+            }
+            _ => Err(format!("Unsupported float size: {}", dtype.size)),
+        },
+        NpyKind::Int => match dtype.size {
+            1 => Ok(read_i8(slice)? as f32),
+            2 => Ok(read_i16(slice, little_endian)? as f32),
+            4 => Ok(read_i32(slice, little_endian)? as f32),
+            8 => Ok(read_i64(slice, little_endian)? as f32),
+            _ => Err(format!("Unsupported int size: {}", dtype.size)),
+        },
+        NpyKind::UInt => match dtype.size {
+            1 => Ok(read_u8(slice)? as f32),
+            2 => Ok(read_u16(slice, little_endian)? as f32),
+            4 => Ok(read_u32(slice, little_endian)? as f32),
+            8 => Ok(read_u64(slice, little_endian)? as f32),
+            _ => Err(format!("Unsupported uint size: {}", dtype.size)),
+        },
+        NpyKind::Bool => match dtype.size {
+            1 => Ok(if read_u8(slice)? == 0 { 0.0 } else { 1.0 }),
+            _ => Err(format!("Unsupported bool size: {}", dtype.size)),
+        },
+    }
 }
 
-fn parse_f64(slice: &[u8], little_endian: bool) -> f64 {
-    let bytes: [u8; 8] = slice.try_into().unwrap_or([0, 0, 0, 0, 0, 0, 0, 0]);
-    let raw = if little_endian {
-        bytes
+fn read_u8(slice: &[u8]) -> Result<u8, String> {
+    slice.get(0).copied().ok_or_else(|| "Numpy data truncated".to_string())
+}
+
+fn read_i8(slice: &[u8]) -> Result<i8, String> {
+    Ok(read_u8(slice)? as i8)
+}
+
+fn read_u16(slice: &[u8], little_endian: bool) -> Result<u16, String> {
+    let bytes: [u8; 2] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    Ok(if little_endian {
+        u16::from_le_bytes(bytes)
     } else {
-        [
-            bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0],
-        ]
+        u16::from_be_bytes(bytes)
+    })
+}
+
+fn read_i16(slice: &[u8], little_endian: bool) -> Result<i16, String> {
+    Ok(read_u16(slice, little_endian)? as i16)
+}
+
+fn read_u32(slice: &[u8], little_endian: bool) -> Result<u32, String> {
+    let bytes: [u8; 4] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    Ok(if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
+}
+
+fn read_i32(slice: &[u8], little_endian: bool) -> Result<i32, String> {
+    Ok(read_u32(slice, little_endian)? as i32)
+}
+
+fn read_u64(slice: &[u8], little_endian: bool) -> Result<u64, String> {
+    let bytes: [u8; 8] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    Ok(if little_endian {
+        u64::from_le_bytes(bytes)
+    } else {
+        u64::from_be_bytes(bytes)
+    })
+}
+
+fn read_i64(slice: &[u8], little_endian: bool) -> Result<i64, String> {
+    Ok(read_u64(slice, little_endian)? as i64)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
+
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut mant = mant;
+            let mut exp = -1i32;
+            while (mant & 0x0400) == 0 {
+                mant <<= 1;
+                exp -= 1;
+            }
+            mant &= 0x03ff;
+            let exp32 = (exp + 1 + 127 - 15) as u32;
+            (sign << 31) | (exp32 << 23) | (mant << 13)
+        }
+    } else if exp == 0x1f {
+        let mant32 = if mant == 0 { 0 } else { mant << 13 };
+        (sign << 31) | (0xff << 23) | mant32
+    } else {
+        let exp32 = exp + (127 - 15);
+        (sign << 31) | (exp32 << 23) | (mant << 13)
     };
-    f64::from_ne_bytes(raw)
+    f32::from_bits(f32_bits)
 }

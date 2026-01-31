@@ -58,7 +58,8 @@ Special handling:
   `/api/search/pql/build` response to apply extra column aliases and the
   `check_path` behavior. The Rust PQL compiler (SeaQuery) now mirrors the
   Python implementation, including embedding filters and async preprocessing
-  that can call the inference upstream and parse `.npy`/JSON embeddings. It
+  that can call the inference upstream and parse `.npy`/JSON embeddings
+  (including `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It
   tracks joined base tables to avoid duplicate joins when the root CTE is
   unwrapped.
 
