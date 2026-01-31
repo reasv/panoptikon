@@ -189,4 +189,4 @@ data/
 /target
 gateway/target
 
-/.cargo*
+/.cargo-target*

@@ -221,6 +221,11 @@ From the repo root:
 cargo run -p gateway
 ```
 
+Windows note: the workspace sets the executable stack size via
+`.cargo/config.toml` (MSVC: `/STACK:8388608`, GNU: `--stack,8388608`) to avoid
+startup stack overflows on the default Windows main-thread stack. Tokio worker
+threads are still configured with 8MB stacks in code.
+
 Then visit:
 
 - `http://localhost:8080` for the UI

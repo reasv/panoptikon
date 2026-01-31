@@ -18,6 +18,10 @@ Behavior (important)
 - Policy selection by effective host (`Host`, optionally forwarded headers).
 - Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/openapi.json`).
 - `.env` is loaded at startup (if present) so env-based config can be set via dotenv files.
+- On Windows, the gateway sets the executable stack size via linker flags
+  (`/STACK:8388608` for MSVC, `--stack,8388608` for GNU) to avoid startup stack
+  overflows on the default main thread stack; Tokio worker threads are also
+  configured with 8MB stacks.
 - `EXPERIMENTAL_RUST_DB_CREATION` is treated as truthy only for `1`, `true`, `yes`, or `on` (case-insensitive).
 - `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` runs migrations across all on-disk DBs in `DATA_FOLDER` and baselines Python-created DBs when truthy.
 - `EXPERIMENTAL_RUST_JOBS` gates local `/api/jobs/*` endpoints; when false, job routes are proxied to the Python backend.
