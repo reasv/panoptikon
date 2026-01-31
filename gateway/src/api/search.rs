@@ -10,15 +10,16 @@ use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
 };
 use crate::db::{DbConnection, ReadOnly};
+use crate::pql::{PqlError, build_query_preprocessed, preprocess_query_async};
+use crate::pql::model::PqlQuery;
 use crate::proxy::ProxyState;
 use axum::{
     Json,
-    body::Body,
     extract::State,
-    http::{Request, header},
 };
 use axum_extra::extract::Query;
-use http_body_util::BodyExt;
+use base64::{Engine as _, engine::general_purpose};
+use sea_query::{SqliteQueryBuilder, Value as SeaValue, Values};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Column;
@@ -35,21 +36,21 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 const DEFAULT_LIMIT: i64 = 10;
 const DEFAULT_USER: &str = "user";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub(crate) struct SearchMetrics {
     build: f64,
     compile: f64,
     execute: f64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize)]
 struct CompiledQuery {
     sql: String,
     params: Vec<Value>,
 }
 
-#[derive(Deserialize)]
-struct PqlBuilderResult {
+#[derive(Serialize)]
+pub(crate) struct PqlBuildResponse {
     compiled_query: Option<CompiledQuery>,
     compiled_count_query: Option<CompiledQuery>,
     result_metrics: SearchMetrics,
@@ -241,7 +242,7 @@ pub async fn search_pql(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let builder = compile_pql(&state, &payload).await?;
+    let builder = compile_pql(&state, payload).await?;
 
     let mut count_metrics = builder.count_metrics.clone();
     let mut result_metrics = builder.result_metrics.clone();
@@ -278,6 +279,17 @@ pub async fn search_pql(
         count_metrics,
         result_metrics,
     }))
+}
+
+pub async fn search_pql_build(
+    State(state): State<Arc<ProxyState>>,
+    body: Option<Json<Value>>,
+) -> ApiResult<Json<PqlBuildResponse>> {
+    let payload = body
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let builder = compile_pql(&state, payload).await?;
+    Ok(Json(builder))
 }
 
 async fn load_tags(
@@ -339,63 +351,148 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
     }
 }
 
-async fn compile_pql(state: &ProxyState, payload: &Value) -> ApiResult<PqlBuilderResult> {
-    let body = serde_json::to_vec(payload).map_err(|err| {
-        tracing::error!(error = %err, "failed to encode pql payload");
+async fn compile_pql(state: &ProxyState, payload: Value) -> ApiResult<PqlBuildResponse> {
+    let mut query: PqlQuery = serde_json::from_value(payload).map_err(|err| {
+        tracing::error!(error = %err, "failed to decode pql payload");
         ApiError::bad_request("Invalid PQL payload")
     })?;
-    let uri = state.api.uri_for("/api/search/pql/build").map_err(|err| {
-        tracing::error!(error = %err, "failed to build pql upstream uri");
-        ApiError::internal("Failed to compile search query")
-    })?;
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to build pql upstream request");
-            ApiError::internal("Failed to compile search query")
-        })?;
-    let response = state.client.request(request).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to call pql build upstream");
-        ApiError::internal("Failed to compile search query")
-    })?;
 
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to read pql build response");
-            ApiError::internal("Failed to compile search query")
-        })?
-        .to_bytes();
+    let mut count_metrics = SearchMetrics::default();
+    let mut result_metrics = SearchMetrics::default();
+    let check_path = query.check_path;
 
-    if !status.is_success() {
-        let detail = parse_upstream_error(bytes.as_ref());
-        return Err(ApiError::new(status, detail));
+    let mut used_preprocess = false;
+    let mut preprocess_time = 0.0;
+    if let Some(root) = query.query.take() {
+        used_preprocess = true;
+        let start = Instant::now();
+        let preprocessed = preprocess_query_async(root, &state.inference_client)
+            .await
+            .map_err(map_pql_error)?;
+        preprocess_time = elapsed_seconds(start);
+        query.query = preprocessed;
     }
 
-    let result: PqlBuilderResult = serde_json::from_slice(bytes.as_ref()).map_err(|err| {
-        tracing::error!(error = %err, "failed to parse pql build response");
-        ApiError::internal("Failed to compile search query")
-    })?;
-    Ok(result)
+    if !query.results && !query.count {
+        return Ok(PqlBuildResponse {
+            compiled_query: None,
+            compiled_count_query: None,
+            result_metrics,
+            count_metrics,
+            extra_columns: HashMap::new(),
+            check_path,
+        });
+    }
+
+    let mut compiled_count_query = None;
+    if query.count {
+        let start = Instant::now();
+        let built = build_query_preprocessed(query.clone(), true).map_err(map_pql_error)?;
+        count_metrics.build = elapsed_seconds(start);
+        if used_preprocess {
+            count_metrics.build += preprocess_time;
+        }
+        let start = Instant::now();
+        compiled_count_query = Some(compile_select(built)?);
+        count_metrics.compile = elapsed_seconds(start);
+
+        if !query.results {
+            return Ok(PqlBuildResponse {
+                compiled_query: None,
+                compiled_count_query,
+                result_metrics,
+                count_metrics,
+                extra_columns: HashMap::new(),
+                check_path,
+            });
+        }
+    }
+
+    let start = Instant::now();
+    let built = build_query_preprocessed(query, false).map_err(map_pql_error)?;
+    result_metrics.build = elapsed_seconds(start);
+    if used_preprocess {
+        result_metrics.build += preprocess_time;
+    }
+    let extra_columns = built.extra_columns.clone();
+    let start = Instant::now();
+    let compiled_query = compile_select(built)?;
+    result_metrics.compile = elapsed_seconds(start);
+
+    Ok(PqlBuildResponse {
+        compiled_query: Some(compiled_query),
+        compiled_count_query,
+        result_metrics,
+        count_metrics,
+        extra_columns,
+        check_path,
+    })
 }
 
-fn parse_upstream_error(bytes: &[u8]) -> String {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return String::from_utf8_lossy(bytes).to_string();
+fn compile_select(built: crate::pql::PqlBuilderResult) -> ApiResult<CompiledQuery> {
+    let (sql, values) = match built.with_clause {
+        Some(with_clause) => built.query.with(with_clause).build(SqliteQueryBuilder),
+        None => built.query.build(SqliteQueryBuilder),
     };
-    if let Some(detail) = value.get("detail") {
-        if let Some(text) = detail.as_str() {
-            return text.to_string();
-        }
-        return detail.to_string();
+    let params = encode_values(values)?;
+    Ok(CompiledQuery { sql, params })
+}
+
+fn encode_values(values: Values) -> ApiResult<Vec<Value>> {
+    let mut encoded = Vec::with_capacity(values.iter().count());
+    for value in values.into_iter() {
+        encoded.push(encode_value(value)?);
     }
-    value.to_string()
+    Ok(encoded)
+}
+
+fn encode_value(value: SeaValue) -> ApiResult<Value> {
+    match value {
+        SeaValue::Bool(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        SeaValue::TinyInt(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
+        SeaValue::SmallInt(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
+        SeaValue::Int(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
+        SeaValue::BigInt(value) => Ok(value.map(Value::from).unwrap_or(Value::Null)),
+        SeaValue::TinyUnsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
+        SeaValue::SmallUnsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
+        SeaValue::Unsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
+        SeaValue::BigUnsigned(value) => Ok(value.map(Value::from).unwrap_or(Value::Null)),
+        SeaValue::Float(value) => Ok(match value {
+            Some(v) => json_f64(v as f64)?,
+            None => Value::Null,
+        }),
+        SeaValue::Double(value) => Ok(match value {
+            Some(v) => json_f64(v)?,
+            None => Value::Null,
+        }),
+        SeaValue::String(value) => Ok(value.map(Value::String).unwrap_or(Value::Null)),
+        SeaValue::Char(value) => Ok(value
+            .map(|v| Value::String(v.to_string()))
+            .unwrap_or(Value::Null)),
+        SeaValue::Bytes(value) => match value {
+            Some(bytes) => {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "__bytes__".to_string(),
+                    Value::String(general_purpose::STANDARD.encode(bytes)),
+                );
+                Ok(Value::Object(map))
+            }
+            None => Ok(Value::Null),
+        },
+        SeaValue::Json(value) => Ok(value.map(|v| *v).unwrap_or(Value::Null)),
+        _ => Err(ApiError::bad_request("Unsupported PQL parameter type")),
+    }
+}
+
+fn json_f64(value: f64) -> ApiResult<Value> {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or_else(|| ApiError::bad_request("Invalid floating point parameter"))
+}
+
+fn map_pql_error(err: PqlError) -> ApiError {
+    ApiError::bad_request(err.message)
 }
 
 async fn apply_check_path(

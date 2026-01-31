@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use sea_query::{
-    Alias, Asterisk, BinOper, ColumnRef, CommonTableExpression, Cond, Expr, ExprTrait, Func,
-    IntoColumnRef, JoinType, NullOrdering, Order, OverStatement, Query, SelectStatement, UnionType,
-    WindowStatement, WithClause,
-};
 use crate::pql::model::{
     Column, EntityType, OrderArgs, OrderByField, OrderDirection, PqlQuery, QueryElement, Rrf,
     ScalarValue, SortableOptions,
 };
 use crate::pql::preprocess::{PqlError, preprocess_query};
+use sea_query::{
+    Alias, Asterisk, BinOper, ColumnRef, CommonTableExpression, Cond, Expr, ExprTrait, Func,
+    IntoColumnRef, JoinType, NullOrdering, Order, OverStatement, Query, SelectStatement, UnionType,
+    WindowStatement, WithClause,
+};
 
 pub(crate) mod filters;
 use self::filters::FilterCompiler;
@@ -150,6 +150,26 @@ pub(crate) fn build_query(
     mut input_query: PqlQuery,
     count_query: bool,
 ) -> Result<PqlBuilderResult, PqlError> {
+    let query_root = match input_query.query.take() {
+        Some(query_root) => preprocess_query(query_root)?,
+        None => None,
+    };
+    build_query_with_root(input_query, count_query, query_root)
+}
+
+pub(crate) fn build_query_preprocessed(
+    mut input_query: PqlQuery,
+    count_query: bool,
+) -> Result<PqlBuilderResult, PqlError> {
+    let query_root = input_query.query.take();
+    build_query_with_root(input_query, count_query, query_root)
+}
+
+fn build_query_with_root(
+    mut input_query: PqlQuery,
+    count_query: bool,
+    query_root: Option<QueryElement>,
+) -> Result<PqlBuilderResult, PqlError> {
     raise_if_invalid(&input_query)?;
 
     let mut state = QueryState {
@@ -172,10 +192,6 @@ pub(crate) fn build_query(
     let mut data_id_ref: Option<ColumnRef> = None;
     let mut joined_tables = JoinedTables::default();
 
-    let query_root = match input_query.query.take() {
-        Some(query_root) => preprocess_query(query_root)?,
-        None => None,
-    };
     let used_filters = query_root.is_some();
 
     if let Some(query_root) = query_root {

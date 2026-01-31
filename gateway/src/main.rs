@@ -60,10 +60,13 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .expect("inference upstream should be initialized");
     let inference_upstream = proxy::Upstream::parse("inference", &inference_config.base_url)?;
+    let inference_client =
+        inferio_client::InferenceApiClient::from_settings_with_metadata_cache(&settings, true)?;
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
         api_upstream,
         inference_upstream,
+        inference_client,
     ));
 
     if env_truthy("EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS") {
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/items/item/tags", get(api::items::item_tags))
             .route("/api/items/text/any", get(api::items::texts_any))
             .route("/api/search/pql", post(api::search::search_pql))
+            .route("/api/search/pql/build", post(api::search::search_pql_build))
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
             .route("/api/search/stats", get(api::search::get_stats));

@@ -41,6 +41,7 @@ pub(crate) enum PredictOutput {
 pub(crate) struct InferenceApiClient {
     base_url: String,
     client: ClientWithMiddleware,
+    cache_metadata: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,13 @@ const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl InferenceApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        Self::new_with_metadata_cache(base_url, true)
+    }
+
+    pub fn new_with_metadata_cache(
+        base_url: impl Into<String>,
+        cache_metadata: bool,
+    ) -> Result<Self> {
         let base_url = normalize_base_url(base_url.into());
         let base = reqwest::Client::builder()
             .build()
@@ -62,16 +70,27 @@ impl InferenceApiClient {
         let client = ClientBuilder::new(base)
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            client,
+            cache_metadata,
+        })
     }
 
     pub fn from_settings(settings: &Settings) -> Result<Self> {
+        Self::from_settings_with_metadata_cache(settings, true)
+    }
+
+    pub fn from_settings_with_metadata_cache(
+        settings: &Settings,
+        cache_metadata: bool,
+    ) -> Result<Self> {
         let inference = settings
             .upstreams
             .inference
             .as_ref()
             .context("inference upstream missing from settings")?;
-        Self::new(inference.base_url.clone())
+        Self::new_with_metadata_cache(inference.base_url.clone(), cache_metadata)
     }
 
     pub fn base_url(&self) -> &str {
@@ -183,6 +202,9 @@ impl InferenceApiClient {
     }
 
     pub async fn get_metadata(&self) -> Result<Value> {
+        if !self.cache_metadata {
+            return self.fetch_metadata().await;
+        }
         let cache = METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
         {
             let guard = cache.read().await;
@@ -193,14 +215,7 @@ impl InferenceApiClient {
             }
         }
 
-        let url = format!("{}/metadata", self.base_url);
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .context("inference metadata request failed")?;
-        let value = parse_json_response(response).await?;
+        let value = self.fetch_metadata().await?;
         let mut guard = cache.write().await;
         guard.insert(
             self.base_url.clone(),
@@ -210,6 +225,17 @@ impl InferenceApiClient {
             },
         );
         Ok(value)
+    }
+
+    async fn fetch_metadata(&self) -> Result<Value> {
+        let url = format!("{}/metadata", self.base_url);
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("inference metadata request failed")?;
+        parse_json_response(response).await
     }
 }
 

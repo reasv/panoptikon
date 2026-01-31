@@ -4,6 +4,6 @@ pub(crate) mod model;
 pub(crate) mod preprocess;
 pub(crate) mod utils;
 
-pub(crate) use builder::{PqlBuilderResult, build_query};
+pub(crate) use builder::{PqlBuilderResult, build_query, build_query_preprocessed};
 pub(crate) use model::{JobFilter, PqlQuery, QueryElement};
 pub(crate) use preprocess::{PqlError, preprocess_query, preprocess_query_async};

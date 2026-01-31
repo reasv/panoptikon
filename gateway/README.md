@@ -51,19 +51,19 @@ Special handling:
   `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`,
   `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`,
   `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`,
-  `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`,
+  `/api/items/text/any`, `/api/search/pql`, `/api/search/pql/build`,
+  `/api/search/tags`,
   `/api/search/tags/top`, and `/api/search/stats`
   locally using the same policy enforcement and filtering rules.
-  `/api/search/pql` still compiles queries via the upstream
-  `/api/search/pql/build` response to apply extra column aliases and the
-  `check_path` behavior. The Rust PQL compiler (SeaQuery) now mirrors the
-  Python implementation, including embedding filters and async preprocessing
-  that can call the inference upstream and parse `.npy`/JSON embeddings
-  (including `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It
-  caches inference metadata lookups for 5 minutes to reduce repeated metadata
-  calls while applying distance-function overrides. It
-  tracks joined base tables to avoid duplicate joins when the root CTE is
-  unwrapped.
+  `/api/search/pql` compiles queries via the Rust PQL builder and executes them
+  locally; `/api/search/pql/build` returns the compiled SQL/params without
+  executing. The Rust PQL compiler (SeaQuery) mirrors the Python
+  implementation, including embedding filters and async preprocessing that can
+  call the inference upstream and parse `.npy`/JSON embeddings (including
+  `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It caches
+  inference metadata lookups for 5 minutes to reduce repeated metadata calls
+  while applying distance-function overrides. It tracks joined base tables to
+  avoid duplicate joins when the root CTE is unwrapped.
 
 ## Database migrations
 

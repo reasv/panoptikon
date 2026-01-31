@@ -10,7 +10,7 @@ Architecture (current)
 - Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
@@ -55,9 +55,9 @@ Behavior (important)
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.
   - Existing Python-created DBs without `_sqlx_migrations` are baselined to the first migration so future migrations can apply.
 - Local PQL search:
-  - `/api/search/pql` compiles PQL queries via the upstream `/api/search/pql/build` endpoint.
-  - The compiled SQL and parameters are executed against the local database.
-  - Extra columns use the upstream alias map, and `check_path` results are validated with fallback file lookup.
+  - `/api/search/pql` compiles queries via the Rust PQL builder and executes them locally.
+  - `/api/search/pql/build` returns the compiled SQL/params without executing.
+  - Extra columns use the Rust alias map, and `check_path` results are validated with fallback file lookup.
 - Streaming:
   - All responses are streamed except `/api/db`, which is buffered so it can be filtered.
 
@@ -109,15 +109,16 @@ PQL Rewrite (Rust, Planned)
   - `SimilarTo` is implemented with an `unqemb` CTE, cross-modal constraints, and weighted distance aggregation when source-text weights are provided.
   - `preprocess_query_async` embeds queries via the inference upstream and loads model metadata for distance-function overrides; the sync preprocessor accepts base64 embeddings or prefilled `_embedding` fields.
   - Inference metadata is cached per inference base URL (5-minute TTL) to avoid repeated `/metadata` calls during preprocessing.
+    - Callers that need fresh metadata can construct the client with caching disabled (`InferenceApiClient::from_settings_with_metadata_cache(..., false)`).
   - Embedding decoding accepts `f16/f32/f64`, integer/boolean dtypes, and both C/Fortran order; non-float inputs are coerced to `f32` and 2-D arrays use the first row.
-  - Wiring into `/api/search/pql` is still pending; the route continues to compile via upstream `/api/search/pql/build` until the Rust builder is turned on.
-- Test strategy (results + performance invariants):
-  - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development.
-  - Validate result equivalence and ordering on a fixed SQLite fixture DB.
-  - Per-filter unit tests build a full PQL query and execute it against in-memory test databases to ensure the generated SQL is valid for our schema.
-  - Validate SQL structure without relying on byte-for-byte SQL equality:
-    - Normalize SQL (whitespace/casing) and compare key structural properties (CTE ordering, join graph, selected columns).
-    - Track query plans as a diagnostic signal; do not rely on plan output alone, but use it to spot regressions in join/index usage.
+  - `/api/search/pql` and `/api/search/pql/build` now use the Rust compiler; no Python PQL calls remain in the gateway.
+  - Test strategy (results + performance invariants):
+    - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development when needed.
+    - Validate result equivalence and ordering on a fixed SQLite fixture DB.
+    - Per-filter unit tests build a full PQL query and execute it against in-memory test databases to ensure the generated SQL is valid for our schema.
+    - Validate SQL structure without relying on byte-for-byte SQL equality:
+      - Normalize SQL (whitespace/casing) and compare key structural properties (CTE ordering, join graph, selected columns).
+      - Track query plans as a diagnostic signal; do not rely on plan output alone, but use it to spot regressions in join/index usage.
   - Maintain a golden fixture suite covering all implemented filters, text vs file entities, partitioning, and ordering edge cases.
 
 Continuous File Scanning (Implemented)
