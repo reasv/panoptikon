@@ -108,6 +108,7 @@ PQL Rewrite (Rust, Planned)
   - `SemanticImageSearch` is implemented with CLIP cross-modal support, source-text filters, and model distance-function overrides.
   - `SimilarTo` is implemented with an `unqemb` CTE, cross-modal constraints, and weighted distance aggregation when source-text weights are provided.
   - `preprocess_query_async` embeds queries via the inference upstream and loads model metadata for distance-function overrides; the sync preprocessor accepts base64 embeddings or prefilled `_embedding` fields.
+  - Inference metadata is cached per inference base URL (5-minute TTL) to avoid repeated `/metadata` calls during preprocessing.
   - Embedding decoding accepts `f16/f32/f64`, integer/boolean dtypes, and both C/Fortran order; non-float inputs are coerced to `f32` and 2-D arrays use the first row.
   - Wiring into `/api/search/pql` is still pending; the route continues to compile via upstream `/api/search/pql/build` until the Rust builder is turned on.
 - Test strategy (results + performance invariants):

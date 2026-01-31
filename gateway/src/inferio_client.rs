@@ -5,7 +5,11 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use crate::config::Settings;
 
@@ -38,6 +42,15 @@ pub(crate) struct InferenceApiClient {
     base_url: String,
     client: ClientWithMiddleware,
 }
+
+#[derive(Debug, Clone)]
+struct CachedMetadata {
+    value: Value,
+    fetched_at: Instant,
+}
+
+static METADATA_CACHE: OnceLock<RwLock<HashMap<String, CachedMetadata>>> = OnceLock::new();
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl InferenceApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
@@ -170,6 +183,16 @@ impl InferenceApiClient {
     }
 
     pub async fn get_metadata(&self) -> Result<Value> {
+        let cache = METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        {
+            let guard = cache.read().await;
+            if let Some(entry) = guard.get(&self.base_url) {
+                if entry.fetched_at.elapsed() < METADATA_CACHE_TTL {
+                    return Ok(entry.value.clone());
+                }
+            }
+        }
+
         let url = format!("{}/metadata", self.base_url);
         let response = self
             .client
@@ -177,7 +200,16 @@ impl InferenceApiClient {
             .send()
             .await
             .context("inference metadata request failed")?;
-        parse_json_response(response).await
+        let value = parse_json_response(response).await?;
+        let mut guard = cache.write().await;
+        guard.insert(
+            self.base_url.clone(),
+            CachedMetadata {
+                value: value.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        Ok(value)
     }
 }
 

@@ -60,6 +60,8 @@ Special handling:
   Python implementation, including embedding filters and async preprocessing
   that can call the inference upstream and parse `.npy`/JSON embeddings
   (including `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It
+  caches inference metadata lookups for 5 minutes to reduce repeated metadata
+  calls while applying distance-function overrides. It
   tracks joined base tables to avoid duplicate joins when the root CTE is
   unwrapped.
 
