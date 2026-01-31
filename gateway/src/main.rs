@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod inferio_client;
 mod jobs;
+mod openapi;
 mod policy;
 mod proxy;
 mod pql;

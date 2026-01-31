@@ -10,16 +10,13 @@ use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
 };
 use crate::db::{DbConnection, ReadOnly};
+use crate::pql::model::{EntityType, PqlQuery};
 use crate::pql::{
     EmbeddingCacheStats, PqlError, build_query_preprocessed, clear_embedding_cache,
     embedding_cache_stats, preprocess_query_async,
 };
-use crate::pql::model::{EntityType, PqlQuery};
 use crate::proxy::ProxyState;
-use axum::{
-    Json,
-    extract::State,
-};
+use axum::{Json, extract::State};
 use axum_extra::extract::Query;
 use base64::{Engine as _, engine::general_purpose};
 use sea_query::{SqliteQueryBuilder, Value as SeaValue, Values};
@@ -33,38 +30,54 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use utoipa::ToSchema;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const DEFAULT_LIMIT: i64 = 10;
 const DEFAULT_USER: &str = "user";
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, ToSchema)]
 pub(crate) struct SearchMetrics {
+    /// Build time
+    ///
+    /// Time taken to process the query into an SQLAlchemy Core statement
     build: f64,
+    /// Compile time
+    ///
+    /// Time taken to compile the SQLAlchemy Core statement into an SQL string
     compile: f64,
+    /// Execution time
+    ///
+    /// Time taken to execute the SQL query
     execute: f64,
 }
 
-#[derive(Serialize)]
-struct CompiledQuery {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CompiledQuery {
     sql: String,
     params: Vec<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct PqlBuildResponse {
     compiled_query: Option<CompiledQuery>,
     compiled_count_query: Option<CompiledQuery>,
     result_metrics: SearchMetrics,
     count_metrics: SearchMetrics,
     #[serde(default)]
+    /// Extra Column Aliases
+    ///
+    /// Mapping of SQL column labels to their user-facing aliases.
     extra_columns: HashMap<String, String>,
     #[serde(default)]
+    /// Check Paths Exist
+    ///
+    /// Whether to validate paths after executing search queries.
     check_path: bool,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, ToSchema)]
 pub(crate) struct SearchResult {
     file_id: i64,
     item_id: i64,
@@ -122,10 +135,13 @@ pub(crate) struct SearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Extra Fields
+    ///
+    /// Extra fields retrieved from filters that are not part of the main result object.
     extra: Option<HashMap<String, Value>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct FileSearchResponse {
     count: i64,
     results: Vec<SearchResult>,
@@ -133,19 +149,19 @@ pub(crate) struct FileSearchResponse {
     result_metrics: SearchMetrics,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct TagSearchQuery {
     name: String,
     #[serde(default = "default_limit")]
     limit: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TagSearchResults {
     tags: Vec<(String, String, i64)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct TopTagsQuery {
     namespace: Option<String>,
     #[serde(default)]
@@ -155,12 +171,12 @@ pub(crate) struct TopTagsQuery {
     limit: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TagFrequency {
     tags: Vec<(String, String, i64, f64)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct SearchStatsQuery {
     #[serde(default = "default_user")]
     user: String,
@@ -168,27 +184,27 @@ pub(crate) struct SearchStatsQuery {
     include_wildcard: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ExtractedTextStats {
     languages: Vec<String>,
     lowest_language_confidence: Option<f64>,
     lowest_confidence: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TagStats {
     namespaces: Vec<String>,
     min_confidence: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct FileStats {
     total: i64,
     unique: i64,
     mime_types: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct SearchStats {
     setters: Vec<(String, String)>,
     bookmarks: Vec<String>,
@@ -198,6 +214,26 @@ pub(crate) struct SearchStats {
     text_stats: ExtractedTextStats,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/search/tags",
+    tag = "search",
+    params(
+        ("name" = String, Query, description = "The (partial) tag name to search for"),
+        ("limit" = i64, Query, description = "Maximum number of tags to return", example = 10)
+    ),
+    responses(
+        (status = 200, description = "Tag autocomplete results", body = TagSearchResults)
+    )
+)]
+/// Search tag names for autocompletion
+///
+/// Given a string, finds tags whose names contain the string.
+/// Meant to be used for autocompletion in the search bar.
+/// The `limit` parameter can be used to control the number of tags to return.
+/// Returns a list of tuples, where each tuple contains the namespace, name,
+/// and the number of unique items tagged with the tag.
+/// The tags are returned in descending order of the number of items tagged.
 pub async fn get_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TagSearchQuery>,
@@ -206,6 +242,31 @@ pub async fn get_tags(
     Ok(Json(TagSearchResults { tags }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/search/tags/top",
+    tag = "search",
+    params(
+        ("namespace" = Option<String>, Query, description = "The tag namespace to search in"),
+        ("setters" = Vec<String>, Query, description = "The tag setter names to restrict the search to. Default is all"),
+        ("confidence_threshold" = Option<f64>, Query, description = "The minimum confidence threshold for tags", minimum = 0.0, maximum = 1.0),
+        ("limit" = i64, Query, description = "Maximum number of tags to return", example = 10)
+    ),
+    responses(
+        (status = 200, description = "Most common tags", body = TagFrequency)
+    )
+)]
+/// Get the most common tags in the database
+///
+/// Get the most common tags in the database, based on the provided query parameters.
+/// The result is a list of tuples, where each tuple contains the namespace, tag name,
+/// occurrences count, and relative frequency % (occurrences / total item_setter pairs).
+/// The latter value is expressed as a float between 0 and 1.
+/// The tags are returned in descending order of frequency.
+/// The `limit` parameter can be used to control the number of tags to return.
+/// The `namespace` parameter can be used to restrict the search to a specific tag namespace.
+/// The `setters` parameter can be used to restrict the search to specific setters.
+/// The `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.
 pub async fn get_top_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TopTagsQuery>,
@@ -229,6 +290,24 @@ pub async fn get_top_tags(
     Ok(Json(TagFrequency { tags }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/search/stats",
+    tag = "search",
+    params(
+        ("user" = String, Query, description = "The bookmarks user to get the bookmark namespaces for", example = "user"),
+        ("include_wildcard" = bool, Query, description = "Include namespaces from bookmarks with the * user value", example = true)
+    ),
+    responses(
+        (status = 200, description = "Search statistics", body = SearchStats)
+    )
+)]
+/// Get statistics on the searchable data
+///
+/// Get statistics on the data indexed in the database.
+/// This includes information about the tag namespaces, bookmark namespaces, file types, and folders present.
+/// Most importantly, it includes the list of currently existing setters for each data type.
+/// This information is relevant for building search queries.
 pub async fn get_stats(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<SearchStatsQuery>,
@@ -237,6 +316,22 @@ pub async fn get_stats(
     Ok(Json(stats))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/search/pql",
+    tag = "search",
+    request_body(
+        content = PqlQuery,
+        description = "The PQL Search query to execute"
+    ),
+    responses(
+        (status = 200, description = "Search results", body = FileSearchResponse)
+    )
+)]
+/// Search for files and items in the database
+///
+/// Search for files in the database based on the provided query parameters.
+/// This endpoint is meant to be used with the Panoptikon Query Language.
 pub async fn search_pql(
     State(state): State<Arc<ProxyState>>,
     mut db: DbConnection<ReadOnly>,
@@ -289,6 +384,21 @@ pub async fn search_pql(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/search/pql/build",
+    tag = "search",
+    request_body(
+        content = PqlQuery,
+        description = "The PQL Search query to execute"
+    ),
+    responses(
+        (status = 200, description = "Compiled PQL queries", body = PqlBuildResponse)
+    )
+)]
+/// Build PQL search queries without executing them
+///
+/// Build the SQL queries for the provided PQL search query without executing them.
 pub async fn search_pql_build(
     State(state): State<Arc<ProxyState>>,
     body: Option<Json<Value>>,
@@ -361,7 +471,6 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
 }
 
 async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBuildResponse> {
-
     let mut count_metrics = SearchMetrics::default();
     let mut result_metrics = SearchMetrics::default();
     let check_path = query.check_path;
@@ -376,8 +485,8 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
             &state.inference_client,
             state.search_embedding_cache_size,
         )
-            .await
-            .map_err(map_pql_error)?;
+        .await
+        .map_err(map_pql_error)?;
         preprocess_time = elapsed_seconds(start);
         query.query = preprocessed;
     }
@@ -438,7 +547,7 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct CacheQuery {
     #[serde(default = "default_cache_page")]
     page: usize,
@@ -446,6 +555,21 @@ pub(crate) struct CacheQuery {
     page_size: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/search/embeddings/cache",
+    tag = "search",
+    params(
+        ("page" = usize, Query, description = "Page number", example = 1),
+        ("page_size" = usize, Query, description = "Page size", example = 128)
+    ),
+    responses(
+        (status = 200, description = "Embedding cache stats", body = EmbeddingCacheStats)
+    )
+)]
+/// Get embedding cache stats
+///
+/// Returns cache usage and paginated entries for the search embedding cache.
 pub async fn get_search_cache(
     State(state): State<Arc<ProxyState>>,
     Query(query): Query<CacheQuery>,
@@ -456,6 +580,21 @@ pub async fn get_search_cache(
     Ok(Json(stats))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/search/embeddings/cache",
+    tag = "search",
+    params(
+        ("page" = usize, Query, description = "Page number", example = 1),
+        ("page_size" = usize, Query, description = "Page size", example = 128)
+    ),
+    responses(
+        (status = 200, description = "Embedding cache stats after clearing", body = EmbeddingCacheStats)
+    )
+)]
+/// Clear embedding cache
+///
+/// Clears the search embedding cache and returns updated cache stats.
 pub async fn clear_search_cache(
     State(state): State<Arc<ProxyState>>,
     Query(query): Query<CacheQuery>,
@@ -502,12 +641,20 @@ fn encode_value(value: SeaValue) -> ApiResult<Value> {
     match value {
         SeaValue::Bool(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
         SeaValue::TinyInt(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
-        SeaValue::SmallInt(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
+        SeaValue::SmallInt(value) => {
+            Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null))
+        }
         SeaValue::Int(value) => Ok(value.map(|v| Value::from(v as i64)).unwrap_or(Value::Null)),
         SeaValue::BigInt(value) => Ok(value.map(Value::from).unwrap_or(Value::Null)),
-        SeaValue::TinyUnsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
-        SeaValue::SmallUnsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
-        SeaValue::Unsigned(value) => Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null)),
+        SeaValue::TinyUnsigned(value) => {
+            Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null))
+        }
+        SeaValue::SmallUnsigned(value) => {
+            Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null))
+        }
+        SeaValue::Unsigned(value) => {
+            Ok(value.map(|v| Value::from(v as u64)).unwrap_or(Value::Null))
+        }
         SeaValue::BigUnsigned(value) => Ok(value.map(Value::from).unwrap_or(Value::Null)),
         SeaValue::Float(value) => Ok(match value {
             Some(v) => json_f64(v as f64)?,
@@ -968,9 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn load_stats_aggregates_results() {
         let mut dbs = setup_stats_db().await;
-        let stats = load_stats(&mut dbs.index_conn, "user", true)
-            .await
-            .unwrap();
+        let stats = load_stats(&mut dbs.index_conn, "user", true).await.unwrap();
 
         assert_eq!(
             stats.bookmarks,

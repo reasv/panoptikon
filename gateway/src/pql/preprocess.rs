@@ -14,6 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
+use utoipa::ToSchema;
 
 #[derive(Debug)]
 pub(crate) struct PqlError {
@@ -105,14 +106,14 @@ where
     Ok(value)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EmbeddingCacheEntry {
     pub inference_id: String,
     pub kind: String,
     pub size: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EmbeddingCacheStats {
     pub used_slots: usize,
     pub total_slots: usize,

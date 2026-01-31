@@ -154,7 +154,10 @@ impl Settings {
             .set_default("server.trust_forwarded_headers", false)?
             .set_default("upstreams.ui.base_url", "http://127.0.0.1:6339")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
-            .set_default("search.embedding_cache_size", default_embedding_cache_size())?
+            .set_default(
+                "search.embedding_cache_size",
+                default_embedding_cache_size() as i64,
+            )?
             .add_source(config::File::from(config_path).required(false))
             .add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
 
