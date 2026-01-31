@@ -41,8 +41,20 @@ struct Args {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Build a custom tokio runtime with a larger worker thread stack size.
+    // The default 2MB stack can be insufficient for deeply nested async code,
+    // especially in debug builds where stack frames are larger due to unoptimized
+    // code and extra debug info.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8MB stack for worker threads
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
