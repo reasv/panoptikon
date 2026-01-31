@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         api_upstream,
         inference_upstream,
         inference_client,
+        settings.search.embedding_cache_size,
     ));
 
     if env_truthy("EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS") {
@@ -119,6 +120,10 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/items/text/any", get(api::items::texts_any))
             .route("/api/search/pql", post(api::search::search_pql))
             .route("/api/search/pql/build", post(api::search::search_pql_build))
+            .route(
+                "/api/search/embeddings/cache",
+                get(api::search::get_search_cache).delete(api::search::clear_search_cache),
+            )
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
             .route("/api/search/stats", get(api::search::get_stats));

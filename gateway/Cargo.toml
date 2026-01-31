@@ -52,6 +52,7 @@ base64 = "0.22"
 dotenvy = "0.15"
 ractor = "0.15"
 blurhash = "0.2.3"
+hashlink = "0.10"
 sea-query = { version = "=1.0.0-rc.30", features = ["sqlx-utils"] }
 sea-query-sqlx = { version = "=0.8.0-rc.14", features = [
     "sqlx-sqlite",

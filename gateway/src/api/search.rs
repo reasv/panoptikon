@@ -10,7 +10,10 @@ use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
 };
 use crate::db::{DbConnection, ReadOnly};
-use crate::pql::{PqlError, build_query_preprocessed, preprocess_query_async};
+use crate::pql::{
+    EmbeddingCacheStats, PqlError, build_query_preprocessed, clear_embedding_cache,
+    embedding_cache_stats, preprocess_query_async,
+};
 use crate::pql::model::{EntityType, PqlQuery};
 use crate::proxy::ProxyState;
 use axum::{
@@ -368,7 +371,11 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
     if let Some(root) = query.query.take() {
         used_preprocess = true;
         let start = Instant::now();
-        let preprocessed = preprocess_query_async(root, &state.inference_client)
+        let preprocessed = preprocess_query_async(
+            root,
+            &state.inference_client,
+            state.search_embedding_cache_size,
+        )
             .await
             .map_err(map_pql_error)?;
         preprocess_time = elapsed_seconds(start);
@@ -429,6 +436,35 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
         extra_columns,
         check_path,
     })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CacheQuery {
+    #[serde(default = "default_cache_page")]
+    page: usize,
+    #[serde(default = "default_cache_page_size")]
+    page_size: usize,
+}
+
+pub async fn get_search_cache(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<CacheQuery>,
+) -> ApiResult<Json<EmbeddingCacheStats>> {
+    let page = query.page.max(1);
+    let page_size = query.page_size.max(1);
+    let stats = embedding_cache_stats(state.search_embedding_cache_size, page, page_size).await;
+    Ok(Json(stats))
+}
+
+pub async fn clear_search_cache(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<CacheQuery>,
+) -> ApiResult<Json<EmbeddingCacheStats>> {
+    clear_embedding_cache(state.search_embedding_cache_size).await;
+    let page = query.page.max(1);
+    let page_size = query.page_size.max(1);
+    let stats = embedding_cache_stats(state.search_embedding_cache_size, page, page_size).await;
+    Ok(Json(stats))
 }
 
 fn decode_pql_payload(payload: &Value) -> ApiResult<PqlQuery> {
@@ -693,6 +729,14 @@ fn elapsed_seconds(start: Instant) -> f64 {
 
 fn default_limit() -> i64 {
     DEFAULT_LIMIT
+}
+
+fn default_cache_page() -> usize {
+    1
+}
+
+fn default_cache_page_size() -> usize {
+    128
 }
 
 fn default_user() -> String {

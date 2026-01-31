@@ -52,6 +52,7 @@ Special handling:
   `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`,
   `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`,
   `/api/items/text/any`, `/api/search/pql`, `/api/search/pql/build`,
+  `/api/search/embeddings/cache`,
   `/api/search/tags`,
   `/api/search/tags/top`, and `/api/search/stats`
   locally using the same policy enforcement and filtering rules.
@@ -62,7 +63,9 @@ Special handling:
   call the inference upstream and parse `.npy`/JSON embeddings (including
   `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It caches
   inference metadata lookups for 5 minutes to reduce repeated metadata calls
-  while applying distance-function overrides. It tracks joined base tables to
+  while applying distance-function overrides. Search-time embeddings are cached
+  in-process with a global LRU keyed by `(model, kind, query)`
+  using `search.embedding_cache_size` from the gateway config. It tracks joined base tables to
   avoid duplicate joins when the root CTE is unwrapped. When `check_path` is
   enabled for `entity = file` with no `partition_by`, missing paths are dropped
   instead of substituting a different file (matching Python behavior).
@@ -153,6 +156,9 @@ local = false
 base_url = "http://127.0.0.1:6342"
 local = false
 
+[search]
+embedding_cache_size = 16
+
 [rulesets.allow_all]
 allow_all = true
 
@@ -184,6 +190,7 @@ GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
 GATEWAY__UPSTREAM_API_LOCAL=false
 GATEWAY__UPSTREAM_INFERENCE=http://127.0.0.1:6342
 GATEWAY__UPSTREAM_INFERENCE_LOCAL=false
+GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
 ```
 
 CLI override example:
@@ -203,6 +210,7 @@ GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
 GATEWAY__UPSTREAMS__API__LOCAL=false
 GATEWAY__UPSTREAMS__INFERENCE__BASE_URL=http://127.0.0.1:6342
 GATEWAY__UPSTREAMS__INFERENCE__LOCAL=false
+GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
 ```
 
 ## Running locally

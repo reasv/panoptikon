@@ -13,6 +13,8 @@ pub struct Settings {
     pub server: ServerConfig,
     pub upstreams: UpstreamsConfig,
     #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
@@ -39,6 +41,24 @@ pub struct UpstreamConfig {
     pub base_url: String,
     #[serde(default)]
     pub local: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_embedding_cache_size")]
+    pub embedding_cache_size: usize,
+}
+
+fn default_embedding_cache_size() -> usize {
+    16
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            embedding_cache_size: default_embedding_cache_size(),
+        }
+    }
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleSetConfig {
@@ -134,6 +154,7 @@ impl Settings {
             .set_default("server.trust_forwarded_headers", false)?
             .set_default("upstreams.ui.base_url", "http://127.0.0.1:6339")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
+            .set_default("search.embedding_cache_size", default_embedding_cache_size())?
             .add_source(config::File::from(config_path).required(false))
             .add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
 

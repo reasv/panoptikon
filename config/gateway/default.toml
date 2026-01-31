@@ -24,6 +24,10 @@ local = true
 # base_url = "http://127.0.0.1:6342"
 # local = false
 
+[search]
+# Size of the in-process embedding cache used by search preprocessing.
+embedding_cache_size = 16
+
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
 # If a policy references a ruleset, anything not matched is denied.

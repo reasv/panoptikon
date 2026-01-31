@@ -46,6 +46,7 @@ pub struct ProxyState {
     pub api: Upstream,
     pub inference: Upstream,
     pub inference_client: InferenceApiClient,
+    pub search_embedding_cache_size: usize,
 }
 
 impl ProxyState {
@@ -54,6 +55,7 @@ impl ProxyState {
         api: Upstream,
         inference: Upstream,
         inference_client: InferenceApiClient,
+        search_embedding_cache_size: usize,
     ) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self {
@@ -62,6 +64,7 @@ impl ProxyState {
             api,
             inference,
             inference_client,
+            search_embedding_cache_size,
         }
     }
 }

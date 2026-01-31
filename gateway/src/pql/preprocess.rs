@@ -7,9 +7,13 @@ use crate::pql::model::{
 };
 use crate::pql::utils::parse_and_escape_query;
 use base64::{Engine as _, engine::general_purpose};
+use hashlink::LruCache;
+use serde::Serialize;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub(crate) struct PqlError {
@@ -31,6 +35,153 @@ impl std::fmt::Display for PqlError {
 }
 
 impl std::error::Error for PqlError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EmbeddingKind {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmbeddingCacheKey {
+    model: String,
+    kind: EmbeddingKind,
+    query: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedEmbedding {
+    value: Vec<u8>,
+}
+
+static EMBEDDING_CACHE: OnceLock<Mutex<LruCache<EmbeddingCacheKey, CachedEmbedding>>> =
+    OnceLock::new();
+
+fn embedding_cache() -> &'static Mutex<LruCache<EmbeddingCacheKey, CachedEmbedding>> {
+    EMBEDDING_CACHE.get_or_init(|| Mutex::new(LruCache::new(1)))
+}
+
+fn ensure_cache_capacity(cache: &mut LruCache<EmbeddingCacheKey, CachedEmbedding>, capacity: usize) {
+    let target = capacity.max(1);
+    if cache.capacity() != target {
+        cache.set_capacity(target);
+    }
+}
+
+async fn get_cached_embedding(key: &EmbeddingCacheKey, capacity: usize) -> Option<Vec<u8>> {
+    let cache = embedding_cache();
+    let mut guard = cache.lock().await;
+    ensure_cache_capacity(&mut guard, capacity);
+    if let Some(entry) = guard.get(key) {
+        return Some(entry.value.clone());
+    }
+    guard.remove(key);
+    None
+}
+
+async fn put_cached_embedding(key: EmbeddingCacheKey, capacity: usize, value: Vec<u8>) {
+    let cache = embedding_cache();
+    let mut guard = cache.lock().await;
+    ensure_cache_capacity(&mut guard, capacity);
+    guard.insert(key, CachedEmbedding { value });
+}
+
+async fn cached_embedding_or_fetch<F>(
+    key: EmbeddingCacheKey,
+    cache_size: usize,
+    fetch: F,
+) -> Result<Vec<u8>, PqlError>
+where
+    F: Future<Output = Result<Vec<u8>, PqlError>>,
+{
+    if cache_size == 0 {
+        return fetch.await;
+    }
+    if let Some(value) = get_cached_embedding(&key, cache_size).await {
+        return Ok(value);
+    }
+    let value = fetch.await?;
+    put_cached_embedding(key, cache_size, value.clone()).await;
+    Ok(value)
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct EmbeddingCacheEntry {
+    pub inference_id: String,
+    pub kind: String,
+    pub size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct EmbeddingCacheStats {
+    pub used_slots: usize,
+    pub total_slots: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub entries: Vec<EmbeddingCacheEntry>,
+}
+
+pub(crate) async fn clear_embedding_cache(cache_size: usize) {
+    if cache_size == 0 {
+        return;
+    }
+    let cache = embedding_cache();
+    let mut guard = cache.lock().await;
+    ensure_cache_capacity(&mut guard, cache_size);
+    guard.clear();
+}
+
+pub(crate) async fn embedding_cache_stats(
+    cache_size: usize,
+    page: usize,
+    page_size: usize,
+) -> EmbeddingCacheStats {
+    if cache_size == 0 {
+        return EmbeddingCacheStats {
+            used_slots: 0,
+            total_slots: 0,
+            page,
+            page_size,
+            entries: Vec::new(),
+        };
+    }
+
+    let cache = embedding_cache();
+    let mut guard = cache.lock().await;
+    ensure_cache_capacity(&mut guard, cache_size);
+    let used_slots = guard.len();
+    let total_slots = guard.capacity();
+
+    let mut entries: Vec<EmbeddingCacheEntry> = guard
+        .iter()
+        .map(|(key, value)| EmbeddingCacheEntry {
+            inference_id: key.model.clone(),
+            kind: match key.kind {
+                EmbeddingKind::Text => "text".to_string(),
+                EmbeddingKind::Image => "image".to_string(),
+            },
+            size: value.value.len(),
+        })
+        .collect();
+    entries.reverse();
+
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+    let start = (page - 1).saturating_mul(page_size);
+    let entries = entries
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect();
+
+    EmbeddingCacheStats {
+        used_slots,
+        total_slots,
+        page,
+        page_size,
+        entries,
+    }
+}
 
 pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>, PqlError> {
     match el {
@@ -98,10 +249,12 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
 pub(crate) async fn preprocess_query_async(
     el: QueryElement,
     inference: &InferenceApiClient,
+    embedding_cache_size: usize,
 ) -> Result<Option<QueryElement>, PqlError> {
     let mut state = AsyncPreprocessState {
         inference,
         metadata: None,
+        embedding_cache_size,
     };
     preprocess_query_async_inner(el, &mut state).await
 }
@@ -109,6 +262,7 @@ pub(crate) async fn preprocess_query_async(
 struct AsyncPreprocessState<'a> {
     inference: &'a InferenceApiClient,
     metadata: Option<Value>,
+    embedding_cache_size: usize,
 }
 
 impl<'a> AsyncPreprocessState<'a> {
@@ -432,22 +586,30 @@ async fn embed_text_query(
     model: &str,
     embed: &EmbedArgs,
 ) -> Result<Vec<u8>, PqlError> {
-    let inputs = [InferenceInput::new(
-        serde_json::json!({"text": query, "task": "s2s"}),
-        None,
-    )];
-    let output = state
-        .inference
-        .predict(
-            model,
-            &embed.cache_key,
-            embed.lru_size,
-            embed.ttl_seconds,
-            &inputs,
-        )
-        .await
-        .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
-    embedding_from_predict(output)
+    let key = EmbeddingCacheKey {
+        model: model.to_string(),
+        kind: EmbeddingKind::Text,
+        query: query.to_string(),
+    };
+    cached_embedding_or_fetch(key, state.embedding_cache_size, async {
+        let inputs = [InferenceInput::new(
+            serde_json::json!({"text": query, "task": "s2s"}),
+            None,
+        )];
+        let output = state
+            .inference
+            .predict(
+                model,
+                &embed.cache_key,
+                embed.lru_size,
+                embed.ttl_seconds,
+                &inputs,
+            )
+            .await
+            .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+        embedding_from_predict(output)
+    })
+    .await
 }
 
 async fn embed_image_query(
@@ -456,22 +618,30 @@ async fn embed_image_query(
     model: &str,
     embed: &EmbedArgs,
 ) -> Result<Vec<u8>, PqlError> {
-    let inputs = [InferenceInput::new(
-        serde_json::json!({"text": query}),
-        None,
-    )];
-    let output = state
-        .inference
-        .predict(
-            model,
-            &embed.cache_key,
-            embed.lru_size,
-            embed.ttl_seconds,
-            &inputs,
-        )
-        .await
-        .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
-    embedding_from_predict(output)
+    let key = EmbeddingCacheKey {
+        model: model.to_string(),
+        kind: EmbeddingKind::Image,
+        query: query.to_string(),
+    };
+    cached_embedding_or_fetch(key, state.embedding_cache_size, async {
+        let inputs = [InferenceInput::new(
+            serde_json::json!({"text": query}),
+            None,
+        )];
+        let output = state
+            .inference
+            .predict(
+                model,
+                &embed.cache_key,
+                embed.lru_size,
+                embed.ttl_seconds,
+                &inputs,
+            )
+            .await
+            .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+        embedding_from_predict(output)
+    })
+    .await
 }
 
 fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {
