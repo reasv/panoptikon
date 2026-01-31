@@ -11,7 +11,7 @@ use crate::db::tags::{
 };
 use crate::db::{DbConnection, ReadOnly};
 use crate::pql::{PqlError, build_query_preprocessed, preprocess_query_async};
-use crate::pql::model::PqlQuery;
+use crate::pql::model::{EntityType, PqlQuery};
 use crate::proxy::ProxyState;
 use axum::{
     Json,
@@ -242,7 +242,10 @@ pub async fn search_pql(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let builder = compile_pql(&state, payload).await?;
+    let query = decode_pql_payload(&payload)?;
+    let skip_missing_file =
+        query.check_path && matches!(query.entity, EntityType::File) && is_empty_partition(&query);
+    let builder = compile_pql(&state, query).await?;
 
     let mut count_metrics = builder.count_metrics.clone();
     let mut result_metrics = builder.result_metrics.clone();
@@ -263,7 +266,9 @@ pub async fn search_pql(
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
             let mut result = map_search_result(&row, &builder.extra_columns)?;
-            if builder.check_path && !apply_check_path(&mut db.conn, &mut result).await? {
+            if builder.check_path
+                && !apply_check_path(&mut db.conn, &mut result, skip_missing_file).await?
+            {
                 continue;
             }
             results.push(result);
@@ -288,7 +293,8 @@ pub async fn search_pql_build(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let builder = compile_pql(&state, payload).await?;
+    let query = decode_pql_payload(&payload)?;
+    let builder = compile_pql(&state, query).await?;
     Ok(Json(builder))
 }
 
@@ -351,11 +357,7 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
     }
 }
 
-async fn compile_pql(state: &ProxyState, payload: Value) -> ApiResult<PqlBuildResponse> {
-    let mut query: PqlQuery = serde_json::from_value(payload).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode pql payload");
-        ApiError::bad_request("Invalid PQL payload")
-    })?;
+async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBuildResponse> {
 
     let mut count_metrics = SearchMetrics::default();
     let mut result_metrics = SearchMetrics::default();
@@ -429,6 +431,20 @@ async fn compile_pql(state: &ProxyState, payload: Value) -> ApiResult<PqlBuildRe
     })
 }
 
+fn decode_pql_payload(payload: &Value) -> ApiResult<PqlQuery> {
+    serde_json::from_value(payload.clone()).map_err(|err| {
+        tracing::error!(error = %err, "failed to decode pql payload");
+        ApiError::bad_request("Invalid PQL payload")
+    })
+}
+
+fn is_empty_partition(query: &PqlQuery) -> bool {
+    query
+        .partition_by
+        .as_ref()
+        .map_or(true, |partition| partition.is_empty())
+}
+
 fn compile_select(built: crate::pql::PqlBuilderResult) -> ApiResult<CompiledQuery> {
     let (sql, values) = match built.with_clause {
         Some(with_clause) => built.query.with(with_clause).build(SqliteQueryBuilder),
@@ -498,12 +514,22 @@ fn map_pql_error(err: PqlError) -> ApiError {
 async fn apply_check_path(
     conn: &mut sqlx::SqliteConnection,
     result: &mut SearchResult,
+    skip_missing_file: bool,
 ) -> ApiResult<bool> {
     let Some(path) = result.path.as_deref() else {
         return Ok(true);
     };
     if Path::new(path).exists() {
         return Ok(true);
+    }
+
+    if skip_missing_file {
+        tracing::warn!(
+            path = %path,
+            item_id = %result.item_id,
+            "pql file path missing"
+        );
+        return Ok(false);
     }
 
     tracing::warn!(

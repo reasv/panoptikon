@@ -58,6 +58,7 @@ Behavior (important)
   - `/api/search/pql` compiles queries via the Rust PQL builder and executes them locally.
   - `/api/search/pql/build` returns the compiled SQL/params without executing.
   - Extra columns use the Rust alias map, and `check_path` results are validated with fallback file lookup.
+  - When `check_path` is enabled for `entity = file` and no `partition_by`, missing paths are dropped without substitution (matching Python behavior).
 - Streaming:
   - All responses are streamed except `/api/db`, which is buffered so it can be filtered.
 

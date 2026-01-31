@@ -63,7 +63,9 @@ Special handling:
   `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It caches
   inference metadata lookups for 5 minutes to reduce repeated metadata calls
   while applying distance-function overrides. It tracks joined base tables to
-  avoid duplicate joins when the root CTE is unwrapped.
+  avoid duplicate joins when the root CTE is unwrapped. When `check_path` is
+  enabled for `entity = file` with no `partition_by`, missing paths are dropped
+  instead of substituting a different file (matching Python behavior).
 
 ## Database migrations
 
