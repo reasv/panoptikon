@@ -341,16 +341,19 @@ impl Default for PqlQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct AndOperator {
+    #[serde(alias = "and")]
     pub and_: Vec<QueryElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct OrOperator {
+    #[serde(alias = "or")]
     pub or_: Vec<QueryElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct NotOperator {
+    #[serde(alias = "not")]
     pub not_: Box<QueryElement>,
 }
 
