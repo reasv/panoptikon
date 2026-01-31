@@ -139,7 +139,8 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
-            .route("/api/search/stats", get(api::search::get_stats));
+            .route("/api/search/stats", get(api::search::get_stats))
+            .route("/openapi.json", get(api::openapi::openapi_json));
         if env_truthy("EXPERIMENTAL_RUST_JOBS") {
             app = app
                 .route(

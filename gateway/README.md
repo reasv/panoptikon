@@ -20,7 +20,8 @@ added later.
 
 - `/api/*` goes to the Python backend, except local routes when enabled
 - `/api/inference/*` goes to the inference upstream (defaults to the API upstream)
-- `/docs` and `/openapi.json` go to the Python backend
+- `/docs` goes to the Python backend
+- `/openapi.json` goes to the Python backend unless `upstreams.api.local = true`
 - everything else goes to the Next.js frontend
 
 Paths, methods, headers, and bodies are forwarded as-is.
@@ -55,7 +56,8 @@ Special handling:
   `/api/search/embeddings/cache`,
   `/api/search/tags`,
   `/api/search/tags/top`, and `/api/search/stats`
-  locally using the same policy enforcement and filtering rules.
+  locally using the same policy enforcement and filtering rules, and serves
+  `/openapi.json` from the local OpenAPI generator.
   `/api/search/pql` compiles queries via the Rust PQL builder and executes them
   locally; `/api/search/pql/build` returns the compiled SQL/params without
   executing. The Rust PQL compiler (SeaQuery) mirrors the Python
