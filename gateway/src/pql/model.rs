@@ -258,6 +258,7 @@ impl Default for OrderArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub(crate) struct PqlQuery {
+    #[schema(no_recursion)]
     pub query: Option<QueryElement>,
     /// Values to order results by
     ///
@@ -342,26 +343,32 @@ impl Default for PqlQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct AndOperator {
     #[serde(alias = "and")]
+    #[schema(no_recursion)]
     pub and_: Vec<QueryElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct OrOperator {
     #[serde(alias = "or")]
+    #[schema(no_recursion)]
     pub or_: Vec<QueryElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct NotOperator {
     #[serde(alias = "not")]
+    #[schema(no_recursion)]
     pub not_: Box<QueryElement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum QueryElement {
+    #[schema(no_recursion)]
     And(AndOperator),
+    #[schema(no_recursion)]
     Or(OrOperator),
+    #[schema(no_recursion)]
     Not(NotOperator),
     Match(Match),
     MatchPath(MatchPath),
@@ -379,6 +386,7 @@ pub(crate) enum QueryElement {
 pub(crate) struct JobFilter {
     #[serde(default)]
     pub setter_names: Vec<String>,
+    #[schema(no_recursion)]
     pub pql_query: QueryElement,
 }
 
