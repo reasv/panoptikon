@@ -342,3 +342,90 @@ fn f16_to_f32(bits: u16) -> f32 {
     };
     f32::from_bits(f32_bits)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{embedding_from_npy_bytes, parse_npy_f32};
+
+    const F32_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/f32_1d.npy");
+    const F16_2D_C: &[u8] = include_bytes!("../../tests/fixtures/npy/f16_2d_c.npy");
+    const F16_2D_F: &[u8] = include_bytes!("../../tests/fixtures/npy/f16_2d_f.npy");
+    const F64_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/f64_1d.npy");
+    const I16_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/i16_1d.npy");
+    const U8_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/u8_1d.npy");
+    const U16_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/u16_1d.npy");
+    const BOOL_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/bool_1d.npy");
+    const BE_F32_1D: &[u8] = include_bytes!("../../tests/fixtures/npy/be_f32_1d.npy");
+
+    fn assert_slice_approx(actual: &[f32], expected: &[f32], tol: f32) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (*actual - *expected).abs();
+            assert!(
+                delta <= tol,
+                "index {idx}: expected {expected}, got {actual} (delta {delta})"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_f32_1d() {
+        let values = parse_npy_f32(F32_1D).expect("parse f32 1d");
+        assert_slice_approx(&values, &[0.0, 1.5, -2.25, 3.0], 1e-6);
+    }
+
+    #[test]
+    fn parses_f16_2d_c_order_first_row() {
+        let values = parse_npy_f32(F16_2D_C).expect("parse f16 2d c");
+        assert_slice_approx(&values, &[1.0, 2.0, 3.0], 1e-3);
+    }
+
+    #[test]
+    fn parses_f16_2d_fortran_order_first_row() {
+        let values = parse_npy_f32(F16_2D_F).expect("parse f16 2d f");
+        assert_slice_approx(&values, &[1.0, 2.0, 3.0], 1e-3);
+    }
+
+    #[test]
+    fn parses_f64_1d() {
+        let values = parse_npy_f32(F64_1D).expect("parse f64 1d");
+        assert_slice_approx(&values, &[1e-3, -1e3, 42.125], 1e-3);
+    }
+
+    #[test]
+    fn parses_int_1d() {
+        let values = parse_npy_f32(I16_1D).expect("parse i16 1d");
+        assert_slice_approx(&values, &[-2.0, 0.0, 2.0, 1234.0], 0.0);
+    }
+
+    #[test]
+    fn parses_uint_1d() {
+        let values = parse_npy_f32(U8_1D).expect("parse u8 1d");
+        assert_slice_approx(&values, &[0.0, 200.0, 255.0], 0.0);
+        let values = parse_npy_f32(U16_1D).expect("parse u16 1d");
+        assert_slice_approx(&values, &[0.0, 65535.0], 0.0);
+    }
+
+    #[test]
+    fn parses_bool_1d() {
+        let values = parse_npy_f32(BOOL_1D).expect("parse bool 1d");
+        assert_slice_approx(&values, &[1.0, 0.0, 1.0], 0.0);
+    }
+
+    #[test]
+    fn parses_big_endian_f32() {
+        let values = parse_npy_f32(BE_F32_1D).expect("parse be f32 1d");
+        assert_slice_approx(&values, &[1.0, -2.5, 100.25], 1e-6);
+    }
+
+    #[test]
+    fn serializes_embedding_bytes() {
+        let bytes = embedding_from_npy_bytes(F32_1D).expect("serialize f32 1d");
+        let expected_values = [0.0f32, 1.5, -2.25, 3.0];
+        let mut expected = Vec::with_capacity(expected_values.len() * 4);
+        for value in expected_values {
+            expected.extend_from_slice(&value.to_ne_bytes());
+        }
+        assert_eq!(bytes, expected);
+    }
+}
