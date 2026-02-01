@@ -24,7 +24,9 @@ use utoipa::OpenApi;
         crate::api::bookmarks::get_bookmark,
         crate::api::bookmarks::add_bookmark_by_sha256,
         crate::api::bookmarks::delete_bookmark_by_sha256,
-        crate::api::bookmarks::bookmarks_item
+        crate::api::bookmarks::bookmarks_item,
+        crate::api::db::db_info,
+        crate::api::db::db_create
     ),
     components(
         schemas(
@@ -58,6 +60,9 @@ use utoipa::OpenApi;
             crate::api::bookmarks::ItemsMeta,
             crate::api::bookmarks::BookmarkOrderBy,
             crate::api::bookmarks::SortOrder,
+            crate::policy::DbInfo,
+            crate::policy::SingleDbInfo,
+            crate::api::db::DbCreateResponse,
             crate::pql::EmbeddingCacheEntry,
             crate::pql::EmbeddingCacheStats,
             crate::pql::model::PqlQuery,
@@ -107,7 +112,8 @@ use utoipa::OpenApi;
     tags(
         (name = "search", description = "Search and PQL endpoints"),
         (name = "items"),
-        (name = "bookmarks")
+        (name = "bookmarks"),
+        (name = "database")
     )
 )]
 #[allow(dead_code)]

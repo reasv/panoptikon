@@ -5,6 +5,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
@@ -162,13 +163,13 @@ pub(crate) struct EnforcementError {
     pub(crate) reason: &'static str,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct DbInfo {
     pub(crate) index: SingleDbInfo,
     pub(crate) user_data: SingleDbInfo,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SingleDbInfo {
     pub(crate) current: String,
     pub(crate) all: Vec<String>,
