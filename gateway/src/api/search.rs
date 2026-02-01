@@ -30,7 +30,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -149,10 +149,14 @@ pub(crate) struct FileSearchResponse {
     result_metrics: SearchMetrics,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct TagSearchQuery {
+    /// The (partial) tag name to search for
     name: String,
     #[serde(default = "default_limit")]
+    #[param(default = 10)]
+    /// The `limit` parameter can be used to control the number of tags to return.
     limit: i64,
 }
 
@@ -161,13 +165,20 @@ pub(crate) struct TagSearchResults {
     tags: Vec<(String, String, i64)>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct TopTagsQuery {
+    /// The tag namespace to search in
     namespace: Option<String>,
     #[serde(default)]
+    /// The tag setter names to restrict the search to. Default is all
     setters: Vec<String>,
+    /// The minimum confidence threshold for tags
+    #[param(minimum = 0.0, maximum = 1.0)]
     confidence_threshold: Option<f64>,
     #[serde(default = "default_limit")]
+    #[param(default = 10)]
+    /// The `limit` parameter can be used to control the number of tags to return.
     limit: i64,
 }
 
@@ -176,11 +187,16 @@ pub(crate) struct TagFrequency {
     tags: Vec<(String, String, i64, f64)>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct SearchStatsQuery {
     #[serde(default = "default_user")]
+    #[param(default = "user")]
+    /// The bookmarks user to get the bookmark namespaces for
     user: String,
     #[serde(default = "default_true")]
+    #[param(default = true)]
+    /// Include namespaces from bookmarks with the * user value
     include_wildcard: bool,
 }
 
@@ -218,22 +234,13 @@ pub(crate) struct SearchStats {
     get,
     path = "/api/search/tags",
     tag = "search",
-    params(
-        ("name" = String, Query, description = "The (partial) tag name to search for"),
-        ("limit" = i64, Query, description = "Maximum number of tags to return", example = 10)
-    ),
+    summary = "Search tag names for autocompletion",
+    description = "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nThe tags are returned in descending order of the number of items tagged.",
+    params(TagSearchQuery),
     responses(
         (status = 200, description = "Tag autocomplete results", body = TagSearchResults)
     )
 )]
-/// Search tag names for autocompletion
-///
-/// Given a string, finds tags whose names contain the string.
-/// Meant to be used for autocompletion in the search bar.
-/// The `limit` parameter can be used to control the number of tags to return.
-/// Returns a list of tuples, where each tuple contains the namespace, name,
-/// and the number of unique items tagged with the tag.
-/// The tags are returned in descending order of the number of items tagged.
 pub async fn get_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TagSearchQuery>,
@@ -246,27 +253,13 @@ pub async fn get_tags(
     get,
     path = "/api/search/tags/top",
     tag = "search",
-    params(
-        ("namespace" = Option<String>, Query, description = "The tag namespace to search in"),
-        ("setters" = Vec<String>, Query, description = "The tag setter names to restrict the search to. Default is all"),
-        ("confidence_threshold" = Option<f64>, Query, description = "The minimum confidence threshold for tags", minimum = 0.0, maximum = 1.0),
-        ("limit" = i64, Query, description = "Maximum number of tags to return", example = 10)
-    ),
+    summary = "Get the most common tags in the database",
+    description = "Get the most common tags in the database, based on the provided query parameters.\nThe result is a list of tuples, where each tuple contains the namespace, tag name, \noccurrences count, and relative frequency % (occurrences / total item_setter pairs).\nThe latter value is expressed as a float between 0 and 1.\nThe tags are returned in descending order of frequency.\nThe `limit` parameter can be used to control the number of tags to return.\nThe `namespace` parameter can be used to restrict the search to a specific tag namespace.\nThe `setters` parameter can be used to restrict the search to specific setters.\nThe `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.",
+    params(TopTagsQuery),
     responses(
         (status = 200, description = "Most common tags", body = TagFrequency)
     )
 )]
-/// Get the most common tags in the database
-///
-/// Get the most common tags in the database, based on the provided query parameters.
-/// The result is a list of tuples, where each tuple contains the namespace, tag name,
-/// occurrences count, and relative frequency % (occurrences / total item_setter pairs).
-/// The latter value is expressed as a float between 0 and 1.
-/// The tags are returned in descending order of frequency.
-/// The `limit` parameter can be used to control the number of tags to return.
-/// The `namespace` parameter can be used to restrict the search to a specific tag namespace.
-/// The `setters` parameter can be used to restrict the search to specific setters.
-/// The `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.
 pub async fn get_top_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TopTagsQuery>,
@@ -294,20 +287,13 @@ pub async fn get_top_tags(
     get,
     path = "/api/search/stats",
     tag = "search",
-    params(
-        ("user" = String, Query, description = "The bookmarks user to get the bookmark namespaces for", example = "user"),
-        ("include_wildcard" = bool, Query, description = "Include namespaces from bookmarks with the * user value", example = true)
-    ),
+    summary = "Get statistics on the searchable data",
+    description = "Get statistics on the data indexed in the database.\nThis includes information about the tag namespaces, bookmark namespaces, file types, and folders present.\nMost importantly, it includes the list of currently existing setters for each data type.\nThis information is relevant for building search queries.",
+    params(SearchStatsQuery),
     responses(
         (status = 200, description = "Search statistics", body = SearchStats)
     )
 )]
-/// Get statistics on the searchable data
-///
-/// Get statistics on the data indexed in the database.
-/// This includes information about the tag namespaces, bookmark namespaces, file types, and folders present.
-/// Most importantly, it includes the list of currently existing setters for each data type.
-/// This information is relevant for building search queries.
 pub async fn get_stats(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<SearchStatsQuery>,
@@ -320,18 +306,16 @@ pub async fn get_stats(
     post,
     path = "/api/search/pql",
     tag = "search",
+    summary = "Search for files and items in the database",
+    description = "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.",
     request_body(
-        content = PqlQuery,
+        content = Option<PqlQuery>,
         description = "The PQL Search query to execute"
     ),
     responses(
         (status = 200, description = "Search results", body = FileSearchResponse)
     )
 )]
-/// Search for files and items in the database
-///
-/// Search for files in the database based on the provided query parameters.
-/// This endpoint is meant to be used with the Panoptikon Query Language.
 pub async fn search_pql(
     State(state): State<Arc<ProxyState>>,
     mut db: DbConnection<ReadOnly>,
@@ -388,17 +372,16 @@ pub async fn search_pql(
     post,
     path = "/api/search/pql/build",
     tag = "search",
+    summary = "Build PQL search queries without executing them",
+    description = "Build the SQL queries for the provided PQL search query without executing them.",
     request_body(
-        content = PqlQuery,
+        content = Option<PqlQuery>,
         description = "The PQL Search query to execute"
     ),
     responses(
         (status = 200, description = "Compiled PQL queries", body = PqlBuildResponse)
     )
 )]
-/// Build PQL search queries without executing them
-///
-/// Build the SQL queries for the provided PQL search query without executing them.
 pub async fn search_pql_build(
     State(state): State<Arc<ProxyState>>,
     body: Option<Json<Value>>,
@@ -547,11 +530,16 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
     })
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct CacheQuery {
     #[serde(default = "default_cache_page")]
+    #[param(default = 1)]
+    /// Page number
     page: usize,
     #[serde(default = "default_cache_page_size")]
+    #[param(default = 128)]
+    /// Page size
     page_size: usize,
 }
 
@@ -559,17 +547,13 @@ pub(crate) struct CacheQuery {
     get,
     path = "/api/search/embeddings/cache",
     tag = "search",
-    params(
-        ("page" = usize, Query, description = "Page number", example = 1),
-        ("page_size" = usize, Query, description = "Page size", example = 128)
-    ),
+    summary = "Get embedding cache stats",
+    description = "Returns cache usage and paginated entries for the search embedding cache.",
+    params(CacheQuery),
     responses(
         (status = 200, description = "Embedding cache stats", body = EmbeddingCacheStats)
     )
 )]
-/// Get embedding cache stats
-///
-/// Returns cache usage and paginated entries for the search embedding cache.
 pub async fn get_search_cache(
     State(state): State<Arc<ProxyState>>,
     Query(query): Query<CacheQuery>,
@@ -584,17 +568,13 @@ pub async fn get_search_cache(
     delete,
     path = "/api/search/embeddings/cache",
     tag = "search",
-    params(
-        ("page" = usize, Query, description = "Page number", example = 1),
-        ("page_size" = usize, Query, description = "Page size", example = 128)
-    ),
+    summary = "Clear embedding cache",
+    description = "Clears the search embedding cache and returns updated cache stats.",
+    params(CacheQuery),
     responses(
         (status = 200, description = "Embedding cache stats after clearing", body = EmbeddingCacheStats)
     )
 )]
-/// Clear embedding cache
-///
-/// Clears the search embedding cache and returns updated cache stats.
 pub async fn clear_search_cache(
     State(state): State<Arc<ProxyState>>,
     Query(query): Query<CacheQuery>,

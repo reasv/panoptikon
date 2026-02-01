@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use sqlx::Row;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -6,7 +7,7 @@ use crate::api_error::ApiError;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ItemIdentifierType {
     ItemId,
@@ -46,7 +47,7 @@ pub(crate) struct ItemMetadata {
     pub files: Vec<FileRecord>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, ToSchema)]
 pub(crate) struct ExtractedTextRecord {
     pub id: i64,
     pub item_sha256: String,

@@ -8,6 +8,7 @@ use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio_util::io::ReaderStream;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::api::utils::{content_disposition_value, iso_to_system_time, strip_non_latin1_chars};
 use crate::api_error::ApiError;
@@ -21,48 +22,65 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const PLACEHOLDER_PNG: &[u8] = include_bytes!("assets/placeholder.png");
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ItemQuery {
+    /// An item identifier (sha256 hash, file ID, path, item ID, or data ID for associated data)
     id: String,
+    /// The type of the item identifier
     id_type: ItemIdentifierType,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ItemTextQuery {
+    /// An item identifier (sha256 hash, file ID, path, item ID, or data ID for associated data)
     id: String,
+    /// The type of the item identifier
     id_type: ItemIdentifierType,
     #[serde(default)]
     setters: Vec<String>,
     #[serde(default)]
     languages: Vec<String>,
+    /// Text will be truncated to this length, if set. The `length` field will contain the original length.
     truncate_length: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ItemTagsQuery {
+    /// An item identifier (sha256 hash, file ID, path, item ID, or data ID for associated data)
     id: String,
+    /// The type of the item identifier
     id_type: ItemIdentifierType,
     #[serde(default)]
+    /// List of models that set the tags to filter by (default: all)
     setters: Vec<String>,
     #[serde(default)]
+    /// List of namespaces to filter by (default: all). A namespace includes all namespaces that start with the namespace string.
     namespaces: Vec<String>,
     #[serde(default)]
+    #[param(default = 0.0, minimum = 0.0, maximum = 1.0)]
+    /// Minimum confidence threshold, between 0 and 1 (default: 0.0)
     confidence_threshold: f64,
+    /// Maximum number of tags to return for each *setter, namespace pair* (default: all). Higher confidence tags are given priority.
     limit_per_namespace: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct TextAnyQuery {
+    /// List of extracted text IDs
     text_ids: Vec<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ItemMetadataResponse {
     item: ItemRecordResponse,
     files: Vec<FileRecordResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ItemRecordResponse {
     id: i64,
     sha256: String,
@@ -80,7 +98,7 @@ pub(crate) struct ItemRecordResponse {
     time_added: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct FileRecordResponse {
     id: i64,
     sha256: String,
@@ -89,24 +107,39 @@ pub(crate) struct FileRecordResponse {
     filename: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TextResponse {
     text: Vec<ExtractedTextRecord>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TagResponse {
     tags: Vec<(String, String, f64, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ThumbnailQuery {
+    /// An item identifier (sha256 hash, file ID, path, item ID, or data ID for associated data)
     id: String,
+    /// The type of the item identifier
     id_type: ItemIdentifierType,
     #[serde(default = "default_true")]
+    #[param(default = true)]
     big: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/item/file",
+    tag = "items",
+    summary = "Get actual file contents for an item",
+    description = "Returns the actual file contents for a given item.\nContent type is determined by the file extension.",
+    params(ItemQuery),
+    responses(
+        (status = 200, description = "Item file contents")
+    )
+)]
 pub async fn item_file(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ItemQuery>,
@@ -129,6 +162,17 @@ pub async fn item_file(
     file_response(&item, file, &filename, "inline").await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/item",
+    tag = "items",
+    summary = "Get item metadata and associated file metadata",
+    description = "Returns metadata for a given item.\nThis includes the item metadata and a list of all files associated with the item.\nFiles that do not exist on disk will not be included in the response.\nThis means the file list may be empty.\n\nAn `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.\nFiles are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.",
+    params(ItemQuery),
+    responses(
+        (status = 200, description = "Item metadata", body = ItemMetadataResponse)
+    )
+)]
 pub async fn item_meta(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ItemQuery>,
@@ -146,6 +190,17 @@ pub async fn item_meta(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/item/text",
+    tag = "items",
+    summary = "Get all text extracted from an item",
+    description = "Returns the text extracted from a given item",
+    params(ItemTextQuery),
+    responses(
+        (status = 200, description = "Extracted text", body = TextResponse)
+    )
+)]
 pub async fn item_text(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ItemTextQuery>,
@@ -178,6 +233,17 @@ pub async fn item_text(
     Ok(Json(TextResponse { text }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/item/tags",
+    tag = "items",
+    summary = "Get tags for an item",
+    description = "Returns the tags associated with a given item.\nThe response contains a list of tuples, where each tuple contains\nthe tag namespace, tag name, confidence, and setter name.\nThe `setters` parameter can be used to filter tags by the setter name.\nThe `confidence_threshold` parameter can be used to filter tags based on\nthe minimum confidence threshold",
+    params(ItemTagsQuery),
+    responses(
+        (status = 200, description = "Item tags", body = TagResponse)
+    )
+)]
 pub async fn item_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ItemTagsQuery>,
@@ -200,6 +266,17 @@ pub async fn item_tags(
     Ok(Json(TagResponse { tags }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/text/any",
+    tag = "items",
+    summary = "Get text from text_ids",
+    description = "Returns texts given a list of text IDs",
+    params(TextAnyQuery),
+    responses(
+        (status = 200, description = "Extracted text entries", body = TextResponse)
+    )
+)]
 pub async fn texts_any(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TextAnyQuery>,
@@ -208,6 +285,17 @@ pub async fn texts_any(
     Ok(Json(TextResponse { text }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/items/item/thumbnail",
+    tag = "items",
+    summary = "Get thumbnail for an item",
+    description = "Returns a thumbnail for a given item.\nThe thumbnail may be a thumbnail,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).",
+    params(ThumbnailQuery),
+    responses(
+        (status = 200, description = "Item thumbnail image")
+    )
+)]
 pub async fn item_thumbnail(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ThumbnailQuery>,

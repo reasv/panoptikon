@@ -2,6 +2,7 @@ use axum::{Json, extract::Path};
 use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::api_error::ApiError;
 use crate::db::bookmarks::{
@@ -16,42 +17,76 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 const DEFAULT_USER: &str = "user";
 const LARGE_PAGE_SIZE: i64 = 1_000_000;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ItemBookmarksQuery {
+    /// The user to get the bookmark from. The wildcard '*' can be used to get `wildcard user` bookmarks that apply to all users.
     #[serde(default = "default_user")]
+    #[param(default = "user")]
     user: String,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct BookmarkUserQuery {
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct BookmarkGetUserQuery {
+    /// The user to get the bookmark from. The wildcard '*' can be used to get `wildcard user` bookmarks that apply to all users.
     #[serde(default = "default_user")]
+    #[param(default = "user")]
     user: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct BookmarkSaveUserQuery {
+    /// The user to save the bookmark under. The wildcard '*' can be used to set `wildcard user` bookmarks that apply to all users.
+    #[serde(default = "default_user")]
+    #[param(default = "user")]
+    user: String,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct BookmarkDeleteUserQuery {
+    /// The user to delete the bookmark from.
+    #[serde(default = "default_user")]
+    #[param(default = "user")]
+    user: String,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct BookmarkListQuery {
     #[serde(default = "default_user")]
+    #[param(default = "user")]
     user: String,
     #[serde(default = "default_page_size")]
+    #[param(default = 1000)]
     page_size: i64,
     #[serde(default = "default_page")]
+    #[param(default = 1)]
     page: i64,
     #[serde(default)]
+    #[param(default = "time_added")]
     order_by: BookmarkOrderBy,
     order: Option<SortOrder>,
     #[serde(default = "default_true")]
+    #[param(default = true)]
+    /// Whether or not to include bookmarks set under the wildcard user.
     include_wildcard: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct DeleteNamespaceQuery {
     #[serde(default = "default_user")]
+    #[param(default = "user")]
+    /// The user to delete the bookmarks from.
     user: String,
     #[serde(default)]
     exclude_last_n: i64,
 }
 
-#[derive(Deserialize, Copy, Clone)]
+#[derive(Deserialize, Copy, Clone, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BookmarkOrderBy {
     LastModified,
@@ -65,35 +100,35 @@ impl Default for BookmarkOrderBy {
     }
 }
 
-#[derive(Deserialize, Copy, Clone)]
+#[derive(Deserialize, Copy, Clone, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SortOrder {
     Asc,
     Desc,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct Items {
     sha256: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct ItemsMeta {
     sha256: Vec<String>,
     metadata: Option<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct BookmarkNamespaces {
     namespaces: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct BookmarkUsers {
     users: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct FileSearchResult {
     path: String,
     sha256: String,
@@ -102,35 +137,44 @@ pub(crate) struct FileSearchResult {
     item_type: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct Results {
     count: i64,
     results: Vec<FileSearchResult>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ExistingBookmarkMetadata {
     namespace: Option<String>,
     metadata: Option<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct ItemBookmarks {
     bookmarks: Vec<ExistingBookmarkMetadata>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct BookmarkMetadata {
     exists: bool,
     namespace: Option<String>,
     metadata: Option<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct MessageResult {
     message: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bookmarks/ns",
+    tag = "bookmarks",
+    summary = "Get all bookmark namespaces",
+    responses(
+        (status = 200, description = "Bookmark namespaces", body = BookmarkNamespaces)
+    )
+)]
 pub async fn bookmark_namespaces(
     mut db: DbConnection<ReadOnly>,
 ) -> ApiResult<Json<BookmarkNamespaces>> {
@@ -138,11 +182,34 @@ pub async fn bookmark_namespaces(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bookmarks/users",
+    tag = "bookmarks",
+    summary = "Get all users with bookmarks",
+    responses(
+        (status = 200, description = "Bookmark users", body = BookmarkUsers)
+    )
+)]
 pub async fn bookmark_users(mut db: DbConnection<ReadOnly>) -> ApiResult<Json<BookmarkUsers>> {
     let response = load_bookmark_users(&mut db.conn).await?;
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bookmarks/ns/{namespace}",
+    tag = "bookmarks",
+    summary = "Get all bookmarks in a namespace",
+    description = "Get all items bookmarked in namespace.\nNote that unlike the search API, this returns unique items, not files.\nThis has two implications:\n1. Results are unique by `sha256` value.\n2. Even if multiple files have the same `sha256` value, they will only appear once in the results, with the path of the first reachable file found.\n\nThe `order_by` parameter can be used to sort the results by `last_modified`, `path`, or `time_added`.\nThe `order` parameter can be used to sort the results in ascending or descending order.\nThe `include_wildcard` parameter can be used to include bookmarks with the `*` user value.",
+    params(
+        ("namespace" = String, Path, description = "The namespace to get the bookmarks from. Wildcard ('*') results in getting bookmarks from all namespaces."),
+        BookmarkListQuery
+    ),
+    responses(
+        (status = 200, description = "Bookmarks in namespace", body = Results)
+    )
+)]
 pub async fn bookmarks_by_namespace(
     mut db: DbConnection<ReadOnly>,
     Path(namespace): Path<String>,
@@ -162,6 +229,23 @@ pub async fn bookmarks_by_namespace(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/bookmarks/ns/{namespace}",
+    tag = "bookmarks",
+    summary = "Delete all/many bookmarks in a namespace",
+    description = "Delete all bookmarks in a namespace. If `exclude_last_n` is provided, the last `n` added bookmarks will be kept.\nAlternatively, a list of `sha256` values can be provided in the request body to only delete specific bookmarks.",
+    params(
+        ("namespace" = String, Path, description = "The namespace to delete the bookmarks from. Wildcard ('*') results in deleting bookmarks from all namespaces."),
+        DeleteNamespaceQuery
+    ),
+    request_body(
+        content = Option<Items>
+    ),
+    responses(
+        (status = 200, description = "Delete results", body = MessageResult)
+    )
+)]
 pub async fn delete_bookmarks_by_namespace(
     mut db: DbConnection<UserDataWrite>,
     Path(namespace): Path<String>,
@@ -179,29 +263,79 @@ pub async fn delete_bookmarks_by_namespace(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/bookmarks/ns/{namespace}",
+    tag = "bookmarks",
+    summary = "Add multiple bookmarks to a namespace",
+    description = "Add multiple bookmarks to a namespace.\nThe `sha256` values of the items to be bookmarked should be provided in the request body.\nOptionally, metadata can be provided.\nIf metadata is provided, it should be a dictionary where the keys are the `sha256`\nvalues and the values are dictionaries of metadata.\nIf the sha256 value is not in the metadata dictionary keys, the entire metadata dictionary\nwill be used as metadata for the the sha256 item.\nYou can use this to set the same metadata for all items.\n\nExample request body:\n```\n{\n    \"sha256\": [\"<sha256_1>\", \"<sha256_2>\", ...],\n    \"metadata\": {\n        \"<sha256_1>: {\n            \"key1\": \"value1\",\n            \"key2\": \"value2\",\n            ...\n        },\n        \"key1\": \"value1\",\n        \"key2\": \"value2\",\n        ...\n    }\n}\n```",
+    params(
+        ("namespace" = String, Path, description = "The namespace to save the bookmarks under. Wildcard is not allowed here."),
+        BookmarkSaveUserQuery
+    ),
+    request_body(
+        content = ItemsMeta
+    ),
+    responses(
+        (status = 200, description = "Add results", body = MessageResult)
+    )
+)]
 pub async fn add_bookmarks_by_namespace(
     mut db: DbConnection<UserDataWrite>,
     Path(namespace): Path<String>,
-    Query(query): Query<BookmarkUserQuery>,
+    Query(query): Query<BookmarkSaveUserQuery>,
     Json(items): Json<ItemsMeta>,
 ) -> ApiResult<Json<MessageResult>> {
     let response = add_bookmarks_bulk(&mut db.conn, &namespace, &query.user, &items).await?;
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bookmarks/ns/{namespace}/{sha256}",
+    tag = "bookmarks",
+    summary = "Get a bookmark by namespace and sha256",
+    description = "Get a bookmark by namespace and sha256.\nReturns whether the bookmark exists and the metadata.",
+    params(
+        ("namespace" = String, Path, description = "The namespace to get the bookmark from. Use '*' wildcard to mean 'any namespace', in which case it will return the first result found."),
+        ("sha256" = String, Path, description = "The sha256 of the item"),
+        BookmarkGetUserQuery
+    ),
+    responses(
+        (status = 200, description = "Bookmark metadata", body = BookmarkMetadata)
+    )
+)]
 pub async fn get_bookmark(
     mut db: DbConnection<ReadOnly>,
     Path((namespace, sha256)): Path<(String, String)>,
-    Query(query): Query<BookmarkUserQuery>,
+    Query(query): Query<BookmarkGetUserQuery>,
 ) -> ApiResult<Json<BookmarkMetadata>> {
     let response = load_bookmark_metadata(&mut db.conn, &namespace, &sha256, &query.user).await?;
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/bookmarks/ns/{namespace}/{sha256}",
+    tag = "bookmarks",
+    summary = "Add a bookmark by namespace and sha256",
+    description = "Add a bookmark by namespace and sha256.\nOptionally, metadata can be provided as the request body.\nMetadata should be a dictionary of key-value pairs.",
+    params(
+        ("namespace" = String, Path, description = "The namespace to save the bookmark under. Wildcard is not allowed here."),
+        ("sha256" = String, Path, description = "The sha256 of the item"),
+        BookmarkSaveUserQuery
+    ),
+    request_body(
+        content = Option<Value>
+    ),
+    responses(
+        (status = 200, description = "Add results", body = MessageResult)
+    )
+)]
 pub async fn add_bookmark_by_sha256(
     mut db: DbConnection<UserDataWrite>,
     Path((namespace, sha256)): Path<(String, String)>,
-    Query(query): Query<BookmarkUserQuery>,
+    Query(query): Query<BookmarkSaveUserQuery>,
     metadata: Option<Json<Value>>,
 ) -> ApiResult<Json<MessageResult>> {
     let response = add_bookmark_entry(
@@ -215,6 +349,20 @@ pub async fn add_bookmark_by_sha256(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bookmarks/item/{sha256}",
+    tag = "bookmarks",
+    summary = "Get all bookmarks for an item",
+    description = "Get all bookmarks for an item.\nReturns a list of namespaces and metadata for each bookmark.",
+    params(
+        ("sha256" = String, Path),
+        ItemBookmarksQuery
+    ),
+    responses(
+        (status = 200, description = "Item bookmarks", body = ItemBookmarks)
+    )
+)]
 pub async fn bookmarks_item(
     mut db: DbConnection<ReadOnly>,
     Path(sha256): Path<String>,
@@ -224,10 +372,24 @@ pub async fn bookmarks_item(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/bookmarks/ns/{namespace}/{sha256}",
+    tag = "bookmarks",
+    summary = "Delete a specific bookmark by namespace and sha256",
+    params(
+        ("namespace" = String, Path, description = "The namespace to delete the bookmark from. Wildcard ('*') results in deleting bookmarks for an item from all namespaces."),
+        ("sha256" = String, Path, description = "The sha256 of the item"),
+        BookmarkDeleteUserQuery
+    ),
+    responses(
+        (status = 200, description = "Delete results", body = MessageResult)
+    )
+)]
 pub async fn delete_bookmark_by_sha256(
     mut db: DbConnection<UserDataWrite>,
     Path((namespace, sha256)): Path<(String, String)>,
-    Query(query): Query<BookmarkUserQuery>,
+    Query(query): Query<BookmarkDeleteUserQuery>,
 ) -> ApiResult<Json<MessageResult>> {
     let response = delete_bookmark_entry(&mut db.conn, &sha256, &namespace, &query.user).await?;
     Ok(Json(response))

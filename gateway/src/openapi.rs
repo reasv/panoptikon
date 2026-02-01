@@ -9,7 +9,22 @@ use utoipa::OpenApi;
         crate::api::search::clear_search_cache,
         crate::api::search::get_tags,
         crate::api::search::get_top_tags,
-        crate::api::search::get_stats
+        crate::api::search::get_stats,
+        crate::api::items::item_meta,
+        crate::api::items::item_file,
+        crate::api::items::item_thumbnail,
+        crate::api::items::item_text,
+        crate::api::items::item_tags,
+        crate::api::items::texts_any,
+        crate::api::bookmarks::bookmark_namespaces,
+        crate::api::bookmarks::bookmark_users,
+        crate::api::bookmarks::bookmarks_by_namespace,
+        crate::api::bookmarks::delete_bookmarks_by_namespace,
+        crate::api::bookmarks::add_bookmarks_by_namespace,
+        crate::api::bookmarks::get_bookmark,
+        crate::api::bookmarks::add_bookmark_by_sha256,
+        crate::api::bookmarks::delete_bookmark_by_sha256,
+        crate::api::bookmarks::bookmarks_item
     ),
     components(
         schemas(
@@ -24,6 +39,25 @@ use utoipa::OpenApi;
             crate::api::search::FileStats,
             crate::api::search::ExtractedTextStats,
             crate::api::search::SearchStats,
+            crate::api::items::ItemMetadataResponse,
+            crate::api::items::ItemRecordResponse,
+            crate::api::items::FileRecordResponse,
+            crate::api::items::TextResponse,
+            crate::api::items::TagResponse,
+            crate::db::items::ExtractedTextRecord,
+            crate::db::items::ItemIdentifierType,
+            crate::api::bookmarks::BookmarkNamespaces,
+            crate::api::bookmarks::BookmarkUsers,
+            crate::api::bookmarks::Results,
+            crate::api::bookmarks::FileSearchResult,
+            crate::api::bookmarks::ExistingBookmarkMetadata,
+            crate::api::bookmarks::ItemBookmarks,
+            crate::api::bookmarks::BookmarkMetadata,
+            crate::api::bookmarks::MessageResult,
+            crate::api::bookmarks::Items,
+            crate::api::bookmarks::ItemsMeta,
+            crate::api::bookmarks::BookmarkOrderBy,
+            crate::api::bookmarks::SortOrder,
             crate::pql::EmbeddingCacheEntry,
             crate::pql::EmbeddingCacheStats,
             crate::pql::model::PqlQuery,
@@ -71,7 +105,9 @@ use utoipa::OpenApi;
         )
     ),
     tags(
-        (name = "search", description = "Search and PQL endpoints")
+        (name = "search", description = "Search and PQL endpoints"),
+        (name = "items"),
+        (name = "bookmarks")
     )
 )]
 #[allow(dead_code)]
