@@ -14,6 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
+use tracing::warn;
 use utoipa::ToSchema;
 
 #[derive(Debug)]
@@ -273,7 +274,7 @@ impl<'a> AsyncPreprocessState<'a> {
                 .inference
                 .get_metadata()
                 .await
-                .map_err(|err| PqlError::invalid(format!("inference metadata error: {err}")))?;
+                .map_err(|err| inference_error("inference metadata error", err))?;
             self.metadata = Some(value);
         }
         Ok(self.metadata.as_ref().expect("metadata cached"))
@@ -607,7 +608,7 @@ async fn embed_text_query(
                 &inputs,
             )
             .await
-            .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+            .map_err(|err| inference_error("inference embed error", err))?;
         embedding_from_predict(output)
     })
     .await
@@ -639,10 +640,15 @@ async fn embed_image_query(
                 &inputs,
             )
             .await
-            .map_err(|err| PqlError::invalid(format!("inference embed error: {err}")))?;
+            .map_err(|err| inference_error("inference embed error", err))?;
         embedding_from_predict(output)
     })
     .await
+}
+
+fn inference_error<E: std::fmt::Display>(context: &'static str, err: E) -> PqlError {
+    warn!(error = %err, "{context}");
+    PqlError::invalid(context)
 }
 
 fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {

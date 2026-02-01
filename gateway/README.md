@@ -65,7 +65,10 @@ Special handling:
   call the inference upstream and parse `.npy`/JSON embeddings (including
   `f16/f32/f64`, integer/bool dtypes, and Fortran-ordered arrays). It caches
   inference metadata lookups for 5 minutes to reduce repeated metadata calls
-  while applying distance-function overrides. Search-time embeddings are cached
+  while applying distance-function overrides. Multipart inference predict calls
+  bypass the retry middleware and use a raw reqwest client with manual retry
+  logic because multipart bodies are not clonable. Inference errors are sanitized
+  in client responses while detailed error context is logged. Search-time embeddings are cached
   in-process with a global LRU keyed by `(model, kind, query)`
   using `search.embedding_cache_size` from the gateway config. It tracks joined base tables to
   avoid duplicate joins when the root CTE is unwrapped. When `check_path` is

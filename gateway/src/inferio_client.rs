@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::config::Settings;
 
@@ -41,6 +42,7 @@ pub(crate) enum PredictOutput {
 pub(crate) struct InferenceApiClient {
     base_url: String,
     client: ClientWithMiddleware,
+    raw_client: reqwest::Client,
     cache_metadata: bool,
 }
 
@@ -52,6 +54,9 @@ struct CachedMetadata {
 
 static METADATA_CACHE: OnceLock<RwLock<HashMap<String, CachedMetadata>>> = OnceLock::new();
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
+const PREDICT_MAX_RETRIES: u32 = 3;
+const PREDICT_MIN_DELAY: Duration = Duration::from_secs(1);
+const PREDICT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 impl InferenceApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
@@ -67,12 +72,13 @@ impl InferenceApiClient {
             .build()
             .context("failed to build inference API client")?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-        let client = ClientBuilder::new(base)
+        let client = ClientBuilder::new(base.clone())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
         Ok(Self {
             base_url,
             client,
+            raw_client: base,
             cache_metadata,
         })
     }
@@ -106,44 +112,60 @@ impl InferenceApiClient {
         inputs: &[InferenceInput],
     ) -> Result<PredictOutput> {
         let url = format!("{}/predict/{}", self.base_url, inference_id);
-        let payload = json!({
-            "inputs": inputs.iter().map(|item| item.data.clone()).collect::<Vec<_>>(),
-        });
-        let mut form = Form::new().text("data", serde_json::to_string(&payload)?);
-        for (idx, input) in inputs.iter().enumerate() {
-            if let Some(file) = &input.file {
-                let part = file_to_part(idx, file).await?;
-                form = form.part("files", part);
+        let mut attempts: u32 = 0;
+        loop {
+            let form = build_predict_form(inputs).await?;
+            let response = self
+                .raw_client
+                .post(&url)
+                .query(&[
+                    ("cache_key", cache_key),
+                    ("lru_size", &lru_size.to_string()),
+                    ("ttl_seconds", &ttl_seconds.to_string()),
+                ])
+                .multipart(form)
+                .send()
+                .await;
+
+            match response {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let content_type = response
+                            .headers()
+                            .get(CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = response.bytes().await?.to_vec();
+                        return parse_predict_response(&content_type, &body);
+                    }
+
+                    let status = response.status();
+                    if should_retry_status(status) {
+                        if let Some(delay) = next_retry_delay(attempts) {
+                            attempts += 1;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(%url, %status, %body, "inference predict failed");
+                    bail!("inference predict failed ({status})");
+                }
+                Err(err) => {
+                    if should_retry_error(&err) {
+                        if let Some(delay) = next_retry_delay(attempts) {
+                            attempts += 1;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                    warn!(%url, error = %err, "inference predict request failed");
+                    return Err(err).context("inference predict request failed");
+                }
             }
         }
-
-        let response = self
-            .client
-            .post(url)
-            .query(&[
-                ("cache_key", cache_key),
-                ("lru_size", &lru_size.to_string()),
-                ("ttl_seconds", &ttl_seconds.to_string()),
-            ])
-            .multipart(form)
-            .send()
-            .await
-            .context("inference predict request failed")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            bail!("inference predict failed ({status}): {body}");
-        }
-
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = response.bytes().await?.to_vec();
-        parse_predict_response(&content_type, &body)
     }
 
     pub async fn load_model(
@@ -250,9 +272,40 @@ async fn file_to_part(idx: usize, file: &InferenceFile) -> Result<Part> {
         }
         InferenceFile::Bytes(bytes) => Part::bytes(bytes.clone()),
     };
-    Ok(part
-        .file_name(name)
-        .mime_str("application/octet-stream")?)
+    Ok(part.file_name(name).mime_str("application/octet-stream")?)
+}
+
+async fn build_predict_form(inputs: &[InferenceInput]) -> Result<Form> {
+    let payload = json!({
+        "inputs": inputs.iter().map(|item| item.data.clone()).collect::<Vec<_>>(),
+    });
+    let mut form = Form::new().text("data", serde_json::to_string(&payload)?);
+    for (idx, input) in inputs.iter().enumerate() {
+        if let Some(file) = &input.file {
+            let part = file_to_part(idx, file).await?;
+            form = form.part("files", part);
+        }
+    }
+    Ok(form)
+}
+
+fn should_retry_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
+
+fn should_retry_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
+fn next_retry_delay(attempts: u32) -> Option<std::time::Duration> {
+    if attempts >= PREDICT_MAX_RETRIES {
+        return None;
+    }
+    let multiplier = 1u64 << attempts;
+    let min_ms = PREDICT_MIN_DELAY.as_millis() as u64;
+    let max_ms = PREDICT_MAX_DELAY.as_millis() as u64;
+    let delay_ms = min_ms.saturating_mul(multiplier).min(max_ms);
+    Some(Duration::from_millis(delay_ms))
 }
 
 fn normalize_base_url(raw: String) -> String {
@@ -275,8 +328,8 @@ fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictOutp
     }
 
     if content_type.contains("multipart/mixed") {
-        let boundary = extract_boundary(content_type)
-            .context("multipart response missing boundary")?;
+        let boundary =
+            extract_boundary(content_type).context("multipart response missing boundary")?;
         let outputs = parse_multipart_outputs(body, &boundary)?;
         return Ok(PredictOutput::Binary(outputs));
     }
@@ -290,7 +343,10 @@ fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictOutp
 
 async fn parse_json_response(response: reqwest::Response) -> Result<Value> {
     if response.status().is_success() {
-        return response.json::<Value>().await.context("decode inference response");
+        return response
+            .json::<Value>()
+            .await
+            .context("decode inference response");
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();

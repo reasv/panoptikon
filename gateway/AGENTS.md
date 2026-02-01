@@ -115,9 +115,11 @@ PQL Rewrite (Rust, Planned)
   - `preprocess_query_async` embeds queries via the inference upstream and loads model metadata for distance-function overrides; the sync preprocessor accepts base64 embeddings or prefilled `_embedding` fields.
   - Inference metadata is cached per inference base URL (5-minute TTL) to avoid repeated `/metadata` calls during preprocessing.
     - Callers that need fresh metadata can construct the client with caching disabled (`InferenceApiClient::from_settings_with_metadata_cache(..., false)`).
-  - Search-time embeddings are cached in-process with a global LRU keyed by `(model, kind, query)`; cache size is controlled by `search.embedding_cache_size` in gateway config.
+- Search-time embeddings are cached in-process with a global LRU keyed by `(model, kind, query)`; cache size is controlled by `search.embedding_cache_size` in gateway config.
   - `/api/search/embeddings/cache` provides cache stats and allows clearing the embedding cache.
   - Embedding decoding accepts `f16/f32/f64`, integer/boolean dtypes, and both C/Fortran order; non-float inputs are coerced to `f32` and 2-D arrays use the first row.
+  - Inference predict calls (multipart uploads) bypass the retry middleware and use a raw reqwest client with manual retry logic because multipart bodies are not clonable.
+  - Inference embed/metadata errors are sanitized in client responses; detailed error context is logged server-side.
   - `/api/search/pql` and `/api/search/pql/build` now use the Rust compiler; no Python PQL calls remain in the gateway.
   - Test strategy (results + performance invariants):
     - Use Python `/api/search/pql/build` as the reference compiler for fixtures during development when needed.
