@@ -1,17 +1,18 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::{
     collections::BTreeMap,
-    env,
-    fs,
+    env, fs,
     path::{Component, Path, PathBuf},
 };
+use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
 use crate::pql::model::{JobFilter, Match};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub(crate) struct CronJob {
     pub inference_id: String,
     #[serde(default)]
@@ -20,7 +21,7 @@ pub(crate) struct CronJob {
     pub threshold: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub(crate) struct JobSettings {
     pub group_name: String,
     #[serde(default)]
@@ -31,7 +32,7 @@ pub(crate) struct JobSettings {
     pub default_threshold: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SystemConfig {
     #[serde(default = "default_true")]
     pub remove_unavailable_files: bool,
@@ -73,6 +74,7 @@ pub(crate) struct SystemConfig {
 
     /// Unknown keys are preserved to keep forward/backward compatibility.
     #[serde(flatten)]
+    #[schema(value_type = std::collections::BTreeMap<String, JsonValue>)]
     pub extra: BTreeMap<String, toml::Value>,
 }
 
@@ -244,7 +246,10 @@ mod tests {
         let config = store.load("default").unwrap();
 
         let default = SystemConfig::default();
-        assert_eq!(config.remove_unavailable_files, default.remove_unavailable_files);
+        assert_eq!(
+            config.remove_unavailable_files,
+            default.remove_unavailable_files
+        );
         assert_eq!(config.scan_images, default.scan_images);
         assert_eq!(config.scan_video, default.scan_video);
         assert!(config.job_filters.is_empty());

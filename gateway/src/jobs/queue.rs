@@ -5,16 +5,17 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
+use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
 use crate::db::index_writer::IndexDbWriterMessage;
 use crate::db::index_writer::call_index_db_writer;
-use crate::jobs::files::FileScanService;
 use crate::jobs::continuous_scan;
+use crate::jobs::files::FileScanService;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobType {
     DataExtraction,
@@ -40,7 +41,7 @@ pub(crate) struct Job {
     pub tag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct JobModel {
     pub queue_id: i64,
     pub job_type: JobType,
@@ -53,7 +54,7 @@ pub(crate) struct JobModel {
     pub tag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct QueueStatusModel {
     pub queue: Vec<JobModel>,
 }

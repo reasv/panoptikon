@@ -1,5 +1,6 @@
-use sqlx::Row;
 use serde::Serialize;
+use sqlx::Row;
+use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
 
@@ -39,7 +40,7 @@ pub(crate) async fn get_existing_setters(
     Ok(results)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct LogRecord {
     pub id: i64,
     pub start_time: String,
@@ -389,9 +390,7 @@ mod tests {
         .execute(&mut dbs.index_conn)
         .await
         .unwrap();
-        let totals = get_setters_total_data(&mut dbs.index_conn)
-            .await
-            .unwrap();
+        let totals = get_setters_total_data(&mut dbs.index_conn).await.unwrap();
         assert_eq!(totals, vec![("alpha".to_string(), 2)]);
     }
 

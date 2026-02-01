@@ -2,10 +2,11 @@ use sqlx::Row;
 
 use crate::api_error::ApiError;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub(crate) struct FileScanRecord {
     pub id: i64,
     pub start_time: String,
@@ -388,9 +389,7 @@ AND path LIKE ?1 || '%'
     Ok((marked_unavailable, available_files))
 }
 
-pub(crate) async fn delete_unavailable_files(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<u64> {
+pub(crate) async fn delete_unavailable_files(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let result = sqlx::query(
         r#"
 DELETE FROM files
@@ -442,7 +441,9 @@ mod tests {
         .await
         .unwrap();
 
-        let scans = get_all_file_scans(&mut dbs.index_conn, 1, None).await.unwrap();
+        let scans = get_all_file_scans(&mut dbs.index_conn, 1, None)
+            .await
+            .unwrap();
         let scan = scans.into_iter().find(|scan| scan.id == scan_id).unwrap();
 
         assert_eq!(scan.path, r"C:\data");
@@ -486,18 +487,18 @@ VALUES
         .await
         .unwrap();
 
-        let (marked, available) =
-            mark_unavailable_files(&mut dbs.index_conn, scan_id, r"C:\data\")
-                .await
-                .unwrap();
+        let (marked, available) = mark_unavailable_files(&mut dbs.index_conn, scan_id, r"C:\data\")
+            .await
+            .unwrap();
 
         assert_eq!(marked, 1);
         assert_eq!(available, 0);
 
-        let row: (i64,) = sqlx::query_as("SELECT available FROM files WHERE path = 'C:\\other\\two.png'")
-            .fetch_one(&mut dbs.index_conn)
-            .await
-            .unwrap();
+        let row: (i64,) =
+            sqlx::query_as("SELECT available FROM files WHERE path = 'C:\\other\\two.png'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
         assert_eq!(row.0, 1);
     }
 
