@@ -253,7 +253,10 @@ async fn get_correct_path(
     sha256: &str,
     path: Option<String>,
 ) -> ApiResult<String> {
-    let trimmed_path = path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let trimmed_path = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(path) = trimmed_path {
         let files = get_existing_files_for_sha256(conn, sha256).await?;
         if files.is_empty() || !files.iter().any(|file| file.path == path) {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use sqlx::Row;
 use std::{collections::HashMap, path::PathBuf};
+use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
 
@@ -681,9 +681,10 @@ fn limit_tags_by_namespace(
     let mut tags_with_index: Vec<(usize, (String, String, f64, String))> =
         tags.into_iter().enumerate().collect();
     tags_with_index.sort_by(|a, b| {
-        let cmp = b.1 .2
-            .partial_cmp(&a.1 .2)
-            .unwrap_or(std::cmp::Ordering::Equal);
+        let cmp =
+            b.1.2
+                .partial_cmp(&a.1.2)
+                .unwrap_or(std::cmp::Ordering::Equal);
         if cmp == std::cmp::Ordering::Equal {
             a.0.cmp(&b.0)
         } else {
@@ -741,9 +742,7 @@ pub(crate) async fn get_all_mime_types(
     Ok(mime_types)
 }
 
-pub(crate) async fn get_file_stats(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<(i64, i64)> {
+pub(crate) async fn get_file_stats(conn: &mut sqlx::SqliteConnection) -> ApiResult<(i64, i64)> {
     let file_row = sqlx::query(
         r#"
         SELECT COUNT(*) AS total_files
@@ -816,7 +815,10 @@ pub(crate) async fn get_thumbnail_bytes(
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
-    use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_path(label: &str) -> PathBuf {
         let stamp = SystemTime::now()

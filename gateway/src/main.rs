@@ -6,8 +6,8 @@ mod inferio_client;
 mod jobs;
 mod openapi;
 mod policy;
-mod proxy;
 mod pql;
+mod proxy;
 #[cfg(test)]
 mod test_utils;
 
@@ -131,7 +131,10 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/items/item/text", get(api::items::item_text))
             .route("/api/items/item/tags", get(api::items::item_tags))
             .route("/api/items/text/any", get(api::items::texts_any))
-            .route("/api/open/file/{sha256}", post(api::open::open_file_on_host))
+            .route(
+                "/api/open/file/{sha256}",
+                post(api::open::open_file_on_host),
+            )
             .route(
                 "/api/open/folder/{sha256}",
                 post(api::open::show_in_file_manager),
@@ -157,17 +160,22 @@ async fn async_main() -> anyhow::Result<()> {
                     post(api::jobs::enqueue_data_extraction)
                         .delete(api::jobs::enqueue_delete_extracted_data),
                 )
-                .route("/api/jobs/folders/rescan", post(api::jobs::enqueue_folder_rescan))
+                .route(
+                    "/api/jobs/folders/rescan",
+                    post(api::jobs::enqueue_folder_rescan),
+                )
                 .route(
                     "/api/jobs/folders",
                     get(api::jobs::get_folders).put(api::jobs::enqueue_update_folders),
                 )
                 .route("/api/jobs/cancel", post(api::jobs::cancel_current_job))
-                .route("/api/jobs/folders/history", get(api::jobs::get_scan_history))
+                .route(
+                    "/api/jobs/folders/history",
+                    get(api::jobs::get_scan_history),
+                )
                 .route(
                     "/api/jobs/data/history",
-                    get(api::jobs::get_extraction_history)
-                        .delete(api::jobs::delete_scan_data),
+                    get(api::jobs::get_extraction_history).delete(api::jobs::delete_scan_data),
                 )
                 .route(
                     "/api/jobs/config",
@@ -177,7 +185,10 @@ async fn async_main() -> anyhow::Result<()> {
                     "/api/jobs/data/setters/total",
                     get(api::jobs::get_setter_data_count),
                 )
-                .route("/api/jobs/cronjob/run", post(api::jobs::manual_trigger_cronjob));
+                .route(
+                    "/api/jobs/cronjob/run",
+                    post(api::jobs::manual_trigger_cronjob),
+                );
         }
     }
 
