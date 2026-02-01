@@ -1,4 +1,23 @@
 use utoipa::OpenApi;
+use utoipa::Modify;
+use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType};
+
+struct JsonValueSchema;
+
+impl Modify for JsonValueSchema {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.schemas.insert(
+            "Value".to_string(),
+            Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::AnyValue)
+                    .build(),
+            )
+            .into(),
+        );
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -147,7 +166,8 @@ use utoipa::OpenApi;
         (name = "jobs"),
         (name = "bookmarks"),
         (name = "database")
-    )
+    ),
+    modifiers(&JsonValueSchema)
 )]
 #[allow(dead_code)]
 pub struct ApiDoc;
