@@ -16,6 +16,8 @@ use utoipa::OpenApi;
         crate::api::items::item_text,
         crate::api::items::item_tags,
         crate::api::items::texts_any,
+        crate::api::open::open_file_on_host,
+        crate::api::open::show_in_file_manager,
         crate::api::bookmarks::bookmark_namespaces,
         crate::api::bookmarks::bookmark_users,
         crate::api::bookmarks::bookmarks_by_namespace,
@@ -46,6 +48,7 @@ use utoipa::OpenApi;
             crate::api::items::FileRecordResponse,
             crate::api::items::TextResponse,
             crate::api::items::TagResponse,
+            crate::api::open::OpenResponse,
             crate::db::items::ExtractedTextRecord,
             crate::db::items::ItemIdentifierType,
             crate::api::bookmarks::BookmarkNamespaces,
@@ -112,6 +115,7 @@ use utoipa::OpenApi;
     tags(
         (name = "search", description = "Search and PQL endpoints"),
         (name = "items"),
+        (name = "open"),
         (name = "bookmarks"),
         (name = "database")
     )

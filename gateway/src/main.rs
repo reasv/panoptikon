@@ -131,6 +131,11 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/items/item/text", get(api::items::item_text))
             .route("/api/items/item/tags", get(api::items::item_tags))
             .route("/api/items/text/any", get(api::items::texts_any))
+            .route("/api/open/file/{sha256}", post(api::open::open_file_on_host))
+            .route(
+                "/api/open/folder/{sha256}",
+                post(api::open::show_in_file_manager),
+            )
             .route("/api/search/pql", post(api::search::search_pql))
             .route("/api/search/pql/build", post(api::search::search_pql_build))
             .route(

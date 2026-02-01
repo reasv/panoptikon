@@ -52,7 +52,8 @@ Special handling:
   `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`,
   `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`,
   `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`,
-  `/api/items/text/any`, `/api/search/pql`, `/api/search/pql/build`,
+  `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`,
+  `/api/search/pql`, `/api/search/pql/build`,
   `/api/search/embeddings/cache`,
   `/api/search/tags`,
   `/api/search/tags/top`, and `/api/search/stats`

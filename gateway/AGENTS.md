@@ -10,7 +10,7 @@ Architecture (current)
 - Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/openapi.json` is served locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/openapi.json` is served locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
@@ -90,7 +90,7 @@ PQL Rewrite (Rust, Planned)
 
 - Goal: fully replace the Python PQL compiler with a Rust implementation that is behaviorally identical for both results and performance-critical SQL structure.
 - Rollout: gated by an explicit experimental env flag; when enabled, Rust PQL is the only path (no proxy fallback, no shadow mode).
-- OpenAPI: PQL types are annotated for OpenAPI generation from the start, but `/openapi.json` will remain proxied until the Rust API surface is complete.
+- OpenAPI: PQL types are annotated for OpenAPI generation from the start; when `upstreams.api.local = true`, `/openapi.json` is served from the Rust generator even though some endpoints are still proxied.
 - Architecture:
   - Schema/AST: `serde` models mirror the Pydantic union shapes and field names (`and_`, `or_`, `not_`, filter fields).
   - Preprocess/validation: matches Python behavior exactly, including filter-specific mutations (e.g., `MatchText.filter_only`).
