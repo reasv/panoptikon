@@ -64,6 +64,8 @@ sea-query-sqlx = { version = "=0.8.0-rc.14", features = [
 ] }
 shell-words = "1"
 utoipa = "5.4"
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa-redoc = { version = "6", features = ["axum"] }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"

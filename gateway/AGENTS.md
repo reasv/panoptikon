@@ -7,16 +7,16 @@ Purpose
 
 Architecture (current)
 
-- Router: Axum routes for `/api`, `/docs`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
+- Router: Axum routes for `/api`, `/docs`, `/redoc`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/openapi.json` is served locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/openapi.json`, `/docs`, and `/redoc` are served locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
 
 - Policy selection by effective host (`Host`, optionally forwarded headers).
-- Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/openapi.json`).
+- Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/redoc`, `/openapi.json`).
 - `.env` is loaded at startup (if present) so env-based config can be set via dotenv files.
 - On Windows, the gateway sets the executable stack size via linker flags
   (`/STACK:8388608` for MSVC, `--stack,8388608` for GNU) to avoid startup stack

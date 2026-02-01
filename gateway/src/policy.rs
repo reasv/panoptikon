@@ -247,7 +247,11 @@ fn apply_policy(
 }
 
 fn is_api_surface(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path == "/docs" || path == "/openapi.json"
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/docs"
+        || path == "/redoc"
+        || path == "/openapi.json"
 }
 
 fn is_inference_path(path: &str) -> bool {
@@ -263,7 +267,7 @@ fn is_db_create_path(path: &str) -> bool {
 }
 
 fn needs_db_params(path: &str) -> bool {
-    if path == "/docs" || path == "/openapi.json" {
+    if path == "/docs" || path == "/redoc" || path == "/openapi.json" {
         return false;
     }
     if is_db_info_path(path) || is_db_create_path(path) || is_inference_path(path) {

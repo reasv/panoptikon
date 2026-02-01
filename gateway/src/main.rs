@@ -19,6 +19,10 @@ use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use utoipa::OpenApi;
+use utoipa_redoc::Redoc;
+use utoipa_redoc::Servable;
+use utoipa_swagger_ui::SwaggerUi;
 
 fn env_truthy(key: &str) -> bool {
     match env::var(key) {
@@ -148,7 +152,8 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
             .route("/api/search/stats", get(api::search::get_stats))
-            .route("/openapi.json", get(api::openapi::openapi_json));
+            .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
+            .merge(Redoc::with_url("/redoc", openapi::ApiDoc::openapi()));
         if env_truthy("EXPERIMENTAL_RUST_JOBS") {
             app = app
                 .route(
