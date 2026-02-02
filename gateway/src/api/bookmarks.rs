@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
 use crate::db::bookmarks::{
     BookmarkSearchResult, add_bookmark, delete_bookmark, delete_bookmarks_exclude_last_n,
@@ -171,6 +172,7 @@ pub(crate) struct MessageResult {
     path = "/api/bookmarks/ns",
     tag = "bookmarks",
     summary = "Get all bookmark namespaces",
+    params(DbQueryParams),
     responses(
         (status = 200, description = "Bookmark namespaces", body = BookmarkNamespaces)
     )
@@ -187,6 +189,7 @@ pub async fn bookmark_namespaces(
     path = "/api/bookmarks/users",
     tag = "bookmarks",
     summary = "Get all users with bookmarks",
+    params(DbQueryParams),
     responses(
         (status = 200, description = "Bookmark users", body = BookmarkUsers)
     )
@@ -203,6 +206,7 @@ pub async fn bookmark_users(mut db: DbConnection<ReadOnly>) -> ApiResult<Json<Bo
     summary = "Get all bookmarks in a namespace",
     description = "Get all items bookmarked in namespace.\nNote that unlike the search API, this returns unique items, not files.\nThis has two implications:\n1. Results are unique by `sha256` value.\n2. Even if multiple files have the same `sha256` value, they will only appear once in the results, with the path of the first reachable file found.\n\nThe `order_by` parameter can be used to sort the results by `last_modified`, `path`, or `time_added`.\nThe `order` parameter can be used to sort the results in ascending or descending order.\nThe `include_wildcard` parameter can be used to include bookmarks with the `*` user value.",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to get the bookmarks from. Wildcard ('*') results in getting bookmarks from all namespaces."),
         BookmarkListQuery
     ),
@@ -236,6 +240,7 @@ pub async fn bookmarks_by_namespace(
     summary = "Delete all/many bookmarks in a namespace",
     description = "Delete all bookmarks in a namespace. If `exclude_last_n` is provided, the last `n` added bookmarks will be kept.\nAlternatively, a list of `sha256` values can be provided in the request body to only delete specific bookmarks.",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to delete the bookmarks from. Wildcard ('*') results in deleting bookmarks from all namespaces."),
         DeleteNamespaceQuery
     ),
@@ -270,6 +275,7 @@ pub async fn delete_bookmarks_by_namespace(
     summary = "Add multiple bookmarks to a namespace",
     description = "Add multiple bookmarks to a namespace.\nThe `sha256` values of the items to be bookmarked should be provided in the request body.\nOptionally, metadata can be provided.\nIf metadata is provided, it should be a dictionary where the keys are the `sha256`\nvalues and the values are dictionaries of metadata.\nIf the sha256 value is not in the metadata dictionary keys, the entire metadata dictionary\nwill be used as metadata for the the sha256 item.\nYou can use this to set the same metadata for all items.\n\nExample request body:\n```\n{\n    \"sha256\": [\"<sha256_1>\", \"<sha256_2>\", ...],\n    \"metadata\": {\n        \"<sha256_1>: {\n            \"key1\": \"value1\",\n            \"key2\": \"value2\",\n            ...\n        },\n        \"key1\": \"value1\",\n        \"key2\": \"value2\",\n        ...\n    }\n}\n```",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to save the bookmarks under. Wildcard is not allowed here."),
         BookmarkSaveUserQuery
     ),
@@ -297,6 +303,7 @@ pub async fn add_bookmarks_by_namespace(
     summary = "Get a bookmark by namespace and sha256",
     description = "Get a bookmark by namespace and sha256.\nReturns whether the bookmark exists and the metadata.",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to get the bookmark from. Use '*' wildcard to mean 'any namespace', in which case it will return the first result found."),
         ("sha256" = String, Path, description = "The sha256 of the item"),
         BookmarkGetUserQuery
@@ -321,6 +328,7 @@ pub async fn get_bookmark(
     summary = "Add a bookmark by namespace and sha256",
     description = "Add a bookmark by namespace and sha256.\nOptionally, metadata can be provided as the request body.\nMetadata should be a dictionary of key-value pairs.",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to save the bookmark under. Wildcard is not allowed here."),
         ("sha256" = String, Path, description = "The sha256 of the item"),
         BookmarkSaveUserQuery
@@ -356,6 +364,7 @@ pub async fn add_bookmark_by_sha256(
     summary = "Get all bookmarks for an item",
     description = "Get all bookmarks for an item.\nReturns a list of namespaces and metadata for each bookmark.",
     params(
+        DbQueryParams,
         ("sha256" = String, Path),
         ItemBookmarksQuery
     ),
@@ -378,6 +387,7 @@ pub async fn bookmarks_item(
     tag = "bookmarks",
     summary = "Delete a specific bookmark by namespace and sha256",
     params(
+        DbQueryParams,
         ("namespace" = String, Path, description = "The namespace to delete the bookmark from. Wildcard ('*') results in deleting bookmarks for an item from all namespaces."),
         ("sha256" = String, Path, description = "The sha256 of the item"),
         BookmarkDeleteUserQuery

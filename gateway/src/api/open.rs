@@ -5,6 +5,7 @@ use std::{env, path::Path as FsPath};
 use tokio::process::Command;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
 use crate::db::items::get_existing_files_for_sha256;
 use crate::db::{DbConnection, ReadOnly};
@@ -293,6 +294,7 @@ async fn get_correct_path(
     summary = "Open a file in the default application",
     description = "Open a file in the default application on the host system.\nThis is done using os.startfile on Windows and xdg-open on Linux.\nThis is a potentially dangerous operation, as it can execute arbitrary code.",
     params(
+        DbQueryParams,
         ("sha256" = String, Path),
         OpenQuery
     ),
@@ -320,6 +322,7 @@ pub async fn open_file_on_host(
     summary = "Show a file in the host system's file manager",
     description = "Show a file in the host system's file manager.\nThis is done using the appropriate command for the host system.\nOn Windows, the file is highlighted in the Windows Explorer.\nOn macOS, the file is revealed in the Finder.\nThis is a potentially dangerous operation.",
     params(
+        DbQueryParams,
         ("sha256" = String, Path),
         OpenQuery
     ),

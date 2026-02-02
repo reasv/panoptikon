@@ -1,3 +1,4 @@
+use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
 use crate::db::extraction_log::get_existing_setters;
@@ -236,7 +237,7 @@ pub(crate) struct SearchStats {
     tag = "search",
     summary = "Search tag names for autocompletion",
     description = "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nThe tags are returned in descending order of the number of items tagged.",
-    params(TagSearchQuery),
+    params(DbQueryParams, TagSearchQuery),
     responses(
         (status = 200, description = "Tag autocomplete results", body = TagSearchResults)
     )
@@ -255,7 +256,7 @@ pub async fn get_tags(
     tag = "search",
     summary = "Get the most common tags in the database",
     description = "Get the most common tags in the database, based on the provided query parameters.\nThe result is a list of tuples, where each tuple contains the namespace, tag name, \noccurrences count, and relative frequency % (occurrences / total item_setter pairs).\nThe latter value is expressed as a float between 0 and 1.\nThe tags are returned in descending order of frequency.\nThe `limit` parameter can be used to control the number of tags to return.\nThe `namespace` parameter can be used to restrict the search to a specific tag namespace.\nThe `setters` parameter can be used to restrict the search to specific setters.\nThe `confidence_threshold` parameter can be used to filter tags based on the minimum confidence threshold.",
-    params(TopTagsQuery),
+    params(DbQueryParams, TopTagsQuery),
     responses(
         (status = 200, description = "Most common tags", body = TagFrequency)
     )
@@ -289,7 +290,7 @@ pub async fn get_top_tags(
     tag = "search",
     summary = "Get statistics on the searchable data",
     description = "Get statistics on the data indexed in the database.\nThis includes information about the tag namespaces, bookmark namespaces, file types, and folders present.\nMost importantly, it includes the list of currently existing setters for each data type.\nThis information is relevant for building search queries.",
-    params(SearchStatsQuery),
+    params(DbQueryParams, SearchStatsQuery),
     responses(
         (status = 200, description = "Search statistics", body = SearchStats)
     )
@@ -308,6 +309,7 @@ pub async fn get_stats(
     tag = "search",
     summary = "Search for files and items in the database",
     description = "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.",
+    params(DbQueryParams),
     request_body(
         content = Option<PqlQuery>,
         description = "The PQL Search query to execute"
@@ -374,6 +376,7 @@ pub async fn search_pql(
     tag = "search",
     summary = "Build PQL search queries without executing them",
     description = "Build the SQL queries for the provided PQL search query without executing them.",
+    params(DbQueryParams),
     request_body(
         content = Option<PqlQuery>,
         description = "The PQL Search query to execute"
@@ -549,7 +552,7 @@ pub(crate) struct CacheQuery {
     tag = "search",
     summary = "Get embedding cache stats",
     description = "Returns cache usage and paginated entries for the search embedding cache.",
-    params(CacheQuery),
+    params(DbQueryParams, CacheQuery),
     responses(
         (status = 200, description = "Embedding cache stats", body = EmbeddingCacheStats)
     )
@@ -570,7 +573,7 @@ pub async fn get_search_cache(
     tag = "search",
     summary = "Clear embedding cache",
     description = "Clears the search embedding cache and returns updated cache stats.",
-    params(CacheQuery),
+    params(DbQueryParams, CacheQuery),
     responses(
         (status = 200, description = "Embedding cache stats after clearing", body = EmbeddingCacheStats)
     )

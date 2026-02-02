@@ -10,6 +10,7 @@ use std::path::Path;
 use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::api::db_params::DbQueryParams;
 use crate::api::utils::{content_disposition_value, iso_to_system_time, strip_non_latin1_chars};
 use crate::api_error::ApiError;
 use crate::db::items::{
@@ -135,7 +136,7 @@ pub(crate) struct ThumbnailQuery {
     tag = "items",
     summary = "Get actual file contents for an item",
     description = "Returns the actual file contents for a given item.\nContent type is determined by the file extension.",
-    params(ItemQuery),
+    params(DbQueryParams, ItemQuery),
     responses(
         (status = 200, description = "Item file contents")
     )
@@ -168,7 +169,7 @@ pub async fn item_file(
     tag = "items",
     summary = "Get item metadata and associated file metadata",
     description = "Returns metadata for a given item.\nThis includes the item metadata and a list of all files associated with the item.\nFiles that do not exist on disk will not be included in the response.\nThis means the file list may be empty.\n\nAn `item` is a unique file. `item`s can have multiple `file`s associated with them, but unlike `file`s, `item`s have a unique sha256 hash.\nFiles are unique by `path`. If all files associated with an `item` are deleted, the item is deleted.",
-    params(ItemQuery),
+    params(DbQueryParams, ItemQuery),
     responses(
         (status = 200, description = "Item metadata", body = ItemMetadataResponse)
     )
@@ -196,7 +197,7 @@ pub async fn item_meta(
     tag = "items",
     summary = "Get all text extracted from an item",
     description = "Returns the text extracted from a given item",
-    params(ItemTextQuery),
+    params(DbQueryParams, ItemTextQuery),
     responses(
         (status = 200, description = "Extracted text", body = TextResponse)
     )
@@ -239,7 +240,7 @@ pub async fn item_text(
     tag = "items",
     summary = "Get tags for an item",
     description = "Returns the tags associated with a given item.\nThe response contains a list of tuples, where each tuple contains\nthe tag namespace, tag name, confidence, and setter name.\nThe `setters` parameter can be used to filter tags by the setter name.\nThe `confidence_threshold` parameter can be used to filter tags based on\nthe minimum confidence threshold",
-    params(ItemTagsQuery),
+    params(DbQueryParams, ItemTagsQuery),
     responses(
         (status = 200, description = "Item tags", body = TagResponse)
     )
@@ -272,7 +273,7 @@ pub async fn item_tags(
     tag = "items",
     summary = "Get text from text_ids",
     description = "Returns texts given a list of text IDs",
-    params(TextAnyQuery),
+    params(DbQueryParams, TextAnyQuery),
     responses(
         (status = 200, description = "Extracted text entries", body = TextResponse)
     )
@@ -291,7 +292,7 @@ pub async fn texts_any(
     tag = "items",
     summary = "Get thumbnail for an item",
     description = "Returns a thumbnail for a given item.\nThe thumbnail may be a thumbnail,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).",
-    params(ThumbnailQuery),
+    params(DbQueryParams, ThumbnailQuery),
     responses(
         (status = 200, description = "Item thumbnail image")
     )
