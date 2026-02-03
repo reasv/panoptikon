@@ -112,14 +112,19 @@ The system config now parses `job_filters`/`filescan_filter` as PQL objects;
 invalid PQL in config will fail to load (matching Python behavior).
 
 Continuous file scanning is independent of the job queue and is controlled per
-index DB via the system config (`continuous_filescan = true`). A supervisor
+index DB via the system config `[continuous_filescan]` section. A supervisor
 actor spawns one continuous scan actor per enabled DB. Each actor creates a
 `file_scans` row with path `"<continuous>"` while active, uses notify-based
 watchers to react to filesystem changes, and writes through the index DB writer
 actor. Continuous scanning pauses automatically when a full rescan or folder
-update job starts on the same DB and resumes afterward. To force polling (e.g.,
-for unreliable shares), set `continuous_filescan_poll_interval_secs` to a
-number of seconds (uses `notify::PollWatcher` instead of native watchers).
+update job starts on the same DB and resumes afterward. If
+`[continuous_filescan].included_folders` is set, watcher roots are limited to
+those paths; they must be under the DB’s global `included_folders` and not under
+`excluded_folders`, otherwise continuous scanning is disabled for that DB until
+fixed. To force polling (e.g., for unreliable shares), set
+`[continuous_filescan].poll_interval_secs` to a number of seconds (uses
+`notify::PollWatcher` instead of native watchers). There is no native watcher
+exclude support, so continuous-scan excludes are not implemented.
 
 To add migrations, use SQLx's CLI against the appropriate source directory:
 

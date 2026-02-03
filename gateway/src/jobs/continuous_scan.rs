@@ -134,6 +134,13 @@ pub(crate) struct ContinuousScanActorArgs {
     pub enable_watcher: bool,
 }
 
+struct WatchRootsOutcome {
+    watch_roots: Vec<PathBuf>,
+    excluded_roots: Vec<PathBuf>,
+    valid: bool,
+    invalid_includes: Vec<String>,
+}
+
 struct ScanStats {
     new_items: i64,
     unchanged_files: i64,
@@ -168,6 +175,57 @@ impl ScanStats {
     }
 }
 
+fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
+    let mut included = config.included_folders.clone();
+    included.retain(|folder| check_folder_validity(folder));
+    let global_included = deduplicate_paths(&included);
+    let global_included_roots: Vec<PathBuf> =
+        global_included.iter().map(|path| PathBuf::from(path)).collect();
+
+    let global_excluded_roots: Vec<PathBuf> = config
+        .excluded_folders
+        .iter()
+        .map(|path| normalize_path(path, true))
+        .collect();
+
+    let mut watch_roots: Vec<PathBuf> = Vec::new();
+    let mut invalid_includes: Vec<String> = Vec::new();
+    let continuous_includes = &config.continuous_filescan.included_folders;
+    if continuous_includes.is_empty() {
+        watch_roots = global_included_roots.clone();
+    } else {
+        let mut continuous = continuous_includes.clone();
+        continuous.retain(|folder| check_folder_validity(folder));
+        let deduped = deduplicate_paths(&continuous);
+        for folder in &deduped {
+            let path = PathBuf::from(folder);
+            let under_global = global_included_roots.iter().any(|root| path.starts_with(root));
+            let under_excluded = is_excluded(&path, &global_excluded_roots);
+            if !under_global || under_excluded {
+                invalid_includes.push(folder.clone());
+                continue;
+            }
+            watch_roots.push(path);
+        }
+    }
+
+    if !watch_roots.is_empty() {
+        let watch_strings: Vec<String> =
+            watch_roots.iter().map(|path| path.to_string_lossy().to_string()).collect();
+        let deduped = deduplicate_paths(&watch_strings);
+        watch_roots = deduped.into_iter().map(PathBuf::from).collect();
+    }
+
+    let invalid = !continuous_includes.is_empty() && watch_roots.is_empty();
+
+    WatchRootsOutcome {
+        watch_roots,
+        excluded_roots: global_excluded_roots,
+        valid: !invalid,
+        invalid_includes,
+    }
+}
+
 enum WatcherHandle {
     Recommended(RecommendedWatcher),
     Poll(PollWatcher),
@@ -178,7 +236,7 @@ pub(crate) struct ContinuousScanState {
     user_data_db: String,
     config_store: SystemConfigStore,
     config: SystemConfig,
-    included_roots: Vec<PathBuf>,
+    watch_roots: Vec<PathBuf>,
     excluded_roots: Vec<PathBuf>,
     allowed_extensions: HashSet<String>,
     filescan_filter: Option<Arc<Match>>,
@@ -199,23 +257,20 @@ impl ContinuousScanState {
         self.stats = ScanStats::new();
     }
 
-    fn refresh_roots(&mut self) {
-        let mut included = self.config.included_folders.clone();
-        included.retain(|folder| check_folder_validity(folder));
-        let deduped = deduplicate_paths(&included);
-        self.included_roots = deduped
-            .iter()
-            .map(|path| normalize_path(path, true))
-            .collect();
-
-        self.excluded_roots = self
-            .config
-            .excluded_folders
-            .iter()
-            .map(|path| normalize_path(path, true))
-            .collect();
+    fn refresh_roots(&mut self) -> bool {
+        let outcome = compute_watch_roots(&self.config);
+        self.watch_roots = outcome.watch_roots;
+        self.excluded_roots = outcome.excluded_roots;
         self.allowed_extensions = build_extension_set(&self.config);
         self.filescan_filter = parse_filescan_filter(&self.config).map(Arc::new);
+        if !outcome.valid {
+            tracing::warn!(
+                index_db = %self.index_db,
+                invalid_includes = ?outcome.invalid_includes,
+                "continuous scan disabled: includes must be within global included roots and not under excluded roots"
+            );
+        }
+        outcome.valid
     }
 
     async fn start_scan(&mut self) -> ApiResult<()> {
@@ -284,7 +339,7 @@ impl ContinuousScanState {
     }
 
     fn should_process_path(&self, path: &Path) -> bool {
-        if self.included_roots.is_empty() {
+        if self.watch_roots.is_empty() {
             return false;
         }
         if is_hidden_or_temp(path) {
@@ -293,7 +348,7 @@ impl ContinuousScanState {
         if !has_allowed_extension(path, &self.allowed_extensions) {
             return false;
         }
-        let is_included = self.included_roots.iter().any(|root| path.starts_with(root));
+        let is_included = self.watch_roots.iter().any(|root| path.starts_with(root));
         if !is_included {
             return false;
         }
@@ -498,7 +553,7 @@ impl Actor for ContinuousScanActor {
             user_data_db: args.user_data_db,
             config_store,
             config,
-            included_roots: Vec::new(),
+            watch_roots: Vec::new(),
             excluded_roots: Vec::new(),
             allowed_extensions: HashSet::new(),
             filescan_filter: None,
@@ -515,15 +570,15 @@ impl Actor for ContinuousScanActor {
             enable_watcher: args.enable_watcher,
         };
 
-        state.refresh_roots();
+        let roots_ok = state.refresh_roots();
         let _ = state.close_stale_scan().await;
-        if state.config.continuous_filescan {
+        if state.config.continuous_filescan.enabled && roots_ok {
             let _ = state.start_scan().await;
             if state.enable_watcher {
                 let watcher = start_watcher(
                     myself.clone(),
-                    &state.included_roots,
-                    state.config.continuous_filescan_poll_interval_secs,
+                    &state.watch_roots,
+                    state.config.continuous_filescan.poll_interval_secs,
                 );
                 state.watcher = watcher.ok();
             }
@@ -558,9 +613,14 @@ impl Actor for ContinuousScanActor {
                         return Ok(());
                     }
                 };
-                state.refresh_roots();
-                if !state.config.continuous_filescan {
+                let roots_ok = state.refresh_roots();
+                if !state.config.continuous_filescan.enabled || !roots_ok {
                     state.paused = true;
+                    state.watcher = None;
+                    if !roots_ok {
+                        state.epoch = state.epoch.wrapping_add(1);
+                        let _ = state.close_scan().await;
+                    }
                     return Ok(());
                 }
                 state.paused = false;
@@ -569,17 +629,25 @@ impl Actor for ContinuousScanActor {
                 if state.enable_watcher {
                     let watcher = start_watcher(
                         myself.clone(),
-                        &state.included_roots,
-                        state.config.continuous_filescan_poll_interval_secs,
+                        &state.watch_roots,
+                        state.config.continuous_filescan.poll_interval_secs,
                     );
                     state.watcher = watcher.ok();
                 }
             }
             ContinuousScanMessage::UpdateConfig { config } => {
-                let was_enabled = state.config.continuous_filescan;
-                let now_enabled = config.continuous_filescan;
+                let was_enabled = state.config.continuous_filescan.enabled;
                 state.config = config;
-                state.refresh_roots();
+                let roots_ok = state.refresh_roots();
+                let now_enabled = state.config.continuous_filescan.enabled;
+                if !now_enabled || !roots_ok {
+                    state.paused = true;
+                    state.epoch = state.epoch.wrapping_add(1);
+                    state.watcher = None;
+                    let _ = state.close_scan().await;
+                    return Ok(());
+                }
+
                 if !was_enabled && now_enabled {
                     if !state.paused_for_job {
                         state.paused = false;
@@ -588,17 +656,25 @@ impl Actor for ContinuousScanActor {
                         if state.enable_watcher {
                             let watcher = start_watcher(
                                 myself.clone(),
-                                &state.included_roots,
-                                state.config.continuous_filescan_poll_interval_secs,
+                                &state.watch_roots,
+                                state.config.continuous_filescan.poll_interval_secs,
                             );
                             state.watcher = watcher.ok();
                         }
                     }
-                } else if was_enabled && !now_enabled {
-                    state.paused = true;
-                    state.epoch = state.epoch.wrapping_add(1);
-                    state.watcher = None;
-                    let _ = state.close_scan().await;
+                } else if was_enabled && now_enabled {
+                    if !state.paused_for_job {
+                        state.paused = false;
+                        state.epoch = state.epoch.wrapping_add(1);
+                        if state.enable_watcher {
+                            let watcher = start_watcher(
+                                myself.clone(),
+                                &state.watch_roots,
+                                state.config.continuous_filescan.poll_interval_secs,
+                            );
+                            state.watcher = watcher.ok();
+                        }
+                    }
                 }
             }
             ContinuousScanMessage::FsEvent(event) => {
@@ -919,7 +995,7 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
                 continue;
             }
             let config = state.config_store.load(&index_db)?;
-            if config.continuous_filescan {
+            if config.continuous_filescan.enabled {
                 desired.insert(index_db, config);
             }
         }
@@ -978,7 +1054,7 @@ async fn sync_single_db(
         }
         return Ok(());
     }
-    if !config.continuous_filescan {
+    if !config.continuous_filescan.enabled {
         if let Some(actor) = state.actors.remove(index_db) {
             actor.stop(None);
         }
@@ -1093,6 +1169,8 @@ mod tests {
     use ractor::Actor;
     use std::sync::atomic::{AtomicU64, Ordering};
     use crate::test_utils::test_data_dir;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn unique_db_name(prefix: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1118,7 +1196,7 @@ mod tests {
 
         let store = SystemConfigStore::new(root.clone());
         let mut config = store.load(&index_db).unwrap();
-        config.continuous_filescan = true;
+        config.continuous_filescan.enabled = true;
         config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
         store.save(&index_db, &config).unwrap();
 
@@ -1191,7 +1269,7 @@ mod tests {
 
         let store = SystemConfigStore::new(root.clone());
         let mut config = store.load(&index_db).unwrap();
-        config.continuous_filescan = true;
+        config.continuous_filescan.enabled = true;
         config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
         store.save(&index_db, &config).unwrap();
 
@@ -1233,5 +1311,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0);
+    }
+
+    #[test]
+    fn continuous_includes_subset_of_global() {
+        let tmp = TempDir::new().unwrap();
+        let global_root = tmp.path().join("global");
+        let subset = global_root.join("subset");
+        fs::create_dir_all(&subset).unwrap();
+        fs::write(global_root.join("dummy.txt"), "x").unwrap();
+        fs::write(subset.join("dummy.txt"), "x").unwrap();
+
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![global_root.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders = vec![subset.to_string_lossy().to_string()];
+
+        let outcome = compute_watch_roots(&config);
+        assert!(outcome.valid);
+        assert_eq!(outcome.watch_roots.len(), 1);
+        assert!(outcome.watch_roots[0].starts_with(&subset));
+    }
+
+    #[test]
+    fn continuous_includes_outside_global_disables() {
+        let tmp = TempDir::new().unwrap();
+        let global_root = tmp.path().join("global");
+        let outside_root = tmp.path().join("outside");
+        fs::create_dir_all(&global_root).unwrap();
+        fs::create_dir_all(&outside_root).unwrap();
+        fs::write(global_root.join("dummy.txt"), "x").unwrap();
+        fs::write(outside_root.join("dummy.txt"), "x").unwrap();
+
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![global_root.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders = vec![outside_root.to_string_lossy().to_string()];
+
+        let outcome = compute_watch_roots(&config);
+        assert!(!outcome.valid);
+        assert!(outcome.watch_roots.is_empty());
+    }
+
+    #[test]
+    fn continuous_includes_under_global_excluded_disables() {
+        let tmp = TempDir::new().unwrap();
+        let global_root = tmp.path().join("global");
+        let excluded_root = global_root.join("excluded");
+        fs::create_dir_all(&excluded_root).unwrap();
+        fs::write(global_root.join("dummy.txt"), "x").unwrap();
+        fs::write(excluded_root.join("dummy.txt"), "x").unwrap();
+
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![global_root.to_string_lossy().to_string()];
+        config.excluded_folders = vec![excluded_root.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders = vec![excluded_root.to_string_lossy().to_string()];
+
+        let outcome = compute_watch_roots(&config);
+        assert!(!outcome.valid);
+        assert!(outcome.watch_roots.is_empty());
     }
 }

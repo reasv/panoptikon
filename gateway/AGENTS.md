@@ -132,7 +132,7 @@ PQL Rewrite (Rust, Planned)
 
 Continuous File Scanning (Implemented)
 
-- Scope: optional continuous file scanning per index DB, controlled by `continuous_filescan = true` in the per-DB TOML SystemConfig. This feature is not part of the job queue.
+- Scope: optional continuous file scanning per index DB, controlled by `[continuous_filescan].enabled = true` in the per-DB TOML SystemConfig. This feature is not part of the job queue.
 - Actor topology:
   - `ContinuousScanSupervisor` (singleton actor) maintains `index_db -> ActorRef<ContinuousScanActor>`.
   - One `ContinuousScanActor` per index DB when enabled in config.
@@ -172,6 +172,8 @@ Continuous File Scanning (Implemented)
   - If a move appears as delete+create (no rename event), process it directly as delete+create.
 - Cross-platform file watching:
   - Use `notify` with native backends (Windows/macOS/Linux).
-  - Optional polling mode when `continuous_filescan_poll_interval_secs` is set (uses `notify::PollWatcher`).
-  - Watcher overflow logs a warning (index_db + watched roots); no automatic recovery action.
-  - For unreliable shares (SMB/NFS), add an explicit config opt-in to use `notify::PollWatcher` with a configurable interval (e.g., `continuous_filescan_poll_interval_secs`); default remains native watchers.
+- Optional polling mode when `[continuous_filescan].poll_interval_secs` is set (uses `notify::PollWatcher`).
+- Watcher overflow logs a warning (index_db + watched roots); no automatic recovery action.
+- For unreliable shares (SMB/NFS), add an explicit config opt-in to use `notify::PollWatcher` with a configurable interval (e.g., `[continuous_filescan].poll_interval_secs`); default remains native watchers.
+- When `[continuous_filescan].included_folders` is non-empty, watcher roots are limited to those paths; they must be within the global `included_folders` and not under `excluded_folders`, otherwise continuous scanning is disabled for that DB until fixed.
+- No continuous-scan exclude list is implemented because notify backends do not support watcher-level excludes.

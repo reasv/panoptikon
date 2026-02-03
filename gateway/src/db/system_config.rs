@@ -61,9 +61,7 @@ pub(crate) struct SystemConfig {
     #[serde(default)]
     pub preload_embedding_models: bool,
     #[serde(default)]
-    pub continuous_filescan: bool,
-    #[serde(default)]
-    pub continuous_filescan_poll_interval_secs: Option<u64>,
+    pub continuous_filescan: ContinuousFilescanConfig,
 
     /// PQL job filters (parsed).
     #[serde(default)]
@@ -76,6 +74,16 @@ pub(crate) struct SystemConfig {
     #[serde(flatten)]
     #[schema(value_type = std::collections::BTreeMap<String, JsonValue>)]
     pub extra: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub(crate) struct ContinuousFilescanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub included_folders: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -102,8 +110,11 @@ impl Default for SystemConfig {
             included_folders: Vec::new(),
             excluded_folders: Vec::new(),
             preload_embedding_models: false,
-            continuous_filescan: false,
-            continuous_filescan_poll_interval_secs: None,
+            continuous_filescan: ContinuousFilescanConfig {
+                enabled: false,
+                poll_interval_secs: None,
+                included_folders: Vec::new(),
+            },
             job_filters: Vec::new(),
             filescan_filter: None,
             extra: BTreeMap::new(),
@@ -185,6 +196,10 @@ fn normalize_folder_lists(config: &mut SystemConfig) {
     }
     if !config.excluded_folders.is_empty() {
         config.excluded_folders = clean_folder_list(&config.excluded_folders);
+    }
+    if !config.continuous_filescan.included_folders.is_empty() {
+        config.continuous_filescan.included_folders =
+            clean_folder_list(&config.continuous_filescan.included_folders);
     }
 }
 
