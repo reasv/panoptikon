@@ -1089,17 +1089,20 @@ fn apply_partition_by(
     let mut window = WindowStatement::new();
     for col in partition_by {
         let label = format!("part_{}", column_name(*col));
-        window.partition_by((Alias::new("select_cte"), Alias::new(label.as_str())));
+        window.partition_by((
+            Alias::new(select_cte.name.as_str()),
+            Alias::new(label.as_str()),
+        ));
     }
     for order_col in order_columns {
-        let order_spec = order_spec_for_alias(order_col, "select_cte");
+        let order_spec = order_spec_for_alias(order_col, select_cte.name.as_str());
         window.order_by_expr_with_nulls(order_spec.expr, order_spec.order, order_spec.nulls);
     }
 
     let mut partition_query = Query::select();
     partition_query
-        .from(Alias::new("select_cte"))
-        .column((Alias::new("select_cte"), Asterisk))
+        .from(Alias::new(select_cte.name.as_str()))
+        .column((Alias::new(select_cte.name.as_str()), Asterisk))
         .expr_window_as(
             Expr::cust("row_number()"),
             window,
