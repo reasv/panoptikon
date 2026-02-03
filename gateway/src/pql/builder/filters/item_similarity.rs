@@ -151,6 +151,8 @@ fn default_distance_aggregation() -> DistanceAggregation {
     DistanceAggregation::Avg
 }
 
+// Used by serde default attribute.
+#[allow(dead_code)]
 fn default_sort_asc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.order_by = true;

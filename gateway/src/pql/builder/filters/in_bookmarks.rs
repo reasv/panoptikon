@@ -59,6 +59,8 @@ fn default_bookmarks_user() -> String {
     "user".to_string()
 }
 
+// Used by serde default attribute.
+#[allow(dead_code)]
 fn default_sort_desc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.direction = OrderDirection::Desc;

@@ -52,6 +52,8 @@ pub(crate) struct MatchTags {
     pub match_tags: TagsArgs,
 }
 
+// Used by serde default attribute.
+#[allow(dead_code)]
 fn default_sort_desc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.direction = OrderDirection::Desc;

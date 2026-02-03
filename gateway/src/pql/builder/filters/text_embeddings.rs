@@ -99,6 +99,8 @@ fn default_embed_args() -> Option<EmbedArgs> {
     Some(EmbedArgs::default())
 }
 
+// Used by serde default attribute.
+#[allow(dead_code)]
 fn default_sort_asc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.order_by = true;
