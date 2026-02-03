@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::{Deserialize, Serialize};
@@ -432,7 +431,7 @@ async fn execute_job(job: Job) -> Result<(), String> {
                 .as_deref()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(200);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             Ok(())
         }
         _ => Err("Job type not implemented".to_string()),
