@@ -5,8 +5,8 @@ pub(crate) use crate::pql::builder::filters::{
     DerivedDataArgs, DistanceAggregation, DistanceFunction, EmbedArgs, HasUnprocessedData,
     InBookmarks, InBookmarksArgs, Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchPath,
     MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue, MatchValues, Matches,
-    OneOrMany, ProcessedBy, SemanticImageArgs, SemanticImageSearch, SemanticTextArgs,
-    SemanticTextSearch, SimilarTo, SimilarityArgs, SourceArgs, TagsArgs,
+    ProcessedBy, SemanticImageArgs, SemanticImageSearch, SemanticTextArgs, SemanticTextSearch,
+    SimilarTo, SimilarityArgs, SourceArgs, TagsArgs,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
