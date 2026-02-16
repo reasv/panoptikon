@@ -33,7 +33,7 @@ pub struct UpstreamsConfig {
     pub ui: UpstreamConfig,
     pub api: UpstreamConfig,
     #[serde(default)]
-    pub inference: Option<UpstreamConfig>,
+    pub inference: Vec<InferenceEndpointConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +44,15 @@ pub struct UpstreamConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct InferenceEndpointConfig {
+    pub base_url: String,
+    #[serde(default = "default_inference_weight")]
+    pub weight: f64,
+    #[serde(default = "default_inference_use_for_jobs")]
+    pub use_for_jobs: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SearchConfig {
     #[serde(default = "default_embedding_cache_size")]
     pub embedding_cache_size: usize,
@@ -51,6 +60,14 @@ pub struct SearchConfig {
 
 fn default_embedding_cache_size() -> usize {
     16
+}
+
+fn default_inference_weight() -> f64 {
+    1.0
+}
+
+fn default_inference_use_for_jobs() -> bool {
+    true
 }
 
 impl Default for SearchConfig {
@@ -202,32 +219,13 @@ impl Settings {
                 .parse()
                 .context("GATEWAY__UPSTREAM_API_LOCAL must be a boolean")?;
         }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_INFERENCE") {
-            self.upstreams.inference = Some(UpstreamConfig {
-                base_url: value,
-                local: false,
-            });
-        }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_INFERENCE_LOCAL") {
-            let local = value
-                .parse()
-                .context("GATEWAY__UPSTREAM_INFERENCE_LOCAL must be a boolean")?;
-            match self.upstreams.inference.as_mut() {
-                Some(config) => config.local = local,
-                None => {
-                    self.upstreams.inference = Some(UpstreamConfig {
-                        base_url: self.upstreams.api.base_url.clone(),
-                        local,
-                    });
-                }
-            }
-        }
         Ok(())
     }
 
     fn validate(&self) -> Result<()> {
         self.validate_rulesets()?;
         self.validate_policies()?;
+        self.validate_inference_endpoints()?;
         Ok(())
     }
 
@@ -276,14 +274,33 @@ impl Settings {
         }
         Ok(())
     }
+
+    fn validate_inference_endpoints(&self) -> Result<()> {
+        if self.upstreams.inference.is_empty() {
+            anyhow::bail!("upstreams.inference must include at least one endpoint");
+        }
+        for (idx, endpoint) in self.upstreams.inference.iter().enumerate() {
+            if endpoint.base_url.trim().is_empty() {
+                anyhow::bail!("upstreams.inference[{}] base_url must not be empty", idx);
+            }
+            if endpoint.weight.is_nan() || endpoint.weight < 0.0 {
+                anyhow::bail!(
+                    "upstreams.inference[{}] weight must be >= 0",
+                    idx
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Settings {
     fn apply_inference_default(&mut self) {
-        if self.upstreams.inference.is_none() {
-            self.upstreams.inference = Some(UpstreamConfig {
+        if self.upstreams.inference.is_empty() {
+            self.upstreams.inference.push(InferenceEndpointConfig {
                 base_url: self.upstreams.api.base_url.clone(),
-                local: self.upstreams.api.local,
+                weight: default_inference_weight(),
+                use_for_jobs: default_inference_use_for_jobs(),
             });
         }
     }

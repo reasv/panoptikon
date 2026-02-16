@@ -69,6 +69,7 @@ utoipa-redoc = { version = "6", features = ["axum"] }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

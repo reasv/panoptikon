@@ -3,6 +3,7 @@ pub(crate) mod items;
 pub(crate) mod bookmarks;
 pub(crate) mod tags;
 pub(crate) mod extraction_log;
+pub(crate) mod extraction_write;
 pub(crate) mod folders;
 pub(crate) mod file_scans;
 pub(crate) mod files;

@@ -11,6 +11,7 @@ use crate::db::index_writer::IndexDbWriterMessage;
 use crate::db::index_writer::call_index_db_writer;
 use crate::jobs::continuous_scan;
 use crate::jobs::files::FileScanService;
+use crate::jobs::extraction;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -412,6 +413,18 @@ async fn execute_job(job: Job) -> Result<(), String> {
             let result = service.run_folder_update().await;
             let _ = continuous_scan::resume_after_job(&job.index_db).await;
             result.map_err(|err| format!("{err:?}"))?;
+            Ok(())
+        }
+        JobType::DataExtraction => {
+            extraction::run_extraction_job(job)
+                .await
+                .map_err(|err| format!("{err}"))?;
+            Ok(())
+        }
+        JobType::DataDeletion => {
+            extraction::run_data_deletion_job(job)
+                .await
+                .map_err(|err| format!("{err}"))?;
             Ok(())
         }
         JobType::JobDataDeletion => {

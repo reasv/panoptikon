@@ -25,6 +25,7 @@ Behavior (important)
 - `EXPERIMENTAL_RUST_DB_CREATION` is treated as truthy only for `1`, `true`, `yes`, or `on` (case-insensitive).
 - `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` runs migrations across all on-disk DBs in `DATA_FOLDER` and baselines Python-created DBs when truthy.
 - `EXPERIMENTAL_RUST_JOBS` gates local `/api/jobs/*` endpoints; when false, job routes are proxied to the Python backend.
+- Inference upstreams are configured as an array; the first entry is the proxy + metadata target and may be marked `use_for_jobs = false` to keep it search-only. Extraction jobs only use endpoints with `use_for_jobs = true`.
 - DB param enforcement:
   - Enforces `index_db` and `user_data_db` for DB-aware routes.
   - Strips DB params for `/api/inference/*`, `/api/db`, and `/api/db/create`.
@@ -49,6 +50,7 @@ Behavior (important)
   - `/api/jobs/*` is implemented locally only when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
   - A global `JobQueueActor` keeps an in-memory queue and running job state; a `JobRunnerActor` executes one job at a time.
   - File scan jobs (`folder_rescan`, `folder_update`) run through `FileScanService` and the index writer actor for writes.
+  - Data extraction jobs run per-item inference with an inflight cap (job `batch_size`), use the inference pool for prediction, and serialize all DB writes through the index writer actor.
   - File scan jobs honor `filescan_filter` (PQL `Match`) during stage-1/2 file filtering and apply `job_filters` entries that include `file_scan` after scans to delete files that violate the rules.
   - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).

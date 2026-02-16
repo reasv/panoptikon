@@ -11,6 +11,7 @@ mod proxy;
 #[cfg(test)]
 mod test_utils;
 
+use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
 use axum::{
     Router,
     routing::{any, get, post},
@@ -74,11 +75,24 @@ async fn async_main() -> anyhow::Result<()> {
     let inference_config = settings
         .upstreams
         .inference
-        .as_ref()
+        .first()
         .expect("inference upstream should be initialized");
     let inference_upstream = proxy::Upstream::parse("inference", &inference_config.base_url)?;
     let inference_client =
         inferio_client::InferenceApiClient::from_settings_with_metadata_cache(&settings, true)?;
+    let job_endpoints = settings
+        .upstreams
+        .inference
+        .iter()
+        .filter(|endpoint| endpoint.use_for_jobs)
+        .cloned()
+        .collect::<Vec<_>>();
+    let inference_pool = InferencePool::new(job_endpoints)?;
+    set_job_inference_context(JobInferenceContext {
+        primary: inference_client.clone(),
+        pool: inference_pool,
+        embedding_cache_size: settings.search.embedding_cache_size,
+    })?;
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
         api_upstream,

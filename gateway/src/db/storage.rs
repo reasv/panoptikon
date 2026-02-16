@@ -1,4 +1,5 @@
 use crate::api_error::ApiError;
+use sqlx::Row;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -162,6 +163,37 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     Ok(())
 }
 
+pub(crate) async fn get_frames_bytes(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Vec<Vec<u8>>> {
+    let rows = sqlx::query(
+        r#"
+SELECT frame
+FROM storage.frames
+WHERE item_sha256 = ?1
+ORDER BY idx
+        "#,
+    )
+    .bind(sha256)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read frames");
+        ApiError::internal("Failed to read frames")
+    })?;
+
+    let mut frames = Vec::with_capacity(rows.len());
+    for row in rows {
+        let frame: Vec<u8> = row.try_get("frame").map_err(|err| {
+            tracing::error!(error = %err, "failed to parse frame");
+            ApiError::internal("Failed to read frames")
+        })?;
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 pub(crate) async fn delete_orphaned_thumbnails(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<u64> {
@@ -186,9 +218,7 @@ WHERE item_sha256 IN (
     Ok(result.rows_affected())
 }
 
-pub(crate) async fn delete_orphaned_frames(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<u64> {
+pub(crate) async fn delete_orphaned_frames(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let result = sqlx::query(
         r#"
 DELETE FROM storage.frames

@@ -94,7 +94,7 @@ impl InferenceApiClient {
         let inference = settings
             .upstreams
             .inference
-            .as_ref()
+            .first()
             .context("inference upstream missing from settings")?;
         Self::new_with_metadata_cache(inference.base_url.clone(), cache_metadata)
     }

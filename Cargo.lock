@@ -1322,6 +1322,7 @@ dependencies = [
  "clap",
  "config",
  "dotenvy",
+ "futures-util",
  "hashlink 0.10.0",
  "http-body-util",
  "httpdate",

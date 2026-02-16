@@ -38,6 +38,23 @@ use crate::db::{
         delete_files_under_excluded_folders,
         delete_folders_not_in_list,
     },
+    extraction_write::{
+        add_data_log,
+        delete_orphan_tags,
+        delete_setter_by_name,
+        remove_incomplete_jobs,
+        update_data_log,
+        upsert_setter,
+        write_clip_output,
+        write_tags_output,
+        write_text_embedding_output,
+        write_text_output,
+        DataLogUpdate,
+        EmbeddingEntry,
+        TagEntry,
+        TagTextEntry,
+        TextEntry,
+    },
     open_index_db_read_no_user_data,
     open_index_db_write_no_user_data,
     storage::{
@@ -144,6 +161,63 @@ pub(crate) enum IndexDbWriterMessage {
     DeleteJobData {
         log_id: i64,
         reply: Reply<()>,
+    },
+    RemoveIncompleteJobs {
+        reply: Reply<()>,
+    },
+    AddDataLog {
+        scan_time: String,
+        threshold: Option<f64>,
+        types: Vec<String>,
+        setter: String,
+        batch_size: i64,
+        reply: Reply<i64>,
+    },
+    UpdateDataLog {
+        job_id: i64,
+        update: DataLogUpdate,
+        reply: Reply<()>,
+    },
+    UpsertSetter {
+        setter_name: String,
+        reply: Reply<i64>,
+    },
+    WriteTagsOutput {
+        job_id: i64,
+        setter_name: String,
+        item_sha256: String,
+        tags: Vec<TagEntry>,
+        text_entries: Vec<TagTextEntry>,
+        reply: Reply<()>,
+    },
+    WriteTextOutput {
+        job_id: i64,
+        setter_name: String,
+        item_sha256: String,
+        entries: Vec<TextEntry>,
+        reply: Reply<()>,
+    },
+    WriteClipOutput {
+        job_id: i64,
+        setter_name: String,
+        item_sha256: String,
+        entries: Vec<EmbeddingEntry>,
+        reply: Reply<()>,
+    },
+    WriteTextEmbeddingOutput {
+        job_id: i64,
+        setter_name: String,
+        item_sha256: String,
+        source_data_id: Option<i64>,
+        entries: Vec<EmbeddingEntry>,
+        reply: Reply<()>,
+    },
+    DeleteSetterByName {
+        setter_name: String,
+        reply: Reply<u64>,
+    },
+    DeleteOrphanTags {
+        reply: Reply<u64>,
     },
     AddFolderToDatabase {
         time_added: String,
@@ -470,6 +544,164 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_data_job_by_log_id(conn, log_id).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RemoveIncompleteJobs { reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { remove_incomplete_jobs(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::AddDataLog {
+                scan_time,
+                threshold,
+                types,
+                setter,
+                batch_size,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            add_data_log(conn, &scan_time, threshold, &types, &setter, batch_size)
+                                .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpdateDataLog {
+                job_id,
+                update,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { update_data_log(conn, job_id, &update).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertSetter { setter_name, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { upsert_setter(conn, &setter_name).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::WriteTagsOutput {
+                job_id,
+                setter_name,
+                item_sha256,
+                tags,
+                text_entries,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            write_tags_output(
+                                conn,
+                                job_id,
+                                &setter_name,
+                                &item_sha256,
+                                &tags,
+                                &text_entries,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::WriteTextOutput {
+                job_id,
+                setter_name,
+                item_sha256,
+                entries,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            write_text_output(
+                                conn,
+                                job_id,
+                                &setter_name,
+                                &item_sha256,
+                                &entries,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::WriteClipOutput {
+                job_id,
+                setter_name,
+                item_sha256,
+                entries,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            write_clip_output(
+                                conn,
+                                job_id,
+                                &setter_name,
+                                &item_sha256,
+                                &entries,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::WriteTextEmbeddingOutput {
+                job_id,
+                setter_name,
+                item_sha256,
+                source_data_id,
+                entries,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            write_text_embedding_output(
+                                conn,
+                                job_id,
+                                &setter_name,
+                                &item_sha256,
+                                source_data_id,
+                                &entries,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteSetterByName { setter_name, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_setter_by_name(conn, &setter_name).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteOrphanTags { reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_orphan_tags(conn).await })
                     })
                     .await;
                 let _ = reply.send(result);

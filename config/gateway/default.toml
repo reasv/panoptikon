@@ -18,11 +18,12 @@ base_url = "http://127.0.0.1:6339"
 base_url = "http://127.0.0.1:6342"
 local = true
 
-# Optional inference upstream. Defaults to the API upstream if omitted.
-#
-# [upstreams.inference]
-# base_url = "http://127.0.0.1:6342"
-# local = false
+# Inference upstreams (first entry is used for search + metadata + /api/inference proxy).
+# Each entry can be excluded from batch jobs with `use_for_jobs = false`.
+[[upstreams.inference]]
+base_url = "http://127.0.0.1:6342"
+weight = 1.0
+use_for_jobs = true
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.

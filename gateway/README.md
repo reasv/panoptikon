@@ -19,7 +19,7 @@ added later.
 ## Routing
 
 - `/api/*` goes to the Python backend, except local routes when enabled
-- `/api/inference/*` goes to the inference upstream (defaults to the API upstream)
+- `/api/inference/*` goes to the first inference upstream (defaults to the API upstream)
 - `/docs` goes to the Python backend unless `upstreams.api.local = true`
 - `/redoc` goes to the Python backend unless `upstreams.api.local = true`
 - `/openapi.json` goes to the Python backend unless `upstreams.api.local = true`
@@ -163,10 +163,11 @@ base_url = "http://127.0.0.1:6339"
 base_url = "http://127.0.0.1:6342"
 local = false
 
-[upstreams.inference]
-# Optional; defaults to the API upstream if omitted.
+# Inference upstreams (first entry is used for search + metadata + /api/inference proxy).
+[[upstreams.inference]]
 base_url = "http://127.0.0.1:6342"
-local = false
+weight = 1.0
+use_for_jobs = true
 
 [search]
 embedding_cache_size = 16
@@ -200,8 +201,6 @@ GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAM_UI=http://127.0.0.1:6339
 GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
 GATEWAY__UPSTREAM_API_LOCAL=false
-GATEWAY__UPSTREAM_INFERENCE=http://127.0.0.1:6342
-GATEWAY__UPSTREAM_INFERENCE_LOCAL=false
 GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
 ```
 
@@ -220,8 +219,9 @@ GATEWAY__SERVER__TRUST_FORWARDED_HEADERS=false
 GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6339
 GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
 GATEWAY__UPSTREAMS__API__LOCAL=false
-GATEWAY__UPSTREAMS__INFERENCE__BASE_URL=http://127.0.0.1:6342
-GATEWAY__UPSTREAMS__INFERENCE__LOCAL=false
+GATEWAY__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342
+GATEWAY__UPSTREAMS__INFERENCE__0__WEIGHT=1.0
+GATEWAY__UPSTREAMS__INFERENCE__0__USE_FOR_JOBS=true
 GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
 ```
 
