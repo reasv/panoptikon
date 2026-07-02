@@ -230,6 +230,49 @@ impl Default for SortableOptions {
     }
 }
 
+/// Deserialization shape for `SortableOptions` when flattened into a filter struct.
+///
+/// serde silently ignores `#[serde(default = "...")]` on `#[serde(flatten)]` fields
+/// (serde-rs/serde#1626), so filters that need non-base sort defaults must
+/// deserialize through this type and call `resolve` with their own defaults.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PartialSortableOptions {
+    #[serde(default)]
+    pub order_by: Option<bool>,
+    #[serde(default)]
+    pub direction: Option<OrderDirection>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub row_n: Option<bool>,
+    #[serde(default)]
+    pub row_n_direction: Option<OrderDirection>,
+    #[serde(default)]
+    pub gt: Option<ScalarValue>,
+    #[serde(default)]
+    pub lt: Option<ScalarValue>,
+    #[serde(default)]
+    pub select_as: Option<String>,
+    #[serde(default)]
+    pub rrf: Option<Rrf>,
+}
+
+impl PartialSortableOptions {
+    pub(crate) fn resolve(self, defaults: SortableOptions) -> SortableOptions {
+        SortableOptions {
+            order_by: self.order_by.unwrap_or(defaults.order_by),
+            direction: self.direction.unwrap_or(defaults.direction),
+            priority: self.priority.unwrap_or(defaults.priority),
+            row_n: self.row_n.unwrap_or(defaults.row_n),
+            row_n_direction: self.row_n_direction.unwrap_or(defaults.row_n_direction),
+            gt: self.gt.or(defaults.gt),
+            lt: self.lt.or(defaults.lt),
+            select_as: self.select_as.or(defaults.select_as),
+            rrf: self.rrf.or(defaults.rrf),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct OrderArgs {
     #[serde(default = "default_order_by_field")]

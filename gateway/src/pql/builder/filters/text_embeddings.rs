@@ -2,7 +2,7 @@ use sea_query::{Alias, Cond, Expr, ExprTrait, Func, JoinType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::pql::model::{EntityType, OrderDirection, SortableOptions};
+use crate::pql::model::{EntityType, OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
@@ -73,14 +73,36 @@ pub(crate) struct SemanticTextArgs {
     pub src_text: Option<SourceArgs>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct SemanticTextSearch {
-    #[serde(flatten, default = "default_sort_asc")]
+    #[serde(flatten)]
     pub sort: SortableOptions,
     /// Search Text Embeddings
     ///
     /// Search for text using semantic search on text embeddings.
     pub text_embeddings: SemanticTextArgs,
+}
+
+// Manual impl because serde ignores `default = ...` on flattened fields;
+// this filter orders results by distance (ascending, best matches first)
+// by default.
+impl<'de> serde::Deserialize<'de> for SemanticTextSearch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(flatten)]
+            sort: PartialSortableOptions,
+            text_embeddings: SemanticTextArgs,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(Self {
+            sort: repr.sort.resolve(default_sort_asc()),
+            text_embeddings: repr.text_embeddings,
+        })
+    }
 }
 
 fn default_cache_key() -> String {
@@ -99,8 +121,6 @@ fn default_embed_args() -> Option<EmbedArgs> {
     Some(EmbedArgs::default())
 }
 
-// Used by serde default attribute.
-#[allow(dead_code)]
 fn default_sort_asc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.order_by = true;
@@ -289,13 +309,21 @@ impl FilterCompiler for SemanticTextSearch {
                 add_rank_column_expr(&mut query, &self.sort, rank_column)?;
             }
 
-            let (query, context_for_wrap) =
-                apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
-
+            // Only `extracted_text` is joined without an alias (and on the same
+            // condition add_inner_joins would use); `item_data`/`setters` exist
+            // only under the text_/vec_ aliases, so references to the unaliased
+            // tables in the final query would not resolve against this select.
             let mut joined_tables = JoinedTables::default();
-            joined_tables.mark(BaseTable::ItemData);
-            joined_tables.mark(BaseTable::Setters);
             joined_tables.mark(BaseTable::ExtractedText);
+            let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+                state,
+                query,
+                context.clone(),
+                &cte_name,
+                &self.sort,
+                joined_tables,
+            );
+
             let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
             state.cte_counter += 1;
             if !state.is_count_query {
@@ -374,15 +402,18 @@ impl FilterCompiler for SemanticTextSearch {
             add_rank_column_expr(&mut query, &self.sort, rank_column)?;
         }
 
-        let (query, context_for_wrap) =
-            apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
+        // No marks: `item_data`/`setters` are only joined under aliases here, and
+        // `extracted_text` (when joined) is bound to the embedding's source text,
+        // not to the standard data_id join that add_inner_joins provides.
+        let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            query,
+            context.clone(),
+            &cte_name,
+            &self.sort,
+            JoinedTables::default(),
+        );
 
-        let mut joined_tables = JoinedTables::default();
-        joined_tables.mark(BaseTable::ItemData);
-        joined_tables.mark(BaseTable::Setters);
-        if !criteria.is_empty() || weights_used {
-            joined_tables.mark(BaseTable::ExtractedText);
-        }
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
@@ -417,6 +448,24 @@ mod tests {
     };
 
     #[test]
+    fn semantic_text_defaults_to_order_by_distance() {
+        use crate::pql::model::OrderDirection;
+        let filter: SemanticTextSearch = serde_json::from_value(json!({
+            "text_embeddings": { "query": "hello", "model": "textembed/test" }
+        }))
+        .expect("semantic text filter");
+        assert!(filter.sort.order_by);
+        assert!(matches!(filter.sort.direction, OrderDirection::Asc));
+
+        let filter: SemanticTextSearch = serde_json::from_value(json!({
+            "text_embeddings": { "query": "hello", "model": "textembed/test" },
+            "order_by": false
+        }))
+        .expect("semantic text filter");
+        assert!(!filter.sort.order_by);
+    }
+
+    #[test]
     fn semantic_text_builds_sql() {
         let mut filter: SemanticTextSearch = serde_json::from_value(json!({
             "text_embeddings": { "query": "hello", "model": "textembed/test" }
@@ -439,5 +488,27 @@ mod tests {
         run_full_pql_query(QueryElement::SemanticTextSearch(filter), EntityType::File)
             .await
             .expect("semantic text query");
+    }
+
+    #[tokio::test]
+    async fn semantic_text_entity_text_with_text_columns_runs_full_query() {
+        // Regression: this filter only joins item_data/setters under aliases,
+        // so the final query must add the standard unaliased joins for the
+        // selected text columns to resolve.
+        use crate::pql::model::{Column, PqlQuery};
+        use super::super::test_support::run_pql_query;
+
+        let mut filter: SemanticTextSearch = serde_json::from_value(json!({
+            "text_embeddings": { "query": "hello", "model": "textembed/test" }
+        }))
+        .expect("semantic text filter");
+        filter.text_embeddings._embedding = Some(vec![0, 0, 0, 0]);
+        let query = PqlQuery {
+            query: Some(QueryElement::SemanticTextSearch(filter)),
+            entity: EntityType::Text,
+            select: vec![Column::SetterName, Column::JobId],
+            ..Default::default()
+        };
+        run_pql_query(query).await.expect("semantic text entity query");
     }
 }

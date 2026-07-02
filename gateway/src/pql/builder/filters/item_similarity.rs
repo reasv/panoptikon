@@ -2,7 +2,7 @@ use sea_query::{Alias, Cond, Expr, ExprTrait, Func, JoinType, Query};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::pql::model::{OrderDirection, SortableOptions};
+use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
@@ -118,9 +118,9 @@ pub(crate) struct SimilarityArgs {
     pub xmodal_i2i: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct SimilarTo {
-    #[serde(flatten, default = "default_sort_asc")]
+    #[serde(flatten)]
     pub sort: SortableOptions,
     /// Item Similarity Search
     ///
@@ -143,6 +143,28 @@ pub(crate) struct SimilarTo {
     pub similar_to: SimilarityArgs,
 }
 
+// Manual impl because serde ignores `default = ...` on flattened fields;
+// this filter orders results by distance (ascending, best matches first)
+// by default.
+impl<'de> serde::Deserialize<'de> for SimilarTo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(flatten)]
+            sort: PartialSortableOptions,
+            similar_to: SimilarityArgs,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(Self {
+            sort: repr.sort.resolve(default_sort_asc()),
+            similar_to: repr.similar_to,
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -151,8 +173,6 @@ fn default_distance_aggregation() -> DistanceAggregation {
     DistanceAggregation::Avg
 }
 
-// Used by serde default attribute.
-#[allow(dead_code)]
 fn default_sort_asc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.order_by = true;
@@ -495,15 +515,15 @@ impl FilterCompiler for SimilarTo {
             add_rank_column_expr(&mut distance_select, &self.sort, rank_column)?;
         }
 
-        let (distance_select, context_for_wrap) = apply_sort_bounds(
+        let (distance_select, context_for_wrap, joined_tables) = apply_sort_bounds(
             state,
             distance_select,
             other_ctx.clone(),
             &cte_name,
             &self.sort,
+            JoinedTables::default(),
         );
 
-        let joined_tables = JoinedTables::default();
         let cte = wrap_query(
             state,
             distance_select,
@@ -542,6 +562,24 @@ mod tests {
     use super::super::test_support::{
         build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
     };
+
+    #[test]
+    fn similar_to_defaults_to_order_by_distance() {
+        use crate::pql::model::OrderDirection;
+        let filter: SimilarTo = serde_json::from_value(json!({
+            "similar_to": { "target": "abc", "model": "clip/test" }
+        }))
+        .expect("similar_to filter");
+        assert!(filter.sort.order_by);
+        assert!(matches!(filter.sort.direction, OrderDirection::Asc));
+
+        let filter: SimilarTo = serde_json::from_value(json!({
+            "similar_to": { "target": "abc", "model": "clip/test" },
+            "order_by": false
+        }))
+        .expect("similar_to filter");
+        assert!(!filter.sort.order_by);
+    }
 
     #[test]
     fn similar_to_builds_sql() {

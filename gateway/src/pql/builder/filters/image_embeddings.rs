@@ -2,7 +2,7 @@ use sea_query::{Alias, Cond, Expr, ExprTrait, Func, JoinType, Query};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::pql::model::{OrderDirection, SortableOptions};
+use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
@@ -59,9 +59,9 @@ pub(crate) struct SemanticImageArgs {
     pub src_text: Option<SourceArgs>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct SemanticImageSearch {
-    #[serde(flatten, default = "default_sort_asc")]
+    #[serde(flatten)]
     pub sort: SortableOptions,
     /// Search Image Embeddings
     ///
@@ -69,12 +69,32 @@ pub(crate) struct SemanticImageSearch {
     pub image_embeddings: SemanticImageArgs,
 }
 
+// Manual impl because serde ignores `default = ...` on flattened fields;
+// this filter orders results by distance (ascending, best matches first)
+// by default.
+impl<'de> serde::Deserialize<'de> for SemanticImageSearch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(flatten)]
+            sort: PartialSortableOptions,
+            image_embeddings: SemanticImageArgs,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(Self {
+            sort: repr.sort.resolve(default_sort_asc()),
+            image_embeddings: repr.image_embeddings,
+        })
+    }
+}
+
 fn default_embed_args() -> Option<EmbedArgs> {
     Some(EmbedArgs::default())
 }
 
-// Used by serde default attribute.
-#[allow(dead_code)]
 fn default_sort_asc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.order_by = true;
@@ -120,6 +140,7 @@ impl FilterCompiler for SemanticImageSearch {
 
         let src_setters = Alias::new("src_setters");
         let src_item_data = Alias::new("src_item_data");
+        let mut join_text = false;
         if let Some(src_args) = &args.src_text {
             query.join_as(
                 JoinType::LeftJoin,
@@ -138,7 +159,6 @@ impl FilterCompiler for SemanticImageSearch {
                 );
             }
 
-            let mut join_text = false;
             let mut conditions = Vec::new();
             if !src_args.setters.is_empty() {
                 let setters = src_args
@@ -235,7 +255,9 @@ impl FilterCompiler for SemanticImageSearch {
             joined_tables.mark(BaseTable::Items);
             joined_tables.mark(BaseTable::ItemData);
             joined_tables.mark(BaseTable::Setters);
-            if args.src_text.is_some() {
+            // The unaliased extracted_text join only exists when a src_text
+            // criterion (or weight) required it.
+            if join_text {
                 joined_tables.mark(BaseTable::ExtractedText);
             }
             let cte = wrap_query(state, query, context, cte_name, &joined_tables);
@@ -309,16 +331,24 @@ impl FilterCompiler for SemanticImageSearch {
             add_rank_column_expr(&mut query, &self.sort, rank_column)?;
         }
 
-        let (query, context_for_wrap) =
-            apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
-
         let mut joined_tables = JoinedTables::default();
         joined_tables.mark(BaseTable::Items);
         joined_tables.mark(BaseTable::ItemData);
         joined_tables.mark(BaseTable::Setters);
-        if args.src_text.is_some() {
+        // The unaliased extracted_text join only exists when a src_text
+        // criterion (or weight) required it.
+        if join_text {
             joined_tables.mark(BaseTable::ExtractedText);
         }
+        let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            query,
+            context.clone(),
+            &cte_name,
+            &self.sort,
+            joined_tables,
+        );
+
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
@@ -351,6 +381,33 @@ mod tests {
     use super::super::test_support::{
         build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
     };
+
+    #[test]
+    fn semantic_image_defaults_to_order_by_distance() {
+        let filter: SemanticImageSearch = serde_json::from_value(json!({
+            "image_embeddings": { "query": "hello", "model": "clip/test" }
+        }))
+        .expect("semantic image filter");
+        assert!(filter.sort.order_by);
+        assert!(matches!(filter.sort.direction, OrderDirection::Asc));
+    }
+
+    #[test]
+    fn image_embeddings_sync_preprocess_requires_distance_override() {
+        use crate::pql::build_query;
+        use crate::pql::model::PqlQuery;
+
+        let mut filter: SemanticImageSearch = serde_json::from_value(json!({
+            "image_embeddings": { "query": "hello", "model": "clip/test" }
+        }))
+        .expect("semantic image filter");
+        filter.image_embeddings._embedding = Some(vec![0, 0, 0, 0]);
+        let query = PqlQuery {
+            query: Some(QueryElement::SemanticImageSearch(filter)),
+            ..Default::default()
+        };
+        assert!(build_query(query, false).is_err());
+    }
 
     #[test]
     fn semantic_image_builds_sql() {

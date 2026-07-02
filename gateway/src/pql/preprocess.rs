@@ -505,6 +505,14 @@ impl SemanticImageSearch {
                 ));
             }
         }
+        if self.image_embeddings._distance_func_override.is_none() {
+            // Only async preprocessing can look up the model's distance function;
+            // silently falling back to cosine would rank results with the wrong
+            // metric for L2 models.
+            return Err(PqlError::invalid(
+                "image_embeddings requires async preprocessing to apply distance function overrides",
+            ));
+        }
         if !self.image_embeddings.clip_xmodal && self.image_embeddings.src_text.is_some() {
             self.image_embeddings.src_text = None;
         }

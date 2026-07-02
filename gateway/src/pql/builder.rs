@@ -172,6 +172,15 @@ fn build_query_with_root(
 ) -> Result<PqlBuilderResult, PqlError> {
     raise_if_invalid(&input_query)?;
 
+    // An empty partition list means no partitioning.
+    if input_query
+        .partition_by
+        .as_ref()
+        .is_some_and(|columns| columns.is_empty())
+    {
+        input_query.partition_by = None;
+    }
+
     let mut state = QueryState {
         order_list: Vec::new(),
         extra_columns: Vec::new(),
@@ -268,12 +277,8 @@ fn build_query_with_root(
             (count_query, HashMap::new())
         } else {
             let partition_by = input_query.partition_by.clone().unwrap_or_default();
-            let mut partition_columns = partition_by
-                .iter()
-                .map(|col| get_column_expr(*col))
-                .collect::<Vec<_>>();
+            let mut partition_columns = partition_by.iter().map(|col| get_column_expr(*col));
             let mut partition_key = partition_columns
-                .drain(..1)
                 .next()
                 .ok_or_else(|| PqlError::invalid("partition_by is empty"))?;
             for col in partition_columns {
@@ -552,9 +557,10 @@ fn apply_sort_bounds(
     context: CteRef,
     cte_name: &str,
     sort: &SortableOptions,
-) -> (SelectStatement, CteRef) {
+    joined_tables: JoinedTables,
+) -> (SelectStatement, CteRef, JoinedTables) {
     if state.is_count_query || (sort.gt.is_none() && sort.lt.is_none()) {
-        return (query, context);
+        return (query, context, joined_tables);
     }
 
     let wrapped_name = format!("wrapped_{cte_name}");
@@ -575,7 +581,10 @@ fn apply_sort_bounds(
                 .lt(scalar_to_expr(lt)),
         );
     }
-    (wrapped_query, wrapped_cte)
+    // The wrapper selects only from the bounds CTE, so none of the base tables
+    // the filter joined are visible to the final query anymore; add_inner_joins
+    // must join them again against the wrapper's columns.
+    (wrapped_query, wrapped_cte, JoinedTables::default())
 }
 
 fn select_std_from_cte(cte: &CteRef, state: &QueryState) -> SelectStatement {
@@ -1376,6 +1385,47 @@ enum Files {
     Path,
     Filename,
     LastModified,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_query::SqliteQueryBuilder;
+
+    fn base_query(partition_by: Option<Vec<Column>>) -> PqlQuery {
+        PqlQuery {
+            partition_by,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_partition_by_count_query_matches_no_partitioning() {
+        let with_empty =
+            build_query(base_query(Some(Vec::new())), true).expect("count query builds");
+        let without = build_query(base_query(None), true).expect("count query builds");
+        assert_eq!(
+            with_empty.query.to_string(SqliteQueryBuilder),
+            without.query.to_string(SqliteQueryBuilder)
+        );
+    }
+
+    #[test]
+    fn empty_partition_by_results_query_matches_no_partitioning() {
+        let with_empty =
+            build_query(base_query(Some(Vec::new())), false).expect("results query builds");
+        let without = build_query(base_query(None), false).expect("results query builds");
+        assert_eq!(
+            with_empty.query.to_string(SqliteQueryBuilder),
+            without.query.to_string(SqliteQueryBuilder)
+        );
+        assert!(
+            !with_empty
+                .query
+                .to_string(SqliteQueryBuilder)
+                .contains("partition_rownum")
+        );
+    }
 }
 
 #[derive(sea_query::Iden)]

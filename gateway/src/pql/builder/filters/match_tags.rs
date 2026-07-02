@@ -2,7 +2,7 @@ use sea_query::{Alias, BinOper, Cond, Expr, ExprTrait, Func, JoinType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::pql::model::{OrderDirection, SortableOptions};
+use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -45,15 +45,34 @@ pub(crate) struct TagsArgs {
     pub all_setters_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct MatchTags {
-    #[serde(flatten, default = "default_sort_desc")]
+    #[serde(flatten)]
     pub sort: SortableOptions,
     pub match_tags: TagsArgs,
 }
 
-// Used by serde default attribute.
-#[allow(dead_code)]
+// Manual impl because serde ignores `default = ...` on flattened fields;
+// this filter sorts descending (highest tag confidence first) by default.
+impl<'de> serde::Deserialize<'de> for MatchTags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(flatten)]
+            sort: PartialSortableOptions,
+            match_tags: TagsArgs,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(Self {
+            sort: repr.sort.resolve(default_sort_desc()),
+            match_tags: repr.match_tags,
+        })
+    }
+}
+
 fn default_sort_desc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.direction = OrderDirection::Desc;
@@ -175,10 +194,15 @@ impl FilterCompiler for MatchTags {
             join_condition,
         );
 
-        let (query, context_for_wrap) =
-            apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
+        let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            query,
+            context.clone(),
+            &cte_name,
+            &self.sort,
+            JoinedTables::default(),
+        );
 
-        let joined_tables = JoinedTables::default();
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
@@ -211,6 +235,24 @@ mod tests {
     use super::super::test_support::{
         build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
     };
+
+    #[test]
+    fn match_tags_defaults_to_descending_sort() {
+        let filter: MatchTags = serde_json::from_value(json!({
+            "match_tags": { "tags": ["cat"] }
+        }))
+        .expect("match_tags filter");
+        assert!(!filter.sort.order_by);
+        assert!(matches!(filter.sort.direction, OrderDirection::Desc));
+        assert!(matches!(filter.sort.row_n_direction, OrderDirection::Desc));
+
+        let filter: MatchTags = serde_json::from_value(json!({
+            "match_tags": { "tags": ["cat"] },
+            "direction": "asc"
+        }))
+        .expect("match_tags filter");
+        assert!(matches!(filter.sort.direction, OrderDirection::Asc));
+    }
 
     #[test]
     fn match_tags_builds_sql() {

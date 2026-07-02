@@ -238,6 +238,7 @@ impl FilterCompiler for MatchText {
 
             let mut context_for_wrap = context.clone();
             let mut final_query = query;
+            let mut joined_tables = JoinedTables::default();
 
             if want_snippet {
                 final_query.expr_as(snippet_expr, Alias::new("snip"));
@@ -265,6 +266,8 @@ impl FilterCompiler for MatchText {
                     );
                 final_query = select_query;
                 context_for_wrap = rownum_cte;
+                // The final select only reads from the rownum CTE; the base
+                // tables joined inside matchq are not visible to it.
 
                 if !state.is_count_query {
                     add_rank_column_expr(&mut final_query, &self.sort, Expr::cust("rank"))?;
@@ -279,15 +282,20 @@ impl FilterCompiler for MatchText {
                     };
                     add_rank_column_expr(&mut final_query, &self.sort, rank_expr)?;
                 }
+                joined_tables.mark(BaseTable::ItemData);
+                joined_tables.mark(BaseTable::Setters);
+                joined_tables.mark(BaseTable::ExtractedText);
             }
 
-            let (final_query, context_for_wrap) =
-                apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &self.sort);
+            let (final_query, context_for_wrap, joined_tables) = apply_sort_bounds(
+                state,
+                final_query,
+                context_for_wrap,
+                &cte_name,
+                &self.sort,
+                joined_tables,
+            );
 
-            let mut joined_tables = JoinedTables::default();
-            joined_tables.mark(BaseTable::ItemData);
-            joined_tables.mark(BaseTable::Setters);
-            joined_tables.mark(BaseTable::ExtractedText);
             let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
             state.cte_counter += 1;
             if !state.is_count_query {
@@ -347,6 +355,7 @@ impl FilterCompiler for MatchText {
 
         let mut context_for_wrap = context.clone();
         let mut final_query = query;
+        let mut joined_tables = JoinedTables::default();
 
         if want_snippet {
             final_query.expr_as(snippet_expr, Alias::new("snip"));
@@ -359,6 +368,12 @@ impl FilterCompiler for MatchText {
                 .from(Alias::new(match_cte.name.as_str()))
                 .column((Alias::new(match_cte.name.as_str()), sea_query::Asterisk));
             final_query = select_query;
+            // The final select only reads from the matchq CTE; the base tables
+            // joined inside it are not visible to the final query.
+        } else {
+            joined_tables.mark(BaseTable::ItemData);
+            joined_tables.mark(BaseTable::Setters);
+            joined_tables.mark(BaseTable::ExtractedText);
         }
 
         if !state.is_count_query {
@@ -370,13 +385,15 @@ impl FilterCompiler for MatchText {
             add_rank_column_expr(&mut final_query, &self.sort, rank_expr)?;
         }
 
-        let (final_query, context_for_wrap) =
-            apply_sort_bounds(state, final_query, context_for_wrap, &cte_name, &self.sort);
+        let (final_query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            final_query,
+            context_for_wrap,
+            &cte_name,
+            &self.sort,
+            joined_tables,
+        );
 
-        let mut joined_tables = JoinedTables::default();
-        joined_tables.mark(BaseTable::ItemData);
-        joined_tables.mark(BaseTable::Setters);
-        joined_tables.mark(BaseTable::ExtractedText);
         let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
@@ -439,5 +456,47 @@ mod tests {
         run_full_pql_query(QueryElement::MatchText(filter), EntityType::Text)
             .await
             .expect("match_text query");
+    }
+
+    #[tokio::test]
+    async fn match_text_snippet_with_text_columns_runs_full_query() {
+        // Regression: the snippet path wraps the select in matchq/rownum CTEs,
+        // hiding the item_data/setters/extracted_text joins; the final query
+        // must re-join them for the selected text columns to resolve.
+        use crate::pql::model::{Column, PqlQuery};
+        use super::super::test_support::run_pql_query;
+
+        let filter: MatchText = serde_json::from_value(json!({
+            "match_text": { "match": "hello world", "select_snippet_as": "snip" }
+        }))
+        .expect("match_text filter");
+        let query = PqlQuery {
+            query: Some(QueryElement::MatchText(filter)),
+            entity: EntityType::Text,
+            select: vec![Column::Language, Column::SetterName],
+            ..Default::default()
+        };
+        run_pql_query(query).await.expect("match_text snippet query");
+    }
+
+    #[tokio::test]
+    async fn match_text_with_sort_bounds_runs_full_query() {
+        // Regression: the gt/lt wrapper CTE hides the filter's joins.
+        use crate::pql::model::{Column, PqlQuery};
+        use super::super::test_support::run_pql_query;
+
+        let filter: MatchText = serde_json::from_value(json!({
+            "match_text": { "match": "hello world" },
+            "order_by": true,
+            "gt": -100
+        }))
+        .expect("match_text filter");
+        let query = PqlQuery {
+            query: Some(QueryElement::MatchText(filter)),
+            entity: EntityType::Text,
+            select: vec![Column::Language, Column::SetterName],
+            ..Default::default()
+        };
+        run_pql_query(query).await.expect("match_text bounded query");
     }
 }

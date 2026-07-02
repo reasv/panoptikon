@@ -1,8 +1,8 @@
-use sea_query::{Alias, Expr, ExprTrait, JoinType};
+use sea_query::{Alias, Expr, ExprTrait, Func, JoinType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::pql::model::{OrderDirection, SortableOptions};
+use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
 use super::FilterCompiler;
@@ -41,14 +41,35 @@ pub(crate) struct InBookmarksArgs {
     pub include_wildcard: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct InBookmarks {
-    #[serde(flatten, default = "default_sort_desc")]
+    #[serde(flatten)]
     pub sort: SortableOptions,
     /// Restrict search to Bookmarks
     ///
     /// Only include items that are bookmarked.
     pub in_bookmarks: InBookmarksArgs,
+}
+
+// Manual impl because serde ignores `default = ...` on flattened fields;
+// this filter sorts descending (most recently bookmarked first) by default.
+impl<'de> serde::Deserialize<'de> for InBookmarks {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(flatten)]
+            sort: PartialSortableOptions,
+            in_bookmarks: InBookmarksArgs,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(Self {
+            sort: repr.sort.resolve(default_sort_desc()),
+            in_bookmarks: repr.in_bookmarks,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -59,8 +80,6 @@ fn default_bookmarks_user() -> String {
     "user".to_string()
 }
 
-// Used by serde default attribute.
-#[allow(dead_code)]
 fn default_sort_desc() -> SortableOptions {
     let mut options = SortableOptions::default();
     options.direction = OrderDirection::Desc;
@@ -132,7 +151,14 @@ impl FilterCompiler for InBookmarks {
 
         if !state.is_count_query {
             let rank_expr = if args.filter {
-                Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::TimeAdded))
+                // Aggregated: the query is grouped by the std columns, and an item
+                // can have several matching bookmarks (namespaces, wildcard user).
+                Func::max(Expr::col((
+                    user_data.clone(),
+                    Bookmarks::Table,
+                    Bookmarks::TimeAdded,
+                )))
+                .into()
             } else {
                 Expr::val(1)
             };
@@ -141,11 +167,17 @@ impl FilterCompiler for InBookmarks {
 
         apply_group_by(&mut query, get_std_group_by(context, state));
 
-        let (query, context_for_wrap) =
-            apply_sort_bounds(state, query, context.clone(), &cte_name, &self.sort);
-
         let mut joined_tables = JoinedTables::default();
         joined_tables.mark(BaseTable::Files);
+        let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            query,
+            context.clone(),
+            &cte_name,
+            &self.sort,
+            joined_tables,
+        );
+
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
@@ -190,6 +222,45 @@ mod tests {
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("bookmarks"));
         assert!(sql.contains("SELECT"));
+    }
+
+    #[test]
+    fn in_bookmarks_defaults_to_descending_sort() {
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "filter": true }
+        }))
+        .expect("in_bookmarks filter");
+        assert!(!filter.sort.order_by);
+        assert!(matches!(filter.sort.direction, OrderDirection::Desc));
+        assert!(matches!(filter.sort.row_n_direction, OrderDirection::Desc));
+    }
+
+    #[test]
+    fn in_bookmarks_rank_aggregates_time_added() {
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "filter": true },
+            "order_by": true
+        }))
+        .expect("in_bookmarks filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("MAX("));
+    }
+
+    #[tokio::test]
+    async fn in_bookmarks_with_sort_bounds_runs_full_query() {
+        // Regression: the gt/lt wrapper CTE hides the filter's joins, so the
+        // final query must re-join files/items against the wrapper.
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "filter": true },
+            "order_by": true,
+            "gt": 5
+        }))
+        .expect("in_bookmarks filter");
+        run_full_pql_query(QueryElement::InBookmarks(filter), EntityType::File)
+            .await
+            .expect("in_bookmarks query with bounds");
     }
 
     #[tokio::test]

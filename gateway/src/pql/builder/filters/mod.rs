@@ -119,17 +119,8 @@ pub(crate) mod test_support {
         select.with(with_clause).to_string(SqliteQueryBuilder)
     }
 
-    pub(crate) async fn run_full_pql_query(
-        filter: QueryElement,
-        entity: EntityType,
-    ) -> Result<(), sqlx::Error> {
+    pub(crate) async fn run_pql_query(query: PqlQuery) -> Result<(), sqlx::Error> {
         ensure_vec_extension_loaded();
-        let mut query = PqlQuery {
-            query: Some(filter),
-            entity,
-            ..Default::default()
-        };
-
         let built = build_query(query, false).expect("build_query");
         let mut dbs = setup_test_databases().await;
 
@@ -142,5 +133,17 @@ pub(crate) mod test_support {
             .fetch_all(&mut dbs.index_conn)
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn run_full_pql_query(
+        filter: QueryElement,
+        entity: EntityType,
+    ) -> Result<(), sqlx::Error> {
+        let query = PqlQuery {
+            query: Some(filter),
+            entity,
+            ..Default::default()
+        };
+        run_pql_query(query).await
     }
 }

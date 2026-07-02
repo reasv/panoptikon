@@ -1,4 +1,4 @@
-use sea_query::{Alias, Expr, ExprTrait, JoinType, Query};
+use sea_query::{Expr, ExprTrait, JoinType};
 use sea_query::extension::sqlite::SqliteBinOper;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -9,7 +9,7 @@ use crate::pql::preprocess::PqlError;
 use super::FilterCompiler;
 use super::super::{
     CteRef, ExtraColumn, FilesPathFts, JoinedTables, OrderByFilter, QueryState,
-    add_sortable_rank_column, create_cte, scalar_to_expr, select_std_from_cte, wrap_query,
+    add_sortable_rank_column, apply_sort_bounds, select_std_from_cte, wrap_query,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -65,34 +65,15 @@ impl FilterCompiler for MatchPath {
         }
 
         let cte_name = format!("n{}_MatchPath", state.cte_counter);
-        let mut context_for_wrap = context.clone();
-        let mut final_query = query;
+        let (final_query, context_for_wrap, joined_tables) = apply_sort_bounds(
+            state,
+            query,
+            context.clone(),
+            &cte_name,
+            &self.sort,
+            JoinedTables::default(),
+        );
 
-        if !state.is_count_query && (self.sort.gt.is_some() || self.sort.lt.is_some()) {
-            let wrapped_name = format!("wrapped_{cte_name}");
-            let wrapped_cte = create_cte(state, wrapped_name.clone(), final_query.to_owned());
-            context_for_wrap = wrapped_cte.clone();
-
-            let mut wrapped_query = Query::select();
-            wrapped_query
-                .from(Alias::new(wrapped_name.as_str()))
-                .column((Alias::new(wrapped_name.as_str()), sea_query::Asterisk));
-            if let Some(gt) = &self.sort.gt {
-                wrapped_query.and_where(
-                    Expr::col((Alias::new(wrapped_name.as_str()), Alias::new("order_rank")))
-                        .gt(scalar_to_expr(gt)),
-                );
-            }
-            if let Some(lt) = &self.sort.lt {
-                wrapped_query.and_where(
-                    Expr::col((Alias::new(wrapped_name.as_str()), Alias::new("order_rank")))
-                        .lt(scalar_to_expr(lt)),
-                );
-            }
-            final_query = wrapped_query;
-        }
-
-        let joined_tables = JoinedTables::default();
         let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {

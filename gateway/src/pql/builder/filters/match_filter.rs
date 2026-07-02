@@ -141,6 +141,7 @@ pub(crate) struct MatchValue {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MatchOps {
     #[serde(default)]
     pub eq: Option<MatchValue>,
@@ -173,27 +174,36 @@ pub(crate) struct MatchOps {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MatchAnd {
+    #[serde(alias = "and")]
     pub and_: Vec<MatchOps>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MatchOr {
+    #[serde(alias = "or")]
     pub or_: Vec<MatchOps>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MatchNot {
+    #[serde(alias = "not")]
     pub not_: MatchOps,
 }
 
+/// Untagged: variants are tried in order, so `Ops` must come last and deny
+/// unknown fields — it would otherwise match any JSON object (all its fields
+/// are optional) and swallow `and_`/`or_`/`not_` trees as an empty no-op.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum Matches {
-    Ops(MatchOps),
     And(MatchAnd),
     Or(MatchOr),
     Not(MatchNot),
+    Ops(MatchOps),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -273,6 +283,61 @@ mod tests {
     use super::super::test_support::{
         build_base_state, build_begin_cte, render_filter_sql, run_full_pql_query,
     };
+
+    #[test]
+    fn matches_routes_boolean_operators() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "and_": [ { "eq": { "type": "image/png" } } ] }
+        }))
+        .expect("and_ filter");
+        assert!(matches!(filter.match_, Matches::And(_)));
+
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "or_": [ { "eq": { "type": "image/png" } } ] }
+        }))
+        .expect("or_ filter");
+        assert!(matches!(filter.match_, Matches::Or(_)));
+
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "not_": { "eq": { "type": "image/png" } } }
+        }))
+        .expect("not_ filter");
+        assert!(matches!(filter.match_, Matches::Not(_)));
+
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "type": "image/png" } }
+        }))
+        .expect("ops filter");
+        assert!(matches!(filter.match_, Matches::Ops(_)));
+    }
+
+    #[test]
+    fn matches_rejects_unknown_operator_keys() {
+        assert!(
+            serde_json::from_value::<Match>(json!({
+                "match": { "not_a_real_op": { "type": "image/png" } }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Match>(json!({
+                "match": { "and_": [], "eq": { "type": "image/png" } }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn match_not_builds_negated_sql() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "not_": { "eq": { "type": "image/png" } } }
+        }))
+        .expect("not_ filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains("NOT"));
+    }
 
     #[test]
     fn match_filter_builds_sql() {
