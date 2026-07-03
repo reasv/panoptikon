@@ -296,7 +296,7 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
         .map_err(|err| format!("{err:?}"))?;
     drop(conn);
 
-    call_index_db_writer(&job.index_db, |reply| {
+    let deleted = call_index_db_writer(&job.index_db, |reply| {
         IndexDbWriterMessage::DeleteSetterByName {
             setter_name: inference_id.clone(),
             reply,
@@ -305,13 +305,17 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
     .await
     .map_err(|err| format!("{err:?}"))?;
 
+    let mut orphan_tags_deleted = 0;
     if data_types.iter().any(|entry| entry == "tags") {
-        let _ = call_index_db_writer(&job.index_db, |reply| {
+        orphan_tags_deleted = call_index_db_writer(&job.index_db, |reply| {
             IndexDbWriterMessage::DeleteOrphanTags { reply }
         })
-        .await;
+        .await
+        .unwrap_or(0);
     }
-    run_post_job_maintenance(&job.index_db, true).await;
+    // VACUUM blocks the writer for the whole run; skip it when the deletion
+    // turned out to be a no-op.
+    run_post_job_maintenance(&job.index_db, deleted > 0 || orphan_tags_deleted > 0).await;
     Ok(())
 }
 

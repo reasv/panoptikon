@@ -215,10 +215,12 @@ pub(crate) async fn get_all_data_logs(
     Ok(results)
 }
 
+/// Returns the number of rows actually deleted, so callers can skip
+/// post-deletion maintenance when nothing was removed.
 pub(crate) async fn delete_data_job_by_log_id(
     conn: &mut sqlx::SqliteConnection,
     data_log_id: i64,
-) -> ApiResult<()> {
+) -> ApiResult<u64> {
     let job_id: Option<i64> = sqlx::query("SELECT job_id FROM data_log WHERE id = ?")
         .bind(data_log_id)
         .fetch_optional(&mut *conn)
@@ -229,18 +231,20 @@ pub(crate) async fn delete_data_job_by_log_id(
         })?
         .and_then(|row| row.try_get("job_id").ok());
 
+    let mut deleted = 0;
     if let Some(job_id) = job_id {
-        sqlx::query("DELETE FROM data_jobs WHERE id = ?")
+        deleted = sqlx::query("DELETE FROM data_jobs WHERE id = ?")
             .bind(job_id)
             .execute(&mut *conn)
             .await
             .map_err(|err| {
                 tracing::error!(error = %err, "failed to delete data job");
                 ApiError::internal("Failed to delete data job")
-            })?;
+            })?
+            .rows_affected();
     }
 
-    Ok(())
+    Ok(deleted)
 }
 
 pub(crate) async fn get_setters_total_data(

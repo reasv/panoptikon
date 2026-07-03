@@ -429,13 +429,14 @@ async fn execute_job(job: Job) -> Result<(), String> {
         }
         JobType::JobDataDeletion => {
             let log_id = job.log_id.ok_or_else(|| "Log ID required".to_string())?;
-            call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::DeleteJobData {
-                log_id,
-                reply,
+            let deleted = call_index_db_writer(&job.index_db, |reply| {
+                IndexDbWriterMessage::DeleteJobData { log_id, reply }
             })
             .await
             .map_err(|err| format!("{err:?}"))?;
-            crate::jobs::files::run_post_job_maintenance(&job.index_db, true).await;
+            // VACUUM blocks the writer for the whole run; skip it when the
+            // deletion turned out to be a no-op.
+            crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0).await;
             Ok(())
         }
         #[cfg(test)]

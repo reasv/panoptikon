@@ -11,6 +11,7 @@ use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
+use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
 
 pub(super) async fn build_image_frames_inputs(
     index_db: &str,
@@ -99,7 +100,7 @@ pub(super) async fn load_base_frames(
             let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::StoreFrames {
                 sha256: item.sha256.clone(),
                 mime_type: item.item_type.clone(),
-                process_version: 1,
+                process_version: FRAME_PROCESS_VERSION,
                 frames: stored.clone(),
                 reply,
             })
@@ -377,7 +378,10 @@ fn extract_video_frames_into(
     temp_dir: &std::path::Path,
 ) -> ApiResult<Vec<DynamicImage>> {
     let output_pattern = temp_dir.join("frame_%04d.png");
-    let status = std::process::Command::new("ffmpeg")
+    // stdout is silenced, but stderr is captured so a failure can say why
+    // (corrupt file, missing codec, disk full); it is only surfaced on a
+    // non-zero exit.
+    let output = std::process::Command::new("ffmpeg")
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -386,13 +390,17 @@ fn extract_video_frames_into(
         .arg("vfr")
         .arg(&output_pattern)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .map_err(|err| {
             tracing::error!(error = %err, "ffmpeg failed");
             ApiError::internal("Failed to extract frames")
         })?;
-    if !status.success() {
+    if !output.status.success() {
+        tracing::error!(
+            path,
+            stderr = %stderr_tail(&output.stderr),
+            "ffmpeg failed to extract frames"
+        );
         return Err(ApiError::internal("ffmpeg failed to extract frames"));
     }
     let mut paths = std::fs::read_dir(temp_dir)
@@ -436,12 +444,21 @@ fn probe_duration(path: &str) -> ApiResult<f64> {
 }
 
 fn temp_dir_path() -> PathBuf {
+    // PID plus a process-local counter rules out collisions between
+    // concurrent extractions and between gateway instances; the timestamp
+    // alone could repeat across calls or processes, and a collision means
+    // one call's cleanup deletes the other's frames mid-extraction.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let base = std::env::temp_dir();
-    let unique = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    base.join(format!("panoptikon-extract-{unique}"))
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    base.join(format!(
+        "panoptikon-extract-{}-{nanos:x}-{unique}",
+        std::process::id()
+    ))
 }
 
 fn render_pdf_frames(path: &str) -> ApiResult<Vec<Vec<u8>>> {
@@ -458,6 +475,18 @@ fn render_pdf_or_html_frames(path: &str, kind: Option<&str>) -> ApiResult<Vec<Ve
         tracing::error!(error = %err, "failed to create temp dir");
         ApiError::internal("Failed to render document")
     })?;
+    let result = render_pdf_or_html_frames_into(path, kind, &temp_dir);
+    if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
+        tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp render dir");
+    }
+    result
+}
+
+fn render_pdf_or_html_frames_into(
+    path: &str,
+    kind: Option<&str>,
+    temp_dir: &std::path::Path,
+) -> ApiResult<Vec<Vec<u8>>> {
     let script = r#"
 import sys
 from pathlib import Path
@@ -519,7 +548,6 @@ doc.close()
         if let Ok(bytes) = std::fs::read(&page_path) {
             pages.push(bytes);
         }
-        let _ = std::fs::remove_file(&page_path);
     }
     Ok(pages)
 }

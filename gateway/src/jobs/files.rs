@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
-        Arc, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -32,7 +32,7 @@ use crate::{
     api_error::ApiError,
     db::{
         file_scans::{
-            FileScanUpdate, get_open_file_scan_id,
+            FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id,
         },
         files::{
             FileScanData, FileUpsertResult, ItemScanMeta,
@@ -238,6 +238,36 @@ impl FileScanService {
             .await?;
             if inserted {
                 excluded_added.push(folder.clone());
+            }
+        }
+
+        // Folder registration and scanning are separate committed writes, so
+        // a folder update that failed mid-scan leaves folders registered but
+        // never scanned — and re-running the update would skip them, since
+        // INSERT OR IGNORE no longer reports them as new. Pick up any
+        // included folder not yet covered by a completed scan (its own or an
+        // ancestor's, since nested folders are scanned via their parent).
+        {
+            let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
+            let registered = get_folders_from_database(&mut conn, true).await?;
+            let completed = get_completed_scan_paths(&mut conn).await?;
+            drop(conn);
+            let completed_roots: Vec<PathBuf> = completed
+                .iter()
+                .map(|scan_path| normalize_path(scan_path, false))
+                .collect();
+            for folder in registered {
+                let normalized = normalize_path(&folder, false);
+                let covered = completed_roots
+                    .iter()
+                    .any(|root| normalized.starts_with(root));
+                if !covered && !included_added.contains(&folder) {
+                    tracing::info!(
+                        folder,
+                        "included folder has no completed scan; scheduling scan"
+                    );
+                    included_added.push(folder);
+                }
             }
         }
 
@@ -531,9 +561,24 @@ struct ScanContext {
     filescan_filter: Option<Arc<Match>>,
     semaphore: Arc<Semaphore>,
     tasks: JoinSet<TaskOutcome>,
+    // Path (and whether the task is a visuals backfill) per in-flight task, so
+    // a task that dies without producing an outcome can still be accounted to
+    // its file.
+    task_paths: HashMap<tokio::task::Id, TrackedTask>,
+    // Content hashes with an in-flight visuals task. Visuals are keyed by
+    // sha256, so a second file with identical content would regenerate (and
+    // then fail to store) the exact same data.
+    in_flight_visuals: HashSet<String>,
     stats: FolderStats,
     error_paths: Vec<String>,
     conn: sqlx::SqliteConnection,
+}
+
+struct TrackedTask {
+    path: String,
+    // Some(sha256) when the task is a visuals backfill, None for file
+    // processing (hash / new-item preparation).
+    backfill_sha256: Option<String>,
 }
 
 async fn scan_single_folder(
@@ -555,6 +600,8 @@ async fn scan_single_folder(
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
         tasks: JoinSet::new(),
+        task_paths: HashMap::new(),
+        in_flight_visuals: HashSet::new(),
         stats: FolderStats::new(),
         error_paths: Vec::new(),
         conn,
@@ -567,7 +614,7 @@ async fn scan_single_folder(
     {
         // Drain finished work before taking on more, so completed results
         // are persisted as the walk progresses instead of piling up in memory.
-        while let Some(joined) = ctx.tasks.try_join_next() {
+        while let Some(joined) = ctx.tasks.try_join_next_with_id() {
             ctx.handle_joined(joined).await?;
         }
 
@@ -594,7 +641,7 @@ async fn scan_single_folder(
         ctx.scan_path(path).await?;
     }
 
-    while let Some(joined) = ctx.tasks.join_next().await {
+    while let Some(joined) = ctx.tasks.join_next_with_id().await {
         ctx.handle_joined(joined).await?;
     }
 
@@ -689,13 +736,42 @@ impl ScanContext {
 
     async fn handle_joined(
         &mut self,
-        joined: Result<TaskOutcome, tokio::task::JoinError>,
+        joined: Result<(tokio::task::Id, TaskOutcome), tokio::task::JoinError>,
     ) -> ApiResult<()> {
         match joined {
-            Ok(outcome) => self.handle_outcome(outcome).await,
+            Ok((id, outcome)) => {
+                self.task_paths.remove(&id);
+                self.handle_outcome(outcome).await
+            }
             Err(err) => {
-                tracing::error!(error = %err, "file processing task failed");
-                self.stats.errors += 1;
+                match self.task_paths.remove(&err.id()) {
+                    // Backfill failures are not scan errors: the file itself
+                    // was already recorded, only its visuals are missing, and
+                    // the next scan retries them (matching Python, which
+                    // catches ensure_thumbnail/blurhash errors per file).
+                    Some(TrackedTask {
+                        path,
+                        backfill_sha256: Some(sha256),
+                    }) => {
+                        self.in_flight_visuals.remove(&sha256);
+                        tracing::error!(error = %err, path, "visuals backfill task failed");
+                    }
+                    // A file whose task died without an outcome must be kept
+                    // out of unavailable-marking, or cleanup could delete a
+                    // file that is still on disk.
+                    Some(TrackedTask {
+                        path,
+                        backfill_sha256: None,
+                    }) => {
+                        tracing::error!(error = %err, path, "file processing task failed");
+                        self.stats.errors += 1;
+                        self.error_paths.push(path);
+                    }
+                    None => {
+                        tracing::error!(error = %err, "file processing task failed");
+                        self.stats.errors += 1;
+                    }
+                }
                 Ok(())
             }
         }
@@ -847,12 +923,22 @@ impl ScanContext {
     }
 
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
+        self.in_flight_visuals.remove(&backfill.sha256);
         self.stats.thumbgen_time += backfill.thumb_time;
         self.stats.blurhash_time += backfill.blurhash_time;
 
+        // Another task may have stored visuals for the same content while
+        // this one was running; re-check before writing so a duplicate store
+        // cannot violate the (item_sha256, idx) uniqueness. Read failures
+        // fall through to storing, which was the previous behavior.
+        let already_stored =
+            has_thumbnail(&mut self.conn, &backfill.sha256, THUMBNAIL_PROCESS_VERSION)
+                .await
+                .unwrap_or(false);
+
         // Storage failures for backfilled visuals are logged and skipped so a
         // single bad file cannot abort the scan; the next scan retries them.
-        if !backfill.thumbnails.is_empty() {
+        if !backfill.thumbnails.is_empty() && !already_stored {
             if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreThumbnails {
                     sha256: backfill.sha256.clone(),
@@ -868,7 +954,10 @@ impl ScanContext {
             }
         }
 
-        if !backfill.extracted_frames.is_empty() {
+        let frames_stored = has_frame(&mut self.conn, &backfill.sha256, FRAME_PROCESS_VERSION)
+            .await
+            .unwrap_or(false);
+        if !backfill.extracted_frames.is_empty() && !frames_stored {
             if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreFrames {
                     sha256: backfill.sha256.clone(),
@@ -923,24 +1012,35 @@ impl ScanContext {
         if !needs_thumb && !needs_blurhash {
             return Ok(());
         }
+        // Identical content elsewhere in this scan already has a visuals task
+        // in flight; its results apply to this sha256 as well.
+        if self.in_flight_visuals.contains(&sha256) {
+            return Ok(());
+        }
 
         let mut existing_frames = Vec::new();
         let mut video_duration = 0.0_f64;
         if needs_thumb && mime_type.starts_with("video") {
-            if let Some((duration, video_tracks)) =
-                get_item_visual_meta(&mut self.conn, &sha256).await?
-            {
-                let duration = duration.unwrap_or(0.0);
-                if duration <= 0.0 || video_tracks.unwrap_or(0) <= 0 {
-                    tracing::debug!(
-                        path = %path.display(),
-                        "skipping video thumbnail generation due to missing video track"
-                    );
-                    return Ok(());
-                }
-                video_duration = duration;
-            }
+            // Frames already stored in the database can rebuild the thumbnail
+            // even when the item's duration metadata is missing; only a fresh
+            // ffmpeg extraction needs a usable duration (matching Python,
+            // which consults metadata only when no frames exist).
             existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
+            if existing_frames.is_empty() {
+                if let Some((duration, video_tracks)) =
+                    get_item_visual_meta(&mut self.conn, &sha256).await?
+                {
+                    let duration = duration.unwrap_or(0.0);
+                    if duration <= 0.0 || video_tracks.unwrap_or(0) <= 0 {
+                        tracing::debug!(
+                            path = %path.display(),
+                            "skipping video thumbnail generation due to missing video track"
+                        );
+                        return Ok(());
+                    }
+                    video_duration = duration;
+                }
+            }
         }
         let existing_thumb = if !needs_thumb && needs_blurhash {
             get_thumbnail_bytes(&mut self.conn, &sha256, 0).await?
@@ -962,9 +1062,16 @@ impl ScanContext {
             .acquire_owned()
             .await
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
-        self.tasks.spawn(async move {
+        self.in_flight_visuals.insert(sha256.clone());
+        let tracked = TrackedTask {
+            path: path.to_string_lossy().to_string(),
+            backfill_sha256: Some(sha256.clone()),
+        };
+        let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let outer_path = path.clone();
+            let outer_sha256 = sha256.clone();
+            let outer_mime = mime_type.clone();
             let joined = tokio::task::spawn_blocking(move || {
                 generate_backfill_visuals(
                     &path,
@@ -980,14 +1087,30 @@ impl ScanContext {
             .await;
             match joined {
                 Ok(backfill) => TaskOutcome::Backfill(backfill),
-                Err(err) => TaskOutcome::Failed(FailedFile {
-                    path: outer_path,
-                    hash_time: 0.0,
-                    metadata_time: 0.0,
-                    error: FileProcessError::Worker(err.to_string()),
-                }),
+                // The file itself was already recorded before this task was
+                // dispatched; a dead visuals worker only means the visuals
+                // stay missing until the next scan. Do not surface it as a
+                // file error, which would double-count the file and put it
+                // on the unavailable-marking exclusion list for no reason.
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        path = %outer_path.display(),
+                        "visuals backfill worker failed"
+                    );
+                    TaskOutcome::Backfill(BackfillResult {
+                        sha256: outer_sha256,
+                        mime_type: outer_mime,
+                        thumbnails: Vec::new(),
+                        extracted_frames: Vec::new(),
+                        blurhash: None,
+                        thumb_time: 0.0,
+                        blurhash_time: 0.0,
+                    })
+                }
             }
         });
+        self.task_paths.insert(handle.id(), tracked);
         Ok(())
     }
 
@@ -1005,7 +1128,11 @@ impl ScanContext {
             .acquire_owned()
             .await
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
-        self.tasks.spawn(async move {
+        let tracked = TrackedTask {
+            path: path.to_string_lossy().to_string(),
+            backfill_sha256: None,
+        };
+        let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let hash_path = path.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -1042,6 +1169,7 @@ impl ScanContext {
                 }),
             }
         });
+        self.task_paths.insert(handle.id(), tracked);
         Ok(())
     }
 
@@ -1063,7 +1191,11 @@ impl ScanContext {
             .await
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
         let filter = self.filescan_filter.clone();
-        self.tasks.spawn(async move {
+        let tracked = TrackedTask {
+            path: path.to_string_lossy().to_string(),
+            backfill_sha256: None,
+        };
+        let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let outer_path = path.clone();
             let joined = tokio::task::spawn_blocking(move || {
@@ -1080,6 +1212,7 @@ impl ScanContext {
                 }),
             }
         });
+        self.task_paths.insert(handle.id(), tracked);
         Ok(())
     }
 
@@ -1815,6 +1948,12 @@ fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProce
 }
 
 static PDFIUM: OnceLock<Option<Pdfium>> = OnceLock::new();
+// The pdfium C library is not thread-safe, and pdfium-render's `sync` feature
+// only makes the `Pdfium` handle Send+Sync (its internal mutex guards nothing
+// but library init/destroy). Every FFI call — document load, page access,
+// rendering — must be externally serialized or concurrent scan workers cause
+// undefined behavior inside pdfium.
+static PDFIUM_CALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Lazily binds the pdfium dynamic library, mirroring the Python dependency
 /// on pypdfium2. Degrades gracefully: when the library cannot be found, PDF
@@ -1867,6 +2006,9 @@ fn pdfium() -> Option<&'static Pdfium> {
 /// pypdfium2 loader (`scale=2`, i.e. 144 dpi).
 fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
     let pdfium = pdfium()?;
+    let _serialized = PDFIUM_CALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let document = match pdfium.load_pdf_from_file(path, None) {
         Ok(document) => document,
         Err(err) => {
@@ -1929,9 +2071,11 @@ fn html_renderer() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Builds a file:// URL from a canonicalized path. On Windows, canonicalize
-/// yields a \\?\C:\... verbatim path; the prefix is stripped and backslashes
-/// flipped so the result is file:///C:/dir/page.html.
+/// Builds a percent-encoded file:// URL from a canonicalized path, so names
+/// containing `#`, `?`, `%`, or spaces are not misparsed by the browser as
+/// fragment/query/escape syntax. On Windows, canonicalize yields a \\?\C:\...
+/// verbatim path; the prefix is stripped first because the url crate would
+/// encode it into the result.
 fn html_file_url(path: &Path) -> Option<String> {
     let canonical = match path.canonicalize() {
         Ok(canonical) => canonical,
@@ -1940,14 +2084,66 @@ fn html_file_url(path: &Path) -> Option<String> {
             return None;
         }
     };
-    let mut text = canonical.to_string_lossy().replace('\\', "/");
-    if let Some(stripped) = text.strip_prefix("//?/") {
-        text = stripped.to_string();
+    let text = canonical.to_string_lossy().to_string();
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    match url::Url::from_file_path(plain) {
+        Ok(url) => Some(url.into()),
+        Err(()) => {
+            tracing::error!(path = %path.display(), "failed to build file URL for HTML path");
+            None
+        }
     }
-    if text.starts_with('/') {
-        Some(format!("file://{text}"))
-    } else {
-        Some(format!("file:///{text}"))
+}
+
+/// A headless browser is a multi-process tree weighing hundreds of MB;
+/// scan-worker parallelism (CPU count) is the wrong unit for it. At most this
+/// many renders run at once, independent of the scan semaphore.
+static BROWSER_SLOTS: BlockingSemaphore = BlockingSemaphore::new(2);
+
+/// A minimal counting semaphore usable from spawn_blocking threads, where the
+/// tokio async semaphore cannot be awaited.
+struct BlockingSemaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+impl BlockingSemaphore {
+    const fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> BlockingSemaphoreGuard<'_> {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *permits == 0 {
+            permits = self
+                .available
+                .wait(permits)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *permits -= 1;
+        BlockingSemaphoreGuard { semaphore: self }
+    }
+}
+
+struct BlockingSemaphoreGuard<'a> {
+    semaphore: &'a BlockingSemaphore,
+}
+
+impl Drop for BlockingSemaphoreGuard<'_> {
+    fn drop(&mut self) {
+        let mut permits = self
+            .semaphore
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *permits += 1;
+        self.semaphore.available.notify_one();
     }
 }
 
@@ -1957,6 +2153,7 @@ fn html_file_url(path: &Path) -> Option<String> {
 fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
     let browser = html_renderer()?;
     let url = html_file_url(path)?;
+    let _slot = BROWSER_SLOTS.acquire();
     let temp_dir = temp_dir_path();
     // The browser resolves its path arguments itself, so they must not
     // depend on the inherited working directory.
@@ -1973,6 +2170,9 @@ fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
         return None;
     }
     let screenshot = temp_dir.join("shot.png");
+    // A leftover file here (crashed previous run, reused directory) would
+    // decode as this file's screenshot before the browser writes anything.
+    let _ = fs::remove_file(&screenshot);
 
     let result = run_html_screenshot(browser, &url, &profile_dir, &screenshot, path);
     if let Err(err) = fs::remove_dir_all(&temp_dir) {
@@ -1988,11 +2188,22 @@ fn run_html_screenshot(
     screenshot: &Path,
     path: &Path,
 ) -> Option<DynamicImage> {
+    // Scanned HTML lives in user-approved folders, but a saved page can still
+    // carry live script and remote references, so all network traffic
+    // (including localhost, via the <-loopback> bypass override) is routed
+    // into a dead proxy — no beaconing, no SSRF. file:// subresources are
+    // unaffected, matching what the Python weasyprint pipeline could load.
+    // JavaScript stays enabled: --blink-settings=scriptEnabled=false makes
+    // Edge's new headless mode never produce a screenshot (verified against
+    // Edge 13x), and with the network dead a runaway script can only burn CPU
+    // until the deadline, where the job object kills the process tree.
     let mut child = match Command::new(browser)
         .arg("--headless")
         .arg("--disable-gpu")
         .arg("--no-first-run")
         .arg("--hide-scrollbars")
+        .arg("--proxy-server=127.0.0.1:0")
+        .arg("--proxy-bypass-list=<-loopback>")
         .arg("--window-size=1280,2000")
         .arg("--default-background-color=FFFFFFFF")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -2008,6 +2219,11 @@ fn run_html_screenshot(
             return None;
         }
     };
+    // Chromium is a process tree, and on Windows msedge.exe is a launcher
+    // whose real browser detaches from it entirely; killing the direct child
+    // leaves the tree running. A kill-on-close job object captures every
+    // descendant, so dropping the guard (any return path) reaps them all.
+    let _job = process_tree::JobGuard::assign(&child);
 
     // Poll instead of wait() so a wedged renderer cannot stall a scan worker
     // forever; these run inside spawn_blocking, so sleeping here is fine.
@@ -2048,6 +2264,96 @@ fn run_html_screenshot(
     }
     tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
     None
+}
+
+/// Kill-on-close job object wrapper. On Windows, every descendant of the
+/// assigned process is terminated when the guard drops, covering both the
+/// multi-process Chromium tree and the msedge.exe launcher whose real browser
+/// detaches from the spawned process. On other platforms this is a no-op and
+/// `Child::kill` remains the only cleanup.
+mod process_tree {
+    pub(super) struct JobGuard {
+        #[cfg(windows)]
+        _job: Option<windows_job::Job>,
+    }
+
+    impl JobGuard {
+        pub(super) fn assign(child: &std::process::Child) -> JobGuard {
+            #[cfg(windows)]
+            {
+                let job = windows_job::Job::assign(child);
+                if job.is_none() {
+                    tracing::warn!(
+                        "failed to create job object; browser subprocesses may outlive the scan"
+                    );
+                }
+                JobGuard { _job: job }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = child;
+                JobGuard {}
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod windows_job {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        pub(super) struct Job(HANDLE);
+
+        // The handle is used only to close the job object exactly once; the
+        // kernel object itself is thread-safe.
+        unsafe impl Send for Job {}
+
+        impl Job {
+            /// Children the process spawned before this call are not captured
+            /// (std cannot spawn suspended), but the launcher needs far longer
+            /// to start the browser than this takes to run.
+            pub(super) fn assign(child: &std::process::Child) -> Option<Job> {
+                unsafe {
+                    let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                    if handle.is_null() {
+                        return None;
+                    }
+                    // Owns the handle from here on, so early returns close it.
+                    let job = Job(handle);
+                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    if SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformation,
+                        (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    ) == 0
+                    {
+                        return None;
+                    }
+                    if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                        return None;
+                    }
+                    Some(job)
+                }
+            }
+        }
+
+        impl Drop for Job {
+            fn drop(&mut self) {
+                // Kill-on-close terminates every process still in the job.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -2142,8 +2448,11 @@ fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
                 title = tag.title().map(|value| value.to_string()).unwrap_or_default();
                 if let Some(picture) = tag.pictures().first() {
                     if let Ok(cover) = image::load_from_memory(picture.data()) {
-                        // Cover art is used as-is, without any text overlay.
-                        return cover;
+                        // Cover art gets no text overlay, but is capped in
+                        // size: embedded art can be arbitrarily large and
+                        // would otherwise be stored full-resolution in the
+                        // database.
+                        return downscale_cover_art(cover);
                     }
                 }
             }
@@ -2157,6 +2466,22 @@ fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
         }
     }
     build_audio_placeholder(mime_type, &artist, &album, &title)
+}
+
+/// Caps cover art at the placeholder's dimensions. Matches the 1024x1024
+/// canvas used by `build_audio_placeholder`, so stored audio thumbnails have
+/// a consistent upper bound regardless of the embedded art's resolution.
+fn downscale_cover_art(cover: DynamicImage) -> DynamicImage {
+    const MAX_COVER_DIM: u32 = 1024;
+    let (width, height) = cover.dimensions();
+    if width <= MAX_COVER_DIM && height <= MAX_COVER_DIM {
+        return cover;
+    }
+    cover.resize(
+        MAX_COVER_DIM,
+        MAX_COVER_DIM,
+        image::imageops::FilterType::Lanczos3,
+    )
 }
 
 fn build_audio_placeholder(
@@ -2246,6 +2571,18 @@ fn extract_video_frames(
     result
 }
 
+/// Renders the last portion of a captured stderr for error messages, keeping
+/// diagnostics without dumping pages of encoder output into the log.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
+    const MAX_LEN: usize = 500;
+    let text = String::from_utf8_lossy(stderr);
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth_back(MAX_LEN - 1) {
+        Some((idx, _)) => format!("...{}", &trimmed[idx..]),
+        None => trimmed.to_string(),
+    }
+}
+
 fn extract_video_frames_into(
     path: &Path,
     num_frames: usize,
@@ -2253,7 +2590,10 @@ fn extract_video_frames_into(
     temp_dir: &Path,
 ) -> Result<Vec<DynamicImage>, FileProcessError> {
     let output_pattern = temp_dir.join("frame_%04d.png");
-    let status = Command::new("ffmpeg")
+    // stdout is silenced, but stderr is captured so a failure can say why
+    // (corrupt file, missing codec, disk full) instead of just "ffmpeg
+    // failed"; it is only surfaced on a non-zero exit.
+    let output = Command::new("ffmpeg")
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -2262,12 +2602,14 @@ fn extract_video_frames_into(
         .arg("vfr")
         .arg(&output_pattern)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
 
-    if !status.success() {
-        return Err(FileProcessError::Unsupported("ffmpeg failed".to_string()));
+    if !output.status.success() {
+        return Err(FileProcessError::Unsupported(format!(
+            "ffmpeg failed: {}",
+            stderr_tail(&output.stderr)
+        )));
     }
 
     let mut frames = Vec::new();
@@ -2456,11 +2798,25 @@ fn iso_format() -> &'static [FormatItem<'static>] {
     })
 }
 
+/// Returns a temp directory path that is unique across processes and process
+/// restarts. A bare counter is not enough: after a crash, leftover files from
+/// a previous run's `frames-0` would be picked up as the *wrong file's*
+/// output (a stale screenshot decodes fine and gets stored keyed by sha256).
 fn temp_dir_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static STARTUP_NONCE: OnceLock<u64> = OnceLock::new();
+    let nonce = STARTUP_NONCE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0)
+    });
     let base = env::var("TEMP_DIR").unwrap_or_else(|_| "data/tmp".to_string());
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(base).join(format!("frames-{unique}"))
+    PathBuf::from(base).join(format!(
+        "frames-{}-{nonce:x}-{unique}",
+        std::process::id()
+    ))
 }
 
 pub(crate) fn check_folder_validity(folder: &str) -> bool {
@@ -2931,6 +3287,58 @@ LIMIT 1
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let folders_after = get_folders_from_database(&mut conn, true).await.unwrap();
         assert_eq!(folders_after, folders);
+    }
+
+    // A folder registered by an update that failed before its scan completed
+    // must be picked up by the next update, even though INSERT OR IGNORE no
+    // longer reports it as newly added.
+    #[tokio::test]
+    async fn folder_update_scans_registered_but_unscanned_folders() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("sample.png");
+        let image = image::RgbImage::new(8, 8);
+        image.save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        // Simulate an update that committed the folder registration and then
+        // failed before completing a scan.
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddFolderToDatabase {
+            time_added: "2024-01-01T00:00:00".to_string(),
+            path: media_dir.to_string_lossy().to_string(),
+            included: true,
+            reply,
+        })
+        .await
+        .unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        let result = service.run_folder_update().await.unwrap();
+        assert!(!result.scan_ids.is_empty(), "stranded folder was not scanned");
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(files.0, 1);
     }
 
     // A file that is not valid audio must still yield a 1024x1024 placeholder.

@@ -33,7 +33,7 @@ use crate::jobs::files::{
     THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data, check_folder_validity,
     current_iso_timestamp, deduplicate_paths, get_last_modified_time_and_size,
     has_allowed_extension, is_excluded, is_hidden_or_temp, normalize_path, parse_filescan_filter,
-    process_file,
+    process_file, run_post_job_maintenance,
 };
 use crate::pql::model::Match;
 
@@ -41,6 +41,9 @@ type ApiResult<T> = Result<T, ApiError>;
 
 const CONTINUOUS_PATH_SENTINEL: &str = "<continuous>";
 const SUPERVISOR_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
+// Watcher deletions happen outside any job, so no post-job maintenance pass
+// ever accounts for them; compact once this many rows have been removed.
+const MAINTENANCE_DELETION_THRESHOLD: u64 = 1000;
 
 #[derive(Clone)]
 struct FileWork {
@@ -252,6 +255,7 @@ pub(crate) struct ContinuousScanState {
     factory_handle: Option<ractor::concurrency::JoinHandle<()>>,
     watcher: Option<WatcherHandle>,
     enable_watcher: bool,
+    deletions_since_maintenance: u64,
 }
 impl ContinuousScanState {
     fn reset_stats(&mut self) {
@@ -389,17 +393,22 @@ impl ContinuousScanState {
             return Ok(());
         }
 
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let files_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteFileByPath {
                 path: path.to_string_lossy().to_string(),
                 reply,
             }
         })
         .await?;
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let item_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteItemIfOrphan { item_id, reply }
         })
         .await?;
+        self.deletions_since_maintenance += files_deleted + u64::from(item_deleted);
+        if self.deletions_since_maintenance >= MAINTENANCE_DELETION_THRESHOLD {
+            self.deletions_since_maintenance = 0;
+            run_post_job_maintenance(&self.index_db, true).await;
+        }
         Ok(())
     }
 
@@ -569,6 +578,7 @@ impl Actor for ContinuousScanActor {
             factory_handle: Some(handle),
             watcher: None,
             enable_watcher: args.enable_watcher,
+            deletions_since_maintenance: 0,
         };
 
         let roots_ok = state.refresh_roots();

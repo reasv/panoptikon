@@ -186,6 +186,27 @@ LIMIT 1
     Ok(row.map(|(id,)| id))
 }
 
+/// Returns the distinct root paths of scans that ran to completion. Used to
+/// detect folders that were registered but whose first scan never finished.
+pub(crate) async fn get_completed_scan_paths(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+SELECT DISTINCT path
+FROM file_scans
+WHERE end_time IS NOT NULL
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to query completed file scans");
+        ApiError::internal("Failed to query file scans")
+    })?;
+    Ok(rows.into_iter().map(|(path,)| path).collect())
+}
+
 pub(crate) async fn get_all_file_scans(
     conn: &mut sqlx::SqliteConnection,
     page: i64,
@@ -346,7 +367,14 @@ pub(crate) async fn mark_unavailable_files(
             .take(excluded_paths.len())
             .collect::<Vec<_>>()
             .join(",");
-        format!("\nAND path NOT IN ({placeholders})")
+        // On Windows the same folder can be re-registered with different
+        // casing between scans, and NOT IN compares bytes; without folding,
+        // a failed file's stored row would escape the exclusion and could be
+        // marked unavailable (and deleted) while still on disk. NOCASE folds
+        // ASCII only, which covers drive letters and typical drift; erring
+        // toward excluding too much is the safe direction here.
+        let collate = if cfg!(windows) { " COLLATE NOCASE" } else { "" };
+        format!("\nAND path{collate} NOT IN ({placeholders})")
     };
 
     let count_sql = format!(
@@ -593,6 +621,60 @@ VALUES
                 .await
                 .unwrap();
         assert_eq!(row.0, 0);
+    }
+
+    // Ensures the exclusion still protects a failed file when the folder was
+    // re-registered with different casing than the stored rows (Windows paths
+    // are case-insensitive, NOT IN compares bytes).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mark_unavailable_files_excludes_case_drifted_paths() {
+        let mut dbs = setup_test_databases().await;
+        let previous_scan_id =
+            add_file_scan(&mut dbs.index_conn, "2024-01-01T00:00:00", r"C:\data\")
+                .await
+                .unwrap();
+        let scan_id = add_file_scan(&mut dbs.index_conn, "2024-01-01T00:01:00", r"C:\data\")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available)
+VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1)
+            "#,
+        )
+        .bind(previous_scan_id)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let (marked, _) = mark_unavailable_files(
+            &mut dbs.index_conn,
+            scan_id,
+            r"C:\data\",
+            &[r"c:\data\ONE.png".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(marked, 0);
+        let row: (i64,) =
+            sqlx::query_as("SELECT available FROM files WHERE path = 'C:\\data\\one.png'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 1);
     }
 
     // Ensures unavailable deletion removes only files flagged unavailable.

@@ -1416,6 +1416,7 @@ dependencies = [
  "utoipa-redoc",
  "utoipa-swagger-ui",
  "walkdir",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

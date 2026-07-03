@@ -161,7 +161,7 @@ pub(crate) enum IndexDbWriterMessage {
     },
     DeleteJobData {
         log_id: i64,
-        reply: Reply<()>,
+        reply: Reply<u64>,
     },
     RemoveIncompleteJobs {
         reply: Reply<()>,
@@ -797,7 +797,10 @@ impl Actor for IndexDbWriter {
                     index_db = %state.index_db,
                     "running VACUUM on index database; this may take a while"
                 );
-                let result = state.run_maintenance(&["VACUUM"]).await;
+                // A schema-less VACUUM only compacts `main`; the attached
+                // storage database holds the thumbnail/frame blobs whose
+                // deletion is what usually triggers this in the first place.
+                let result = state.run_maintenance(&["VACUUM", "VACUUM storage"]).await;
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::Analyze { reply } => {

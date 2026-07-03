@@ -72,10 +72,13 @@ pub(crate) async fn store_thumbnails(
     process_version: i64,
     thumbnails: &[StoredImage],
 ) -> ApiResult<()> {
+    // <= makes a same-version re-store replace instead of violating the
+    // (item_sha256, idx) uniqueness when two sources race to store visuals
+    // for identical content.
     sqlx::query(
         r#"
 DELETE FROM storage.thumbnails
-WHERE item_sha256 = ?1 AND version < ?2
+WHERE item_sha256 = ?1 AND version <= ?2
         "#,
     )
     .bind(sha256)
@@ -121,10 +124,12 @@ pub(crate) async fn store_frames(
     process_version: i64,
     frames: &[StoredImage],
 ) -> ApiResult<()> {
+    // <= for the same reason as store_thumbnails: same-version re-stores
+    // replace rather than conflict.
     sqlx::query(
         r#"
 DELETE FROM storage.frames
-WHERE item_sha256 = ?1 AND version < ?2
+WHERE item_sha256 = ?1 AND version <= ?2
         "#,
     )
     .bind(sha256)
