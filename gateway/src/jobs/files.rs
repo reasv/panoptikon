@@ -1594,6 +1594,13 @@ fn generate_new_item_visuals(
             thumbnails.push(encode_image(0, &page)?);
             blurhash_source = Some(page);
         }
+    } else if mime_type.starts_with("text/html") {
+        // Renders nothing when no headless browser is installed or the page
+        // fails to render; the item is then indexed without visuals.
+        if let Some(shot) = render_html_screenshot(path) {
+            thumbnails.push(encode_image(0, &shot)?);
+            blurhash_source = Some(shot);
+        }
     }
 
     let thumb_time = thumb_start.elapsed().as_secs_f64();
@@ -1728,6 +1735,11 @@ fn build_backfill_thumbnails(
         if let Some(page) = render_pdf_first_page(path) {
             thumbnails.push(encode_image(0, &page)?);
             source = Some(page);
+        }
+    } else if mime_type.starts_with("text/html") {
+        if let Some(shot) = render_html_screenshot(path) {
+            thumbnails.push(encode_image(0, &shot)?);
+            source = Some(shot);
         }
     }
 
@@ -1876,6 +1888,166 @@ fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
             None
         }
     }
+}
+
+static HTML_RENDERER: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Lazily locates a locally installed Chromium-family browser for headless
+/// HTML screenshots. Degrades gracefully: when no browser is found, HTML
+/// thumbnails are skipped (warned once) and all other scanning is unaffected.
+fn html_renderer() -> Option<&'static PathBuf> {
+    HTML_RENDERER
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Ok(custom) = env::var("HTML_RENDERER_PATH") {
+                candidates.push(PathBuf::from(custom));
+            }
+            candidates.extend(
+                [
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/google-chrome-stable",
+                ]
+                .iter()
+                .map(PathBuf::from),
+            );
+            for candidate in &candidates {
+                if candidate.is_file() {
+                    return Some(candidate.clone());
+                }
+            }
+            tracing::warn!(
+                searched = ?candidates,
+                "no headless browser found; HTML thumbnails are disabled"
+            );
+            None
+        })
+        .as_ref()
+}
+
+/// Builds a file:// URL from a canonicalized path. On Windows, canonicalize
+/// yields a \\?\C:\... verbatim path; the prefix is stripped and backslashes
+/// flipped so the result is file:///C:/dir/page.html.
+fn html_file_url(path: &Path) -> Option<String> {
+    let canonical = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(err) => {
+            tracing::error!(error = %err, path = %path.display(), "failed to canonicalize HTML path");
+            return None;
+        }
+    };
+    let mut text = canonical.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = text.strip_prefix("//?/") {
+        text = stripped.to_string();
+    }
+    if text.starts_with('/') {
+        Some(format!("file://{text}"))
+    } else {
+        Some(format!("file:///{text}"))
+    }
+}
+
+/// Screenshots an HTML file with a locally installed headless browser. This
+/// intentionally replaces the Python weasyprint HTML->PDF pipeline with a
+/// browser viewport capture. Never fails hard: any error degrades to None.
+fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
+    let browser = html_renderer()?;
+    let url = html_file_url(path)?;
+    let temp_dir = temp_dir_path();
+    // The browser resolves its path arguments itself, so they must not
+    // depend on the inherited working directory.
+    let temp_dir = if temp_dir.is_absolute() {
+        temp_dir
+    } else {
+        env::current_dir().ok()?.join(temp_dir)
+    };
+    // Headless browsers refuse to share a live profile; give each render its
+    // own throwaway --user-data-dir.
+    let profile_dir = temp_dir.join("profile");
+    if let Err(err) = fs::create_dir_all(&profile_dir) {
+        tracing::error!(error = %err, path = %profile_dir.display(), "failed to create temp screenshot dir");
+        return None;
+    }
+    let screenshot = temp_dir.join("shot.png");
+
+    let result = run_html_screenshot(browser, &url, &profile_dir, &screenshot, path);
+    if let Err(err) = fs::remove_dir_all(&temp_dir) {
+        tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp screenshot dir");
+    }
+    result
+}
+
+fn run_html_screenshot(
+    browser: &Path,
+    url: &str,
+    profile_dir: &Path,
+    screenshot: &Path,
+    path: &Path,
+) -> Option<DynamicImage> {
+    let mut child = match Command::new(browser)
+        .arg("--headless")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--hide-scrollbars")
+        .arg("--window-size=1280,2000")
+        .arg("--default-background-color=FFFFFFFF")
+        .arg(format!("--user-data-dir={}", profile_dir.display()))
+        .arg(format!("--screenshot={}", screenshot.display()))
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::error!(error = %err, browser = %browser.display(), "failed to launch headless browser");
+            return None;
+        }
+    };
+
+    // Poll instead of wait() so a wedged renderer cannot stall a scan worker
+    // forever; these run inside spawn_blocking, so sleeping here is fine.
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::error!(path = %path.display(), "headless browser timed out rendering HTML");
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                tracing::error!(error = %err, path = %path.display(), "failed to wait for headless browser");
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        tracing::error!(status = %status, path = %path.display(), "headless browser exited with an error");
+        return None;
+    }
+    // On Windows the spawned executable can be a launcher that exits at once
+    // while a detached browser process writes the screenshot, so poll until
+    // the file decodes (a partially written PNG fails to decode) or time is
+    // up.
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match image::open(screenshot) {
+            Ok(image) => return Some(image),
+            Err(err) => last_err = Some(err),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
+    None
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -2875,5 +3047,26 @@ LIMIT 1
         assert!(page.width() > 0 && page.height() > 0);
         // scale_page_by_factor(2.0) doubles the page's point size.
         assert_eq!(page.dimensions(), (400, 200));
+    }
+
+    // HTML rendering depends on a locally installed Chromium-family browser;
+    // the scan pipeline (and this test) must degrade gracefully without one.
+    #[test]
+    fn render_html_screenshot_captures_page_when_browser_available() {
+        if html_renderer().is_none() {
+            eprintln!("no headless browser available, skipping");
+            return;
+        }
+        let test_env = test_data_dir();
+        let path = test_env.path().join("sample.html");
+        fs::write(
+            &path,
+            "<html><body style=\"background:#ff0000\"><h1>hello</h1></body></html>",
+        )
+        .unwrap();
+
+        let shot = render_html_screenshot(&path).expect("screenshot should render");
+        // --window-size fixes the viewport width; the height can vary.
+        assert_eq!(shot.width(), 1280);
     }
 }
