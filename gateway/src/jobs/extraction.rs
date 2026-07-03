@@ -21,7 +21,7 @@ use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::inferio_client::InferenceInput;
 use crate::jobs::continuous_scan;
-use crate::jobs::files::{FileScanService, is_resync_needed};
+use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
 use crate::pql::builder::filters::OneOrMany;
 use crate::pql::model::{
@@ -112,6 +112,9 @@ pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(
 
     let result = run_extraction_job_inner(&job, &inference_id).await;
     let _ = continuous_scan::resume_after_job(&job.index_db).await;
+    if result.is_ok() {
+        run_post_job_maintenance(&job.index_db, false).await;
+    }
     result.map_err(|err| format!("{err:?}"))
 }
 async fn run_extraction_job_inner(
@@ -308,6 +311,7 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
         })
         .await;
     }
+    run_post_job_maintenance(&job.index_db, true).await;
     Ok(())
 }
 

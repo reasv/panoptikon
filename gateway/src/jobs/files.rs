@@ -158,14 +158,21 @@ impl FileScanService {
             }
         })
         .await?;
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let orphan_frames_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteOrphanedFrames { reply }
         })
         .await?;
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let orphan_thumbnails_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
         })
         .await?;
+
+        let vacuum = unavailable_files_deleted > 0
+            || rule_files_deleted > 0
+            || orphan_items_deleted > 0
+            || orphan_frames_deleted > 0
+            || orphan_thumbnails_deleted > 0;
+        run_post_job_maintenance(&self.index_db, vacuum).await;
 
         Ok(RescanResult {
             scan_ids,
@@ -270,14 +277,23 @@ impl FileScanService {
             }
         })
         .await?;
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let orphan_frames_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteOrphanedFrames { reply }
         })
         .await?;
-        let _ = call_index_db_writer(&self.index_db, |reply| {
+        let orphan_thumbnails_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
         })
         .await?;
+
+        let vacuum = unavailable_files_deleted > 0
+            || excluded_folder_files_deleted > 0
+            || orphan_files_deleted > 0
+            || rule_files_deleted > 0
+            || orphan_items_deleted > 0
+            || orphan_frames_deleted > 0
+            || orphan_thumbnails_deleted > 0;
+        run_post_job_maintenance(&self.index_db, vacuum).await;
 
         Ok(FolderUpdateResult {
             included_deleted,
@@ -310,6 +326,23 @@ pub(crate) async fn is_resync_needed(
     new_excluded.sort();
 
     Ok(current_included != new_included || current_excluded != new_excluded)
+}
+
+/// Post-job VACUUM/ANALYZE. Failures are logged but never fail the job: the
+/// job's own work has already been committed at this point.
+pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
+    if vacuum {
+        if let Err(err) =
+            call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Vacuum { reply }).await
+        {
+            tracing::error!(error = ?err, index_db, "failed to vacuum index database");
+        }
+    }
+    if let Err(err) =
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Analyze { reply }).await
+    {
+        tracing::error!(error = ?err, index_db, "failed to analyze index database");
+    }
 }
 
 async fn execute_folder_scan(
@@ -1482,8 +1515,8 @@ fn extract_item_metadata_inner(
         let info = extract_media_info(path)?;
         if mime_type.starts_with("video") {
             if let Some(video) = info.video_track {
-                metadata.width = Some(video.width as i64);
-                metadata.height = Some(video.height as i64);
+                metadata.width = video.width.map(|width| width as i64);
+                metadata.height = video.height.map(|height| height as i64);
                 metadata.duration = Some(video.duration);
                 metadata.video_tracks = Some(1);
             }
@@ -1796,6 +1829,19 @@ fn extract_video_frames(
     let temp_dir = temp_dir_path();
     fs::create_dir_all(&temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
 
+    let result = extract_video_frames_into(path, num_frames, interval, &temp_dir);
+    if let Err(err) = fs::remove_dir_all(&temp_dir) {
+        tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp frame dir");
+    }
+    result
+}
+
+fn extract_video_frames_into(
+    path: &Path,
+    num_frames: usize,
+    interval: f64,
+    temp_dir: &Path,
+) -> Result<Vec<DynamicImage>, FileProcessError> {
     let output_pattern = temp_dir.join("frame_%04d.png");
     let status = Command::new("ffmpeg")
         .arg("-i")
@@ -1805,6 +1851,8 @@ fn extract_video_frames(
         .arg("-vsync")
         .arg("vfr")
         .arg(&output_pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
 
@@ -1814,7 +1862,7 @@ fn extract_video_frames(
 
     let mut frames = Vec::new();
     let mut entries =
-        fs::read_dir(&temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
+        fs::read_dir(temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
     let mut paths = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.map_err(|err| FileProcessError::Io(err.to_string()))?;
@@ -1828,7 +1876,6 @@ fn extract_video_frames(
         if let Ok(image) = image::open(&frame_path) {
             frames.push(image);
         }
-        let _ = fs::remove_file(&frame_path);
     }
 
     Ok(frames)
@@ -1867,8 +1914,8 @@ struct AudioTrack {
 
 struct VideoTrack {
     duration: f64,
-    width: u64,
-    height: u64,
+    width: Option<u64>,
+    height: Option<u64>,
 }
 
 struct SubtitleTrack;
@@ -1908,29 +1955,30 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
     let mut video_track = None;
     let mut subtitle_tracks = Vec::new();
 
+    // Streams sometimes report a zero duration; fall back to the container's
+    // format duration in that case, as ffprobe does not always populate both.
+    let stream_duration = |stream: &FfprobeStream| {
+        stream
+            .duration
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(format_duration)
+    };
+
     for stream in data.streams {
         match stream.codec_type.as_deref() {
             Some("audio") => {
-                let duration = stream
-                    .duration
-                    .as_deref()
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .unwrap_or(format_duration);
-                audio_tracks.push(AudioTrack { duration });
+                audio_tracks.push(AudioTrack {
+                    duration: stream_duration(&stream),
+                });
             }
             Some("video") => {
-                let duration = stream
-                    .duration
-                    .as_deref()
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .unwrap_or(format_duration);
-                if let (Some(width), Some(height)) = (stream.width, stream.height) {
-                    video_track = Some(VideoTrack {
-                        duration,
-                        width,
-                        height,
-                    });
-                }
+                video_track = Some(VideoTrack {
+                    duration: stream_duration(&stream),
+                    width: stream.width,
+                    height: stream.height,
+                });
             }
             Some("subtitle") => {
                 subtitle_tracks.push(SubtitleTrack);
@@ -2319,6 +2367,55 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(item_count.0, 1);
+    }
+
+    // VACUUM must run outside the writer's usual transaction wrapper; both
+    // maintenance messages have to succeed against a real on-disk database.
+    #[tokio::test]
+    async fn vacuum_and_analyze_writer_messages_succeed() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("sample.png");
+        let image = image::RgbImage::new(8, 8);
+        image.save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+        service.rescan_folders().await.unwrap();
+
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::Vacuum { reply })
+            .await
+            .unwrap();
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::Analyze { reply })
+            .await
+            .unwrap();
+
+        // The writer connection must remain usable after maintenance.
+        let scan_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddFileScan {
+            scan_time: current_iso_timestamp(),
+            path: media_dir.to_string_lossy().to_string(),
+            reply,
+        })
+        .await
+        .unwrap();
+        assert!(scan_id > 0);
     }
 
     // An interrupted scan leaves a file_scans row with a NULL end_time; the

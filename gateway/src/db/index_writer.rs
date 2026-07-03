@@ -237,6 +237,12 @@ pub(crate) enum IndexDbWriterMessage {
     DeleteFilesNotUnderIncludedFolders {
         reply: Reply<u64>,
     },
+    Vacuum {
+        reply: Reply<()>,
+    },
+    Analyze {
+        reply: Reply<()>,
+    },
     IdleCheck,
 }
 
@@ -300,6 +306,35 @@ impl IndexDbWriterState {
             self.last_used = None;
         } else if self.conn.is_some() {
             self.last_used = Some(Instant::now());
+        }
+
+        result
+    }
+
+    /// Runs maintenance statements directly on the connection, outside of
+    /// `with_transaction`: VACUUM cannot execute inside a transaction.
+    async fn run_maintenance(&mut self, statements: &[&str]) -> ApiResult<()> {
+        let result = async {
+            let conn = self.ensure_conn().await?;
+            for statement in statements {
+                sqlx::query(statement)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|err| {
+                        tracing::error!(error = ?err, statement, "failed to run maintenance statement");
+                        ApiError::internal("Failed to run database maintenance")
+                    })?;
+            }
+            Ok(())
+        }
+        .await;
+
+        match &result {
+            Ok(()) => self.last_used = Some(Instant::now()),
+            Err(_) => {
+                self.conn = None;
+                self.last_used = None;
+            }
         }
 
         result
@@ -755,6 +790,18 @@ impl Actor for IndexDbWriter {
                         })
                     })
                     .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::Vacuum { reply } => {
+                tracing::info!(
+                    index_db = %state.index_db,
+                    "running VACUUM on index database; this may take a while"
+                );
+                let result = state.run_maintenance(&["VACUUM"]).await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::Analyze { reply } => {
+                let result = state.run_maintenance(&["ANALYZE", "PRAGMA optimize"]).await;
                 let _ = reply.send(result);
             }
         }

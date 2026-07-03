@@ -435,6 +435,7 @@ async fn execute_job(job: Job) -> Result<(), String> {
             })
             .await
             .map_err(|err| format!("{err:?}"))?;
+            crate::jobs::files::run_post_job_maintenance(&job.index_db, true).await;
             Ok(())
         }
         #[cfg(test)]

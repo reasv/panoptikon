@@ -363,6 +363,19 @@ fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicI
         tracing::error!(error = %err, "failed to create temp dir");
         ApiError::internal("Failed to extract frames")
     })?;
+    let result = extract_video_frames_into(path, num_frames, interval, &temp_dir);
+    if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
+        tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp frame dir");
+    }
+    result
+}
+
+fn extract_video_frames_into(
+    path: &str,
+    num_frames: usize,
+    interval: f64,
+    temp_dir: &std::path::Path,
+) -> ApiResult<Vec<DynamicImage>> {
     let output_pattern = temp_dir.join("frame_%04d.png");
     let status = std::process::Command::new("ffmpeg")
         .arg("-i")
@@ -372,6 +385,8 @@ fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicI
         .arg("-vsync")
         .arg("vfr")
         .arg(&output_pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map_err(|err| {
             tracing::error!(error = %err, "ffmpeg failed");
@@ -380,7 +395,7 @@ fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicI
     if !status.success() {
         return Err(ApiError::internal("ffmpeg failed to extract frames"));
     }
-    let mut paths = std::fs::read_dir(&temp_dir)
+    let mut paths = std::fs::read_dir(temp_dir)
         .map_err(|err| ApiError::internal(format!("Failed to read frames: {err}")))?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -392,7 +407,6 @@ fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicI
         if let Ok(image) = image::open(&frame_path) {
             frames.push(image);
         }
-        let _ = std::fs::remove_file(&frame_path);
     }
     Ok(frames)
 }
