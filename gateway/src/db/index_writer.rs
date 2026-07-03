@@ -99,6 +99,7 @@ pub(crate) enum IndexDbWriterMessage {
     MarkUnavailableFiles {
         scan_id: i64,
         path: String,
+        excluded_paths: Vec<String>,
         reply: Reply<(i64, i64)>,
     },
     UpdateFileData {
@@ -385,11 +386,14 @@ impl Actor for IndexDbWriter {
             IndexDbWriterMessage::MarkUnavailableFiles {
                 scan_id,
                 path,
+                excluded_paths,
                 reply,
             } => {
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { mark_unavailable_files(conn, scan_id, &path).await })
+                        Box::pin(async move {
+                            mark_unavailable_files(conn, scan_id, &path, &excluded_paths).await
+                        })
                     })
                     .await;
                 let _ = reply.send(result);

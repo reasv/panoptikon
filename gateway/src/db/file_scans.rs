@@ -325,20 +325,43 @@ pub(crate) async fn mark_unavailable_files(
     conn: &mut sqlx::SqliteConnection,
     scan_id: i64,
     path_prefix: &str,
+    excluded_paths: &[String],
 ) -> ApiResult<(i64, i64)> {
-    let row = sqlx::query(
+    // SQLite caps the number of bind variables; a scan with this many
+    // failures should not be trusted to mark availability at all.
+    if excluded_paths.len() > 30_000 {
+        tracing::warn!(
+            scan_id,
+            excluded = excluded_paths.len(),
+            "too many failed paths, skipping unavailable marking"
+        );
+        let available_files = count_available_files(conn, path_prefix).await?;
+        return Ok((0, available_files));
+    }
+
+    let exclusion = if excluded_paths.is_empty() {
+        String::new()
+    } else {
+        let placeholders = std::iter::repeat("?")
+            .take(excluded_paths.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("\nAND path NOT IN ({placeholders})")
+    };
+
+    let count_sql = format!(
         r#"
 SELECT COUNT(*) AS marked_unavailable
 FROM files
-WHERE scan_id != ?1
-AND path LIKE ?2 || '%'
-        "#,
-    )
-    .bind(scan_id)
-    .bind(path_prefix)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
+WHERE scan_id != ?
+AND path LIKE ? || '%'{exclusion}
+        "#
+    );
+    let mut count_query = sqlx::query(&count_sql).bind(scan_id).bind(path_prefix);
+    for path in excluded_paths {
+        count_query = count_query.bind(path);
+    }
+    let row = count_query.fetch_one(&mut *conn).await.map_err(|err| {
         tracing::error!(error = %err, scan_id, "failed to count unavailable files");
         ApiError::internal("Failed to mark unavailable files")
     })?;
@@ -348,23 +371,32 @@ AND path LIKE ?2 || '%'
         ApiError::internal("Failed to mark unavailable files")
     })?;
 
-    sqlx::query(
+    let update_sql = format!(
         r#"
 UPDATE files
 SET available = FALSE
-WHERE scan_id != ?1
-AND path LIKE ?2 || '%'
-        "#,
-    )
-    .bind(scan_id)
-    .bind(path_prefix)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
+WHERE scan_id != ?
+AND path LIKE ? || '%'{exclusion}
+        "#
+    );
+    let mut update_query = sqlx::query(&update_sql).bind(scan_id).bind(path_prefix);
+    for path in excluded_paths {
+        update_query = update_query.bind(path);
+    }
+    update_query.execute(&mut *conn).await.map_err(|err| {
         tracing::error!(error = %err, scan_id, "failed to update unavailable files");
         ApiError::internal("Failed to mark unavailable files")
     })?;
 
+    let available_files = count_available_files(conn, path_prefix).await?;
+
+    Ok((marked_unavailable, available_files))
+}
+
+async fn count_available_files(
+    conn: &mut sqlx::SqliteConnection,
+    path_prefix: &str,
+) -> ApiResult<i64> {
     let row = sqlx::query(
         r#"
 SELECT COUNT(*) AS available_files
@@ -377,16 +409,14 @@ AND path LIKE ?1 || '%'
     .fetch_one(&mut *conn)
     .await
     .map_err(|err| {
-        tracing::error!(error = %err, scan_id, "failed to count available files");
+        tracing::error!(error = %err, "failed to count available files");
         ApiError::internal("Failed to mark unavailable files")
     })?;
 
-    let available_files: i64 = row.try_get("available_files").map_err(|err| {
+    row.try_get("available_files").map_err(|err| {
         tracing::error!(error = %err, "failed to read available file count");
         ApiError::internal("Failed to mark unavailable files")
-    })?;
-
-    Ok((marked_unavailable, available_files))
+    })
 }
 
 pub(crate) async fn delete_unavailable_files(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
@@ -487,9 +517,10 @@ VALUES
         .await
         .unwrap();
 
-        let (marked, available) = mark_unavailable_files(&mut dbs.index_conn, scan_id, r"C:\data\")
-            .await
-            .unwrap();
+        let (marked, available) =
+            mark_unavailable_files(&mut dbs.index_conn, scan_id, r"C:\data\", &[])
+                .await
+                .unwrap();
 
         assert_eq!(marked, 1);
         assert_eq!(available, 0);
@@ -500,6 +531,68 @@ VALUES
                 .await
                 .unwrap();
         assert_eq!(row.0, 1);
+    }
+
+    // Ensures files that failed processing are not marked unavailable while
+    // their siblings still are.
+    #[tokio::test]
+    async fn mark_unavailable_files_skips_excluded_paths() {
+        let mut dbs = setup_test_databases().await;
+        let previous_scan_id =
+            add_file_scan(&mut dbs.index_conn, "2024-01-01T00:00:00", r"C:\data\")
+                .await
+                .unwrap();
+        let scan_id = add_file_scan(&mut dbs.index_conn, "2024-01-01T00:01:00", r"C:\data\")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available)
+VALUES
+    ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1),
+    ('sha_one', 1, 'C:\data\two.png', 'two.png', '2024-01-01T00:00:00', ?1, 1)
+            "#,
+        )
+        .bind(previous_scan_id)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let (marked, available) = mark_unavailable_files(
+            &mut dbs.index_conn,
+            scan_id,
+            r"C:\data\",
+            &[r"C:\data\one.png".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(marked, 1);
+        assert_eq!(available, 1);
+
+        let row: (i64,) =
+            sqlx::query_as("SELECT available FROM files WHERE path = 'C:\\data\\one.png'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 1);
+        let row: (i64,) =
+            sqlx::query_as("SELECT available FROM files WHERE path = 'C:\\data\\two.png'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
     }
 
     // Ensures unavailable deletion removes only files flagged unavailable.

@@ -50,8 +50,10 @@ pub(crate) async fn delete_folders_not_in_list(
         .take(folder_paths.len())
         .collect::<Vec<_>>()
         .join(",");
+    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
+    // so every placeholder here must stay unnumbered.
     let sql = format!(
-        "DELETE FROM folders WHERE included = ?1 AND path NOT IN ({placeholders})"
+        "DELETE FROM folders WHERE included = ? AND path NOT IN ({placeholders})"
     );
 
     let mut query = sqlx::query(&sql).bind(included);

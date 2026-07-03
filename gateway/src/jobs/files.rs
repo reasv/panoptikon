@@ -28,7 +28,7 @@ use crate::{
     api_error::ApiError,
     db::{
         file_scans::{
-            FileScanUpdate,
+            FileScanUpdate, get_open_file_scan_id,
         },
         files::{
             FileScanData, FileUpsertResult, ItemScanMeta,
@@ -179,25 +179,6 @@ impl FileScanService {
         let config = self.config_store.load(&self.index_db)?;
         self.config_store.save(&self.index_db, &config)?;
 
-        let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
-        let current_included = get_folders_from_database(&mut conn, true).await?;
-        let current_excluded = get_folders_from_database(&mut conn, false).await?;
-        drop(conn);
-
-        let included_added = difference(&config.included_folders, &current_included);
-        let excluded_added = difference(&config.excluded_folders, &current_excluded);
-
-        let scan_ids = execute_folder_scan(
-            &self.index_db,
-            &self.user_data_db,
-            &config,
-            &included_added,
-            &config.excluded_folders,
-            self.options,
-        )
-        .await?;
-
-        let scan_time = current_iso_timestamp();
         let included_deleted = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteFoldersNotInList {
                 folder_paths: config.included_folders.clone(),
@@ -215,8 +196,12 @@ impl FileScanService {
         })
         .await?;
 
+        // Folders are registered before scanning so that file rows can never
+        // be inserted for a folder missing from the folders table.
+        let scan_time = current_iso_timestamp();
+        let mut included_added = Vec::new();
         for folder in &config.included_folders {
-            let _ = call_index_db_writer(&self.index_db, |reply| {
+            let inserted = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::AddFolderToDatabase {
                     time_added: scan_time.clone(),
                     path: folder.clone(),
@@ -225,9 +210,13 @@ impl FileScanService {
                 }
             })
             .await?;
+            if inserted {
+                included_added.push(folder.clone());
+            }
         }
+        let mut excluded_added = Vec::new();
         for folder in &config.excluded_folders {
-            let _ = call_index_db_writer(&self.index_db, |reply| {
+            let inserted = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::AddFolderToDatabase {
                     time_added: scan_time.clone(),
                     path: folder.clone(),
@@ -236,7 +225,20 @@ impl FileScanService {
                 }
             })
             .await?;
+            if inserted {
+                excluded_added.push(folder.clone());
+            }
         }
+
+        let scan_ids = execute_folder_scan(
+            &self.index_db,
+            &self.user_data_db,
+            &config,
+            &included_added,
+            &config.excluded_folders,
+            self.options,
+        )
+        .await?;
 
         let unavailable_files_deleted = if config.remove_unavailable_files {
             call_index_db_writer(&self.index_db, |reply| {
@@ -321,6 +323,21 @@ async fn execute_folder_scan(
     let mut all_included = included_folders.to_vec();
     all_included.retain(|folder| check_folder_validity(folder));
     let starting_points = deduplicate_paths(&all_included);
+
+    // Scans interrupted before completion leave rows with a NULL end_time;
+    // close them so they are not reported as still running.
+    let mut conn = open_index_db_read(index_db, user_data_db).await?;
+    for folder in &starting_points {
+        while let Some(stale_scan_id) = get_open_file_scan_id(&mut conn, folder).await? {
+            call_index_db_writer(index_db, |reply| IndexDbWriterMessage::CloseFileScan {
+                scan_id: stale_scan_id,
+                end_time: current_iso_timestamp(),
+                reply,
+            })
+            .await?;
+        }
+    }
+    drop(conn);
 
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
@@ -478,6 +495,7 @@ struct ScanContext {
     semaphore: Arc<Semaphore>,
     tasks: JoinSet<TaskOutcome>,
     stats: FolderStats,
+    error_paths: Vec<String>,
     conn: sqlx::SqliteConnection,
 }
 
@@ -501,6 +519,7 @@ async fn scan_single_folder(
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
         tasks: JoinSet::new(),
         stats: FolderStats::new(),
+        error_paths: Vec::new(),
         conn,
     };
 
@@ -542,12 +561,17 @@ async fn scan_single_folder(
         ctx.handle_joined(joined).await?;
     }
 
-    let ScanContext { mut stats, .. } = ctx;
+    let ScanContext {
+        mut stats,
+        error_paths,
+        ..
+    } = ctx;
 
     let (marked_unavailable, total_available) =
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::MarkUnavailableFiles {
             scan_id,
             path: folder.to_string(),
+            excluded_paths: error_paths.clone(),
             reply,
         })
         .await?;
@@ -567,6 +591,7 @@ impl ScanContext {
             Err(err) => {
                 tracing::info!(error = %err, path = %path.display(), "failed to stat file");
                 self.stats.errors += 1;
+                self.error_paths.push(path.to_string_lossy().to_string());
                 return Ok(());
             }
         };
@@ -575,6 +600,7 @@ impl ScanContext {
             Err(_) => {
                 tracing::error!(path = %path.display(), "could not determine mime type");
                 self.stats.errors += 1;
+                self.error_paths.push(path.to_string_lossy().to_string());
                 return Ok(());
             }
         };
@@ -663,6 +689,8 @@ impl ScanContext {
                             path = %failed.path.display(),
                             "failed to process file"
                         );
+                        self.error_paths
+                            .push(failed.path.to_string_lossy().to_string());
                     }
                 }
                 Ok(())
@@ -2092,14 +2120,6 @@ pub(crate) fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
     excluded.iter().any(|prefix| path.starts_with(prefix))
 }
 
-fn difference(current: &[String], existing: &[String]) -> Vec<String> {
-    current
-        .iter()
-        .filter(|entry| !existing.contains(entry))
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2299,5 +2319,110 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(item_count.0, 1);
+    }
+
+    // An interrupted scan leaves a file_scans row with a NULL end_time; the
+    // next scan of the same folder must close it.
+    #[tokio::test]
+    async fn rescan_closes_stale_open_scans() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("sample.png");
+        let image = image::RgbImage::new(8, 8);
+        image.save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let scan_path: (String,) = sqlx::query_as("SELECT path FROM file_scans LIMIT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let mut write_conn = crate::db::open_index_db_write_no_user_data(&index_db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO file_scans (start_time, path) VALUES (?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(&scan_path.0)
+            .execute(&mut write_conn)
+            .await
+            .unwrap();
+        drop(write_conn);
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let open_scans: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM file_scans WHERE end_time IS NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(open_scans.0, 0);
+    }
+
+    // The folders table is updated before scanning, so a repeated folder
+    // update adds no folders and starts no scans.
+    #[tokio::test]
+    async fn folder_update_is_idempotent() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("sample.png");
+        let image = image::RgbImage::new(8, 8);
+        image.save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        let result = service.run_folder_update().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let folders = get_folders_from_database(&mut conn, true).await.unwrap();
+        drop(conn);
+        assert_eq!(folders.len(), 1);
+        assert_eq!(result.included_added, folders);
+        assert!(!result.scan_ids.is_empty());
+
+        let result = service.run_folder_update().await.unwrap();
+        assert!(result.included_added.is_empty());
+        assert!(result.scan_ids.is_empty());
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let folders_after = get_folders_from_database(&mut conn, true).await.unwrap();
+        assert_eq!(folders_after, folders);
     }
 }
