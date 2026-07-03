@@ -163,6 +163,38 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     Ok(())
 }
 
+pub(crate) async fn get_thumbnail_bytes(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    idx: i64,
+) -> ApiResult<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        r#"
+SELECT thumbnail
+FROM storage.thumbnails
+WHERE item_sha256 = ?1 AND idx = ?2
+LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .bind(idx)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read thumbnail");
+        ApiError::internal("Failed to read thumbnail")
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = row.try_get("thumbnail").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse thumbnail");
+        ApiError::internal("Failed to read thumbnail")
+    })?;
+    Ok(Some(bytes))
+}
+
 pub(crate) async fn get_frames_bytes(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,

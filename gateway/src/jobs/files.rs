@@ -31,8 +31,8 @@ use crate::{
             FileScanUpdate,
         },
         files::{
-            FileScanData, ItemScanMeta,
-            get_file_by_path, get_item_id, has_blurhash,
+            FileScanData, FileUpsertResult, ItemScanMeta,
+            get_file_by_path, get_item_id, get_item_visual_meta, has_blurhash,
         },
         folders::{
             get_folders_from_database,
@@ -40,7 +40,7 @@ use crate::{
         index_writer::{call_index_db_writer, IndexDbWriterMessage},
         open_index_db_read,
         storage::{
-            StoredImage, has_frame, has_thumbnail,
+            StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail,
         },
         system_config::{SystemConfig, SystemConfigStore},
     },
@@ -380,6 +380,11 @@ async fn execute_folder_scan(
     Ok(scan_ids)
 }
 
+pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
+pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
+/// Images at or below this size never get a stored thumbnail.
+const SMALL_IMAGE_FILE_SIZE: u64 = 5 * 1024 * 1024;
+
 struct FolderStats {
     new_items: i64,
     unchanged_files: i64,
@@ -395,6 +400,87 @@ struct FolderStats {
     blurhash_time: f64,
 }
 
+impl FolderStats {
+    fn new() -> Self {
+        Self {
+            new_items: 0,
+            unchanged_files: 0,
+            new_files: 0,
+            modified_files: 0,
+            marked_unavailable: 0,
+            errors: 0,
+            total_available: 0,
+            false_changes: 0,
+            metadata_time: 0.0,
+            hashing_time: 0.0,
+            thumbgen_time: 0.0,
+            blurhash_time: 0.0,
+        }
+    }
+}
+
+struct HashedFile {
+    path: PathBuf,
+    last_modified: String,
+    reported_size: i64,
+    mime_type: String,
+    existing_sha256: Option<String>,
+    md5: String,
+    sha256: String,
+    real_size: i64,
+    hash_time: f64,
+}
+
+struct NewItemData {
+    path: PathBuf,
+    last_modified: String,
+    file_size: i64,
+    sha256: String,
+    mime_type: String,
+    metadata: ItemScanMeta,
+    metadata_time: f64,
+    thumb_time: f64,
+    blurhash_time: f64,
+    thumbnails: Vec<StoredImage>,
+    frames: Vec<StoredImage>,
+    blurhash: Option<String>,
+}
+
+struct BackfillResult {
+    sha256: String,
+    mime_type: String,
+    thumbnails: Vec<StoredImage>,
+    extracted_frames: Vec<StoredImage>,
+    blurhash: Option<String>,
+    thumb_time: f64,
+    blurhash_time: f64,
+}
+
+struct FailedFile {
+    path: PathBuf,
+    hash_time: f64,
+    metadata_time: f64,
+    error: FileProcessError,
+}
+
+enum TaskOutcome {
+    Hashed(HashedFile),
+    NewItem(NewItemData),
+    Backfill(BackfillResult),
+    Failed(FailedFile),
+}
+
+struct ScanContext {
+    index_db: String,
+    scan_id: i64,
+    scan_time: String,
+    filescan_filter: Option<Arc<Match>>,
+    semaphore: Arc<Semaphore>,
+    tasks: JoinSet<TaskOutcome>,
+    stats: FolderStats,
+    conn: sqlx::SqliteConnection,
+}
+
 async fn scan_single_folder(
     index_db: &str,
     user_data_db: &str,
@@ -406,15 +492,29 @@ async fn scan_single_folder(
     options: ScanOptions,
 ) -> ApiResult<FolderStats> {
     let allowed_extensions = build_extension_set(config);
-    let filescan_filter = parse_filescan_filter(config).map(Arc::new);
-    let semaphore = Arc::new(Semaphore::new(options.worker_count));
-    let mut tasks = JoinSet::new();
+    let conn = open_index_db_read(index_db, user_data_db).await?;
+    let mut ctx = ScanContext {
+        index_db: index_db.to_string(),
+        scan_id,
+        scan_time: scan_time.to_string(),
+        filescan_filter: parse_filescan_filter(config).map(Arc::new),
+        semaphore: Arc::new(Semaphore::new(options.worker_count)),
+        tasks: JoinSet::new(),
+        stats: FolderStats::new(),
+        conn,
+    };
 
     for entry in WalkDir::new(folder)
         .follow_links(true)
         .into_iter()
         .filter_entry(|entry| !is_excluded(entry.path(), excluded_paths))
     {
+        // Drain finished work before taking on more, so completed results
+        // are persisted as the walk progresses instead of piling up in memory.
+        while let Some(joined) = ctx.tasks.try_join_next() {
+            ctx.handle_joined(joined).await?;
+        }
+
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -435,172 +535,14 @@ async fn scan_single_folder(
             continue;
         }
 
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
-        let filescan_filter = filescan_filter.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            tokio::task::spawn_blocking(move || process_file(path, filescan_filter))
-                .await
-                .map_err(|err| FileProcessError::Worker(err.to_string()))?
-        });
+        ctx.scan_path(path).await?;
     }
 
-    let mut stats = FolderStats {
-        new_items: 0,
-        unchanged_files: 0,
-        new_files: 0,
-        modified_files: 0,
-        marked_unavailable: 0,
-        errors: 0,
-        total_available: 0,
-        false_changes: 0,
-        metadata_time: 0.0,
-        hashing_time: 0.0,
-        thumbgen_time: 0.0,
-        blurhash_time: 0.0,
-    };
-
-    let mut conn = open_index_db_read(index_db, user_data_db).await?;
-
-    while let Some(result) = tasks.join_next().await {
-        let processed = match result {
-            Ok(Ok(processed)) => processed,
-            Ok(Err(_)) => {
-                stats.errors += 1;
-                continue;
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "file processing task failed");
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        stats.hashing_time += processed.hash_time;
-        stats.metadata_time += processed.metadata_time;
-        stats.thumbgen_time += processed.thumb_time;
-        stats.blurhash_time += processed.blurhash_time;
-
-        let file_data = match build_file_scan_data(&mut conn, processed, scan_time).await {
-            Ok(data) => data,
-            Err(err) => {
-                tracing::error!(error = ?err, "failed to build file scan data");
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        let false_change = file_data.new_file_hash == false && file_data.new_file_timestamp;
-        if false_change {
-            stats.false_changes += 1;
-        }
-
-        if !file_data.thumbnails.is_empty() {
-            match has_thumbnail(&mut conn, &file_data.sha256, 1).await {
-                Ok(has_thumb) => {
-                    if !has_thumb {
-                        if let Err(err) = call_index_db_writer(index_db, |reply| {
-                            IndexDbWriterMessage::StoreThumbnails {
-                                sha256: file_data.sha256.clone(),
-                                mime_type: file_data.mime_type.clone(),
-                                process_version: 1,
-                                thumbnails: file_data.thumbnails.clone(),
-                                reply,
-                            }
-                        })
-                        .await
-                        {
-                            tracing::error!(error = ?err, "failed to store thumbnails");
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(error = ?err, "failed to check thumbnails");
-                }
-            }
-        }
-
-        if !file_data.frames.is_empty() {
-            match has_frame(&mut conn, &file_data.sha256, 1).await {
-                Ok(has_frame) => {
-                    if !has_frame {
-                        if let Err(err) = call_index_db_writer(index_db, |reply| {
-                            IndexDbWriterMessage::StoreFrames {
-                                sha256: file_data.sha256.clone(),
-                                mime_type: file_data.mime_type.clone(),
-                                process_version: 1,
-                                frames: file_data.frames.clone(),
-                                reply,
-                            }
-                        })
-                        .await
-                        {
-                            tracing::error!(error = ?err, "failed to store frames");
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(error = ?err, "failed to check frames");
-                }
-            }
-        }
-
-        if let Some(blurhash) = &file_data.blurhash {
-            match has_blurhash(&mut conn, &file_data.sha256).await {
-                Ok(has_value) => {
-                    if !has_value {
-                        if let Err(err) = call_index_db_writer(index_db, |reply| {
-                            IndexDbWriterMessage::SetBlurhash {
-                                sha256: file_data.sha256.clone(),
-                                blurhash: blurhash.clone(),
-                                reply,
-                            }
-                        })
-                        .await
-                        {
-                            tracing::error!(error = ?err, "failed to set blurhash");
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(error = ?err, "failed to check blurhash");
-                }
-            }
-        }
-
-        let result = match call_index_db_writer(index_db, |reply| {
-            IndexDbWriterMessage::UpdateFileData {
-                time_added: file_data.time_added.clone(),
-                scan_id,
-                data: file_data.data.clone(),
-                reply,
-            }
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::error!(error = ?err, "failed to update file data");
-                stats.errors += 1;
-                continue;
-            }
-        };
-
-        if result.item_inserted {
-            stats.new_items += 1;
-        }
-        if result.file_updated {
-            stats.unchanged_files += 1;
-        } else if result.file_deleted {
-            stats.modified_files += 1;
-        } else if result.file_inserted {
-            stats.new_files += 1;
-        }
+    while let Some(joined) = ctx.tasks.join_next().await {
+        ctx.handle_joined(joined).await?;
     }
+
+    let ScanContext { mut stats, .. } = ctx;
 
     let (marked_unavailable, total_available) =
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::MarkUnavailableFiles {
@@ -613,6 +555,573 @@ async fn scan_single_folder(
     stats.total_available = total_available;
 
     Ok(stats)
+}
+
+impl ScanContext {
+    /// Handles one candidate path from the walk: files whose mtime matches the
+    /// database record are updated directly without hashing or decoding;
+    /// everything else is dispatched to the worker pool.
+    async fn scan_path(&mut self, path: PathBuf) -> ApiResult<()> {
+        let (last_modified, file_size) = match get_last_modified_time_and_size(&path) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::info!(error = %err, path = %path.display(), "failed to stat file");
+                self.stats.errors += 1;
+                return Ok(());
+            }
+        };
+        let mime_type = match infer_mime_type(&path) {
+            Ok(mime) => mime,
+            Err(_) => {
+                tracing::error!(path = %path.display(), "could not determine mime type");
+                self.stats.errors += 1;
+                return Ok(());
+            }
+        };
+        if !passes_filescan_filter_stage1(
+            self.filescan_filter.as_deref(),
+            &path,
+            &last_modified,
+            file_size,
+            &mime_type,
+        ) {
+            tracing::debug!(
+                path = %path.display(),
+                "file does not match the filescan filter (stage 1), skipping"
+            );
+            self.stats.errors += 1;
+            return Ok(());
+        }
+
+        let path_str = path.to_string_lossy().to_string();
+        let existing = get_file_by_path(&mut self.conn, &path_str).await?;
+
+        if let Some(existing) = &existing {
+            if existing.last_modified == last_modified {
+                let sha256 = existing.sha256.clone();
+                let data = FileScanData {
+                    sha256: sha256.clone(),
+                    last_modified: existing.last_modified.clone(),
+                    path: path_str,
+                    new_file_hash: false,
+                    file_size: None,
+                    item_metadata: None,
+                    blurhash: None,
+                };
+                let result = self.update_file_data(data).await?;
+                self.tally(&result);
+                return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
+            }
+        }
+
+        self.dispatch_hash(
+            path,
+            last_modified,
+            file_size,
+            mime_type,
+            existing.map(|record| record.sha256),
+        )
+        .await
+    }
+
+    async fn handle_joined(
+        &mut self,
+        joined: Result<TaskOutcome, tokio::task::JoinError>,
+    ) -> ApiResult<()> {
+        match joined {
+            Ok(outcome) => self.handle_outcome(outcome).await,
+            Err(err) => {
+                tracing::error!(error = %err, "file processing task failed");
+                self.stats.errors += 1;
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_outcome(&mut self, outcome: TaskOutcome) -> ApiResult<()> {
+        match outcome {
+            TaskOutcome::Hashed(hashed) => self.handle_hashed(hashed).await,
+            TaskOutcome::NewItem(item) => self.handle_new_item(item).await,
+            TaskOutcome::Backfill(backfill) => {
+                self.handle_backfill(backfill).await;
+                Ok(())
+            }
+            TaskOutcome::Failed(failed) => {
+                self.stats.hashing_time += failed.hash_time;
+                self.stats.metadata_time += failed.metadata_time;
+                self.stats.errors += 1;
+                match &failed.error {
+                    FileProcessError::Filtered => {
+                        tracing::debug!(
+                            path = %failed.path.display(),
+                            "file does not match the filescan filter (stage 2), skipping"
+                        );
+                    }
+                    error => {
+                        tracing::error!(
+                            error = ?error,
+                            path = %failed.path.display(),
+                            "failed to process file"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_hashed(&mut self, hashed: HashedFile) -> ApiResult<()> {
+        let HashedFile {
+            path,
+            last_modified,
+            reported_size,
+            mime_type,
+            existing_sha256,
+            md5,
+            sha256,
+            real_size,
+            hash_time,
+        } = hashed;
+        self.stats.hashing_time += hash_time;
+        if real_size != reported_size {
+            tracing::warn!(path = %path.display(), real_size, reported_size, "file size mismatch");
+        }
+        let path_str = path.to_string_lossy().to_string();
+
+        if existing_sha256.as_deref() == Some(sha256.as_str()) {
+            // The timestamp changed but the contents did not.
+            tracing::warn!(path = %path.display(), "file has a new timestamp but the same hash");
+            let data = FileScanData {
+                sha256: sha256.clone(),
+                last_modified,
+                path: path_str,
+                new_file_hash: false,
+                file_size: Some(real_size),
+                item_metadata: None,
+                blurhash: None,
+            };
+            let result = self.update_file_data(data).await?;
+            self.stats.false_changes += 1;
+            self.tally(&result);
+            return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
+        }
+
+        if get_item_id(&mut self.conn, &sha256).await?.is_some() {
+            tracing::info!(path = %path.display(), "item already exists");
+            let data = FileScanData {
+                sha256: sha256.clone(),
+                last_modified,
+                path: path_str,
+                new_file_hash: true,
+                file_size: Some(real_size),
+                item_metadata: None,
+                blurhash: None,
+            };
+            let result = self.update_file_data(data).await?;
+            self.tally(&result);
+            return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
+        }
+
+        self.dispatch_prepare(path, last_modified, real_size, mime_type, md5, sha256)
+            .await
+    }
+
+    async fn handle_new_item(&mut self, item: NewItemData) -> ApiResult<()> {
+        self.stats.metadata_time += item.metadata_time;
+        self.stats.thumbgen_time += item.thumb_time;
+        self.stats.blurhash_time += item.blurhash_time;
+
+        if !item.thumbnails.is_empty()
+            && !has_thumbnail(&mut self.conn, &item.sha256, THUMBNAIL_PROCESS_VERSION).await?
+        {
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::StoreThumbnails {
+                    sha256: item.sha256.clone(),
+                    mime_type: item.mime_type.clone(),
+                    process_version: THUMBNAIL_PROCESS_VERSION,
+                    thumbnails: item.thumbnails.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                tracing::error!(error = ?err, "failed to store thumbnails");
+            }
+        }
+
+        if !item.frames.is_empty()
+            && !has_frame(&mut self.conn, &item.sha256, FRAME_PROCESS_VERSION).await?
+        {
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::StoreFrames {
+                    sha256: item.sha256.clone(),
+                    mime_type: item.mime_type.clone(),
+                    process_version: FRAME_PROCESS_VERSION,
+                    frames: item.frames.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                tracing::error!(error = ?err, "failed to store frames");
+            }
+        }
+
+        let data = FileScanData {
+            sha256: item.sha256.clone(),
+            last_modified: item.last_modified.clone(),
+            path: item.path.to_string_lossy().to_string(),
+            new_file_hash: true,
+            file_size: Some(item.file_size),
+            item_metadata: Some(item.metadata.clone()),
+            blurhash: item.blurhash.clone(),
+        };
+        let result = self.update_file_data(data).await?;
+        self.tally(&result);
+        Ok(())
+    }
+
+    async fn handle_backfill(&mut self, backfill: BackfillResult) {
+        self.stats.thumbgen_time += backfill.thumb_time;
+        self.stats.blurhash_time += backfill.blurhash_time;
+
+        // Storage failures for backfilled visuals are logged and skipped so a
+        // single bad file cannot abort the scan; the next scan retries them.
+        if !backfill.thumbnails.is_empty() {
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::StoreThumbnails {
+                    sha256: backfill.sha256.clone(),
+                    mime_type: backfill.mime_type.clone(),
+                    process_version: THUMBNAIL_PROCESS_VERSION,
+                    thumbnails: backfill.thumbnails.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                tracing::error!(error = ?err, "failed to store thumbnails");
+            }
+        }
+
+        if !backfill.extracted_frames.is_empty() {
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::StoreFrames {
+                    sha256: backfill.sha256.clone(),
+                    mime_type: backfill.mime_type.clone(),
+                    process_version: FRAME_PROCESS_VERSION,
+                    frames: backfill.extracted_frames.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                tracing::error!(error = ?err, "failed to store frames");
+            }
+        }
+
+        if let Some(blurhash) = &backfill.blurhash {
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::SetBlurhash {
+                    sha256: backfill.sha256.clone(),
+                    blurhash: blurhash.clone(),
+                    reply,
+                }
+            })
+            .await
+            {
+                tracing::error!(error = ?err, "failed to set blurhash");
+            }
+        }
+    }
+
+    /// Regenerates missing thumbnails or blurhashes for files whose contents
+    /// are already indexed. Dispatches a worker task only when something is
+    /// actually missing, mirroring the Python `ensure_*` early returns.
+    async fn maybe_dispatch_backfill(
+        &mut self,
+        sha256: String,
+        mime_type: String,
+        path: PathBuf,
+    ) -> ApiResult<()> {
+        let mut needs_thumb =
+            !has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
+        let needs_blurhash = !has_blurhash(&mut self.conn, &sha256).await?;
+        if needs_thumb && mime_type.starts_with("image") {
+            // Small images never get stored thumbnails; skip without decoding.
+            let small = fs::metadata(&path)
+                .map(|metadata| metadata.len() <= SMALL_IMAGE_FILE_SIZE)
+                .unwrap_or(true);
+            if small {
+                needs_thumb = false;
+            }
+        }
+        if !needs_thumb && !needs_blurhash {
+            return Ok(());
+        }
+
+        let mut existing_frames = Vec::new();
+        let mut video_duration = 0.0_f64;
+        if needs_thumb && mime_type.starts_with("video") {
+            if let Some((duration, video_tracks)) =
+                get_item_visual_meta(&mut self.conn, &sha256).await?
+            {
+                let duration = duration.unwrap_or(0.0);
+                if duration <= 0.0 || video_tracks.unwrap_or(0) <= 0 {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skipping video thumbnail generation due to missing video track"
+                    );
+                    return Ok(());
+                }
+                video_duration = duration;
+            }
+            existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
+        }
+        let existing_thumb = if !needs_thumb && needs_blurhash {
+            get_thumbnail_bytes(&mut self.conn, &sha256, 0).await?
+        } else {
+            None
+        };
+        // A blurhash can only come from a stored thumbnail or the image itself.
+        if !needs_thumb
+            && needs_blurhash
+            && existing_thumb.is_none()
+            && !mime_type.starts_with("image")
+        {
+            return Ok(());
+        }
+
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let outer_path = path.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                generate_backfill_visuals(
+                    &path,
+                    &mime_type,
+                    sha256,
+                    needs_thumb,
+                    needs_blurhash,
+                    existing_frames,
+                    existing_thumb,
+                    video_duration,
+                )
+            })
+            .await;
+            match joined {
+                Ok(backfill) => TaskOutcome::Backfill(backfill),
+                Err(err) => TaskOutcome::Failed(FailedFile {
+                    path: outer_path,
+                    hash_time: 0.0,
+                    metadata_time: 0.0,
+                    error: FileProcessError::Worker(err.to_string()),
+                }),
+            }
+        });
+        Ok(())
+    }
+
+    async fn dispatch_hash(
+        &mut self,
+        path: PathBuf,
+        last_modified: String,
+        reported_size: i64,
+        mime_type: String,
+        existing_sha256: Option<String>,
+    ) -> ApiResult<()> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let hash_path = path.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let result = calculate_hashes(&hash_path);
+                (result, start.elapsed().as_secs_f64())
+            })
+            .await;
+            match joined {
+                Ok((Ok((md5, sha256, real_size)), hash_time)) => {
+                    TaskOutcome::Hashed(HashedFile {
+                        path,
+                        last_modified,
+                        reported_size,
+                        mime_type,
+                        existing_sha256,
+                        md5,
+                        sha256,
+                        real_size,
+                        hash_time,
+                    })
+                }
+                Ok((Err(err), hash_time)) => TaskOutcome::Failed(FailedFile {
+                    path,
+                    hash_time,
+                    metadata_time: 0.0,
+                    error: FileProcessError::Io(err.to_string()),
+                }),
+                Err(err) => TaskOutcome::Failed(FailedFile {
+                    path,
+                    hash_time: 0.0,
+                    metadata_time: 0.0,
+                    error: FileProcessError::Worker(err.to_string()),
+                }),
+            }
+        });
+        Ok(())
+    }
+
+    /// Runs full metadata extraction, the stage-2 filter, and visual
+    /// generation for files whose content is new to the index.
+    async fn dispatch_prepare(
+        &mut self,
+        path: PathBuf,
+        last_modified: String,
+        file_size: i64,
+        mime_type: String,
+        md5: String,
+        sha256: String,
+    ) -> ApiResult<()> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
+        let filter = self.filescan_filter.clone();
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let outer_path = path.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                prepare_new_item(path, last_modified, file_size, mime_type, md5, sha256, filter)
+            })
+            .await;
+            match joined {
+                Ok(outcome) => outcome,
+                Err(err) => TaskOutcome::Failed(FailedFile {
+                    path: outer_path,
+                    hash_time: 0.0,
+                    metadata_time: 0.0,
+                    error: FileProcessError::Worker(err.to_string()),
+                }),
+            }
+        });
+        Ok(())
+    }
+
+    async fn update_file_data(&mut self, data: FileScanData) -> ApiResult<FileUpsertResult> {
+        call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
+            time_added: self.scan_time.clone(),
+            scan_id: self.scan_id,
+            data: data.clone(),
+            reply,
+        })
+        .await
+    }
+
+    fn tally(&mut self, result: &FileUpsertResult) {
+        if result.item_inserted {
+            self.stats.new_items += 1;
+        }
+        if result.file_updated {
+            self.stats.unchanged_files += 1;
+        } else if result.file_deleted {
+            self.stats.modified_files += 1;
+        } else if result.file_inserted {
+            self.stats.new_files += 1;
+        }
+    }
+}
+
+fn prepare_new_item(
+    path: PathBuf,
+    last_modified: String,
+    file_size: i64,
+    mime_type: String,
+    md5: String,
+    sha256: String,
+    filter: Option<Arc<Match>>,
+) -> TaskOutcome {
+    let metadata_start = Instant::now();
+    let preloaded_image = if mime_type.starts_with("image") {
+        match image::open(&path) {
+            Ok(image) => Some(image),
+            Err(err) => {
+                return TaskOutcome::Failed(FailedFile {
+                    path,
+                    hash_time: 0.0,
+                    metadata_time: metadata_start.elapsed().as_secs_f64(),
+                    error: FileProcessError::Unsupported(err.to_string()),
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let metadata =
+        match extract_item_metadata_inner(&path, &mime_type, md5, preloaded_image.as_ref()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return TaskOutcome::Failed(FailedFile {
+                    path,
+                    hash_time: 0.0,
+                    metadata_time: metadata_start.elapsed().as_secs_f64(),
+                    error,
+                });
+            }
+        };
+    let metadata_time = metadata_start.elapsed().as_secs_f64();
+
+    if !passes_filescan_filter_stage2(
+        filter.as_deref(),
+        &path,
+        &last_modified,
+        file_size,
+        &mime_type,
+        &metadata.md5,
+        &sha256,
+        &metadata,
+    ) {
+        return TaskOutcome::Failed(FailedFile {
+            path,
+            hash_time: 0.0,
+            metadata_time,
+            error: FileProcessError::Filtered,
+        });
+    }
+
+    let (thumbnails, frames, blurhash, thumb_time, blurhash_time) =
+        match generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
+                (Vec::new(), Vec::new(), None, 0.0, 0.0)
+            }
+        };
+
+    TaskOutcome::NewItem(NewItemData {
+        path,
+        last_modified,
+        file_size,
+        sha256,
+        mime_type,
+        metadata,
+        metadata_time,
+        thumb_time,
+        blurhash_time,
+        thumbnails,
+        frames,
+        blurhash,
+    })
 }
 
 pub(crate) struct PreparedFile {
@@ -753,6 +1262,8 @@ pub(crate) enum FileProcessError {
     Worker(String),
     Io(String),
     Unsupported(String),
+    /// The file was rejected by the user's filescan filter.
+    Filtered,
 }
 
 pub(crate) fn process_file(
@@ -770,7 +1281,7 @@ pub(crate) fn process_file(
         file_size,
         &mime_type,
     ) {
-        return Err(FileProcessError::Unsupported("filtered".to_string()));
+        return Err(FileProcessError::Filtered);
     }
 
     let hash_start = Instant::now();
@@ -797,11 +1308,11 @@ pub(crate) fn process_file(
         &sha256,
         &metadata,
     ) {
-        return Err(FileProcessError::Unsupported("filtered".to_string()));
+        return Err(FileProcessError::Filtered);
     }
 
     let (thumbnails, frames, blurhash, thumb_time, blurhash_time) =
-        match generate_visuals(&path, &mime_type) {
+        match generate_new_item_visuals(&path, &mime_type, &metadata, None) {
             Ok(result) => result,
             Err(err) => {
                 tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
@@ -907,6 +1418,15 @@ fn extract_item_metadata(
     mime_type: &str,
     md5: String,
 ) -> Result<ItemScanMeta, FileProcessError> {
+    extract_item_metadata_inner(path, mime_type, md5, None)
+}
+
+fn extract_item_metadata_inner(
+    path: &Path,
+    mime_type: &str,
+    md5: String,
+    preloaded_image: Option<&DynamicImage>,
+) -> Result<ItemScanMeta, FileProcessError> {
     let mut metadata = ItemScanMeta {
         md5,
         mime_type: mime_type.to_string(),
@@ -919,10 +1439,14 @@ fn extract_item_metadata(
     };
 
     if mime_type.starts_with("image") {
-        let image =
-            image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
-        metadata.width = Some(image.width() as i64);
-        metadata.height = Some(image.height() as i64);
+        let (width, height) = match preloaded_image {
+            Some(image) => image.dimensions(),
+            None => image::open(path)
+                .map_err(|err| FileProcessError::Unsupported(err.to_string()))?
+                .dimensions(),
+        };
+        metadata.width = Some(width as i64);
+        metadata.height = Some(height as i64);
         return Ok(metadata);
     }
 
@@ -948,9 +1472,11 @@ fn extract_item_metadata(
     Ok(metadata)
 }
 
-fn generate_visuals(
+fn generate_new_item_visuals(
     path: &Path,
     mime_type: &str,
+    metadata: &ItemScanMeta,
+    preloaded_image: Option<DynamicImage>,
 ) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<String>, f64, f64), FileProcessError> {
     let thumb_start = Instant::now();
     let mut thumbnails = Vec::new();
@@ -958,29 +1484,41 @@ fn generate_visuals(
     let mut blurhash_source: Option<DynamicImage> = None;
 
     if mime_type.starts_with("video") {
-        let extracted_frames = extract_video_frames(path, 4)?;
-        if !extracted_frames.is_empty() {
-            let grid = build_image_grid(&extracted_frames);
-            thumbnails.push(encode_image(0, &grid)?);
-            thumbnails.push(encode_image(1, &extracted_frames[0])?);
-            frames = extracted_frames
-                .iter()
-                .enumerate()
-                .map(|(idx, frame)| encode_image(idx as i64, frame))
-                .collect::<Result<Vec<_>, _>>()?;
-            blurhash_source = Some(grid);
+        let duration = metadata.duration.unwrap_or(0.0);
+        if metadata.video_tracks.unwrap_or(0) > 0 && duration > 0.0 {
+            let extracted_frames = extract_video_frames(path, 4, duration)?;
+            if !extracted_frames.is_empty() {
+                let grid = build_image_grid(&extracted_frames);
+                thumbnails.push(encode_image(0, &grid)?);
+                thumbnails.push(encode_image(1, &extracted_frames[0])?);
+                frames = extracted_frames
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, frame)| encode_image(idx as i64, frame))
+                    .collect::<Result<Vec<_>, _>>()?;
+                blurhash_source = Some(grid);
+            }
+        } else {
+            tracing::debug!(
+                path = %path.display(),
+                "skipping video thumbnail generation due to missing video track"
+            );
         }
     } else if mime_type.starts_with("audio") {
         let placeholder = create_audio_placeholder();
         thumbnails.push(encode_image(0, &placeholder)?);
         blurhash_source = Some(placeholder);
     } else if mime_type.starts_with("image") {
-        if let Some(thumb) = generate_thumbnail(path)? {
+        let image = match preloaded_image {
+            Some(image) => image,
+            None => {
+                image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?
+            }
+        };
+        if let Some(thumb) = generate_thumbnail(path, &image)? {
             thumbnails.push(encode_image(0, &thumb)?);
             blurhash_source = Some(thumb);
         } else {
-            let image =
-                image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
             blurhash_source = Some(image);
         }
     }
@@ -996,6 +1534,125 @@ fn generate_visuals(
     let blurhash_time = blurhash_start.elapsed().as_secs_f64();
 
     Ok((thumbnails, frames, blurhash, thumb_time, blurhash_time))
+}
+
+/// Regenerates only the visuals a file is missing. Never fails hard: partial
+/// or failed generation degrades to empty results, matching the Python
+/// behavior of catching thumbnail/blurhash errors per file.
+fn generate_backfill_visuals(
+    path: &Path,
+    mime_type: &str,
+    sha256: String,
+    needs_thumb: bool,
+    needs_blurhash: bool,
+    existing_frames: Vec<Vec<u8>>,
+    existing_thumb: Option<Vec<u8>>,
+    video_duration: f64,
+) -> BackfillResult {
+    let thumb_start = Instant::now();
+    let mut thumbnails = Vec::new();
+    let mut extracted_frames = Vec::new();
+    let mut blurhash_source: Option<DynamicImage> = None;
+
+    if needs_thumb {
+        match build_backfill_thumbnails(path, mime_type, &existing_frames, video_duration) {
+            Ok((thumbs, extracted, source)) => {
+                thumbnails = thumbs;
+                extracted_frames = extracted;
+                blurhash_source = source;
+            }
+            Err(err) => {
+                tracing::error!(error = ?err, path = %path.display(), "failed to generate thumbnails");
+            }
+        }
+    }
+    let thumb_time = thumb_start.elapsed().as_secs_f64();
+
+    let blurhash_start = Instant::now();
+    let mut blurhash = None;
+    if needs_blurhash {
+        let source = blurhash_source.or_else(|| {
+            existing_thumb
+                .as_deref()
+                .and_then(|bytes| image::load_from_memory(bytes).ok())
+        });
+        let source = match source {
+            Some(source) => Some(source),
+            None if mime_type.starts_with("image") => image::open(path).ok(),
+            None => None,
+        };
+        blurhash = source.as_ref().and_then(|image| compute_blurhash(image).ok());
+    }
+    let blurhash_time = blurhash_start.elapsed().as_secs_f64();
+
+    BackfillResult {
+        sha256,
+        mime_type: mime_type.to_string(),
+        thumbnails,
+        extracted_frames,
+        blurhash,
+        thumb_time,
+        blurhash_time,
+    }
+}
+
+fn build_backfill_thumbnails(
+    path: &Path,
+    mime_type: &str,
+    existing_frames: &[Vec<u8>],
+    video_duration: f64,
+) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<DynamicImage>), FileProcessError> {
+    let mut thumbnails = Vec::new();
+    let mut extracted = Vec::new();
+    let mut source = None;
+
+    if mime_type.starts_with("video") {
+        // Reuse frames already stored in the database before re-running ffmpeg.
+        let mut frames: Vec<DynamicImage> = existing_frames
+            .iter()
+            .filter_map(|bytes| image::load_from_memory(bytes).ok())
+            .collect();
+        let mut fresh = false;
+        if frames.is_empty() {
+            frames = extract_video_frames(path, 4, video_duration)?;
+            fresh = true;
+        }
+        if !frames.is_empty() {
+            let grid = build_image_grid(&frames);
+            thumbnails.push(encode_image(0, &grid)?);
+            thumbnails.push(encode_image(1, &frames[0])?);
+            if fresh {
+                extracted = frames
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, frame)| encode_image(idx as i64, frame))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            source = Some(grid);
+        }
+    } else if mime_type.starts_with("audio") {
+        let placeholder = create_audio_placeholder();
+        thumbnails.push(encode_image(0, &placeholder)?);
+        source = Some(placeholder);
+    } else if mime_type.starts_with("image") {
+        let file_size = fs::metadata(path)
+            .map_err(|err| FileProcessError::Io(err.to_string()))?
+            .len();
+        // Only decode when the image is large enough to warrant a thumbnail;
+        // the blurhash fallback opens the image separately when needed.
+        if file_size > SMALL_IMAGE_FILE_SIZE {
+            let image =
+                image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+            if let Some(thumb) = generate_thumbnail(path, &image)? {
+                thumbnails.push(encode_image(0, &thumb)?);
+                source = Some(thumb);
+            } else {
+                source = Some(image);
+            }
+        }
+    }
+
+    Ok((thumbnails, extracted, source))
 }
 
 fn compute_blurhash(image: &DynamicImage) -> Result<String, FileProcessError> {
@@ -1025,15 +1682,16 @@ fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
     image.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
 }
 
-fn generate_thumbnail(path: &Path) -> Result<Option<DynamicImage>, FileProcessError> {
+fn generate_thumbnail(
+    path: &Path,
+    image: &DynamicImage,
+) -> Result<Option<DynamicImage>, FileProcessError> {
     let metadata = fs::metadata(path).map_err(|err| FileProcessError::Io(err.to_string()))?;
     let file_size = metadata.len();
-    let really_small_file_size = 5 * 1024 * 1024u64;
-    if file_size <= really_small_file_size {
+    if file_size <= SMALL_IMAGE_FILE_SIZE {
         return Ok(None);
     }
 
-    let image = image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
     let (width, height) = image.dimensions();
     let max_dimensions = (4096u32, 4096u32);
     let max_file_size = 24 * 1024 * 1024u64;
@@ -1100,8 +1758,8 @@ fn build_image_grid(frames: &[DynamicImage]) -> DynamicImage {
 fn extract_video_frames(
     path: &Path,
     num_frames: usize,
+    duration: f64,
 ) -> Result<Vec<DynamicImage>, FileProcessError> {
-    let duration = probe_duration_seconds(path)?;
     if duration <= 0.0 {
         return Ok(Vec::new());
     }
@@ -1146,29 +1804,6 @@ fn extract_video_frames(
     }
 
     Ok(frames)
-}
-
-fn probe_duration_seconds(path: &Path) -> Result<f64, FileProcessError> {
-    let output = Command::new("ffprobe")
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path)
-        .output()
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
-
-    if !output.status.success() {
-        return Err(FileProcessError::Unsupported("ffprobe failed".to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .trim()
-        .parse::<f64>()
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1526,5 +2161,143 @@ mod tests {
         assert_eq!(file_count.0, 1);
         assert_eq!(item_count.0, 1);
         assert!(blurhash.and_then(|value| value.0).is_some());
+    }
+
+    async fn latest_scan_record(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> (i64, i64, i64, i64, i64) {
+        sqlx::query_as(
+            r#"
+SELECT unchanged_files, new_files, modified_files, errors, marked_unavailable
+FROM file_scans
+ORDER BY id DESC
+LIMIT 1
+            "#,
+        )
+        .fetch_one(conn)
+        .await
+        .unwrap()
+    }
+
+    // Unchanged files must be updated without reprocessing: a file whose
+    // contents can no longer be decoded but whose mtime is unchanged has to
+    // survive a rescan as "unchanged" instead of being marked unavailable
+    // and deleted. Also verifies missing blurhashes are backfilled and that
+    // genuinely modified files are replaced.
+    #[tokio::test]
+    async fn rescan_skips_unchanged_files_and_backfills() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("sample.png");
+        let image = image::RgbImage::new(8, 8);
+        image.save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        // The first rescan triggers a folder update (which scans the new
+        // folder) followed by a full rescan: the file is new in the first
+        // pass and already unchanged in the second.
+        let totals: (i64, i64, i64) = sqlx::query_as(
+            "SELECT SUM(new_files), SUM(unchanged_files), SUM(errors) FROM file_scans",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(totals, (1, 1, 0));
+        let original_sha: (String,) = sqlx::query_as("SELECT sha256 FROM files LIMIT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+
+        // A missing blurhash is backfilled on the next scan without the file
+        // counting as new or modified.
+        drop(conn);
+        let mut write_conn = crate::db::open_index_db_write_no_user_data(&index_db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE items SET blurhash = NULL")
+            .execute(&mut write_conn)
+            .await
+            .unwrap();
+        drop(write_conn);
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let (unchanged, new_files, modified, errors, marked) =
+            latest_scan_record(&mut conn).await;
+        assert_eq!((unchanged, new_files, modified, errors, marked), (1, 0, 0, 0, 0));
+        let blurhash: (Option<String>,) = sqlx::query_as("SELECT blurhash FROM items LIMIT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(blurhash.0.is_some());
+        drop(conn);
+
+        // Corrupt the contents but keep the mtime: the scan must treat the
+        // file as unchanged and never attempt to decode it.
+        let mtime = fs::metadata(&image_path).unwrap().modified().unwrap();
+        fs::write(&image_path, b"this is not a png").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let (unchanged, new_files, modified, errors, marked) =
+            latest_scan_record(&mut conn).await;
+        assert_eq!((unchanged, new_files, modified, errors, marked), (1, 0, 0, 0, 0));
+        let row: (String, i64) = sqlx::query_as("SELECT sha256, available FROM files LIMIT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(row.0, original_sha.0);
+        assert_eq!(row.1, 1);
+        drop(conn);
+
+        // A genuinely modified file (new content, newer mtime) is replaced and
+        // the orphaned item is cleaned up.
+        let new_image = image::RgbImage::new(16, 16);
+        new_image.save(&image_path).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(10))
+            .unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let (unchanged, new_files, modified, errors, _) = latest_scan_record(&mut conn).await;
+        assert_eq!((unchanged, new_files, modified, errors), (0, 0, 1, 0));
+        let row: (String,) = sqlx::query_as("SELECT sha256 FROM files LIMIT 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_ne!(row.0, original_sha.0);
+        let item_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(item_count.0, 1);
     }
 }

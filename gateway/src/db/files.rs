@@ -267,6 +267,24 @@ pub(crate) async fn get_item_id(
     Ok(row.map(|(id,)| id))
 }
 
+/// Returns `(duration, video_tracks)` for the item, used to decide whether
+/// video thumbnail generation is possible without probing the file.
+pub(crate) async fn get_item_visual_meta(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<(Option<f64>, Option<i64>)>> {
+    let row: Option<(Option<f64>, Option<i64>)> =
+        sqlx::query_as("SELECT duration, video_tracks FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read item media metadata");
+                ApiError::internal("Failed to query item")
+            })?;
+    Ok(row)
+}
+
 pub(crate) async fn has_blurhash(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
