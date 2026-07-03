@@ -20,6 +20,7 @@ use imageproc::drawing::{draw_text_mut, text_size};
 use lofty::prelude::{Accessor, TaggedFileExt};
 use md5::{Digest, Md5};
 use mime_guess::MimeGuess;
+use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 use serde::Deserialize;
 use sha2::Sha256;
 use time::{OffsetDateTime, format_description::FormatItem};
@@ -1586,6 +1587,13 @@ fn generate_new_item_visuals(
         } else {
             blurhash_source = Some(image);
         }
+    } else if mime_type.starts_with("application/pdf") {
+        // Renders nothing when pdfium is unavailable or the PDF is broken;
+        // the item is then indexed without visuals, like any unsupported type.
+        if let Some(page) = render_pdf_first_page(path) {
+            thumbnails.push(encode_image(0, &page)?);
+            blurhash_source = Some(page);
+        }
     }
 
     let thumb_time = thumb_start.elapsed().as_secs_f64();
@@ -1716,6 +1724,11 @@ fn build_backfill_thumbnails(
                 source = Some(image);
             }
         }
+    } else if mime_type.starts_with("application/pdf") {
+        if let Some(page) = render_pdf_first_page(path) {
+            thumbnails.push(encode_image(0, &page)?);
+            source = Some(page);
+        }
     }
 
     Ok((thumbnails, extracted, source))
@@ -1787,6 +1800,82 @@ fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProce
         height: image.height() as i64,
         bytes: buffer,
     })
+}
+
+static PDFIUM: OnceLock<Option<Pdfium>> = OnceLock::new();
+
+/// Lazily binds the pdfium dynamic library, mirroring the Python dependency
+/// on pypdfium2. Degrades gracefully: when the library cannot be found, PDF
+/// thumbnails are skipped (warned once) and all other scanning is unaffected.
+fn pdfium() -> Option<&'static Pdfium> {
+    PDFIUM
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Ok(custom) = env::var("PDFIUM_PATH") {
+                candidates.push(PathBuf::from(custom));
+            }
+            if let Some(exe_dir) = env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            {
+                candidates.push(exe_dir);
+            }
+            if let Ok(cwd) = env::current_dir() {
+                candidates.push(cwd);
+            }
+            for dir in &candidates {
+                let library = Pdfium::pdfium_platform_library_name_at_path(dir);
+                match Pdfium::bind_to_library(&library) {
+                    Ok(bindings) => return Some(Pdfium::new(bindings)),
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            path = %library.display(),
+                            "failed to bind pdfium library"
+                        );
+                    }
+                }
+            }
+            match Pdfium::bind_to_system_library() {
+                Ok(bindings) => Some(Pdfium::new(bindings)),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        searched = ?candidates,
+                        "pdfium library not found; PDF thumbnails are disabled"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Renders the first page of a PDF at 2x its point size, matching the Python
+/// pypdfium2 loader (`scale=2`, i.e. 144 dpi).
+fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
+    let pdfium = pdfium()?;
+    let document = match pdfium.load_pdf_from_file(path, None) {
+        Ok(document) => document,
+        Err(err) => {
+            tracing::error!(error = %err, path = %path.display(), "failed to load PDF");
+            return None;
+        }
+    };
+    let page = match document.pages().first() {
+        Ok(page) => page,
+        Err(err) => {
+            tracing::error!(error = %err, path = %path.display(), "PDF has no readable pages");
+            return None;
+        }
+    };
+    match page.render_with_config(&PdfRenderConfig::new().scale_page_by_factor(2.0)) {
+        Ok(bitmap) => Some(bitmap.as_image()),
+        Err(err) => {
+            tracing::error!(error = %err, path = %path.display(), "failed to render PDF page");
+            None
+        }
+    }
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -2743,5 +2832,48 @@ LIMIT 1
     fn draw_label_does_not_panic() {
         let mut image = RgbImage::new(64, 64);
         draw_label(&mut image, "video/mp4", 10, 34, 20.0);
+    }
+
+    // A minimal one-page PDF (200x100pt, no content stream) with a consistent
+    // xref table, built programmatically so the byte offsets stay correct.
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>\nendobj\n",
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for object in objects {
+            offsets.push(pdf.len());
+            pdf.push_str(object);
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str("xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        pdf.into_bytes()
+    }
+
+    // PDF rendering depends on the pdfium dynamic library, which may not be
+    // installed; the scan pipeline (and this test) must degrade gracefully.
+    #[test]
+    fn render_pdf_first_page_renders_when_pdfium_available() {
+        if pdfium().is_none() {
+            eprintln!("pdfium not available, skipping");
+            return;
+        }
+        let test_env = test_data_dir();
+        let path = test_env.path().join("minimal.pdf");
+        fs::write(&path, minimal_pdf_bytes()).unwrap();
+
+        let page = render_pdf_first_page(&path).expect("first page should render");
+        assert!(page.width() > 0 && page.height() > 0);
+        // scale_page_by_factor(2.0) doubles the page's point size.
+        assert_eq!(page.dimensions(), (400, 200));
     }
 }

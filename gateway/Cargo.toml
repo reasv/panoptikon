@@ -73,6 +73,16 @@ futures-util = "0.3"
 lofty = "0.22"
 imageproc = "0.25"
 ab_glyph = "0.2"
+# `sync` adds Send+Sync on `Pdfium` (implies `thread_safe`) so the binding can
+# live in a static shared by spawn_blocking workers. `pdfium_6721` selects the
+# FPDF_* API set: symbols are resolved eagerly, so this must not exceed the
+# oldest pdfium build we want to load — 6721 covers the pypdfium2-bundled
+# library (build 6899) and anything newer.
+pdfium-render = { version = "0.8", default-features = false, features = [
+    "sync",
+    "image_025",
+    "pdfium_6721",
+] }
 
 [dev-dependencies]
 tempfile = "3"
