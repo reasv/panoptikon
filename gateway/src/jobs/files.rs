@@ -5,16 +5,19 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
 
+use ab_glyph::{FontVec, PxScale};
 use blurhash::encode as blurhash_encode;
 use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use imageproc::drawing::{draw_text_mut, text_size};
+use lofty::prelude::{Accessor, TaggedFileExt};
 use md5::{Digest, Md5};
 use mime_guess::MimeGuess;
 use serde::Deserialize;
@@ -1549,9 +1552,10 @@ fn generate_new_item_visuals(
         if metadata.video_tracks.unwrap_or(0) > 0 && duration > 0.0 {
             let extracted_frames = extract_video_frames(path, 4, duration)?;
             if !extracted_frames.is_empty() {
-                let grid = build_image_grid(&extracted_frames);
+                let grid = overlay_mime_label(build_image_grid(&extracted_frames), mime_type);
                 thumbnails.push(encode_image(0, &grid)?);
-                thumbnails.push(encode_image(1, &extracted_frames[0])?);
+                let labeled_first = overlay_mime_label(extracted_frames[0].clone(), mime_type);
+                thumbnails.push(encode_image(1, &labeled_first)?);
                 frames = extracted_frames
                     .iter()
                     .enumerate()
@@ -1566,9 +1570,9 @@ fn generate_new_item_visuals(
             );
         }
     } else if mime_type.starts_with("audio") {
-        let placeholder = create_audio_placeholder();
-        thumbnails.push(encode_image(0, &placeholder)?);
-        blurhash_source = Some(placeholder);
+        let thumb = get_audio_thumbnail(path, mime_type);
+        thumbnails.push(encode_image(0, &thumb)?);
+        blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
         let image = match preloaded_image {
             Some(image) => image,
@@ -1679,9 +1683,10 @@ fn build_backfill_thumbnails(
             fresh = true;
         }
         if !frames.is_empty() {
-            let grid = build_image_grid(&frames);
+            let grid = overlay_mime_label(build_image_grid(&frames), mime_type);
             thumbnails.push(encode_image(0, &grid)?);
-            thumbnails.push(encode_image(1, &frames[0])?);
+            let labeled_first = overlay_mime_label(frames[0].clone(), mime_type);
+            thumbnails.push(encode_image(1, &labeled_first)?);
             if fresh {
                 extracted = frames
                     .iter()
@@ -1692,9 +1697,9 @@ fn build_backfill_thumbnails(
             source = Some(grid);
         }
     } else if mime_type.starts_with("audio") {
-        let placeholder = create_audio_placeholder();
-        thumbnails.push(encode_image(0, &placeholder)?);
-        source = Some(placeholder);
+        let thumb = get_audio_thumbnail(path, mime_type);
+        thumbnails.push(encode_image(0, &thumb)?);
+        source = Some(thumb);
     } else if mime_type.starts_with("image") {
         let file_size = fs::metadata(path)
             .map_err(|err| FileProcessError::Io(err.to_string()))?
@@ -1784,16 +1789,160 @@ fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProce
     })
 }
 
-fn create_audio_placeholder() -> DynamicImage {
+static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
+
+/// Lazily loads a system font for thumbnail text. Mirrors the Python code,
+/// which tries arial.ttf and degrades gracefully: when no font is found the
+/// text helpers become no-ops and images are produced without labels.
+fn label_font() -> Option<&'static FontVec> {
+    LABEL_FONT
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Ok(custom) = env::var("PANOPTIKON_FONT") {
+                candidates.push(PathBuf::from(custom));
+            }
+            candidates.extend(
+                [
+                    r"C:\Windows\Fonts\segoeui.ttf",
+                    r"C:\Windows\Fonts\arial.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                ]
+                .iter()
+                .map(PathBuf::from),
+            );
+            for candidate in candidates {
+                if let Ok(bytes) = fs::read(&candidate) {
+                    match FontVec::try_from_vec(bytes) {
+                        Ok(font) => return Some(font),
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                path = %candidate.display(),
+                                "failed to parse font file"
+                            );
+                        }
+                    }
+                }
+            }
+            tracing::warn!("no usable system font found; thumbnail text labels will be omitted");
+            None
+        })
+        .as_ref()
+}
+
+fn draw_text(image: &mut RgbImage, text: &str, x: i32, y: i32, scale: f32, color: Rgb<u8>) {
+    if text.is_empty() {
+        return;
+    }
+    let Some(font) = label_font() else {
+        return;
+    };
+    draw_text_mut(image, color, x, y, PxScale::from(scale), font, text);
+}
+
+fn draw_label(image: &mut RgbImage, text: &str, x: i32, y: i32, scale: f32) {
+    // Python draws the outline as eight 1px-offset black copies of the text
+    // underneath the white text; replicate that exactly.
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if dx != 0 || dy != 0 {
+                draw_text(image, text, x + dx, y + dy, scale, Rgb([0, 0, 0]));
+            }
+        }
+    }
+    draw_text(image, text, x, y, scale, Rgb([255, 255, 255]));
+}
+
+/// Writes the mime type bottom-left, matching Python's write_text_on_image
+/// (font size 20, 10px margins). Applied to copies before encoding so the
+/// stored clean frames are never mutated.
+fn overlay_mime_label(image: DynamicImage, mime_type: &str) -> DynamicImage {
+    let mut rgb = image.into_rgb8();
+    let font_size = 20.0f32;
+    let y = rgb.height() as i32 - font_size as i32 - 10;
+    draw_label(&mut rgb, mime_type, 10, y, font_size);
+    DynamicImage::ImageRgb8(rgb)
+}
+
+/// Returns embedded cover art when the file has any, otherwise a generated
+/// placeholder. Infallible: tag read failures degrade to a placeholder with
+/// empty metadata, matching the Python get_audio_thumbnail.
+fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
+    let mut artist = String::new();
+    let mut album = String::new();
+    let mut title = String::new();
+    match lofty::read_from_path(path) {
+        Ok(tagged) => {
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                artist = tag.artist().map(|value| value.to_string()).unwrap_or_default();
+                album = tag.album().map(|value| value.to_string()).unwrap_or_default();
+                title = tag.title().map(|value| value.to_string()).unwrap_or_default();
+                if let Some(picture) = tag.pictures().first() {
+                    if let Ok(cover) = image::load_from_memory(picture.data()) {
+                        // Cover art is used as-is, without any text overlay.
+                        return cover;
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                path = %path.display(),
+                "failed to read audio tags for thumbnail"
+            );
+        }
+    }
+    build_audio_placeholder(mime_type, &artist, &album, &title)
+}
+
+fn build_audio_placeholder(
+    mime_type: &str,
+    artist: &str,
+    album: &str,
+    title: &str,
+) -> DynamicImage {
     let width = 1024u32;
     let height = 1024u32;
-    let mut image = image::RgbImage::new(width, height);
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        let r = ((x as f32 / width as f32) * 200.0) as u8;
-        let g = ((y as f32 / height as f32) * 200.0) as u8;
-        let b = 64u8;
-        *pixel = image::Rgb([r, g, b]);
+    // Fixed colors within the ranges Python randomizes.
+    let top = [35.0f32, 35.0, 75.0];
+    let bottom = [175.0f32, 225.0, 225.0];
+    let mut image = RgbImage::new(width, height);
+    for y in 0..height {
+        let t = y as f32 / height as f32;
+        let pixel = Rgb([
+            (top[0] + (bottom[0] - top[0]) * t) as u8,
+            (top[1] + (bottom[1] - top[1]) * t) as u8,
+            (top[2] + (bottom[2] - top[2]) * t) as u8,
+        ]);
+        for x in 0..width {
+            image.put_pixel(x, y, pixel);
+        }
     }
+
+    if let Some(font) = label_font() {
+        let note = "\u{266a}";
+        let scale = PxScale::from(400.0);
+        let (note_w, note_h) = text_size(scale, font, note);
+        let x = (width as i32 - note_w as i32) / 2;
+        let y = (height as i32 - note_h as i32) / 2;
+        draw_text_mut(&mut image, Rgb([255, 255, 255]), x, y, scale, font, note);
+    }
+
+    draw_text(
+        &mut image,
+        mime_type,
+        10,
+        height as i32 - 60,
+        50.0,
+        Rgb([255, 255, 255]),
+    );
+    draw_text(&mut image, artist, 10, 10, 60.0, Rgb([255, 255, 255]));
+    draw_text(&mut image, album, 10, 80, 60.0, Rgb([255, 255, 255]));
+    draw_text(&mut image, title, 10, 150, 60.0, Rgb([255, 255, 255]));
+
     DynamicImage::ImageRgb8(image)
 }
 
@@ -2521,5 +2670,78 @@ LIMIT 1
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let folders_after = get_folders_from_database(&mut conn, true).await.unwrap();
         assert_eq!(folders_after, folders);
+    }
+
+    // A file that is not valid audio must still yield a 1024x1024 placeholder.
+    #[test]
+    fn audio_thumbnail_falls_back_to_placeholder() {
+        let test_env = test_data_dir();
+        let path = test_env.path().join("not_audio.mp3");
+        fs::write(&path, b"definitely not audio data").unwrap();
+        let thumb = get_audio_thumbnail(&path, "audio/mpeg");
+        assert_eq!(thumb.dimensions(), (1024, 1024));
+    }
+
+    /// Builds a minimal valid mono 16-bit PCM WAV byte stream.
+    fn minimal_wav_bytes() -> Vec<u8> {
+        let samples: [u8; 8] = [0; 8];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + samples.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        bytes.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&samples);
+        bytes
+    }
+
+    // Embedded cover art must be returned as the thumbnail unchanged.
+    #[test]
+    fn audio_thumbnail_uses_embedded_cover_art() {
+        use lofty::config::WriteOptions;
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::prelude::TagExt;
+        use lofty::tag::{Tag, TagType};
+
+        let test_env = test_data_dir();
+        let path = test_env.path().join("with_cover.wav");
+        fs::write(&path, minimal_wav_bytes()).unwrap();
+
+        let cover = image::RgbImage::from_pixel(6, 4, Rgb([255, 0, 0]));
+        let mut png_bytes = Vec::new();
+        DynamicImage::ImageRgb8(cover)
+            .write_to(
+                &mut io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.push_picture(Picture::new_unchecked(
+            PictureType::CoverFront,
+            Some(MimeType::Png),
+            None,
+            png_bytes,
+        ));
+        tag.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let thumb = get_audio_thumbnail(&path, "audio/wav");
+        assert_eq!(thumb.dimensions(), (6, 4));
+        assert_eq!(thumb.to_rgb8().get_pixel(0, 0), &Rgb([255, 0, 0]));
+    }
+
+    // Text drawing must never panic, with or without a usable system font.
+    #[test]
+    fn draw_label_does_not_panic() {
+        let mut image = RgbImage::new(64, 64);
+        draw_label(&mut image, "video/mp4", 10, 34, 20.0);
     }
 }

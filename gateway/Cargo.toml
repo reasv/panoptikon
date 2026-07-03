@@ -70,6 +70,9 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"
+lofty = "0.22"
+imageproc = "0.25"
+ab_glyph = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
