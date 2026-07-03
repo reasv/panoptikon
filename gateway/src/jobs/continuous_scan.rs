@@ -29,10 +29,11 @@ use crate::db::{
 };
 use crate::db::files::has_blurhash;
 use crate::jobs::files::{
-    FileProcessError, PreparedFile, ScanOptions, build_extension_set,
-    build_file_scan_data, check_folder_validity, current_iso_timestamp, deduplicate_paths,
-    get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
-    normalize_path, parse_filescan_filter, process_file,
+    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions,
+    THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data, check_folder_validity,
+    current_iso_timestamp, deduplicate_paths, get_last_modified_time_and_size,
+    has_allowed_extension, is_excluded, is_hidden_or_temp, normalize_path, parse_filescan_filter,
+    process_file,
 };
 use crate::pql::model::Match;
 
@@ -745,13 +746,19 @@ impl Actor for ContinuousScanActor {
                     if let Ok(mut thumb_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
                     {
-                        if let Ok(has_thumb) = has_thumbnail(&mut thumb_conn, &file_data.sha256, 1).await {
+                        if let Ok(has_thumb) = has_thumbnail(
+                            &mut thumb_conn,
+                            &file_data.sha256,
+                            THUMBNAIL_PROCESS_VERSION,
+                        )
+                        .await
+                        {
                             if !has_thumb {
                                 let _ = call_index_db_writer(&state.index_db, |reply| {
                                     IndexDbWriterMessage::StoreThumbnails {
                                         sha256: file_data.sha256.clone(),
                                         mime_type: file_data.mime_type.clone(),
-                                        process_version: 1,
+                                        process_version: THUMBNAIL_PROCESS_VERSION,
                                         thumbnails: file_data.thumbnails.clone(),
                                         reply,
                                     }
@@ -766,13 +773,19 @@ impl Actor for ContinuousScanActor {
                     if let Ok(mut frame_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
                     {
-                        if let Ok(has_frame) = has_frame(&mut frame_conn, &file_data.sha256, 1).await {
+                        if let Ok(has_frame) = has_frame(
+                            &mut frame_conn,
+                            &file_data.sha256,
+                            FRAME_PROCESS_VERSION,
+                        )
+                        .await
+                        {
                             if !has_frame {
                                 let _ = call_index_db_writer(&state.index_db, |reply| {
                                     IndexDbWriterMessage::StoreFrames {
                                         sha256: file_data.sha256.clone(),
                                         mime_type: file_data.mime_type.clone(),
-                                        process_version: 1,
+                                        process_version: FRAME_PROCESS_VERSION,
                                         frames: file_data.frames.clone(),
                                         reply,
                                     }
