@@ -79,6 +79,14 @@ pub(crate) struct JobRunResult {
     error: Option<String>,
 }
 
+/// Dedup condition for batch enqueueing: the whole batch is skipped when any
+/// queued or running job carries this tag for this index DB.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchDedup {
+    pub tag: String,
+    pub index_db: String,
+}
+
 impl JobModel {
     fn from_job(job: &Job, running: bool) -> Self {
         Self {
@@ -99,6 +107,14 @@ pub(crate) enum JobQueueMessage {
     Enqueue {
         request: JobRequest,
         reply: oneshot::Sender<ApiResult<JobModel>>,
+    },
+    /// All-or-nothing enqueue of several jobs, with an optional dedup check
+    /// evaluated atomically inside the actor (a check-then-enqueue done by the
+    /// caller would race concurrent triggers). Replies `None` when skipped.
+    EnqueueBatch {
+        requests: Vec<JobRequest>,
+        dedup: Option<BatchDedup>,
+        reply: oneshot::Sender<ApiResult<Option<Vec<JobModel>>>>,
     },
     GetQueueStatus {
         reply: oneshot::Sender<ApiResult<QueueStatusModel>>,
@@ -204,25 +220,39 @@ impl Actor for JobQueueActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             JobQueueMessage::Enqueue { request, reply } => {
-                state.job_counter += 1;
-                let job = Job {
-                    queue_id: state.job_counter,
-                    job_type: request.job_type,
-                    index_db: request.index_db,
-                    user_data_db: request.user_data_db,
-                    metadata: request.metadata,
-                    batch_size: request.batch_size,
-                    threshold: request.threshold,
-                    log_id: request.log_id,
-                    tag: request.tag,
-                };
-                let model = JobModel::from_job(&job, false);
-                state.queue.push_back(job.clone());
-                state.queued_jobs.insert(job.queue_id, job);
+                let model = push_job(state, request);
                 if state.running_job.is_none() {
                     start_next_job(state).await;
                 }
                 let _ = reply.send(Ok(model));
+            }
+            JobQueueMessage::EnqueueBatch {
+                requests,
+                dedup,
+                reply,
+            } => {
+                let conflict = dedup.as_ref().is_some_and(|dedup| {
+                    state
+                        .running_job
+                        .iter()
+                        .chain(state.queue.iter())
+                        .any(|job| {
+                            job.tag.as_deref() == Some(dedup.tag.as_str())
+                                && job.index_db == dedup.index_db
+                        })
+                });
+                if conflict {
+                    let _ = reply.send(Ok(None));
+                } else {
+                    let models = requests
+                        .into_iter()
+                        .map(|request| push_job(state, request))
+                        .collect();
+                    if state.running_job.is_none() {
+                        start_next_job(state).await;
+                    }
+                    let _ = reply.send(Ok(Some(models)));
+                }
             }
             JobQueueMessage::GetQueueStatus { reply } => {
                 let mut queue = Vec::new();
@@ -273,6 +303,25 @@ impl Actor for JobQueueActor {
         }
         Ok(())
     }
+}
+
+fn push_job(state: &mut JobQueueState, request: JobRequest) -> JobModel {
+    state.job_counter += 1;
+    let job = Job {
+        queue_id: state.job_counter,
+        job_type: request.job_type,
+        index_db: request.index_db,
+        user_data_db: request.user_data_db,
+        metadata: request.metadata,
+        batch_size: request.batch_size,
+        threshold: request.threshold,
+        log_id: request.log_id,
+        tag: request.tag,
+    };
+    let model = JobModel::from_job(&job, false);
+    state.queue.push_back(job.clone());
+    state.queued_jobs.insert(job.queue_id, job);
+    model
 }
 
 async fn start_next_job(state: &mut JobQueueState) {
@@ -498,6 +547,25 @@ pub(crate) async fn enqueue_job(request: JobRequest) -> ApiResult<JobModel> {
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
 }
 
+/// Enqueues all `requests` atomically, unless `dedup` matches a queued or
+/// running job — in which case nothing is enqueued and `None` is returned.
+pub(crate) async fn enqueue_jobs_unless_tagged(
+    requests: Vec<JobRequest>,
+    dedup: Option<BatchDedup>,
+) -> ApiResult<Option<Vec<JobModel>>> {
+    let queue = ensure_job_queue().await?;
+    let (reply, rx) = oneshot::channel();
+    queue
+        .send_message(JobQueueMessage::EnqueueBatch {
+            requests,
+            dedup,
+            reply,
+        })
+        .map_err(|_| ApiError::internal("Job queue unavailable"))?;
+    rx.await
+        .map_err(|_| ApiError::internal("Job queue dropped response"))?
+}
+
 pub(crate) async fn get_queue_status() -> ApiResult<QueueStatusModel> {
     let queue = ensure_job_queue().await?;
     let (reply, rx) = oneshot::channel();
@@ -558,10 +626,10 @@ mod tests {
         ActorRef<JobQueueMessage>,
         ractor::concurrency::JoinHandle<()>,
     ) {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        // A monotonic counter, not a timestamp: parallel tests can spawn
+        // within the same clock tick and collide on the actor name.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Actor::spawn(
             Some(format!("job-queue-test-{unique}")),
             JobQueueActor,
@@ -705,6 +773,81 @@ mod tests {
         );
         assert_eq!(status.queue[0].queue_id, second.queue_id);
         assert!(status.queue[0].running);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    async fn enqueue_batch_on(
+        queue: &ActorRef<JobQueueMessage>,
+        requests: Vec<JobRequest>,
+        dedup: Option<BatchDedup>,
+    ) -> Option<Vec<JobModel>> {
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::EnqueueBatch {
+                requests,
+                dedup,
+                reply,
+            })
+            .unwrap();
+        rx.await.unwrap().unwrap()
+    }
+
+    // The batch dedup must be atomic in the actor: while a tagged job for the
+    // same index DB is queued or running, the whole batch is skipped; other
+    // index DBs are unaffected; once the tagged jobs are gone the batch goes
+    // through.
+    #[tokio::test]
+    async fn batch_enqueue_skips_while_tagged_job_active() {
+        let (queue, handle) = spawn_test_queue().await;
+        // Unparseable TestSleep tags fall back to a 200ms sleep.
+        let job = JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some("cronjob".to_string()),
+        };
+        let dedup = || {
+            Some(BatchDedup {
+                tag: "cronjob".to_string(),
+                index_db: "default".to_string(),
+            })
+        };
+
+        let first = enqueue_batch_on(&queue, vec![job.clone(), job.clone()], dedup()).await;
+        assert_eq!(first.map(|jobs| jobs.len()), Some(2));
+
+        // One of the batch is running, one queued: a second batch is skipped.
+        let second = enqueue_batch_on(&queue, vec![job.clone()], dedup()).await;
+        assert!(second.is_none());
+
+        // A different index DB does not collide with the dedup condition.
+        let other_db = JobRequest {
+            index_db: "other".to_string(),
+            ..job.clone()
+        };
+        let other = enqueue_batch_on(
+            &queue,
+            vec![other_db],
+            Some(BatchDedup {
+                tag: "cronjob".to_string(),
+                index_db: "other".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(other.map(|jobs| jobs.len()), Some(1));
+
+        // After all tagged jobs have drained, the batch enqueues again.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let status = status_on(&queue).await;
+        assert!(status.queue.is_empty(), "queue should be idle: {status:?}");
+        let third = enqueue_batch_on(&queue, vec![job.clone()], dedup()).await;
+        assert_eq!(third.map(|jobs| jobs.len()), Some(1));
 
         queue.stop(None);
         handle.await.unwrap();

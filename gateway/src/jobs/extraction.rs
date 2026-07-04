@@ -785,7 +785,17 @@ pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMe
         tracing::error!(error = %err, "failed to load inference metadata");
         ApiError::internal("Failed to load inference metadata")
     })?;
+    resolve_model_metadata(&metadata, inference_id)
+}
 
+/// Resolves a single model's metadata from an already-fetched `/metadata`
+/// payload. Errors mean the model is unknown to the inference server (or its
+/// entry is malformed) — the payload itself being unavailable is the caller's
+/// distinction to make.
+pub(crate) fn resolve_model_metadata(
+    metadata: &Value,
+    inference_id: &str,
+) -> ApiResult<ModelMetadata> {
     let (group, short_id) = inference_id
         .split_once('/')
         .ok_or_else(|| ApiError::bad_request("Inference ID must be in group/id format"))?;

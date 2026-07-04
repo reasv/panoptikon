@@ -169,6 +169,10 @@ async fn async_main() -> anyhow::Result<()> {
             .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
             .merge(Redoc::with_url("/redoc", openapi::ApiDoc::openapi()));
         if env_truthy("EXPERIMENTAL_RUST_JOBS") {
+            // The scheduler enqueues into the Rust job queue, so it only runs
+            // when the Rust job system serves the API; otherwise the Python
+            // side still owns cron and this would double-schedule.
+            let _ = jobs::cron::ensure_cron_scheduler().await;
             app = app
                 .route(
                     "/api/jobs/queue",
@@ -207,6 +211,10 @@ async fn async_main() -> anyhow::Result<()> {
                 .route(
                     "/api/jobs/cronjob/run",
                     post(api::jobs::manual_trigger_cronjob),
+                )
+                .route(
+                    "/api/jobs/cronjob/schedule",
+                    get(api::jobs::get_cronjob_schedule),
                 );
         }
     }

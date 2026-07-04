@@ -85,6 +85,8 @@ pdfium-render = { version = "0.8", default-features = false, features = [
     "image_025",
     "pdfium_6721",
 ] }
+croner = "3.0.1"
+chrono = "0.4.45"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render

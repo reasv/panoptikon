@@ -18,13 +18,13 @@ pub(crate) fn load_db_info() -> Result<DbInfo> {
     })
 }
 
-fn db_defaults() -> (String, String) {
+pub(crate) fn db_defaults() -> (String, String) {
     let index_default = env::var("INDEX_DB").unwrap_or_else(|_| "default".to_string());
     let user_default = env::var("USER_DATA_DB").unwrap_or_else(|_| "default".to_string());
     (index_default, user_default)
 }
 
-fn db_lists() -> Result<(Vec<String>, Vec<String>)> {
+pub(crate) fn db_lists() -> Result<(Vec<String>, Vec<String>)> {
     let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
     let index_dir = data_dir.join("index");
     let user_data_dir = data_dir.join("user_data");

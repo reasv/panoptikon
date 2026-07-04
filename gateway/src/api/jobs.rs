@@ -10,6 +10,7 @@ use crate::db::folders::get_folders_from_database;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{DbConnection, ReadOnly};
 use crate::jobs::continuous_scan;
+use crate::jobs::cron::{self, CronRunOutcome};
 use crate::jobs::files::is_resync_needed;
 use crate::jobs::queue::{
     JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs, cancel_running_job,
@@ -370,10 +371,19 @@ pub(crate) async fn update_config(
     conn: DbConnection<ReadOnly>,
     Json(config): Json<SystemConfig>,
 ) -> Result<Json<SystemConfig>, ApiError> {
+    // Python accepts unparseable cron strings and fails invisibly inside the
+    // scheduler forever; reject them here so typos surface at save time.
+    if let Err(err) = cron::validate_cron_schedule(&config.cron_schedule) {
+        return Err(ApiError::bad_request(format!(
+            "Invalid cron_schedule {:?}: {err}",
+            config.cron_schedule
+        )));
+    }
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
     let config = store.load(&conn.index_db)?;
     let _ = continuous_scan::notify_config_change(&conn.index_db).await;
+    let _ = cron::notify_config_change(&conn.index_db).await;
     let resync_needed = is_resync_needed(&conn.index_db, &conn.user_data_db, &config).await?;
     if resync_needed {
         let _ = enqueue_job(JobRequest {
@@ -442,22 +452,57 @@ pub(crate) async fn get_setter_data_count(
 pub(crate) async fn manual_trigger_cronjob(
     conn: DbConnection<ReadOnly>,
 ) -> Result<Json<CronJobResponse>, ApiError> {
+    let detail = match cron::run_cronjob(&conn.index_db, &conn.user_data_db).await? {
+        CronRunOutcome::Enqueued(_) => "Cronjob triggered.".to_string(),
+        // Python also replies 200 here (the skip is silent); keep the status
+        // code but say what happened.
+        CronRunOutcome::Skipped => {
+            "Cronjob skipped: a previous cronjob for this database is still queued or running."
+                .to_string()
+        }
+    };
+    Ok(Json(CronJobResponse { detail }))
+}
+
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct CronScheduleResponse {
+    /// Whether automatic cron runs are enabled for this database.
+    enabled: bool,
+    /// The configured cron schedule string.
+    cron_schedule: String,
+    /// Whether the configured schedule string parses.
+    valid: bool,
+    /// Next automatic run (RFC 3339, local time), when scheduling is active.
+    next_run: Option<String>,
+    /// Last automatic run fired by this process (RFC 3339, local time).
+    /// Manual triggers are not included.
+    last_run: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/jobs/cronjob/schedule",
+    tag = "jobs",
+    summary = "Get the cronjob schedule status",
+    description = "Get the configured cron schedule for the selected database along with the next and last automatic run times.",
+    params(DbQueryParams),
+    responses(
+        (status = 200, description = "Cronjob schedule status", body = CronScheduleResponse)
+    )
+)]
+pub(crate) async fn get_cronjob_schedule(
+    conn: DbConnection<ReadOnly>,
+) -> Result<Json<CronScheduleResponse>, ApiError> {
     let store = SystemConfigStore::from_env();
     let config = store.load(&conn.index_db)?;
-    for job in config.cron_jobs {
-        let _ = enqueue_job(JobRequest {
-            job_type: JobType::DataExtraction,
-            index_db: conn.index_db.clone(),
-            user_data_db: conn.user_data_db.clone(),
-            metadata: Some(job.inference_id),
-            batch_size: job.batch_size,
-            threshold: job.threshold,
-            log_id: None,
-            tag: None,
-        })
-        .await?;
-    }
-    Ok(Json(CronJobResponse {
-        detail: "Cronjob triggered.".to_string(),
+    let status = cron::get_schedule_status(&conn.index_db)
+        .await
+        .unwrap_or_default();
+    Ok(Json(CronScheduleResponse {
+        enabled: config.enable_cron_job,
+        valid: cron::validate_cron_schedule(&config.cron_schedule).is_ok(),
+        cron_schedule: config.cron_schedule,
+        next_run: status.next_run.map(|time| time.to_rfc3339()),
+        last_run: status.last_run.map(|time| time.to_rfc3339()),
     }))
 }

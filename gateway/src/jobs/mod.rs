@@ -1,3 +1,4 @@
+pub(crate) mod cron;
 pub(crate) mod dir_poller;
 pub(crate) mod files;
 pub(crate) mod queue;
