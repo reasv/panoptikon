@@ -26,6 +26,9 @@ pub(super) async fn handle_text_output(
             .unwrap_or("")
             .trim()
             .to_string();
+        // Deliberately byte length, not chars (Python counted chars): the
+        // filter exists to drop junk like "a" or "ok", and a 1-2 character
+        // CJK result is a real word worth keeping.
         if transcription.len() < 3 {
             continue;
         }

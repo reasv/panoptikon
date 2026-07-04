@@ -46,6 +46,11 @@ impl InferencePool {
             .all(|endpoint| endpoint.weight <= 0.0)
     }
 
+    /// Weighted round-robin with failover: when the selected endpoint fails
+    /// (after the client's own HTTP retries), the request is retried on each
+    /// remaining endpoint before giving up — one endpoint being down costs
+    /// latency on its share of requests, not failed items (matching the
+    /// Python distributed client's shard retry).
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -54,15 +59,34 @@ impl InferencePool {
         ttl_seconds: i64,
         inputs: &[InferenceInput],
     ) -> Result<PredictOutput> {
-        let client = {
-            let mut guard = self.state.lock().await;
-            guard
-                .select_client()
-                .ok_or_else(|| anyhow!("no inference endpoints available"))?
-        };
-        client
-            .predict(inference_id, cache_key, lru_size, ttl_seconds, inputs)
-            .await
+        let mut tried = Vec::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        loop {
+            let selected = {
+                let mut guard = self.state.lock().await;
+                guard.select_client(&tried)
+            };
+            let Some((idx, client)) = selected else {
+                return Err(
+                    last_err.unwrap_or_else(|| anyhow!("no inference endpoints available"))
+                );
+            };
+            match client
+                .predict(inference_id, cache_key, lru_size, ttl_seconds, inputs)
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        endpoint = idx,
+                        "inference endpoint failed, trying another"
+                    );
+                    tried.push(idx);
+                    last_err = Some(err);
+                }
+            }
+        }
     }
 
     pub async fn load_model_all(
@@ -84,10 +108,33 @@ impl InferencePool {
         if clients.is_empty() {
             bail!("no inference endpoints available");
         }
-        for client in clients {
-            client
+        // Partial availability is fine (like Python's _all_or_ignore):
+        // endpoints that failed the explicit load lazy-load on predict, and
+        // predict fails over past endpoints that are down entirely.
+        let total = clients.len();
+        let mut last_err = None;
+        let mut failed = 0usize;
+        for (idx, client) in clients.into_iter().enumerate() {
+            if let Err(err) = client
                 .load_model(inference_id, cache_key, lru_size, ttl_seconds)
-                .await?;
+                .await
+            {
+                tracing::error!(
+                    error = %err,
+                    endpoint = idx,
+                    inference_id,
+                    "failed to load model on inference endpoint"
+                );
+                failed += 1;
+                last_err = Some(err);
+            }
+        }
+        if failed == total {
+            return Err(last_err
+                .unwrap_or_else(|| anyhow!("model load failed on all inference endpoints"))
+                .context(format!(
+                    "model load failed on all {total} inference endpoints"
+                )));
         }
         Ok(())
     }
@@ -110,13 +157,15 @@ impl InferencePool {
 }
 
 impl PoolState {
-    fn select_client(&mut self) -> Option<InferenceApiClient> {
+    /// Smooth weighted round-robin, skipping `exclude`d endpoints (already
+    /// tried in this failover round).
+    fn select_client(&mut self, exclude: &[usize]) -> Option<(usize, InferenceApiClient)> {
         let mut total_weight = 0.0;
         let mut best_idx: Option<usize> = None;
         let mut best_weight = f64::MIN;
 
         for (idx, endpoint) in self.endpoints.iter_mut().enumerate() {
-            if endpoint.weight <= 0.0 {
+            if endpoint.weight <= 0.0 || exclude.contains(&idx) {
                 continue;
             }
             endpoint.current_weight += endpoint.weight;
@@ -130,7 +179,7 @@ impl PoolState {
         let idx = best_idx?;
         let endpoint = &mut self.endpoints[idx];
         endpoint.current_weight -= total_weight;
-        Some(endpoint.client.clone())
+        Some((idx, endpoint.client.clone()))
     }
 }
 
@@ -139,6 +188,11 @@ pub(crate) struct JobInferenceContext {
     pub primary: InferenceApiClient,
     pub pool: InferencePool,
     pub embedding_cache_size: usize,
+    /// Concurrent extraction input loaders (from the gateway's `[jobs]`
+    /// config).
+    pub loader_concurrency: usize,
+    /// Intermediate-data budget for in-flight extraction items, in KiB.
+    pub intermediate_budget_kib: u32,
 }
 
 static JOB_INFERENCE_CONTEXT: OnceLock<JobInferenceContext> = OnceLock::new();

@@ -213,12 +213,14 @@ pub(crate) enum IndexDbWriterMessage {
         entries: Vec<EmbeddingEntry>,
         reply: Reply<()>,
     },
-    DeleteSetterByName {
+    /// Deletes a setter and (for tag setters) the orphaned tags it leaves
+    /// behind in one transaction, so a crash can't leave dangling tag rows
+    /// visible in tag lists.
+    DeleteSetterData {
         setter_name: String,
-        reply: Reply<u64>,
-    },
-    DeleteOrphanTags {
-        reply: Reply<u64>,
+        include_orphan_tags: bool,
+        /// (setter rows deleted, orphan tags deleted)
+        reply: Reply<(u64, u64)>,
     },
     AddFolderToDatabase {
         time_added: String,
@@ -729,18 +731,22 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
-            IndexDbWriterMessage::DeleteSetterByName { setter_name, reply } => {
+            IndexDbWriterMessage::DeleteSetterData {
+                setter_name,
+                include_orphan_tags,
+                reply,
+            } => {
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { delete_setter_by_name(conn, &setter_name).await })
-                    })
-                    .await;
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::DeleteOrphanTags { reply } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move { delete_orphan_tags(conn).await })
+                        Box::pin(async move {
+                            let deleted = delete_setter_by_name(conn, &setter_name).await?;
+                            let orphan_tags = if include_orphan_tags {
+                                delete_orphan_tags(conn).await?
+                            } else {
+                                0
+                            };
+                            Ok((deleted, orphan_tags))
+                        })
                     })
                     .await;
                 let _ = reply.send(result);

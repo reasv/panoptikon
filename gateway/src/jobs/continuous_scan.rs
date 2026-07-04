@@ -310,7 +310,10 @@ pub(crate) struct ContinuousScanState {
     stats: ScanStats,
     epoch: u64,
     paused: bool,
-    paused_for_job: bool,
+    /// Number of jobs currently holding a pause. A refcount, not a bool: a
+    /// cancelled job's Drop-spawned resume can arrive after the *next* job's
+    /// pause, and must not un-pause the scan underneath it.
+    job_pauses: u32,
     actor_ref: ActorRef<ContinuousScanMessage>,
     factory: ActorRef<FactoryMessage<(), FileWork>>,
     factory_handle: Option<ractor::concurrency::JoinHandle<()>>,
@@ -711,7 +714,7 @@ impl Actor for ContinuousScanActor {
             stats: ScanStats::new(),
             epoch: 0,
             paused: false,
-            paused_for_job: false,
+            job_pauses: 0,
             actor_ref: myself.clone(),
             factory,
             factory_handle: Some(handle),
@@ -742,7 +745,7 @@ impl Actor for ContinuousScanActor {
         match message {
             ContinuousScanMessage::Pause { reply } => {
                 state.paused = true;
-                state.paused_for_job = true;
+                state.job_pauses += 1;
                 state.epoch = state.epoch.wrapping_add(1);
                 state.watcher = None;
                 state.poller = None;
@@ -750,7 +753,10 @@ impl Actor for ContinuousScanActor {
                 let _ = reply.send(());
             }
             ContinuousScanMessage::Resume => {
-                state.paused_for_job = false;
+                state.job_pauses = state.job_pauses.saturating_sub(1);
+                if state.job_pauses > 0 {
+                    return Ok(());
+                }
                 state.config = match state.config_store.load(&state.index_db) {
                     Ok(config) => config,
                     Err(err) => {
@@ -788,7 +794,7 @@ impl Actor for ContinuousScanActor {
                     return Ok(());
                 }
 
-                if !state.paused_for_job {
+                if state.job_pauses == 0 {
                     state.paused = false;
                     state.epoch = state.epoch.wrapping_add(1);
                     if !was_enabled {

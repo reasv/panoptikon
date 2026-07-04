@@ -15,9 +15,45 @@ pub struct Settings {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub jobs: JobsConfig,
+    #[serde(default)]
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
+}
+
+/// Host-resource limits for extraction jobs. These describe the machine the
+/// gateway runs on (unlike the per-index-DB SystemConfig, which describes
+/// what to run): all index DBs share the same process memory and I/O.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobsConfig {
+    /// Concurrent input loaders (decode processes and file reads). Bounds
+    /// load-phase memory to roughly this many unmeasured items and doubles
+    /// as an I/O-politeness cap for network mounts.
+    #[serde(default = "default_loader_concurrency")]
+    pub loader_concurrency: usize,
+    /// Cap on loaded-but-unfinished intermediate input data (frames, audio,
+    /// rendered pages) held in memory across in-flight items. A single item
+    /// larger than the whole budget still runs, but alone.
+    #[serde(default = "default_intermediate_data_budget_mb")]
+    pub intermediate_data_budget_mb: u64,
+}
+
+fn default_loader_concurrency() -> usize {
+    8
+}
+
+fn default_intermediate_data_budget_mb() -> u64 {
+    1024
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            loader_concurrency: default_loader_concurrency(),
+            intermediate_data_budget_mb: default_intermediate_data_budget_mb(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

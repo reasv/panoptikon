@@ -19,7 +19,7 @@ use crate::db::items::get_existing_file_for_item_id;
 use crate::db::open_index_db_read;
 use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
-use crate::inferio_client::{InferenceInput, PredictOutput};
+use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
@@ -109,13 +109,68 @@ pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(
     let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
         .await
         .map_err(|err| format!("{err:?}"))?;
+    let cleanup = IncompleteJobCleanup::arm(&job.index_db);
 
     let result = run_extraction_job_inner(&job, &inference_id).await;
     guard.resume().await;
-    if result.is_ok() {
-        run_post_job_maintenance(&job.index_db, false).await;
+    match result {
+        Ok(()) => {
+            cleanup.disarm();
+            run_post_job_maintenance(&job.index_db, false).await;
+            Ok(())
+        }
+        Err(err) => {
+            cleanup.run().await;
+            Err(format!("{err:?}"))
+        }
     }
-    result.map_err(|err| format!("{err:?}"))
+}
+
+/// Marks this job's unfinished data_log row as incomplete when the job fails
+/// or is cancelled, so job history doesn't show a phantom in-progress job
+/// until the next extraction run's cleanup pass (Python runs
+/// remove_incomplete_jobs immediately on exception). `Drop` covers the
+/// cancellation path — the job task is aborted, so only a drop guard runs.
+struct IncompleteJobCleanup {
+    index_db: Option<String>,
+}
+
+impl IncompleteJobCleanup {
+    fn arm(index_db: &str) -> Self {
+        Self {
+            index_db: Some(index_db.to_string()),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.index_db = None;
+    }
+
+    async fn run(mut self) {
+        if let Some(index_db) = self.index_db.take() {
+            cleanup_incomplete_jobs(&index_db).await;
+        }
+    }
+}
+
+impl Drop for IncompleteJobCleanup {
+    fn drop(&mut self) {
+        if let Some(index_db) = self.index_db.take() {
+            tokio::spawn(async move {
+                cleanup_incomplete_jobs(&index_db).await;
+            });
+        }
+    }
+}
+
+async fn cleanup_incomplete_jobs(index_db: &str) {
+    let result = call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+    })
+    .await;
+    if let Err(err) = result {
+        tracing::error!(error = ?err, index_db, "failed to clean up incomplete extraction jobs");
+    }
 }
 async fn run_extraction_job_inner(
     job: &crate::jobs::queue::Job,
@@ -202,8 +257,16 @@ async fn run_extraction_job_inner(
     }
 
     let counters = Arc::new(Mutex::new(JobCounters::default()));
-    // Bounds how many items are concurrently being loaded/processed.
-    let item_slots = Arc::new(Semaphore::new(defaults.batch_size as usize));
+    // Bounds concurrent input loading (decode processes, file reads). Loaded
+    // items park on the byte budget below, so loading pipelines ahead of
+    // inference instead of running in lockstep with it.
+    let loader_slots = Arc::new(Semaphore::new(context.loader_concurrency.max(1)));
+    // Bounds loaded-but-unfinished intermediate data across in-flight items
+    // (KiB permits). An item larger than the whole budget clamps to capacity
+    // and runs alone; worst-case memory is roughly
+    // budget + loader_concurrency × item size.
+    let budget_capacity = context.intermediate_budget_kib.max(1);
+    let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
     // Bounds the total number of work units inside in-flight inference
     // requests across all items (the actual meaning of job batch_size).
     let unit_slots = Arc::new(Semaphore::new(defaults.batch_size as usize));
@@ -224,7 +287,7 @@ async fn run_extraction_job_inner(
         let Some(item) = map_job_input(&job.index_db, &job.user_data_db, &row).await? else {
             continue;
         };
-        let permit = item_slots
+        let loader_permit = loader_slots
             .clone()
             .acquire_owned()
             .await
@@ -235,8 +298,8 @@ async fn run_extraction_job_inner(
         let index_db = job.index_db.clone();
         let threshold = defaults.threshold;
         let unit_slots = Arc::clone(&unit_slots);
+        let budget_slots = Arc::clone(&budget_slots);
         tasks.spawn(async move {
-            let _permit = permit;
             let result = process_item(
                 &index_db,
                 &model,
@@ -244,6 +307,9 @@ async fn run_extraction_job_inner(
                 item,
                 threshold,
                 &pool,
+                loader_permit,
+                &budget_slots,
+                budget_capacity,
                 &unit_slots,
                 unit_capacity,
                 counters,
@@ -268,9 +334,14 @@ async fn run_extraction_job_inner(
         remaining
     };
 
-    let final_update = {
+    let (final_update, total_failure) = {
         let guard = counters.lock().await;
-        DataLogUpdate {
+        // Every attempted item failing means a systemic cause (inference
+        // server down, model broken), not per-item bad data: surface it as a
+        // job failure instead of a "completed" job that did nothing. The
+        // log row is left unfinished so the cleanup pass marks it incomplete.
+        let total_failure = guard.processed > 0 && guard.errors >= guard.processed;
+        let update = DataLogUpdate {
             image_files: guard.image_files,
             video_files: guard.video_files,
             other_files: guard.other_files,
@@ -279,8 +350,9 @@ async fn run_extraction_job_inner(
             total_remaining: remaining_after,
             data_load_time: guard.data_load_time,
             inference_time: guard.inference_time,
-            finished: true,
-        }
+            finished: !total_failure,
+        };
+        (update, total_failure)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -294,6 +366,12 @@ async fn run_extraction_job_inner(
         .unload_model_all(&model.setter_name, CACHE_KEY)
         .await;
 
+    if total_failure {
+        return Err(ApiError::internal(format!(
+            "All {} attempted items failed; check the inference server",
+            final_update.errors
+        )));
+    }
     Ok(())
 }
 
@@ -302,31 +380,32 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
         .metadata
         .clone()
         .ok_or_else(|| "Inference ID required".to_string())?;
-    let mut conn = open_index_db_read(&job.index_db, &job.user_data_db)
+    let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
         .await
         .map_err(|err| format!("{err:?}"))?;
-    let data_types = get_setter_data_types(&mut conn, &inference_id)
-        .await
-        .map_err(|err| format!("{err:?}"))?;
+    let result = run_data_deletion_job_inner(&job, &inference_id).await;
+    guard.resume().await;
+    result.map_err(|err| format!("{err:?}"))
+}
+
+async fn run_data_deletion_job_inner(
+    job: &crate::jobs::queue::Job,
+    inference_id: &str,
+) -> ApiResult<()> {
+    let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
+    let data_types = get_setter_data_types(&mut conn, inference_id).await?;
     drop(conn);
 
-    let deleted = call_index_db_writer(&job.index_db, |reply| {
-        IndexDbWriterMessage::DeleteSetterByName {
-            setter_name: inference_id.clone(),
+    let include_orphan_tags = data_types.iter().any(|entry| entry == "tags");
+    let (deleted, orphan_tags_deleted) = call_index_db_writer(&job.index_db, |reply| {
+        IndexDbWriterMessage::DeleteSetterData {
+            setter_name: inference_id.to_string(),
+            include_orphan_tags,
             reply,
         }
     })
-    .await
-    .map_err(|err| format!("{err:?}"))?;
+    .await?;
 
-    let mut orphan_tags_deleted = 0;
-    if data_types.iter().any(|entry| entry == "tags") {
-        orphan_tags_deleted = call_index_db_writer(&job.index_db, |reply| {
-            IndexDbWriterMessage::DeleteOrphanTags { reply }
-        })
-        .await
-        .unwrap_or(0);
-    }
     // VACUUM blocks the writer for the whole run; skip it when the deletion
     // turned out to be a no-op.
     run_post_job_maintenance(&job.index_db, deleted > 0 || orphan_tags_deleted > 0).await;
@@ -341,6 +420,9 @@ async fn process_item(
     item: JobInputData,
     threshold: Option<f64>,
     pool: &InferencePool,
+    loader_permit: tokio::sync::OwnedSemaphorePermit,
+    budget_slots: &Arc<Semaphore>,
+    budget_capacity: u32,
     unit_slots: &Arc<Semaphore>,
     unit_capacity: usize,
     counters: Arc<Mutex<JobCounters>>,
@@ -371,15 +453,8 @@ async fn process_item(
     let load_time = load_start.elapsed().as_secs_f64();
 
     if prepared.inputs.is_empty() {
-        let empty_outputs = output_handlers::empty_outputs_for(&model.output_type)?;
-        let result = output_handlers::handle_outputs(
-            index_db,
-            model,
-            job_id,
-            prepared.item.clone(),
-            empty_outputs,
-        )
-        .await;
+        let result =
+            output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
         finalize_item(
             index_db,
             job_id,
@@ -397,6 +472,27 @@ async fn process_item(
     }
 
     let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
+    // Reserve budget for the loaded data *before* releasing the loader slot:
+    // when the budget is exhausted this parks with the slot still held, so
+    // once every loader slot is parked no new loads start — that is the
+    // backpressure that bounds memory. The clamp to capacity means an item
+    // bigger than the entire budget acquires all of it and runs alone rather
+    // than deadlocking.
+    let kib = input_memory_kib(&inference_inputs);
+    let _budget_permits = if kib > 0 {
+        let want = kib.min(budget_capacity);
+        Some(
+            budget_slots
+                .clone()
+                .acquire_many_owned(want)
+                .await
+                .map_err(|_| ApiError::internal("Extraction budget semaphore closed"))?,
+        )
+    } else {
+        None
+    };
+    drop(loader_permit);
+
     let segments = inference_inputs.len() as i64;
     let inf_start = Instant::now();
     let outputs = match run_chunked_inference(
@@ -447,6 +543,20 @@ async fn process_item(
     )
     .await;
     result.map(|_| ())
+}
+
+/// In-memory footprint of an item's prepared inputs, in KiB (rounded up).
+/// Only counts buffers actually held in memory: path-based inputs are read
+/// transiently at request time, which the work-unit cap already bounds.
+fn input_memory_kib(inputs: &[InferenceInput]) -> u32 {
+    let bytes: usize = inputs
+        .iter()
+        .map(|input| match &input.file {
+            Some(InferenceFile::Bytes(buffer)) => buffer.len(),
+            _ => 0,
+        })
+        .sum();
+    u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
 }
 
 /// Runs inference over one item's work units in chunks of at most

@@ -92,6 +92,11 @@ async fn async_main() -> anyhow::Result<()> {
         primary: inference_client.clone(),
         pool: inference_pool,
         embedding_cache_size: settings.search.embedding_cache_size,
+        loader_concurrency: settings.jobs.loader_concurrency,
+        intermediate_budget_kib: u32::try_from(
+            settings.jobs.intermediate_data_budget_mb.saturating_mul(1024),
+        )
+        .unwrap_or(u32::MAX),
     })?;
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
