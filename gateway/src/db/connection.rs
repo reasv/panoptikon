@@ -276,6 +276,18 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
     Ok(())
 }
 
+/// True when the READONLY env var requests read-only mode. Python parity:
+/// the same variable strips write locks and skips startup migrations there.
+pub(crate) fn readonly_mode() -> bool {
+    env::var("READONLY")
+        .ok()
+        .map(|value| {
+            let value = value.to_lowercase();
+            matches!(value.as_str(), "true" | "1")
+        })
+        .unwrap_or(false)
+}
+
 async fn connect_db(
     paths: &DbPaths,
     write_lock: bool,
@@ -283,13 +295,7 @@ async fn connect_db(
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
     ensure_sqlite_vec_loaded()?;
-    let readonly_mode = env::var("READONLY")
-        .ok()
-        .map(|value| {
-            let value = value.to_lowercase();
-            matches!(value.as_str(), "true" | "1")
-        })
-        .unwrap_or(false);
+    let readonly_mode = readonly_mode();
     let write_lock = write_lock && !readonly_mode;
     let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
     let open_readonly = !write_lock && !user_data_wl;

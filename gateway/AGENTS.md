@@ -10,7 +10,7 @@ Architecture (current)
 - Router: Axum routes for `/api`, `/docs`, `/redoc`, `/openapi.json`, `/api/inference/*`, and fallback to UI.
 - Proxy: `gateway/src/proxy.rs` streams requests to upstreams with minimal rewriting (forwarded headers, URI swap).
 - Policy layer: `gateway/src/policy.rs` enforces host-based policy selection, rulesets, DB param rewriting, and `/api/db` response filtering across both proxied and local handlers.
-- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is set), `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, and `/api/search/stats` locally when `upstreams.api.local = true`. `/openapi.json`, `/docs`, and `/redoc` are served locally when `upstreams.api.local = true`. `/api/jobs/*` is only local when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+- Local API: `gateway/src/api/*.rs` implements `/api/db`, `/api/db/create`, `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, `/api/search/stats`, and `/api/jobs/*` locally when `upstreams.api.local = true`. `/openapi.json`, `/docs`, and `/redoc` are served locally when `upstreams.api.local = true`.
 - Config: `gateway/src/config.rs` loads TOML + env, validates policies/rulesets, default path `config/gateway/default.toml`.
 
 Behavior (important)
@@ -22,9 +22,9 @@ Behavior (important)
   (`/STACK:8388608` for MSVC, `--stack,8388608` for GNU) to avoid startup stack
   overflows on the default main thread stack; Tokio worker threads are also
   configured with 8MB stacks.
-- `EXPERIMENTAL_RUST_DB_CREATION` is treated as truthy only for `1`, `true`, `yes`, or `on` (case-insensitive).
-- `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` runs migrations across all on-disk DBs in `DATA_FOLDER` and baselines Python-created DBs when truthy.
-- `EXPERIMENTAL_RUST_JOBS` gates local `/api/jobs/*` endpoints; when false, job routes are proxied to the Python backend.
+- `upstreams.api.local = true` means the gateway owns the databases outright: it serves the full API locally (including `/api/jobs/*` and `/api/db/create`), runs the cron scheduler, and runs startup migrations across all on-disk DBs in `DATA_FOLDER` (skipped when `READONLY` is set, matching Python). Do not run the Python server's cron against the same `DATA_FOLDER` in this mode — it would double-schedule extraction jobs.
+- Graceful shutdown (`shutdown.rs`): first SIGINT/SIGTERM drains HTTP, stops cron + continuous-scan actors, cancels the running job (queued jobs dropped, new enqueues refused), and flushes index DB writers; 10s cleanup grace, 20s hard exit deadline, second signal exits immediately.
+- Logging (`logging.rs`): console plus append-mode file, default `$DATA_FOLDER/panoptikon-gateway.log`; `LOGS_FILE` overrides (empty disables), `LOGLEVEL` sets the level, `RUST_LOG` wins when set.
 - Inference upstreams are configured as an array; the first entry is the proxy + metadata target and may be marked `use_for_jobs = false` to keep it search-only. Extraction jobs only use endpoints with `use_for_jobs = true`.
 - DB param enforcement:
   - Enforces `index_db` and `user_data_db` for DB-aware routes.
@@ -47,7 +47,7 @@ Behavior (important)
   - Writers open short-lived write transactions and keep a cached connection with a 5-minute idle timeout.
   - A supervisor actor spawns writers on demand and runs 5-minute health checks (index/storage file existence + index/storage read-only ping).
 - Job system:
-  - `/api/jobs/*` is implemented locally only when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
+  - `/api/jobs/*` is implemented locally whenever `upstreams.api.local = true`.
   - A global `JobQueueActor` keeps an in-memory queue and running job state; a `JobRunnerActor` executes one job at a time.
   - Job completion flows through a watcher task: it observes the job task ending (return, error, panic, or abort) and sends `JobCompleted` to the runner, which clears its busy state before forwarding `RunnerFinished` to the queue. This ordering means the queue's next `RunJob` can never hit a stale busy state, and a panicking job cannot wedge the queue.
   - Cancellation aborts the job task; extraction item tasks live in a `JoinSet` owned by that task, so they are aborted with it instead of continuing to run and write. Continuous-scan pause/resume uses `JobPauseGuard` (Drop-based), so a cancelled or panicking job cannot leave a DB's continuous scan paused.
@@ -63,7 +63,7 @@ Behavior (important)
   - File scan jobs honor `filescan_filter` (PQL `Match`) during stage-1/2 file filtering and apply `job_filters` entries that include `file_scan` after scans to delete files that violate the rules.
   - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).
-  - Cron jobs are fully ported (`jobs/cron.rs`): a scheduler actor ticks every minute over all index DBs, evaluating each DB's `cron_schedule` (croner, croniter-compatible 5-field patterns, local time) with Python's semantics — config re-read every tick, a changed string recomputes the next fire from now, no catch-up for missed runs (deliberate: startup must never kick off a GPU-heavy run on its own). The scheduler starts only under `EXPERIMENTAL_RUST_JOBS` (otherwise Python owns cron).
+  - Cron jobs are fully ported (`jobs/cron.rs`): a scheduler actor ticks every minute over all index DBs, evaluating each DB's `cron_schedule` (croner, croniter-compatible 5-field patterns, local time) with Python's semantics — config re-read every tick, a changed string recomputes the next fire from now, no catch-up for missed runs (deliberate: startup must never kick off a GPU-heavy run on its own). The scheduler starts whenever `upstreams.api.local = true`.
   - `run_cronjob` (shared by the scheduler and the manual trigger, which deliberately ignores `enable_cron_job`) enqueues a folder rescan first, then extraction jobs ordered items/files-targeting models before derived-data models; all tagged `cronjob`. The batch is enqueued atomically and skipped while a previous cronjob for that DB is queued/running (dedup lives inside the queue actor to avoid check-then-enqueue races). A model unknown to the inference server is skipped; if the metadata fetch itself fails, jobs are enqueued unordered instead of consuming the slot (deliberate improvement over Python).
   - `PUT /api/jobs/config` rejects unparseable `cron_schedule` strings with 400 (Python accepts them and fails silently in the ticker). `GET /api/jobs/cronjob/schedule` (additive, not in Python) reports enabled/valid/next_run/last_run.
   - Embedding-model preload (`preload_embedding_models`) runs on the same minute tick, mirroring Python: existing text-embedding/clip setters (excluding `tclip/`) are kept loaded under cache key `preload[<index_db>]` with 1h TTL and renewal ~2 minutes before expiry; disabling clears the inference cache once.
@@ -71,7 +71,7 @@ Behavior (important)
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.
   - `db::migrations::migrate_databases` can create or update on-disk DBs and supports in-memory DBs for tests.
-  - Existing Python-created DBs without `_sqlx_migrations` are baselined to the first migration so future migrations can apply.
+  - Existing Python-created DBs without `_sqlx_migrations` are baselined to the first migration so future migrations can apply. Baselining is guarded: the DB's `alembic_version` must equal the head revision the init snapshot was taken from (constants in `migrations.rs`), otherwise startup fails with an explicit error. Freshly created DBs get the alembic head stamped into `alembic_version` so Python can still manage them during the transition.
 - Local PQL search:
   - `/api/search/pql` compiles queries via the Rust PQL builder and executes them locally.
   - `/api/search/pql/build` returns the compiled SQL/params without executing.

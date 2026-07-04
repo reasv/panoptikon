@@ -21,4 +21,5 @@ pub(crate) use connection::{
     open_index_db_read,
     open_index_db_read_no_user_data,
     open_index_db_write_no_user_data,
+    readonly_mode,
 };

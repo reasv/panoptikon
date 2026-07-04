@@ -15,6 +15,17 @@ static INDEX_MIGRATOR: Migrator = sqlx::migrate!("migrations/index");
 static STORAGE_MIGRATOR: Migrator = sqlx::migrate!("migrations/storage");
 static USER_DATA_MIGRATOR: Migrator = sqlx::migrate!("migrations/user_data");
 
+// Alembic head revisions of the Python-managed schemas (see
+// src/panoptikon/db/migrations/*/versions). Each init.sql is a snapshot of
+// the schema at exactly this revision, so a Python-created database may be
+// baselined (init recorded as applied without executing it) only when its
+// alembic_version matches: baselining an out-of-date schema would leave the
+// gateway assuming columns that don't exist. Update these if Python ever
+// gains another alembic migration.
+const INDEX_ALEMBIC_HEAD: &str = "b2c3d4e5f6a7";
+const STORAGE_ALEMBIC_HEAD: &str = "31adcda83d69";
+const USER_DATA_ALEMBIC_HEAD: &str = "31adcda83d69";
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MigrationTarget {
     Disk,
@@ -54,9 +65,9 @@ pub(crate) async fn migrate_databases_on_disk(
     let index_db = index_db.unwrap_or(&default_index).to_string();
     let user_data_db = user_data_db.unwrap_or(&default_user).to_string();
     let paths = db_paths(&index_db, &user_data_db)?;
-    migrate_path(&paths.index_db_file, &INDEX_MIGRATOR).await?;
-    migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR).await?;
-    migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR).await?;
+    migrate_path(&paths.index_db_file, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await?;
+    migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD).await?;
+    migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD).await?;
     Ok(paths)
 }
 
@@ -79,11 +90,11 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
             let db_dir = entry.path();
             let index_db_file = db_dir.join("index.db");
             if index_db_file.is_file() {
-                migrate_path(&index_db_file, &INDEX_MIGRATOR).await?;
+                migrate_path(&index_db_file, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await?;
             }
             let storage_db_file = db_dir.join("storage.db");
             if storage_db_file.is_file() {
-                migrate_path(&storage_db_file, &STORAGE_MIGRATOR).await?;
+                migrate_path(&storage_db_file, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD).await?;
             }
         }
     }
@@ -107,7 +118,7 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
             if !is_db {
                 continue;
             }
-            migrate_path(&path, &USER_DATA_MIGRATOR).await?;
+            migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD).await?;
         }
     }
 
@@ -168,22 +179,60 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
     })
 }
 
-async fn migrate_path(path: &Path, migrator: &Migrator) -> Result<()> {
+async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &str) -> Result<()> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);
     let mut conn = SqliteConnection::connect_with(&options)
         .await
         .with_context(|| format!("failed to open database {}", path.display()))?;
-    ensure_baseline_if_needed(&mut conn, migrator).await?;
+    let fresh = !has_user_tables(&mut conn).await?;
+    ensure_baseline_if_needed(&mut conn, migrator, expected_alembic_head)
+        .await
+        .with_context(|| format!("refusing to migrate database {}", path.display()))?;
     migrator
         .run(&mut conn)
         .await
         .with_context(|| format!("failed to migrate database {}", path.display()))?;
+    if fresh {
+        stamp_alembic_head(&mut conn, expected_alembic_head)
+            .await
+            .with_context(|| format!("failed to stamp database {}", path.display()))?;
+    }
     Ok(())
 }
 
-async fn ensure_baseline_if_needed(conn: &mut SqliteConnection, migrator: &Migrator) -> Result<()> {
+/// Marks a freshly created database as being at the alembic head. init.sql
+/// creates `alembic_version` empty; the Python server's alembic decides what
+/// to run from that table, so left empty it would attempt the initial
+/// migration on top of the existing tables and fail at startup. Stamping
+/// keeps gateway-created databases manageable by Python during the
+/// transition. (Done in code rather than in init.sql: editing a shipped
+/// migration changes its sqlx checksum and breaks every already-migrated or
+/// baselined database.)
+async fn stamp_alembic_head(conn: &mut SqliteConnection, head: &str) -> Result<()> {
+    if !table_exists(conn, "alembic_version").await? {
+        return Ok(());
+    }
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alembic_version")
+        .fetch_one(&mut *conn)
+        .await
+        .context("failed to read alembic_version")?;
+    if count.0 == 0 {
+        sqlx::query("INSERT INTO alembic_version (version_num) VALUES (?1)")
+            .bind(head)
+            .execute(&mut *conn)
+            .await
+            .context("failed to insert alembic head revision")?;
+    }
+    Ok(())
+}
+
+async fn ensure_baseline_if_needed(
+    conn: &mut SqliteConnection,
+    migrator: &Migrator,
+    expected_alembic_head: &str,
+) -> Result<()> {
     let has_user_tables = has_user_tables(conn).await?;
     if !has_user_tables {
         return Ok(());
@@ -202,6 +251,33 @@ async fn ensure_baseline_if_needed(conn: &mut SqliteConnection, migrator: &Migra
 
     if applied_count > 0 {
         return Ok(());
+    }
+
+    // About to baseline a database the gateway has never migrated: it must be
+    // a Python-created database at exactly the alembic head the init snapshot
+    // was taken from. Anything else (an older Python schema, or a database
+    // from some other source) must be migrated by Python first — recording
+    // the snapshot as applied over the wrong schema would fail at runtime
+    // instead, far from the cause.
+    let alembic_version: Option<(String,)> = if table_exists(conn, "alembic_version").await? {
+        sqlx::query_as("SELECT version_num FROM alembic_version LIMIT 1")
+            .fetch_optional(&mut *conn)
+            .await
+            .context("failed to read alembic_version")?
+    } else {
+        None
+    };
+    match alembic_version.as_ref().map(|(v,)| v.as_str()) {
+        Some(version) if version == expected_alembic_head => {}
+        Some(version) => anyhow::bail!(
+            "existing database is at alembic revision {version}, expected head \
+             {expected_alembic_head}; run the Python server once to migrate it \
+             before starting the gateway"
+        ),
+        None => anyhow::bail!(
+            "existing database has tables but no alembic_version; refusing to \
+             baseline a schema of unknown provenance"
+        ),
     }
 
     conn.ensure_migrations_table()
@@ -350,5 +426,127 @@ pub(crate) async fn setup_test_databases() -> InMemoryDatabases {
     {
         MigratedDatabases::Memory(databases) => databases,
         MigratedDatabases::Disk(_) => unreachable!("expected in-memory databases for tests"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn connect(path: &Path) -> SqliteConnection {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        SqliteConnection::connect_with(&options)
+            .await
+            .expect("failed to open test database")
+    }
+
+    /// Creates a fake Python-created user_data DB: alembic_version at the
+    /// given revision plus a `bookmarks` table whose shape differs from the
+    /// init snapshot, so any accidental execution of init.sql fails loudly
+    /// ("table already exists") instead of passing silently.
+    async fn fake_python_db(path: &Path, alembic_revision: Option<&str>) {
+        let mut conn = connect(path).await;
+        if let Some(revision) = alembic_revision {
+            sqlx::query("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO alembic_version VALUES (?1)")
+                .bind(revision)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::query("CREATE TABLE bookmarks (fake_marker INTEGER PRIMARY KEY)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+
+    async fn sqlx_migration_count(path: &Path) -> i64 {
+        let mut conn = connect(path).await;
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        count.0
+    }
+
+    // A Python DB at alembic head is baselined: the init migration is
+    // recorded as applied but never executed (the fake bookmarks shape
+    // survives untouched).
+    #[tokio::test]
+    async fn baseline_records_without_executing_at_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        fake_python_db(&path, Some(USER_DATA_ALEMBIC_HEAD)).await;
+
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect("baseline at head should succeed");
+
+        assert_eq!(sqlx_migration_count(&path).await, 1);
+        let mut conn = connect(&path).await;
+        let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("SELECT * FROM pragma_table_info('bookmarks')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(cols.len(), 1, "init.sql must not have been executed");
+        assert_eq!(cols[0].1, "fake_marker");
+        conn.close().await.unwrap();
+    }
+
+    // A Python DB behind head must not be baselined — the init snapshot
+    // assumes columns an older schema doesn't have.
+    #[tokio::test]
+    async fn baseline_refuses_outdated_alembic_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        fake_python_db(&path, Some("31adcda83d68")).await;
+
+        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect_err("outdated revision must be refused");
+        assert!(format!("{err:#}").contains("alembic revision"), "{err:#}");
+    }
+
+    // A non-empty DB without alembic_version is of unknown provenance and
+    // must be refused rather than baselined.
+    #[tokio::test]
+    async fn baseline_refuses_unknown_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        fake_python_db(&path, None).await;
+
+        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect_err("missing alembic_version must be refused");
+        assert!(format!("{err:#}").contains("no alembic_version"), "{err:#}");
+    }
+
+    // A fresh file gets the real schema from init.sql, including the
+    // alembic_version row that keeps the DB readable by the Python server.
+    #[tokio::test]
+    async fn fresh_database_is_created_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect("fresh database creation should succeed");
+
+        assert_eq!(sqlx_migration_count(&path).await, 1);
+        let mut conn = connect(&path).await;
+        let version: (String,) = sqlx::query_as("SELECT version_num FROM alembic_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(version.0, USER_DATA_ALEMBIC_HEAD);
+        conn.close().await.unwrap();
     }
 }

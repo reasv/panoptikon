@@ -26,12 +26,6 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(10);
 /// axum's graceful shutdown would wait on them forever.
 const FORCE_EXIT_AFTER: Duration = Duration::from_secs(20);
 
-/// Which optional subsystems `main` actually started, so cleanup doesn't
-/// lazily spawn an actor just to stop it.
-pub(crate) struct Subsystems {
-    pub jobs: bool,
-    pub local_api: bool,
-}
 
 /// Resolves when the process receives its first termination signal
 /// (SIGINT/SIGTERM on Unix; Ctrl-C/Break/Close/Shutdown on Windows). If no
@@ -80,8 +74,9 @@ pub(crate) async fn wait_for_signal() {
 
 /// Runs the coordinated cleanup after the first shutdown signal. Called
 /// concurrently with axum's graceful HTTP shutdown; `main` joins this before
-/// returning.
-pub(crate) async fn run_cleanup(subsystems: Subsystems) {
+/// returning. `local_api` says whether the job/scan/cron subsystems were
+/// started at all, so cleanup doesn't lazily spawn an actor just to stop it.
+pub(crate) async fn run_cleanup(local_api: bool) {
     tracing::info!("shutdown signal received; stopping gracefully (repeat the signal to force exit)");
 
     tokio::spawn(async {
@@ -98,10 +93,8 @@ pub(crate) async fn run_cleanup(subsystems: Subsystems) {
     });
 
     let cleanup = async {
-        if subsystems.jobs {
+        if local_api {
             cron::stop_cron_scheduler();
-        }
-        if subsystems.local_api {
             continuous_scan::stop_continuous_scanning().await;
         }
         if let Some(queue_id) = queue::shutdown_job_queue().await {

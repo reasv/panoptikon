@@ -26,17 +26,6 @@ use utoipa_redoc::Redoc;
 use utoipa_redoc::Servable;
 use utoipa_swagger_ui::SwaggerUi;
 
-fn env_truthy(key: &str) -> bool {
-    match env::var(key) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" | "" => false,
-            _ => false,
-        },
-        Err(_) => false,
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "panoptikon-gateway",
@@ -102,7 +91,16 @@ async fn async_main() -> anyhow::Result<()> {
         settings.search.embedding_cache_size,
     ));
 
-    if env_truthy("EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS") {
+    let local_api = settings.upstreams.api.local;
+
+    // When the gateway is the API server it owns the databases, so it runs
+    // startup migrations like the Python server does (and, like Python,
+    // skips them in READONLY mode): the default databases are created if
+    // missing, then every other on-disk DB is brought up to date.
+    // Python-created DBs are baselined, not re-migrated — see
+    // db::migrations::ensure_baseline_if_needed.
+    if local_api && !db::readonly_mode() {
+        db::migrations::migrate_databases_on_disk(None, None).await?;
         db::migrations::migrate_all_databases_on_disk().await?;
     }
 
@@ -115,14 +113,10 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/openapi.json", any(proxy::proxy_api))
         .fallback(any(proxy::proxy_ui));
 
-    let local_api = settings.upstreams.api.local;
-    let mut jobs_enabled = false;
     if local_api {
-        let enable_db_create = env_truthy("EXPERIMENTAL_RUST_DB_CREATION");
-        app = app.route("/api/db", get(api::db::db_info));
-        if enable_db_create {
-            app = app.route("/api/db/create", post(api::db::db_create));
-        }
+        app = app
+            .route("/api/db", get(api::db::db_info))
+            .route("/api/db/create", post(api::db::db_create));
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app
             .route(
@@ -171,14 +165,12 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/search/stats", get(api::search::get_stats))
             .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
             .merge(Redoc::with_url("/redoc", openapi::ApiDoc::openapi()));
-        jobs_enabled = env_truthy("EXPERIMENTAL_RUST_JOBS");
-        if jobs_enabled {
-            // The scheduler enqueues into the Rust job queue, so it only runs
-            // when the Rust job system serves the API; otherwise the Python
-            // side still owns cron and this would double-schedule.
-            let _ = jobs::cron::ensure_cron_scheduler().await;
-            app = app
-                .route(
+        // Local API mode means the gateway owns jobs and cron. Do not run
+        // the Python server's cron against the same databases — it would
+        // double-schedule.
+        let _ = jobs::cron::ensure_cron_scheduler().await;
+        app = app
+            .route(
                     "/api/jobs/queue",
                     get(api::jobs::queue_status).delete(api::jobs::cancel_queued),
                 )
@@ -220,7 +212,6 @@ async fn async_main() -> anyhow::Result<()> {
                     "/api/jobs/cronjob/schedule",
                     get(api::jobs::get_cronjob_schedule),
                 );
-        }
     }
 
     let app = app
@@ -236,14 +227,10 @@ async fn async_main() -> anyhow::Result<()> {
     // requests while the cleanup task cancels jobs and flushes the DB writers.
     // Both must finish before main returns; shutdown.rs enforces the deadline.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let subsystems = shutdown::Subsystems {
-        jobs: jobs_enabled,
-        local_api,
-    };
     let cleanup = tokio::spawn(async move {
         shutdown::wait_for_signal().await;
         let _ = shutdown_tx.send(());
-        shutdown::run_cleanup(subsystems).await;
+        shutdown::run_cleanup(local_api).await;
     });
     axum::serve(
         listener,

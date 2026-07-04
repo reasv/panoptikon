@@ -43,12 +43,10 @@ Special handling:
 - `/api/db` is filtered so only allowed DB names are returned; tenant-prefixed
   DBs are reported without the prefix, and `current` defaults reflect the policy.
 - `/api/db/create` uses `new_index_db` and `new_user_data_db` with the same
-  enforcement rules as normal DB parameters and is only available when
-  `EXPERIMENTAL_RUST_DB_CREATION` is set to a truthy value (`1`, `true`, `yes`,
-  or `on`, case-insensitive).
+  enforcement rules as normal DB parameters.
 - `/api/inference/*` never receives DB query parameters.
 - When `upstreams.api.local = true`, the gateway serves `/api/db`,
-  `/api/db/create` (only when `EXPERIMENTAL_RUST_DB_CREATION` is truthy),
+  `/api/db/create`,
   `/api/bookmarks/ns`, `/api/bookmarks/users`,
   `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`,
   `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`,
@@ -97,9 +95,11 @@ for write transactions.
 
 ## Job system
 
-When `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is set to a
-truthy value (`1`, `true`, `yes`, or `on`), `/api/jobs/*` is implemented
-locally. A global job-queue actor holds the in-memory queue and running job
+When `upstreams.api.local = true`, `/api/jobs/*` is implemented locally and
+the cron scheduler runs in the gateway. Local mode means the gateway owns the
+databases outright: do not run the Python server's cron (or the Python server
+at all) against the same `DATA_FOLDER`, or extraction jobs will be scheduled
+twice. A global job-queue actor holds the in-memory queue and running job
 state, and a job-runner actor executes one job at a time. File scan jobs
 (`folder_rescan`, `folder_update`) run through `FileScanService`, which writes
 via the index DB writer actor. Queue status mirrors Python semantics (running
@@ -134,12 +134,18 @@ sqlx migrate add --source gateway/migrations/index add_new_table
 
 Programmatic creation and migration lives in `gateway/src/db/migrations.rs`
 (`migrate_databases`) and supports both on-disk databases and shared
-in-memory databases for tests. Existing Python-created DBs that predate
-SQLx migrations are baselined to the first migration so later migrations
-can still apply.
-Set `EXPERIMENTAL_RUST_DB_AUTO_MIGRATIONS` to a truthy value (`1`, `true`,
-`yes`, or `on`) to run migrations across every on-disk DB in `DATA_FOLDER`
-at startup, including baselining Python-created databases.
+in-memory databases for tests.
+
+When `upstreams.api.local = true` (and `READONLY` is not set), the gateway
+runs migrations across every on-disk DB in `DATA_FOLDER` at startup, like the
+Python server does. Existing Python-created DBs are baselined: the init
+snapshot is recorded as applied without executing any SQL — the only write is
+the `_sqlx_migrations` bookkeeping table. Baselining requires the DB to be at
+the exact alembic head the snapshot was taken from; anything older (or a
+non-empty DB with no `alembic_version` at all) makes startup fail with an
+explicit error instead of silently assuming the wrong schema. Freshly created
+DBs get the alembic head revision stamped into `alembic_version` so they
+remain manageable by the Python server during the transition.
 
 ## Configuration
 
