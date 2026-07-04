@@ -49,12 +49,21 @@ Behavior (important)
 - Job system:
   - `/api/jobs/*` is implemented locally only when `upstreams.api.local = true` and `EXPERIMENTAL_RUST_JOBS` is truthy.
   - A global `JobQueueActor` keeps an in-memory queue and running job state; a `JobRunnerActor` executes one job at a time.
+  - Job completion flows through a watcher task: it observes the job task ending (return, error, panic, or abort) and sends `JobCompleted` to the runner, which clears its busy state before forwarding `RunnerFinished` to the queue. This ordering means the queue's next `RunJob` can never hit a stale busy state, and a panicking job cannot wedge the queue.
+  - Cancellation aborts the job task; extraction item tasks live in a `JoinSet` owned by that task, so they are aborted with it instead of continuing to run and write. Continuous-scan pause/resume uses `JobPauseGuard` (Drop-based), so a cancelled or panicking job cannot leave a DB's continuous scan paused.
   - File scan jobs (`folder_rescan`, `folder_update`) run through `FileScanService` and the index writer actor for writes.
-  - Data extraction jobs run per-item inference with an inflight cap (job `batch_size`), use the inference pool for prediction, and serialize all DB writes through the index writer actor.
+  - Data extraction jobs stream items concurrently and serialize all DB writes through the index writer actor. Job `batch_size` caps both the number of items in flight and the total number of work units inside in-flight inference requests (shared unit semaphore); items with more work units than `batch_size` (e.g. many-page PDFs) are split into multiple sequential requests and their outputs concatenated in order.
+  - `POST /api/jobs/data/extraction` validates models and resolves effective `batch_size`/`threshold` at enqueue time (mirrors Python): a bad inference ID fails the request, and queue status shows the resolved values.
+  - Threshold semantics mirror Python: a zero threshold anywhere in the chain (request, job settings) means "unset" and falls back to the model default; a still-unset/zero final value is omitted from inference payloads so the server-side fallback (e.g. mcut for taggers) applies.
+  - Extraction input handlers render PDFs natively via the shared pdfium binding (all pages, 2x scale) and HTML via the shared headless-browser screenshot path — the same code the scan pipeline uses for thumbnails. Render failures (including pdfium/browser not installed) fail the item so it is retried next run; they never write a placeholder.
+  - Image inputs get a header-level readability check before upload (mirrors Python `is_image_readable`); unreadable files fail the item instead of reaching the inference server where they could fail a coalesced batch.
+  - Sliced image inputs are re-encoded in their source format (PNG stays PNG with alpha; unknown formats fall back to PNG); JPEG slices keep the quality-85 encoder. PDF pages and HTML screenshots are sliced using their own rendered dimensions, other frames use the item's stored dimensions.
+  - Tag output text entries keep Python's ordering: namespaces in first-appearance order, tags confidence-sorted within each namespace. Empty `metadata` objects produce no metadata text entry.
+  - `data_log` start and end times use the same local-time format (`db::extraction_write::current_iso_timestamp`), and incomplete-job cleanup runs before the remaining count so `ATOMIC_EXTRACTION_JOBS` cleanup is reflected in it.
   - File scan jobs honor `filescan_filter` (PQL `Match`) during stage-1/2 file filtering and apply `job_filters` entries that include `file_scan` after scans to delete files that violate the rules.
   - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).
-  - Manual cronjob trigger enqueues configured cron jobs from the system config.
+  - Manual cronjob trigger enqueues configured cron jobs from the system config. (The scheduled cron loop and the Python trigger semantics — rescan-first, items-before-derived ordering, cronjob tag dedup — are deferred and not yet ported.)
   - System config parses `job_filters` and `filescan_filter` as PQL objects; invalid PQL in config fails to load (mirrors Python).
 - Local DB migrations:
   - SQLx migrations live in `gateway/migrations/index`, `gateway/migrations/storage`, and `gateway/migrations/user_data`.

@@ -3,7 +3,6 @@ use std::collections::{HashMap, VecDeque};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, oneshot};
-use tokio::task::JoinHandle;
 use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
@@ -26,6 +25,9 @@ pub(crate) enum JobType {
     #[cfg(test)]
     #[serde(rename = "test_sleep")]
     TestSleep,
+    #[cfg(test)]
+    #[serde(rename = "test_panic")]
+    TestPanic,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +138,14 @@ pub(crate) enum JobRunnerMessage {
     CancelRunning {
         reply: oneshot::Sender<ApiResult<Option<i64>>>,
     },
+    /// Sent by the watcher task when the job task finishes (success, error,
+    /// panic, or abort). The runner clears its own busy state *before*
+    /// forwarding completion to the queue, so the follow-up `RunJob` from the
+    /// queue can never race a stale busy state.
+    JobCompleted {
+        queue_id: i64,
+        result: JobRunResult,
+    },
 }
 
 pub(crate) struct JobRunnerActor;
@@ -151,7 +161,7 @@ pub(crate) struct JobRunnerState {
 
 struct RunningJob {
     queue_id: i64,
-    handle: JoinHandle<()>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl Actor for JobQueueActor {
@@ -341,7 +351,7 @@ impl Actor for JobRunnerActor {
 
     async fn handle(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -351,42 +361,63 @@ impl Actor for JobRunnerActor {
                     let _ = reply.send(Err(ApiError::internal("Job runner busy")));
                     return Ok(());
                 }
-                let queue = state.queue.clone();
                 let queue_id = job.queue_id;
-                let handle = tokio::spawn(async move {
-                    let result = execute_job(job).await;
-                    let run_result = match result {
-                        Ok(()) => JobRunResult {
+                let inner = tokio::spawn(execute_job(job));
+                let abort = inner.abort_handle();
+                // Watcher task: observes the job no matter how it ends
+                // (return, panic, or abort) and reports through the runner,
+                // so the busy state is always cleared and a panicking job
+                // cannot wedge the queue.
+                let runner = myself.clone();
+                tokio::spawn(async move {
+                    let result = match inner.await {
+                        Ok(Ok(())) => JobRunResult {
                             success: true,
                             error: None,
                         },
-                        Err(err) => JobRunResult {
+                        Ok(Err(err)) => JobRunResult {
                             success: false,
                             error: Some(err),
                         },
+                        Err(join_err) if join_err.is_cancelled() => JobRunResult {
+                            success: false,
+                            error: Some("Job cancelled".to_string()),
+                        },
+                        Err(join_err) => JobRunResult {
+                            success: false,
+                            error: Some(format!("Job panicked: {join_err}")),
+                        },
                     };
-                    let _ = queue.send_message(JobQueueMessage::RunnerFinished {
-                        queue_id,
-                        result: run_result,
-                    });
+                    let _ = runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
                 });
-                state.running = Some(RunningJob { queue_id, handle });
+                state.running = Some(RunningJob { queue_id, abort });
                 let _ = reply.send(Ok(()));
             }
             JobRunnerMessage::CancelRunning { reply } => {
                 if let Some(running) = state.running.take() {
-                    running.handle.abort();
-                    let _ = state.queue.send_message(JobQueueMessage::RunnerFinished {
-                        queue_id: running.queue_id,
-                        result: JobRunResult {
-                            success: false,
-                            error: Some("Job cancelled".to_string()),
-                        },
-                    });
+                    running.abort.abort();
+                    // The watcher still delivers JobCompleted for the aborted
+                    // task; by then this id is stale and gets ignored.
                     let _ = reply.send(Ok(Some(running.queue_id)));
                 } else {
                     let _ = reply.send(Ok(None));
                 }
+            }
+            JobRunnerMessage::JobCompleted { queue_id, result } => {
+                let matches = state
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.queue_id == queue_id);
+                if matches {
+                    state.running = None;
+                }
+                // Clear the busy state before the queue learns of completion:
+                // the queue reacts by immediately sending the next RunJob.
+                // Stale ids (cancelled jobs) are forwarded too; the queue
+                // ignores completions for jobs it no longer tracks.
+                let _ = state
+                    .queue
+                    .send_message(JobQueueMessage::RunnerFinished { queue_id, result });
             }
         }
         Ok(())
@@ -396,22 +427,22 @@ impl Actor for JobRunnerActor {
 async fn execute_job(job: Job) -> Result<(), String> {
     match job.job_type {
         JobType::FolderRescan => {
-            continuous_scan::pause_for_job(&job.index_db)
+            let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
             let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
             let result = service.rescan_folders().await;
-            let _ = continuous_scan::resume_after_job(&job.index_db).await;
+            guard.resume().await;
             result.map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
         JobType::FolderUpdate => {
-            continuous_scan::pause_for_job(&job.index_db)
+            let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
             let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
             let result = service.run_folder_update().await;
-            let _ = continuous_scan::resume_after_job(&job.index_db).await;
+            guard.resume().await;
             result.map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
@@ -449,6 +480,8 @@ async fn execute_job(job: Job) -> Result<(), String> {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             Ok(())
         }
+        #[cfg(test)]
+        JobType::TestPanic => panic!("test job panic"),
         _ => Err("Job type not implemented".to_string()),
     }
 }
@@ -593,6 +626,85 @@ mod tests {
         assert!(status.queue[0].running);
         assert_eq!(status.queue[1].queue_id, second.queue_id);
         assert!(!status.queue[1].running);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Regression test: the runner must clear its busy state when a job
+    // completes normally, so the next queued job actually starts running
+    // instead of being rejected as "runner busy" and silently dropped.
+    #[tokio::test]
+    async fn second_job_runs_after_first_completes() {
+        let (queue, handle) = spawn_test_queue().await;
+        let job = JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some("200".to_string()),
+        };
+        let job2 = JobRequest {
+            tag: Some("400".to_string()),
+            ..job.clone()
+        };
+        let _first = enqueue_on(&queue, job).await;
+        let second = enqueue_on(&queue, job2).await;
+
+        // At t=300ms the first job (200ms) has finished and the second
+        // (400ms) must be the running job.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let status = status_on(&queue).await;
+        assert_eq!(
+            status.queue.len(),
+            1,
+            "expected second job to be running, queue: {status:?}"
+        );
+        assert_eq!(status.queue[0].queue_id, second.queue_id);
+        assert!(status.queue[0].running);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Regression test: a panicking job must not wedge the queue. The watcher
+    // task reports the panic, the busy state clears, and the next queued job
+    // runs normally.
+    #[tokio::test]
+    async fn panicking_job_does_not_wedge_queue() {
+        let (queue, handle) = spawn_test_queue().await;
+        let panic_job = JobRequest {
+            job_type: JobType::TestPanic,
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: None,
+        };
+        let sleep_job = JobRequest {
+            job_type: JobType::TestSleep,
+            tag: Some("400".to_string()),
+            ..panic_job.clone()
+        };
+        let _first = enqueue_on(&queue, panic_job).await;
+        let second = enqueue_on(&queue, sleep_job).await;
+
+        // The panic job dies immediately; shortly after, the sleep job must
+        // be running.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let status = status_on(&queue).await;
+        assert_eq!(
+            status.queue.len(),
+            1,
+            "expected sleep job to be running after panic, queue: {status:?}"
+        );
+        assert_eq!(status.queue[0].queue_id, second.queue_id);
+        assert!(status.queue[0].running);
 
         queue.stop(None);
         handle.await.unwrap();

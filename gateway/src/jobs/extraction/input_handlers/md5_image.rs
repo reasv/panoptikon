@@ -10,7 +10,7 @@ pub(super) async fn build_md5_image_inputs(
     item: &JobInputData,
 ) -> ApiResult<Vec<InferenceInput>> {
     let frames = load_base_frames(index_db, item).await?;
-    let frame = frames.into_iter().next();
+    let frame = frames.into_iter().next().map(|frame| frame.bytes);
 
     Ok(vec![InferenceInput::new(
         json!({"md5": item.md5}),

@@ -1184,6 +1184,40 @@ pub(crate) async fn resume_after_job(index_db: &str) -> ApiResult<()> {
         .map_err(|_| ApiError::internal("Failed to resume continuous scan"))?;
     Ok(())
 }
+
+/// Pauses continuous scanning for a job and guarantees resumption even when
+/// the owning task is aborted (job cancellation) or panics: `Drop` spawns the
+/// resume, so the scan cannot be left paused by a cancelled job.
+pub(crate) struct JobPauseGuard {
+    index_db: Option<String>,
+}
+
+pub(crate) async fn pause_for_job_guarded(index_db: &str) -> ApiResult<JobPauseGuard> {
+    pause_for_job(index_db).await?;
+    Ok(JobPauseGuard {
+        index_db: Some(index_db.to_string()),
+    })
+}
+
+impl JobPauseGuard {
+    /// Resumes the scan inline; use on the normal completion path so the
+    /// resume happens before any follow-up work instead of via `Drop`.
+    pub(crate) async fn resume(mut self) {
+        if let Some(index_db) = self.index_db.take() {
+            let _ = resume_after_job(&index_db).await;
+        }
+    }
+}
+
+impl Drop for JobPauseGuard {
+    fn drop(&mut self) {
+        if let Some(index_db) = self.index_db.take() {
+            tokio::spawn(async move {
+                let _ = resume_after_job(&index_db).await;
+            });
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -106,15 +106,28 @@ pub(crate) async fn enqueue_data_extraction(
     Query(query): Query<InferenceQuery>,
     conn: DbConnection<ReadOnly>,
 ) -> Result<(StatusCode, Json<Vec<JobModel>>), ApiError> {
+    // Validate the models and resolve effective batch_size/threshold at
+    // enqueue time (mirrors Python): a bad inference ID fails this request
+    // instead of a job hours later, and the queue status shows the values
+    // the job will actually run with.
+    let store = SystemConfigStore::from_env();
+    let config = store.load(&conn.index_db)?;
     let mut jobs = Vec::new();
     for inference_id in query.inference_ids {
+        let model = crate::jobs::extraction::load_model_metadata(&inference_id).await?;
+        let defaults = crate::jobs::extraction::resolve_job_defaults(
+            &config,
+            &model,
+            query.batch_size,
+            query.threshold,
+        );
         let job = enqueue_job(JobRequest {
             job_type: JobType::DataExtraction,
             index_db: conn.index_db.clone(),
             user_data_db: conn.user_data_db.clone(),
             metadata: Some(inference_id),
-            batch_size: query.batch_size,
-            threshold: query.threshold,
+            batch_size: Some(defaults.batch_size),
+            threshold: defaults.threshold,
             log_id: None,
             tag: None,
         })

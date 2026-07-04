@@ -2032,6 +2032,28 @@ fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
     }
 }
 
+/// Renders every page of a PDF at 2x its point size (144 dpi), matching the
+/// Python pypdfium2 loader used by data extraction (`scale=2`). Unlike
+/// thumbnail generation this fails hard: extraction must record the item as
+/// failed (and retry it next run) rather than mark it processed.
+pub(crate) fn render_pdf_pages(path: &Path) -> Result<Vec<DynamicImage>, String> {
+    let pdfium = pdfium().ok_or_else(|| "pdfium library not available".to_string())?;
+    let _serialized = PDFIUM_CALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let document = pdfium
+        .load_pdf_from_file(path, None)
+        .map_err(|err| format!("failed to load PDF: {err}"))?;
+    let mut pages = Vec::new();
+    for page in document.pages().iter() {
+        let bitmap = page
+            .render_with_config(&PdfRenderConfig::new().scale_page_by_factor(2.0))
+            .map_err(|err| format!("failed to render PDF page: {err}"))?;
+        pages.push(bitmap.as_image());
+    }
+    Ok(pages)
+}
+
 static HTML_RENDERER: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Lazily locates a locally installed Chromium-family browser for headless
@@ -2150,7 +2172,8 @@ impl Drop for BlockingSemaphoreGuard<'_> {
 /// Screenshots an HTML file with a locally installed headless browser. This
 /// intentionally replaces the Python weasyprint HTML->PDF pipeline with a
 /// browser viewport capture. Never fails hard: any error degrades to None.
-fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
+/// (Extraction callers treat None as an item failure so the item is retried.)
+pub(crate) fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
     let browser = html_renderer()?;
     let url = html_file_url(path)?;
     let _slot = BROWSER_SLOTS.acquire();

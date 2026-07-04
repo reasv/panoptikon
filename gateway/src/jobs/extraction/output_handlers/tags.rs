@@ -209,7 +209,14 @@ impl TagResult {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let metadata = value.get("metadata").and_then(Value::as_object).cloned();
+        // An empty metadata object counts as "no metadata", matching
+        // Python's truthiness check — otherwise every item gets a junk
+        // "{}" text entry.
+        let metadata = value
+            .get("metadata")
+            .and_then(Value::as_object)
+            .filter(|map| !map.is_empty())
+            .cloned();
         let metadata_score = value
             .get("metadata_score")
             .and_then(Value::as_f64)
@@ -230,27 +237,37 @@ fn aggregate_tags(
     namespaces_tags: Vec<Vec<(String, HashMap<String, f64>)>>,
     severity_order: &[String],
 ) -> Vec<(String, String, f64)> {
+    // Namespaces keep their first-appearance order and tags are sorted by
+    // confidence within each namespace, matching the Python aggregation.
+    // The order feeds the searchable/displayed "tag1, tag2, ..." text
+    // entries, so display parity matters here.
+    let mut namespace_order: Vec<String> = Vec::new();
     let mut combined: HashMap<String, Vec<HashMap<String, f64>>> = HashMap::new();
     for namespaces in namespaces_tags {
         for (namespace, tags) in namespaces {
+            if !combined.contains_key(&namespace) {
+                namespace_order.push(namespace.clone());
+            }
             combined.entry(namespace).or_default().push(tags);
         }
     }
 
     let mut output = Vec::new();
-    for (namespace, tags) in combined {
+    for namespace in namespace_order {
+        let Some(tags) = combined.get(&namespace) else {
+            continue;
+        };
         if namespace == "rating" {
-            if let Some((rating, score)) = get_rating(&tags, severity_order) {
+            if let Some((rating, score)) = get_rating(tags, severity_order) {
                 output.push((namespace.clone(), format!("rating:{rating}"), score));
             }
         } else {
-            let combined = combine_tags(&tags);
+            let combined = combine_tags(tags);
             for (tag, score) in combined {
                 output.push((namespace.clone(), tag, score));
             }
         }
     }
-    output.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     output
 }
 

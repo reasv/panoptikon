@@ -13,6 +13,26 @@ use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
 
+/// A frame ready to be sent to inference. PDF pages and HTML screenshots
+/// carry their own pixel dimensions (each page differs from the item's stored
+/// size); frames without dimensions are sliced using the item's stored
+/// width/height, mirroring the Python loader.
+pub(super) struct BaseFrame {
+    pub bytes: Vec<u8>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+impl BaseFrame {
+    fn sized_by_item(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            width: None,
+            height: None,
+        }
+    }
+}
+
 pub(super) async fn build_image_frames_inputs(
     index_db: &str,
     item: &JobInputData,
@@ -32,18 +52,24 @@ pub(super) async fn build_image_frames_inputs(
         None
     };
 
-    if let (Some(width), Some(height)) = (item.width, item.height) {
-        if width < 3 || height < 3 {
-            return Ok(Vec::new());
-        }
-    }
-
     let frames = load_base_frames(index_db, item).await?;
     if frames.is_empty() {
         return Ok(Vec::new());
     }
 
-    let sliced = slice_target_size(frames, item.width, item.height, slice_settings.as_ref())?;
+    let mut sliced: Vec<Vec<u8>> = Vec::new();
+    for frame in frames {
+        let (width, height) = match (frame.width, frame.height) {
+            (Some(width), Some(height)) => (Some(width), Some(height)),
+            _ => (item.width, item.height),
+        };
+        sliced.extend(slice_target_size(
+            vec![frame.bytes],
+            width,
+            height,
+            slice_settings.as_ref(),
+        )?);
+    }
     let mut outputs = Vec::new();
     for frame in sliced.into_iter().take(max_frames) {
         outputs.push(InferenceInput::new(
@@ -57,7 +83,21 @@ pub(super) async fn build_image_frames_inputs(
 pub(super) async fn load_base_frames(
     index_db: &str,
     item: &JobInputData,
-) -> ApiResult<Vec<Vec<u8>>> {
+) -> ApiResult<Vec<BaseFrame>> {
+    // Mirrors the Python image_loader guard: absurdly small images are
+    // skipped outright (placeholder written) for every media type.
+    if let (Some(width), Some(height)) = (item.width, item.height) {
+        if width < 3 || height < 3 {
+            tracing::warn!(
+                path = %item.path,
+                sha256 = %item.sha256,
+                width,
+                height,
+                "image too small, skipping"
+            );
+            return Ok(Vec::new());
+        }
+    }
     if item.item_type.starts_with("image/gif") {
         return gif_to_frames(&item.path);
     }
@@ -66,7 +106,8 @@ pub(super) async fn load_base_frames(
             tracing::error!(error = %err, path = %item.path, "failed to read image");
             ApiError::internal("Failed to read image")
         })?;
-        return Ok(vec![buffer]);
+        ensure_image_readable(&buffer, &item.path)?;
+        return Ok(vec![BaseFrame::sized_by_item(buffer)]);
     }
     if item.item_type.starts_with("video") {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
@@ -74,7 +115,10 @@ pub(super) async fn load_base_frames(
             .await
             .unwrap_or_default();
         if !cached.is_empty() {
-            return Ok(cached);
+            return Ok(cached
+                .into_iter()
+                .map(BaseFrame::sized_by_item)
+                .collect());
         }
         if item.duration.unwrap_or(0.0) > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
             let extracted = tokio::task::spawn_blocking({
@@ -105,17 +149,37 @@ pub(super) async fn load_base_frames(
                 reply,
             })
             .await;
-            return Ok(frames);
+            return Ok(frames.into_iter().map(BaseFrame::sized_by_item).collect());
         }
         return Ok(Vec::new());
     }
     if item.item_type.starts_with("application/pdf") {
-        return render_pdf_frames(&item.path);
+        return render_pdf_frames(&item.path).await;
     }
     if item.item_type.starts_with("text/html") {
-        return render_html_frames(&item.path);
+        return render_html_frames(&item.path).await;
     }
     Ok(Vec::new())
+}
+
+/// Header-level readability check mirroring Python's `is_image_readable`
+/// (PIL `verify()` with truncated images accepted): rejects files whose
+/// header cannot even be parsed, without decoding pixel data. Without this,
+/// a corrupt file reaches the inference server where it can fail an entire
+/// coalesced GPU batch instead of just this item.
+fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
+    image::ImageReader::new(std::io::Cursor::new(buffer))
+        .with_guessed_format()
+        .map_err(|err| {
+            tracing::error!(error = %err, path, "image format detection failed");
+            ApiError::internal(format!("Image {path} is not readable"))
+        })?
+        .into_dimensions()
+        .map_err(|err| {
+            tracing::error!(error = %err, path, "image is not readable");
+            ApiError::internal(format!("Image {path} is not readable"))
+        })?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +304,7 @@ fn calculate_slices_needed(width: f64, height: f64, settings: &ImageSliceSetting
 }
 
 fn slice_image(image_bytes: &[u8], num_slices: usize) -> ApiResult<Vec<Vec<u8>>> {
+    let format = slice_output_format(image_bytes);
     let image = load_dynamic_image(image_bytes)?;
     let (width, height) = image.dimensions();
     let mut output = Vec::new();
@@ -253,7 +318,7 @@ fn slice_image(image_bytes: &[u8], num_slices: usize) -> ApiResult<Vec<Vec<u8>>>
                 start + slice_width
             };
             let cropped = image.crop_imm(start, 0, end - start, height);
-            output.push(encode_jpeg(&cropped)?);
+            output.push(encode_slice(&cropped, format)?);
         }
     } else {
         let slice_height = height / num_slices as u32;
@@ -265,10 +330,38 @@ fn slice_image(image_bytes: &[u8], num_slices: usize) -> ApiResult<Vec<Vec<u8>>>
                 start + slice_height
             };
             let cropped = image.crop_imm(0, start, width, end - start);
-            output.push(encode_jpeg(&cropped)?);
+            output.push(encode_slice(&cropped, format)?);
         }
     }
     Ok(output)
+}
+
+/// Slices are re-encoded in the source format like the Python loader
+/// (`img.save(..., format=img.format)`), so a sliced PNG keeps its alpha
+/// channel instead of being flattened into a JPEG. Unknown formats default
+/// to PNG, matching Python's fallback.
+fn slice_output_format(image_bytes: &[u8]) -> image::ImageFormat {
+    image::guess_format(image_bytes).unwrap_or(image::ImageFormat::Png)
+}
+
+fn encode_slice(image: &DynamicImage, format: image::ImageFormat) -> ApiResult<Vec<u8>> {
+    if format == image::ImageFormat::Jpeg {
+        return encode_jpeg(image);
+    }
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    if image.write_to(&mut buffer, format).is_ok() {
+        return Ok(buffer.into_inner());
+    }
+    // Formats without encoder support (or whose encoder rejects this color
+    // type) fall back to PNG rather than dropping image data.
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut buffer, image::ImageFormat::Png)
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to encode image slice");
+            ApiError::internal("Failed to encode image slice")
+        })?;
+    Ok(buffer.into_inner())
 }
 
 fn grid_for_pixels(width: f64, height: f64, settings: &ImageSliceSettings) -> (usize, usize) {
@@ -278,6 +371,7 @@ fn grid_for_pixels(width: f64, height: f64, settings: &ImageSliceSettings) -> (u
 }
 
 fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<Vec<Vec<u8>>> {
+    let format = slice_output_format(image_bytes);
     let image = load_dynamic_image(image_bytes)?;
     let (width, height) = image.dimensions();
     let tile_w = width as f64 / cols as f64;
@@ -290,7 +384,7 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
             let right = ((col + 1) as f64 * tile_w).round() as u32;
             let bottom = ((row + 1) as f64 * tile_h).round() as u32;
             let cropped = image.crop_imm(left, top, right - left, bottom - top);
-            output.push(encode_jpeg(&cropped)?);
+            output.push(encode_slice(&cropped, format)?);
         }
     }
     Ok(output)
@@ -321,7 +415,7 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
     Ok(buffer)
 }
 
-fn gif_to_frames(path: &str) -> ApiResult<Vec<Vec<u8>>> {
+fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     let file = std::fs::File::open(path).map_err(|err| {
         tracing::error!(error = %err, "failed to open gif");
         ApiError::internal("Failed to open gif")
@@ -344,7 +438,7 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<Vec<u8>>> {
         if idx % step == 0 {
             let image: image::RgbaImage = frame.into_buffer();
             let image = DynamicImage::ImageRgba8(image);
-            output.push(encode_jpeg(&image)?);
+            output.push(BaseFrame::sized_by_item(encode_jpeg(&image)?));
         }
         if output.len() >= 4 {
             break;
@@ -461,93 +555,51 @@ fn temp_dir_path() -> PathBuf {
     ))
 }
 
-fn render_pdf_frames(path: &str) -> ApiResult<Vec<Vec<u8>>> {
-    render_pdf_or_html_frames(path, None)
-}
-
-fn render_html_frames(path: &str) -> ApiResult<Vec<Vec<u8>>> {
-    render_pdf_or_html_frames(path, Some("html"))
-}
-
-fn render_pdf_or_html_frames(path: &str, kind: Option<&str>) -> ApiResult<Vec<Vec<u8>>> {
-    let temp_dir = temp_dir_path();
-    std::fs::create_dir_all(&temp_dir).map_err(|err| {
-        tracing::error!(error = %err, "failed to create temp dir");
-        ApiError::internal("Failed to render document")
+/// Renders every PDF page natively via the shared pdfium binding (same
+/// library the scan pipeline uses for thumbnails). Any failure — including
+/// pdfium not being installed — is an error so the item is recorded as
+/// failed and retried on the next run, never silently marked processed.
+async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
+    let owned = path.to_string();
+    let pages = tokio::task::spawn_blocking(move || {
+        crate::jobs::files::render_pdf_pages(std::path::Path::new(&owned))
+    })
+    .await
+    .map_err(|_| ApiError::internal("PDF render task failed"))?
+    .map_err(|err| {
+        tracing::error!(error = %err, path, "failed to render PDF");
+        ApiError::internal("Failed to render PDF")
     })?;
-    let result = render_pdf_or_html_frames_into(path, kind, &temp_dir);
-    if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
-        tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp render dir");
+    let mut frames = Vec::with_capacity(pages.len());
+    for page in pages {
+        frames.push(BaseFrame {
+            width: Some(page.width() as i64),
+            height: Some(page.height() as i64),
+            bytes: encode_jpeg(&page)?,
+        });
     }
-    result
+    Ok(frames)
 }
 
-fn render_pdf_or_html_frames_into(
-    path: &str,
-    kind: Option<&str>,
-    temp_dir: &std::path::Path,
-) -> ApiResult<Vec<Vec<u8>>> {
-    let script = r#"
-import sys
-from pathlib import Path
-try:
-    import pypdfium2 as pdfium
-except Exception as e:
-    print(f"pypdfium2 unavailable: {e}", file=sys.stderr)
-    sys.exit(2)
-
-kind = sys.argv[1]
-src = sys.argv[2]
-out_dir = Path(sys.argv[3])
-
-if kind == "html":
-    try:
-        from weasyprint import HTML
-    except Exception as e:
-        print(f"weasyprint unavailable: {e}", file=sys.stderr)
-        sys.exit(2)
-    pdf_bytes = HTML(src).write_pdf()
-    doc = pdfium.PdfDocument(pdf_bytes)
-else:
-    doc = pdfium.PdfDocument(src)
-
-for idx, page in enumerate(doc):
-    image = page.render(scale=2, rev_byteorder=True).to_pil()
-    image.save(out_dir / f"page_{idx:04d}.jpg", format="JPEG")
-    image.close()
-doc.close()
-"#;
-    let kind_arg = kind.unwrap_or("pdf");
-    let output = std::process::Command::new("python")
-        .arg("-c")
-        .arg(script)
-        .arg(kind_arg)
-        .arg(path)
-        .arg(temp_dir.to_string_lossy().to_string())
-        .output()
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to render document");
-            ApiError::internal("Failed to render document")
-        })?;
-    if !output.status.success() {
-        tracing::warn!(
-            stderr = %String::from_utf8_lossy(&output.stderr),
-            "document render failed"
-        );
-        return Ok(Vec::new());
-    }
-    let mut paths = std::fs::read_dir(&temp_dir)
-        .map_err(|err| ApiError::internal(format!("Failed to read rendered pages: {err}")))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jpg"))
-        .collect::<Vec<_>>();
-    paths.sort();
-    let mut pages = Vec::new();
-    for page_path in paths {
-        if let Ok(bytes) = std::fs::read(&page_path) {
-            pages.push(bytes);
-        }
-    }
-    Ok(pages)
+/// Renders an HTML file via the shared headless-browser screenshot path used
+/// by the scan pipeline (replacing the Python weasyprint HTML->PDF chain).
+/// Failure — including no browser being installed — is an error so the item
+/// is recorded as failed and retried, never silently marked processed.
+async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
+    let owned = path.to_string();
+    let shot = tokio::task::spawn_blocking(move || {
+        crate::jobs::files::render_html_screenshot(std::path::Path::new(&owned))
+    })
+    .await
+    .map_err(|_| ApiError::internal("HTML render task failed"))?
+    .ok_or_else(|| {
+        tracing::error!(path, "failed to render HTML page");
+        ApiError::internal("Failed to render HTML page")
+    })?;
+    Ok(vec![BaseFrame {
+        width: Some(shot.width() as i64),
+        height: Some(shot.height() as i64),
+        bytes: encode_jpeg(&shot)?,
+    }])
 }
+

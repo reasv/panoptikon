@@ -19,7 +19,7 @@ use crate::db::items::get_existing_file_for_item_id;
 use crate::db::open_index_db_read;
 use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
-use crate::inferio_client::InferenceInput;
+use crate::inferio_client::{InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
@@ -77,9 +77,9 @@ struct JobInputData {
 }
 
 #[derive(Debug, Clone)]
-struct JobDefaults {
-    batch_size: i64,
-    threshold: Option<f64>,
+pub(crate) struct JobDefaults {
+    pub batch_size: i64,
+    pub threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,12 +106,12 @@ pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(
         .clone()
         .ok_or_else(|| "Inference ID required".to_string())?;
 
-    continuous_scan::pause_for_job(&job.index_db)
+    let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
         .await
         .map_err(|err| format!("{err:?}"))?;
 
     let result = run_extraction_job_inner(&job, &inference_id).await;
-    let _ = continuous_scan::resume_after_job(&job.index_db).await;
+    guard.resume().await;
     if result.is_ok() {
         run_post_job_maintenance(&job.index_db, false).await;
     }
@@ -151,6 +151,14 @@ async fn run_extraction_job_inner(
     let compiled = compile_pql_select(query.clone())?;
     let compiled_count = compile_pql_count(query.clone())?;
 
+    // Clean up incomplete jobs before counting: with ATOMIC_EXTRACTION_JOBS
+    // the cleanup deletes their item_data, which frees items for
+    // reprocessing and must be reflected in the count (mirrors Python).
+    call_index_db_writer(&job.index_db, |reply| {
+        IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+    })
+    .await?;
+
     let mut count_conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
     let total_remaining =
         run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params).await?;
@@ -161,12 +169,10 @@ async fn run_extraction_job_inner(
         return Ok(());
     }
 
-    call_index_db_writer(&job.index_db, |reply| {
-        IndexDbWriterMessage::RemoveIncompleteJobs { reply }
-    })
-    .await?;
-
-    let scan_time = current_iso_timestamp();
+    // Same local-time format as the writer's end_time updates so
+    // start_time/end_time are directly comparable (and match Python's local
+    // isoformat convention).
+    let scan_time = crate::db::extraction_write::current_iso_timestamp();
     let job_id = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::AddDataLog {
         scan_time: scan_time.clone(),
         threshold: defaults.threshold,
@@ -196,8 +202,16 @@ async fn run_extraction_job_inner(
     }
 
     let counters = Arc::new(Mutex::new(JobCounters::default()));
-    let semaphore = Arc::new(Semaphore::new(defaults.batch_size as usize));
-    let mut handles = Vec::new();
+    // Bounds how many items are concurrently being loaded/processed.
+    let item_slots = Arc::new(Semaphore::new(defaults.batch_size as usize));
+    // Bounds the total number of work units inside in-flight inference
+    // requests across all items (the actual meaning of job batch_size).
+    let unit_slots = Arc::new(Semaphore::new(defaults.batch_size as usize));
+    let unit_capacity = defaults.batch_size.max(1) as usize;
+    // Item tasks live in a JoinSet owned by this task: when the job is
+    // cancelled (task aborted), dropping the set aborts every in-flight item
+    // instead of leaving detached tasks writing to the DB.
+    let mut tasks = tokio::task::JoinSet::new();
 
     let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
     let mut query = sqlx::query(&compiled.sql);
@@ -210,7 +224,7 @@ async fn run_extraction_job_inner(
         let Some(item) = map_job_input(&job.index_db, &job.user_data_db, &row).await? else {
             continue;
         };
-        let permit = semaphore
+        let permit = item_slots
             .clone()
             .acquire_owned()
             .await
@@ -220,7 +234,8 @@ async fn run_extraction_job_inner(
         let counters = Arc::clone(&counters);
         let index_db = job.index_db.clone();
         let threshold = defaults.threshold;
-        let handle = tokio::spawn(async move {
+        let unit_slots = Arc::clone(&unit_slots);
+        tasks.spawn(async move {
             let _permit = permit;
             let result = process_item(
                 &index_db,
@@ -229,6 +244,8 @@ async fn run_extraction_job_inner(
                 item,
                 threshold,
                 &pool,
+                &unit_slots,
+                unit_capacity,
                 counters,
                 total_remaining,
             )
@@ -237,14 +254,11 @@ async fn run_extraction_job_inner(
                 tracing::error!(error = ?err, "extraction item failed");
             }
         });
-        handles.push(handle);
     }
     drop(rows);
     drop(conn);
 
-    for handle in handles {
-        let _ = handle.await;
-    }
+    while tasks.join_next().await.is_some() {}
 
     let remaining_after = {
         let mut count_conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
@@ -319,6 +333,7 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_item(
     index_db: &str,
     model: &ModelMetadata,
@@ -326,6 +341,8 @@ async fn process_item(
     item: JobInputData,
     threshold: Option<f64>,
     pool: &InferencePool,
+    unit_slots: &Arc<Semaphore>,
+    unit_capacity: usize,
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
 ) -> ApiResult<()> {
@@ -382,15 +399,14 @@ async fn process_item(
     let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
     let segments = inference_inputs.len() as i64;
     let inf_start = Instant::now();
-    let outputs = match pool
-        .predict(
-            &model.setter_name,
-            CACHE_KEY,
-            CACHE_LRU_SIZE,
-            CACHE_TTL_SECS,
-            &inference_inputs,
-        )
-        .await
+    let outputs = match run_chunked_inference(
+        &model.setter_name,
+        pool,
+        unit_slots,
+        unit_capacity,
+        &inference_inputs,
+    )
+    .await
     {
         Ok(outputs) => outputs,
         Err(err) => {
@@ -431,6 +447,56 @@ async fn process_item(
     )
     .await;
     result.map(|_| ())
+}
+
+/// Runs inference over one item's work units in chunks of at most
+/// `unit_capacity`, holding one unit permit per work unit for the duration of
+/// each request. Together with the shared semaphore this caps the total
+/// number of work units inside in-flight inference requests at the job's
+/// batch size, and splits oversized items (e.g. many-page PDFs) into multiple
+/// sequential requests whose outputs are concatenated in order.
+async fn run_chunked_inference(
+    setter_name: &str,
+    pool: &InferencePool,
+    unit_slots: &Arc<Semaphore>,
+    unit_capacity: usize,
+    inputs: &[InferenceInput],
+) -> anyhow::Result<PredictOutput> {
+    let chunk_size = unit_capacity.max(1);
+    let mut merged: Option<PredictOutput> = None;
+    for chunk in inputs.chunks(chunk_size) {
+        let permits = unit_slots
+            .clone()
+            .acquire_many_owned(chunk.len() as u32)
+            .await
+            .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
+        let response = pool
+            .predict(setter_name, CACHE_KEY, CACHE_LRU_SIZE, CACHE_TTL_SECS, chunk)
+            .await;
+        drop(permits);
+        let outputs = response?;
+        merged = Some(match merged {
+            None => outputs,
+            Some(previous) => merge_outputs(previous, outputs)?,
+        });
+    }
+    merged.ok_or_else(|| anyhow::anyhow!("no inference outputs produced"))
+}
+
+fn merge_outputs(first: PredictOutput, second: PredictOutput) -> anyhow::Result<PredictOutput> {
+    match (first, second) {
+        (PredictOutput::Json(mut a), PredictOutput::Json(b)) => {
+            a.extend(b);
+            Ok(PredictOutput::Json(a))
+        }
+        (PredictOutput::Binary(mut a), PredictOutput::Binary(b)) => {
+            a.extend(b);
+            Ok(PredictOutput::Binary(a))
+        }
+        _ => Err(anyhow::anyhow!(
+            "inference chunks returned mixed output types"
+        )),
+    }
 }
 
 async fn finalize_item(
@@ -652,7 +718,7 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
     Ok(pql)
 }
 
-fn resolve_job_defaults(
+pub(crate) fn resolve_job_defaults(
     config: &SystemConfig,
     model: &ModelMetadata,
     batch_size: Option<i64>,
@@ -697,13 +763,23 @@ fn resolve_job_defaults(
         chosen_threshold = threshold;
     }
 
+    // Mirror Python: a zero threshold anywhere along the chain means "unset"
+    // and falls back to the model default (`threshold or default_threshold`),
+    // and a still-zero/absent final value is omitted entirely so the
+    // inference side can apply its own fallback (e.g. mcut for taggers).
+    let resolved = match chosen_threshold {
+        Some(value) if value != 0.0 => Some(value),
+        _ => model.default_threshold,
+    };
+    let threshold = resolved.filter(|value| *value != 0.0);
+
     JobDefaults {
         batch_size: chosen_batch.max(1),
-        threshold: chosen_threshold,
+        threshold,
     }
 }
 
-async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMetadata> {
+pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMetadata> {
     let context = job_inference_context();
     let metadata = context.primary.get_metadata().await.map_err(|err| {
         tracing::error!(error = %err, "failed to load inference metadata");
@@ -1003,8 +1079,3 @@ fn bind_param<'q>(
     }
 }
 
-fn current_iso_timestamp() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}

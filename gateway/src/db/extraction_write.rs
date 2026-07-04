@@ -679,7 +679,7 @@ fn round_value(value: f64) -> f64 {
     (value * 10000.0).round() / 10000.0
 }
 
-fn current_iso_timestamp() -> String {
+pub(crate) fn current_iso_timestamp() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     now.format(iso_format())
         .unwrap_or_else(|_| OffsetDateTime::now_utc().format(iso_format()).unwrap())
