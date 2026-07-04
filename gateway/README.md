@@ -210,6 +210,24 @@ CLI override example:
 cargo run -p gateway -- --config config\gateway\userconfig.toml
 ```
 
+## Logging and shutdown
+
+Log output goes to the console and, by default, to
+`$DATA_FOLDER/panoptikon-gateway.log` (append; the name is distinct from the
+Python server's `panoptikon.log` so the two processes never interleave one
+file). `LOGS_FILE` overrides the path; setting it to an empty string disables
+file logging. `LOGLEVEL` sets the default level (same variable the Python
+server uses); `RUST_LOG` takes precedence when set and supports per-module
+directives.
+
+On SIGINT/SIGTERM (Ctrl-C, `docker stop`, systemd) the gateway shuts down
+gracefully: it stops accepting connections, drains in-flight requests, stops
+the cron scheduler and continuous scan actors, cancels the running job (same
+path as `POST /api/jobs/cancel`), and flushes the index DB writers so every
+queued write commits. Cleanup is bounded by a 10s grace period and a 20s hard
+deadline; a second signal exits immediately. Anything cut off is a single
+SQLite transaction, which rolls back on next open.
+
 The nested style supported by the config crate also works:
 
 ```bash

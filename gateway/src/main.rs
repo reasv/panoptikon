@@ -4,10 +4,12 @@ mod config;
 mod db;
 mod inferio_client;
 mod jobs;
+mod logging;
 mod openapi;
 mod policy;
 mod pql;
 mod proxy;
+mod shutdown;
 #[cfg(test)]
 mod test_utils;
 
@@ -19,7 +21,6 @@ use axum::{
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa_redoc::Redoc;
 use utoipa_redoc::Servable;
@@ -61,9 +62,9 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .init();
+    // The guard must stay alive for the whole process: dropping it flushes
+    // buffered file-log output.
+    let _log_guard = logging::init();
 
     let args = Args::parse();
     let config_path = args
@@ -114,7 +115,9 @@ async fn async_main() -> anyhow::Result<()> {
         .route("/openapi.json", any(proxy::proxy_api))
         .fallback(any(proxy::proxy_ui));
 
-    if settings.upstreams.api.local {
+    let local_api = settings.upstreams.api.local;
+    let mut jobs_enabled = false;
+    if local_api {
         let enable_db_create = env_truthy("EXPERIMENTAL_RUST_DB_CREATION");
         app = app.route("/api/db", get(api::db::db_info));
         if enable_db_create {
@@ -168,7 +171,8 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/search/stats", get(api::search::get_stats))
             .merge(SwaggerUi::new("/docs").url("/openapi.json", openapi::ApiDoc::openapi()))
             .merge(Redoc::with_url("/redoc", openapi::ApiDoc::openapi()));
-        if env_truthy("EXPERIMENTAL_RUST_JOBS") {
+        jobs_enabled = env_truthy("EXPERIMENTAL_RUST_JOBS");
+        if jobs_enabled {
             // The scheduler enqueues into the Rust job queue, so it only runs
             // when the Rust job system serves the API; otherwise the Python
             // side still owns cron and this would double-schedule.
@@ -227,10 +231,29 @@ async fn async_main() -> anyhow::Result<()> {
     let listen_addr = settings.listen_addr();
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     tracing::info!(address = %listen_addr, "gateway listening");
+
+    // First signal: axum stops accepting connections and drains in-flight
+    // requests while the cleanup task cancels jobs and flushes the DB writers.
+    // Both must finish before main returns; shutdown.rs enforces the deadline.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let subsystems = shutdown::Subsystems {
+        jobs: jobs_enabled,
+        local_api,
+    };
+    let cleanup = tokio::spawn(async move {
+        shutdown::wait_for_signal().await;
+        let _ = shutdown_tx.send(());
+        shutdown::run_cleanup(subsystems).await;
+    });
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+    })
     .await?;
+    let _ = cleanup.await;
+    tracing::info!("gateway stopped");
     Ok(())
 }

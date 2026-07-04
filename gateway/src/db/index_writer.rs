@@ -243,6 +243,11 @@ pub(crate) enum IndexDbWriterMessage {
     Analyze {
         reply: Reply<()>,
     },
+    /// No-op barrier: the writer handles messages in order, so a reply proves
+    /// every previously queued write has committed. Used at process shutdown.
+    Flush {
+        reply: Reply<()>,
+    },
     IdleCheck,
 }
 
@@ -807,6 +812,9 @@ impl Actor for IndexDbWriter {
                 let result = state.run_maintenance(&["ANALYZE", "PRAGMA optimize"]).await;
                 let _ = reply.send(result);
             }
+            IndexDbWriterMessage::Flush { reply } => {
+                let _ = reply.send(Ok(()));
+            }
         }
         Ok(())
     }
@@ -819,6 +827,12 @@ pub(crate) enum IndexDbSupervisorMessage {
         reply: Reply<ActorRef<IndexDbWriterMessage>>,
     },
     HealthCheck,
+    /// Barrier across every live writer; replies with the number of writers
+    /// that acknowledged once each has processed all previously queued
+    /// messages. Used at process shutdown.
+    FlushAll {
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 pub(crate) struct IndexDbSupervisor;
@@ -934,6 +948,25 @@ impl Actor for IndexDbSupervisor {
                     }
                 }
             }
+            IndexDbSupervisorMessage::FlushAll { reply } => {
+                let mut receivers = Vec::new();
+                for writer in state.writers.values() {
+                    let (tx, rx) = oneshot::channel();
+                    if writer
+                        .send_message(IndexDbWriterMessage::Flush { reply: tx })
+                        .is_ok()
+                    {
+                        receivers.push(rx);
+                    }
+                }
+                let mut flushed = 0;
+                for rx in receivers {
+                    if rx.await.is_ok() {
+                        flushed += 1;
+                    }
+                }
+                let _ = reply.send(flushed);
+            }
         }
         Ok(())
     }
@@ -1015,6 +1048,27 @@ where
     Err(last_err.unwrap_or_else(|| {
         ApiError::internal("Index DB writer unavailable")
     }))
+}
+
+/// Drains every live index DB writer (a message-ordering barrier, not an
+/// fsync). Returns the number of writers that acknowledged; 0 when the
+/// supervisor was never started. Used at process shutdown.
+pub(crate) async fn flush_all_writers() -> usize {
+    let Some(cell) = SUPERVISOR.get() else {
+        return 0;
+    };
+    let supervisor = cell.lock().await.clone();
+    let Some(supervisor) = supervisor else {
+        return 0;
+    };
+    let (reply, rx) = oneshot::channel();
+    if supervisor
+        .send_message(IndexDbSupervisorMessage::FlushAll { reply })
+        .is_err()
+    {
+        return 0;
+    }
+    rx.await.unwrap_or(0)
 }
 
 async fn ensure_supervisor() -> ApiResult<ActorRef<IndexDbSupervisorMessage>> {

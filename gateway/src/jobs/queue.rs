@@ -130,6 +130,14 @@ pub(crate) enum JobQueueMessage {
         queue_id: i64,
         result: JobRunResult,
     },
+    /// Process shutdown: drops every queued job, cancels the running one, and
+    /// puts the queue into a mode where new enqueues are refused — an HTTP
+    /// request still in flight during the graceful drain must not start a job
+    /// that would then be killed with the process. Replies with the cancelled
+    /// running job's id, if any.
+    Shutdown {
+        reply: oneshot::Sender<Option<i64>>,
+    },
 }
 
 pub(crate) struct JobQueueActor;
@@ -144,6 +152,7 @@ pub(crate) struct JobQueueState {
     running_job: Option<Job>,
     job_counter: i64,
     runner: ActorRef<JobRunnerMessage>,
+    shutting_down: bool,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -209,6 +218,7 @@ impl Actor for JobQueueActor {
             running_job: None,
             job_counter: 0,
             runner,
+            shutting_down: false,
         })
     }
 
@@ -220,6 +230,10 @@ impl Actor for JobQueueActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             JobQueueMessage::Enqueue { request, reply } => {
+                if state.shutting_down {
+                    let _ = reply.send(Err(ApiError::internal("Job queue is shutting down")));
+                    return Ok(());
+                }
                 let model = push_job(state, request);
                 if state.running_job.is_none() {
                     start_next_job(state).await;
@@ -231,6 +245,10 @@ impl Actor for JobQueueActor {
                 dedup,
                 reply,
             } => {
+                if state.shutting_down {
+                    let _ = reply.send(Err(ApiError::internal("Job queue is shutting down")));
+                    return Ok(());
+                }
                 let conflict = dedup.as_ref().is_some_and(|dedup| {
                     state
                         .running_job
@@ -300,6 +318,17 @@ impl Actor for JobQueueActor {
                     }
                 }
             }
+            JobQueueMessage::Shutdown { reply } => {
+                state.shutting_down = true;
+                let dropped = state.queue.len();
+                state.queue.clear();
+                state.queued_jobs.clear();
+                if dropped > 0 {
+                    tracing::info!(dropped, "dropped queued jobs for shutdown");
+                }
+                let cancelled = cancel_running_job_inner(state).await;
+                let _ = reply.send(cancelled);
+            }
         }
         Ok(())
     }
@@ -325,7 +354,7 @@ fn push_job(state: &mut JobQueueState, request: JobRequest) -> JobModel {
 }
 
 async fn start_next_job(state: &mut JobQueueState) {
-    if state.running_job.is_some() {
+    if state.shutting_down || state.running_job.is_some() {
         return;
     }
     let job = match state.queue.pop_front() {
@@ -596,6 +625,18 @@ pub(crate) async fn cancel_running_job() -> ApiResult<Option<i64>> {
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
 }
 
+/// Cancels the running job, drops all queued jobs, and makes the queue refuse
+/// new enqueues. Returns the cancelled running job's id, if there was one.
+/// Deliberately does not spawn the queue when it was never started.
+pub(crate) async fn shutdown_job_queue() -> Option<i64> {
+    let queue = JOB_QUEUE.get()?;
+    let (reply, rx) = oneshot::channel();
+    queue
+        .send_message(JobQueueMessage::Shutdown { reply })
+        .ok()?;
+    rx.await.ok().flatten()
+}
+
 async fn ensure_job_queue() -> ApiResult<ActorRef<JobQueueMessage>> {
     JOB_QUEUE
         .get_or_try_init(|| async {
@@ -733,6 +774,55 @@ mod tests {
         );
         assert_eq!(status.queue[0].queue_id, second.queue_id);
         assert!(status.queue[0].running);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Process shutdown: the running job is cancelled, queued jobs are
+    // dropped without starting, and new enqueues are refused so an HTTP
+    // request still draining can't start a job that would die with the
+    // process.
+    #[tokio::test]
+    async fn shutdown_cancels_everything_and_rejects_new_jobs() {
+        let (queue, handle) = spawn_test_queue().await;
+        let job = JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some("60000".to_string()),
+        };
+        let running = enqueue_on(&queue, job.clone()).await;
+        let _queued = enqueue_on(&queue, job.clone()).await;
+
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::Shutdown { reply })
+            .unwrap();
+        let cancelled = rx.await.unwrap();
+        assert_eq!(cancelled, Some(running.queue_id));
+
+        let status = status_on(&queue).await;
+        assert!(
+            status.queue.is_empty(),
+            "queue should be empty after shutdown, got: {status:?}"
+        );
+
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::Enqueue {
+                request: job,
+                reply,
+            })
+            .unwrap();
+        assert!(
+            rx.await.unwrap().is_err(),
+            "enqueue after shutdown should be refused"
+        );
 
         queue.stop(None);
         handle.await.unwrap();

@@ -1,0 +1,122 @@
+//! Graceful shutdown coordination.
+//!
+//! Port of `panoptikon.signal_handler`, adapted to the gateway's in-process
+//! architecture. Python's handler exists to terminate child processes (the
+//! extraction job runs in one and gets hard-killed after a 3s grace); the
+//! gateway instead cancels the running job through the queue — the same path
+//! as `POST /api/jobs/cancel` — stops the background actors so nothing new
+//! starts, and drains the index DB writers so every already-queued write
+//! commits before the process exits. Anything cut off beyond that is a single
+//! SQLite transaction, which rolls back on the next open.
+//!
+//! A second signal exits immediately, and a hard timer forces exit even if
+//! cleanup or the HTTP connection drain wedges.
+
+use std::time::Duration;
+
+use crate::db::index_writer;
+use crate::jobs::{continuous_scan, cron, queue};
+
+/// Upper bound on the actor-coordination part of shutdown. Generous because a
+/// writer may be mid-VACUUM on a large database; past this we exit and let
+/// SQLite roll back.
+const CLEANUP_GRACE: Duration = Duration::from_secs(10);
+/// Hard ceiling from first signal to process exit. Covers HTTP connections
+/// that never drain (e.g. a long-lived streaming proxy request) — without it
+/// axum's graceful shutdown would wait on them forever.
+const FORCE_EXIT_AFTER: Duration = Duration::from_secs(20);
+
+/// Which optional subsystems `main` actually started, so cleanup doesn't
+/// lazily spawn an actor just to stop it.
+pub(crate) struct Subsystems {
+    pub jobs: bool,
+    pub local_api: bool,
+}
+
+/// Resolves when the process receives its first termination signal
+/// (SIGINT/SIGTERM on Unix; Ctrl-C/Break/Close/Shutdown on Windows). If no
+/// handler can be installed, logs the error and never resolves — the process
+/// then only stops by external kill, matching a failed signal(2) registration.
+pub(crate) async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to install SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut ctrl_c = windows::ctrl_c().ok();
+        let mut ctrl_break = windows::ctrl_break().ok();
+        let mut ctrl_close = windows::ctrl_close().ok();
+        let mut ctrl_shutdown = windows::ctrl_shutdown().ok();
+        if ctrl_c.is_none()
+            && ctrl_break.is_none()
+            && ctrl_close.is_none()
+            && ctrl_shutdown.is_none()
+        {
+            tracing::error!("failed to install any shutdown signal handler");
+            std::future::pending::<()>().await;
+        }
+        tokio::select! {
+            _ = async { ctrl_c.as_mut().unwrap().recv().await }, if ctrl_c.is_some() => {}
+            _ = async { ctrl_break.as_mut().unwrap().recv().await }, if ctrl_break.is_some() => {}
+            _ = async { ctrl_close.as_mut().unwrap().recv().await }, if ctrl_close.is_some() => {}
+            _ = async { ctrl_shutdown.as_mut().unwrap().recv().await }, if ctrl_shutdown.is_some() => {}
+        }
+    }
+}
+
+/// Runs the coordinated cleanup after the first shutdown signal. Called
+/// concurrently with axum's graceful HTTP shutdown; `main` joins this before
+/// returning.
+pub(crate) async fn run_cleanup(subsystems: Subsystems) {
+    tracing::info!("shutdown signal received; stopping gracefully (repeat the signal to force exit)");
+
+    tokio::spawn(async {
+        wait_for_signal().await;
+        // process::exit skips destructors, so buffered file-log output is
+        // lost — acceptable on an explicitly forced exit.
+        tracing::warn!("second shutdown signal received; exiting immediately");
+        std::process::exit(130);
+    });
+    tokio::spawn(async {
+        tokio::time::sleep(FORCE_EXIT_AFTER).await;
+        tracing::warn!("shutdown deadline expired; forcing exit");
+        std::process::exit(0);
+    });
+
+    let cleanup = async {
+        if subsystems.jobs {
+            cron::stop_cron_scheduler();
+        }
+        if subsystems.local_api {
+            continuous_scan::stop_continuous_scanning().await;
+        }
+        if let Some(queue_id) = queue::shutdown_job_queue().await {
+            tracing::info!(queue_id, "cancelled running job for shutdown");
+        }
+        let flushed = index_writer::flush_all_writers().await;
+        if flushed > 0 {
+            tracing::info!(writers = flushed, "index DB writers drained");
+        }
+    };
+    match tokio::time::timeout(CLEANUP_GRACE, cleanup).await {
+        Ok(()) => tracing::info!("background work stopped cleanly"),
+        Err(_) => tracing::warn!(
+            grace_secs = CLEANUP_GRACE.as_secs(),
+            "cleanup did not finish within the grace period; exiting anyway"
+        ),
+    }
+}

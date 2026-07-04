@@ -512,6 +512,15 @@ pub(crate) async fn ensure_cron_scheduler() -> ApiResult<ActorRef<CronSchedulerM
         .map(Clone::clone)
 }
 
+/// Stops the scheduler at process shutdown so no further tick can enqueue
+/// jobs. A tick already in progress finishes first; anything it enqueues after
+/// the queue enters shutdown mode is refused there.
+pub(crate) fn stop_cron_scheduler() {
+    if let Some(actor) = SCHEDULER.get() {
+        actor.stop(None);
+    }
+}
+
 pub(crate) async fn notify_config_change(index_db: &str) -> ApiResult<()> {
     let scheduler = ensure_cron_scheduler().await?;
     scheduler

@@ -1162,6 +1162,10 @@ pub(crate) enum ContinuousScanSupervisorMessage {
         reply: oneshot::Sender<()>,
     },
     ResumeAfterJob { index_db: String },
+    /// Process shutdown: stops every per-DB scan actor and refuses to spawn
+    /// new ones. The scan actors are not linked to the supervisor, so merely
+    /// stopping the supervisor would leave them running.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
 pub(crate) struct ContinuousScanSupervisor;
@@ -1175,6 +1179,7 @@ pub(crate) struct ContinuousScanSupervisorState {
     config_store: SystemConfigStore,
     actors: HashMap<String, ActorRef<ContinuousScanMessage>>,
     watcher: Option<RecommendedWatcher>,
+    shutting_down: bool,
 }
 
 impl Actor for ContinuousScanSupervisor {
@@ -1194,6 +1199,7 @@ impl Actor for ContinuousScanSupervisor {
             config_store,
             actors: HashMap::new(),
             watcher,
+            shutting_down: false,
         };
         let _ = myself.send_interval(
             RactorDuration::from_secs(SUPERVISOR_RESYNC_INTERVAL.as_secs()),
@@ -1209,6 +1215,17 @@ impl Actor for ContinuousScanSupervisor {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        if state.shutting_down {
+            // No message may spawn or resume scan actors once shutdown began;
+            // a queued ResyncFromDisk would otherwise respawn what Shutdown
+            // just stopped.
+            if let ContinuousScanSupervisorMessage::Shutdown { reply } = message {
+                let _ = reply.send(());
+            } else if let ContinuousScanSupervisorMessage::PauseForJob { reply, .. } = message {
+                let _ = reply.send(());
+            }
+            return Ok(());
+        }
         match message {
             ContinuousScanSupervisorMessage::ResyncFromDisk => {
                 let _ = resync_from_disk(state).await;
@@ -1230,6 +1247,20 @@ impl Actor for ContinuousScanSupervisor {
                 } else {
                     let _ = sync_single_db(state, &index_db).await;
                 }
+            }
+            ContinuousScanSupervisorMessage::Shutdown { reply } => {
+                state.shutting_down = true;
+                // Dropping the watcher stops filesystem events from queueing
+                // further resyncs.
+                state.watcher = None;
+                let stopped = state.actors.len();
+                for (_, actor) in state.actors.drain() {
+                    actor.stop(None);
+                }
+                if stopped > 0 {
+                    tracing::info!(stopped, "stopped continuous scan actors for shutdown");
+                }
+                let _ = reply.send(());
             }
         }
         Ok(())
@@ -1389,6 +1420,22 @@ pub(crate) async fn ensure_continuous_supervisor() -> ApiResult<ActorRef<Continu
         })
         .await
         .map(Clone::clone)
+}
+
+/// Stops every continuous scan actor and then the supervisor itself. No-op
+/// when continuous scanning was never started. Used at process shutdown.
+pub(crate) async fn stop_continuous_scanning() {
+    let Some(supervisor) = SUPERVISOR.get() else {
+        return;
+    };
+    let (reply, rx) = oneshot::channel();
+    if supervisor
+        .cast(ContinuousScanSupervisorMessage::Shutdown { reply })
+        .is_ok()
+    {
+        let _ = rx.await;
+    }
+    supervisor.stop(None);
 }
 
 pub(crate) async fn notify_config_change(index_db: &str) -> ApiResult<()> {
