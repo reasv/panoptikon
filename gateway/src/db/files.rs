@@ -96,6 +96,25 @@ LIMIT 1
     }))
 }
 
+/// Bulk-loads every known file path with its stored mtime, used to seed the
+/// continuous-scan directory poller so unchanged files are never re-dispatched.
+pub(crate) async fn get_all_file_paths_with_mtime(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<(String, String)>> {
+    sqlx::query_as::<_, (String, String)>(
+        r#"
+SELECT path, last_modified
+FROM files
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to load file mtimes");
+        ApiError::internal("Failed to load file mtimes")
+    })
+}
+
 pub(crate) async fn get_file_delete_info(
     conn: &mut sqlx::SqliteConnection,
     path: &str,

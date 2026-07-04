@@ -1462,6 +1462,8 @@ pub(crate) enum FileProcessError {
     Unsupported(String),
     /// The file was rejected by the user's filescan filter.
     Filtered,
+    /// The file's mtime matches the DB record, so hashing was skipped.
+    Unchanged,
 }
 
 pub(crate) fn process_file(
@@ -2795,16 +2797,18 @@ pub(crate) fn get_last_modified_time_and_size(path: &Path) -> Result<(String, i6
     let metadata = fs::metadata(path)?;
     let size = metadata.len() as i64;
     let modified = metadata.modified()?;
-    let duration = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let seconds = duration.as_secs() as i64;
-    let dt = OffsetDateTime::from_unix_timestamp(seconds)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let formatted = dt
-        .format(iso_format())
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let formatted = format_system_time(modified)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "unrepresentable mtime"))?;
     Ok((formatted, size))
+}
+
+/// Formats a filesystem timestamp with the same truncation and format used for
+/// `files.last_modified`, so strings from disk and from the DB compare equal.
+pub(crate) fn format_system_time(time: std::time::SystemTime) -> Option<String> {
+    let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let seconds = duration.as_secs() as i64;
+    let dt = OffsetDateTime::from_unix_timestamp(seconds).ok()?;
+    dt.format(iso_format()).ok()
 }
 
 pub(crate) fn current_iso_timestamp() -> String {

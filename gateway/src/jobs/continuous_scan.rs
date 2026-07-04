@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::event::{ModifyKind, RenameMode};
 use ractor::factory::{
     Factory, FactoryArguments, FactoryMessage, Job, JobOptions, Worker, WorkerBuilder,
@@ -20,7 +20,8 @@ use crate::db::{
         FileScanUpdate, get_open_file_scan_id,
     },
     files::{
-        FileDeleteInfo, FileUpsertResult, count_files_for_item, get_file_delete_info,
+        FileDeleteInfo, FileUpsertResult, count_files_for_item, get_all_file_paths_with_mtime,
+        get_file_by_path, get_file_delete_info,
     },
     index_writer::{call_index_db_writer, IndexDbWriterMessage},
     open_index_db_read,
@@ -28,6 +29,9 @@ use crate::db::{
     system_config::{SystemConfig, SystemConfigStore},
 };
 use crate::db::files::has_blurhash;
+use crate::jobs::dir_poller::{
+    FileMeta, PollFilters, PollOutcome, PollerSnapshot, run_poll_pass, seed_snapshot,
+};
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions,
     THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data, check_folder_validity,
@@ -44,6 +48,11 @@ const SUPERVISOR_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 // Watcher deletions happen outside any job, so no post-job maintenance pass
 // ever accounts for them; compact once this many rows have been removed.
 const MAINTENANCE_DELETION_THRESHOLD: u64 = 1000;
+// A file detected by the poller must keep the same mtime and size across this
+// window before it is processed, so half-written files aren't hashed.
+const POLL_SETTLE_DELAY: Duration = Duration::from_secs(2);
+// Backoff ceiling for files that keep changing (e.g. a long copy in progress).
+const SETTLE_MAX_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct FileWork {
@@ -51,6 +60,8 @@ struct FileWork {
     filescan_filter: Option<Arc<Match>>,
     epoch: u64,
     scan_time: String,
+    index_db: String,
+    user_data_db: String,
     reply_to: ActorRef<ContinuousScanMessage>,
 }
 
@@ -82,8 +93,37 @@ impl Worker for ContinuousWorker {
             filescan_filter,
             epoch,
             scan_time,
+            index_db,
+            user_data_db,
             reply_to,
         } = job.msg;
+
+        // Skip hashing when the on-disk mtime matches the DB record, mirroring
+        // the full-scan dedup: spurious watcher events and re-dispatched paths
+        // cost one stat and one point query instead of a full re-process.
+        let stat_path = path.clone();
+        let disk_mtime = tokio::task::spawn_blocking(move || {
+            get_last_modified_time_and_size(&stat_path).map(|(mtime, _)| mtime)
+        })
+        .await
+        .ok()
+        .and_then(|res| res.ok());
+        if let Some(disk_mtime) = &disk_mtime {
+            if let Ok(mut conn) = open_index_db_read(&index_db, &user_data_db).await {
+                if let Ok(Some(existing)) =
+                    get_file_by_path(&mut conn, path.to_string_lossy().as_ref()).await
+                {
+                    if &existing.last_modified == disk_mtime {
+                        let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
+                            epoch,
+                            scan_time,
+                            result: Err(FileProcessError::Unchanged),
+                        });
+                        return Ok(job.key);
+                    }
+                }
+            }
+        }
 
         let result = tokio::task::spawn_blocking(move || process_file(path, filescan_filter))
             .await
@@ -121,6 +161,19 @@ pub(crate) enum ContinuousScanMessage {
     Resume,
     UpdateConfig { config: SystemConfig },
     FsEvent(FsEvent),
+    /// Starts a poll pass on the blocking pool unless one is already running.
+    PollTick { epoch: u64 },
+    /// A poll pass finished: restore the snapshot, act on the diff, reschedule.
+    PollCompleted { epoch: u64, outcome: PollOutcome },
+    /// Re-stat a detected file after the settle delay; dispatch once stable.
+    SettleCheck {
+        epoch: u64,
+        path: PathBuf,
+        meta: FileMeta,
+        attempts: u32,
+    },
+    /// A settle check confirmed the file is stable; dispatch it to a worker.
+    DispatchStable { epoch: u64, path: PathBuf },
     WorkerResult {
         epoch: u64,
         scan_time: String,
@@ -230,9 +283,13 @@ fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
     }
 }
 
-enum WatcherHandle {
-    Recommended(RecommendedWatcher),
-    Poll(PollWatcher),
+/// Runtime state for poll mode; replaces notify's `PollWatcher`, which
+/// re-stats every file in the tree on each tick.
+struct PollerRuntime {
+    interval: Duration,
+    filters: Arc<PollFilters>,
+    /// Taken while a pass runs on the blocking pool; restored on completion.
+    snapshot: Option<PollerSnapshot>,
 }
 
 pub(crate) struct ContinuousScanState {
@@ -253,7 +310,8 @@ pub(crate) struct ContinuousScanState {
     actor_ref: ActorRef<ContinuousScanMessage>,
     factory: ActorRef<FactoryMessage<(), FileWork>>,
     factory_handle: Option<ractor::concurrency::JoinHandle<()>>,
-    watcher: Option<WatcherHandle>,
+    watcher: Option<RecommendedWatcher>,
+    poller: Option<PollerRuntime>,
     enable_watcher: bool,
     deletions_since_maintenance: u64,
 }
@@ -473,6 +531,8 @@ impl ContinuousScanState {
             filescan_filter: self.filescan_filter.clone(),
             epoch: self.epoch,
             scan_time,
+            index_db: self.index_db.clone(),
+            user_data_db: self.user_data_db.clone(),
             reply_to: self.actor_ref.clone(),
         };
         let _ = self.factory.cast(FactoryMessage::Dispatch(Job {
@@ -481,6 +541,66 @@ impl ContinuousScanState {
             options: JobOptions::default(),
             accepted: None,
         }));
+    }
+
+    /// Starts change detection for the current roots: the hierarchical mtime
+    /// poller when `poll_interval_secs` is set, the native OS watcher
+    /// otherwise.
+    async fn start_watching(&mut self) {
+        self.watcher = None;
+        self.poller = None;
+        if !self.enable_watcher {
+            return;
+        }
+        let poll_interval = self
+            .config
+            .continuous_filescan
+            .poll_interval_secs
+            .filter(|secs| *secs > 0);
+        if let Some(secs) = poll_interval {
+            if let Err(err) = self.start_poller(Duration::from_secs(secs)).await {
+                tracing::error!(
+                    index_db = %self.index_db,
+                    error = ?err,
+                    "failed to start continuous scan poller"
+                );
+            }
+            return;
+        }
+        match start_watcher(self.actor_ref.clone(), &self.watch_roots) {
+            Ok(watcher) => self.watcher = Some(watcher),
+            Err(err) => {
+                tracing::error!(
+                    index_db = %self.index_db,
+                    error = ?err,
+                    "failed to start continuous scan watcher"
+                );
+            }
+        }
+    }
+
+    /// Seeds the poller snapshot from the DB so the first tick diffs the disk
+    /// against the index: files added or changed while watching was down (app
+    /// offline, actor paused for a job) are picked up immediately, while
+    /// unchanged files are never re-dispatched.
+    async fn start_poller(&mut self, interval: Duration) -> ApiResult<()> {
+        let filters = Arc::new(PollFilters {
+            roots: self.watch_roots.clone(),
+            excluded_roots: self.excluded_roots.clone(),
+            allowed_extensions: self.allowed_extensions.clone(),
+        });
+        let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
+        let rows = get_all_file_paths_with_mtime(&mut conn).await?;
+        let snapshot = seed_snapshot(&rows, &filters);
+        self.poller = Some(PollerRuntime {
+            interval,
+            filters,
+            snapshot: Some(snapshot),
+        });
+        let _ = self
+            .actor_ref
+            .cast(ContinuousScanMessage::PollTick { epoch: self.epoch });
+        Ok(())
     }
 }
 impl ContinuousScanActor {
@@ -577,6 +697,7 @@ impl Actor for ContinuousScanActor {
             factory,
             factory_handle: Some(handle),
             watcher: None,
+            poller: None,
             enable_watcher: args.enable_watcher,
             deletions_since_maintenance: 0,
         };
@@ -585,14 +706,7 @@ impl Actor for ContinuousScanActor {
         let _ = state.close_stale_scan().await;
         if state.config.continuous_filescan.enabled && roots_ok {
             let _ = state.start_scan().await;
-            if state.enable_watcher {
-                let watcher = start_watcher(
-                    myself.clone(),
-                    &state.watch_roots,
-                    state.config.continuous_filescan.poll_interval_secs,
-                );
-                state.watcher = watcher.ok();
-            }
+            state.start_watching().await;
         } else {
             state.paused = true;
         }
@@ -612,6 +726,7 @@ impl Actor for ContinuousScanActor {
                 state.paused_for_job = true;
                 state.epoch = state.epoch.wrapping_add(1);
                 state.watcher = None;
+                state.poller = None;
                 let _ = state.close_scan().await;
                 let _ = reply.send(());
             }
@@ -628,6 +743,7 @@ impl Actor for ContinuousScanActor {
                 if !state.config.continuous_filescan.enabled || !roots_ok {
                     state.paused = true;
                     state.watcher = None;
+                    state.poller = None;
                     if !roots_ok {
                         state.epoch = state.epoch.wrapping_add(1);
                         let _ = state.close_scan().await;
@@ -637,14 +753,7 @@ impl Actor for ContinuousScanActor {
                 state.paused = false;
                 state.epoch = state.epoch.wrapping_add(1);
                 let _ = state.start_scan().await;
-                if state.enable_watcher {
-                    let watcher = start_watcher(
-                        myself.clone(),
-                        &state.watch_roots,
-                        state.config.continuous_filescan.poll_interval_secs,
-                    );
-                    state.watcher = watcher.ok();
-                }
+                state.start_watching().await;
             }
             ContinuousScanMessage::UpdateConfig { config } => {
                 let was_enabled = state.config.continuous_filescan.enabled;
@@ -655,37 +764,18 @@ impl Actor for ContinuousScanActor {
                     state.paused = true;
                     state.epoch = state.epoch.wrapping_add(1);
                     state.watcher = None;
+                    state.poller = None;
                     let _ = state.close_scan().await;
                     return Ok(());
                 }
 
-                if !was_enabled && now_enabled {
-                    if !state.paused_for_job {
-                        state.paused = false;
-                        state.epoch = state.epoch.wrapping_add(1);
+                if !state.paused_for_job {
+                    state.paused = false;
+                    state.epoch = state.epoch.wrapping_add(1);
+                    if !was_enabled {
                         let _ = state.start_scan().await;
-                        if state.enable_watcher {
-                            let watcher = start_watcher(
-                                myself.clone(),
-                                &state.watch_roots,
-                                state.config.continuous_filescan.poll_interval_secs,
-                            );
-                            state.watcher = watcher.ok();
-                        }
                     }
-                } else if was_enabled && now_enabled {
-                    if !state.paused_for_job {
-                        state.paused = false;
-                        state.epoch = state.epoch.wrapping_add(1);
-                        if state.enable_watcher {
-                            let watcher = start_watcher(
-                                myself.clone(),
-                                &state.watch_roots,
-                                state.config.continuous_filescan.poll_interval_secs,
-                            );
-                            state.watcher = watcher.ok();
-                        }
-                    }
+                    state.start_watching().await;
                 }
             }
             ContinuousScanMessage::FsEvent(event) => {
@@ -709,6 +799,128 @@ impl Actor for ContinuousScanActor {
                     }
                 }
             }
+            ContinuousScanMessage::PollTick { epoch } => {
+                if state.paused || epoch != state.epoch {
+                    return Ok(());
+                }
+                let Some(poller) = state.poller.as_mut() else {
+                    return Ok(());
+                };
+                // A pass already in flight will schedule the next tick itself.
+                let Some(snapshot) = poller.snapshot.take() else {
+                    return Ok(());
+                };
+                let filters = poller.filters.clone();
+                let reply = state.actor_ref.clone();
+                tokio::task::spawn_blocking(move || {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_poll_pass(snapshot, &filters)
+                    }))
+                    .unwrap_or_else(|_| {
+                        // Losing the snapshot re-dispatches everything next
+                        // pass; the worker's mtime check makes that cheap.
+                        tracing::error!("continuous scan poll pass panicked");
+                        PollOutcome {
+                            snapshot: PollerSnapshot::default(),
+                            changes: Vec::new(),
+                            removals: Vec::new(),
+                            degraded: true,
+                        }
+                    });
+                    let _ = reply.cast(ContinuousScanMessage::PollCompleted { epoch, outcome });
+                });
+            }
+            ContinuousScanMessage::PollCompleted { epoch, outcome } => {
+                if epoch != state.epoch {
+                    return Ok(());
+                }
+                let Some(poller) = state.poller.as_mut() else {
+                    return Ok(());
+                };
+                poller.snapshot = Some(outcome.snapshot);
+                let interval = poller.interval;
+                if outcome.degraded {
+                    tracing::warn!(
+                        index_db = %state.index_db,
+                        "poll pass degraded: some directories could not be inspected"
+                    );
+                }
+                // Defer removals past the settle window so a move detected in
+                // one pass indexes the new path first: the item then has two
+                // file rows and the removal deletes just the stale one instead
+                // of orphaning the item (which would drop its tags).
+                for path in outcome.removals {
+                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY * 2, move || {
+                        ContinuousScanMessage::FsEvent(FsEvent::Remove(path))
+                    });
+                }
+                for change in outcome.changes {
+                    let path = change.path;
+                    let meta = change.meta;
+                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                        ContinuousScanMessage::SettleCheck {
+                            epoch,
+                            path,
+                            meta,
+                            attempts: 0,
+                        }
+                    });
+                }
+                let _ = state
+                    .actor_ref
+                    .send_after(interval, move || ContinuousScanMessage::PollTick { epoch });
+            }
+            ContinuousScanMessage::SettleCheck {
+                epoch,
+                path,
+                meta,
+                attempts,
+            } => {
+                if state.paused || epoch != state.epoch {
+                    return Ok(());
+                }
+                // Re-stat off the actor so a slow network mount can't block
+                // event processing; dispatch happens via DispatchStable.
+                let reply = state.actor_ref.clone();
+                tokio::spawn(async move {
+                    let stat_path = path.clone();
+                    let current = tokio::task::spawn_blocking(move || {
+                        get_last_modified_time_and_size(&stat_path)
+                    })
+                    .await;
+                    let Ok(Ok((last_modified, size))) = current else {
+                        // Vanished or unreadable: drop it; a later poll pass
+                        // or full scan picks it up if it comes back.
+                        return;
+                    };
+                    let stable = last_modified == meta.last_modified
+                        && meta.size.map_or(true, |prev| prev == size);
+                    if stable {
+                        let _ =
+                            reply.cast(ContinuousScanMessage::DispatchStable { epoch, path });
+                        return;
+                    }
+                    // Still being written: retry with backoff until it settles.
+                    let delay = POLL_SETTLE_DELAY
+                        .saturating_mul(2u32.saturating_pow(attempts.min(5)))
+                        .min(SETTLE_MAX_DELAY);
+                    let _ = reply.send_after(delay, move || ContinuousScanMessage::SettleCheck {
+                        epoch,
+                        path,
+                        meta: FileMeta {
+                            last_modified,
+                            size: Some(size),
+                        },
+                        attempts: attempts.saturating_add(1),
+                    });
+                });
+            }
+            ContinuousScanMessage::DispatchStable { epoch, path } => {
+                if state.paused || epoch != state.epoch {
+                    return Ok(());
+                }
+                state.dispatch_path(path);
+            }
             ContinuousScanMessage::WorkerResult {
                 epoch,
                 scan_time,
@@ -719,6 +931,10 @@ impl Actor for ContinuousScanActor {
                 }
                 let processed = match result {
                     Ok(processed) => processed,
+                    Err(FileProcessError::Unchanged) => {
+                        state.stats.unchanged_files += 1;
+                        return Ok(());
+                    }
                     Err(_) => {
                         state.stats.errors += 1;
                         return Ok(());
@@ -885,8 +1101,7 @@ impl Actor for ContinuousScanActor {
 fn start_watcher(
     actor: ActorRef<ContinuousScanMessage>,
     roots: &[PathBuf],
-    poll_interval_secs: Option<u64>,
-) -> Result<WatcherHandle, notify::Error> {
+) -> Result<RecommendedWatcher, notify::Error> {
     let handler = move |res| match res {
         Ok(event) => {
             for mapped in ContinuousScanActor::map_event(event) {
@@ -898,21 +1113,12 @@ fn start_watcher(
         }
     };
 
-    if let Some(interval) = poll_interval_secs {
-        let config = notify::Config::default().with_poll_interval(Duration::from_secs(interval));
-        let mut watcher = PollWatcher::new(handler, config)?;
-        for root in roots {
-            watcher.watch(root, RecursiveMode::Recursive)?;
-        }
-        return Ok(WatcherHandle::Poll(watcher));
-    }
-
     let mut watcher = RecommendedWatcher::new(handler, notify::Config::default())?;
     for root in roots {
         watcher.watch(root, RecursiveMode::Recursive)?;
     }
 
-    Ok(WatcherHandle::Recommended(watcher))
+    Ok(watcher)
 }
 
 pub(crate) enum ContinuousScanSupervisorMessage {
@@ -1368,6 +1574,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0);
+    }
+
+    // End-to-end poll mode: seed → poll pass → settle → worker → DB row.
+    #[tokio::test]
+    async fn poll_mode_picks_up_new_files() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("poll");
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+
+        let watch_dir = root.join("pollwatch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let file_path = watch_dir.join("new.png");
+        write_test_image(&file_path);
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.continuous_filescan.poll_interval_secs = Some(1);
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // First tick + settle delay + processing; poll interval is 1s and the
+        // settle window is 2s, so this normally completes within ~5s.
+        let mut found = false;
+        for _ in 0..120 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            if count.0 > 0 {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        actor.stop(None);
+        assert!(found, "poll mode did not index the new file in time");
     }
 
     #[test]
