@@ -283,10 +283,14 @@ fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
     }
 }
 
-/// Runtime state for poll mode; replaces notify's `PollWatcher`, which
-/// re-stats every file in the tree on each tick.
+/// Runtime state for the directory-mtime poller. In poll mode it replaces
+/// notify's `PollWatcher` (which re-stats every file each tick) and runs on a
+/// recurring interval. In native watcher mode it runs one-shot passes: a
+/// catch-up diff at watcher startup/resume and a recovery pass after an event
+/// overflow.
 struct PollerRuntime {
-    interval: Duration,
+    /// Recurring tick interval; None means one-shot passes only (native mode).
+    interval: Option<Duration>,
     filters: Arc<PollFilters>,
     /// Taken while a pass runs on the blocking pool; restored on completion.
     snapshot: Option<PollerSnapshot>,
@@ -558,7 +562,7 @@ impl ContinuousScanState {
             .poll_interval_secs
             .filter(|secs| *secs > 0);
         if let Some(secs) = poll_interval {
-            if let Err(err) = self.start_poller(Duration::from_secs(secs)).await {
+            if let Err(err) = self.start_poller(Some(Duration::from_secs(secs))).await {
                 tracing::error!(
                     index_db = %self.index_db,
                     error = ?err,
@@ -568,7 +572,21 @@ impl ContinuousScanState {
             return;
         }
         match start_watcher(self.actor_ref.clone(), &self.watch_roots) {
-            Ok(watcher) => self.watcher = Some(watcher),
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                // One-shot catch-up pass: diffs the disk against the index so
+                // changes made while nothing was watching (app offline, actor
+                // paused for a job) are picked up instead of waiting for the
+                // next cron scan. The retained snapshot also enables recovery
+                // passes after watcher overflow.
+                if let Err(err) = self.start_poller(None).await {
+                    tracing::warn!(
+                        index_db = %self.index_db,
+                        error = ?err,
+                        "failed to run continuous scan catch-up pass"
+                    );
+                }
+            }
             Err(err) => {
                 tracing::error!(
                     index_db = %self.index_db,
@@ -579,11 +597,12 @@ impl ContinuousScanState {
         }
     }
 
-    /// Seeds the poller snapshot from the DB so the first tick diffs the disk
-    /// against the index: files added or changed while watching was down (app
-    /// offline, actor paused for a job) are picked up immediately, while
-    /// unchanged files are never re-dispatched.
-    async fn start_poller(&mut self, interval: Duration) -> ApiResult<()> {
+    /// Seeds the poller snapshot from the DB so the first pass diffs the disk
+    /// against the index: files added or changed while watching was down are
+    /// picked up immediately, while unchanged files are never re-dispatched.
+    /// With an interval the pass reschedules itself (poll mode); without one
+    /// it runs once and further passes only fire on demand (overflow).
+    async fn start_poller(&mut self, interval: Option<Duration>) -> ApiResult<()> {
         let filters = Arc::new(PollFilters {
             roots: self.watch_roots.clone(),
             excluded_roots: self.excluded_roots.clone(),
@@ -794,8 +813,20 @@ impl Actor for ContinuousScanActor {
                     FsEvent::Overflow => {
                         tracing::warn!(
                             index_db = %state.index_db,
-                            "continuous scan watcher overflow or unknown event"
+                            "continuous scan watcher overflow; scheduling recovery pass"
                         );
+                        // Events were dropped; a poll pass re-diffs the tree
+                        // against the snapshot and recovers anything missed.
+                        // Delayed so the burst that caused the overflow can
+                        // finish first; an already-running pass makes this a
+                        // no-op and redundant dispatches are absorbed by the
+                        // worker's mtime check.
+                        if state.poller.is_some() {
+                            let epoch = state.epoch;
+                            let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                                ContinuousScanMessage::PollTick { epoch }
+                            });
+                        }
                     }
                 }
             }
@@ -866,9 +897,11 @@ impl Actor for ContinuousScanActor {
                         }
                     });
                 }
-                let _ = state
-                    .actor_ref
-                    .send_after(interval, move || ContinuousScanMessage::PollTick { epoch });
+                if let Some(interval) = interval {
+                    let _ = state
+                        .actor_ref
+                        .send_after(interval, move || ContinuousScanMessage::PollTick { epoch });
+                }
             }
             ContinuousScanMessage::SettleCheck {
                 epoch,
@@ -1574,6 +1607,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0);
+    }
+
+    // Native watcher mode runs a one-shot catch-up pass at startup: a file
+    // created before the watcher existed (no FS event ever fires for it) must
+    // still get indexed by diffing the disk against the DB.
+    #[tokio::test]
+    async fn native_mode_catch_up_indexes_preexisting_files() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("catchup");
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+
+        let watch_dir = root.join("catchupwatch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        write_test_image(&watch_dir.join("offline.png"));
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        // poll_interval_secs stays None: native watcher mode.
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut found = false;
+        for _ in 0..120 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            if count.0 > 0 {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        actor.stop(None);
+        assert!(found, "catch-up pass did not index the pre-existing file");
     }
 
     // End-to-end poll mode: seed → poll pass → settle → worker → DB row.
