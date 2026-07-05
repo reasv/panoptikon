@@ -899,7 +899,7 @@ impl ModelManager {
         // Release the spawn pin under the same lock as the bookkeeping
         // below so the sweeper cannot expire the fresh entry in between.
         spawn_pin.release_locked(&mut state.cache);
-        let (workers, registry_default_batch, impl_class) = match spawn_result {
+        let (workers, registry_default_batch, impl_class, claim_eligible) = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 // Python removes the requesting cache key's entry and
@@ -969,8 +969,11 @@ impl ModelManager {
         // time, unless the request said prewarm=false. Respawn-on-claim is
         // exactly this rule firing after a claim emptied the slot. Runs
         // outside the state lock (the pool has its own mutex) and only
-        // schedules a background task.
-        if prewarm_hint {
+        // schedules a background task. Skipped when the spec has no
+        // unpinned replica: claim() can never hand an (unpinned) pooled
+        // worker to a fully device-pinned family, so a warm worker would
+        // sit unclaimable forever — pure RAM burn.
+        if prewarm_hint && claim_eligible {
             self.prewarm.lazy_warm(&impl_class);
         }
         Ok(sender)
@@ -993,7 +996,10 @@ impl ModelManager {
     /// (the pool pings before handing it over). The claimed worker skips
     /// spawn + handshake + heavy imports and only needs `configure` +
     /// `load`; the remaining replicas fresh-spawn as before.
-    async fn spawn_model(&self, inference_id: &str) -> Result<(Vec<Worker>, Option<u32>, String)> {
+    async fn spawn_model(
+        &self,
+        inference_id: &str,
+    ) -> Result<(Vec<Worker>, Option<u32>, String, bool)> {
         let (spec, registry_default_batch) = {
             let mut registry = self.registry.lock().unwrap();
             let snapshot = registry
@@ -1077,7 +1083,12 @@ impl ModelManager {
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
-        Ok((workers, registry_default_batch, spec.impl_class))
+        Ok((
+            workers,
+            registry_default_batch,
+            spec.impl_class,
+            claim_replica.is_some(),
+        ))
     }
 
     /// Bind a claimed prewarmed worker to the concrete model. A
