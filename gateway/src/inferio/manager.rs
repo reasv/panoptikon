@@ -908,7 +908,9 @@ impl ModelManager {
         Ok(sender)
     }
 
-    /// Spawn + handshake + load the model's whole WorkerSet (design §8):
+    /// Spawn + handshake + configure + load the model's whole WorkerSet
+    /// (design §8, protocol v2 flow — handshake carries the impl class
+    /// identity, `configure` binds the model's kwargs and instantiates):
     /// one worker per entry of the spec's `device_pins`, each pinned via
     /// `CUDA_VISIBLE_DEVICES` at spawn, all spawned and loaded
     /// *concurrently*. Any replica failing kills the others — a load either
@@ -931,7 +933,7 @@ impl ModelManager {
             let device = device.clone();
             async move {
                 let mut worker =
-                    Worker::spawn(&self.cfg.spawn, inference_id, spec, device).await?;
+                    Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device).await?;
                 if let Err(err) = worker.load().await {
                     // A load `error` frame leaves the worker alive; kill it
                     // either way so a failed load never leaks a process

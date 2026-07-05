@@ -1,5 +1,5 @@
 //! Worker-process supervision: the orchestrator side of
-//! `docs/inferio-worker-protocol.md` (v1).
+//! `docs/inferio-worker-protocol.md` (v2).
 //!
 //! A [`Worker`] wraps one `python -m inferio_worker` child. Frames are 4-byte
 //! little-endian u32 length + one msgpack map over the child's stdin/stdout;
@@ -7,6 +7,15 @@
 //! bounded tail is kept for error reports. The protocol allows exactly one
 //! outstanding request per worker, which is enforced structurally: every
 //! request method takes `&mut self`.
+//!
+//! v2 lifecycle: [`Worker::spawn`] performs the handshake only, which
+//! carries the worker's *identity* (impl_class + impl_dirs) — no
+//! instantiation, so a spawned worker can be prewarmed ([`Worker::prewarm`]
+//! runs the impl's optional `prepare()` classmethod) and parked before it
+//! is bound to a concrete model via [`Worker::configure`] (which
+//! instantiates `impl_class(**config)`), then loaded. Normal (non-pooled)
+//! call sites use [`Worker::spawn_configured`], which chains spawn +
+//! configure.
 //!
 //! Failure semantics (design doc §4):
 //! - `error` frames are per-request failures; the worker stays alive and the
@@ -40,7 +49,7 @@ use crate::process_tree::JobGuard;
 
 /// Protocol version this orchestrator speaks; workers answering anything
 /// else in the handshake are killed.
-const PROTOCOL_VERSION: u64 = 1;
+const PROTOCOL_VERSION: u64 = 2;
 
 /// Max frame size (512 MiB). Either side treats a larger declared length as
 /// a fatal protocol error.
@@ -62,11 +71,14 @@ const FATAL_REAP_GRACE: Duration = Duration::from_secs(5);
 /// long, and cancellation means killing the worker.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerDeadlines {
-    /// Spawn → handshake response (default 30 s). Also used for `ping`,
+    /// Spawn → handshake response (default 30 s). Also used for `configure`
+    /// (instantiation is cheap — weights load in `load`) and for `ping`,
     /// whose whole point is bounded liveness checking.
     pub handshake: Duration,
     /// `load` response deadline; long because it covers heavy dependency
-    /// imports plus weight loading (default 600 s).
+    /// imports plus weight loading (default 600 s). Also used for `prewarm`:
+    /// `prepare()` exists precisely to run the slow heavy-dependency imports
+    /// early, so it gets the load budget, not the handshake one.
     pub load: Duration,
     /// Graceful stop: `unload` sent → `ok` + process exit (default 10 s).
     pub unload_grace: Duration,
@@ -173,7 +185,11 @@ impl StderrTail {
 
 /// A supervised inferio worker process. See the module docs for semantics.
 pub struct Worker {
-    inference_id: String,
+    /// Log/error label: the impl_class from spawn until `configure`
+    /// succeeds, then the configured inference_id. The stderr forwarder
+    /// keeps the spawn-time impl_class prefix for the worker's whole life
+    /// (its identity — a pooled worker may serve any model of the family).
+    label: String,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -196,14 +212,16 @@ pub struct Worker {
 impl Worker {
     /// Spawn `python -m inferio_worker` per the protocol's spawn contract
     /// (INFERIO_WORKER=1, PYTHONPATH prepend, CUDA_VISIBLE_DEVICES when a
-    /// device pin is given, inherited env otherwise) and perform the
-    /// handshake within the handshake deadline. On any failure the child is
-    /// killed and reaped and the error carries the worker traceback (from
-    /// the `error` frame) or the stderr tail.
+    /// device pin is given, inherited env otherwise) and perform the v2
+    /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
+    /// no instantiation — within the handshake deadline. On any failure the
+    /// child is killed and reaped and the error carries the worker
+    /// traceback (from the `error` frame) or the stderr tail. The worker
+    /// must be [`Worker::configure`]d (optionally after a
+    /// [`Worker::prewarm`]) before `load`/`predict`.
     pub async fn spawn(
         cfg: &WorkerSpawnConfig,
-        inference_id: &str,
-        spec: &SpawnSpec,
+        impl_class: &str,
         device: Option<String>,
     ) -> Result<Worker> {
         let mut command = Command::new(&cfg.python);
@@ -241,7 +259,7 @@ impl Worker {
 
         let mut child = command.spawn().with_context(|| {
             format!(
-                "failed to spawn inferio worker for {inference_id} via {}",
+                "failed to spawn inferio worker for impl class {impl_class} via {}",
                 cfg.python.display()
             )
         })?;
@@ -254,12 +272,12 @@ impl Worker {
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         let stderr_task = tokio::spawn(forward_stderr(
             stderr,
-            inference_id.to_owned(),
+            impl_class.to_owned(),
             Arc::clone(&tail),
         ));
 
         let mut worker = Worker {
-            inference_id: inference_id.to_owned(),
+            label: impl_class.to_owned(),
             child,
             stdin,
             stdout,
@@ -282,12 +300,7 @@ impl Worker {
                 Value::from("protocol_version"),
                 Value::from(PROTOCOL_VERSION),
             ),
-            (Value::from("inference_id"), Value::from(inference_id)),
-            (
-                Value::from("impl_class"),
-                Value::from(spec.impl_class.as_str()),
-            ),
-            (Value::from("config"), json_to_rmpv(&spec.config_kwargs)),
+            (Value::from("impl_class"), Value::from(impl_class)),
             (Value::from("impl_dirs"), Value::Array(impl_dirs)),
         ];
         let deadline = worker.deadlines.handshake;
@@ -299,7 +312,7 @@ impl Worker {
                 // kill() is safe in both cases and guarantees the reap.
                 worker.kill().await;
                 return Err(err.context(format!(
-                    "inferio worker handshake failed for {inference_id}"
+                    "inferio worker handshake failed for impl class {impl_class}"
                 )));
             }
         };
@@ -314,14 +327,86 @@ impl Worker {
         Ok(worker)
     }
 
-    /// Send `load` and await `ok` within the load deadline. Idempotent on
-    /// the worker side (the impl's own load() guard).
+    /// Convenience for the normal (non-pooled) flow: spawn + handshake by
+    /// impl class, then `configure` for the concrete model. On a configure
+    /// failure the (still-alive but useless-to-the-caller) worker is killed
+    /// and reaped before the error is returned — call sites always get
+    /// either a configured worker or no process at all.
+    pub async fn spawn_configured(
+        cfg: &WorkerSpawnConfig,
+        inference_id: &str,
+        spec: &SpawnSpec,
+        device: Option<String>,
+    ) -> Result<Worker> {
+        let mut worker = Self::spawn(cfg, &spec.impl_class, device)
+            .await
+            .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
+        if let Err(err) = worker.configure(inference_id, &spec.config_kwargs).await {
+            worker.kill().await;
+            return Err(err);
+        }
+        Ok(worker)
+    }
+
+    /// Send `configure` — bind this worker to a concrete model by
+    /// instantiating `impl_class(**config)` in the child — and await `ok`
+    /// within the handshake deadline (instantiation is cheap; weights load
+    /// in `load`). Exactly once per worker, before `load`. An `error` frame
+    /// (bad kwargs, failing `__init__`, double configure) is a per-request
+    /// [`WorkerError`]: the worker stays alive and is NOT poisoned. On
+    /// success the worker's log/error label becomes the inference_id.
+    pub async fn configure(
+        &mut self,
+        inference_id: &str,
+        config_kwargs: &JsonValue,
+    ) -> Result<()> {
+        let deadline = self.deadlines.handshake;
+        let fields = vec![
+            (Value::from("inference_id"), Value::from(inference_id)),
+            (Value::from("config"), json_to_rmpv(config_kwargs)),
+        ];
+        self.roundtrip("configure", fields, Some(deadline))
+            .await
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "configure as {inference_id} failed for inferio worker {}",
+                    self.label
+                )
+            })?;
+        self.label = inference_id.to_owned();
+        Ok(())
+    }
+
+    /// Send `prewarm` — run the impl's optional `prepare()` classmethod
+    /// (heavy dependency imports, no weights; absent = no-op) — and await
+    /// `ok`. Valid only between handshake and configure; idempotent. Uses
+    /// the LOAD deadline, not the handshake one: `prepare()` exists to run
+    /// the slow imports early, so it gets the same budget `load` would have
+    /// paid (see [`WorkerDeadlines::load`]). An `error` frame is a
+    /// per-request [`WorkerError`] and NON-fatal — the worker stays alive
+    /// and fully usable (a failed prepare just means load pays the
+    /// imports).
+    // No production caller yet: the prewarm pool (design §8) is the next
+    // task; the manager's normal flow goes spawn_configured -> load.
+    #[allow(dead_code)]
+    pub async fn prewarm(&mut self) -> Result<()> {
+        let deadline = self.deadlines.load;
+        self.roundtrip("prewarm", Vec::new(), Some(deadline))
+            .await
+            .map(|_| ())
+            .with_context(|| format!("prewarm failed for inferio worker {}", self.label))
+    }
+
+    /// Send `load` and await `ok` within the load deadline. Requires a
+    /// prior successful `configure`. Idempotent on the worker side (the
+    /// impl's own load() guard).
     pub async fn load(&mut self) -> Result<()> {
         let deadline = self.deadlines.load;
         self.roundtrip("load", Vec::new(), Some(deadline))
             .await
             .map(|_| ())
-            .with_context(|| format!("load failed for inferio worker {}", self.inference_id))
+            .with_context(|| format!("load failed for inferio worker {}", self.label))
     }
 
     /// Send `predict` with the given inputs and return one output per input,
@@ -354,7 +439,7 @@ impl Worker {
                 None,
             )
             .await
-            .with_context(|| format!("predict failed for inferio worker {}", self.inference_id))?;
+            .with_context(|| format!("predict failed for inferio worker {}", self.label))?;
         let outputs = match take_field(&mut payload, "outputs") {
             Some(Value::Array(outputs)) => outputs,
             other => {
@@ -411,7 +496,7 @@ impl Worker {
         self.roundtrip("ping", Vec::new(), Some(deadline))
             .await
             .map(|_| ())
-            .with_context(|| format!("ping failed for inferio worker {}", self.inference_id))
+            .with_context(|| format!("ping failed for inferio worker {}", self.label))
     }
 
     /// Graceful stop ladder: `unload` → await `ok` + process exit within
@@ -419,7 +504,7 @@ impl Worker {
     /// The child is always reaped. Returns the exit status on the graceful
     /// path (the harness exits 0 after unload).
     pub async fn shutdown(mut self) -> Result<ExitStatus> {
-        let name = self.inference_id.clone();
+        let name = self.label.clone();
         if self.dead {
             self.kill().await;
             bail!("inferio worker {name} had already failed fatally before shutdown");
@@ -525,7 +610,7 @@ impl Worker {
         if self.dead {
             bail!(
                 "inferio worker {} is dead after a previous fatal error",
-                self.inference_id
+                self.label
             );
         }
         if self.in_flight {
@@ -638,7 +723,7 @@ impl Worker {
         let tail = self.stderr_tail_snapshot();
         anyhow!(
             "inferio worker {} failed fatally: {why}; process status: {status}; stderr tail:\n{tail}",
-            self.inference_id
+            self.label
         )
     }
 
@@ -899,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn full_lifecycle_happy_path() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/echo", &spec("echo_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
             .await
             .expect("spawn + handshake");
         worker.load().await.expect("load ok");
@@ -938,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_unknown_impl_class_surfaces_worker_traceback() {
         let cfg = test_spawn_config();
-        let err = match Worker::spawn(&cfg, "test/missing", &spec("does_not_exist"), None).await {
+        let err = match Worker::spawn_configured(&cfg, "test/missing", &spec("does_not_exist"), None).await {
             Ok(_) => panic!("handshake with an unknown impl_class must fail"),
             Err(err) => err,
         };
@@ -964,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn predict_before_load_is_worker_error_and_worker_survives() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/echo", &spec("echo_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
             .await
             .expect("spawn + handshake");
 
@@ -998,7 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn externally_killed_worker_fails_next_predict_without_hanging() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/echo", &spec("echo_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
             .await
             .expect("spawn + handshake");
         worker.load().await.expect("load ok");
@@ -1036,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn stdout_hygiene_survives_printing_impl() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/printer", &spec("printing_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/printer", &spec("printing_test"), None)
             .await
             .expect("spawn + handshake");
         worker.load().await.expect("load ok despite print()");
@@ -1088,7 +1173,7 @@ mod tests {
     #[tokio::test]
     async fn stderr_forwarder_survives_invalid_utf8_and_cr_only_runs() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/badbytes", &spec("badbytes_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/badbytes", &spec("badbytes_test"), None)
             .await
             .expect("spawn + handshake");
         worker.load().await.expect("load ok");
@@ -1149,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn predict_data_round_trips_with_exact_json_fidelity() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "test/echo", &spec("echo_test"), None)
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
             .await
             .expect("spawn + handshake");
         worker.load().await.expect("load ok");
@@ -1176,5 +1261,147 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
+    }
+
+    /// The v2 pooled flow end to end: spawn by impl class (handshake only,
+    /// no instantiation), prewarm (runs the prepare_test fixture's
+    /// prepare() classmethod — proven by its stderr marker), park (ping,
+    /// like the orchestrator would before claiming a parked worker), then
+    /// configure + load + predict — the fixture reports the module flag
+    /// prepare() set, so `{"prepared": true}` proves the prewarm actually
+    /// ran in-process before the model was bound. Graceful shutdown exits 0.
+    #[tokio::test]
+    async fn prewarm_park_configure_load_happy_path() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn(&cfg, "prepare_test", None)
+            .await
+            .expect("spawn + identity handshake");
+        worker.prewarm().await.expect("prewarm runs prepare()");
+
+        // Parked: the worker is idle and unbound; ping is the claim check.
+        worker.ping().await.expect("parked worker answers ping");
+
+        worker
+            .configure("test/prepare", &json!({}))
+            .await
+            .expect("configure instantiates after the park");
+        worker.load().await.expect("load ok");
+        let outputs = worker
+            .predict(&[WorkerInput {
+                data: Some(json!(1)),
+                file: None,
+            }])
+            .await
+            .expect("predict ok");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
+
+        // The prepare() stderr marker was forwarded (drains asynchronously;
+        // poll briefly).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if worker
+                .stderr_tail_snapshot()
+                .contains("prepare_test-prepare-marker")
+            {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "prepare() marker never reached the stderr tail: {:?}",
+                    worker.stderr_tail_snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
+    }
+
+    /// unload is valid in every state: a parked prewarmed worker (spawn +
+    /// prewarm, never configured — no instance exists) is dismissed via the
+    /// same graceful ladder and exits 0.
+    #[tokio::test]
+    async fn parked_worker_unloads_gracefully() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn(&cfg, "echo_test", None)
+            .await
+            .expect("spawn + identity handshake");
+        worker.prewarm().await.expect("prewarm (no prepare) is ok");
+        let status = worker.shutdown().await.expect("graceful shutdown while parked");
+        assert_eq!(status.code(), Some(0), "parked worker exits 0 on unload");
+    }
+
+    /// configure errors are per-request: a config kwarg the impl __init__
+    /// rejects yields a WorkerError (downcastable, with the Python
+    /// traceback) and must NOT poison the worker — a follow-up configure
+    /// with good kwargs succeeds on the same process and the worker serves
+    /// normally.
+    #[tokio::test]
+    async fn failed_configure_does_not_poison_worker() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn(&cfg, "prepare_test", None)
+            .await
+            .expect("spawn + identity handshake");
+
+        // predict before configure is the state-machine sanity error.
+        let err = worker
+            .predict(&[WorkerInput {
+                data: Some(json!(1)),
+                file: None,
+            }])
+            .await
+            .expect_err("predict before configure must fail");
+        let worker_err = err
+            .downcast_ref::<WorkerError>()
+            .expect("per-request failure maps to WorkerError");
+        assert!(
+            worker_err.message.contains("configure"),
+            "message explains the missing configure: {}",
+            worker_err.message
+        );
+
+        worker
+            .configure("test/prepare", &json!({}))
+            .await
+            .expect("configure still works on the same worker");
+        worker
+            .configure("test/prepare-again", &json!({}))
+            .await
+            .expect_err("second configure is a per-request error")
+            .downcast_ref::<WorkerError>()
+            .expect("double configure maps to WorkerError");
+        worker.load().await.expect("first instance is intact");
+
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// Version-mismatch kill: a stale harness that answers the handshake
+    /// with protocol_version 1 (the fake_v1_harness package, shadowing the
+    /// real one via a PYTHONPATH prepend) must fail the spawn with a fatal
+    /// error naming the version — and the child is killed/reaped by the
+    /// fatal path (the fake lingers on stdin, so the test finishing without
+    /// a hang is the observable half of the kill).
+    #[tokio::test]
+    async fn version_mismatch_kills_worker() {
+        let mut cfg = test_spawn_config();
+        cfg.pythonpath.insert(
+            0,
+            workspace_root().join("tests/inferio_worker/fake_v1_harness"),
+        );
+        let err = match Worker::spawn(&cfg, "echo_test", None).await {
+            Ok(_) => panic!("a v1 handshake echo must be rejected"),
+            Err(err) => err,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("protocol_version") && text.contains("expected 2"),
+            "error names the version mismatch: {text}"
+        );
+        assert!(
+            err.downcast_ref::<WorkerError>().is_none(),
+            "version mismatch is a fatal supervision error, not a worker error frame"
+        );
     }
 }
