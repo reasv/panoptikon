@@ -258,10 +258,18 @@ impl Registry {
 /// module docs for the rules). Returns one entry per replica: the
 /// `CUDA_VISIBLE_DEVICES` value to pin at spawn, or `None` for no pin.
 fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
+    // Hard ceiling on the WorkerSet size: each replica is a full Python
+    // process, so anything past this is a config typo, and the pin vector is
+    // materialized eagerly at registry load (an unbounded value would OOM at
+    // boot instead of producing a load error).
+    const MAX_REPLICAS: usize = 64;
     let replicas = match config.get("replicas") {
         None => None,
         Some(value) => match value.as_i64() {
-            Some(n) if n >= 1 => Some(n as usize),
+            Some(n) if n >= 1 && (n as u64) <= MAX_REPLICAS as u64 => Some(n as usize),
+            Some(n) if n >= 1 => bail!(
+                "'replicas' ({n}) exceeds the maximum of {MAX_REPLICAS} worker processes"
+            ),
             _ => bail!("'replicas' must be an integer >= 1, got {value}"),
         },
     };
@@ -281,6 +289,13 @@ fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option
                 .collect::<Result<_>>()?;
             if devices.is_empty() {
                 bail!("'devices' must not be empty (omit it for the single-replica default)");
+            }
+            if devices.len() > MAX_REPLICAS {
+                bail!(
+                    "'devices' lists {} entries, exceeding the maximum of {MAX_REPLICAS} \
+                     worker processes",
+                    devices.len()
+                );
             }
             Some(devices)
         }
@@ -1152,6 +1167,10 @@ config.devices = ["0", "1"]
             ("config.replicas = -2", "replicas"),
             ("config.replicas = 1.5", "replicas"),
             ("config.replicas = \"two\"", "replicas"),
+            // Above the 64-process ceiling: a typo'd huge value must be a
+            // load error, not an eager multi-billion-entry pin allocation.
+            ("config.replicas = 65", "replicas"),
+            ("config.replicas = 30000000000", "replicas"),
             ("config.devices = []", "devices"),
             ("config.devices = [3, 7]", "devices"),
             ("config.devices = \"3\"", "devices"),

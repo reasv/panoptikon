@@ -321,6 +321,13 @@ pub(crate) async fn run_dispatcher(
         End::Fatal(message) => {
             // Phase 3 death policy: any replica fatal -> the whole model
             // dies (degradation to a smaller set is future work).
+            // Zero the stats first: a health probe can land while the
+            // teardown below runs (the manager entry is removed only in
+            // handle_worker_death), and the counters must not report
+            // requests/windows that are already being failed.
+            ctx.stats.queue_len.store(0, Relaxed);
+            ctx.stats.in_flight_windows.store(0, Relaxed);
+            ctx.stats.replicas_free.store(0, Relaxed);
             fail_requests(queue.drain(..), &message);
             rx.close();
             while let Ok(msg) = rx.try_recv() {
