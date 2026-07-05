@@ -45,9 +45,14 @@ pub(super) async fn build_image_frames_inputs(
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let slice_settings = if slice_frames {
-        opts.get("slice_settings")
-            .map(ImageSliceSettings::from_value)
-            .transpose()?
+        // An absent slice_settings key means full defaults (like Python's
+        // from_dict({})), not "slicing disabled" — slice_frames alone turns
+        // slicing on.
+        let value = opts
+            .get("slice_settings")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        Some(ImageSliceSettings::from_value(&value)?)
     } else {
         None
     };
@@ -449,8 +454,11 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
 
 fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicImage>> {
     let duration = probe_duration(path)?;
+    // The caller already checked the DB-recorded duration; a zero here means
+    // the file on disk disagrees (truncated or corrupt). Fail the item so it
+    // is retried instead of being permanently marked processed as "no data".
     if duration <= 0.0 {
-        return Ok(Vec::new());
+        return Err(ApiError::internal("Video has no probeable duration"));
     }
     let interval = duration / num_frames as f64;
     let temp_dir = temp_dir_path();
@@ -506,9 +514,13 @@ fn extract_video_frames_into(
     paths.sort();
     let mut frames = Vec::new();
     for frame_path in paths.into_iter().take(num_frames) {
-        if let Ok(image) = image::open(&frame_path) {
-            frames.push(image);
-        }
+        // These PNGs were just written by our own ffmpeg run; one being
+        // unreadable means something is broken (disk full, races), so fail
+        // the item rather than silently tagging it from fewer frames.
+        let image = image::open(&frame_path).map_err(|err| {
+            ApiError::internal(format!("Failed to read extracted frame: {err}"))
+        })?;
+        frames.push(image);
     }
     Ok(frames)
 }

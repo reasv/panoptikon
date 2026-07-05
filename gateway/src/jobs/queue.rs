@@ -287,8 +287,11 @@ impl Actor for JobQueueActor {
                 for queue_id in queue_ids {
                     if let Some(running) = state.running_job.as_ref() {
                         if running.queue_id == queue_id {
-                            let _ = cancel_running_job_inner(state).await;
-                            cancelled.push(queue_id);
+                            // Only report it cancelled if the runner actually
+                            // confirmed the cancellation.
+                            if cancel_running_job_inner(state).await == Some(queue_id) {
+                                cancelled.push(queue_id);
+                            }
                             continue;
                         }
                     }
@@ -538,15 +541,29 @@ async fn execute_job(job: Job) -> Result<(), String> {
         }
         JobType::JobDataDeletion => {
             let log_id = job.log_id.ok_or_else(|| "Log ID required".to_string())?;
+            // Paused like every other write-heavy job so the potential
+            // VACUUM doesn't stall continuous-scan writes mid-flight.
+            let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
+                .await
+                .map_err(|err| format!("{err:?}"))?;
             let deleted = call_index_db_writer(&job.index_db, |reply| {
                 IndexDbWriterMessage::DeleteJobData { log_id, reply }
             })
-            .await
-            .map_err(|err| format!("{err:?}"))?;
-            // VACUUM blocks the writer for the whole run; skip it when the
-            // deletion turned out to be a no-op.
-            crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0).await;
-            Ok(())
+            .await;
+            match deleted {
+                Ok(deleted) => {
+                    // VACUUM blocks the writer for the whole run; skip it
+                    // when the deletion turned out to be a no-op.
+                    crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0)
+                        .await;
+                    guard.resume().await;
+                    Ok(())
+                }
+                Err(err) => {
+                    guard.resume().await;
+                    Err(format!("{err:?}"))
+                }
+            }
         }
         #[cfg(test)]
         JobType::TestSleep => {

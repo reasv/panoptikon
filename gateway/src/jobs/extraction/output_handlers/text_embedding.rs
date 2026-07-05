@@ -17,22 +17,15 @@ pub(super) async fn handle_text_embedding_output(
     let source_data_id = item.data_id;
     let mut entries = Vec::new();
     let buffers = outputs.into_binary("text-embedding")?;
-    if buffers.is_empty() {
-        call_index_db_writer(index_db, |reply| {
-            IndexDbWriterMessage::WriteTextEmbeddingOutput {
-                job_id,
-                setter_name: model.setter_name.clone(),
-                item_sha256: item.sha256.clone(),
-                source_data_id,
-                entries: Vec::new(),
-                reply,
-            }
-        })
-        .await?;
-        return Ok(OutputDisposition::Written);
-    }
+    // The zero-input placeholder never reaches this handler, so anything
+    // other than exactly one npy for the single text input is an inference
+    // anomaly: fail the item so it stays retryable instead of writing a
+    // placeholder that would permanently mark it processed.
     if buffers.len() != 1 {
-        return Err(ApiError::internal("Text embedding output mismatch"));
+        return Err(ApiError::internal(format!(
+            "Text embedding output mismatch: expected 1 buffer, got {}",
+            buffers.len()
+        )));
     }
     let embedding_rows = parse_npy_to_f32_rows(&buffers[0])?;
     for (idx, embedding) in embedding_rows.into_iter().enumerate() {

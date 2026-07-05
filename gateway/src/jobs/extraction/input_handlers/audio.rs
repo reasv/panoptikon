@@ -120,10 +120,15 @@ fn has_audio_stream(path: &str) -> ApiResult<bool> {
         .arg(path)
         .output()
         .map_err(|err| ApiError::internal(format!("ffprobe failed: {err}")))?;
+    // ffprobe failing is not the same as "no audio stream": a corrupt file or
+    // a transient read error (e.g. an SMB hiccup) must fail the item so it is
+    // retried, not permanently marked processed with a placeholder.
     if !output.status.success() {
-        return Ok(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::internal(format!("ffprobe failed: {stderr}")));
     }
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| ApiError::internal(format!("ffprobe output unparseable: {err}")))?;
     let streams = value
         .get("streams")
         .and_then(Value::as_array)
