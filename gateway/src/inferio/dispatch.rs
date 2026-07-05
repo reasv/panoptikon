@@ -390,7 +390,11 @@ mod tests {
             1,
             "cap is clamped to >= 1"
         );
-        assert_eq!(effective_cap([Some(0)], None, 64), 1, "explicit 0 clamps to 1");
+        assert_eq!(
+            effective_cap([Some(0)], None, 64),
+            1,
+            "explicit 0 clamps to 1"
+        );
     }
 
     /// Window formation takes a FIFO prefix while the running unit total

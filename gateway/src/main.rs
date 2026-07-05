@@ -34,8 +34,19 @@ use utoipa_swagger_ui::SwaggerUi;
     about = "Panoptikon reverse proxy gateway"
 )]
 struct Args {
-    #[arg(long, value_name = "PATH")]
+    /// Config file path (global: also valid after the subcommand).
+    #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Run ONLY the local inference service (`/api/inference/*` + `/health`):
+    /// no proxy, API, jobs, cron, or migrations. For machines that just lend
+    /// their GPU to other panoptikon instances (design doc §3).
+    Inferio,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +73,11 @@ async fn async_main() -> anyhow::Result<()> {
         .config
         .or_else(|| env::var(config::CONFIG_PATH_ENV).ok().map(PathBuf::from));
     let settings = Arc::new(config::Settings::load(config_path)?);
+
+    if matches!(args.command, Some(Command::Inferio)) {
+        return inferio_main(settings).await;
+    }
+
     let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;
     let api_upstream = proxy::Upstream::parse("api", &settings.upstreams.api.base_url)?;
     let inference_config = settings
@@ -86,7 +102,10 @@ async fn async_main() -> anyhow::Result<()> {
         embedding_cache_size: settings.search.embedding_cache_size,
         loader_concurrency: settings.jobs.loader_concurrency,
         intermediate_budget_kib: u32::try_from(
-            settings.jobs.intermediate_data_budget_mb.saturating_mul(1024),
+            settings
+                .jobs
+                .intermediate_data_budget_mb
+                .saturating_mul(1024),
         )
         .unwrap_or(u32::MAX),
     })?;
@@ -111,9 +130,30 @@ async fn async_main() -> anyhow::Result<()> {
         db::migrations::migrate_all_databases_on_disk().await?;
     }
 
-    let mut app = Router::new()
-        .route("/api/inference", any(proxy::proxy_inference))
-        .route("/api/inference/{*path}", any(proxy::proxy_inference))
+    // Local inference (design doc §3): when enabled, the /api/inference/*
+    // paths that used to be proxied are served in-process by the inferio
+    // orchestrator — same position in the router, so they stay behind the
+    // policy layer (which strips DB params for inference paths) exactly like
+    // the proxy did. When disabled, proxy exactly as before.
+    let inferio_state = if settings.inference_local.enabled {
+        Some(inferio::http::InferioState::from_settings(&settings)?)
+    } else {
+        None
+    };
+
+    let mut app = Router::new();
+    match &inferio_state {
+        Some(state) => {
+            tracing::info!("serving /api/inference locally (inference_local.enabled)");
+            app = app.nest_service("/api/inference", inferio::http::router(Arc::clone(state)));
+        }
+        None => {
+            app = app
+                .route("/api/inference", any(proxy::proxy_inference))
+                .route("/api/inference/{*path}", any(proxy::proxy_inference));
+        }
+    }
+    let mut app = app
         .route("/api", any(proxy::proxy_api))
         .route("/api/{*path}", any(proxy::proxy_api))
         .route("/docs", any(proxy::proxy_api))
@@ -178,47 +218,47 @@ async fn async_main() -> anyhow::Result<()> {
         let _ = jobs::cron::ensure_cron_scheduler().await;
         app = app
             .route(
-                    "/api/jobs/queue",
-                    get(api::jobs::queue_status).delete(api::jobs::cancel_queued),
-                )
-                .route(
-                    "/api/jobs/data/extraction",
-                    post(api::jobs::enqueue_data_extraction)
-                        .delete(api::jobs::enqueue_delete_extracted_data),
-                )
-                .route(
-                    "/api/jobs/folders/rescan",
-                    post(api::jobs::enqueue_folder_rescan),
-                )
-                .route(
-                    "/api/jobs/folders",
-                    get(api::jobs::get_folders).put(api::jobs::enqueue_update_folders),
-                )
-                .route("/api/jobs/cancel", post(api::jobs::cancel_current_job))
-                .route(
-                    "/api/jobs/folders/history",
-                    get(api::jobs::get_scan_history),
-                )
-                .route(
-                    "/api/jobs/data/history",
-                    get(api::jobs::get_extraction_history).delete(api::jobs::delete_scan_data),
-                )
-                .route(
-                    "/api/jobs/config",
-                    get(api::jobs::get_config).put(api::jobs::update_config),
-                )
-                .route(
-                    "/api/jobs/data/setters/total",
-                    get(api::jobs::get_setter_data_count),
-                )
-                .route(
-                    "/api/jobs/cronjob/run",
-                    post(api::jobs::manual_trigger_cronjob),
-                )
-                .route(
-                    "/api/jobs/cronjob/schedule",
-                    get(api::jobs::get_cronjob_schedule),
-                );
+                "/api/jobs/queue",
+                get(api::jobs::queue_status).delete(api::jobs::cancel_queued),
+            )
+            .route(
+                "/api/jobs/data/extraction",
+                post(api::jobs::enqueue_data_extraction)
+                    .delete(api::jobs::enqueue_delete_extracted_data),
+            )
+            .route(
+                "/api/jobs/folders/rescan",
+                post(api::jobs::enqueue_folder_rescan),
+            )
+            .route(
+                "/api/jobs/folders",
+                get(api::jobs::get_folders).put(api::jobs::enqueue_update_folders),
+            )
+            .route("/api/jobs/cancel", post(api::jobs::cancel_current_job))
+            .route(
+                "/api/jobs/folders/history",
+                get(api::jobs::get_scan_history),
+            )
+            .route(
+                "/api/jobs/data/history",
+                get(api::jobs::get_extraction_history).delete(api::jobs::delete_scan_data),
+            )
+            .route(
+                "/api/jobs/config",
+                get(api::jobs::get_config).put(api::jobs::update_config),
+            )
+            .route(
+                "/api/jobs/data/setters/total",
+                get(api::jobs::get_setter_data_count),
+            )
+            .route(
+                "/api/jobs/cronjob/run",
+                post(api::jobs::manual_trigger_cronjob),
+            )
+            .route(
+                "/api/jobs/cronjob/schedule",
+                get(api::jobs::get_cronjob_schedule),
+            );
     }
 
     let app = app
@@ -234,10 +274,13 @@ async fn async_main() -> anyhow::Result<()> {
     // requests while the cleanup task cancels jobs and flushes the DB writers.
     // Both must finish before main returns; shutdown.rs enforces the deadline.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let inferio_manager = inferio_state
+        .as_ref()
+        .map(|state| Arc::clone(&state.manager));
     let cleanup = tokio::spawn(async move {
         shutdown::wait_for_signal().await;
         let _ = shutdown_tx.send(());
-        shutdown::run_cleanup(local_api).await;
+        shutdown::run_cleanup(local_api, inferio_manager).await;
     });
     axum::serve(
         listener,
@@ -249,5 +292,46 @@ async fn async_main() -> anyhow::Result<()> {
     .await?;
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
+    Ok(())
+}
+
+/// `panoptikon-gateway inferio`: the standalone inference service (design
+/// doc §3 "GPU lender" mode). Same config file, same policy layer (host
+/// policies + rulesets apply; inference paths get DB params stripped), but
+/// only `/api/inference/*` and `/health` are served — no proxy, local API,
+/// jobs, cron, or migrations. `inference_local.enabled` is implied by the
+/// subcommand; `[inference_local].port` overrides the listen port
+/// (defaults to `server.port`).
+async fn inferio_main(settings: Arc<config::Settings>) -> anyhow::Result<()> {
+    let state = inferio::http::InferioState::from_settings(&settings)?;
+    let app = inferio::http::standalone_router(Arc::clone(&state))
+        .layer(TraceLayer::new_for_http())
+        .layer(policy::PolicyLayer::new(Arc::clone(&settings)));
+
+    let port = settings
+        .inference_local
+        .port
+        .unwrap_or(settings.server.port);
+    let listen_addr = format!("{}:{}", settings.server.host, port);
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    tracing::info!(address = %listen_addr, "inference service listening (inferio mode)");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let manager = Arc::clone(&state.manager);
+    let cleanup = tokio::spawn(async move {
+        shutdown::wait_for_signal().await;
+        let _ = shutdown_tx.send(());
+        shutdown::run_inferio_cleanup(manager).await;
+    });
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+    let _ = cleanup.await;
+    tracing::info!("inference service stopped");
     Ok(())
 }

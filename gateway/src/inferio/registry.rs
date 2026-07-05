@@ -81,10 +81,7 @@ impl RegistryConfig {
             None => {
                 let dir = PathBuf::from("src/inferio/config");
                 if !dir.is_dir() {
-                    bail!(
-                        "Base configuration folder not found at: {}",
-                        dir.display()
-                    );
+                    bail!("Base configuration folder not found at: {}", dir.display());
                 }
                 dir
             }
@@ -168,11 +165,10 @@ impl Registry {
     /// Metadata for one inference id, matching Python's `get_metadata`
     /// (config.py:120-136): `{"group_metadata": ..., "inference_id_metadata":
     /// ...}`, or None when the group or id is unknown.
-    pub fn inference_id_metadata(
-        &self,
-        group_name: &str,
-        inference_id: &str,
-    ) -> Option<JsonValue> {
+    // Not exposed over HTTP (router.py has no such endpoint); kept for the
+    // API-side consumers that use Python's get_metadata when they port over.
+    #[allow(dead_code)]
+    pub fn inference_id_metadata(&self, group_name: &str, inference_id: &str) -> Option<JsonValue> {
         let group = self.groups.get(group_name)?;
         let entry = group.inference_ids.get(inference_id)?;
         let mut obj = JsonMap::new();
@@ -196,13 +192,9 @@ impl Registry {
     /// fails its impl-class lookup at load time; we fail here instead — the
     /// same user-visible outcome (model load errors), just earlier.
     pub fn spawn_spec(&self, full_inference_id: &str) -> Result<SpawnSpec> {
-        let (group_name, inference_id) = full_inference_id
-            .split_once('/')
-            .with_context(|| {
-                format!(
-                    "Inference ID '{full_inference_id}' must be in 'group/name' form"
-                )
-            })?;
+        let (group_name, inference_id) = full_inference_id.split_once('/').with_context(|| {
+            format!("Inference ID '{full_inference_id}' must be in 'group/name' form")
+        })?;
         let group = self
             .groups
             .get(group_name)
@@ -378,22 +370,20 @@ fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<(
             merge_table_into(&mut entry.group_config, table);
         }
         if let Some(metadata) = group_data.get("metadata") {
-            let table = metadata.as_table().with_context(|| {
-                format!("group '{group_name}' metadata must be a table")
-            })?;
+            let table = metadata
+                .as_table()
+                .with_context(|| format!("group '{group_name}' metadata must be a table"))?;
             merge_table_into(&mut entry.group_metadata, table);
         }
 
         let Some(ids_value) = group_data.get("inference_ids") else {
             continue;
         };
-        let id_tables = ids_value.as_table().with_context(|| {
-            format!("group '{group_name}' inference_ids must be a table")
-        })?;
+        let id_tables = ids_value
+            .as_table()
+            .with_context(|| format!("group '{group_name}' inference_ids must be a table"))?;
         for (inference_id, inf_data) in id_tables {
-            if entry.inference_ids.contains_key(inference_id)
-                && !allow_inference_id_overrides
-            {
+            if entry.inference_ids.contains_key(inference_id) && !allow_inference_id_overrides {
                 // Same failure mode as Python (config.py:61-63): the error
                 // propagates and the entire load fails.
                 bail!(
@@ -414,9 +404,7 @@ fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<(
             let mut merged_config = entry.group_config.clone();
             if let Some(config) = inf_data.get("config") {
                 let table = config.as_table().with_context(|| {
-                    format!(
-                        "inference id '{group_name}/{inference_id}' config must be a table"
-                    )
+                    format!("inference id '{group_name}/{inference_id}' config must be a table")
                 })?;
                 merge_table_into(&mut merged_config, table);
             }
@@ -472,9 +460,7 @@ fn toml_to_json(value: &toml::Value) -> JsonValue {
         // tomli yields datetime objects which FastAPI would serialize as ISO
         // strings; the TOML text form is that ISO string.
         toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
-        toml::Value::Array(items) => {
-            JsonValue::Array(items.iter().map(toml_to_json).collect())
-        }
+        toml::Value::Array(items) => JsonValue::Array(items.iter().map(toml_to_json).collect()),
         toml::Value::Table(table) => JsonValue::Object(table_to_json_map(table)),
     }
 }
@@ -559,7 +545,10 @@ mod tests {
         let registry = registry_for(&[&dir]).expect("built-in registry loads");
 
         let entry = &registry.groups["tagmatch"].inference_ids["danbooru"];
-        assert!(entry.config.contains_key("ray_config"), "merged config keeps it");
+        assert!(
+            entry.config.contains_key("ray_config"),
+            "merged config keeps it"
+        );
 
         let spec = registry.spawn_spec("tagmatch/danbooru").expect("resolves");
         assert_eq!(spec.impl_class, "danbooru_tagger");
@@ -580,8 +569,14 @@ mod tests {
         let id_meta = &tags["inference_ids"]["wd-swinv2-tagger-v3"];
         assert!(id_meta["description"].is_string());
         assert!(id_meta.get("config").is_none(), "config must not leak");
-        assert!(id_meta.get("impl_class").is_none(), "impl_class must not leak");
-        assert!(tags.get("group_config").is_none(), "group config must not leak");
+        assert!(
+            id_meta.get("impl_class").is_none(),
+            "impl_class must not leak"
+        );
+        assert!(
+            tags.get("group_config").is_none(),
+            "group config must not leak"
+        );
     }
 
     /// Group-level config is inherited by every inference id, and id-level
@@ -675,8 +670,8 @@ config.v = 1
 config.v = 2
 "#,
         );
-        let err = registry_for(&[base.path(), user.path()])
-            .expect_err("duplicate id must fail the load");
+        let err =
+            registry_for(&[base.path(), user.path()]).expect_err("duplicate id must fail the load");
         assert!(
             format!("{err:#}").contains("Duplicate inference_id 'g/x'"),
             "unexpected error: {err:#}"
@@ -717,8 +712,7 @@ metadata.extra = "added"
 config.v = 2
 "#,
         );
-        let registry =
-            registry_for(&[base.path(), user.path()]).expect("override load succeeds");
+        let registry = registry_for(&[base.path(), user.path()]).expect("override load succeeds");
 
         let spec = registry.spawn_spec("g/x").expect("resolves");
         assert_eq!(spec.config_kwargs, json!({"v": 2}), "later definition wins");
@@ -809,8 +803,7 @@ config.impl_class = "cls"
 "#,
         );
         let missing = dir.path().join("does-not-exist");
-        let registry =
-            registry_for(&[dir.path(), &missing]).expect("missing dir is not fatal");
+        let registry = registry_for(&[dir.path(), &missing]).expect("missing dir is not fatal");
         assert!(registry.groups["g"].inference_ids.contains_key("x"));
     }
 
@@ -857,7 +850,10 @@ config.v = 2
         .unwrap();
         set_mtime(&file, original_mtime);
         let third = cache.get().expect("still cached");
-        assert!(Arc::ptr_eq(&first, &third), "same mtime keeps the old snapshot");
+        assert!(
+            Arc::ptr_eq(&first, &third),
+            "same mtime keeps the old snapshot"
+        );
 
         // Bump the mtime forward: reload picks up the new content.
         set_mtime(&file, original_mtime + Duration::from_secs(2));
@@ -909,7 +905,9 @@ config.v = 1
         let err = registry.spawn_spec("g/nope").expect_err("unknown id");
         assert!(format!("{err:#}").contains("Inference ID 'nope' not found in group 'g'"));
 
-        let err = registry.spawn_spec("g/noimpl").expect_err("missing impl_class");
+        let err = registry
+            .spawn_spec("g/noimpl")
+            .expect_err("missing impl_class");
         assert!(format!("{err:#}").contains("impl_class"));
 
         let err = registry.spawn_spec("no-slash").expect_err("malformed id");

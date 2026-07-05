@@ -293,9 +293,9 @@ impl Worker {
                 // own (the harness exits 1); fatal paths already killed it.
                 // kill() is safe in both cases and guarantees the reap.
                 worker.kill().await;
-                return Err(
-                    err.context(format!("inferio worker handshake failed for {inference_id}"))
-                );
+                return Err(err.context(format!(
+                    "inferio worker handshake failed for {inference_id}"
+                )));
             }
         };
         let version = map_get(&payload, "protocol_version").and_then(Value::as_u64);
@@ -377,15 +377,20 @@ impl Worker {
             .enumerate()
             .map(|(index, output)| match output {
                 Value::Binary(bytes) => Ok(WorkerOutput::Bytes(bytes)),
-                other => rmpv_to_json(&other).map(WorkerOutput::Json).with_context(|| {
-                    format!("predict output {index} is not representable as JSON")
-                }),
+                other => rmpv_to_json(&other)
+                    .map(WorkerOutput::Json)
+                    .with_context(|| {
+                        format!("predict output {index} is not representable as JSON")
+                    }),
             })
             .collect()
     }
 
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
     /// deadline (an unbounded liveness probe would be useless).
+    // No production caller yet: per-worker liveness reporting arrives with
+    // the fuller /health surface (design §7/§8).
+    #[allow(dead_code)]
     pub async fn ping(&mut self) -> Result<()> {
         let deadline = self.deadlines.handshake;
         self.roundtrip("ping", Vec::new(), Some(deadline))
@@ -443,7 +448,9 @@ impl Worker {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                bail!("unload was not acknowledged (type {resp_type:?}, id {resp_id:?}): {message}");
+                bail!(
+                    "unload was not acknowledged (type {resp_type:?}, id {resp_id:?}): {message}"
+                );
             }
             let status = child
                 .wait()

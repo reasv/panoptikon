@@ -597,10 +597,13 @@ impl ModelManager {
             if state.shutting_down {
                 bail!("the model manager is shutting down");
             }
-            let unloads =
-                state
-                    .cache
-                    .touch_load(inference_id, cache_key, lru_size, ttl_seconds, Local::now());
+            let unloads = state.cache.touch_load(
+                inference_id,
+                cache_key,
+                lru_size,
+                ttl_seconds,
+                Local::now(),
+            );
             for id in &unloads {
                 Self::begin_unload(&mut state, id);
             }
@@ -659,11 +662,7 @@ impl ModelManager {
             generation,
             registry_default_batch,
             server_default_batch: self.cfg.default_max_batch,
-            manager: self
-                .weak
-                .get()
-                .cloned()
-                .expect("weak self is set in new()"),
+            manager: self.weak.get().cloned().expect("weak self is set in new()"),
         };
         // WorkerSet seam (design §8): one replica in Phase 1; the
         // dispatcher receives a Vec either way.
@@ -762,7 +761,11 @@ mod tests {
         assert!(cache.touch_load("g/a", "k", 2, -1, now).is_empty());
         assert!(cache.touch_load("g/b", "k", 2, -1, now).is_empty());
         let unloads = cache.touch_load("g/c", "k", 2, -1, now);
-        assert_eq!(unloads, vec!["g/a".to_string()], "oldest entry evicted and unloaded");
+        assert_eq!(
+            unloads,
+            vec!["g/a".to_string()],
+            "oldest entry evicted and unloaded"
+        );
         assert!(!cache.refs_non_empty("g/a"));
         assert!(cache.refs_non_empty("g/b") && cache.refs_non_empty("g/c"));
     }
@@ -778,7 +781,11 @@ mod tests {
         cache.touch_load("g/b", "k", 2, -1, now);
         cache.touch_load("g/a", "k", 2, -1, now); // renew: a becomes most recent
         let unloads = cache.touch_load("g/c", "k", 2, -1, now);
-        assert_eq!(unloads, vec!["g/b".to_string()], "b was oldest after a's renewal");
+        assert_eq!(
+            unloads,
+            vec!["g/b".to_string()],
+            "b was oldest after a's renewal"
+        );
     }
 
     /// A model referenced by two cache keys survives eviction/removal from
@@ -840,7 +847,10 @@ mod tests {
         let unloads = cache.expire(at(now, 5));
         assert_eq!(unloads, vec!["g/expired".to_string()]);
         assert!(cache.refs_non_empty("g/never"), "ttl -1 never expires");
-        assert!(cache.refs_non_empty("g/pinned"), "pinned skipped while expired");
+        assert!(
+            cache.refs_non_empty("g/pinned"),
+            "pinned skipped while expired"
+        );
 
         // Unpinning with a fresh TTL restores the window: not expired right
         // after, expired once the restored TTL passes.
@@ -868,7 +878,10 @@ mod tests {
         );
 
         cache.unpin_restore("g/a", "k", 1, at(now, 60));
-        assert!(cache.expire(at(now, 61)).is_empty(), "restored ttl not yet past");
+        assert!(
+            cache.expire(at(now, 61)).is_empty(),
+            "restored ttl not yet past"
+        );
         assert_eq!(cache.expire(at(now, 62)), vec!["g/a".to_string()]);
     }
 
@@ -1036,10 +1049,20 @@ config.impl_class = "does_not_exist"
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("echo/test", "key", 10, 60, None, vec![data_input(json!({"text": "a"}))])
+            .predict(
+                "echo/test",
+                "key",
+                10,
+                60,
+                None,
+                vec![data_input(json!({"text": "a"}))],
+            )
             .await
             .expect("first predict auto-loads");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": {"text": "a"}}))]);
+        assert_eq!(
+            outputs,
+            vec![WorkerOutput::Json(json!({"echo": {"text": "a"}}))]
+        );
         let generation = manager.loaded_generation("echo/test").expect("loaded");
         assert_eq!(
             manager.cached_models(),
@@ -1069,8 +1092,14 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager.load_model("echo/test", "a", 10, -1).await.expect("load via a");
-        manager.load_model("echo/test", "b", 10, -1).await.expect("load via b");
+        manager
+            .load_model("echo/test", "a", 10, -1)
+            .await
+            .expect("load via a");
+        manager
+            .load_model("echo/test", "b", 10, -1)
+            .await
+            .expect("load via b");
         let generation = manager.loaded_generation("echo/test").expect("loaded");
 
         assert!(manager.unload_model("a", "echo/test").await.unwrap());
@@ -1087,7 +1116,10 @@ config.impl_class = "does_not_exist"
         assert_eq!(manager.loaded_generation("echo/test"), Some(generation));
 
         assert!(manager.unload_model("b", "echo/test").await.unwrap());
-        assert!(manager.cached_models().is_empty(), "last ref gone -> unloaded");
+        assert!(
+            manager.cached_models().is_empty(),
+            "last ref gone -> unloaded"
+        );
         assert_eq!(manager.loaded_generation("echo/test"), None);
         // Removing again reports "not cached".
         assert!(!manager.unload_model("b", "echo/test").await.unwrap());
@@ -1098,7 +1130,10 @@ config.impl_class = "does_not_exist"
             .expect("respawns after unload");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 1}))]);
         assert!(
-            manager.loaded_generation("echo/test").expect("loaded again") > generation,
+            manager
+                .loaded_generation("echo/test")
+                .expect("loaded again")
+                > generation,
             "a fresh worker was spawned"
         );
 
@@ -1113,8 +1148,14 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager.load_model("echo/test", "k", 1, -1).await.expect("load first");
-        manager.load_model("echo/second", "k", 1, -1).await.expect("load second");
+        manager
+            .load_model("echo/test", "k", 1, -1)
+            .await
+            .expect("load first");
+        manager
+            .load_model("echo/second", "k", 1, -1)
+            .await
+            .expect("load second");
 
         assert_eq!(
             manager.cached_models(),
@@ -1135,8 +1176,14 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_millis(200), 32);
         let manager = &setup.manager;
 
-        manager.load_model("echo/second", "k", 10, -1).await.expect("load never");
-        manager.load_model("echo/test", "k", 10, 1).await.expect("load short ttl");
+        manager
+            .load_model("echo/second", "k", 10, -1)
+            .await
+            .expect("load never");
+        manager
+            .load_model("echo/test", "k", 10, 1)
+            .await
+            .expect("load short ttl");
 
         tokio::time::sleep(Duration::from_millis(2500)).await;
 
@@ -1173,7 +1220,9 @@ config.impl_class = "does_not_exist"
         // expiration was restored to a finite timestamp (not never).
         let expirations = manager.cache_expirations("k");
         assert!(
-            expirations.get("slow/test").is_some_and(|exp| exp.is_some()),
+            expirations
+                .get("slow/test")
+                .is_some_and(|exp| exp.is_some()),
             "entry present with restored finite ttl: {expirations:?}"
         );
 
@@ -1197,7 +1246,10 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager.load_model("batch/test", "k", 10, -1).await.expect("load");
+        manager
+            .load_model("batch/test", "k", 10, -1)
+            .await
+            .expect("load");
 
         let first = {
             let manager = manager.clone();
@@ -1248,14 +1300,24 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager.load_model("batch/test", "k", 10, -1).await.expect("load");
+        manager
+            .load_model("batch/test", "k", 10, -1)
+            .await
+            .expect("load");
 
         let mut tasks = Vec::new();
         for i in 0..6 {
             let manager = manager.clone();
             tasks.push(tokio::spawn(async move {
                 manager
-                    .predict("batch/test", "k", 10, -1, Some(2), vec![data_input(json!(i))])
+                    .predict(
+                        "batch/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(2),
+                        vec![data_input(json!(i))],
+                    )
                     .await
             }));
         }
@@ -1278,13 +1340,23 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager.load_model("failbatch/test", "k", 10, -1).await.expect("load");
+        manager
+            .load_model("failbatch/test", "k", 10, -1)
+            .await
+            .expect("load");
 
         let first = {
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("failbatch/test", "k", 10, -1, None, vec![data_input(json!(0))])
+                    .predict(
+                        "failbatch/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        vec![data_input(json!(0))],
+                    )
                     .await
             })
         };
@@ -1295,7 +1367,14 @@ config.impl_class = "does_not_exist"
             let manager = manager.clone();
             rest.push(tokio::spawn(async move {
                 manager
-                    .predict("failbatch/test", "k", 10, -1, None, vec![data_input(json!(i))])
+                    .predict(
+                        "failbatch/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        vec![data_input(json!(i))],
+                    )
                     .await
             }));
         }
@@ -1369,7 +1448,10 @@ config.impl_class = "does_not_exist"
             "worker's handshake error is preserved: {err:#}"
         );
         assert!(manager.cached_models().is_empty(), "no phantom cache entry");
-        assert!(manager.cache_expirations("k").is_empty(), "no LRU entry left behind");
+        assert!(
+            manager.cache_expirations("k").is_empty(),
+            "no LRU entry left behind"
+        );
 
         manager.shutdown().await;
     }
@@ -1382,7 +1464,10 @@ config.impl_class = "does_not_exist"
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager.load_model("echo/test", "k", 10, -1).await.expect("load");
+        manager
+            .load_model("echo/test", "k", 10, -1)
+            .await
+            .expect("load");
         manager.shutdown().await;
 
         assert!(manager.cached_models().is_empty());

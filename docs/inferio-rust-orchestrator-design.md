@@ -275,8 +275,9 @@ unknowable in principle; `batch_size` on the job UI is the user's manual
 overflow lever. Today that signal never reaches inferio, and merging can
 combine multiple clients' requests. The fix is to carry the signal:
 
-- `POST /predict` and `PUT /load` gain an optional `max_batch` query param
-  (additive, ignored by old servers).
+- `POST /predict` gains an optional `max_batch` query param (additive,
+  ignored by old servers). Predict-only: under the stateless per-merge cap
+  rule there is no state a load-time cap could attach to.
 - Extraction jobs pass their job `batch_size` as `max_batch`. Search passes
   nothing (batch-of-1 queries don't express a VRAM opinion).
 - The cap is **stateless — computed per merge** (decided 2026-07-05): when
@@ -326,7 +327,7 @@ and the web UI all keep working with zero changes, and parity is testable
 request-by-request against the Python server.
 
 Additions (all additive):
-- `max_batch` on predict/load (§6).
+- `max_batch` on predict (§6; predict-only under the stateless cap rule).
 - `GET /health`: orchestrator + per-worker liveness, loaded models, queue
   depths — the observability we never had.
 - (Reserved) `prewarm` load mode (§8).
