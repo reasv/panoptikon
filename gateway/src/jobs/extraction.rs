@@ -250,6 +250,10 @@ async fn run_extraction_job_inner(
             CACHE_KEY,
             CACHE_LRU_SIZE,
             CACHE_TTL_SECS,
+            // Batch jobs opt out of lazy prewarming (design doc §8):
+            // batch-only model families must not hold a warm worker's RAM
+            // after the job ends.
+            Some(false),
         )
         .await;
     if let Err(err) = load_result {
@@ -590,6 +594,8 @@ async fn run_chunked_inference(
                 // merge cap (design doc §6): a local orchestrator must not
                 // form GPU batches larger than what this job was tuned for.
                 Some(u32::try_from(chunk_size).unwrap_or(u32::MAX)),
+                // Batch jobs opt out of lazy prewarming (design doc §8).
+                Some(false),
                 chunk,
             )
             .await;

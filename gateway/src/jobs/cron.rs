@@ -23,7 +23,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::{OnceCell, oneshot};
 
 use crate::api_error::ApiError;
-use crate::db::extraction_log::get_existing_setters;
+use crate::db::extraction_log::get_search_embedding_setters;
 use crate::db::info::{db_defaults, db_lists};
 use crate::db::open_index_db_read;
 use crate::db::system_config::{CronJob, SystemConfig, SystemConfigStore};
@@ -435,20 +435,14 @@ async fn preload_tick(state: &mut CronSchedulerState, index_db: &str, config: &S
             return;
         }
     };
-    let setters = match get_existing_setters(&mut conn).await {
+    // Shared selection rule with the prewarm eager set (extraction_log.rs).
+    let embedding_setters = match get_search_embedding_setters(&mut conn).await {
         Ok(setters) => setters,
         Err(err) => {
             tracing::error!(error = ?err, index_db, "preload failed to list setters");
             return;
         }
     };
-    let embedding_setters: Vec<String> = setters
-        .into_iter()
-        .filter(|(data_type, setter)| {
-            (data_type == "text-embedding" || data_type == "clip") && !setter.starts_with("tclip/")
-        })
-        .map(|(_, setter)| setter)
-        .collect();
     if embedding_setters.is_empty() {
         return;
     }
@@ -470,6 +464,9 @@ async fn preload_tick(state: &mut CronSchedulerState, index_db: &str, config: &S
                 &cache_key,
                 embedding_setters.len() as i64,
                 PRELOAD_TTL_SECS,
+                // No prewarm opinion (absent = true): preloaded embedding
+                // models are exactly what the warm pool exists to back up.
+                None,
             )
             .await
         {

@@ -110,6 +110,7 @@ impl InferenceApiClient {
         lru_size: i64,
         ttl_seconds: i64,
         max_batch: Option<u32>,
+        prewarm: Option<bool>,
         inputs: &[InferenceInput],
     ) -> Result<PredictOutput> {
         let url = format!("{}/predict/{}", self.base_url, inference_id);
@@ -124,6 +125,12 @@ impl InferenceApiClient {
         // to a pre-max_batch upstream is harmless.
         if let Some(max_batch) = max_batch {
             query.push(("max_batch", max_batch.to_string()));
+        }
+        // Lazy prewarm hint (design doc §8): absent = true on the server,
+        // so only callers with an opinion (extraction jobs: false) send it.
+        // Equally ignored by old Python servers.
+        if let Some(prewarm) = prewarm {
+            query.push(("prewarm", prewarm.to_string()));
         }
         let mut attempts: u32 = 0;
         loop {
@@ -183,16 +190,23 @@ impl InferenceApiClient {
         cache_key: &str,
         lru_size: i64,
         ttl_seconds: i64,
+        prewarm: Option<bool>,
     ) -> Result<Value> {
         let url = format!("{}/load/{}", self.base_url, inference_id);
+        let mut query: Vec<(&str, String)> = vec![
+            ("cache_key", cache_key.to_string()),
+            ("lru_size", lru_size.to_string()),
+            ("ttl_seconds", ttl_seconds.to_string()),
+        ];
+        // Lazy prewarm hint (design doc §8), same absent-means-true rule as
+        // on predict; old Python servers ignore it.
+        if let Some(prewarm) = prewarm {
+            query.push(("prewarm", prewarm.to_string()));
+        }
         let response = self
             .client
             .put(url)
-            .query(&[
-                ("cache_key", cache_key),
-                ("lru_size", &lru_size.to_string()),
-                ("ttl_seconds", &ttl_seconds.to_string()),
-            ])
+            .query(&query)
             .send()
             .await
             .context("inference load request failed")?;
@@ -471,27 +485,40 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    /// The predict request must carry `max_batch` as a query param exactly
-    /// when the caller passes Some (the stateless per-request merge cap,
-    /// design doc §6) and omit it entirely when None — so callers with no
-    /// batch opinion (PQL search embeds) leave the server's own default cap
-    /// in charge, and the param never appears as a spurious `max_batch=`
-    /// empty value. Captured off a stub server because the client builds
-    /// the URL internally.
+    /// The predict request must carry `max_batch` (design §6) and `prewarm`
+    /// (design §8) as query params exactly when the caller passes Some, and
+    /// omit them entirely when None — so callers with no opinion (PQL
+    /// search embeds pass None for both) leave the server defaults in
+    /// charge, and the params never appear as spurious empty values. Same
+    /// contract on PUT /load for `prewarm` (extraction jobs pass
+    /// Some(false); cron preload passes None). Captured off a stub server
+    /// because the client builds the URLs internally.
     #[tokio::test]
-    async fn predict_url_carries_max_batch_only_when_some() {
+    async fn urls_carry_max_batch_and_prewarm_only_when_some() {
         let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-        let sink = Arc::clone(&captured);
-        let app = Router::new().route(
-            "/api/inference/predict/{group}/{id}",
-            post(move |RawQuery(query): RawQuery| {
-                let sink = Arc::clone(&sink);
-                async move {
-                    sink.lock().unwrap().push(query.unwrap_or_default());
-                    Json(json!({"outputs": [{"ok": true}]}))
-                }
-            }),
-        );
+        let predict_sink = Arc::clone(&captured);
+        let load_sink = Arc::clone(&captured);
+        let app = Router::new()
+            .route(
+                "/api/inference/predict/{group}/{id}",
+                post(move |RawQuery(query): RawQuery| {
+                    let sink = Arc::clone(&predict_sink);
+                    async move {
+                        sink.lock().unwrap().push(query.unwrap_or_default());
+                        Json(json!({"outputs": [{"ok": true}]}))
+                    }
+                }),
+            )
+            .route(
+                "/api/inference/load/{group}/{id}",
+                axum::routing::put(move |RawQuery(query): RawQuery| {
+                    let sink = Arc::clone(&load_sink);
+                    async move {
+                        sink.lock().unwrap().push(query.unwrap_or_default());
+                        Json(json!({"status": "loaded"}))
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -502,32 +529,50 @@ mod tests {
             .expect("client builds");
         let inputs = [InferenceInput::new(json!({"text": "x"}), None)];
         client
-            .predict("group/model", "key", 10, -1, Some(7), &inputs)
+            .predict("group/model", "key", 10, -1, Some(7), Some(false), &inputs)
             .await
-            .expect("capped predict");
+            .expect("capped no-prewarm predict");
         client
-            .predict("group/model", "key", 10, -1, None, &inputs)
+            .predict("group/model", "key", 10, -1, None, None, &inputs)
             .await
-            .expect("uncapped predict");
+            .expect("no-opinion predict");
+        client
+            .load_model("group/model", "key", 10, -1, Some(false))
+            .await
+            .expect("no-prewarm load");
+        client
+            .load_model("group/model", "key", 10, -1, None)
+            .await
+            .expect("no-opinion load");
 
         let queries = captured.lock().unwrap().clone();
-        assert_eq!(queries.len(), 2, "both predicts reached the stub");
+        assert_eq!(queries.len(), 4, "all four requests reached the stub");
         assert!(
-            queries[0].contains("max_batch=7"),
-            "Some(7) serializes as a max_batch query param: {}",
+            queries[0].contains("max_batch=7") && queries[0].contains("prewarm=false"),
+            "Some values serialize as query params: {}",
             queries[0]
         );
         assert!(
             queries[0].contains("cache_key=key")
                 && queries[0].contains("lru_size=10")
                 && queries[0].contains("ttl_seconds=-1"),
-            "existing params still present alongside max_batch: {}",
+            "existing params still present alongside the additive ones: {}",
             queries[0]
         );
         assert!(
-            !queries[1].contains("max_batch"),
-            "None omits the param entirely: {}",
+            !queries[1].contains("max_batch") && !queries[1].contains("prewarm"),
+            "None omits both params entirely: {}",
             queries[1]
+        );
+        assert!(
+            queries[2].contains("prewarm=false"),
+            "load with Some(false) carries prewarm: {}",
+            queries[2]
+        );
+        assert!(
+            !queries[3].contains("prewarm"),
+            "load with None omits prewarm: {}",
+            queries[3]
         );
     }
 }

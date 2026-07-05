@@ -64,8 +64,9 @@ use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher};
-use super::registry::{Registry, RegistryCache};
-use super::worker::{Worker, WorkerInput, WorkerOutput, WorkerSpawnConfig};
+use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
+use super::registry::{Registry, RegistryCache, SpawnSpec};
+use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 
 /// Manager configuration.
 pub struct ManagerConfig {
@@ -76,6 +77,8 @@ pub struct ManagerConfig {
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
+    /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
+    pub prewarm: PrewarmConfig,
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -94,6 +97,10 @@ pub struct HealthReport {
     pub model_count: usize,
     /// Per loaded model liveness/queue snapshot, sorted by inference_id.
     pub models: Vec<ModelHealth>,
+    /// Prewarm pool snapshot (design §8): master/lazy switches plus one
+    /// entry per impl class held (state "warm" | "spawning" |
+    /// "failed_prepare").
+    pub prewarm: PrewarmHealth,
 }
 
 /// One loaded model in the [`HealthReport`].
@@ -500,6 +507,9 @@ pub struct ModelManager {
     cfg: ManagerConfig,
     registry: Arc<StdMutex<RegistryCache>>,
     state: StdMutex<ManagerState>,
+    /// Prewarm pool (design §8): one parked warm worker per impl class.
+    /// Its own mutex, never held together with `state`.
+    prewarm: Arc<PrewarmPool>,
     /// Serializes the slow spawn+load phase, mirroring Python's manager-wide
     /// lock held for the whole `load_model` (see module docs).
     load_lock: TokioMutex<()>,
@@ -511,14 +521,20 @@ pub struct ModelManager {
 impl ModelManager {
     pub fn new(cfg: ManagerConfig, registry: Arc<StdMutex<RegistryCache>>) -> Arc<Self> {
         let sweep_interval = cfg.sweep_interval;
+        let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone());
         let manager = Arc::new(Self {
             cfg,
             registry,
             state: StdMutex::new(ManagerState::default()),
+            prewarm,
             load_lock: TokioMutex::new(()),
             weak: OnceLock::new(),
             sweeper: StdMutex::new(None),
         });
+        // The always_warm whitelist warms at startup in every launch mode
+        // (gateway and the `inferio` subcommand construct a manager; the
+        // eager DB-scan loop is gateway-only and started by main.rs).
+        manager.prewarm.warm_always();
         manager
             .weak
             .set(Arc::downgrade(&manager))
@@ -542,24 +558,36 @@ impl ModelManager {
     /// `PUT /load/{group}/{id}`: idempotent load — spawns the worker when
     /// the model isn't loaded, always renews TTL + LRU position and
     /// enforces `lru_size` (the cron preload loop and UI eager-load rely on
-    /// the renewal).
+    /// the renewal). `prewarm_hint` is the request's optional `prewarm`
+    /// query param (absent = true): `Some(false)` suppresses the lazy-warm
+    /// rule for this load (design §8 — extraction jobs pass it so
+    /// batch-only families don't hold warm workers).
     pub async fn load_model(
         &self,
         inference_id: &str,
         cache_key: &str,
         lru_size: i64,
         ttl_seconds: i64,
+        prewarm_hint: Option<bool>,
     ) -> Result<()> {
-        self.ensure_loaded(inference_id, cache_key, lru_size, ttl_seconds, false)
-            .await
-            .map(|_| ())
+        self.ensure_loaded(
+            inference_id,
+            cache_key,
+            lru_size,
+            ttl_seconds,
+            false,
+            prewarm_hint.unwrap_or(true),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// `POST /predict/{group}/{id}`: auto-loads like Python (router.py:107
     /// calls `load_model` first), pins the model for the duration, queues
     /// the request on the model's dispatcher, and restores the requested
     /// TTL afterwards whether the predict succeeded or not (Python's
-    /// `finally`).
+    /// `finally`). `prewarm_hint` as on [`ModelManager::load_model`]; it
+    /// only matters when this predict is the one that auto-loads the model.
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -567,10 +595,18 @@ impl ModelManager {
         lru_size: i64,
         ttl_seconds: i64,
         max_batch: Option<u32>,
+        prewarm_hint: Option<bool>,
         inputs: Vec<WorkerInput>,
     ) -> Result<Vec<WorkerOutput>> {
         let (tx, pin) = self
-            .ensure_loaded(inference_id, cache_key, lru_size, ttl_seconds, true)
+            .ensure_loaded(
+                inference_id,
+                cache_key,
+                lru_size,
+                ttl_seconds,
+                true,
+                prewarm_hint.unwrap_or(true),
+            )
             .await?
             .expect("ensure_loaded returns a sender when pinning");
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -650,6 +686,9 @@ impl ModelManager {
     /// and released before the state lock (the two are never held together).
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
+        // Pool snapshot before the state lock: the two mutexes are never
+        // held together.
+        let prewarm = self.prewarm.health();
         let state = self.state.lock().unwrap();
         let mut models: Vec<ModelHealth> = state
             .models
@@ -688,7 +727,19 @@ impl ModelManager {
             registry_ok,
             model_count: models.len(),
             models,
+            prewarm,
         }
+    }
+
+    /// The prewarm pool (design §8), for the eager task and tests.
+    pub(crate) fn prewarm_pool(&self) -> &Arc<PrewarmPool> {
+        &self.prewarm
+    }
+
+    /// The registry cache, for the eager task's setter -> impl-class
+    /// mapping (same mtime-gated snapshot `/metadata` and spawns use).
+    pub(crate) fn registry_cache(&self) -> &Arc<StdMutex<RegistryCache>> {
+        &self.registry
     }
 
     /// Graceful shutdown: stop the sweeper, refuse new loads/predicts, fail
@@ -717,13 +768,19 @@ impl ModelManager {
             let mut state = self.state.lock().unwrap();
             handles.append(&mut state.draining);
         }
-        for handle in handles {
-            if let Err(err) = handle.await {
-                if err.is_panic() {
-                    tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
+        // Parked prewarmed workers get the same graceful unload ladder,
+        // concurrently with the dispatcher drains (design §8; both inside
+        // the caller's existing shutdown envelope).
+        let drain = async {
+            for handle in handles {
+                if let Err(err) = handle.await {
+                    if err.is_panic() {
+                        tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
+                    }
                 }
             }
-        }
+        };
+        tokio::join!(drain, self.prewarm.shutdown());
     }
 
     /// Called by a dispatcher task after a fatal worker death: drop the
@@ -789,6 +846,7 @@ impl ModelManager {
         lru_size: i64,
         ttl_seconds: i64,
         pin_for_predict: bool,
+        prewarm_hint: bool,
     ) -> Result<Option<(mpsc::UnboundedSender<DispatchMsg>, PinGuard)>> {
         let _load_guard = self.load_lock.lock().await;
 
@@ -841,7 +899,7 @@ impl ModelManager {
         // Release the spawn pin under the same lock as the bookkeeping
         // below so the sweeper cannot expire the fresh entry in between.
         spawn_pin.release_locked(&mut state.cache);
-        let (workers, registry_default_batch) = match spawn_result {
+        let (workers, registry_default_batch, impl_class) = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 // Python removes the requesting cache key's entry and
@@ -905,6 +963,16 @@ impl ModelManager {
                 stats,
             },
         );
+        drop(state);
+        // Lazy warm (design §8): a model of this class just loaded (claim
+        // or fresh spawn) — keep one warm worker of the class for next
+        // time, unless the request said prewarm=false. Respawn-on-claim is
+        // exactly this rule firing after a claim emptied the slot. Runs
+        // outside the state lock (the pool has its own mutex) and only
+        // schedules a background task.
+        if prewarm_hint {
+            self.prewarm.lazy_warm(&impl_class);
+        }
         Ok(sender)
     }
 
@@ -918,7 +986,14 @@ impl ModelManager {
     /// about). The registry is re-resolved at every spawn (design §4:
     /// workers are always born on current config). Errors carry the
     /// worker's traceback/stderr context from `Worker`.
-    async fn spawn_model(&self, inference_id: &str) -> Result<(Vec<Worker>, Option<u32>)> {
+    ///
+    /// Prewarm claim (design §8): at most one replica — the first with no
+    /// device pin, since pooled workers are spawned unpinned — is served
+    /// from the pool's parked worker for the impl class, if one is alive
+    /// (the pool pings before handing it over). The claimed worker skips
+    /// spawn + handshake + heavy imports and only needs `configure` +
+    /// `load`; the remaining replicas fresh-spawn as before.
+    async fn spawn_model(&self, inference_id: &str) -> Result<(Vec<Worker>, Option<u32>, String)> {
         let (spec, registry_default_batch) = {
             let mut registry = self.registry.lock().unwrap();
             let snapshot = registry
@@ -928,23 +1003,53 @@ impl ModelManager {
             (spec, registry_default_batch(&snapshot, inference_id))
         };
         let replica_count = spec.device_pins.len();
-        let spawns = spec.device_pins.iter().enumerate().map(|(replica, device)| {
-            let spec = &spec;
-            let device = device.clone();
-            async move {
-                let mut worker =
-                    Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device).await?;
-                if let Err(err) = worker.load().await {
-                    // A load `error` frame leaves the worker alive; kill it
-                    // either way so a failed load never leaks a process
-                    // (fatal paths already reaped the child — kill is
-                    // idempotent).
-                    worker.kill().await;
-                    return Err(err);
+        let claim_replica = spec.device_pins.iter().position(Option::is_none);
+        let mut claimed = match claim_replica {
+            Some(_) => self.prewarm.claim(&spec.impl_class).await,
+            // Every replica is device-pinned; a pooled worker (spawned
+            // without CUDA_VISIBLE_DEVICES) would violate the pin.
+            None => None,
+        };
+        let spawns: Vec<_> = spec
+            .device_pins
+            .iter()
+            .enumerate()
+            .map(|(replica, device)| {
+                let claimed = if Some(replica) == claim_replica {
+                    claimed.take()
+                } else {
+                    None
+                };
+                let spec = &spec;
+                let device = device.clone();
+                async move {
+                    let mut worker = match claimed {
+                        Some(worker) => {
+                            match self
+                                .configure_claimed(worker, inference_id, spec, device.clone())
+                                .await
+                            {
+                                Ok(worker) => worker,
+                                Err(err) => return Err(err),
+                            }
+                        }
+                        None => {
+                            Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device)
+                                .await?
+                        }
+                    };
+                    if let Err(err) = worker.load().await {
+                        // A load `error` frame leaves the worker alive; kill it
+                        // either way so a failed load never leaks a process
+                        // (fatal paths already reaped the child — kill is
+                        // idempotent).
+                        worker.kill().await;
+                        return Err(err);
+                    }
+                    anyhow::Ok((replica, worker))
                 }
-                anyhow::Ok((replica, worker))
-            }
-        });
+            })
+            .collect();
         let mut workers: Vec<Worker> = Vec::with_capacity(replica_count);
         let mut first_error: Option<anyhow::Error> = None;
         for result in futures_util::future::join_all(spawns).await {
@@ -972,7 +1077,38 @@ impl ModelManager {
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
-        Ok((workers, registry_default_batch))
+        Ok((workers, registry_default_batch, spec.impl_class))
+    }
+
+    /// Bind a claimed prewarmed worker to the concrete model. A
+    /// [`WorkerError`] from `configure` (bad kwargs, failing `__init__`) is
+    /// a genuine failure a fresh spawn would reproduce — kill the worker
+    /// and propagate. A *fatal* error (the worker died between the claim
+    /// ping and configure) falls back to one fresh `spawn_configured`, so a
+    /// stale pooled worker can never fail a load that would otherwise have
+    /// succeeded.
+    async fn configure_claimed(
+        &self,
+        mut worker: Worker,
+        inference_id: &str,
+        spec: &SpawnSpec,
+        device: Option<String>,
+    ) -> Result<Worker> {
+        match worker.configure(inference_id, &spec.config_kwargs).await {
+            Ok(()) => Ok(worker),
+            Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
+                worker.kill().await;
+                Err(err)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    model = %inference_id,
+                    "claimed prewarmed worker died before configure; falling back to a fresh spawn: {err:#}"
+                );
+                // The fatal path already killed and reaped the child.
+                Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device).await
+            }
+        }
     }
 
     /// Test hook: the load generation of a currently-loaded model, for
@@ -1323,6 +1459,13 @@ config.replicas = 2
             spawn: test_spawn_config(),
             default_max_batch,
             sweep_interval,
+            // Pool disabled: these tests cover the manager's Python-parity
+            // semantics; the prewarm pool has its own suite (prewarm.rs).
+            prewarm: PrewarmConfig {
+                enabled: false,
+                lazy: false,
+                always_warm: Vec::new(),
+            },
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -1360,6 +1503,7 @@ config.replicas = 2
                 10,
                 60,
                 None,
+                None,
                 vec![data_input(json!({"text": "a"}))],
             )
             .await
@@ -1375,7 +1519,7 @@ config.replicas = 2
         );
 
         let outputs = manager
-            .predict("echo/test", "key", 10, 60, None, vec![data_input(json!(2))])
+            .predict("echo/test", "key", 10, 60, None, None, vec![data_input(json!(2))])
             .await
             .expect("second predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 2}))]);
@@ -1398,11 +1542,11 @@ config.replicas = 2
         let manager = &setup.manager;
 
         manager
-            .load_model("echo/test", "a", 10, -1)
+            .load_model("echo/test", "a", 10, -1, None)
             .await
             .expect("load via a");
         manager
-            .load_model("echo/test", "b", 10, -1)
+            .load_model("echo/test", "b", 10, -1, None)
             .await
             .expect("load via b");
         let generation = manager.loaded_generation("echo/test").expect("loaded");
@@ -1414,7 +1558,7 @@ config.replicas = 2
             "still referenced by b"
         );
         let outputs = manager
-            .predict("echo/test", "b", 10, -1, None, vec![data_input(json!("x"))])
+            .predict("echo/test", "b", 10, -1, None, None, vec![data_input(json!("x"))])
             .await
             .expect("still serves");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "x"}))]);
@@ -1430,7 +1574,7 @@ config.replicas = 2
         assert!(!manager.unload_model("b", "echo/test").await.unwrap());
 
         let outputs = manager
-            .predict("echo/test", "b", 10, -1, None, vec![data_input(json!(1))])
+            .predict("echo/test", "b", 10, -1, None, None, vec![data_input(json!(1))])
             .await
             .expect("respawns after unload");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 1}))]);
@@ -1454,11 +1598,11 @@ config.replicas = 2
         let manager = &setup.manager;
 
         manager
-            .load_model("echo/test", "k", 1, -1)
+            .load_model("echo/test", "k", 1, -1, None)
             .await
             .expect("load first");
         manager
-            .load_model("echo/second", "k", 1, -1)
+            .load_model("echo/second", "k", 1, -1, None)
             .await
             .expect("load second");
 
@@ -1482,11 +1626,11 @@ config.replicas = 2
         let manager = &setup.manager;
 
         manager
-            .load_model("echo/second", "k", 10, -1)
+            .load_model("echo/second", "k", 10, -1, None)
             .await
             .expect("load never");
         manager
-            .load_model("echo/test", "k", 10, 1)
+            .load_model("echo/test", "k", 10, 1, None)
             .await
             .expect("load short ttl");
 
@@ -1516,7 +1660,7 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("slow/test", "k", 10, 1, None, vec![data_input(json!(null))])
+            .predict("slow/test", "k", 10, 1, None, None, vec![data_input(json!(null))])
             .await
             .expect("predict outlives its ttl thanks to the pin");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"slow": true}))]);
@@ -1552,7 +1696,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("batch/test", "k", 10, -1)
+            .load_model("batch/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -1560,7 +1704,7 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("batch/test", "k", 10, -1, None, vec![data_input(json!(0))])
+                    .predict("batch/test", "k", 10, -1, None, None, vec![data_input(json!(0))])
                     .await
             })
         };
@@ -1572,7 +1716,7 @@ config.replicas = 2
             let manager = manager.clone();
             rest.push(tokio::spawn(async move {
                 manager
-                    .predict("batch/test", "k", 10, -1, None, vec![data_input(json!(i))])
+                    .predict("batch/test", "k", 10, -1, None, None, vec![data_input(json!(i))])
                     .await
             }));
         }
@@ -1606,7 +1750,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("batch/test", "k", 10, -1)
+            .load_model("batch/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -1621,6 +1765,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(2),
+                        None,
                         vec![data_input(json!(i))],
                     )
                     .await
@@ -1646,7 +1791,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("failbatch/test", "k", 10, -1)
+            .load_model("failbatch/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -1659,6 +1804,7 @@ config.replicas = 2
                         "k",
                         10,
                         -1,
+                        None,
                         None,
                         vec![data_input(json!(0))],
                     )
@@ -1677,6 +1823,7 @@ config.replicas = 2
                         "k",
                         10,
                         -1,
+                        None,
                         None,
                         vec![data_input(json!(i))],
                     )
@@ -1704,7 +1851,7 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let err = manager
-            .predict("dying/test", "k", 10, -1, None, vec![data_input(json!(1))])
+            .predict("dying/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
             .await
             .expect_err("worker exits mid-predict");
         assert!(
@@ -1725,7 +1872,7 @@ config.replicas = 2
         // fatal error proves a new process served it rather than a closed
         // queue or a poisoned handle).
         let err = manager
-            .predict("dying/test", "k", 10, -1, None, vec![data_input(json!(2))])
+            .predict("dying/test", "k", 10, -1, None, None, vec![data_input(json!(2))])
             .await
             .expect_err("fresh worker also dies");
         assert!(
@@ -1745,7 +1892,7 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let err = manager
-            .load_model("missing/test", "k", 10, -1)
+            .load_model("missing/test", "k", 10, -1, None)
             .await
             .expect_err("impl class does not exist");
         assert!(
@@ -1770,19 +1917,19 @@ config.replicas = 2
         let manager = &setup.manager;
 
         manager
-            .load_model("echo/test", "k", 10, -1)
+            .load_model("echo/test", "k", 10, -1, None)
             .await
             .expect("load");
         manager.shutdown().await;
 
         assert!(manager.cached_models().is_empty());
         let err = manager
-            .load_model("echo/test", "k", 10, -1)
+            .load_model("echo/test", "k", 10, -1, None)
             .await
             .expect_err("loads refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
         let err = manager
-            .predict("echo/test", "k", 10, -1, None, vec![data_input(json!(1))])
+            .predict("echo/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
             .await
             .expect_err("predicts refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
@@ -1799,14 +1946,14 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("ok"))])
+            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("ok"))])
             .await
             .expect("normal predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
         let generation = manager.loaded_generation("nan/test").expect("loaded");
 
         let err = manager
-            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("nan"))])
+            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("nan"))])
             .await
             .expect_err("NaN output has no JSON form");
         assert!(
@@ -1824,7 +1971,7 @@ config.replicas = 2
         );
 
         let outputs = manager
-            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("ok"))])
+            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("ok"))])
             .await
             .expect("worker still serves after the failed request");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
@@ -1844,7 +1991,7 @@ config.replicas = 2
 
         // Load first so the abort lands mid-predict, not mid-spawn.
         manager
-            .load_model("slow/test", "k", 10, 1)
+            .load_model("slow/test", "k", 10, 1, None)
             .await
             .expect("load");
 
@@ -1852,7 +1999,7 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("slow/test", "k", 10, 1, None, vec![data_input(json!(null))])
+                    .predict("slow/test", "k", 10, 1, None, None, vec![data_input(json!(null))])
                     .await
             })
         };
@@ -1903,7 +2050,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("device/test", "k", 10, -1)
+            .load_model("device/test", "k", 10, -1, None)
             .await
             .expect("load spawns both replicas");
 
@@ -1920,6 +2067,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(1),
+                        None,
                         vec![data_input(json!(i))],
                     )
                     .await
@@ -1951,7 +2099,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("slowpair/test", "k", 10, -1)
+            .load_model("slowpair/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -1967,6 +2115,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(1),
+                        None,
                         vec![data_input(json!(i))],
                     )
                     .await
@@ -1998,7 +2147,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("dieflag/test", "k", 10, -1)
+            .load_model("dieflag/test", "k", 10, -1, None)
             .await
             .expect("load spawns both replicas");
         let generation = manager.loaded_generation("dieflag/test").expect("loaded");
@@ -2017,6 +2166,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(1),
+                        None,
                         vec![data_input(json!({"die": true}))],
                     )
                     .await
@@ -2034,6 +2184,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(1),
+                        None,
                         vec![data_input(json!(i))],
                     )
                     .await
@@ -2070,6 +2221,7 @@ config.replicas = 2
                 10,
                 -1,
                 Some(1),
+                None,
                 vec![data_input(json!("ok"))],
             )
             .await
@@ -2095,7 +2247,7 @@ config.replicas = 2
         let manager = &setup.manager;
 
         manager
-            .load_model("device/test", "k", 10, -1)
+            .load_model("device/test", "k", 10, -1, None)
             .await
             .expect("load spawns both replicas");
         let generation = manager.loaded_generation("device/test").expect("loaded");
@@ -2108,7 +2260,7 @@ config.replicas = 2
         assert_eq!(manager.loaded_generation("device/test"), None);
 
         manager
-            .load_model("device/test", "k", 10, -1)
+            .load_model("device/test", "k", 10, -1, None)
             .await
             .expect("re-load spawns a fresh set");
         assert!(
@@ -2200,6 +2352,7 @@ config.replicas = 2
                 10,
                 -1,
                 None,
+                None,
                 vec![data_input(json!({"text": "hi"}))],
             )
             .await
@@ -2248,7 +2401,7 @@ config.replicas = 2
         // Load first so the observation window is the predict itself, not
         // the spawn.
         manager
-            .load_model("slow/test", "k", 10, -1)
+            .load_model("slow/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -2256,7 +2409,7 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("slow/test", "k", 10, -1, None, vec![data_input(json!(null))])
+                    .predict("slow/test", "k", 10, -1, None, None, vec![data_input(json!(null))])
                     .await
             })
         };
@@ -2297,7 +2450,7 @@ config.replicas = 2
         let manager = setup.manager.clone();
 
         manager
-            .load_model("batch/test", "k", 10, -1)
+            .load_model("batch/test", "k", 10, -1, None)
             .await
             .expect("load");
 
@@ -2312,6 +2465,7 @@ config.replicas = 2
                         10,
                         -1,
                         Some(2),
+                        None,
                         vec![data_input(json!(i))],
                     )
                     .await

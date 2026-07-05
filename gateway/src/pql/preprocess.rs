@@ -615,6 +615,9 @@ async fn embed_text_query(
                 // Search-time embeds have no batch-size opinion: let the
                 // server merge them freely (its own default cap applies).
                 None,
+                // No prewarm opinion either (absent = true): search-driven
+                // loads are exactly what the warm pool exists for.
+                None,
                 &inputs,
             )
             .await
@@ -649,6 +652,9 @@ async fn embed_image_query(
                 embed.ttl_seconds,
                 // Search-time embeds have no batch-size opinion: let the
                 // server merge them freely (its own default cap applies).
+                None,
+                // No prewarm opinion either (absent = true): search-driven
+                // loads are exactly what the warm pool exists for.
                 None,
                 &inputs,
             )

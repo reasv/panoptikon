@@ -23,8 +23,10 @@
 //! - errors use FastAPI's `{"detail": ...}` shape (`ApiError`), with
 //!   router.py's exact detail strings for the 500s.
 //!
-//! Additive (design §7): optional `max_batch` query param on predict
-//! (forwarded to the dispatcher's merge cap) and `GET /health`
+//! Additive (design §7/§8): optional `max_batch` query param on predict
+//! (forwarded to the dispatcher's merge cap), optional `prewarm` query
+//! param on load AND predict (the lazy-warm hint, absent = true — see
+//! `prewarm.rs`), and `GET /health`
 //! (orchestrator + per-model liveness, queue depths, batch caps — see
 //! [`ModelManager::health`]). `/health` lives on the nested router, so it
 //! is `/api/inference/health` in gateway mode and subcommand mode alike;
@@ -51,6 +53,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use super::manager::{HealthReport, ManagerConfig, ModelManager};
+use super::prewarm::PrewarmConfig;
 use super::registry::{RegistryCache, RegistryConfig};
 use super::worker::{WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 use crate::api_error::ApiError;
@@ -129,6 +132,11 @@ impl InferioState {
                 spawn,
                 default_max_batch: local.default_max_batch,
                 sweep_interval: Duration::from_secs(local.sweep_interval_secs.max(1)),
+                prewarm: PrewarmConfig {
+                    enabled: local.prewarm.enabled,
+                    lazy: local.prewarm.lazy,
+                    always_warm: local.prewarm.always_warm.clone(),
+                },
             },
             Arc::clone(&registry),
         );
@@ -175,6 +183,10 @@ struct LoadParams {
     cache_key: String,
     lru_size: i64,
     ttl_seconds: i64,
+    /// Additive over Python: lazy prewarm hint (design §8). Absent = true;
+    /// `prewarm=false` suppresses keeping a warm worker of this model's
+    /// impl class after the load.
+    prewarm: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +196,8 @@ struct PredictParams {
     ttl_seconds: i64,
     /// Additive over Python: per-request cap on dispatch-time batch merging.
     max_batch: Option<u32>,
+    /// Additive over Python: lazy prewarm hint, as on load (absent = true).
+    prewarm: Option<bool>,
 }
 
 /// `POST /predict/{group}/{inference_id}` — router.py `predict`.
@@ -247,6 +261,7 @@ async fn predict(
             params.lru_size,
             params.ttl_seconds,
             params.max_batch,
+            params.prewarm,
             inputs,
         )
         .await
@@ -279,6 +294,7 @@ async fn load_model(
             &params.cache_key,
             params.lru_size,
             params.ttl_seconds,
+            params.prewarm,
         )
         .await
         .map_err(|err| {
@@ -687,8 +703,25 @@ metadata.description = "echo fixture"
     /// In-process server over an ephemeral port with a caller-supplied
     /// registry TOML (server default_max_batch stays high, 32, so batching
     /// tests can prove caps come from the request, not the server config).
+    /// Prewarm pool disabled — the hint-threading test uses
+    /// [`spawn_test_server_with_prewarm`].
     async fn spawn_test_server_with_registry(
         registry_toml: &str,
+    ) -> (Arc<InferioState>, String, tempfile::TempDir) {
+        spawn_test_server_with_prewarm(
+            registry_toml,
+            PrewarmConfig {
+                enabled: false,
+                lazy: false,
+                always_warm: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn spawn_test_server_with_prewarm(
+        registry_toml: &str,
+        prewarm: PrewarmConfig,
     ) -> (Arc<InferioState>, String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), registry_toml).unwrap();
@@ -700,6 +733,7 @@ metadata.description = "echo fixture"
                 spawn: test_spawn_config(),
                 default_max_batch: 32,
                 sweep_interval: Duration::from_secs(60),
+                prewarm,
             },
             Arc::clone(&registry),
         );
@@ -737,7 +771,7 @@ metadata.description = "echo fixture"
 
         // PUT /load: Python's exact status body.
         let loaded = client
-            .load_model("echo/test", "key", 10, -1)
+            .load_model("echo/test", "key", 10, -1, None)
             .await
             .expect("load");
         assert_eq!(loaded, json!({"status": "loaded"}));
@@ -749,6 +783,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 None,
                 &[InferenceInput::new(json!({"text": "hi"}), None)],
             )
@@ -768,6 +803,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 None,
                 &[InferenceInput::new(
                     JsonValue::Null,
@@ -790,6 +826,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 None,
                 &[
                     InferenceInput::new(
@@ -890,7 +927,7 @@ metadata.description = "batch size reporter"
         .expect("pool builds");
 
         // Preload so the primer isn't skewed by worker spawn latency.
-        pool.load_model_all("batch/test", "key", 10, -1)
+        pool.load_model_all("batch/test", "key", 10, -1, None)
             .await
             .expect("load");
 
@@ -906,6 +943,7 @@ metadata.description = "batch size reporter"
                         10,
                         -1,
                         max_batch,
+                        None,
                         &[InferenceInput::new(json!(0), None)],
                     )
                     .await
@@ -924,6 +962,7 @@ metadata.description = "batch size reporter"
                         10,
                         -1,
                         max_batch,
+                        None,
                         &[InferenceInput::new(json!(i), None)],
                     )
                     .await
@@ -980,12 +1019,18 @@ metadata.description = "batch size reporter"
         assert!(health.registry_ok, "the echo fixture registry parses");
         assert_eq!(health.model_count, 0);
         assert!(health.models.is_empty());
+        // The prewarm section serde round-trips too (this server runs with
+        // the pool disabled; the enabled shape is covered by the prewarm
+        // param test).
+        assert!(!health.prewarm.enabled);
+        assert!(!health.prewarm.lazy);
+        assert!(health.prewarm.warm.is_empty());
 
         // Load a model through the real client, then health reports it.
         let client = InferenceApiClient::new_with_metadata_cache(base_url.clone(), false)
             .expect("client builds");
         client
-            .load_model("echo/test", "key", 10, -1)
+            .load_model("echo/test", "key", 10, -1, None)
             .await
             .expect("load");
         let health: HealthReport = reqwest::get(format!("{base_url}/api/inference/health"))
@@ -1022,6 +1067,112 @@ metadata.description = "batch size reporter"
             .expect("standalone health json");
         assert_eq!(health.status, "ok");
         assert_eq!(health.model_count, 1, "same manager, same report");
+
+        state.manager.shutdown().await;
+    }
+
+    /// The additive `prewarm` query param end to end over real HTTP
+    /// (design §8): `prewarm=false` on PUT /load parses (200) and
+    /// suppresses the lazy warm (pool empty right after — the lazy slot
+    /// insertion is synchronous when it fires, so this is deterministic);
+    /// an absent param means true (the lazy slot exists immediately after
+    /// the load); an explicit `prewarm=true` parses; a non-boolean value is
+    /// a client error rather than a silent default. POST /predict accepts
+    /// the param through the real gateway client (which serializes it only
+    /// when the caller has an opinion). The health report over HTTP shows
+    /// the enabled pool's prewarm section with the warm entry.
+    #[tokio::test]
+    async fn prewarm_param_parses_and_gates_lazy_warm_over_http() {
+        let (state, base_url, _registry_dir) = spawn_test_server_with_prewarm(
+            r#"
+[group.echo]
+config.impl_class = "echo_test"
+[group.echo.inference_ids.test]
+"#,
+            PrewarmConfig {
+                enabled: true,
+                lazy: true,
+                always_warm: Vec::new(),
+            },
+        )
+        .await;
+        let http = reqwest::Client::new();
+        let load_url = |extra: &str| {
+            format!(
+                "{base_url}/api/inference/load/echo/test?cache_key=key&lru_size=10&ttl_seconds=-1{extra}"
+            )
+        };
+
+        // prewarm=false: parses, loads, and leaves no warm worker behind.
+        let response = http.put(load_url("&prewarm=false")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            state.manager.prewarm_pool().health().warm.is_empty(),
+            "prewarm=false suppressed the lazy warm"
+        );
+
+        // Absent = true: after an unload, a plain load leaves a lazy slot.
+        http.delete(format!("{base_url}/api/inference/cache/key/echo/test"))
+            .send()
+            .await
+            .unwrap();
+        let response = http.put(load_url("")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            !state.manager.prewarm_pool().health().warm.is_empty(),
+            "absent hint means true: the lazy slot exists after the load"
+        );
+
+        // Explicit true parses; banana does not.
+        let response = http.put(load_url("&prewarm=true")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let response = http.put(load_url("&prewarm=banana")).send().await.unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "a non-boolean prewarm value is rejected, got {}",
+            response.status()
+        );
+
+        // predict accepts the param via the real client (prewarm=false on
+        // the wire) and still returns normal outputs.
+        let client = InferenceApiClient::new_with_metadata_cache(base_url.clone(), false)
+            .expect("client builds");
+        let output = client
+            .predict(
+                "echo/test",
+                "key",
+                10,
+                -1,
+                None,
+                Some(false),
+                &[InferenceInput::new(json!(1), None)],
+            )
+            .await
+            .expect("predict with prewarm=false");
+        match output {
+            PredictOutput::Json(values) => assert_eq!(values, vec![json!({"echo": 1})]),
+            other => panic!("expected Json output, got {other:?}"),
+        }
+
+        // Health over the wire reports the enabled pool with its entry.
+        let health: HealthReport = reqwest::get(format!("{base_url}/api/inference/health"))
+            .await
+            .expect("health request")
+            .json()
+            .await
+            .expect("health json");
+        assert!(health.prewarm.enabled);
+        assert!(health.prewarm.lazy);
+        assert!(
+            health
+                .prewarm
+                .warm
+                .iter()
+                .any(|entry| entry.impl_class == "echo_test"
+                    && (entry.state == "warm" || entry.state == "spawning")),
+            "the lazy slot shows in the health prewarm section: {:?}",
+            health.prewarm.warm
+        );
 
         state.manager.shutdown().await;
     }

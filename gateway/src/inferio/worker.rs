@@ -387,9 +387,6 @@ impl Worker {
     /// per-request [`WorkerError`] and NON-fatal — the worker stays alive
     /// and fully usable (a failed prepare just means load pays the
     /// imports).
-    // No production caller yet: the prewarm pool (design §8) is the next
-    // task; the manager's normal flow goes spawn_configured -> load.
-    #[allow(dead_code)]
     pub async fn prewarm(&mut self) -> Result<()> {
         let deadline = self.deadlines.load;
         self.roundtrip("prewarm", Vec::new(), Some(deadline))
@@ -487,10 +484,9 @@ impl Worker {
     }
 
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
-    /// deadline (an unbounded liveness probe would be useless).
-    // No production caller yet: per-worker liveness reporting arrives with
-    // the fuller /health surface (design §7/§8).
-    #[allow(dead_code)]
+    /// deadline (an unbounded liveness probe would be useless). The prewarm
+    /// pool pings a parked worker before claiming it (protocol doc: it may
+    /// have died while parked).
     pub async fn ping(&mut self) -> Result<()> {
         let deadline = self.deadlines.handshake;
         self.roundtrip("ping", Vec::new(), Some(deadline))
@@ -735,9 +731,11 @@ impl Worker {
     }
 
     /// Test hook: kill the child out from under the supervisor without
-    /// touching any bookkeeping, simulating an external/OOM kill.
+    /// touching any bookkeeping, simulating an external/OOM kill. Also used
+    /// by the prewarm pool tests to kill a *parked* worker so the claim-time
+    /// ping failure path is exercised.
     #[cfg(test)]
-    async fn kill_child_externally_for_test(&mut self) {
+    pub(crate) async fn kill_child_externally_for_test(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
