@@ -14,9 +14,7 @@ pub(crate) fn parse_and_escape_query(user_input: &str) -> String {
             .map(|token| token.to_string())
             .collect()
     });
-    let escaped_tokens = tokens
-        .into_iter()
-        .map(|token| token.replace('"', "\"\""));
+    let escaped_tokens = tokens.into_iter().map(|token| token.replace('"', "\"\""));
     let quoted_tokens = escaped_tokens.map(|token| format!("\"{}\"", token));
     quoted_tokens.collect::<Vec<String>>().join(" ")
 }

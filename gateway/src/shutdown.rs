@@ -12,9 +12,11 @@
 //! A second signal exits immediately, and a hard timer forces exit even if
 //! cleanup or the HTTP connection drain wedges.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::index_writer;
+use crate::inferio::manager::ModelManager;
 use crate::jobs::{continuous_scan, cron, queue};
 
 /// Upper bound on the actor-coordination part of shutdown. Generous because a
@@ -25,7 +27,6 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(10);
 /// that never drain (e.g. a long-lived streaming proxy request) — without it
 /// axum's graceful shutdown would wait on them forever.
 const FORCE_EXIT_AFTER: Duration = Duration::from_secs(20);
-
 
 /// Resolves when the process receives its first termination signal
 /// (SIGINT/SIGTERM on Unix; Ctrl-C/Break/Close/Shutdown on Windows). If no
@@ -76,21 +77,22 @@ pub(crate) async fn wait_for_signal() {
 /// concurrently with axum's graceful HTTP shutdown; `main` joins this before
 /// returning. `local_api` says whether the job/scan/cron subsystems were
 /// started at all, so cleanup doesn't lazily spawn an actor just to stop it.
-pub(crate) async fn run_cleanup(local_api: bool) {
-    tracing::info!("shutdown signal received; stopping gracefully (repeat the signal to force exit)");
+/// `inferio` is the local inference manager when `[inference_local]` is
+/// enabled: its shutdown (refuse new loads, fail queued predicts, run each
+/// worker's graceful unload → terminate → kill ladder) runs after the job
+/// queue stops — jobs are the main predict callers — and *after* the writer
+/// flush: the predict path writes nothing to the index DBs once the job
+/// queue is stopped, and a wedged GPU batch must not starve the flush
+/// inside the shared cleanup grace (queued writes committing is the one
+/// guarantee this function exists for). If a worker wedges past the hard
+/// exit deadline, the kill-on-close Job Object still reaps it on process
+/// exit.
+pub(crate) async fn run_cleanup(local_api: bool, inferio: Option<Arc<ModelManager>>) {
+    tracing::info!(
+        "shutdown signal received; stopping gracefully (repeat the signal to force exit)"
+    );
 
-    tokio::spawn(async {
-        wait_for_signal().await;
-        // process::exit skips destructors, so buffered file-log output is
-        // lost — acceptable on an explicitly forced exit.
-        tracing::warn!("second shutdown signal received; exiting immediately");
-        std::process::exit(130);
-    });
-    tokio::spawn(async {
-        tokio::time::sleep(FORCE_EXIT_AFTER).await;
-        tracing::warn!("shutdown deadline expired; forcing exit");
-        std::process::exit(0);
-    });
+    spawn_force_exit_guards();
 
     let cleanup = async {
         if local_api {
@@ -104,6 +106,10 @@ pub(crate) async fn run_cleanup(local_api: bool) {
         if flushed > 0 {
             tracing::info!(writers = flushed, "index DB writers drained");
         }
+        if let Some(manager) = inferio {
+            manager.shutdown().await;
+            tracing::info!("local inference workers stopped");
+        }
     };
     match tokio::time::timeout(CLEANUP_GRACE, cleanup).await {
         Ok(()) => tracing::info!("background work stopped cleanly"),
@@ -112,4 +118,40 @@ pub(crate) async fn run_cleanup(local_api: bool) {
             "cleanup did not finish within the grace period; exiting anyway"
         ),
     }
+}
+
+/// Cleanup for the standalone `inferio` subcommand: no jobs, cron, scans,
+/// or DB writers exist — only the model manager's workers need the graceful
+/// stop ladder. Same grace/force-exit envelope as the full gateway.
+pub(crate) async fn run_inferio_cleanup(manager: Arc<ModelManager>) {
+    tracing::info!(
+        "shutdown signal received; stopping gracefully (repeat the signal to force exit)"
+    );
+
+    spawn_force_exit_guards();
+
+    match tokio::time::timeout(CLEANUP_GRACE, manager.shutdown()).await {
+        Ok(()) => tracing::info!("local inference workers stopped"),
+        Err(_) => tracing::warn!(
+            grace_secs = CLEANUP_GRACE.as_secs(),
+            "inference workers did not stop within the grace period; exiting anyway"
+        ),
+    }
+}
+
+/// Second-signal immediate exit + hard exit deadline, shared by both
+/// cleanup paths.
+fn spawn_force_exit_guards() {
+    tokio::spawn(async {
+        wait_for_signal().await;
+        // process::exit skips destructors, so buffered file-log output is
+        // lost — acceptable on an explicitly forced exit.
+        tracing::warn!("second shutdown signal received; exiting immediately");
+        std::process::exit(130);
+    });
+    tokio::spawn(async {
+        tokio::time::sleep(FORCE_EXIT_AFTER).await;
+        tracing::warn!("shutdown deadline expired; forcing exit");
+        std::process::exit(0);
+    });
 }

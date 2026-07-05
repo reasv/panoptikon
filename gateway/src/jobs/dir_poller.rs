@@ -149,8 +149,7 @@ fn enumerate_dir(dir: &Path, filters: &PollFilters) -> std::io::Result<DirListin
             {
                 continue;
             }
-            let Some(last_modified) = metadata.modified().ok().and_then(format_system_time)
-            else {
+            let Some(last_modified) = metadata.modified().ok().and_then(format_system_time) else {
                 continue;
             };
             files.insert(

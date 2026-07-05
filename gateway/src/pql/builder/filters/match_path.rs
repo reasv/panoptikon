@@ -1,16 +1,16 @@
-use sea_query::{Expr, ExprTrait, JoinType};
 use sea_query::extension::sqlite::SqliteBinOper;
+use sea_query::{Expr, ExprTrait, JoinType};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::pql::model::SortableOptions;
 use crate::pql::preprocess::PqlError;
 
-use super::FilterCompiler;
 use super::super::{
     CteRef, ExtraColumn, FilesPathFts, JoinedTables, OrderByFilter, QueryState,
     add_sortable_rank_column, apply_sort_bounds, select_std_from_cte, wrap_query,
 };
+use super::FilterCompiler;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct MatchPathArgs {
@@ -53,12 +53,10 @@ impl FilterCompiler for MatchPath {
         } else {
             Expr::col((FilesPathFts::Table, FilesPathFts::Path))
         };
-        query.and_where(
-            match_column.binary(
-                SqliteBinOper::Match,
-                Expr::val(self.match_path.r#match.clone()),
-            ),
-        );
+        query.and_where(match_column.binary(
+            SqliteBinOper::Match,
+            Expr::val(self.match_path.r#match.clone()),
+        ));
 
         if !state.is_count_query {
             add_sortable_rank_column(&mut query, &self.sort)?;
@@ -74,7 +72,13 @@ impl FilterCompiler for MatchPath {
             JoinedTables::default(),
         );
 
-        let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
+        let cte = wrap_query(
+            state,
+            final_query,
+            &context_for_wrap,
+            cte_name,
+            &joined_tables,
+        );
         state.cte_counter += 1;
         if !state.is_count_query {
             if let Some(alias) = &self.sort.select_as {

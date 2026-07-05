@@ -1,5 +1,5 @@
-use utoipa::OpenApi;
 use utoipa::Modify;
+use utoipa::OpenApi;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType};
 
 struct JsonValueSchema;

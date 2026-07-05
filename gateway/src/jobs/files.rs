@@ -31,21 +31,15 @@ use walkdir::WalkDir;
 use crate::{
     api_error::ApiError,
     db::{
-        file_scans::{
-            FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id,
-        },
+        file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
-            FileScanData, FileUpsertResult, ItemScanMeta,
-            get_file_by_path, get_item_id, get_item_visual_meta, has_blurhash,
+            FileScanData, FileUpsertResult, ItemScanMeta, get_file_by_path, get_item_id,
+            get_item_visual_meta, has_blurhash,
         },
-        folders::{
-            get_folders_from_database,
-        },
-        index_writer::{call_index_db_writer, IndexDbWriterMessage},
+        folders::get_folders_from_database,
+        index_writer::{IndexDbWriterMessage, call_index_db_writer},
         open_index_db_read,
-        storage::{
-            StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail,
-        },
+        storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
     },
     pql::builder::filters::evaluate_match,
@@ -410,12 +404,10 @@ async fn execute_folder_scan(
     let mut scan_ids = Vec::new();
 
     for folder in starting_points {
-        let scan_id = call_index_db_writer(index_db, |reply| {
-            IndexDbWriterMessage::AddFileScan {
-                scan_time: scan_time.clone(),
-                path: folder.clone(),
-                reply,
-            }
+        let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
+            scan_time: scan_time.clone(),
+            path: folder.clone(),
+            reply,
         })
         .await?;
         scan_ids.push(scan_id);
@@ -437,26 +429,24 @@ async fn execute_folder_scan(
         )
         .await?;
 
-        call_index_db_writer(index_db, |reply| {
-            IndexDbWriterMessage::UpdateFileScan {
-                scan_id,
-                update: FileScanUpdate {
-                    end_time: current_iso_timestamp(),
-                    new_items: stats.new_items,
-                    unchanged_files: stats.unchanged_files,
-                    new_files: stats.new_files,
-                    modified_files: stats.modified_files,
-                    marked_unavailable: stats.marked_unavailable,
-                    errors: stats.errors,
-                    total_available: stats.total_available,
-                    false_changes: stats.false_changes,
-                    metadata_time: stats.metadata_time,
-                    hashing_time: stats.hashing_time,
-                    thumbgen_time: stats.thumbgen_time,
-                    blurhash_time: stats.blurhash_time,
-                },
-                reply,
-            }
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateFileScan {
+            scan_id,
+            update: FileScanUpdate {
+                end_time: current_iso_timestamp(),
+                new_items: stats.new_items,
+                unchanged_files: stats.unchanged_files,
+                new_files: stats.new_files,
+                modified_files: stats.modified_files,
+                marked_unavailable: stats.marked_unavailable,
+                errors: stats.errors,
+                total_available: stats.total_available,
+                false_changes: stats.false_changes,
+                metadata_time: stats.metadata_time,
+                hashing_time: stats.hashing_time,
+                thumbgen_time: stats.thumbgen_time,
+                blurhash_time: stats.blurhash_time,
+            },
+            reply,
         })
         .await?;
     }
@@ -651,14 +641,15 @@ async fn scan_single_folder(
         ..
     } = ctx;
 
-    let (marked_unavailable, total_available) =
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::MarkUnavailableFiles {
+    let (marked_unavailable, total_available) = call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::MarkUnavailableFiles {
             scan_id,
             path: folder.to_string(),
             excluded_paths: error_paths.clone(),
             reply,
-        })
-        .await?;
+        }
+    })
+    .await?;
     stats.marked_unavailable = marked_unavailable;
     stats.total_available = total_available;
 
@@ -893,16 +884,15 @@ impl ScanContext {
         if !item.frames.is_empty()
             && !has_frame(&mut self.conn, &item.sha256, FRAME_PROCESS_VERSION).await?
         {
-            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
-                IndexDbWriterMessage::StoreFrames {
+            if let Err(err) =
+                call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
                     sha256: item.sha256.clone(),
                     mime_type: item.mime_type.clone(),
                     process_version: FRAME_PROCESS_VERSION,
                     frames: item.frames.clone(),
                     reply,
-                }
-            })
-            .await
+                })
+                .await
             {
                 tracing::error!(error = ?err, "failed to store frames");
             }
@@ -958,30 +948,28 @@ impl ScanContext {
             .await
             .unwrap_or(false);
         if !backfill.extracted_frames.is_empty() && !frames_stored {
-            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
-                IndexDbWriterMessage::StoreFrames {
+            if let Err(err) =
+                call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
                     sha256: backfill.sha256.clone(),
                     mime_type: backfill.mime_type.clone(),
                     process_version: FRAME_PROCESS_VERSION,
                     frames: backfill.extracted_frames.clone(),
                     reply,
-                }
-            })
-            .await
+                })
+                .await
             {
                 tracing::error!(error = ?err, "failed to store frames");
             }
         }
 
         if let Some(blurhash) = &backfill.blurhash {
-            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
-                IndexDbWriterMessage::SetBlurhash {
+            if let Err(err) =
+                call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::SetBlurhash {
                     sha256: backfill.sha256.clone(),
                     blurhash: blurhash.clone(),
                     reply,
-                }
-            })
-            .await
+                })
+                .await
             {
                 tracing::error!(error = ?err, "failed to set blurhash");
             }
@@ -1142,19 +1130,17 @@ impl ScanContext {
             })
             .await;
             match joined {
-                Ok((Ok((md5, sha256, real_size)), hash_time)) => {
-                    TaskOutcome::Hashed(HashedFile {
-                        path,
-                        last_modified,
-                        reported_size,
-                        mime_type,
-                        existing_sha256,
-                        md5,
-                        sha256,
-                        real_size,
-                        hash_time,
-                    })
-                }
+                Ok((Ok((md5, sha256, real_size)), hash_time)) => TaskOutcome::Hashed(HashedFile {
+                    path,
+                    last_modified,
+                    reported_size,
+                    mime_type,
+                    existing_sha256,
+                    md5,
+                    sha256,
+                    real_size,
+                    hash_time,
+                }),
                 Ok((Err(err), hash_time)) => TaskOutcome::Failed(FailedFile {
                     path,
                     hash_time,
@@ -1199,7 +1185,15 @@ impl ScanContext {
             let _permit = permit;
             let outer_path = path.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                prepare_new_item(path, last_modified, file_size, mime_type, md5, sha256, filter)
+                prepare_new_item(
+                    path,
+                    last_modified,
+                    file_size,
+                    mime_type,
+                    md5,
+                    sha256,
+                    filter,
+                )
             })
             .await;
             match joined {
@@ -1217,11 +1211,13 @@ impl ScanContext {
     }
 
     async fn update_file_data(&mut self, data: FileScanData) -> ApiResult<FileUpsertResult> {
-        call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
-            time_added: self.scan_time.clone(),
-            scan_id: self.scan_id,
-            data: data.clone(),
-            reply,
+        call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileData {
+                time_added: self.scan_time.clone(),
+                scan_id: self.scan_id,
+                data: data.clone(),
+                reply,
+            }
         })
         .await
     }
@@ -1796,7 +1792,9 @@ fn generate_backfill_visuals(
             None if mime_type.starts_with("image") => image::open(path).ok(),
             None => None,
         };
-        blurhash = source.as_ref().and_then(|image| compute_blurhash(image).ok());
+        blurhash = source
+            .as_ref()
+            .and_then(|image| compute_blurhash(image).ok());
     }
     let blurhash_time = blurhash_start.elapsed().as_secs_f64();
 
@@ -2248,7 +2246,7 @@ fn run_html_screenshot(
     // whose real browser detaches from it entirely; killing the direct child
     // leaves the tree running. A kill-on-close job object captures every
     // descendant, so dropping the guard (any return path) reaps them all.
-    let _job = process_tree::JobGuard::assign(&child);
+    let _job = crate::process_tree::JobGuard::assign(&child);
 
     // Poll instead of wait() so a wedged renderer cannot stall a scan worker
     // forever; these run inside spawn_blocking, so sleeping here is fine.
@@ -2289,96 +2287,6 @@ fn run_html_screenshot(
     }
     tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
     None
-}
-
-/// Kill-on-close job object wrapper. On Windows, every descendant of the
-/// assigned process is terminated when the guard drops, covering both the
-/// multi-process Chromium tree and the msedge.exe launcher whose real browser
-/// detaches from the spawned process. On other platforms this is a no-op and
-/// `Child::kill` remains the only cleanup.
-mod process_tree {
-    pub(super) struct JobGuard {
-        #[cfg(windows)]
-        _job: Option<windows_job::Job>,
-    }
-
-    impl JobGuard {
-        pub(super) fn assign(child: &std::process::Child) -> JobGuard {
-            #[cfg(windows)]
-            {
-                let job = windows_job::Job::assign(child);
-                if job.is_none() {
-                    tracing::warn!(
-                        "failed to create job object; browser subprocesses may outlive the scan"
-                    );
-                }
-                JobGuard { _job: job }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = child;
-                JobGuard {}
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    mod windows_job {
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        pub(super) struct Job(HANDLE);
-
-        // The handle is used only to close the job object exactly once; the
-        // kernel object itself is thread-safe.
-        unsafe impl Send for Job {}
-
-        impl Job {
-            /// Children the process spawned before this call are not captured
-            /// (std cannot spawn suspended), but the launcher needs far longer
-            /// to start the browser than this takes to run.
-            pub(super) fn assign(child: &std::process::Child) -> Option<Job> {
-                unsafe {
-                    let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                    if handle.is_null() {
-                        return None;
-                    }
-                    // Owns the handle from here on, so early returns close it.
-                    let job = Job(handle);
-                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                    if SetInformationJobObject(
-                        handle,
-                        JobObjectExtendedLimitInformation,
-                        (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                    ) == 0
-                    {
-                        return None;
-                    }
-                    if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
-                        return None;
-                    }
-                    Some(job)
-                }
-            }
-        }
-
-        impl Drop for Job {
-            fn drop(&mut self) {
-                // Kill-on-close terminates every process still in the job.
-                unsafe {
-                    CloseHandle(self.0);
-                }
-            }
-        }
-    }
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -2468,9 +2376,18 @@ fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
     match lofty::read_from_path(path) {
         Ok(tagged) => {
             if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-                artist = tag.artist().map(|value| value.to_string()).unwrap_or_default();
-                album = tag.album().map(|value| value.to_string()).unwrap_or_default();
-                title = tag.title().map(|value| value.to_string()).unwrap_or_default();
+                artist = tag
+                    .artist()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                album = tag
+                    .album()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                title = tag
+                    .title()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
                 if let Some(picture) = tag.pictures().first() {
                     if let Ok(cover) = image::load_from_memory(picture.data()) {
                         // Cover art gets no text overlay, but is capped in
@@ -2840,10 +2757,7 @@ fn temp_dir_path() -> PathBuf {
     });
     let base = env::var("TEMP_DIR").unwrap_or_else(|_| "data/tmp".to_string());
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(base).join(format!(
-        "frames-{}-{nonce:x}-{unique}",
-        std::process::id()
-    ))
+    PathBuf::from(base).join(format!("frames-{}-{nonce:x}-{unique}", std::process::id()))
 }
 
 pub(crate) fn check_folder_validity(folder: &str) -> bool {
@@ -3024,9 +2938,7 @@ mod tests {
         assert!(blurhash.and_then(|value| value.0).is_some());
     }
 
-    async fn latest_scan_record(
-        conn: &mut sqlx::SqliteConnection,
-    ) -> (i64, i64, i64, i64, i64) {
+    async fn latest_scan_record(conn: &mut sqlx::SqliteConnection) -> (i64, i64, i64, i64, i64) {
         sqlx::query_as(
             r#"
 SELECT unchanged_files, new_files, modified_files, errors, marked_unavailable
@@ -3103,9 +3015,11 @@ LIMIT 1
         drop(write_conn);
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
-        let (unchanged, new_files, modified, errors, marked) =
-            latest_scan_record(&mut conn).await;
-        assert_eq!((unchanged, new_files, modified, errors, marked), (1, 0, 0, 0, 0));
+        let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
+        assert_eq!(
+            (unchanged, new_files, modified, errors, marked),
+            (1, 0, 0, 0, 0)
+        );
         let blurhash: (Option<String>,) = sqlx::query_as("SELECT blurhash FROM items LIMIT 1")
             .fetch_one(&mut conn)
             .await
@@ -3125,9 +3039,11 @@ LIMIT 1
             .unwrap();
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
-        let (unchanged, new_files, modified, errors, marked) =
-            latest_scan_record(&mut conn).await;
-        assert_eq!((unchanged, new_files, modified, errors, marked), (1, 0, 0, 0, 0));
+        let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
+        assert_eq!(
+            (unchanged, new_files, modified, errors, marked),
+            (1, 0, 0, 0, 0)
+        );
         let row: (String, i64) = sqlx::query_as("SELECT sha256, available FROM files LIMIT 1")
             .fetch_one(&mut conn)
             .await
@@ -3342,11 +3258,13 @@ LIMIT 1
 
         // Simulate an update that committed the folder registration and then
         // failed before completing a scan.
-        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddFolderToDatabase {
-            time_added: "2024-01-01T00:00:00".to_string(),
-            path: media_dir.to_string_lossy().to_string(),
-            included: true,
-            reply,
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::AddFolderToDatabase {
+                time_added: "2024-01-01T00:00:00".to_string(),
+                path: media_dir.to_string_lossy().to_string(),
+                included: true,
+                reply,
+            }
         })
         .await
         .unwrap();
@@ -3359,7 +3277,10 @@ LIMIT 1
         );
 
         let result = service.run_folder_update().await.unwrap();
-        assert!(!result.scan_ids.is_empty(), "stranded folder was not scanned");
+        assert!(
+            !result.scan_ids.is_empty(),
+            "stranded folder was not scanned"
+        );
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
             .fetch_one(&mut conn)

@@ -5,7 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
@@ -90,6 +90,9 @@ pdfium-render = { version = "0.8", default-features = false, features = [
 ] }
 croner = "3.0.1"
 chrono = "0.4.45"
+# Dynamic msgpack values for the inferio worker protocol (framed stdio):
+# rmpv keeps str vs bin distinct, which the protocol relies on.
+rmpv = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render

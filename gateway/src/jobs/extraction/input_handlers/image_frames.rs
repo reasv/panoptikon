@@ -120,10 +120,7 @@ pub(super) async fn load_base_frames(
             .await
             .unwrap_or_default();
         if !cached.is_empty() {
-            return Ok(cached
-                .into_iter()
-                .map(BaseFrame::sized_by_item)
-                .collect());
+            return Ok(cached.into_iter().map(BaseFrame::sized_by_item).collect());
         }
         if item.duration.unwrap_or(0.0) > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
             let extracted = tokio::task::spawn_blocking({
@@ -517,9 +514,8 @@ fn extract_video_frames_into(
         // These PNGs were just written by our own ffmpeg run; one being
         // unreadable means something is broken (disk full, races), so fail
         // the item rather than silently tagging it from fewer frames.
-        let image = image::open(&frame_path).map_err(|err| {
-            ApiError::internal(format!("Failed to read extracted frame: {err}"))
-        })?;
+        let image = image::open(&frame_path)
+            .map_err(|err| ApiError::internal(format!("Failed to read extracted frame: {err}")))?;
         frames.push(image);
     }
     Ok(frames)
@@ -614,4 +610,3 @@ async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
         bytes: encode_jpeg(&shot)?,
     }])
 }
-

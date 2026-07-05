@@ -52,9 +52,7 @@ pub(crate) async fn delete_folders_not_in_list(
         .join(",");
     // Mixing numbered and bare placeholders misbinds parameters under sqlx,
     // so every placeholder here must stay unnumbered.
-    let sql = format!(
-        "DELETE FROM folders WHERE included = ? AND path NOT IN ({placeholders})"
-    );
+    let sql = format!("DELETE FROM folders WHERE included = ? AND path NOT IN ({placeholders})");
 
     let mut query = sqlx::query(&sql).bind(included);
     for path in folder_paths {
@@ -183,15 +181,24 @@ mod tests {
     #[tokio::test]
     async fn add_folder_to_database_ignores_duplicates() {
         let mut dbs = setup_test_databases().await;
-        let inserted = add_folder_to_database(&mut dbs.index_conn, "2024-01-01T00:00:00", r"C:\data\", true)
-            .await
-            .unwrap();
+        let inserted = add_folder_to_database(
+            &mut dbs.index_conn,
+            "2024-01-01T00:00:00",
+            r"C:\data\",
+            true,
+        )
+        .await
+        .unwrap();
         assert!(inserted);
 
-        let inserted_again =
-            add_folder_to_database(&mut dbs.index_conn, "2024-01-01T00:00:00", r"C:\data\", true)
-                .await
-                .unwrap();
+        let inserted_again = add_folder_to_database(
+            &mut dbs.index_conn,
+            "2024-01-01T00:00:00",
+            r"C:\data\",
+            true,
+        )
+        .await
+        .unwrap();
         assert!(!inserted_again);
     }
 

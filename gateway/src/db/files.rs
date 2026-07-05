@@ -745,11 +745,12 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', 1, 0)
         assert!(!result.file_deleted);
         assert!(!result.file_inserted);
 
-        let row: (i64, String) =
-            sqlx::query_as("SELECT scan_id, last_modified FROM files WHERE path = 'C:\\data\\one.png'")
-                .fetch_one(&mut dbs.index_conn)
-                .await
-                .unwrap();
+        let row: (i64, String) = sqlx::query_as(
+            "SELECT scan_id, last_modified FROM files WHERE path = 'C:\\data\\one.png'",
+        )
+        .fetch_one(&mut dbs.index_conn)
+        .await
+        .unwrap();
         assert_eq!(row.0, scan_id);
         assert_eq!(row.1, "2024-01-01T00:02:00");
     }

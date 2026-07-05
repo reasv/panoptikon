@@ -317,7 +317,9 @@ fn normalize_base_url(raw: String) -> String {
     }
 }
 
-fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictOutput> {
+/// Also used by the local orchestrator's HTTP tests as the parity oracle:
+/// whatever `inferio::http` encodes must be parseable by this exact logic.
+pub(crate) fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictOutput> {
     if content_type.contains("application/json") {
         let value: Value = serde_json::from_slice(body)?;
         let outputs = value

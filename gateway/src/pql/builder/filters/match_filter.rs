@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use crate::pql::model::Column;
 use crate::pql::preprocess::PqlError;
 
-use super::FilterCompiler;
 use super::super::{
     BaseTable, CteRef, ExtractedText, Files, ItemData, Items, JoinedTables, QueryState, Setters,
     get_column_expr, is_text_column, select_std_from_cte, wrap_query,
 };
+use super::FilterCompiler;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
@@ -454,7 +454,9 @@ fn build_matches_expression(matches: &Matches, allow_text: bool) -> Result<Expr,
 fn evaluate_matches(matches: &Matches, obj_fields: &HashMap<Column, FieldValue>) -> bool {
     match matches {
         Matches::Ops(ops) => evaluate_match_ops(ops, obj_fields),
-        Matches::And(MatchAnd { and_ }) => and_.iter().all(|ops| evaluate_match_ops(ops, obj_fields)),
+        Matches::And(MatchAnd { and_ }) => {
+            and_.iter().all(|ops| evaluate_match_ops(ops, obj_fields))
+        }
         Matches::Or(MatchOr { or_ }) => or_.iter().any(|ops| evaluate_match_ops(ops, obj_fields)),
         Matches::Not(MatchNot { not_ }) => !evaluate_match_ops(not_, obj_fields),
     }
@@ -473,7 +475,11 @@ fn evaluate_match_ops(ops: &MatchOps, obj_fields: &HashMap<Column, FieldValue>) 
         results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::In));
     }
     if let Some(values) = &ops.nin {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotIn));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::NotIn,
+        ));
     }
     if let Some(values) = &ops.gt {
         results.extend(evaluate_match_values(values, obj_fields, MatchOp::Gt));
@@ -488,22 +494,46 @@ fn evaluate_match_ops(ops: &MatchOps, obj_fields: &HashMap<Column, FieldValue>) 
         results.extend(evaluate_match_values(values, obj_fields, MatchOp::Lte));
     }
     if let Some(values) = &ops.startswith {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::StartsWith));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::StartsWith,
+        ));
     }
     if let Some(values) = &ops.not_startswith {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotStartsWith));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::NotStartsWith,
+        ));
     }
     if let Some(values) = &ops.endswith {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::EndsWith));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::EndsWith,
+        ));
     }
     if let Some(values) = &ops.not_endswith {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotEndsWith));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::NotEndsWith,
+        ));
     }
     if let Some(values) = &ops.contains {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::Contains));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::Contains,
+        ));
     }
     if let Some(values) = &ops.not_contains {
-        results.extend(evaluate_match_value_lists(values, obj_fields, MatchOp::NotContains));
+        results.extend(evaluate_match_value_lists(
+            values,
+            obj_fields,
+            MatchOp::NotContains,
+        ));
     }
 
     if results.is_empty() {
@@ -590,13 +620,19 @@ fn compare_field_list(field_value: &FieldValue, values: &FieldValues, op: MatchO
             list.iter().all(|value| field_value != value)
         }
         MatchOp::StartsWith | MatchOp::NotStartsWith => {
-            string_list_check(field_value, values, op, |value, pattern| value.starts_with(pattern))
+            string_list_check(field_value, values, op, |value, pattern| {
+                value.starts_with(pattern)
+            })
         }
         MatchOp::EndsWith | MatchOp::NotEndsWith => {
-            string_list_check(field_value, values, op, |value, pattern| value.ends_with(pattern))
+            string_list_check(field_value, values, op, |value, pattern| {
+                value.ends_with(pattern)
+            })
         }
         MatchOp::Contains | MatchOp::NotContains => {
-            string_list_check(field_value, values, op, |value, pattern| value.contains(pattern))
+            string_list_check(field_value, values, op, |value, pattern| {
+                value.contains(pattern)
+            })
         }
         _ => false,
     }
@@ -641,7 +677,9 @@ fn compare_ordered(
 ) -> bool {
     match (left, right) {
         (FieldValue::Int(lhs), FieldValue::Int(rhs)) => check(lhs.cmp(rhs)),
-        (FieldValue::Float(lhs), FieldValue::Float(rhs)) => lhs.partial_cmp(rhs).map(check).unwrap_or(false),
+        (FieldValue::Float(lhs), FieldValue::Float(rhs)) => {
+            lhs.partial_cmp(rhs).map(check).unwrap_or(false)
+        }
         (FieldValue::Int(lhs), FieldValue::Float(rhs)) => {
             (*lhs as f64).partial_cmp(rhs).map(check).unwrap_or(false)
         }
@@ -657,7 +695,11 @@ fn build_match_ops_expression(ops: &MatchOps, allow_text: bool) -> Result<Expr, 
     let mut expressions = Vec::new();
 
     if let Some(value) = &ops.eq {
-        expressions.extend(build_match_value_expressions(value, MatchOperator::Eq, allow_text)?);
+        expressions.extend(build_match_value_expressions(
+            value,
+            MatchOperator::Eq,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.neq {
         expressions.extend(build_match_value_expressions(
@@ -667,7 +709,11 @@ fn build_match_ops_expression(ops: &MatchOps, allow_text: bool) -> Result<Expr, 
         )?);
     }
     if let Some(value) = &ops.in_ {
-        expressions.extend(build_match_values_expressions(value, MatchOperator::In, allow_text)?);
+        expressions.extend(build_match_values_expressions(
+            value,
+            MatchOperator::In,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.nin {
         expressions.extend(build_match_values_expressions(
@@ -677,16 +723,32 @@ fn build_match_ops_expression(ops: &MatchOps, allow_text: bool) -> Result<Expr, 
         )?);
     }
     if let Some(value) = &ops.gt {
-        expressions.extend(build_match_value_expressions(value, MatchOperator::Gt, allow_text)?);
+        expressions.extend(build_match_value_expressions(
+            value,
+            MatchOperator::Gt,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.gte {
-        expressions.extend(build_match_value_expressions(value, MatchOperator::Gte, allow_text)?);
+        expressions.extend(build_match_value_expressions(
+            value,
+            MatchOperator::Gte,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.lt {
-        expressions.extend(build_match_value_expressions(value, MatchOperator::Lt, allow_text)?);
+        expressions.extend(build_match_value_expressions(
+            value,
+            MatchOperator::Lt,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.lte {
-        expressions.extend(build_match_value_expressions(value, MatchOperator::Lte, allow_text)?);
+        expressions.extend(build_match_value_expressions(
+            value,
+            MatchOperator::Lte,
+            allow_text,
+        )?);
     }
     if let Some(value) = &ops.startswith {
         expressions.extend(build_match_values_expressions(
@@ -764,7 +826,9 @@ fn build_match_value_expressions(
     let mut expressions = Vec::new();
     for (column, value) in collect_match_value_fields(values) {
         if !allow_text && is_text_column(column) {
-            return Err(PqlError::invalid("Text columns are not allowed in this context"));
+            return Err(PqlError::invalid(
+                "Text columns are not allowed in this context",
+            ));
         }
         let col_expr = get_column_expr(column);
         let value_expr = value.to_expr();
@@ -792,7 +856,9 @@ fn build_match_values_expressions(
     let mut expressions = Vec::new();
     for (column, value) in collect_match_values_fields(values) {
         if !allow_text && is_text_column(column) {
-            return Err(PqlError::invalid("Text columns are not allowed in this context"));
+            return Err(PqlError::invalid(
+                "Text columns are not allowed in this context",
+            ));
         }
         let col_expr = get_column_expr(column);
         let expr = match operator {
@@ -831,7 +897,11 @@ enum LikeKind {
     NotContains,
 }
 
-fn build_in_expression(col_expr: &Expr, value: FieldValues, negate: bool) -> Result<Expr, PqlError> {
+fn build_in_expression(
+    col_expr: &Expr,
+    value: FieldValues,
+    negate: bool,
+) -> Result<Expr, PqlError> {
     let values = match value {
         FieldValues::Single(_) => {
             return Err(PqlError::invalid("Invalid operator for single value"));
@@ -904,7 +974,9 @@ fn combine_and(mut expressions: Vec<Expr>) -> Result<Expr, PqlError> {
         .drain(..1)
         .next()
         .ok_or_else(|| PqlError::invalid("No expressions to combine"))?;
-    Ok(expressions.into_iter().fold(first, |acc, expr| acc.and(expr)))
+    Ok(expressions
+        .into_iter()
+        .fold(first, |acc, expr| acc.and(expr)))
 }
 
 fn combine_or(mut expressions: Vec<Expr>) -> Result<Expr, PqlError> {
@@ -912,7 +984,9 @@ fn combine_or(mut expressions: Vec<Expr>) -> Result<Expr, PqlError> {
         .drain(..1)
         .next()
         .ok_or_else(|| PqlError::invalid("No expressions to combine"))?;
-    Ok(expressions.into_iter().fold(first, |acc, expr| acc.or(expr)))
+    Ok(expressions
+        .into_iter()
+        .fold(first, |acc, expr| acc.or(expr)))
 }
 
 fn collect_match_value_fields(values: &MatchValue) -> Vec<(Column, FieldValue)> {
@@ -1013,7 +1087,10 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         fields.push((Column::ItemId, convert_one_or_many(value, map_int)));
     }
     if let Some(value) = values.path.as_ref() {
-        fields.push((Column::Path, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Path,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.filename.as_ref() {
         fields.push((
@@ -1022,7 +1099,10 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         ));
     }
     if let Some(value) = values.sha256.as_ref() {
-        fields.push((Column::Sha256, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Sha256,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.last_modified.as_ref() {
         fields.push((
@@ -1031,7 +1111,10 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         ));
     }
     if let Some(value) = values.r#type.as_ref() {
-        fields.push((Column::Type, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Type,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.size.as_ref() {
         fields.push((Column::Size, convert_one_or_many(value, map_int)));
@@ -1052,7 +1135,10 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         ));
     }
     if let Some(value) = values.md5.as_ref() {
-        fields.push((Column::Md5, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Md5,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.audio_tracks.as_ref() {
         fields.push((Column::AudioTracks, convert_one_or_many(value, map_int)));
@@ -1064,21 +1150,31 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         fields.push((Column::SubtitleTracks, convert_one_or_many(value, map_int)));
     }
     if let Some(value) = values.blurhash.as_ref() {
-        fields.push(
-            (Column::Blurhash, convert_one_or_many(value, |v| FieldValue::String(v.clone()))),
-        );
+        fields.push((
+            Column::Blurhash,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.data_id.as_ref() {
         fields.push((Column::DataId, convert_one_or_many(value, map_int)));
     }
     if let Some(value) = values.language.as_ref() {
-        fields.push((Column::Language, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Language,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.language_confidence.as_ref() {
-        fields.push((Column::LanguageConfidence, convert_one_or_many(value, map_float)));
+        fields.push((
+            Column::LanguageConfidence,
+            convert_one_or_many(value, map_float),
+        ));
     }
     if let Some(value) = values.text.as_ref() {
-        fields.push((Column::Text, convert_one_or_many(value, |v| FieldValue::String(v.clone()))));
+        fields.push((
+            Column::Text,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.confidence.as_ref() {
         fields.push((Column::Confidence, convert_one_or_many(value, map_float)));
@@ -1093,9 +1189,10 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
         fields.push((Column::SetterId, convert_one_or_many(value, map_int)));
     }
     if let Some(value) = values.setter_name.as_ref() {
-        fields.push(
-            (Column::SetterName, convert_one_or_many(value, |v| FieldValue::String(v.clone()))),
-        );
+        fields.push((
+            Column::SetterName,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.data_index.as_ref() {
         fields.push((Column::DataIndex, convert_one_or_many(value, map_int)));

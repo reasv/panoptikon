@@ -100,8 +100,7 @@ pub(crate) async fn get_most_common_tags_frequency(
     confidence_threshold: Option<f64>,
     limit: i64,
 ) -> ApiResult<Vec<(String, String, i64, f64)>> {
-    let tags =
-        get_most_common_tags(conn, namespace, setters, confidence_threshold, limit).await?;
+    let tags = get_most_common_tags(conn, namespace, setters, confidence_threshold, limit).await?;
     if tags.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,9 +190,7 @@ pub(crate) async fn get_all_tag_namespaces(
     Ok(namespaces)
 }
 
-pub(crate) async fn get_min_tag_confidence(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<f64> {
+pub(crate) async fn get_min_tag_confidence(conn: &mut sqlx::SqliteConnection) -> ApiResult<f64> {
     let row = sqlx::query(
         r#"
         SELECT MIN(confidence) AS min_confidence
@@ -401,11 +398,7 @@ mod tests {
 
         assert_eq!(
             namespaces,
-            vec![
-                "ns".to_string(),
-                "ns".to_string(),
-                "ns:sub".to_string()
-            ]
+            vec!["ns".to_string(), "ns".to_string(), "ns:sub".to_string()]
         );
     }
 
@@ -422,10 +415,9 @@ mod tests {
     #[tokio::test]
     async fn get_most_common_tags_frequency_calculates_frequency() {
         let mut dbs = setup_tag_db().await;
-        let tags =
-            get_most_common_tags_frequency(&mut dbs.index_conn, None, &[], None, 10)
-                .await
-                .unwrap();
+        let tags = get_most_common_tags_frequency(&mut dbs.index_conn, None, &[], None, 10)
+            .await
+            .unwrap();
 
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0].1, "cat");

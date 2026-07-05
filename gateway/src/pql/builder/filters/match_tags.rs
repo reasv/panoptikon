@@ -5,12 +5,12 @@ use utoipa::ToSchema;
 use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
-use super::FilterCompiler;
 use super::super::{
     CteRef, ExtraColumn, ItemData, JoinedTables, OrderByFilter, QueryState, Setters, Tags,
     TagsItems, add_rank_column_expr, apply_group_by, apply_sort_bounds, create_cte,
     get_std_group_by, select_std_from_cte, wrap_query,
 };
+use super::FilterCompiler;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct TagsArgs {
@@ -85,12 +85,7 @@ impl FilterCompiler for MatchTags {
         let args = &self.match_tags;
         let cte_name = format!("n{}_MatchTags", state.cte_counter);
         let mut conditions = Vec::new();
-        let tag_values = args
-            .tags
-            .iter()
-            .cloned()
-            .map(Expr::val)
-            .collect::<Vec<_>>();
+        let tag_values = args.tags.iter().cloned().map(Expr::val).collect::<Vec<_>>();
         conditions.push(Expr::col((Tags::Table, Tags::Name)).is_in(tag_values));
         if args.min_confidence > 0.0 {
             conditions.push(
@@ -98,16 +93,20 @@ impl FilterCompiler for MatchTags {
             );
         }
         if !args.setters.is_empty() {
-            let setters = args.setters.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+            let setters = args
+                .setters
+                .iter()
+                .cloned()
+                .map(Expr::val)
+                .collect::<Vec<_>>();
             conditions.push(Expr::col((Setters::Table, Setters::Name)).is_in(setters));
         }
 
         if !args.namespaces.is_empty() {
             let mut namespace_exprs = Vec::new();
             for namespace in &args.namespaces {
-                namespace_exprs.push(
-                    Expr::col((Tags::Table, Tags::Namespace)).like(format!("{namespace}%")),
-                );
+                namespace_exprs
+                    .push(Expr::col((Tags::Table, Tags::Namespace)).like(format!("{namespace}%")));
             }
             let mut namespace_cond = namespace_exprs
                 .drain(..1)
@@ -130,8 +129,7 @@ impl FilterCompiler for MatchTags {
         matching_items_select.join(
             JoinType::InnerJoin,
             Setters::Table,
-            Expr::col((Setters::Table, Setters::Id))
-                .equals((ItemData::Table, ItemData::SetterId)),
+            Expr::col((Setters::Table, Setters::Id)).equals((ItemData::Table, ItemData::SetterId)),
         );
         matching_items_select.join(
             JoinType::InnerJoin,
@@ -142,8 +140,7 @@ impl FilterCompiler for MatchTags {
         matching_items_select.join(
             JoinType::InnerJoin,
             Tags::Table,
-            Expr::col((Tags::Table, Tags::Id))
-                .equals((TagsItems::Table, TagsItems::TagId)),
+            Expr::col((Tags::Table, Tags::Id)).equals((TagsItems::Table, TagsItems::TagId)),
         );
         for condition in conditions {
             matching_items_select.and_where(condition);
@@ -159,9 +156,8 @@ impl FilterCompiler for MatchTags {
             having_clauses.push(Func::count_distinct(setter_tag).eq(expected));
         } else {
             let expected = args.tags.len() as i64;
-            having_clauses.push(
-                Func::count_distinct(Expr::col((Tags::Table, Tags::Name))).eq(expected),
-            );
+            having_clauses
+                .push(Func::count_distinct(Expr::col((Tags::Table, Tags::Name))).eq(expected));
         }
         if args.match_any && args.tags.len() > 1 {
             having_clauses.clear();
@@ -176,12 +172,18 @@ impl FilterCompiler for MatchTags {
             add_rank_column_expr(&mut matching_items_select, &self.sort, avg_confidence)?;
         }
 
-        let matching_items =
-            create_cte(state, format!("match_{cte_name}"), matching_items_select.to_owned());
+        let matching_items = create_cte(
+            state,
+            format!("match_{cte_name}"),
+            matching_items_select.to_owned(),
+        );
 
         let mut query = select_std_from_cte(context, state);
         if !state.is_count_query {
-            query.expr_as(matching_items.column_expr("order_rank"), Alias::new("order_rank"));
+            query.expr_as(
+                matching_items.column_expr("order_rank"),
+                Alias::new("order_rank"),
+            );
         }
         let join_condition = if state.item_data_query {
             Expr::col(matching_items.column_ref("data_id")).equals(context.column_ref("data_id"))

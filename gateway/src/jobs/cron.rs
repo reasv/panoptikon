@@ -29,9 +29,7 @@ use crate::db::open_index_db_read;
 use crate::db::system_config::{CronJob, SystemConfig, SystemConfigStore};
 use crate::jobs::extraction::resolve_model_metadata;
 use crate::jobs::inference_pool::job_inference_context;
-use crate::jobs::queue::{
-    BatchDedup, JobModel, JobRequest, JobType, enqueue_jobs_unless_tagged,
-};
+use crate::jobs::queue::{BatchDedup, JobModel, JobRequest, JobType, enqueue_jobs_unless_tagged};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -236,7 +234,9 @@ pub(crate) struct CronScheduleStatus {
 
 pub(crate) enum CronSchedulerMessage {
     Tick,
-    ConfigChanged { index_db: String },
+    ConfigChanged {
+        index_db: String,
+    },
     GetStatus {
         index_db: String,
         reply: oneshot::Sender<CronScheduleStatus>,
@@ -445,8 +445,7 @@ async fn preload_tick(state: &mut CronSchedulerState, index_db: &str, config: &S
     let embedding_setters: Vec<String> = setters
         .into_iter()
         .filter(|(data_type, setter)| {
-            (data_type == "text-embedding" || data_type == "clip")
-                && !setter.starts_with("tclip/")
+            (data_type == "text-embedding" || data_type == "clip") && !setter.starts_with("tclip/")
         })
         .map(|(_, setter)| setter)
         .collect();
@@ -583,7 +582,11 @@ mod tests {
     fn plan_tick_keeps_state_for_unchanged_string() {
         let fire_at = local(2026, 7, 5, 3, 0, 0);
         let prev = state("0 3 * * *", fire_at);
-        let (next, fire) = plan_tick(Some(prev.clone()), Some("0 3 * * *"), local(2026, 7, 4, 13, 0, 0));
+        let (next, fire) = plan_tick(
+            Some(prev.clone()),
+            Some("0 3 * * *"),
+            local(2026, 7, 4, 13, 0, 0),
+        );
         assert_eq!(next.unwrap(), prev);
         assert!(!fire);
     }
@@ -626,7 +629,11 @@ mod tests {
     #[test]
     fn plan_tick_invalid_string_is_inert() {
         let prev = state("0 3 * * *", local(2026, 7, 5, 3, 0, 0));
-        let (next, fire) = plan_tick(Some(prev), Some("not a cron string"), local(2026, 7, 6, 0, 0, 0));
+        let (next, fire) = plan_tick(
+            Some(prev),
+            Some("not a cron string"),
+            local(2026, 7, 6, 0, 0, 0),
+        );
         assert!(next.is_none());
         assert!(!fire);
     }
@@ -634,7 +641,13 @@ mod tests {
     // croniter-style inputs the UI and docs mention must all parse.
     #[test]
     fn validate_accepts_croniter_style_patterns() {
-        for pattern in ["0 3 * * *", "*/15 * * * *", "@daily", "0 4 * * sun", "0 4 * * 7"] {
+        for pattern in [
+            "0 3 * * *",
+            "*/15 * * * *",
+            "@daily",
+            "0 4 * * sun",
+            "0 4 * * 7",
+        ] {
             assert!(
                 validate_cron_schedule(pattern).is_ok(),
                 "pattern should be valid: {pattern}"

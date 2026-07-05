@@ -39,7 +39,9 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(ErrorBody { detail: self.detail });
+        let body = Json(ErrorBody {
+            detail: self.detail,
+        });
         (self.status, body).into_response()
     }
 }

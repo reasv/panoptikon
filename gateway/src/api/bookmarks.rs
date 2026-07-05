@@ -902,10 +902,15 @@ mod tests {
         let mut dbs = setup_user_data_db().await;
         let metadata = json!({"note": "added"});
 
-        let response =
-            add_bookmark_entry(&mut dbs.index_conn, "favorites", "sha256", "user", Some(&metadata))
-                .await
-                .unwrap();
+        let response = add_bookmark_entry(
+            &mut dbs.index_conn,
+            "favorites",
+            "sha256",
+            "user",
+            Some(&metadata),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.message, "Added bookmark");
         let saved = load_bookmark_metadata(&mut dbs.index_conn, "favorites", "sha256", "user")
@@ -953,24 +958,20 @@ mod tests {
         std::fs::write(&path_one, b"one").unwrap();
         std::fs::write(&path_two, b"two").unwrap();
 
-        sqlx::query(
-            "UPDATE files SET path = ?, last_modified = ? WHERE id = ?",
-        )
-        .bind(path_one.to_string_lossy().to_string())
-        .bind("2024-01-01T00:00:00")
-        .bind(10_i64)
-        .execute(&mut dbs.index_conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE files SET path = ?, last_modified = ? WHERE id = ?",
-        )
-        .bind(path_two.to_string_lossy().to_string())
-        .bind("2024-01-02T00:00:00")
-        .bind(20_i64)
-        .execute(&mut dbs.index_conn)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE files SET path = ?, last_modified = ? WHERE id = ?")
+            .bind(path_one.to_string_lossy().to_string())
+            .bind("2024-01-01T00:00:00")
+            .bind(10_i64)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET path = ?, last_modified = ? WHERE id = ?")
+            .bind(path_two.to_string_lossy().to_string())
+            .bind("2024-01-02T00:00:00")
+            .bind(20_i64)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
         sqlx::query(
             r#"
             INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added, metadata)
@@ -1053,15 +1054,10 @@ mod tests {
         let items = Items {
             sha256: vec!["sha_two".to_string()],
         };
-        let response = delete_bookmarks_namespace(
-            &mut dbs.index_conn,
-            "favorites",
-            "user",
-            0,
-            Some(&items),
-        )
-            .await
-            .unwrap();
+        let response =
+            delete_bookmarks_namespace(&mut dbs.index_conn, "favorites", "user", 0, Some(&items))
+                .await
+                .unwrap();
 
         assert_eq!(response.message, "Deleted 1 bookmarks");
         let remaining = sqlx::query(
@@ -1105,9 +1101,10 @@ mod tests {
             .unwrap();
         }
 
-        let response = delete_bookmarks_namespace(&mut dbs.index_conn, "favorites", "user", 1, None)
-            .await
-            .unwrap();
+        let response =
+            delete_bookmarks_namespace(&mut dbs.index_conn, "favorites", "user", 1, None)
+                .await
+                .unwrap();
 
         assert_eq!(response.message, "Deleted bookmarks");
         let remaining = sqlx::query(

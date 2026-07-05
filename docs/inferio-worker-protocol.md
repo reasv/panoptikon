@@ -80,9 +80,14 @@ continues (does not exit).
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
-- Graceful stop: `unload` → wait (config, default 10 s) for `ok` + exit →
-  `terminate` → wait 5 s → kill. The whole tree is additionally under a
-  kill-on-close Job Object on Windows.
+- Graceful stop: `unload` → wait (config, default 10 s) for `ok` + process
+  exit; on timeout the worker is hard-terminated immediately, reaped within
+  the terminate grace (config, default 5 s), and killed again as a last
+  resort if the reap times out. There is no separate soft-terminate
+  (SIGTERM) step between the unload grace and the hard kill: tokio offers no
+  cross-platform soft terminate and Windows (the primary platform) has no
+  SIGTERM equivalent — the `unload` exchange *is* the soft step. The whole
+  tree is additionally under a kill-on-close Job Object on Windows.
 - Unexpected worker exit at any point: all pending/queued requests for that
   model fail with the stderr tail; the model is marked unloaded.
 
@@ -92,6 +97,9 @@ The orchestrator sets for every worker:
 
 - `CUDA_VISIBLE_DEVICES` — when device pinning is active (absent = default).
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
+- `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in
+  depth; the orchestrator's stderr forwarder tolerates arbitrary bytes from
+  native code regardless).
 - Inherited: `DATA_FOLDER`, proxy vars, PATH. Nothing else is promised.
 
 The worker runs `python -m inferio_worker` with no arguments; everything it

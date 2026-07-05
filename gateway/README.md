@@ -19,7 +19,9 @@ added later.
 ## Routing
 
 - `/api/*` goes to the Python backend, except local routes when enabled
-- `/api/inference/*` goes to the first inference upstream (defaults to the API upstream)
+- `/api/inference/*` goes to the first inference upstream (defaults to the API
+  upstream) — or is served in-process by the Rust inferio orchestrator when
+  `[inference_local].enabled = true` (see below)
 - `/docs` goes to the Python backend unless `upstreams.api.local = true`
 - `/redoc` goes to the Python backend unless `upstreams.api.local = true`
 - `/openapi.json` goes to the Python backend unless `upstreams.api.local = true`
@@ -126,6 +128,57 @@ fixed. To force polling (e.g., for unreliable shares), set
 `notify::PollWatcher` instead of native watchers). There is no native watcher
 exclude support, so continuous-scan excludes are not implemented.
 
+## Local inference (inferio orchestrator)
+
+With `[inference_local].enabled = true` the gateway serves `/api/inference/*`
+itself: it parses the inference TOML registry, spawns Python worker processes
+(`python -m inferio_worker`) on demand, manages the LRU/TTL model caches, and
+batches concurrent predict requests at dispatch time. The HTTP surface is
+wire-compatible with the Python inference server (multipart predict requests,
+octet-stream / multipart-mixed / JSON responses, `/metadata` with mtime-gated
+registry reload), so the web UI and all gateway-internal clients work
+unchanged. The routes stay behind the policy layer, which strips DB query
+parameters for inference paths just as it did for the proxy.
+
+When `upstreams.inference` is empty and local inference is enabled, the
+gateway synthesizes a loopback entry pointing at itself so search, jobs, and
+cron preload work with zero extra config. Explicitly configured endpoints are
+left untouched — you can mix the local orchestrator with remote inference
+servers; entry order still decides which endpoint serves search/metadata and
+which ones take jobs.
+
+```toml
+[inference_local]
+enabled = true
+# All optional:
+# python = ".venv/Scripts/python.exe"  # default: auto-detect the repo venv
+# impl_dirs = ["src/inferio/impl", "inferio_custom"]
+# config_dirs = ["src/inferio/config", "config/inference"]
+# pythonpath = ["src"]
+# default_max_batch = 32
+# sweep_interval_secs = 10
+# handshake_secs = 30
+# load_secs = 600
+# unload_grace_secs = 10
+# terminate_grace_secs = 5
+# port = 7777        # `inferio` subcommand listen port (default: server.port)
+```
+
+A machine that only lends its GPU can run the standalone service:
+
+```bash
+cargo run -p gateway -- inferio --config config\gateway\default.toml
+```
+
+This starts only `/api/inference/*` plus `GET /health` — no proxy, local API,
+jobs, cron, or migrations. Point other panoptikon instances at it with an
+`[[upstreams.inference]]` entry.
+
+On shutdown, local inference workers are stopped via the graceful
+unload → terminate → kill ladder after the job queue stops and before the
+index writers flush; workers are additionally covered by a kill-on-close Job
+Object so a forced exit cannot leak processes.
+
 To add migrations, use SQLx's CLI against the appropriate source directory:
 
 ```bash
@@ -170,10 +223,17 @@ base_url = "http://127.0.0.1:6342"
 local = false
 
 # Inference upstreams (first entry is used for search + metadata + /api/inference proxy).
+# Omit entirely when [inference_local] is enabled: a loopback self entry is
+# synthesized automatically.
 [[upstreams.inference]]
 base_url = "http://127.0.0.1:6342"
 weight = 1.0
 use_for_jobs = true
+
+# Serve /api/inference/* in-process instead of proxying (Rust inferio
+# orchestrator; see "Local inference" above).
+[inference_local]
+enabled = false
 
 [search]
 embedding_cache_size = 16

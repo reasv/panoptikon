@@ -20,6 +20,144 @@ pub struct Settings {
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
+    #[serde(default)]
+    pub inference_local: InferenceLocalConfig,
+}
+
+/// `[inference_local]`: the in-process inferio orchestrator (design doc §3).
+/// When enabled the gateway serves `/api/inference/*` locally (spawning
+/// Python worker processes on demand) instead of proxying to an upstream.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InferenceLocalConfig {
+    /// Serve inference locally instead of proxying. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Python interpreter used to spawn workers. Default: auto-detect the
+    /// repo venv (`.venv/Scripts/python.exe` on Windows, `.venv/bin/python`
+    /// elsewhere) relative to the working directory.
+    #[serde(default)]
+    pub python: Option<PathBuf>,
+    /// Directories searched (in order) for impl-class modules; forwarded to
+    /// workers in the spawn handshake. Empty (default) means
+    /// `["src/inferio/impl", "inferio_custom"]`.
+    #[serde(default)]
+    pub impl_dirs: Vec<PathBuf>,
+    /// Registry TOML directories, built-in first. Empty (default) means the
+    /// Python default resolution: `BASE_INFERENCE_CONFIG_FOLDER` env or
+    /// `src/inferio/config`, then `INFERIO_CONFIG_DIR` env or
+    /// `config/inference`.
+    #[serde(default)]
+    pub config_dirs: Vec<PathBuf>,
+    /// Entries prepended to the workers' PYTHONPATH so the `inferio_worker`
+    /// package resolves in the src/ layout. Empty (default) means `["src"]`.
+    #[serde(default)]
+    pub pythonpath: Vec<PathBuf>,
+    /// Server-wide default batch cap when neither the request nor the
+    /// registry expresses an opinion (Python's `MAX_COMBINED_BATCH`).
+    #[serde(default = "default_inference_max_batch")]
+    pub default_max_batch: u32,
+    /// TTL sweeper period in seconds (Python: 10).
+    #[serde(default = "default_inference_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    /// Optional worker lifecycle deadline overrides (protocol doc defaults:
+    /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
+    #[serde(default)]
+    pub handshake_secs: Option<u64>,
+    #[serde(default)]
+    pub load_secs: Option<u64>,
+    #[serde(default)]
+    pub unload_grace_secs: Option<u64>,
+    #[serde(default)]
+    pub terminate_grace_secs: Option<u64>,
+    /// Listen port override for the `inferio` subcommand only (the full
+    /// gateway always serves inference on its own `server.port`). Default:
+    /// `server.port`.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+fn default_inference_max_batch() -> u32 {
+    32
+}
+
+fn default_inference_sweep_interval_secs() -> u64 {
+    10
+}
+
+impl Default for InferenceLocalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            python: None,
+            impl_dirs: Vec::new(),
+            config_dirs: Vec::new(),
+            pythonpath: Vec::new(),
+            default_max_batch: default_inference_max_batch(),
+            sweep_interval_secs: default_inference_sweep_interval_secs(),
+            handshake_secs: None,
+            load_secs: None,
+            unload_grace_secs: None,
+            terminate_grace_secs: None,
+            port: None,
+        }
+    }
+}
+
+impl InferenceLocalConfig {
+    /// The worker interpreter: configured path or the repo venv default.
+    pub fn resolved_python(&self) -> PathBuf {
+        self.python.clone().unwrap_or_else(|| {
+            if cfg!(windows) {
+                PathBuf::from(".venv/Scripts/python.exe")
+            } else {
+                PathBuf::from(".venv/bin/python")
+            }
+        })
+    }
+
+    /// Impl-class search dirs, defaulted and absolutized (the worker
+    /// handshake forwards them verbatim; workers skip missing dirs).
+    ///
+    /// The default custom dir honors `INFERIO_CUSTOM_IMPL_PATH` like the
+    /// Python server (utils.py: env or `./inferio_custom`). Explicitly
+    /// configured `impl_dirs` win over the env var. Note there is no
+    /// local-mode analogue of `INFERIO_ALLOW_BUILT_IN_OVERRIDE`: dirs are
+    /// searched in order (built-ins first, customs later) and the first
+    /// module providing a matching `name()` wins.
+    pub fn resolved_impl_dirs(&self) -> Vec<PathBuf> {
+        let custom_env = env::var_os("INFERIO_CUSTOM_IMPL_PATH");
+        let dirs = if self.impl_dirs.is_empty() {
+            let custom = custom_env
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("inferio_custom"));
+            vec![PathBuf::from("src/inferio/impl"), custom]
+        } else {
+            if custom_env.is_some() {
+                tracing::warn!(
+                    "INFERIO_CUSTOM_IMPL_PATH is set but [inference_local].impl_dirs is \
+                     configured explicitly; the environment variable is ignored"
+                );
+            }
+            self.impl_dirs.clone()
+        };
+        dirs.into_iter().map(absolutize).collect()
+    }
+
+    /// PYTHONPATH prepends for workers, defaulted and absolutized.
+    pub fn resolved_pythonpath(&self) -> Vec<PathBuf> {
+        let dirs = if self.pythonpath.is_empty() {
+            vec![PathBuf::from("src")]
+        } else {
+            self.pythonpath.clone()
+        };
+        dirs.into_iter().map(absolutize).collect()
+    }
+}
+
+/// Best-effort absolutization against the current working directory (keeps
+/// the path as-is if the CWD cannot be resolved).
+fn absolutize(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// Host-resource limits for extraction jobs. These describe the machine the
@@ -216,8 +354,8 @@ impl Settings {
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
         settings.apply_env_overrides()?;
-        settings.apply_inference_default();
-        settings.validate()?;
+        let loopback_synthesized = settings.apply_inference_default();
+        settings.validate(loopback_synthesized)?;
         Ok(settings)
     }
 
@@ -258,11 +396,35 @@ impl Settings {
         Ok(())
     }
 
-    fn validate(&self) -> Result<()> {
+    /// `loopback_synthesized` is true when `apply_inference_default` just
+    /// synthesized a loopback self-call inference upstream, which must be
+    /// checked against the policies (see
+    /// [`Settings::validate_loopback_inference_policy`]).
+    fn validate(&self, loopback_synthesized: bool) -> Result<()> {
         self.validate_rulesets()?;
         self.validate_policies()?;
         self.validate_inference_endpoints()?;
+        if loopback_synthesized {
+            self.validate_loopback_inference_policy()?;
+        }
+        self.warn_inference_local();
         Ok(())
+    }
+
+    /// Local inference spawns workers lazily, so a missing interpreter is a
+    /// warning at load time, not an error — the first model load surfaces it.
+    fn warn_inference_local(&self) {
+        if !self.inference_local.enabled {
+            return;
+        }
+        let python = self.inference_local.resolved_python();
+        if !python.is_file() {
+            tracing::warn!(
+                python = %python.display(),
+                "inference_local is enabled but the worker Python interpreter \
+                 was not found; model loads will fail until it exists"
+            );
+        }
     }
 
     fn validate_rulesets(&self) -> Result<()> {
@@ -311,6 +473,55 @@ impl Settings {
         Ok(())
     }
 
+    /// When a loopback inference upstream was synthesized, the gateway's
+    /// own inference clients (extraction jobs, PQL embedding search, cron
+    /// preload) call back into this gateway's listener — through the policy
+    /// layer. Verify at config-load time that a policy matches the
+    /// synthesized host and that its ruleset admits the inference routes;
+    /// otherwise every self-call would 403 silently at runtime, breaking
+    /// all jobs/search/preload with nothing in the config to hint why.
+    fn validate_loopback_inference_policy(&self) -> Result<()> {
+        let host = crate::policy::normalize_host(loopback_host(&self.server.host));
+        let base_url = &self.upstreams.inference[0].base_url;
+        let Some(policy) = crate::policy::select_policy(self, Some(&host)) else {
+            anyhow::bail!(
+                "inference_local.enabled synthesized a loopback inference upstream ({base_url}) \
+                 because upstreams.inference is empty, but no policy matches host '{host}' — \
+                 every internal inference call (jobs, PQL search, preload) would be rejected \
+                 with 403. Add a [[policies]] entry whose match.hosts includes '{host}', set \
+                 [[upstreams.inference]] explicitly, or bind server.host to a policy-covered \
+                 address"
+            );
+        };
+        for (method, path, what) in [
+            (
+                Method::POST,
+                "/api/inference/predict/group/id",
+                "POST /api/inference/predict/*",
+            ),
+            (
+                Method::PUT,
+                "/api/inference/load/group/id",
+                "PUT /api/inference/load/*",
+            ),
+            (Method::GET, "/api/inference/metadata", "GET /api/inference/metadata"),
+        ] {
+            if !crate::policy::ruleset_allows(self, policy, &method, path) {
+                anyhow::bail!(
+                    "inference_local.enabled synthesized a loopback inference upstream \
+                     ({base_url}) for host '{host}', but policy '{}' (ruleset {:?}) denies \
+                     {what}, which internal inference calls (jobs, PQL search, preload) \
+                     require. Allow the /api/inference routes in that ruleset, set \
+                     [[upstreams.inference]] explicitly, or add a dedicated policy for \
+                     '{host}'",
+                    policy.name,
+                    policy.ruleset,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_inference_endpoints(&self) -> Result<()> {
         if self.upstreams.inference.is_empty() {
             anyhow::bail!("upstreams.inference must include at least one endpoint");
@@ -320,10 +531,7 @@ impl Settings {
                 anyhow::bail!("upstreams.inference[{}] base_url must not be empty", idx);
             }
             if endpoint.weight.is_nan() || endpoint.weight < 0.0 {
-                anyhow::bail!(
-                    "upstreams.inference[{}] weight must be >= 0",
-                    idx
-                );
+                anyhow::bail!("upstreams.inference[{}] weight must be >= 0", idx);
             }
         }
         Ok(())
@@ -331,14 +539,56 @@ impl Settings {
 }
 
 impl Settings {
-    fn apply_inference_default(&mut self) {
+    /// Default inference upstream when `upstreams.inference` is empty.
+    ///
+    /// - `inference_local.enabled = true`: synthesize a loopback entry
+    ///   pointing at the gateway itself, so jobs/PQL/preload (which all talk
+    ///   to `upstreams.inference[0]`) work with zero config — the gateway
+    ///   serves `/api/inference/*` locally anyway. When the user configured
+    ///   endpoints explicitly, they are left untouched (mixing local +
+    ///   remote is allowed; entry order decides who gets jobs/search).
+    /// - otherwise: fall back to the API upstream, exactly as before.
+    ///
+    /// Returns true when a loopback self entry was synthesized, so
+    /// `validate` can verify the policies actually admit the self-calls.
+    fn apply_inference_default(&mut self) -> bool {
         if self.upstreams.inference.is_empty() {
+            let local = self.inference_local.enabled;
+            let base_url = if local {
+                loopback_base_url(&self.server.host, self.server.port)
+            } else {
+                self.upstreams.api.base_url.clone()
+            };
             self.upstreams.inference.push(InferenceEndpointConfig {
-                base_url: self.upstreams.api.base_url.clone(),
+                base_url,
                 weight: default_inference_weight(),
                 use_for_jobs: default_inference_use_for_jobs(),
             });
+            return local;
         }
+        false
+    }
+}
+
+/// A base URL that reaches this gateway's own listener: wildcard binds map
+/// to the matching loopback address, IPv6 hosts get bracketed.
+pub fn loopback_base_url(host: &str, port: u16) -> String {
+    let host = loopback_host(host);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+/// The concrete host a synthesized loopback URL points at. IPv6 wildcards
+/// map to `::1`, not 127.0.0.1: a `::` listener is IPV6_V6ONLY by default
+/// on Windows, so an IPv4 loopback address would never reach it.
+fn loopback_host(host: &str) -> &str {
+    match host {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        other => other,
     }
 }
 
@@ -502,5 +752,275 @@ impl<'de> Deserialize<'de> for MethodsSpec {
         }
 
         deserializer.deserialize_any(MethodsVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// loopback_base_url maps IPv4 wildcard binds to 127.0.0.1, IPv6
+    /// wildcards to [::1] (an IPv6 wildcard listener is IPV6_V6ONLY by
+    /// default on Windows, so 127.0.0.1 would never reach it), and brackets
+    /// bare IPv6 hosts; concrete hosts pass through unchanged. This is the
+    /// URL synthesized for `upstreams.inference` when local inference is
+    /// enabled with no configured endpoints.
+    #[test]
+    fn loopback_base_url_handles_wildcards_and_ipv6() {
+        assert_eq!(loopback_base_url("0.0.0.0", 8080), "http://127.0.0.1:8080");
+        assert_eq!(loopback_base_url("::", 8080), "http://[::1]:8080");
+        assert_eq!(loopback_base_url("[::]", 8080), "http://[::1]:8080");
+        assert_eq!(loopback_base_url("", 1234), "http://127.0.0.1:1234");
+        assert_eq!(
+            loopback_base_url("127.0.0.1", 6342),
+            "http://127.0.0.1:6342"
+        );
+        assert_eq!(loopback_base_url("myhost", 80), "http://myhost:80");
+        assert_eq!(loopback_base_url("::1", 8080), "http://[::1]:8080");
+        assert_eq!(loopback_base_url("[::1]", 8080), "http://[::1]:8080");
+    }
+
+    /// A minimal policy block matching the given hosts with no ruleset
+    /// restriction, for tests that need config load to pass the loopback
+    /// self-call policy validation.
+    fn allow_all_policy_toml(hosts: &str) -> String {
+        format!(
+            r#"
+[[policies]]
+name = "test"
+
+[policies.match]
+hosts = [{hosts}]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+        )
+    }
+
+    /// Config resolution rule for local inference (documented in AGENTS.md):
+    /// `inference_local.enabled = true` with an empty `upstreams.inference`
+    /// synthesizes a loopback self-entry (host/port of the gateway itself)
+    /// so jobs/PQL/preload work with zero config; when endpoints are
+    /// configured explicitly they are left exactly as-is; and when local
+    /// inference is disabled the old default (API upstream) still applies.
+    #[test]
+    fn inference_local_synthesizes_loopback_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+
+        // Enabled + no inference endpoints -> loopback self entry (a policy
+        // covering the loopback host is required — self-calls go through
+        // the policy layer and are validated at config load).
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[inference_local]
+enabled = true
+{}"#,
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.upstreams.inference.len(), 1);
+        assert_eq!(
+            settings.upstreams.inference[0].base_url,
+            "http://127.0.0.1:9155"
+        );
+        assert!(settings.upstreams.inference[0].use_for_jobs);
+
+        // Enabled + explicit endpoints -> left untouched (mix local+remote).
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[inference_local]
+enabled = true
+
+[[upstreams.inference]]
+base_url = "http://gpu-box:8080"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.upstreams.inference.len(), 1);
+        assert_eq!(
+            settings.upstreams.inference[0].base_url,
+            "http://gpu-box:8080"
+        );
+
+        // Disabled + no endpoints -> legacy default: the API upstream.
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path)).unwrap();
+        assert_eq!(
+            settings.upstreams.inference[0].base_url,
+            "http://127.0.0.1:6342"
+        );
+        assert!(!settings.inference_local.enabled);
+        assert_eq!(settings.inference_local.default_max_batch, 32);
+        assert_eq!(settings.inference_local.sweep_interval_secs, 10);
+    }
+
+    /// A synthesized loopback inference upstream must be reachable through
+    /// the policy layer: binding a LAN address while only localhost-only
+    /// policies exist fails config load with the offending host named
+    /// (instead of silently 403ing every job/PQL/preload self-call at
+    /// runtime), and a matching policy whose ruleset denies the inference
+    /// routes fails too. Explicit upstreams skip the check entirely.
+    #[test]
+    fn synthesized_loopback_upstream_requires_matching_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let base = r#"
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[inference_local]
+enabled = true
+"#;
+
+        // LAN bind + localhost-only policy -> no policy matches the
+        // synthesized host: config load fails and names the host.
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nhost = \"192.168.1.5\"\nport = 9155\n{base}{}",
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            ),
+        )
+        .unwrap();
+        let err = Settings::load(Some(path.clone())).expect_err("no policy for the LAN host");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("192.168.1.5"),
+            "error names the unmatched host: {text}"
+        );
+        assert!(
+            text.contains("[[policies]]") && text.contains("upstreams.inference"),
+            "error explains the remedies: {text}"
+        );
+
+        // Matching policy, but its ruleset denies the inference routes ->
+        // config load fails and names the policy.
+        std::fs::write(
+            &path,
+            format!(
+                r#"[server]
+host = "127.0.0.1"
+port = 9155
+{base}
+[rulesets.search_only]
+allow = [{{ methods = ["GET"], path_prefix = "/api/search/" }}]
+
+[[policies]]
+name = "locked_down"
+ruleset = "search_only"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            ),
+        )
+        .unwrap();
+        let err = Settings::load(Some(path.clone())).expect_err("ruleset denies inference routes");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("locked_down") && text.contains("/api/inference"),
+            "error names the policy and the denied surface: {text}"
+        );
+
+        // Same LAN bind + localhost-only policy, but an explicit inference
+        // upstream: nothing is synthesized, so no check applies.
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nhost = \"192.168.1.5\"\nport = 9155\n{base}{}\n\
+                 [[upstreams.inference]]\nbase_url = \"http://gpu-box:8080\"\n",
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            ),
+        )
+        .unwrap();
+        Settings::load(Some(path)).expect("explicit upstreams skip the loopback policy check");
+    }
+
+    /// impl_dirs defaulting honors INFERIO_CUSTOM_IMPL_PATH exactly like
+    /// the Python server (utils.py: env var, default ./inferio_custom);
+    /// explicitly configured impl_dirs win and the env var is ignored.
+    #[test]
+    fn impl_dirs_default_honors_custom_impl_path_env() {
+        let mut local = InferenceLocalConfig::default();
+
+        // Without the env var: the Python default pair.
+        let dirs = local.resolved_impl_dirs();
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with("src/inferio/impl"), "got {dirs:?}");
+        assert!(dirs[1].ends_with("inferio_custom"), "got {dirs:?}");
+
+        // With the env var: it replaces the custom-dir default.
+        unsafe { env::set_var("INFERIO_CUSTOM_IMPL_PATH", "my/custom_impls") };
+        let dirs = local.resolved_impl_dirs();
+        unsafe { env::remove_var("INFERIO_CUSTOM_IMPL_PATH") };
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with("src/inferio/impl"), "got {dirs:?}");
+        assert!(dirs[1].ends_with("my/custom_impls"), "got {dirs:?}");
+
+        // Explicit impl_dirs win over the env var (warned, not honored).
+        local.impl_dirs = vec![PathBuf::from("explicit_dir")];
+        unsafe { env::set_var("INFERIO_CUSTOM_IMPL_PATH", "my/custom_impls") };
+        let dirs = local.resolved_impl_dirs();
+        unsafe { env::remove_var("INFERIO_CUSTOM_IMPL_PATH") };
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].ends_with("explicit_dir"), "got {dirs:?}");
     }
 }

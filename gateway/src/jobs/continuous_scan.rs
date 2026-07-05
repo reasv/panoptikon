@@ -1,43 +1,40 @@
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::event::{ModifyKind, RenameMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use ractor::concurrency::Duration as RactorDuration;
 use ractor::factory::{
-    Factory, FactoryArguments, FactoryMessage, Job, JobOptions, Worker, WorkerBuilder,
-    queues, routing,
+    Factory, FactoryArguments, FactoryMessage, Job, JobOptions, Worker, WorkerBuilder, queues,
+    routing,
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef};
-use ractor::concurrency::Duration as RactorDuration;
 use tokio::sync::{OnceCell, oneshot};
 
 use crate::api_error::ApiError;
+use crate::db::files::has_blurhash;
 use crate::db::{
-    file_scans::{
-        FileScanUpdate, get_open_file_scan_id,
-    },
+    file_scans::{FileScanUpdate, get_open_file_scan_id},
     files::{
         FileDeleteInfo, FileUpsertResult, count_files_for_item, get_all_file_paths_with_mtime,
         get_file_by_path, get_file_delete_info,
     },
-    index_writer::{call_index_db_writer, IndexDbWriterMessage},
+    index_writer::{IndexDbWriterMessage, call_index_db_writer},
     open_index_db_read,
     storage::{has_frame, has_thumbnail},
     system_config::{SystemConfig, SystemConfigStore},
 };
-use crate::db::files::has_blurhash;
 use crate::jobs::dir_poller::{
     FileMeta, PollFilters, PollOutcome, PollerSnapshot, run_poll_pass, seed_snapshot,
 };
 use crate::jobs::files::{
-    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions,
-    THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data, check_folder_validity,
-    current_iso_timestamp, deduplicate_paths, get_last_modified_time_and_size,
-    has_allowed_extension, is_excluded, is_hidden_or_temp, normalize_path, parse_filescan_filter,
-    process_file, run_post_job_maintenance,
+    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions, THUMBNAIL_PROCESS_VERSION,
+    build_extension_set, build_file_scan_data, check_folder_validity, current_iso_timestamp,
+    deduplicate_paths, get_last_modified_time_and_size, has_allowed_extension, is_excluded,
+    is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
+    run_post_job_maintenance,
 };
 use crate::pql::model::Match;
 
@@ -157,14 +154,23 @@ pub(crate) enum FsEvent {
 }
 
 pub(crate) enum ContinuousScanMessage {
-    Pause { reply: oneshot::Sender<()> },
+    Pause {
+        reply: oneshot::Sender<()>,
+    },
     Resume,
-    UpdateConfig { config: SystemConfig },
+    UpdateConfig {
+        config: SystemConfig,
+    },
     FsEvent(FsEvent),
     /// Starts a poll pass on the blocking pool unless one is already running.
-    PollTick { epoch: u64 },
+    PollTick {
+        epoch: u64,
+    },
     /// A poll pass finished: restore the snapshot, act on the diff, reschedule.
-    PollCompleted { epoch: u64, outcome: PollOutcome },
+    PollCompleted {
+        epoch: u64,
+        outcome: PollOutcome,
+    },
     /// Re-stat a detected file after the settle delay; dispatch once stable.
     SettleCheck {
         epoch: u64,
@@ -173,7 +179,10 @@ pub(crate) enum ContinuousScanMessage {
         attempts: u32,
     },
     /// A settle check confirmed the file is stable; dispatch it to a worker.
-    DispatchStable { epoch: u64, path: PathBuf },
+    DispatchStable {
+        epoch: u64,
+        path: PathBuf,
+    },
     WorkerResult {
         epoch: u64,
         scan_time: String,
@@ -236,8 +245,10 @@ fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
     let mut included = config.included_folders.clone();
     included.retain(|folder| check_folder_validity(folder));
     let global_included = deduplicate_paths(&included);
-    let global_included_roots: Vec<PathBuf> =
-        global_included.iter().map(|path| PathBuf::from(path)).collect();
+    let global_included_roots: Vec<PathBuf> = global_included
+        .iter()
+        .map(|path| PathBuf::from(path))
+        .collect();
 
     let global_excluded_roots: Vec<PathBuf> = config
         .excluded_folders
@@ -256,7 +267,9 @@ fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
         let deduped = deduplicate_paths(&continuous);
         for folder in &deduped {
             let path = PathBuf::from(folder);
-            let under_global = global_included_roots.iter().any(|root| path.starts_with(root));
+            let under_global = global_included_roots
+                .iter()
+                .any(|root| path.starts_with(root));
             let under_excluded = is_excluded(&path, &global_excluded_roots);
             if !under_global || under_excluded {
                 invalid_includes.push(folder.clone());
@@ -267,8 +280,10 @@ fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
     }
 
     if !watch_roots.is_empty() {
-        let watch_strings: Vec<String> =
-            watch_roots.iter().map(|path| path.to_string_lossy().to_string()).collect();
+        let watch_strings: Vec<String> = watch_roots
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
         let deduped = deduplicate_paths(&watch_strings);
         watch_roots = deduped.into_iter().map(PathBuf::from).collect();
     }
@@ -345,14 +360,13 @@ impl ContinuousScanState {
 
     async fn start_scan(&mut self) -> ApiResult<()> {
         let scan_time = current_iso_timestamp();
-        let scan_id = call_index_db_writer(&self.index_db, |reply| {
-            IndexDbWriterMessage::AddFileScan {
+        let scan_id =
+            call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::AddFileScan {
                 scan_time: scan_time.clone(),
                 path: CONTINUOUS_PATH_SENTINEL.to_string(),
                 reply,
-            }
-        })
-        .await?;
+            })
+            .await?;
         self.scan_id = Some(scan_id);
         self.scan_time = Some(scan_time);
         self.reset_stats();
@@ -443,17 +457,15 @@ impl ContinuousScanState {
         }
         let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
         let Some(FileDeleteInfo {
-            item_id,
-            scan_id,
-            ..
+            item_id, scan_id, ..
         }) = get_file_delete_info(&mut conn, path.to_string_lossy().as_ref()).await?
         else {
             return Ok(());
         };
 
         let current_scan = self.scan_id.unwrap_or_default();
-        let safe_delete = scan_id == current_scan
-            || count_files_for_item(&mut conn, item_id).await? > 1;
+        let safe_delete =
+            scan_id == current_scan || count_files_for_item(&mut conn, item_id).await? > 1;
         if !safe_delete {
             return Ok(());
         }
@@ -628,7 +640,13 @@ impl ContinuousScanState {
 impl ContinuousScanActor {
     async fn build_factory(
         worker_count: usize,
-    ) -> Result<(ActorRef<FactoryMessage<(), FileWork>>, ractor::concurrency::JoinHandle<()>), ActorProcessingErr> {
+    ) -> Result<
+        (
+            ActorRef<FactoryMessage<(), FileWork>>,
+            ractor::concurrency::JoinHandle<()>,
+        ),
+        ActorProcessingErr,
+    > {
         let factory_def = Factory::<
             (),
             FileWork,
@@ -664,16 +682,12 @@ impl ContinuousScanActor {
                     Vec::new()
                 }
             }
-            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => event
-                .paths
-                .into_iter()
-                .map(FsEvent::Remove)
-                .collect(),
-            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
-                .paths
-                .into_iter()
-                .map(FsEvent::Create)
-                .collect(),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                event.paths.into_iter().map(FsEvent::Remove).collect()
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                event.paths.into_iter().map(FsEvent::Create).collect()
+            }
             EventKind::Modify(_) => event.paths.into_iter().map(FsEvent::Modify).collect(),
             EventKind::Remove(_) => event.paths.into_iter().map(FsEvent::Remove).collect(),
             EventKind::Other => vec![FsEvent::Overflow],
@@ -935,8 +949,7 @@ impl Actor for ContinuousScanActor {
                     let stable = last_modified == meta.last_modified
                         && meta.size.map_or(true, |prev| prev == size);
                     if stable {
-                        let _ =
-                            reply.cast(ContinuousScanMessage::DispatchStable { epoch, path });
+                        let _ = reply.cast(ContinuousScanMessage::DispatchStable { epoch, path });
                         return;
                     }
                     // Still being written: retry with backoff until it settles.
@@ -985,7 +998,8 @@ impl Actor for ContinuousScanActor {
                 state.stats.thumbgen_time += processed.thumb_time;
                 state.stats.blurhash_time += processed.blurhash_time;
 
-                let mut conn = match open_index_db_read(&state.index_db, &state.user_data_db).await {
+                let mut conn = match open_index_db_read(&state.index_db, &state.user_data_db).await
+                {
                     Ok(conn) => conn,
                     Err(err) => {
                         tracing::error!(error = ?err, "failed to open read connection");
@@ -1038,12 +1052,9 @@ impl Actor for ContinuousScanActor {
                     if let Ok(mut frame_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
                     {
-                        if let Ok(has_frame) = has_frame(
-                            &mut frame_conn,
-                            &file_data.sha256,
-                            FRAME_PROCESS_VERSION,
-                        )
-                        .await
+                        if let Ok(has_frame) =
+                            has_frame(&mut frame_conn, &file_data.sha256, FRAME_PROCESS_VERSION)
+                                .await
                         {
                             if !has_frame {
                                 let _ = call_index_db_writer(&state.index_db, |reply| {
@@ -1065,7 +1076,8 @@ impl Actor for ContinuousScanActor {
                     if let Ok(mut blur_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
                     {
-                        if let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await {
+                        if let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await
+                        {
                             if !has_value {
                                 let _ = call_index_db_writer(&state.index_db, |reply| {
                                     IndexDbWriterMessage::SetBlurhash {
@@ -1162,16 +1174,22 @@ fn start_watcher(
 
 pub(crate) enum ContinuousScanSupervisorMessage {
     ResyncFromDisk,
-    ConfigChanged { index_db: String },
+    ConfigChanged {
+        index_db: String,
+    },
     PauseForJob {
         index_db: String,
         reply: oneshot::Sender<()>,
     },
-    ResumeAfterJob { index_db: String },
+    ResumeAfterJob {
+        index_db: String,
+    },
     /// Process shutdown: stops every per-DB scan actor and refuses to spawn
     /// new ones. The scan actors are not linked to the supervisor, so merely
     /// stopping the supervisor would leave them running.
-    Shutdown { reply: oneshot::Sender<()> },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 pub(crate) struct ContinuousScanSupervisor;
@@ -1342,11 +1360,7 @@ async fn sync_single_db(
     index_db: &str,
 ) -> ApiResult<()> {
     let config = state.config_store.load(index_db)?;
-    let index_db_file = state
-        .data_dir
-        .join("index")
-        .join(index_db)
-        .join("index.db");
+    let index_db_file = state.data_dir.join("index").join(index_db).join("index.db");
     if !index_db_file.is_file() {
         if let Some(actor) = state.actors.remove(index_db) {
             actor.stop(None);
@@ -1406,7 +1420,8 @@ fn start_supervisor_watcher(
 
 static SUPERVISOR: OnceCell<ActorRef<ContinuousScanSupervisorMessage>> = OnceCell::const_new();
 
-pub(crate) async fn ensure_continuous_supervisor() -> ApiResult<ActorRef<ContinuousScanSupervisorMessage>> {
+pub(crate) async fn ensure_continuous_supervisor()
+-> ApiResult<ActorRef<ContinuousScanSupervisorMessage>> {
     SUPERVISOR
         .get_or_try_init(|| async {
             let data_dir = std::env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string());
@@ -1514,11 +1529,11 @@ impl Drop for JobPauseGuard {
 mod tests {
     use super::*;
     use crate::db::migrations::migrate_databases_on_disk;
+    use crate::test_utils::test_data_dir;
     use image::{ImageBuffer, Rgb};
     use ractor::Actor;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use crate::test_utils::test_data_dir;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
     fn unique_db_name(prefix: &str) -> String {
@@ -1536,7 +1551,9 @@ mod tests {
         let test_env = test_data_dir();
         let root = test_env.path().to_path_buf();
         let index_db = unique_db_name("cont");
-        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
 
         let watch_dir = root.join("watch");
         std::fs::create_dir_all(&watch_dir).unwrap();
@@ -1577,7 +1594,9 @@ mod tests {
 
         let mut attempts = 0;
         loop {
-            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
             let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
                 .fetch_one(&mut conn)
                 .await
@@ -1590,10 +1609,14 @@ mod tests {
         }
 
         let (tx, rx) = oneshot::channel();
-        actor.cast(ContinuousScanMessage::Pause { reply: tx }).unwrap();
+        actor
+            .cast(ContinuousScanMessage::Pause { reply: tx })
+            .unwrap();
         let _ = rx.await;
 
-        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT end_time FROM file_scans WHERE path = ?1")
                 .bind(CONTINUOUS_PATH_SENTINEL)
@@ -1609,7 +1632,9 @@ mod tests {
         let test_env = test_data_dir();
         let root = test_env.path().to_path_buf();
         let index_db = unique_db_name("cont");
-        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
 
         let watch_dir = root.join("watch2");
         std::fs::create_dir_all(&watch_dir).unwrap();
@@ -1636,7 +1661,9 @@ mod tests {
         .unwrap();
 
         let (tx, rx) = oneshot::channel();
-        actor.cast(ContinuousScanMessage::Pause { reply: tx }).unwrap();
+        actor
+            .cast(ContinuousScanMessage::Pause { reply: tx })
+            .unwrap();
         let _ = rx.await;
 
         let prepared = process_file(
@@ -1654,7 +1681,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
             .fetch_one(&mut conn)
             .await
@@ -1670,7 +1699,9 @@ mod tests {
         let test_env = test_data_dir();
         let root = test_env.path().to_path_buf();
         let index_db = unique_db_name("catchup");
-        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
 
         let watch_dir = root.join("catchupwatch");
         std::fs::create_dir_all(&watch_dir).unwrap();
@@ -1698,7 +1729,9 @@ mod tests {
 
         let mut found = false;
         for _ in 0..120 {
-            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
             let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
                 .fetch_one(&mut conn)
                 .await
@@ -1719,7 +1752,9 @@ mod tests {
         let test_env = test_data_dir();
         let root = test_env.path().to_path_buf();
         let index_db = unique_db_name("poll");
-        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db)).await.unwrap();
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
 
         let watch_dir = root.join("pollwatch");
         std::fs::create_dir_all(&watch_dir).unwrap();
@@ -1750,7 +1785,9 @@ mod tests {
         // settle window is 2s, so this normally completes within ~5s.
         let mut found = false;
         for _ in 0..120 {
-            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db).await.unwrap();
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
             let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
                 .fetch_one(&mut conn)
                 .await
@@ -1796,7 +1833,8 @@ mod tests {
 
         let mut config = SystemConfig::default();
         config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders = vec![outside_root.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders =
+            vec![outside_root.to_string_lossy().to_string()];
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
@@ -1815,7 +1853,8 @@ mod tests {
         let mut config = SystemConfig::default();
         config.included_folders = vec![global_root.to_string_lossy().to_string()];
         config.excluded_folders = vec![excluded_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders = vec![excluded_root.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders =
+            vec![excluded_root.to_string_lossy().to_string()];
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
