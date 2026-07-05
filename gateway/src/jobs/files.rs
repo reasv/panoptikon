@@ -2248,7 +2248,7 @@ fn run_html_screenshot(
     // whose real browser detaches from it entirely; killing the direct child
     // leaves the tree running. A kill-on-close job object captures every
     // descendant, so dropping the guard (any return path) reaps them all.
-    let _job = process_tree::JobGuard::assign(&child);
+    let _job = crate::process_tree::JobGuard::assign(&child);
 
     // Poll instead of wait() so a wedged renderer cannot stall a scan worker
     // forever; these run inside spawn_blocking, so sleeping here is fine.
@@ -2289,96 +2289,6 @@ fn run_html_screenshot(
     }
     tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
     None
-}
-
-/// Kill-on-close job object wrapper. On Windows, every descendant of the
-/// assigned process is terminated when the guard drops, covering both the
-/// multi-process Chromium tree and the msedge.exe launcher whose real browser
-/// detaches from the spawned process. On other platforms this is a no-op and
-/// `Child::kill` remains the only cleanup.
-mod process_tree {
-    pub(super) struct JobGuard {
-        #[cfg(windows)]
-        _job: Option<windows_job::Job>,
-    }
-
-    impl JobGuard {
-        pub(super) fn assign(child: &std::process::Child) -> JobGuard {
-            #[cfg(windows)]
-            {
-                let job = windows_job::Job::assign(child);
-                if job.is_none() {
-                    tracing::warn!(
-                        "failed to create job object; browser subprocesses may outlive the scan"
-                    );
-                }
-                JobGuard { _job: job }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = child;
-                JobGuard {}
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    mod windows_job {
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        pub(super) struct Job(HANDLE);
-
-        // The handle is used only to close the job object exactly once; the
-        // kernel object itself is thread-safe.
-        unsafe impl Send for Job {}
-
-        impl Job {
-            /// Children the process spawned before this call are not captured
-            /// (std cannot spawn suspended), but the launcher needs far longer
-            /// to start the browser than this takes to run.
-            pub(super) fn assign(child: &std::process::Child) -> Option<Job> {
-                unsafe {
-                    let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                    if handle.is_null() {
-                        return None;
-                    }
-                    // Owns the handle from here on, so early returns close it.
-                    let job = Job(handle);
-                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                    if SetInformationJobObject(
-                        handle,
-                        JobObjectExtendedLimitInformation,
-                        (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                    ) == 0
-                    {
-                        return None;
-                    }
-                    if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
-                        return None;
-                    }
-                    Some(job)
-                }
-            }
-        }
-
-        impl Drop for Job {
-            fn drop(&mut self) {
-                // Kill-on-close terminates every process still in the job.
-                unsafe {
-                    CloseHandle(self.0);
-                }
-            }
-        }
-    }
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();

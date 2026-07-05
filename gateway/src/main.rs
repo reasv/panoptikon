@@ -2,12 +2,14 @@ mod api;
 mod api_error;
 mod config;
 mod db;
+mod inferio;
 mod inferio_client;
 mod jobs;
 mod logging;
 mod openapi;
 mod policy;
 mod pql;
+mod process_tree;
 mod proxy;
 mod shutdown;
 #[cfg(test)]

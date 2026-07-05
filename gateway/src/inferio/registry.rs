@@ -1,0 +1,946 @@
+//! Model registry: parses the inferio inference TOML registry and resolves
+//! per-inference-id spawn specs (impl class + constructor kwargs).
+//!
+//! This is a faithful port of `src/inferio/config.py`. The semantics that
+//! matter (verified against the Python source, cited by line):
+//!
+//! - Config folders are scanned for `*.toml` in alphabetical order, built-in
+//!   folder first, then the user folder (`load_config`, config.py:100-101).
+//!   A missing folder is skipped with a warning (config.py:29-31).
+//! - Any error in any file — unparseable TOML, duplicate inference_id —
+//!   fails the whole load; Python logs and re-raises (config.py:77-79),
+//!   nothing is skipped.
+//! - `allow_override` is a *per-file* flag (config.py:39): a file may
+//!   redefine an inference_id that an earlier file already defined only when
+//!   the *later* file sets `allow_override = true`; otherwise the load fails
+//!   with a duplicate-id error (config.py:56-63). Group-level `config` /
+//!   `metadata` tables always merge across files (later file wins per key,
+//!   config.py:44-51) regardless of `allow_override`.
+//! - Group config is merged under inference-id config *eagerly at the point
+//!   the id is defined* (config.py:66-69): group config added by a later
+//!   file does not retroactively apply to ids defined in earlier files.
+//! - The resolved id entry stores the merged config and the id's own
+//!   metadata (config.py:71-76); redefinition (when allowed) replaces both.
+//! - `/metadata` returns, per group, `group_metadata` and a map of id ->
+//!   id-level metadata only (`list_inference_ids`, config.py:105-118).
+//!   `impl_class`/`config` never leak into the metadata output.
+//! - Reload is mtime-triggered: reuse the cached snapshot only when the max
+//!   mtime over all `*.toml` files is <= the recorded mtime (config.py:90).
+//!   Python's check is `if config and mtime and latest <= mtime`, so an
+//!   *empty* registry or a 0.0 mtime (no files at all) is never treated as
+//!   a valid cache and reloads on every call — replicated here.
+//!
+//! Spawn-spec kwargs replicate `process_model.py::_model_process`
+//! (process_model.py:208-212): the merged config minus `impl_class` and
+//! `ray_config` is exactly what Python passes to `impl_class(**kwargs)`
+//! (`clean_dict` is a no-op for TOML-derived plain data). `ray_config` is
+//! therefore *not* forwarded to workers, matching Python.
+//!
+//! Deviation, deliberate: JSON object key order. Python dicts preserve
+//! insertion order and FastAPI serializes `/metadata` in that order; this
+//! module uses `toml`/`serde_json` default maps, which sort keys
+//! alphabetically. Key order is not semantic JSON and every consumer (web
+//! UI, gateway client, Python client) parses into maps. If byte-for-byte
+//! parity is ever required, enable the `preserve_order` features of `toml`
+//! and `serde_json` — the code needs no other change.
+
+use anyhow::{Context, Result, bail};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+use std::{env, fs};
+
+/// Ordered list of directories scanned for `*.toml` registry files.
+/// Built-in (repo) config first, user config after, so user files can extend
+/// groups and (with `allow_override`) redefine inference ids.
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    pub config_dirs: Vec<PathBuf>,
+}
+
+impl RegistryConfig {
+    /// Mirror Python's default folder resolution:
+    ///
+    /// - Base folder: `BASE_INFERENCE_CONFIG_FOLDER` env if set (returned
+    ///   without an existence check, exactly like `get_base_config_folder`,
+    ///   config.py:159-160); otherwise `src/inferio/config`, which must
+    ///   exist (config.py:168-171). Python resolves this relative to the
+    ///   `inferio` package's `__file__`; Rust has no equivalent, so the
+    ///   default is relative to the current working directory — the gateway
+    ///   is run from the repo root in the dev layout, where the two agree.
+    ///   Windows nuance: relative paths resolve against the drive+dir of the
+    ///   process CWD like on Unix; no special handling is needed.
+    /// - User folder: `INFERIO_CONFIG_DIR` env or `config/inference`
+    ///   (config.py:88), never existence-checked (a missing folder is
+    ///   skipped with a warning at load time).
+    pub fn default_dirs() -> Result<Self> {
+        let base = match env::var_os("BASE_INFERENCE_CONFIG_FOLDER") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let dir = PathBuf::from("src/inferio/config");
+                if !dir.is_dir() {
+                    bail!(
+                        "Base configuration folder not found at: {}",
+                        dir.display()
+                    );
+                }
+                dir
+            }
+        };
+        let user = env::var_os("INFERIO_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("config/inference"));
+        Ok(Self {
+            config_dirs: vec![base, user],
+        })
+    }
+}
+
+/// One inference id inside a group: the fully merged config (group config
+/// overlaid with id config, id wins) and the id's own metadata.
+#[derive(Debug, Clone, Default)]
+pub struct InferenceIdEntry {
+    /// Merged config, still including `impl_class` / `ray_config`; use
+    /// [`Registry::spawn_spec`] for the kwargs actually passed to workers.
+    pub config: JsonMap<String, JsonValue>,
+    pub metadata: JsonMap<String, JsonValue>,
+}
+
+/// A model group: accumulated group-level config/metadata plus its ids.
+#[derive(Debug, Clone, Default)]
+pub struct GroupEntry {
+    pub group_config: JsonMap<String, JsonValue>,
+    pub group_metadata: JsonMap<String, JsonValue>,
+    pub inference_ids: BTreeMap<String, InferenceIdEntry>,
+}
+
+/// Immutable loaded snapshot of the whole registry.
+#[derive(Debug, Clone, Default)]
+pub struct Registry {
+    pub groups: BTreeMap<String, GroupEntry>,
+}
+
+/// What a worker needs to instantiate a model: the impl class name and the
+/// exact kwargs Python passes to `impl_class(**kwargs)`.
+#[derive(Debug, Clone)]
+pub struct SpawnSpec {
+    pub impl_class: String,
+    /// Always a JSON object; merged config minus `impl_class`/`ray_config`
+    /// (process_model.py:209-211).
+    pub config_kwargs: JsonValue,
+}
+
+impl Registry {
+    /// Load a fresh snapshot from the configured directories, in order.
+    /// Any file error fails the whole load (Python re-raises, config.py:79).
+    pub fn load(config: &RegistryConfig) -> Result<Self> {
+        let mut groups: BTreeMap<String, GroupEntry> = BTreeMap::new();
+        for dir in &config.config_dirs {
+            load_folder(dir, &mut groups)?;
+        }
+        Ok(Self { groups })
+    }
+
+    /// Build the `/metadata` response body, matching Python's
+    /// `list_inference_ids` (config.py:105-118) exactly:
+    /// `{group: {"group_metadata": {...}, "inference_ids": {id: metadata}}}`.
+    /// Group/id config and `impl_class` are never included.
+    pub fn metadata_json(&self) -> JsonValue {
+        let mut root = JsonMap::new();
+        for (group_name, group) in &self.groups {
+            let mut ids = JsonMap::new();
+            for (id, entry) in &group.inference_ids {
+                ids.insert(id.clone(), JsonValue::Object(entry.metadata.clone()));
+            }
+            let mut group_obj = JsonMap::new();
+            group_obj.insert(
+                "group_metadata".to_string(),
+                JsonValue::Object(group.group_metadata.clone()),
+            );
+            group_obj.insert("inference_ids".to_string(), JsonValue::Object(ids));
+            root.insert(group_name.clone(), JsonValue::Object(group_obj));
+        }
+        JsonValue::Object(root)
+    }
+
+    /// Metadata for one inference id, matching Python's `get_metadata`
+    /// (config.py:120-136): `{"group_metadata": ..., "inference_id_metadata":
+    /// ...}`, or None when the group or id is unknown.
+    pub fn inference_id_metadata(
+        &self,
+        group_name: &str,
+        inference_id: &str,
+    ) -> Option<JsonValue> {
+        let group = self.groups.get(group_name)?;
+        let entry = group.inference_ids.get(inference_id)?;
+        let mut obj = JsonMap::new();
+        obj.insert(
+            "group_metadata".to_string(),
+            JsonValue::Object(group.group_metadata.clone()),
+        );
+        obj.insert(
+            "inference_id_metadata".to_string(),
+            JsonValue::Object(entry.metadata.clone()),
+        );
+        Some(JsonValue::Object(obj))
+    }
+
+    /// Resolve the spawn spec for `group/name`, replicating
+    /// `get_model_config` (config.py:138-155) + the kwarg stripping in
+    /// `_model_process` (process_model.py:208-212): kwargs are the merged
+    /// config minus `impl_class` and `ray_config`.
+    ///
+    /// Python defers a missing/non-string `impl_class` to the worker, which
+    /// fails its impl-class lookup at load time; we fail here instead — the
+    /// same user-visible outcome (model load errors), just earlier.
+    pub fn spawn_spec(&self, full_inference_id: &str) -> Result<SpawnSpec> {
+        let (group_name, inference_id) = full_inference_id
+            .split_once('/')
+            .with_context(|| {
+                format!(
+                    "Inference ID '{full_inference_id}' must be in 'group/name' form"
+                )
+            })?;
+        let group = self
+            .groups
+            .get(group_name)
+            .with_context(|| format!("Group '{group_name}' not found in registry"))?;
+        let entry = group.inference_ids.get(inference_id).with_context(|| {
+            format!("Inference ID '{inference_id}' not found in group '{group_name}'")
+        })?;
+
+        let mut kwargs = entry.config.clone();
+        let impl_class = kwargs.remove("impl_class");
+        // ray_config rode along in the merged config for the dropped Ray
+        // mode; Python strips it before instantiation (process_model.py:211)
+        // and it is NOT forwarded to workers.
+        kwargs.remove("ray_config");
+        let impl_class = match impl_class {
+            Some(JsonValue::String(name)) => name,
+            other => bail!(
+                "Model class {:?} not found in impl_classes (inference id '{}' has no valid impl_class)",
+                other,
+                full_inference_id
+            ),
+        };
+        Ok(SpawnSpec {
+            impl_class,
+            config_kwargs: JsonValue::Object(kwargs),
+        })
+    }
+}
+
+/// Mtime-gated registry cache with the same trigger semantics as Python's
+/// `load_config(config, mtime)` on `/metadata` (config.py:82-103): re-parse
+/// when any scanned file's mtime exceeds the recorded one; keep the previous
+/// snapshot untouched if a reload fails (the caller sees the error, the next
+/// call retries — Python leaves its globals unchanged when the reload
+/// raises, router.py:247-250).
+///
+/// Not internally synchronized; wrap in a `Mutex` (or own it in an actor)
+/// for shared use.
+#[derive(Debug)]
+pub struct RegistryCache {
+    config: RegistryConfig,
+    cached: Option<CachedSnapshot>,
+}
+
+#[derive(Debug)]
+struct CachedSnapshot {
+    registry: Arc<Registry>,
+    /// Max mtime observed over all scanned files *before* the load, exactly
+    /// like Python records `latest_time` computed up front (config.py:89).
+    mtime: SystemTime,
+}
+
+impl RegistryCache {
+    pub fn new(config: RegistryConfig) -> Self {
+        Self {
+            config,
+            cached: None,
+        }
+    }
+
+    /// Return the current snapshot, reloading if any file changed.
+    pub fn get(&mut self) -> Result<Arc<Registry>> {
+        let latest = latest_config_mtime(&self.config.config_dirs)?;
+        if let (Some(cached), Some(latest)) = (&self.cached, latest) {
+            // Python: `if config and mtime and latest_time <= mtime`
+            // (config.py:90) — an empty registry (falsy dict) or a missing
+            // mtime (0.0) never counts as a valid cache.
+            if !cached.registry.groups.is_empty() && latest <= cached.mtime {
+                return Ok(cached.registry.clone());
+            }
+        }
+        let registry = Arc::new(Registry::load(&self.config)?);
+        self.cached = latest.map(|mtime| CachedSnapshot {
+            registry: registry.clone(),
+            mtime,
+        });
+        Ok(registry)
+    }
+}
+
+/// All `*.toml` files directly inside `dir`, sorted by file name — the same
+/// order as Python's `sorted(folder.glob("*.toml"))` within one directory
+/// (config.py:32-34). The extension match is ASCII-case-insensitive: Python's
+/// `Path.glob` is case-insensitive on Windows (the current deployment
+/// platform) and the registry only ships lowercase `.toml` anyway, so this
+/// keeps behavior identical across platforms.
+fn toml_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read config folder {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read config folder {}", dir.display()))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("toml"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(files)
+}
+
+/// Max mtime over every scanned file, or None when there are no files —
+/// Python's `get_config_mtime` returning 0.0 (config.py:11-22). Missing
+/// folders contribute nothing (Python's glob on a missing dir is empty).
+fn latest_config_mtime(dirs: &[PathBuf]) -> Result<Option<SystemTime>> {
+    let mut latest: Option<SystemTime> = None;
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for file in toml_files(dir)? {
+            let modified = fs::metadata(&file)
+                .and_then(|meta| meta.modified())
+                .with_context(|| format!("failed to stat {}", file.display()))?;
+            if latest.map_or(true, |current| modified > current) {
+                latest = Some(modified);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+/// Load every TOML file in `folder` into `groups`, mirroring
+/// `load_config_folder` (config.py:24-80). A missing folder logs a warning
+/// and is skipped; any file error aborts the whole load.
+fn load_folder(folder: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<()> {
+    if !folder.is_dir() {
+        tracing::warn!(
+            folder = %folder.display(),
+            "config folder does not exist or is not a directory"
+        );
+        return Ok(());
+    }
+    for file in toml_files(folder)? {
+        load_file(&file, groups)
+            .with_context(|| format!("Error loading TOML file {}", file.display()))?;
+    }
+    Ok(())
+}
+
+fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<()> {
+    let text = fs::read_to_string(file).context("failed to read file")?;
+    let doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
+
+    // Python evaluates the flag's *truthiness* (`data.get("allow_override",
+    // False)` used in a boolean context, config.py:39,59), so non-bool
+    // values follow Python truthiness rules.
+    let allow_inference_id_overrides = toml_truthy(doc.get("allow_override"));
+
+    let Some(groups_value) = doc.get("group") else {
+        // No [group.*] tables: nothing to merge (data.get("group", {})).
+        return Ok(());
+    };
+    let group_tables = groups_value
+        .as_table()
+        .context("'group' must be a table of group tables")?;
+
+    for (group_name, group_data) in group_tables {
+        let group_data = group_data
+            .as_table()
+            .with_context(|| format!("group '{group_name}' must be a table"))?;
+        let entry = groups.entry(group_name.clone()).or_default();
+
+        // Merge group-level config and metadata, later file wins per key
+        // (config.py:44-51). Always allowed, independent of allow_override.
+        if let Some(config) = group_data.get("config") {
+            let table = config
+                .as_table()
+                .with_context(|| format!("group '{group_name}' config must be a table"))?;
+            merge_table_into(&mut entry.group_config, table);
+        }
+        if let Some(metadata) = group_data.get("metadata") {
+            let table = metadata.as_table().with_context(|| {
+                format!("group '{group_name}' metadata must be a table")
+            })?;
+            merge_table_into(&mut entry.group_metadata, table);
+        }
+
+        let Some(ids_value) = group_data.get("inference_ids") else {
+            continue;
+        };
+        let id_tables = ids_value.as_table().with_context(|| {
+            format!("group '{group_name}' inference_ids must be a table")
+        })?;
+        for (inference_id, inf_data) in id_tables {
+            if entry.inference_ids.contains_key(inference_id)
+                && !allow_inference_id_overrides
+            {
+                // Same failure mode as Python (config.py:61-63): the error
+                // propagates and the entire load fails.
+                bail!(
+                    "Duplicate inference_id '{}/{}' found in {}",
+                    group_name,
+                    inference_id,
+                    file.display()
+                );
+            }
+            let inf_data = inf_data.as_table().with_context(|| {
+                format!("inference id '{group_name}/{inference_id}' must be a table")
+            })?;
+
+            // Merge group config under id config, id wins — computed *now*,
+            // against the group config accumulated so far (config.py:66-69):
+            // group config added by later files does not retroactively
+            // change ids defined earlier.
+            let mut merged_config = entry.group_config.clone();
+            if let Some(config) = inf_data.get("config") {
+                let table = config.as_table().with_context(|| {
+                    format!(
+                        "inference id '{group_name}/{inference_id}' config must be a table"
+                    )
+                })?;
+                merge_table_into(&mut merged_config, table);
+            }
+            let metadata = match inf_data.get("metadata") {
+                Some(metadata) => {
+                    let table = metadata.as_table().with_context(|| {
+                        format!(
+                            "inference id '{group_name}/{inference_id}' metadata must be a table"
+                        )
+                    })?;
+                    table_to_json_map(table)
+                }
+                None => JsonMap::new(),
+            };
+            // Redefinition (when allowed) fully replaces the entry
+            // (config.py:71-76): config re-merged, metadata replaced.
+            entry.inference_ids.insert(
+                inference_id.clone(),
+                InferenceIdEntry {
+                    config: merged_config,
+                    metadata,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Shallow merge of a TOML table into a JSON map (`dict.update` semantics:
+/// existing keys are replaced wholesale, not deep-merged).
+fn merge_table_into(target: &mut JsonMap<String, JsonValue>, table: &toml::Table) {
+    for (key, value) in table {
+        target.insert(key.clone(), toml_to_json(value));
+    }
+}
+
+fn table_to_json_map(table: &toml::Table) -> JsonMap<String, JsonValue> {
+    let mut map = JsonMap::new();
+    merge_table_into(&mut map, table);
+    map
+}
+
+fn toml_to_json(value: &toml::Value) -> JsonValue {
+    match value {
+        toml::Value::String(s) => JsonValue::String(s.clone()),
+        toml::Value::Integer(i) => JsonValue::from(*i),
+        // Non-finite floats have no JSON representation; TOML permits them
+        // but the registry never uses them. Null is the serde_json fallback.
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        toml::Value::Boolean(b) => JsonValue::Bool(*b),
+        // tomli yields datetime objects which FastAPI would serialize as ISO
+        // strings; the TOML text form is that ISO string.
+        toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
+        toml::Value::Array(items) => {
+            JsonValue::Array(items.iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => JsonValue::Object(table_to_json_map(table)),
+    }
+}
+
+/// Python truthiness for a TOML value, for the `allow_override` flag.
+fn toml_truthy(value: Option<&toml::Value>) -> bool {
+    match value {
+        None => false,
+        Some(toml::Value::Boolean(b)) => *b,
+        Some(toml::Value::String(s)) => !s.is_empty(),
+        Some(toml::Value::Integer(i)) => *i != 0,
+        Some(toml::Value::Float(f)) => *f != 0.0,
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        Some(toml::Value::Table(table)) => !table.is_empty(),
+        Some(toml::Value::Datetime(_)) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, content).expect("write fixture file");
+        path
+    }
+
+    fn registry_for(dirs: &[&Path]) -> Result<Registry> {
+        Registry::load(&RegistryConfig {
+            config_dirs: dirs.iter().map(|d| d.to_path_buf()).collect(),
+        })
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open fixture file");
+        file.set_modified(mtime).expect("set fixture mtime");
+    }
+
+    /// Loading the real built-in registry (src/inferio/config) must succeed
+    /// and contain the known `tags` group with the `wd-swinv2-tagger-v3`
+    /// inference id. Its spawn spec resolves impl_class from the group
+    /// config ("wd_tagger") and passes exactly the id-level config as kwargs
+    /// (model_repo only) — with `impl_class` stripped, mirroring
+    /// process_model.py:208-212.
+    #[test]
+    fn loads_real_builtin_registry() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/inferio/config");
+        let registry = registry_for(&[&dir]).expect("built-in registry loads");
+
+        let tags = registry.groups.get("tags").expect("tags group exists");
+        assert!(tags.inference_ids.contains_key("wd-swinv2-tagger-v3"));
+        assert_eq!(
+            tags.group_metadata.get("name"),
+            Some(&json!("Tags")),
+            "group metadata carries the display name"
+        );
+
+        let spec = registry
+            .spawn_spec("tags/wd-swinv2-tagger-v3")
+            .expect("spawn spec resolves");
+        assert_eq!(spec.impl_class, "wd_tagger");
+        assert_eq!(
+            spec.config_kwargs,
+            json!({"model_repo": "SmilingWolf/wd-swinv2-tagger-v3"}),
+            "kwargs are exactly what Python passes to __init__ — no impl_class"
+        );
+    }
+
+    /// The `tagmatch` group carries a group-level `ray_config` table; Python
+    /// strips both `impl_class` and `ray_config` before instantiating
+    /// (process_model.py:211), so the danbooru spawn kwargs must be an empty
+    /// object even though the merged config contains both keys.
+    #[test]
+    fn real_registry_strips_ray_config_from_spawn_kwargs() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/inferio/config");
+        let registry = registry_for(&[&dir]).expect("built-in registry loads");
+
+        let entry = &registry.groups["tagmatch"].inference_ids["danbooru"];
+        assert!(entry.config.contains_key("ray_config"), "merged config keeps it");
+
+        let spec = registry.spawn_spec("tagmatch/danbooru").expect("resolves");
+        assert_eq!(spec.impl_class, "danbooru_tagger");
+        assert_eq!(spec.config_kwargs, json!({}));
+    }
+
+    /// The /metadata payload for the real registry must expose only
+    /// metadata: group_metadata + per-id metadata, never config or
+    /// impl_class (config.py:105-118).
+    #[test]
+    fn real_registry_metadata_excludes_config() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/inferio/config");
+        let registry = registry_for(&[&dir]).expect("built-in registry loads");
+
+        let metadata = registry.metadata_json();
+        let tags = &metadata["tags"];
+        assert_eq!(tags["group_metadata"]["name"], json!("Tags"));
+        let id_meta = &tags["inference_ids"]["wd-swinv2-tagger-v3"];
+        assert!(id_meta["description"].is_string());
+        assert!(id_meta.get("config").is_none(), "config must not leak");
+        assert!(id_meta.get("impl_class").is_none(), "impl_class must not leak");
+        assert!(tags.get("group_config").is_none(), "group config must not leak");
+    }
+
+    /// Group-level config is inherited by every inference id, and id-level
+    /// config wins on key conflicts (config.py:66-69): `b` is overridden by
+    /// the id, `a` flows through from the group.
+    #[test]
+    fn group_config_inherited_and_overridden_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+config.a = 1
+config.b = 2
+
+[group.g.inference_ids.override_id]
+config.b = 3
+
+[group.g.inference_ids.plain_id]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        let spec = registry.spawn_spec("g/override_id").expect("resolves");
+        assert_eq!(spec.config_kwargs, json!({"a": 1, "b": 3}));
+
+        let spec = registry.spawn_spec("g/plain_id").expect("resolves");
+        assert_eq!(spec.config_kwargs, json!({"a": 1, "b": 2}));
+    }
+
+    /// The group config → id config merge happens eagerly when the id is
+    /// defined (config.py:66-69): group config added by a *later* file
+    /// applies only to ids defined from that point on, never retroactively.
+    #[test]
+    fn later_group_config_does_not_retroactively_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+config.a = 1
+
+[group.g.inference_ids.early]
+"#,
+        );
+        write_file(
+            dir.path(),
+            "b.toml",
+            r#"
+[group.g]
+config.b = 2
+
+[group.g.inference_ids.late]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        // Defined before b.toml's group config existed: no `b`.
+        let early = registry.spawn_spec("g/early").expect("resolves");
+        assert_eq!(early.config_kwargs, json!({"a": 1}));
+
+        // Defined after the merge: sees both keys.
+        let late = registry.spawn_spec("g/late").expect("resolves");
+        assert_eq!(late.config_kwargs, json!({"a": 1, "b": 2}));
+    }
+
+    /// A later file redefining an existing inference id without setting
+    /// `allow_override = true` is a hard error that fails the entire load
+    /// (config.py:56-63,77-79) — nothing is skipped or partially loaded.
+    #[test]
+    fn duplicate_id_without_allow_override_fails_whole_load() {
+        let base = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        write_file(
+            base.path(),
+            "base.toml",
+            r#"
+[group.g.inference_ids.x]
+config.v = 1
+"#,
+        );
+        write_file(
+            user.path(),
+            "user.toml",
+            r#"
+[group.g.inference_ids.x]
+config.v = 2
+"#,
+        );
+        let err = registry_for(&[base.path(), user.path()])
+            .expect_err("duplicate id must fail the load");
+        assert!(
+            format!("{err:#}").contains("Duplicate inference_id 'g/x'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// With `allow_override = true` in the *later* file, redefinition is
+    /// allowed and fully replaces the entry (config.py:39,56-76): new config
+    /// re-merged against the current group config, new metadata replacing
+    /// the old. Group metadata still merges across files regardless.
+    #[test]
+    fn allow_override_lets_later_file_redefine_id() {
+        let base = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        write_file(
+            base.path(),
+            "base.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+metadata.name = "G"
+
+[group.g.inference_ids.x]
+config.v = 1
+metadata.description = "old"
+"#,
+        );
+        write_file(
+            user.path(),
+            "user.toml",
+            r#"
+allow_override = true
+
+[group.g]
+metadata.extra = "added"
+
+[group.g.inference_ids.x]
+config.v = 2
+"#,
+        );
+        let registry =
+            registry_for(&[base.path(), user.path()]).expect("override load succeeds");
+
+        let spec = registry.spawn_spec("g/x").expect("resolves");
+        assert_eq!(spec.config_kwargs, json!({"v": 2}), "later definition wins");
+
+        let group = &registry.groups["g"];
+        // Metadata was replaced (not merged) by the redefinition, which had
+        // no metadata table -> empty.
+        assert_eq!(group.inference_ids["x"].metadata, JsonMap::new());
+        // Group metadata merged across both files.
+        assert_eq!(group.group_metadata.get("name"), Some(&json!("G")));
+        assert_eq!(group.group_metadata.get("extra"), Some(&json!("added")));
+    }
+
+    /// metadata_json() must produce exactly the Python /metadata shape
+    /// (config.py:105-118): per group a "group_metadata" object and an
+    /// "inference_ids" object mapping id -> id metadata only. Verified
+    /// against a hand-written literal.
+    #[test]
+    fn metadata_json_matches_python_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+
+[group.g.metadata]
+name = "G"
+default_batch_size = 8
+
+[group.g.inference_ids.i]
+config.x = 1
+metadata.description = "d"
+
+[group.g.inference_ids.bare]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        assert_eq!(
+            registry.metadata_json(),
+            json!({
+                "g": {
+                    "group_metadata": {"name": "G", "default_batch_size": 8},
+                    "inference_ids": {
+                        "i": {"description": "d"},
+                        "bare": {}
+                    }
+                }
+            })
+        );
+    }
+
+    /// Unparseable TOML in any scanned file fails the entire load — Python
+    /// logs and re-raises (config.py:77-79); it does not skip the bad file.
+    #[test]
+    fn unparseable_toml_fails_whole_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "good.toml",
+            r#"
+[group.g.inference_ids.x]
+config.v = 1
+"#,
+        );
+        write_file(dir.path(), "z_bad.toml", "this is [not valid toml");
+        let err = registry_for(&[dir.path()]).expect_err("bad TOML must fail the load");
+        assert!(
+            format!("{err:#}").contains("z_bad.toml"),
+            "error should name the offending file: {err:#}"
+        );
+    }
+
+    /// A missing config directory is skipped with a warning, not an error
+    /// (config.py:29-31): loading proceeds with the remaining directories.
+    #[test]
+    fn missing_directory_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.x]
+"#,
+        );
+        let missing = dir.path().join("does-not-exist");
+        let registry =
+            registry_for(&[dir.path(), &missing]).expect("missing dir is not fatal");
+        assert!(registry.groups["g"].inference_ids.contains_key("x"));
+    }
+
+    /// The cache reloads only when a scanned file's mtime advances past the
+    /// recorded one (config.py:90): content changes with an unchanged mtime
+    /// keep the old snapshot; an mtime bump triggers a re-parse that
+    /// reflects the new content.
+    #[test]
+    fn cache_reloads_on_mtime_bump_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.x]
+config.v = 1
+"#,
+        );
+        let mut cache = RegistryCache::new(RegistryConfig {
+            config_dirs: vec![dir.path().to_path_buf()],
+        });
+
+        let first = cache.get().expect("initial load");
+        let second = cache.get().expect("cached load");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged mtime returns the same snapshot"
+        );
+
+        // Rewrite the content but pin the mtime back: must stay cached,
+        // proving the trigger is mtime, not content.
+        let original_mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        fs::write(
+            &file,
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.x]
+config.v = 2
+"#,
+        )
+        .unwrap();
+        set_mtime(&file, original_mtime);
+        let third = cache.get().expect("still cached");
+        assert!(Arc::ptr_eq(&first, &third), "same mtime keeps the old snapshot");
+
+        // Bump the mtime forward: reload picks up the new content.
+        set_mtime(&file, original_mtime + Duration::from_secs(2));
+        let fourth = cache.get().expect("reloaded");
+        assert!(!Arc::ptr_eq(&first, &fourth), "mtime bump reloads");
+        let spec = fourth.spawn_spec("g/x").expect("resolves");
+        assert_eq!(spec.config_kwargs, json!({"v": 2}));
+    }
+
+    /// Python's cache-validity check is `if config and mtime and ...`
+    /// (config.py:90): an empty registry (no groups → falsy dict) is never
+    /// treated as a valid cache, so every call re-parses. Replicated here:
+    /// two gets over an empty directory return distinct snapshots.
+    #[test]
+    fn cache_never_reuses_empty_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = RegistryCache::new(RegistryConfig {
+            config_dirs: vec![dir.path().to_path_buf()],
+        });
+        let first = cache.get().expect("empty load succeeds");
+        assert!(first.groups.is_empty());
+        let second = cache.get().expect("empty load succeeds again");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "empty registry is reloaded on every call, matching Python"
+        );
+    }
+
+    /// spawn_spec error paths mirror get_model_config (config.py:143-150):
+    /// unknown group and unknown inference id are distinct errors, and an id
+    /// whose merged config lacks impl_class fails resolution (Python fails
+    /// the equivalent lookup worker-side, process_model.py:215-217).
+    #[test]
+    fn spawn_spec_error_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g.inference_ids.noimpl]
+config.v = 1
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        let err = registry.spawn_spec("nope/x").expect_err("unknown group");
+        assert!(format!("{err:#}").contains("Group 'nope' not found"));
+
+        let err = registry.spawn_spec("g/nope").expect_err("unknown id");
+        assert!(format!("{err:#}").contains("Inference ID 'nope' not found in group 'g'"));
+
+        let err = registry.spawn_spec("g/noimpl").expect_err("missing impl_class");
+        assert!(format!("{err:#}").contains("impl_class"));
+
+        let err = registry.spawn_spec("no-slash").expect_err("malformed id");
+        assert!(format!("{err:#}").contains("group/name"));
+    }
+
+    /// inference_id_metadata mirrors Python get_metadata (config.py:120-136):
+    /// group metadata + id metadata under the exact Python key names, None
+    /// for unknown group or id.
+    #[test]
+    fn inference_id_metadata_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g.metadata]
+name = "G"
+[group.g.inference_ids.i]
+metadata.description = "d"
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+        assert_eq!(
+            registry.inference_id_metadata("g", "i"),
+            Some(json!({
+                "group_metadata": {"name": "G"},
+                "inference_id_metadata": {"description": "d"}
+            }))
+        );
+        assert_eq!(registry.inference_id_metadata("g", "missing"), None);
+        assert_eq!(registry.inference_id_metadata("missing", "i"), None);
+    }
+}

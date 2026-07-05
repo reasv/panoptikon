@@ -89,6 +89,9 @@ pdfium-render = { version = "0.8", default-features = false, features = [
 ] }
 croner = "3.0.1"
 chrono = "0.4.45"
+# Dynamic msgpack values for the inferio worker protocol (framed stdio):
+# rmpv keeps str vs bin distinct, which the protocol relies on.
+rmpv = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render
