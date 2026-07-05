@@ -495,8 +495,8 @@ mod tests {
         // Regression: this filter only joins item_data/setters under aliases,
         // so the final query must add the standard unaliased joins for the
         // selected text columns to resolve.
-        use crate::pql::model::{Column, PqlQuery};
         use super::super::test_support::run_pql_query;
+        use crate::pql::model::{Column, PqlQuery};
 
         let mut filter: SemanticTextSearch = serde_json::from_value(json!({
             "text_embeddings": { "query": "hello", "model": "textembed/test" }
@@ -509,6 +509,8 @@ mod tests {
             select: vec![Column::SetterName, Column::JobId],
             ..Default::default()
         };
-        run_pql_query(query).await.expect("semantic text entity query");
+        run_pql_query(query)
+            .await
+            .expect("semantic text entity query");
     }
 }

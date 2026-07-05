@@ -9,8 +9,8 @@ use crate::api_error::ApiError;
 use crate::db::index_writer::IndexDbWriterMessage;
 use crate::db::index_writer::call_index_db_writer;
 use crate::jobs::continuous_scan;
-use crate::jobs::files::FileScanService;
 use crate::jobs::extraction;
+use crate::jobs::files::FileScanService;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -167,10 +167,7 @@ pub(crate) enum JobRunnerMessage {
     /// panic, or abort). The runner clears its own busy state *before*
     /// forwarding completion to the queue, so the follow-up `RunJob` from the
     /// queue can never race a stale busy state.
-    JobCompleted {
-        queue_id: i64,
-        result: JobRunResult,
-    },
+    JobCompleted { queue_id: i64, result: JobRunResult },
 }
 
 pub(crate) struct JobRunnerActor;
@@ -469,7 +466,8 @@ impl Actor for JobRunnerActor {
                             error: Some(format!("Job panicked: {join_err}")),
                         },
                     };
-                    let _ = runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
+                    let _ =
+                        runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
                 });
                 state.running = Some(RunningJob { queue_id, abort });
                 let _ = reply.send(Ok(()));
@@ -554,8 +552,7 @@ async fn execute_job(job: Job) -> Result<(), String> {
                 Ok(deleted) => {
                     // VACUUM blocks the writer for the whole run; skip it
                     // when the deletion turned out to be a no-op.
-                    crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0)
-                        .await;
+                    crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0).await;
                     guard.resume().await;
                     Ok(())
                 }

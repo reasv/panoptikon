@@ -78,9 +78,7 @@ fn parse_npy(buffer: &[u8]) -> ApiResult<(Vec<usize>, Vec<f32>)> {
     // e.g. torch_dtype=float16 serialize <f2 arrays.
     let (elem_size, decode): (usize, fn(&[u8]) -> f32) = match descr.as_str() {
         "<f2" => (2, |b: &[u8]| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))),
-        "<f4" => (4, |b: &[u8]| {
-            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        }),
+        "<f4" => (4, |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         "<f8" => (8, |b: &[u8]| {
             f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
         }),
@@ -190,9 +188,7 @@ mod tests {
     use super::*;
 
     fn npy(descr: &str, shape: &str, data: &[u8]) -> Vec<u8> {
-        let header = format!(
-            "{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}"
-        );
+        let header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
         let mut padded = header.into_bytes();
         // Pad with spaces so magic+len+header is 16-byte aligned, per spec.
         while (10 + padded.len() + 1) % 16 != 0 {
@@ -225,13 +221,25 @@ mod tests {
 
     #[test]
     fn parse_npy_accepts_all_float_dtypes() {
-        let f4 = npy("<f4", "(2,)", &[1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat());
+        let f4 = npy(
+            "<f4",
+            "(2,)",
+            &[1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat(),
+        );
         assert_eq!(parse_npy_to_f32(&f4).unwrap(), vec![1.5, -2.0]);
 
-        let f8 = npy("<f8", "(2,)", &[1.5f64.to_le_bytes(), (-2.0f64).to_le_bytes()].concat());
+        let f8 = npy(
+            "<f8",
+            "(2,)",
+            &[1.5f64.to_le_bytes(), (-2.0f64).to_le_bytes()].concat(),
+        );
         assert_eq!(parse_npy_to_f32(&f8).unwrap(), vec![1.5, -2.0]);
 
-        let f2 = npy("<f2", "(2,)", &[0x3c00u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat());
+        let f2 = npy(
+            "<f2",
+            "(2,)",
+            &[0x3c00u16.to_le_bytes(), 0xc000u16.to_le_bytes()].concat(),
+        );
         assert_eq!(parse_npy_to_f32(&f2).unwrap(), vec![1.0, -2.0]);
 
         let bad = npy("<i4", "(1,)", &1i32.to_le_bytes());

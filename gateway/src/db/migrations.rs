@@ -66,8 +66,18 @@ pub(crate) async fn migrate_databases_on_disk(
     let user_data_db = user_data_db.unwrap_or(&default_user).to_string();
     let paths = db_paths(&index_db, &user_data_db)?;
     migrate_path(&paths.index_db_file, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await?;
-    migrate_path(&paths.storage_db_file, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD).await?;
-    migrate_path(&paths.user_db_file, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD).await?;
+    migrate_path(
+        &paths.storage_db_file,
+        &STORAGE_MIGRATOR,
+        STORAGE_ALEMBIC_HEAD,
+    )
+    .await?;
+    migrate_path(
+        &paths.user_db_file,
+        &USER_DATA_MIGRATOR,
+        USER_DATA_ALEMBIC_HEAD,
+    )
+    .await?;
     Ok(paths)
 }
 

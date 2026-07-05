@@ -67,9 +67,7 @@ impl InferencePool {
                 guard.select_client(&tried)
             };
             let Some((idx, client)) = selected else {
-                return Err(
-                    last_err.unwrap_or_else(|| anyhow!("no inference endpoints available"))
-                );
+                return Err(last_err.unwrap_or_else(|| anyhow!("no inference endpoints available")));
             };
             match client
                 .predict(inference_id, cache_key, lru_size, ttl_seconds, inputs)

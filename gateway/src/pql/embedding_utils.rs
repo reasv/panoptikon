@@ -62,8 +62,7 @@ fn parse_npy_f32(buffer: &[u8]) -> Result<Vec<f32>, String> {
         } else if !fortran {
             idx
         } else {
-            idx
-                .checked_mul(shape[0])
+            idx.checked_mul(shape[0])
                 .ok_or_else(|| "Embedding index overflow".to_string())?
         };
         let start = elem_index * elem_size;
@@ -76,9 +75,7 @@ fn parse_npy_f32(buffer: &[u8]) -> Result<Vec<f32>, String> {
     Ok(values)
 }
 
-fn parse_npy_header(
-    buffer: &[u8],
-) -> Result<(NpyDtype, bool, bool, Vec<usize>, usize), String> {
+fn parse_npy_header(buffer: &[u8]) -> Result<(NpyDtype, bool, bool, Vec<usize>, usize), String> {
     if buffer.len() < 10 {
         return Err("Numpy buffer too small".to_string());
     }
@@ -268,7 +265,10 @@ fn parse_scalar(slice: &[u8], dtype: NpyDtype, little_endian: bool) -> Result<f3
 }
 
 fn read_u8(slice: &[u8]) -> Result<u8, String> {
-    slice.get(0).copied().ok_or_else(|| "Numpy data truncated".to_string())
+    slice
+        .get(0)
+        .copied()
+        .ok_or_else(|| "Numpy data truncated".to_string())
 }
 
 fn read_i8(slice: &[u8]) -> Result<i8, String> {
@@ -276,7 +276,9 @@ fn read_i8(slice: &[u8]) -> Result<i8, String> {
 }
 
 fn read_u16(slice: &[u8], little_endian: bool) -> Result<u16, String> {
-    let bytes: [u8; 2] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    let bytes: [u8; 2] = slice
+        .try_into()
+        .map_err(|_| "Numpy data truncated".to_string())?;
     Ok(if little_endian {
         u16::from_le_bytes(bytes)
     } else {
@@ -289,7 +291,9 @@ fn read_i16(slice: &[u8], little_endian: bool) -> Result<i16, String> {
 }
 
 fn read_u32(slice: &[u8], little_endian: bool) -> Result<u32, String> {
-    let bytes: [u8; 4] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    let bytes: [u8; 4] = slice
+        .try_into()
+        .map_err(|_| "Numpy data truncated".to_string())?;
     Ok(if little_endian {
         u32::from_le_bytes(bytes)
     } else {
@@ -302,7 +306,9 @@ fn read_i32(slice: &[u8], little_endian: bool) -> Result<i32, String> {
 }
 
 fn read_u64(slice: &[u8], little_endian: bool) -> Result<u64, String> {
-    let bytes: [u8; 8] = slice.try_into().map_err(|_| "Numpy data truncated".to_string())?;
+    let bytes: [u8; 8] = slice
+        .try_into()
+        .map_err(|_| "Numpy data truncated".to_string())?;
     Ok(if little_endian {
         u64::from_le_bytes(bytes)
     } else {

@@ -5,7 +5,6 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
@@ -16,6 +15,7 @@ use std::{
 };
 use tower::{Layer, Service};
 use url::form_urlencoded;
+use utoipa::ToSchema;
 
 use crate::config::{
     DbPolicy, MAX_DB_NAME_LEN, MAX_USERNAME_LEN, PolicyConfig, RuleConfig, Settings,

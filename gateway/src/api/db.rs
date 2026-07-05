@@ -1,4 +1,4 @@
-use axum::{Json, http::StatusCode, response::IntoResponse, extract::Query};
+use axum::{Json, extract::Query, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use utoipa::{IntoParams, ToSchema};

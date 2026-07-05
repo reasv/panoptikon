@@ -63,7 +63,10 @@ fn embedding_cache() -> &'static Mutex<LruCache<EmbeddingCacheKey, CachedEmbeddi
     EMBEDDING_CACHE.get_or_init(|| Mutex::new(LruCache::new(1)))
 }
 
-fn ensure_cache_capacity(cache: &mut LruCache<EmbeddingCacheKey, CachedEmbedding>, capacity: usize) {
+fn ensure_cache_capacity(
+    cache: &mut LruCache<EmbeddingCacheKey, CachedEmbedding>,
+    capacity: usize,
+) {
     let target = capacity.max(1);
     if cache.capacity() != target {
         cache.set_capacity(target);
@@ -170,11 +173,7 @@ pub(crate) async fn embedding_cache_stats(
     let page = page.max(1);
     let page_size = page_size.max(1);
     let start = (page - 1).saturating_mul(page_size);
-    let entries = entries
-        .into_iter()
-        .skip(start)
-        .take(page_size)
-        .collect();
+    let entries = entries.into_iter().skip(start).take(page_size).collect();
 
     EmbeddingCacheStats {
         used_slots,

@@ -2,12 +2,17 @@ use axum::{
     extract::{FromRequestParts, Query},
     http::request::Parts,
 };
-use serde::Deserialize;
-use url::Url;
 use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
-use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
-use std::{env, fs, marker::PhantomData, path::{Path, PathBuf}, sync::OnceLock};
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+use std::{
+    env, fs,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+use url::Url;
 
 use crate::api_error::ApiError;
 
@@ -410,11 +415,8 @@ fn ensure_sqlite_vec_loaded() -> Result<(), ApiError> {
         return Ok(());
     }
 
-    let status = unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )))
-    };
+    let status =
+        unsafe { sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ()))) };
     if status != SQLITE_OK {
         tracing::error!(status, "failed to register sqlite-vec extension");
         return Err(ApiError::internal("Failed to load sqlite-vec extension"));

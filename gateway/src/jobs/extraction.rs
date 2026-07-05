@@ -581,7 +581,13 @@ async fn run_chunked_inference(
             .await
             .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
         let response = pool
-            .predict(setter_name, CACHE_KEY, CACHE_LRU_SIZE, CACHE_TTL_SECS, chunk)
+            .predict(
+                setter_name,
+                CACHE_KEY,
+                CACHE_LRU_SIZE,
+                CACHE_TTL_SECS,
+                chunk,
+            )
             .await;
         drop(permits);
         let outputs = response?;
@@ -1198,4 +1204,3 @@ fn bind_param<'q>(
         }
     }
 }
-

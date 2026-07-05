@@ -6,67 +6,40 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ractor::{Actor, ActorProcessingErr, ActorRef};
 use ractor::concurrency::Duration as RactorDuration;
+use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::SqliteConnection;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::api_error::ApiError;
+use crate::db::connection::index_storage_paths_unchecked;
 use crate::db::{
+    extraction_log::delete_data_job_by_log_id,
+    extraction_write::{
+        DataLogUpdate, EmbeddingEntry, TagEntry, TagTextEntry, TextEntry, add_data_log,
+        delete_orphan_tags, delete_setter_by_name, remove_incomplete_jobs, update_data_log,
+        upsert_setter, write_clip_output, write_tags_output, write_text_embedding_output,
+        write_text_output,
+    },
     file_scans::{
-        add_file_scan,
-        close_file_scan,
-        delete_unavailable_files,
-        mark_unavailable_files,
-        update_file_scan,
-        FileScanUpdate,
+        FileScanUpdate, add_file_scan, close_file_scan, delete_unavailable_files,
+        mark_unavailable_files, update_file_scan,
     },
     files::{
-        delete_files_not_allowed,
-        delete_items_without_files,
-        delete_file_by_path,
-        delete_item_if_orphan,
-        rename_file_path,
-        set_blurhash,
+        FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
+        delete_item_if_orphan, delete_items_without_files, rename_file_path, set_blurhash,
         update_file_data,
-        FileScanData,
-        FileUpsertResult,
     },
     folders::{
-        add_folder_to_database,
-        delete_files_not_under_included_folders,
-        delete_files_under_excluded_folders,
-        delete_folders_not_in_list,
+        add_folder_to_database, delete_files_not_under_included_folders,
+        delete_files_under_excluded_folders, delete_folders_not_in_list,
     },
-    extraction_write::{
-        add_data_log,
-        delete_orphan_tags,
-        delete_setter_by_name,
-        remove_incomplete_jobs,
-        update_data_log,
-        upsert_setter,
-        write_clip_output,
-        write_tags_output,
-        write_text_embedding_output,
-        write_text_output,
-        DataLogUpdate,
-        EmbeddingEntry,
-        TagEntry,
-        TagTextEntry,
-        TextEntry,
-    },
-    open_index_db_read_no_user_data,
-    open_index_db_write_no_user_data,
+    open_index_db_read_no_user_data, open_index_db_write_no_user_data,
     storage::{
-        delete_orphaned_frames,
-        delete_orphaned_thumbnails,
-        store_frames,
+        StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails, store_frames,
         store_thumbnails,
-        StoredImage,
     },
-    extraction_log::delete_data_job_by_log_id,
 };
-use crate::db::connection::index_storage_paths_unchecked;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 type Reply<T> = oneshot::Sender<ApiResult<T>>;
@@ -488,14 +461,7 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
-                            store_frames(
-                                conn,
-                                &sha256,
-                                &mime_type,
-                                process_version,
-                                &frames,
-                            )
-                            .await
+                            store_frames(conn, &sha256, &mime_type, process_version, &frames).await
                         })
                     })
                     .await;
@@ -675,14 +641,8 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
-                            write_text_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                &entries,
-                            )
-                            .await
+                            write_text_output(conn, job_id, &setter_name, &item_sha256, &entries)
+                                .await
                         })
                     })
                     .await;
@@ -698,14 +658,8 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
-                            write_clip_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                &entries,
-                            )
-                            .await
+                            write_clip_output(conn, job_id, &setter_name, &item_sha256, &entries)
+                                .await
                         })
                     })
                     .await;
@@ -796,9 +750,7 @@ impl Actor for IndexDbWriter {
             IndexDbWriterMessage::DeleteFilesNotUnderIncludedFolders { reply } => {
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            delete_files_not_under_included_folders(conn).await
-                        })
+                        Box::pin(async move { delete_files_not_under_included_folders(conn).await })
                     })
                     .await;
                 let _ = reply.send(result);
@@ -891,7 +843,10 @@ impl Actor for IndexDbSupervisor {
                 if let Some(existing) = state.writers.get(&key) {
                     if force_new {
                         // Only force a respawn if the existing writer is actually dead.
-                        if existing.send_message(IndexDbWriterMessage::IdleCheck).is_err() {
+                        if existing
+                            .send_message(IndexDbWriterMessage::IdleCheck)
+                            .is_err()
+                        {
                             if let Some(existing) = state.writers.remove(&key) {
                                 existing.stop(None);
                             }
@@ -942,7 +897,10 @@ impl Actor for IndexDbSupervisor {
                     }
 
                     if !to_remove.contains(key) {
-                        if writer.send_message(IndexDbWriterMessage::IdleCheck).is_err() {
+                        if writer
+                            .send_message(IndexDbWriterMessage::IdleCheck)
+                            .is_err()
+                        {
                             to_remove.push(key.clone());
                         }
                     }
@@ -986,9 +944,7 @@ pub(crate) async fn get_index_db_writer(
     get_index_db_writer_inner(index_db, false).await
 }
 
-async fn get_index_db_writer_fresh(
-    index_db: &str,
-) -> ApiResult<ActorRef<IndexDbWriterMessage>> {
+async fn get_index_db_writer_fresh(index_db: &str) -> ApiResult<ActorRef<IndexDbWriterMessage>> {
     get_index_db_writer_inner(index_db, true).await
 }
 
@@ -1022,10 +978,7 @@ async fn get_index_db_writer_inner(
 
 /// Sends a request to the writer with a single retry on writer death.
 /// The builder may be called more than once; use Arc/cloneable payloads if needed.
-pub(crate) async fn call_index_db_writer<T, F>(
-    index_db: &str,
-    mut build: F,
-) -> ApiResult<T>
+pub(crate) async fn call_index_db_writer<T, F>(index_db: &str, mut build: F) -> ApiResult<T>
 where
     F: FnMut(Reply<T>) -> IndexDbWriterMessage,
 {
@@ -1051,9 +1004,7 @@ where
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        ApiError::internal("Index DB writer unavailable")
-    }))
+    Err(last_err.unwrap_or_else(|| ApiError::internal("Index DB writer unavailable")))
 }
 
 /// Drains every live index DB writer (a message-ordering barrier, not an
@@ -1102,11 +1053,11 @@ async fn spawn_supervisor() -> ApiResult<ActorRef<IndexDbSupervisorMessage>> {
         idle_timeout: IDLE_TIMEOUT,
     };
     let (actor, _handle) = Actor::spawn(None, IndexDbSupervisor, args)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = ?err, "failed to start index db supervisor");
-        ApiError::internal("Failed to start index DB supervisor")
-    })?;
+        .await
+        .map_err(|err| {
+            tracing::error!(error = ?err, "failed to start index db supervisor");
+            ApiError::internal("Failed to start index DB supervisor")
+        })?;
     Ok(actor)
 }
 

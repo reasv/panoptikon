@@ -1,19 +1,19 @@
+use sea_query::extension::sqlite::SqliteBinOper;
 use sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, Order, OverStatement, Query, WindowStatement,
 };
-use sea_query::extension::sqlite::SqliteBinOper;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::pql::model::{EntityType, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
-use super::FilterCompiler;
 use super::super::{
     BaseTable, CteRef, ExtraColumn, ExtractedText, ExtractedTextFts, ItemData, JoinedTables,
     OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
     create_cte, get_std_group_by, select_std_from_cte, wrap_query,
 };
+use super::FilterCompiler;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct MatchTextArgs {
@@ -145,10 +145,8 @@ impl FilterCompiler for MatchText {
         let mut criteria = Vec::new();
         if !args.filter_only {
             criteria.push(
-                Expr::col((ExtractedTextFts::Table, ExtractedTextFts::Text)).binary(
-                    SqliteBinOper::Match,
-                    Expr::val(args.r#match.clone()),
-                ),
+                Expr::col((ExtractedTextFts::Table, ExtractedTextFts::Text))
+                    .binary(SqliteBinOper::Match, Expr::val(args.r#match.clone())),
             );
         }
         if let Some(min_length) = args.min_length {
@@ -166,7 +164,12 @@ impl FilterCompiler for MatchText {
             }
         }
         if !args.setters.is_empty() {
-            let setters = args.setters.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+            let setters = args
+                .setters
+                .iter()
+                .cloned()
+                .map(Expr::val)
+                .collect::<Vec<_>>();
             criteria.push(Expr::col((Setters::Table, Setters::Name)).is_in(setters));
         }
         if !args.languages.is_empty() {
@@ -176,7 +179,8 @@ impl FilterCompiler for MatchText {
                 .cloned()
                 .map(Expr::val)
                 .collect::<Vec<_>>();
-            criteria.push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(languages));
+            criteria
+                .push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(languages));
         }
         if let Some(min_language_confidence) = args.min_language_confidence {
             if min_language_confidence > 0.0 {
@@ -296,7 +300,13 @@ impl FilterCompiler for MatchText {
                 joined_tables,
             );
 
-            let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
+            let cte = wrap_query(
+                state,
+                final_query,
+                &context_for_wrap,
+                cte_name,
+                &joined_tables,
+            );
             state.cte_counter += 1;
             if !state.is_count_query {
                 if let Some(alias) = &self.sort.select_as {
@@ -340,8 +350,7 @@ impl FilterCompiler for MatchText {
         query.join(
             JoinType::InnerJoin,
             Setters::Table,
-            Expr::col((Setters::Table, Setters::Id))
-                .equals((ItemData::Table, ItemData::SetterId)),
+            Expr::col((Setters::Table, Setters::Id)).equals((ItemData::Table, ItemData::SetterId)),
         );
         query.join(
             JoinType::InnerJoin,
@@ -394,7 +403,13 @@ impl FilterCompiler for MatchText {
             joined_tables,
         );
 
-        let cte = wrap_query(state, final_query, &context_for_wrap, cte_name, &joined_tables);
+        let cte = wrap_query(
+            state,
+            final_query,
+            &context_for_wrap,
+            cte_name,
+            &joined_tables,
+        );
         state.cte_counter += 1;
         if !state.is_count_query {
             if let Some(alias) = &self.sort.select_as {
@@ -463,8 +478,8 @@ mod tests {
         // Regression: the snippet path wraps the select in matchq/rownum CTEs,
         // hiding the item_data/setters/extracted_text joins; the final query
         // must re-join them for the selected text columns to resolve.
-        use crate::pql::model::{Column, PqlQuery};
         use super::super::test_support::run_pql_query;
+        use crate::pql::model::{Column, PqlQuery};
 
         let filter: MatchText = serde_json::from_value(json!({
             "match_text": { "match": "hello world", "select_snippet_as": "snip" }
@@ -476,14 +491,16 @@ mod tests {
             select: vec![Column::Language, Column::SetterName],
             ..Default::default()
         };
-        run_pql_query(query).await.expect("match_text snippet query");
+        run_pql_query(query)
+            .await
+            .expect("match_text snippet query");
     }
 
     #[tokio::test]
     async fn match_text_with_sort_bounds_runs_full_query() {
         // Regression: the gt/lt wrapper CTE hides the filter's joins.
-        use crate::pql::model::{Column, PqlQuery};
         use super::super::test_support::run_pql_query;
+        use crate::pql::model::{Column, PqlQuery};
 
         let filter: MatchText = serde_json::from_value(json!({
             "match_text": { "match": "hello world" },
@@ -497,6 +514,8 @@ mod tests {
             select: vec![Column::Language, Column::SetterName],
             ..Default::default()
         };
-        run_pql_query(query).await.expect("match_text bounded query");
+        run_pql_query(query)
+            .await
+            .expect("match_text bounded query");
     }
 }

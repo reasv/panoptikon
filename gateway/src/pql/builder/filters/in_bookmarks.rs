@@ -5,12 +5,12 @@ use utoipa::ToSchema;
 use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions};
 use crate::pql::preprocess::PqlError;
 
-use super::FilterCompiler;
 use super::super::{
     BaseTable, Bookmarks, CteRef, ExtraColumn, Files, JoinedTables, OrderByFilter, QueryState,
     add_rank_column_expr, apply_group_by, apply_sort_bounds, get_std_group_by, select_std_from_cte,
     wrap_query,
 };
+use super::FilterCompiler;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct InBookmarksArgs {
@@ -131,7 +131,8 @@ impl FilterCompiler for InBookmarks {
         if args.include_wildcard {
             users.push(Expr::val("*"));
         }
-        criteria.push(Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::User)).is_in(users));
+        criteria
+            .push(Expr::col((user_data.clone(), Bookmarks::Table, Bookmarks::User)).is_in(users));
 
         let mut query = select_std_from_cte(context, state);
         query.join(

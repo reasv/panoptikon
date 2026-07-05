@@ -1,10 +1,7 @@
 use axum::http::header;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) fn content_disposition_value(
-    kind: &str,
-    filename: &str,
-) -> Option<header::HeaderValue> {
+pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<header::HeaderValue> {
     let mut value = Vec::new();
     value.extend_from_slice(kind.as_bytes());
     value.extend_from_slice(b"; filename=\"");
