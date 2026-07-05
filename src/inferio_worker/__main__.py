@@ -1,10 +1,30 @@
 """Entry point: `python -m inferio_worker`.
 
-Implements the worker side of docs/inferio-worker-protocol.md (v1).
+Implements the worker side of docs/inferio-worker-protocol.md (v2).
 Everything the worker needs arrives in the handshake frame; there are no
 command-line arguments. Only stdlib may be imported at module level — the
 stdout-hygiene dance must happen before anything beyond the stdlib (msgpack,
 impl deps) gets a chance to touch fd 1.
+
+State machine (protocol v2):
+
+    handshaken --prewarm*--> handshaken   (optional prepare(), idempotent)
+    handshaken --configure--> configured  (instantiates impl_class(**config))
+    configured --load--> loaded
+    any state  --unload--> ok + exit 0
+
+- `handshake` carries worker *identity* only (impl_class + impl_dirs); the
+  class is located but NOT instantiated, so a prewarmed worker can later be
+  claimed for any model of its impl family.
+- `prewarm` is valid only between handshake and configure; it calls the
+  impl's optional `prepare()` classmethod (absent = no-op → ok). Errors are
+  per-request and non-fatal: a failed prepare just means load pays the
+  imports.
+- `configure` instantiates exactly once (before load); a second configure,
+  or load/predict before configure, is a per-request error and the worker
+  survives.
+- A failed handshake is the one error the worker does not survive (exit
+  non-zero).
 """
 
 from __future__ import annotations
@@ -65,9 +85,11 @@ def _send_error(
     )
 
 
-def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> Any | None:
-    """Process the handshake frame; returns the impl instance or None.
+def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
+    """Process the handshake frame; returns the impl *class* or None.
 
+    v2: the handshake carries identity only (impl_class + impl_dirs). The
+    class is located but not instantiated — `configure` does that later.
     Per the protocol doc, any handshake failure sends an `error` frame and
     the worker exits non-zero (the caller handles the exit).
     """
@@ -95,10 +117,8 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> Any | None:
         )
         return None
 
-    inference_id = msg.get("inference_id", "<unknown>")
-    logger.info("Handshake for inference_id %s", inference_id)
-
-    # cuDNN path setup before impl instantiation; failure is only a warning.
+    # cuDNN path setup before any impl module import; failure is only a
+    # warning.
     try:
         from inferio_worker.cudnn import cudnn_setup
 
@@ -108,31 +128,31 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> Any | None:
 
     try:
         impl_class_name = msg["impl_class"]
-        config = msg.get("config") or {}
         impl_dirs = msg.get("impl_dirs") or []
         from inferio_worker.discovery import find_impl_class
 
         impl_cls = find_impl_class(impl_class_name, impl_dirs, logger)
-        instance = impl_cls(**config)
     except Exception as e:
-        logger.error(
-            "%s - handshake failed: %s", inference_id, e, exc_info=True
-        )
+        logger.error("handshake failed: %s", e, exc_info=True)
         _send_error(proto_out, req_id, str(e), traceback.format_exc())
         return None
 
+    logger.info("Handshake ok for impl class %s", impl_class_name)
     _send_ok(proto_out, req_id, protocol_version=protocol.PROTOCOL_VERSION)
-    return instance
+    return impl_cls
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
     from inferio_worker import protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
-    instance = _handshake(proto_in, proto_out)
-    if instance is None:
+    impl_cls = _handshake(proto_in, proto_out)
+    if impl_cls is None:
         return EXIT_HANDSHAKE_FAILED
 
+    instance: Any | None = None
+    inference_id = "<unconfigured>"
+    prewarmed = False
     loaded = False
     while True:
         msg = protocol.read_frame(proto_in)
@@ -143,7 +163,68 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
         req_id = msg.get("id", 0)
         mtype = msg.get("type")
 
-        if mtype == "load":
+        if mtype == "prewarm":
+            # Valid only between handshake and configure; idempotent.
+            if instance is not None:
+                _send_error(
+                    proto_out,
+                    req_id,
+                    "prewarm after configure is not allowed",
+                )
+                continue
+            if prewarmed:
+                _send_ok(proto_out, req_id)
+                continue
+            prepare = getattr(impl_cls, "prepare", None)
+            if prepare is None:
+                # No prepare() classmethod: prewarm is a no-op -> plain ok.
+                prewarmed = True
+                _send_ok(proto_out, req_id)
+                continue
+            try:
+                prepare()
+                prewarmed = True
+                _send_ok(proto_out, req_id)
+            except Exception as e:
+                # Per-request and NON-fatal: the worker stays usable — a
+                # failed prepare just means the later load pays the imports.
+                logger.error("prewarm failed: %s", e, exc_info=True)
+                _send_error(proto_out, req_id, str(e), traceback.format_exc())
+
+        elif mtype == "configure":
+            if instance is not None:
+                _send_error(
+                    proto_out,
+                    req_id,
+                    f"already configured (as {inference_id}); configure is "
+                    "allowed exactly once per worker",
+                )
+                continue
+            requested_id = msg.get("inference_id", "<unknown>")
+            config = msg.get("config") or {}
+            try:
+                instance = impl_cls(**config)
+            except Exception as e:
+                # Per-request: a failed instantiation leaves the worker
+                # un-configured but alive (configure may be retried).
+                instance = None
+                logger.error(
+                    "%s - configure failed: %s", requested_id, e, exc_info=True
+                )
+                _send_error(proto_out, req_id, str(e), traceback.format_exc())
+                continue
+            inference_id = requested_id
+            logger.info("Configured as %s", inference_id)
+            _send_ok(proto_out, req_id)
+
+        elif mtype == "load":
+            if instance is None:
+                _send_error(
+                    proto_out,
+                    req_id,
+                    "load before configure",
+                )
+                continue
             try:
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
@@ -151,10 +232,19 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 loaded = True
                 _send_ok(proto_out, req_id)
             except Exception as e:
-                logger.error("load failed: %s", e, exc_info=True)
+                logger.error(
+                    "%s - load failed: %s", inference_id, e, exc_info=True
+                )
                 _send_error(proto_out, req_id, str(e), traceback.format_exc())
 
         elif mtype == "predict":
+            if instance is None:
+                _send_error(
+                    proto_out,
+                    req_id,
+                    "predict before configure",
+                )
+                continue
             if not loaded:
                 _send_error(
                     proto_out,
@@ -174,17 +264,23 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 # output type, oversized response): packing happens before
                 # any byte hits the stream, so we can still reply with a
                 # clean error frame and keep serving.
-                logger.error("predict failed: %s", e, exc_info=True)
+                logger.error(
+                    "%s - predict failed: %s", inference_id, e, exc_info=True
+                )
                 _send_error(proto_out, req_id, str(e), traceback.format_exc())
 
         elif mtype == "unload":
+            # Valid in every state: a parked prewarmed worker with no
+            # instance is dismissed the same way (ok + exit 0).
             try:
-                if loaded:
+                if loaded and instance is not None:
                     instance.unload()
             except Exception as e:
                 # Stay alive per the error semantics; the orchestrator's
                 # terminate/kill ladder handles a worker that cannot unload.
-                logger.error("unload failed: %s", e, exc_info=True)
+                logger.error(
+                    "%s - unload failed: %s", inference_id, e, exc_info=True
+                )
                 _send_error(proto_out, req_id, str(e), traceback.format_exc())
                 continue
             _send_ok(proto_out, req_id)
@@ -194,10 +290,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
 
         elif mtype == "ping":
             _send_ok(proto_out, req_id)
-
-        elif mtype == "prewarm":
-            # Reserved (design §8); v1 workers reply error "unsupported".
-            _send_error(proto_out, req_id, "unsupported: prewarm")
 
         else:
             _send_error(

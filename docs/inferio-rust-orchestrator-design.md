@@ -382,20 +382,46 @@ in worker transport. This is also what settles the transport question:
 workers are always direct children of their orchestrator, so framed msgpack
 over stdio wins outright.
 
-**Prewarming.** Measured reality: process start + library imports dominate
-load latency, not weights. Two tiers, both behind the reserved `prewarm`
-protocol message:
-1. *Blank interpreter pool* — cheap (harness imports almost nothing), saves
-   only ~python-startup; probably not worth it alone.
-2. *Dep-profile prewarm* — the real win (torch etc.). Requires a small,
-   backwards-compatible impl-class addition: optional `prepare()` classmethod
-   that imports heavy deps without loading weights (default: no-op).
-   Orchestrator keeps up to K prewarmed workers keyed by impl class; `load`
-   consumes a matching prewarmed worker when available. The UI's existing
-   eager `PUT /load` on model selection already covers the search case
-   end-to-end; prewarm pools mostly help first-load and job-start latency.
-This tier structure also maps 1:1 onto future per-impl venvs: a prewarmed
-worker is keyed by (env, impl-class) instead of (impl-class).
+**Prewarming (policy decided 2026-07-05, protocol v2).** Measured reality:
+process start + library imports dominate load latency, not weights. A
+prewarmed worker has run the impl's optional `prepare()` classmethod (heavy
+imports, no weights, no GPU allocation — RAM-only cost) and is parked until
+claimed. Protocol v2 splits identity from configuration (handshake carries
+impl_class only; `configure` instantiates at claim time) precisely so the
+pool is keyed by **impl class**: one warm worker serves any model of its
+family. Policy:
+
+- **Master switch, default ON.** One warm worker per impl class, and the
+  pool does NOT TTL out — its entire purpose is to be there when the loaded
+  model has TTLed away. If prewarm is enabled, the RAM is considered spent.
+- **Eager set (default):** the same selection logic as
+  `preload_embedding_models` — search-usable embedding setters with data
+  (text-embedding/clip, excluding `tclip/`) across the index DBs — mapped to
+  impl classes. Computed at startup and refreshed on the existing minute
+  tick. Gated per-DB by a new SystemConfig flag `prewarm_embedding_models`
+  (default true; same enumerate-all-act-per-config pattern as cron, same
+  Rust-only-field precedent as `continuous_filescan`; SearchUI settings
+  surface later). This targets the real UX hole: the first embedding search
+  after a restart, for users who don't run Panoptikon 24/7. Models held
+  fully loaded by `preload_embedding_models` don't benefit (they never
+  unload), but the class-level warm worker is what catches them after that
+  preload is disabled or fails.
+- **Lazy warm (default ON, own switch):** after a model of class C is loaded,
+  keep one warm C worker for next time (respawn-on-claim). Exclusion:
+  extraction jobs pass an explicit `prewarm=false` hint (additive query
+  param on load/predict, like `max_batch`) so batch-only model families
+  don't burn RAM on warm workers nobody is waiting for. Explicit hint beats
+  cache-key matching (brittle).
+- **Whitelist:** `always_warm = ["impl_class", ...]` in gateway config,
+  warmed unconditionally at startup (the only eager mechanism available to
+  the standalone `panoptikon inferio` mode, which may have no index DBs).
+- Claiming: ping the parked worker first (it may have died while parked);
+  on failure fall back to a fresh spawn. A failed `prepare()` is per-request
+  and non-fatal — the worker is still usable, the later `load` just pays the
+  imports.
+
+This structure maps 1:1 onto future per-impl venvs: a prewarmed worker is
+keyed by (env, impl-class) instead of (impl-class).
 
 **Environment management (the long-term ambition).** Out of scope now, but
 the design leaves exactly one seam: workers are spawned from a configured

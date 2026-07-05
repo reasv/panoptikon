@@ -60,6 +60,15 @@ pub(crate) struct SystemConfig {
     pub excluded_folders: Vec<String>,
     #[serde(default)]
     pub preload_embedding_models: bool,
+    /// Whether this DB's search-usable embedding setters contribute their
+    /// impl classes to the gateway's eager prewarm set (design §8). Default
+    /// true. Rust-only field like `continuous_filescan`; both survive
+    /// round-trips through either server — the gateway preserves unknown
+    /// keys via its `extra` flatten, and Python's SystemConfig uses
+    /// pydantic `extra="allow"` so its saves keep them too (before that,
+    /// a Python-side save silently dropped Rust-only keys).
+    #[serde(default = "default_true")]
+    pub prewarm_embedding_models: bool,
     #[serde(default)]
     pub continuous_filescan: ContinuousFilescanConfig,
 
@@ -110,6 +119,7 @@ impl Default for SystemConfig {
             included_folders: Vec::new(),
             excluded_folders: Vec::new(),
             preload_embedding_models: false,
+            prewarm_embedding_models: true,
             continuous_filescan: ContinuousFilescanConfig {
                 enabled: false,
                 poll_interval_secs: None,

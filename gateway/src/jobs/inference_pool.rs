@@ -58,6 +58,7 @@ impl InferencePool {
         lru_size: i64,
         ttl_seconds: i64,
         max_batch: Option<u32>,
+        prewarm: Option<bool>,
         inputs: &[InferenceInput],
     ) -> Result<PredictOutput> {
         let mut tried = Vec::new();
@@ -71,7 +72,15 @@ impl InferencePool {
                 return Err(last_err.unwrap_or_else(|| anyhow!("no inference endpoints available")));
             };
             match client
-                .predict(inference_id, cache_key, lru_size, ttl_seconds, max_batch, inputs)
+                .predict(
+                    inference_id,
+                    cache_key,
+                    lru_size,
+                    ttl_seconds,
+                    max_batch,
+                    prewarm,
+                    inputs,
+                )
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -94,6 +103,7 @@ impl InferencePool {
         cache_key: &str,
         lru_size: i64,
         ttl_seconds: i64,
+        prewarm: Option<bool>,
     ) -> Result<()> {
         let clients = {
             let guard = self.state.lock().await;
@@ -115,7 +125,7 @@ impl InferencePool {
         let mut failed = 0usize;
         for (idx, client) in clients.into_iter().enumerate() {
             if let Err(err) = client
-                .load_model(inference_id, cache_key, lru_size, ttl_seconds)
+                .load_model(inference_id, cache_key, lru_size, ttl_seconds, prewarm)
                 .await
             {
                 tracing::error!(

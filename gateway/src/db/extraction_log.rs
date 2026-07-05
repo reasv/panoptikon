@@ -40,6 +40,34 @@ pub(crate) async fn get_existing_setters(
     Ok(results)
 }
 
+/// The search-usable embedding setters among `(data_type, setter)` pairs:
+/// text-embedding and clip setters, excluding `tclip/` (text-CLIP setters
+/// are not selectable in search). This is THE selection rule shared by the
+/// cron `preload_embedding_models` loop and the prewarm eager set (design
+/// §8: "the same selection logic as preload_embedding_models") — change it
+/// in one place or the two features drift.
+pub(crate) fn filter_search_embedding_setters(
+    setters: impl IntoIterator<Item = (String, String)>,
+) -> Vec<String> {
+    setters
+        .into_iter()
+        .filter(|(data_type, setter)| {
+            (data_type == "text-embedding" || data_type == "clip") && !setter.starts_with("tclip/")
+        })
+        .map(|(_, setter)| setter)
+        .collect()
+}
+
+/// Search-usable embedding setters WITH DATA in this index DB (the
+/// existing-setters query + [`filter_search_embedding_setters`]).
+pub(crate) async fn get_search_embedding_setters(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<String>> {
+    Ok(filter_search_embedding_setters(
+        get_existing_setters(conn).await?,
+    ))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct LogRecord {
     pub id: i64,
@@ -330,6 +358,62 @@ mod tests {
                 ("text".to_string(), "alpha".to_string()),
                 ("text".to_string(), "beta".to_string())
             ]
+        );
+    }
+
+    // The shared embedding-setter selection (cron preload + prewarm eager
+    // set) against the real schema: only text-embedding and clip setters
+    // with actual item_data rows are returned, tclip/-prefixed clip setters
+    // are excluded, and non-embedding data types (tags) never appear — a
+    // setter row without item_data has no data and is not selected.
+    #[tokio::test]
+    async fn search_embedding_setters_filter_against_real_schema() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES (1, 'sha_1', 'md5_1', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO setters (id, name)
+            VALUES
+                (1, 'clip/model-a'),
+                (2, 'tclip/model-b'),
+                (3, 'embed/model-c'),
+                (4, 'tags/model-d'),
+                (5, 'clip/no-data')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+            VALUES
+                (10, 1, 1, 'clip', 0, 1),
+                (11, 1, 2, 'clip', 0, 1),
+                (12, 1, 3, 'text-embedding', 0, 1),
+                (13, 1, 4, 'tags', 0, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let mut setters = get_search_embedding_setters(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        setters.sort();
+        assert_eq!(
+            setters,
+            vec!["clip/model-a".to_string(), "embed/model-c".to_string()],
+            "clip + text-embedding with data only; tclip/, tags, and data-less setters excluded"
         );
     }
 

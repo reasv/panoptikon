@@ -13,5 +13,6 @@
 pub mod dispatch;
 pub mod http;
 pub mod manager;
+pub mod prewarm;
 pub mod registry;
 pub mod worker;

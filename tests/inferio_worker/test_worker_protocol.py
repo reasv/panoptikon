@@ -1,8 +1,12 @@
-"""End-to-end tests for the `inferio_worker` harness.
+"""End-to-end tests for the `inferio_worker` harness (protocol v2).
 
 Each test spawns `python -m inferio_worker` as a real subprocess and speaks
 the framed-msgpack protocol from docs/inferio-worker-protocol.md over its
 stdin/stdout, exactly like the Rust orchestrator will.
+
+v2 state machine under test: handshake (identity only, no instantiation)
+-> optional prewarm (optional prepare() classmethod) -> configure
+(instantiates) -> load -> predict, with unload valid in every state.
 
 The worker subprocess resolves the `inferio_worker` package via
 PYTHONPATH=src (the repo uses a src/ layout; the root conftest only patches
@@ -134,44 +138,66 @@ def worker():
 
 
 def handshake_msg(
-    req_id: int = 1, impl_class: str = "echo_test", config: dict | None = None
+    req_id: int = 1,
+    impl_class: str = "echo_test",
+    protocol_version: int = 2,
 ) -> dict:
+    # v2: identity only — no inference_id, no config (those move to
+    # `configure`).
     return {
         "type": "handshake",
         "id": req_id,
-        "protocol_version": 1,
-        "inference_id": "test/worker",
+        "protocol_version": protocol_version,
         "impl_class": impl_class,
-        "config": config or {},
         "impl_dirs": [str(FIXTURE_DIR)],
     }
 
 
+def configure_msg(
+    req_id: int,
+    config: dict | None = None,
+    inference_id: str = "test/worker",
+) -> dict:
+    return {
+        "type": "configure",
+        "id": req_id,
+        "inference_id": inference_id,
+        "config": config or {},
+    }
+
+
 def test_full_lifecycle_happy_path(worker: WorkerProcess) -> None:
-    # Expected behavior: handshake resolves EchoModel by its name() in the
-    # fixture impl dir and replies ok with protocol_version=1; load replies
-    # ok; predict returns one output per input, in order, with bytes outputs
-    # as msgpack bin (round-tripping to Python bytes) and JSON-like outputs
-    # as plain msgpack values; unload replies ok and the worker exits 0.
+    # Expected behavior (v2 normal flow: handshake -> configure -> load):
+    # handshake resolves EchoModel by its name() in the fixture impl dir and
+    # replies ok with protocol_version=2 without instantiating; configure
+    # instantiates and replies ok; load replies ok; predict returns one
+    # output per input, in order, with bytes outputs as msgpack bin and
+    # JSON-like outputs as plain msgpack values; unload replies ok and the
+    # worker exits 0.
     worker.send(handshake_msg(req_id=1))
     resp = worker.recv()
     assert resp["type"] == "ok"
     assert resp["id"] == 1
-    assert resp["protocol_version"] == 1
+    assert resp["protocol_version"] == 2
 
-    worker.send({"type": "load", "id": 2})
+    worker.send(configure_msg(req_id=2))
     resp = worker.recv()
     assert resp["type"] == "ok"
     assert resp["id"] == 2
+
+    worker.send({"type": "load", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 3
 
     inputs = [
         {"data": {"text": "hello"}, "file": None},
         {"data": None, "file": b"\x00\x01\xfe\xff"},
     ]
-    worker.send({"type": "predict", "id": 3, "inputs": inputs})
+    worker.send({"type": "predict", "id": 4, "inputs": inputs})
     resp = worker.recv()
     assert resp["type"] == "ok"
-    assert resp["id"] == 3
+    assert resp["id"] == 4
     outputs = resp["outputs"]
     assert len(outputs) == 2
     # Data-only input: the JSON-like dict comes back as a msgpack map.
@@ -180,10 +206,10 @@ def test_full_lifecycle_happy_path(worker: WorkerProcess) -> None:
     assert isinstance(outputs[1], bytes)
     assert outputs[1] == b"echo:\x00\x01\xfe\xff"
 
-    worker.send({"type": "unload", "id": 4})
+    worker.send({"type": "unload", "id": 5})
     resp = worker.recv()
     assert resp["type"] == "ok"
-    assert resp["id"] == 4
+    assert resp["id"] == 5
     assert worker.wait() == 0
 
 
@@ -193,12 +219,14 @@ def test_load_is_idempotent(worker: WorkerProcess) -> None:
     # InferenceModel.load() guard semantics.
     worker.send(handshake_msg(req_id=1))
     assert worker.recv()["type"] == "ok"
-    worker.send({"type": "load", "id": 2})
+    worker.send(configure_msg(req_id=2))
     assert worker.recv()["type"] == "ok"
     worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 4})
     resp = worker.recv()
     assert resp["type"] == "ok"
-    assert resp["id"] == 3
+    assert resp["id"] == 4
 
 
 def test_handshake_unknown_impl_class(worker: WorkerProcess) -> None:
@@ -215,12 +243,23 @@ def test_handshake_unknown_impl_class(worker: WorkerProcess) -> None:
     assert worker.wait() != 0
 
 
-def test_predict_before_load_is_error_and_worker_survives(
+def test_handshake_version_mismatch_is_fatal(worker: WorkerProcess) -> None:
+    # Expected behavior: a v1 handshake against a v2 worker gets an error
+    # frame naming the supported version, then the worker exits non-zero.
+    worker.send(handshake_msg(req_id=1, protocol_version=1))
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 1
+    assert "version" in resp["message"]
+    assert worker.wait() != 0
+
+
+def test_predict_before_configure_is_error_and_worker_survives(
     worker: WorkerProcess,
 ) -> None:
-    # Expected behavior: predict without a prior successful load replies
-    # error (sanity check per the protocol doc), and the worker stays alive
-    # and serviceable — a follow-up ping replies ok.
+    # Expected behavior: predict before configure is a per-request error
+    # (there is no instance yet) and the worker stays alive and
+    # serviceable — a follow-up ping replies ok and a configure still works.
     worker.send(handshake_msg(req_id=1))
     assert worker.recv()["type"] == "ok"
 
@@ -230,12 +269,243 @@ def test_predict_before_load_is_error_and_worker_survives(
     resp = worker.recv()
     assert resp["type"] == "error"
     assert resp["id"] == 2
-    assert "load" in resp["message"]
+    assert "configure" in resp["message"]
 
     worker.send({"type": "ping", "id": 3})
     resp = worker.recv()
     assert resp["type"] == "ok"
     assert resp["id"] == 3
+
+    worker.send(configure_msg(req_id=4))
+    assert worker.recv()["type"] == "ok"
+
+
+def test_load_before_configure_is_error_and_worker_survives(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: load before configure is a per-request error; the
+    # worker survives and the normal configure -> load flow still succeeds
+    # afterwards.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 2
+    assert "configure" in resp["message"]
+
+    worker.send(configure_msg(req_id=3))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+
+
+def test_predict_before_load_is_error_and_worker_survives(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: predict after configure but without a prior
+    # successful load replies error (sanity check per the protocol doc), and
+    # the worker stays alive and serviceable — a follow-up ping replies ok.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(
+        {"type": "predict", "id": 3, "inputs": [{"data": "x", "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 3
+    assert "load" in resp["message"]
+
+    worker.send({"type": "ping", "id": 4})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 4
+
+
+def test_configure_twice_is_error_and_worker_survives(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: configure is allowed exactly once per worker; a
+    # second configure replies error, the first instance stays intact, and
+    # the worker keeps serving (load + predict on the original instance).
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(configure_msg(req_id=3, inference_id="test/other"))
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 3
+    assert "configure" in resp["message"] or "configured" in resp["message"]
+
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {"type": "predict", "id": 5, "inputs": [{"data": 1, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": 1}]
+
+
+def test_prewarm_without_prepare_is_ok_and_idempotent(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: the echo impl has no prepare() classmethod, so
+    # prewarm defaults to a no-op -> plain ok; a second prewarm is
+    # idempotent (ok again); the pooled flow then continues normally with
+    # configure -> load -> predict.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "prewarm", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 2
+
+    worker.send({"type": "prewarm", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 3
+
+    worker.send(configure_msg(req_id=4))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {"type": "predict", "id": 6, "inputs": [{"data": "x", "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": "x"}]
+
+
+def test_prewarm_runs_prepare_classmethod(worker: WorkerProcess) -> None:
+    # Expected behavior (pooled flow): prewarm on an impl WITH a prepare()
+    # classmethod calls it exactly once (idempotent across repeats), the
+    # stderr marker proves it ran, and after configure -> load the predict
+    # output reports the module flag prepare() set.
+    worker.send(handshake_msg(req_id=1, impl_class="prepare_test"))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "prewarm", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 2
+
+    # Idempotent: the second prewarm replies ok without re-running prepare.
+    worker.send({"type": "prewarm", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(configure_msg(req_id=4))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 5})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(
+        {"type": "predict", "id": 6, "inputs": [{"data": 1, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"prepared": True}]
+
+    worker.send({"type": "unload", "id": 7})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+    assert (
+        worker.stderr_text.count("prepare_test-prepare-marker") == 1
+    ), worker.stderr_text
+
+
+def test_load_without_prewarm_leaves_prepare_unrun(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (normal flow): without a prewarm, prepare() never
+    # runs — load must not depend on it, and predict reports the flag unset.
+    worker.send(handshake_msg(req_id=1, impl_class="prepare_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {"type": "predict", "id": 4, "inputs": [{"data": 1, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"prepared": False}]
+    assert "prepare_test-prepare-marker" not in worker.stderr_text
+
+
+def test_prewarm_failure_is_per_request_and_nonfatal(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: a raising prepare() yields an error frame with the
+    # traceback, but the worker stays alive and fully usable — configure ->
+    # load -> predict all succeed afterwards (a failed prepare just means
+    # load pays the imports).
+    worker.send(handshake_msg(req_id=1, impl_class="prepare_fail_test"))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "prewarm", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 2
+    assert "prepare exploded" in resp["message"]
+    assert "RuntimeError" in resp["traceback"]
+
+    worker.send(configure_msg(req_id=3))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {"type": "predict", "id": 5, "inputs": [{"data": 1, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"ok": True}]
+
+
+def test_prewarm_after_configure_is_error_and_worker_survives(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior: prewarm is only valid between handshake and
+    # configure; after configure it replies error and the worker keeps
+    # serving (load still works).
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "prewarm", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 3
+    assert "configure" in resp["message"]
+
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+
+
+def test_unload_while_parked_exits_cleanly(worker: WorkerProcess) -> None:
+    # Expected behavior: unload is valid in every state — a parked
+    # prewarmed worker (handshake + prewarm, never configured, no instance)
+    # replies ok and exits 0 when dismissed.
+    worker.send(handshake_msg(req_id=1, impl_class="prepare_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "prewarm", "id": 2})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "unload", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 3
+    assert worker.wait() == 0
 
 
 def test_stdout_hygiene_survives_prints(worker: WorkerProcess) -> None:
@@ -246,13 +516,16 @@ def test_stdout_hygiene_survives_prints(worker: WorkerProcess) -> None:
     worker.send(handshake_msg(req_id=1, impl_class="printing_test"))
     assert worker.recv()["type"] == "ok"
 
-    worker.send({"type": "load", "id": 2})
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 3})
     assert worker.recv()["type"] == "ok"
 
     worker.send(
         {
             "type": "predict",
-            "id": 3,
+            "id": 4,
             "inputs": [{"data": 1, "file": None}, {"data": 2, "file": None}],
         }
     )
@@ -260,7 +533,7 @@ def test_stdout_hygiene_survives_prints(worker: WorkerProcess) -> None:
     assert resp["type"] == "ok"
     assert resp["outputs"] == [{"printed": True}, {"printed": True}]
 
-    worker.send({"type": "unload", "id": 4})
+    worker.send({"type": "unload", "id": 5})
     assert worker.recv()["type"] == "ok"
     assert worker.wait() == 0
     # All three print() outputs (load/predict/unload) were rerouted to
@@ -270,12 +543,10 @@ def test_stdout_hygiene_survives_prints(worker: WorkerProcess) -> None:
     assert "garbage on unload stdout" in worker.stderr_text
 
 
-def test_unknown_request_type_and_prewarm_are_unsupported(
-    worker: WorkerProcess,
-) -> None:
+def test_unknown_request_type_is_unsupported(worker: WorkerProcess) -> None:
     # Expected behavior: an unknown request type replies error with
-    # "unsupported" in the message and the worker keeps serving; the
-    # reserved prewarm type behaves the same in v1.
+    # "unsupported" in the message and the worker keeps serving. (prewarm
+    # stopped being unsupported in v2 — it has its own tests above.)
     worker.send(handshake_msg(req_id=1))
     assert worker.recv()["type"] == "ok"
 
@@ -285,16 +556,10 @@ def test_unknown_request_type_and_prewarm_are_unsupported(
     assert resp["id"] == 2
     assert "unsupported" in resp["message"]
 
-    worker.send({"type": "prewarm", "id": 3})
-    resp = worker.recv()
-    assert resp["type"] == "error"
-    assert resp["id"] == 3
-    assert "unsupported" in resp["message"]
-
-    worker.send({"type": "ping", "id": 4})
+    worker.send({"type": "ping", "id": 3})
     resp = worker.recv()
     assert resp["type"] == "ok"
-    assert resp["id"] == 4
+    assert resp["id"] == 3
 
 
 def test_broken_module_does_not_prevent_discovery(
@@ -304,6 +569,8 @@ def test_broken_module_does_not_prevent_discovery(
     # before echo_impl.py so discovery hits it first) is logged as a warning
     # and skipped; echo_test is still found and the handshake succeeds —
     # mirroring get_impl_classes' tolerance for unrelated broken modules.
+    # The immediate unload also covers "unload right after handshake, no
+    # prewarm, no configure" -> ok + exit 0.
     worker.send(handshake_msg(req_id=1, impl_class="echo_test"))
     resp = worker.recv()
     assert resp["type"] == "ok"

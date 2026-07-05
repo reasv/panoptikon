@@ -1,4 +1,4 @@
-"""Framing for the inferio worker protocol v1.
+"""Framing for the inferio worker protocol v2.
 
 Frame = 4-byte little-endian u32 payload length, then exactly that many
 bytes of a single msgpack-encoded map. See docs/inferio-worker-protocol.md.
@@ -11,7 +11,7 @@ from typing import Any, BinaryIO
 
 import msgpack
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 # Max frame size 512 MiB; a larger declared length is a fatal protocol error.
 MAX_FRAME_BYTES = 0x2000_0000
 

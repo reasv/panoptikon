@@ -1,4 +1,11 @@
-# Inferio Worker Protocol v1
+# Inferio Worker Protocol v2
+
+v2 (2026-07-05): handshake carries worker *identity* only (impl class); the
+new `configure` message binds a concrete model's config and instantiates.
+This is what makes prewarm pools keyable by impl class — a warm worker can
+be claimed for any model of its family. `prewarm` is no longer reserved: it
+runs the impl's optional `prepare()` classmethod (heavy dependency imports,
+no weights). Version bumped so a stale harness fails loudly at handshake.
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
@@ -49,12 +56,18 @@ continues (does not exit).
 
 | type | fields | semantics |
 |---|---|---|
-| `handshake` | `protocol_version` (int, =1), `inference_id` (str, "group/name", for logs), `impl_class` (str — value matched against impl `name()`), `config` (map — resolved kwargs for the impl `__init__`), `impl_dirs` (array of str — absolute paths searched for impl modules, in order) | First frame after spawn. Worker locates the impl class, instantiates `impl_class(**config)`, replies `ok`. Does NOT load weights. |
-| `load` | — | Calls `instance.load()`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
+| `handshake` | `protocol_version` (int, =2), `impl_class` (str — value matched against impl `name()`), `impl_dirs` (array of str — absolute paths searched for impl modules, in order) | First frame after spawn. Worker locates the impl class and replies `ok`. Does NOT instantiate and does NOT load weights — the worker's identity is the impl class, so a prewarmed worker can later be claimed for any model of that family. |
+| `prewarm` | — | Calls the impl's optional `prepare()` classmethod (imports heavy deps, must not load weights or touch the GPU allocator; default absent = no-op → plain `ok`). Allowed only between `handshake` and `configure`; idempotent. Errors are per-request (`error` reply, worker stays alive and still usable — a failed prepare just means the later `load` pays the imports). |
+| `configure` | `inference_id` (str, "group/name", for logs), `config` (map — resolved kwargs for the impl `__init__`) | Instantiates `impl_class(**config)`. Exactly once per worker, before `load`; a second `configure`, or `load`/`predict` before it, is a per-request `error`. |
+| `load` | — | Calls `instance.load()`. Requires prior `configure`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
 | `predict` | `inputs`: array of maps `{ "data": <any msgpack value or nil>, "file": <bin or nil> }` | Calls `instance.predict(...)` with the inputs converted to `PredictionInput(data, file)` equivalents, in order. Requires a prior successful `load`; without one, reply `error` (the orchestrator always loads first — this is a sanity check, not a feature). |
-| `unload` | — | Calls `instance.unload()` if loaded, replies `ok`, flushes, then exits 0. |
-| `prewarm` | — | Reserved (design §8). v1 workers reply `error` `"unsupported"`. |
+| `unload` | — | Calls `instance.unload()` if an instance was configured+loaded, replies `ok`, flushes, then exits 0. Valid in every state (a parked prewarmed worker is dismissed the same way). |
 | `ping` | — | Liveness. Reply `ok`. |
+
+Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
+`handshake` → `prewarm` → (parked, possibly for hours) → `configure` →
+`load`. The orchestrator SHOULD `ping` a parked worker before claiming it
+(it may have died while parked) and fall back to a fresh spawn.
 
 ### Worker → orchestrator (responses)
 
@@ -66,8 +79,8 @@ continues (does not exit).
 `ok` payloads:
 
 - `handshake` → `protocol_version` (int): the version the worker speaks.
-  v1 workers echo 1; the orchestrator kills workers that answer anything else.
-- `load`, `unload`, `ping`, → no extra fields.
+  v2 workers echo 2; the orchestrator kills workers that answer anything else.
+- `configure`, `prewarm`, `load`, `unload`, `ping` → no extra fields.
 - `predict` → `outputs`: array, one entry per input, in order. Each entry is
   either msgpack `bin` (bytes output, e.g. serialized numpy) or any other
   msgpack value (JSON-like output). This mirrors what impl `predict()`

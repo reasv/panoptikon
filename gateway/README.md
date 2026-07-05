@@ -146,8 +146,31 @@ orchestrator observability: top-level `status` ("ok"/"shutting_down"),
 loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
 {total, free}`, `queue_depth`, `in_flight_windows`, `last_effective_cap`
 (null until the first window dispatches), `total_predict_requests`, and
-`total_batches`. When local inference is disabled the path proxies upstream
-like any other inference route (a Python upstream 404s it).
+`total_batches`, plus a `prewarm` section `{enabled, lazy, warm:
+[{impl_class, state}]}` where `state` is `"warm"`, `"spawning"`, or
+`"failed_prepare"`. When local inference is disabled the path proxies
+upstream like any other inference route (a Python upstream 404s it).
+
+### Prewarming
+
+Process start and heavy library imports dominate model load latency, so the
+orchestrator keeps one *prewarmed* worker per impl class: spawned,
+handshaken, and with the impl's optional `prepare()` classmethod already run
+(imports only — no weights, no VRAM). Loading any model of that class claims
+the parked worker (skipping the slow part); the pool never expires by design
+— it exists precisely for the moment after the loaded model's TTL has passed.
+Three mechanisms fill the pool:
+
+- **Eager** (gateway mode): at startup and every minute, the search-usable
+  embedding models with data across your index DBs (the same selection as
+  `preload_embedding_models`) are mapped to impl classes and kept warm, so
+  the first embedding search after a restart is fast. Opt a DB out by
+  setting `prewarm_embedding_models = false` in that DB's `config.toml`.
+- **Lazy**: after any model load, one warm worker of its class is kept for
+  next time. Extraction jobs opt out via the additive `prewarm=false` query
+  param on load/predict (absent = true; old Python servers ignore it).
+- **`always_warm`**: impl classes warmed unconditionally at startup — the
+  only eager mechanism in the `inferio` subcommand, which scans no DBs.
 
 When `upstreams.inference` is empty and local inference is enabled, the
 gateway synthesizes a loopback entry pointing at itself so search, jobs, and
@@ -171,6 +194,11 @@ enabled = true
 # unload_grace_secs = 10
 # terminate_grace_secs = 5
 # port = 7777        # `inferio` subcommand listen port (default: server.port)
+
+# [inference_local.prewarm]
+# enabled = true          # master switch for the warm-worker pool
+# lazy = true             # keep one warm worker per class after each load
+# always_warm = []        # impl classes warmed unconditionally at startup
 ```
 
 A machine that only lends its GPU can run the standalone service:

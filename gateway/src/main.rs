@@ -140,6 +140,18 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Eager prewarm set (design §8): gateway mode only — enumerate index
+    // DBs at startup and on a minute tick, warm one worker per search-
+    // usable embedding impl class (plus always_warm, which the manager
+    // already warmed at construction). The `inferio` subcommand never scans
+    // DBs; it gets always_warm only.
+    if let Some(state) = &inferio_state {
+        if settings.inference_local.prewarm.enabled {
+            tokio::spawn(inferio::prewarm::run_eager_prewarm_loop(Arc::downgrade(
+                &state.manager,
+            )));
+        }
+    }
 
     let mut app = Router::new();
     match &inferio_state {

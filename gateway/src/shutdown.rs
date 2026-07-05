@@ -79,7 +79,8 @@ pub(crate) async fn wait_for_signal() {
 /// started at all, so cleanup doesn't lazily spawn an actor just to stop it.
 /// `inferio` is the local inference manager when `[inference_local]` is
 /// enabled: its shutdown (refuse new loads, fail queued predicts, run each
-/// worker's graceful unload → terminate → kill ladder) runs after the job
+/// worker's graceful unload → terminate → kill ladder — parked prewarmed
+/// workers included, concurrently) runs after the job
 /// queue stops — jobs are the main predict callers — and *after* the writer
 /// flush: the predict path writes nothing to the index DBs once the job
 /// queue is stopped, and a wedged GPU batch must not starve the flush

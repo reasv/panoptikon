@@ -74,6 +74,42 @@ pub struct InferenceLocalConfig {
     /// `server.port`.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Prewarm pool policy (design §8: one parked, `prepare()`-warmed worker
+    /// per impl class; no TTL by design).
+    #[serde(default)]
+    pub prewarm: PrewarmSettings,
+}
+
+/// `[inference_local.prewarm]` (design §8, policy decided 2026-07-05).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrewarmSettings {
+    /// Master switch for the whole prewarm pool. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Lazy warm: after a model of class C loads, keep one warm C worker for
+    /// next time (respawn-on-claim), unless the request carried
+    /// `prewarm=false`. Default: true.
+    #[serde(default = "default_true")]
+    pub lazy: bool,
+    /// Impl classes warmed unconditionally at startup — the only eager
+    /// mechanism available to the standalone `inferio` subcommand, which may
+    /// have no index DBs. Default: empty.
+    #[serde(default)]
+    pub always_warm: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PrewarmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lazy: true,
+            always_warm: Vec::new(),
+        }
+    }
 }
 
 fn default_inference_max_batch() -> u32 {
@@ -99,6 +135,7 @@ impl Default for InferenceLocalConfig {
             unload_grace_secs: None,
             terminate_grace_secs: None,
             port: None,
+            prewarm: PrewarmSettings::default(),
         }
     }
 }
