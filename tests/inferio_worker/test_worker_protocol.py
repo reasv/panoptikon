@@ -263,8 +263,11 @@ def test_stdout_hygiene_survives_prints(worker: WorkerProcess) -> None:
     worker.send({"type": "unload", "id": 4})
     assert worker.recv()["type"] == "ok"
     assert worker.wait() == 0
-    # The print() output was rerouted to stderr, not lost and not on stdout.
+    # All three print() outputs (load/predict/unload) were rerouted to
+    # stderr, not lost and not on stdout.
+    assert "garbage on load stdout" in worker.stderr_text
     assert "garbage on predict stdout" in worker.stderr_text
+    assert "garbage on unload stdout" in worker.stderr_text
 
 
 def test_unknown_request_type_and_prewarm_are_unsupported(

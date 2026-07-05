@@ -80,8 +80,11 @@ pub(crate) async fn wait_for_signal() {
 /// `inferio` is the local inference manager when `[inference_local]` is
 /// enabled: its shutdown (refuse new loads, fail queued predicts, run each
 /// worker's graceful unload → terminate → kill ladder) runs after the job
-/// queue stops — jobs are the main predict callers — and before the writer
-/// flush, all inside the cleanup grace. If a worker wedges past the hard
+/// queue stops — jobs are the main predict callers — and *after* the writer
+/// flush: the predict path writes nothing to the index DBs once the job
+/// queue is stopped, and a wedged GPU batch must not starve the flush
+/// inside the shared cleanup grace (queued writes committing is the one
+/// guarantee this function exists for). If a worker wedges past the hard
 /// exit deadline, the kill-on-close Job Object still reaps it on process
 /// exit.
 pub(crate) async fn run_cleanup(local_api: bool, inferio: Option<Arc<ModelManager>>) {
@@ -99,13 +102,13 @@ pub(crate) async fn run_cleanup(local_api: bool, inferio: Option<Arc<ModelManage
         if let Some(queue_id) = queue::shutdown_job_queue().await {
             tracing::info!(queue_id, "cancelled running job for shutdown");
         }
-        if let Some(manager) = inferio {
-            manager.shutdown().await;
-            tracing::info!("local inference workers stopped");
-        }
         let flushed = index_writer::flush_all_writers().await;
         if flushed > 0 {
             tracing::info!(writers = flushed, "index DB writers drained");
+        }
+        if let Some(manager) = inferio {
+            manager.shutdown().await;
+            tracing::info!("local inference workers stopped");
         }
     };
     match tokio::time::timeout(CLEANUP_GRACE, cleanup).await {

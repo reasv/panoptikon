@@ -30,7 +30,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -67,8 +67,27 @@ impl InferioState {
     pub fn from_settings(settings: &Settings) -> Result<Arc<Self>> {
         let local = &settings.inference_local;
         let registry_config = if local.config_dirs.is_empty() {
-            RegistryConfig::default_dirs()
-                .context("resolving inference registry config directories")?
+            RegistryConfig::default_dirs().unwrap_or_else(|err| {
+                // A missing built-in config folder must not hard-fail
+                // gateway boot: Python only surfaces it when the registry
+                // is actually read, and broken registry TOML already
+                // degrades lazily here too (/metadata and loads error per
+                // call). Warn and continue with the user dir only — a
+                // missing dir is skipped with a warning at load time, so
+                // the worst case is an empty registry.
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "built-in inference config folder not found; serving with \
+                     the user config dir only (registry may be empty)"
+                );
+                RegistryConfig {
+                    config_dirs: vec![
+                        std::env::var_os("INFERIO_CONFIG_DIR")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("config/inference")),
+                    ],
+                }
+            })
         } else {
             RegistryConfig {
                 config_dirs: local.config_dirs.clone(),
@@ -794,6 +813,62 @@ metadata.description = "echo fixture"
         let cached = client.get_cached_models().await.expect("cache list");
         assert_eq!(cached, json!({"cache": {}}));
 
+        state.manager.shutdown().await;
+    }
+
+    /// A missing built-in registry config dir must not hard-fail gateway
+    /// boot: from_settings degrades to a working state (warn + user dir
+    /// only, here also missing -> empty registry), matching Python's
+    /// warn-not-fail posture and the lazy degradation already used for
+    /// broken registry TOML. Cargo runs this with CWD = the gateway crate,
+    /// where `src/inferio/config` does not exist.
+    #[tokio::test]
+    async fn from_settings_degrades_when_builtin_config_dir_is_missing() {
+        use crate::config::{
+            InferenceLocalConfig, Settings, UpstreamConfig, UpstreamsConfig,
+        };
+
+        // Force the default-dirs error path deterministically: no env
+        // override, and no src/inferio/config relative to the test CWD.
+        unsafe { std::env::remove_var("BASE_INFERENCE_CONFIG_FOLDER") };
+        assert!(
+            !std::path::Path::new("src/inferio/config").is_dir(),
+            "test premise: the built-in config dir is absent from the crate CWD"
+        );
+
+        let settings = Settings {
+            server: crate::config::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                trust_forwarded_headers: false,
+            },
+            upstreams: UpstreamsConfig {
+                ui: UpstreamConfig {
+                    base_url: "http://127.0.0.1:6339".to_string(),
+                    local: false,
+                },
+                api: UpstreamConfig {
+                    base_url: "http://127.0.0.1:6342".to_string(),
+                    local: false,
+                },
+                inference: Vec::new(),
+            },
+            search: Default::default(),
+            jobs: Default::default(),
+            rulesets: Default::default(),
+            policies: Vec::new(),
+            inference_local: InferenceLocalConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+
+        let state = InferioState::from_settings(&settings)
+            .expect("missing built-in config dir degrades instead of failing boot");
+        // The degraded registry is empty but serviceable: /metadata-style
+        // reads succeed with no groups.
+        let registry = state.registry.lock().unwrap().get().expect("empty registry loads");
+        assert!(registry.groups.is_empty());
         state.manager.shutdown().await;
     }
 }

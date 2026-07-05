@@ -91,5 +91,18 @@ def write_frame(stream: BinaryIO, message: dict) -> None:
             f"Refusing to write frame of {len(payload)} bytes (over the "
             f"{MAX_FRAME_BYTES} limit)"
         )
-    stream.write(struct.pack("<I", len(payload)) + payload)
+    # The protocol stream is an unbuffered raw FileIO, whose write() is a
+    # single write(2) and may be partial (e.g. interrupted by a signal on
+    # POSIX). Loop until every byte is on the pipe — a silent short write
+    # would desynchronize the framing permanently.
+    view = memoryview(struct.pack("<I", len(payload)) + payload)
+    while view:
+        written = stream.write(view)
+        if written is None:
+            # Only a non-blocking raw stream returns None; the worker never
+            # uses one. Fail loudly instead of spinning or dropping bytes.
+            raise ProtocolError(
+                "stream.write returned None (non-blocking stream?)"
+            )
+        view = view[written:]
     stream.flush()

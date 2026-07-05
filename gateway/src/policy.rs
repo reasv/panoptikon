@@ -314,7 +314,7 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
     None
 }
 
-fn normalize_host(value: &str) -> String {
+pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
     if value.starts_with('[') {
         if let Some(end) = value.find(']') {
@@ -328,7 +328,12 @@ fn normalize_host(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn ruleset_allows(settings: &Settings, policy: &PolicyConfig, method: &Method, path: &str) -> bool {
+pub(crate) fn ruleset_allows(
+    settings: &Settings,
+    policy: &PolicyConfig,
+    method: &Method,
+    path: &str,
+) -> bool {
     let ruleset_name = match policy.ruleset.as_deref() {
         None => return true,
         Some("allow_all") => return true,
@@ -363,7 +368,10 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
     false
 }
 
-fn select_policy<'a>(settings: &'a Settings, host: Option<&str>) -> Option<&'a PolicyConfig> {
+pub(crate) fn select_policy<'a>(
+    settings: &'a Settings,
+    host: Option<&str>,
+) -> Option<&'a PolicyConfig> {
     let host = host?;
     for policy in &settings.policies {
         if policy

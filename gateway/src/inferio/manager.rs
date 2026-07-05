@@ -85,12 +85,19 @@ enum Expiration {
 
 impl Expiration {
     /// `ttl_seconds >= 0` -> now + ttl; negative (-1 by convention) -> never
-    /// (manager.py:77-81).
+    /// (manager.py:77-81). `ttl_seconds` is an attacker-controlled query
+    /// param, so the addition uses checked arithmetic: a value chrono cannot
+    /// represent saturates to `Never` instead of panicking while the state
+    /// mutex is held (a poisoned mutex would brick the whole manager).
     fn new(ttl_seconds: i64, now: DateTime<Local>) -> Self {
-        if ttl_seconds >= 0 {
-            Expiration::At(now + chrono::Duration::seconds(ttl_seconds))
-        } else {
-            Expiration::Never
+        if ttl_seconds < 0 {
+            return Expiration::Never;
+        }
+        match chrono::Duration::try_seconds(ttl_seconds)
+            .and_then(|ttl| now.checked_add_signed(ttl))
+        {
+            Some(at) => Expiration::At(at),
+            None => Expiration::Never,
         }
     }
 
@@ -359,6 +366,68 @@ struct ManagerState {
     shutting_down: bool,
 }
 
+/// RAII handle for a pin refcount taken in [`CacheState`]. Every pin
+/// (predict-duration and spawn-phase alike) is wrapped in one of these
+/// immediately, so any early return or *future cancellation* (a client
+/// disconnecting at `reply_rx.await`, or mid-spawn) still releases the pin
+/// — a leaked pin would exempt the model from TTL expiry forever.
+///
+/// For predict pins `restore` carries the requested (cache_key, ttl): Drop
+/// runs `unpin_restore`, preserving the last-completed-predict-wins TTL
+/// semantics (Python's `finally: load_model(ttl)`). Spawn-phase pins carry
+/// no restore and Drop is a plain `unpin`. Drop is sync — it only takes the
+/// state mutex, never awaits.
+struct PinGuard {
+    /// Weak so a guard alive past manager teardown is a no-op.
+    manager: Weak<ModelManager>,
+    inference_id: String,
+    /// `Some((cache_key, ttl_seconds))` for predict pins: restore the
+    /// requested TTL on release.
+    restore: Option<(String, i64)>,
+}
+
+impl PinGuard {
+    /// Wrap a pin the caller already took (under the state lock, so the
+    /// pin stays atomic with the loaded-check). Does not lock.
+    fn adopt(manager: &ModelManager, inference_id: &str, restore: Option<(String, i64)>) -> Self {
+        Self {
+            manager: manager.weak.get().cloned().expect("weak self is set in new()"),
+            inference_id: inference_id.to_owned(),
+            restore,
+        }
+    }
+
+    /// Release the pin now, under a state lock the caller already holds
+    /// (Drop re-locks and would deadlock), and defuse the guard.
+    fn release_locked(mut self, cache: &mut CacheState) {
+        Self::release(&mut self.restore, &self.inference_id, cache);
+        // Defused: Drop upgrades an empty Weak and does nothing.
+        self.manager = Weak::new();
+    }
+
+    fn release(restore: &mut Option<(String, i64)>, inference_id: &str, cache: &mut CacheState) {
+        match restore.take() {
+            Some((cache_key, ttl_seconds)) => {
+                cache.unpin_restore(inference_id, &cache_key, ttl_seconds, Local::now());
+            }
+            None => cache.unpin(inference_id),
+        }
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        // Ignore a poisoned mutex: panicking inside Drop would abort, and a
+        // poisoned manager is already beyond caring about one refcount.
+        if let Ok(mut state) = manager.state.lock() {
+            Self::release(&mut self.restore, &self.inference_id, &mut state.cache);
+        }
+    }
+}
+
 /// The model manager. Construct with [`ModelManager::new`] (requires a
 /// running tokio runtime — it spawns the sweeper task).
 pub struct ModelManager {
@@ -434,7 +503,7 @@ impl ModelManager {
         max_batch: Option<u32>,
         inputs: Vec<WorkerInput>,
     ) -> Result<Vec<WorkerOutput>> {
-        let tx = self
+        let (tx, pin) = self
             .ensure_loaded(inference_id, cache_key, lru_size, ttl_seconds, true)
             .await?
             .expect("ensure_loaded returns a sender when pinning");
@@ -456,11 +525,10 @@ impl ModelManager {
                 )),
             }
         };
-        let mut state = self.state.lock().unwrap();
-        state
-            .cache
-            .unpin_restore(inference_id, cache_key, ttl_seconds, Local::now());
-        drop(state);
+        // The guard's Drop does the unpin + requested-TTL restore (Python's
+        // `finally`); dropping explicitly keeps the restore at completion
+        // time, and cancellation at `reply_rx.await` runs the same Drop.
+        drop(pin);
         result
     }
 
@@ -503,7 +571,11 @@ impl ModelManager {
     }
 
     /// Graceful shutdown: stop the sweeper, refuse new loads/predicts, fail
-    /// queued requests, and run every worker's graceful stop ladder.
+    /// queued requests, and run every worker's graceful stop ladder. A load
+    /// still in flight when the flag flips finishes its spawn, observes
+    /// `shutting_down`, and parks a worker-discard task in `draining` —
+    /// taking `load_lock` below waits for that decision so the second drain
+    /// awaits the discard instead of abandoning the worker mid-stop.
     pub async fn shutdown(&self) {
         if let Some(handle) = self.sweeper.lock().unwrap().take() {
             handle.abort();
@@ -518,6 +590,11 @@ impl ModelManager {
             }
             handles.append(&mut state.draining);
             state.cache = CacheState::default();
+        }
+        {
+            let _load_guard = self.load_lock.lock().await;
+            let mut state = self.state.lock().unwrap();
+            handles.append(&mut state.draining);
         }
         for handle in handles {
             if let Err(err) = handle.await {
@@ -580,8 +657,10 @@ impl ModelManager {
     /// The shared load path. Bookkeeping runs under the state mutex; the
     /// slow spawn+load runs under `load_lock` only. With `pin_for_predict`
     /// the model is pinned *atomically* with the loaded-check and the
-    /// dispatcher sender is returned, so a predict can never observe its
-    /// model expiring between load and enqueue.
+    /// dispatcher sender is returned (paired with the RAII [`PinGuard`]
+    /// that owns the pin), so a predict can never observe its model
+    /// expiring between load and enqueue — and a cancelled caller can never
+    /// leak the pin.
     async fn ensure_loaded(
         &self,
         inference_id: &str,
@@ -589,10 +668,10 @@ impl ModelManager {
         lru_size: i64,
         ttl_seconds: i64,
         pin_for_predict: bool,
-    ) -> Result<Option<mpsc::UnboundedSender<DispatchMsg>>> {
+    ) -> Result<Option<(mpsc::UnboundedSender<DispatchMsg>, PinGuard)>> {
         let _load_guard = self.load_lock.lock().await;
 
-        {
+        let spawn_pin = {
             let mut state = self.state.lock().unwrap();
             if state.shutting_down {
                 bail!("the model manager is shutting down");
@@ -619,19 +698,28 @@ impl ModelManager {
                 if pin_for_predict {
                     let tx = handle.tx.clone();
                     state.cache.pin(inference_id);
-                    return Ok(Some(tx));
+                    let guard = PinGuard::adopt(
+                        self,
+                        inference_id,
+                        Some((cache_key.to_owned(), ttl_seconds)),
+                    );
+                    return Ok(Some((tx, guard)));
                 }
                 return Ok(None);
             }
             // Pin across the spawn so the sweeper cannot expire the entry
             // mid-load (Python has this race: its sweeper uses a separate
-            // lock from load_model).
+            // lock from load_model). The guard releases the pin even when
+            // the calling future is cancelled mid-spawn.
             state.cache.pin(inference_id);
-        }
+            PinGuard::adopt(self, inference_id, None)
+        };
 
         let spawn_result = self.spawn_model(inference_id).await;
         let mut state = self.state.lock().unwrap();
-        state.cache.unpin(inference_id);
+        // Release the spawn pin under the same lock as the bookkeeping
+        // below so the sweeper cannot expire the fresh entry in between.
+        spawn_pin.release_locked(&mut state.cache);
         let (worker, registry_default_batch) = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -647,11 +735,15 @@ impl ModelManager {
         };
         if state.shutting_down || !state.cache.refs_non_empty(inference_id) {
             // Explicitly unloaded (or the manager shut down) while the
-            // worker was spawning: discard it instead of registering.
-            drop(state);
-            tokio::spawn(async move {
+            // worker was spawning: discard it instead of registering. The
+            // discard task is parked in `draining` so shutdown() (which
+            // re-checks after taking load_lock) awaits the graceful stop
+            // instead of abandoning it on a detached task.
+            let discard = tokio::spawn(async move {
                 let _ = worker.shutdown().await;
             });
+            state.draining.push(discard);
+            drop(state);
             bail!("model {inference_id} was unloaded while it was loading");
         }
         let generation = state.next_generation;
@@ -667,10 +759,14 @@ impl ModelManager {
         // WorkerSet seam (design §8): one replica in Phase 1; the
         // dispatcher receives a Vec either way.
         let task = tokio::spawn(run_dispatcher(context, vec![worker], rx));
-        if pin_for_predict {
+        let sender = if pin_for_predict {
             state.cache.pin(inference_id);
-        }
-        let sender = pin_for_predict.then(|| tx.clone());
+            let guard =
+                PinGuard::adopt(self, inference_id, Some((cache_key.to_owned(), ttl_seconds)));
+            Some((tx.clone(), guard))
+        } else {
+            None
+        };
         state.models.insert(
             inference_id.to_owned(),
             ModelHandle {
@@ -898,6 +994,20 @@ mod tests {
         assert_eq!(Expiration::Never.render(), None);
     }
 
+    /// Expiration::new must never panic on huge ttl_seconds (a raw i64
+    /// query param under attacker control — a panic here poisons the state
+    /// mutex and bricks the manager): values chrono cannot represent
+    /// saturate to Never, while ordinary TTLs still yield finite
+    /// expirations.
+    #[test]
+    fn huge_ttl_saturates_to_never_instead_of_panicking() {
+        let now = Local::now();
+        assert_eq!(Expiration::new(i64::MAX, now), Expiration::Never);
+        assert_eq!(Expiration::new(9_000_000_000_000, now), Expiration::Never);
+        assert!(matches!(Expiration::new(60, now), Expiration::At(_)));
+        assert_eq!(Expiration::new(-1, now), Expiration::Never);
+    }
+
     /// registry default_batch_size resolution follows the Python consumers'
     /// merge (group metadata overlaid by id metadata, id wins); missing or
     /// non-positive values yield None.
@@ -997,6 +1107,10 @@ config.impl_class = "failbatch_test"
 [group.dying]
 config.impl_class = "dying_test"
 [group.dying.inference_ids.test]
+
+[group.nan]
+config.impl_class = "nan_test"
+[group.nan.inference_ids.test]
 
 [group.missing]
 config.impl_class = "does_not_exist"
@@ -1481,5 +1595,127 @@ config.impl_class = "does_not_exist"
             .await
             .expect_err("predicts refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
+    }
+
+    /// An output the orchestrator cannot convert to JSON (the nan_test
+    /// fixture returns float NaN on demand) is a per-request error, not a
+    /// fatal supervision error: the requesting caller gets the error, the
+    /// worker survives (load generation unchanged — no respawn), and a
+    /// follow-up normal predict on the very same worker succeeds.
+    #[tokio::test]
+    async fn unconvertible_output_fails_one_request_but_worker_survives() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        let outputs = manager
+            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("ok"))])
+            .await
+            .expect("normal predict");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
+        let generation = manager.loaded_generation("nan/test").expect("loaded");
+
+        let err = manager
+            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("nan"))])
+            .await
+            .expect_err("NaN output has no JSON form");
+        assert!(
+            format!("{err:#}").contains("not representable as JSON"),
+            "error names the unconvertible output: {err:#}"
+        );
+
+        // If this were (wrongly) classified fatal, death cleanup would drop
+        // the model shortly after; give that a beat to prove it doesn't.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            manager.loaded_generation("nan/test"),
+            Some(generation),
+            "same worker: the conversion failure must not kill it"
+        );
+
+        let outputs = manager
+            .predict("nan/test", "k", 10, -1, None, vec![data_input(json!("ok"))])
+            .await
+            .expect("worker still serves after the failed request");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
+
+        manager.shutdown().await;
+    }
+
+    /// A predict future dropped mid-flight (client disconnect) must release
+    /// its TTL pin via the RAII guard: after aborting a slow predict, the
+    /// model still expires and unloads once the restored TTL passes. With a
+    /// leaked pin the model would be exempt from expiry forever and this
+    /// poll would time out.
+    #[tokio::test]
+    async fn aborted_predict_releases_pin_and_model_still_expires() {
+        let setup = test_manager(Duration::from_millis(100), 32);
+        let manager = setup.manager.clone();
+
+        // Load first so the abort lands mid-predict, not mid-spawn.
+        manager
+            .load_model("slow/test", "k", 10, 1)
+            .await
+            .expect("load");
+
+        let task = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .predict("slow/test", "k", 10, 1, None, vec![data_input(json!(null))])
+                    .await
+            })
+        };
+        // Let the predict enqueue and pin (the fixture predict takes 1.5s),
+        // then drop it mid-flight.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        task.abort();
+        let _ = task.await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if manager.cached_models().is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "model never expired after the predict was aborted (leaked pin): {:?}",
+                    manager.cached_models()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        manager.shutdown().await;
+    }
+
+    /// Unit test of the guard itself, covering the spawn-phase pin (which
+    /// flows through the same PinGuard type as the predict pin): while the
+    /// guard is alive the pinned entry cannot expire; dropping the guard
+    /// releases the pin and the stale entry expires normally.
+    #[tokio::test]
+    async fn pin_guard_drop_releases_pin() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+        let now = Local::now();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.cache.touch_load("g/x", "k", 10, 0, now);
+            state.cache.pin("g/x");
+        }
+        let guard = PinGuard::adopt(manager, "g/x", None);
+        {
+            let mut state = manager.state.lock().unwrap();
+            assert!(
+                state.cache.expire(at(now, 5)).is_empty(),
+                "pinned entries are exempt from expiry"
+            );
+        }
+        drop(guard);
+        let mut state = manager.state.lock().unwrap();
+        assert_eq!(
+            state.cache.expire(at(now, 5)),
+            vec!["g/x".to_string()],
+            "the drop released the pin"
+        );
     }
 }

@@ -214,7 +214,12 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env("INFERIO_WORKER", "1");
+            .env("INFERIO_WORKER", "1")
+            // Defense in depth for the stderr forwarder: keep Python's own
+            // text streams UTF-8 regardless of the console code page
+            // (cp1252 tracebacks on Windows). The Rust side still tolerates
+            // arbitrary bytes — native libraries write to fd 2 directly.
+            .env("PYTHONIOENCODING", "utf-8");
         if !cfg.pythonpath.is_empty() {
             let mut entries = cfg.pythonpath.clone();
             if let Some(existing) = env::var_os("PYTHONPATH") {
@@ -377,11 +382,21 @@ impl Worker {
             .enumerate()
             .map(|(index, output)| match output {
                 Value::Binary(bytes) => Ok(WorkerOutput::Bytes(bytes)),
-                other => rmpv_to_json(&other)
-                    .map(WorkerOutput::Json)
-                    .with_context(|| {
-                        format!("predict output {index} is not representable as JSON")
-                    }),
+                other => rmpv_to_json(&other).map(WorkerOutput::Json).map_err(|err| {
+                    // The exchange completed and the stream is in sync — an
+                    // unconvertible output (non-finite float, nested bin/ext)
+                    // is a per-request failure, not a supervision failure.
+                    // Surface it as a WorkerError so the dispatcher applies
+                    // its per-request fallback instead of killing a healthy
+                    // worker and failing the whole queue.
+                    anyhow::Error::new(WorkerError {
+                        message: format!(
+                            "predict output {index} is not representable as JSON: {err:#}"
+                        ),
+                        traceback: String::new(),
+                        stderr_tail: self.stderr_tail_snapshot(),
+                    })
+                }),
             })
             .collect()
     }
@@ -643,11 +658,45 @@ impl Worker {
     }
 }
 
+/// Cap on one accumulated stderr "line": a \r-only progress stream (tqdm)
+/// never emits \n, so an uncapped line read would grow without bound;
+/// oversized chunks are flushed as their own log lines instead.
+const STDERR_LINE_CAP: u64 = 64 * 1024;
+
 /// Forward worker stderr lines to tracing and the shared tail buffer.
-/// Ends on EOF (worker exit) or a read error.
+///
+/// The forwarder must stay alive for the worker's whole life no matter what
+/// bytes arrive: if it exits early the stderr pipe fills, the worker blocks
+/// mid-write, and a deadline-less predict hangs forever. Worker stderr is
+/// not guaranteed UTF-8 (e.g. cp1252 tracebacks on Windows, raw progress
+/// bars), so lines are read as raw bytes and decoded lossily — only EOF
+/// (worker exit) or a fatal read error ends the loop.
 async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mutex<StderrTail>>) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(stderr);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        // `take` caps a single accumulated line at STDERR_LINE_CAP; a chunk
+        // that hits the cap without a newline is flushed as its own line.
+        let read = (&mut reader)
+            .take(STDERR_LINE_CAP)
+            .read_until(b'\n', &mut buf)
+            .await;
+        match read {
+            Ok(0) => break, // EOF: the worker exited.
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(worker = %inference_id, "worker stderr read failed: {err}");
+                break;
+            }
+        }
+        while buf.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buf).into_owned();
         tracing::info!(worker = %inference_id, "{line}");
         if let Ok(mut tail) = tail.lock() {
             tail.push(line);
@@ -980,8 +1029,9 @@ mod tests {
     /// stdout hygiene end-to-end: the printing_test fixture print()s during
     /// load/predict/unload, which lands on stderr in the worker (fd 1 is
     /// dup2'd to stderr before impl code runs) — so every protocol frame
-    /// still parses, predict returns its real outputs, and shutdown is a
-    /// clean exit 0.
+    /// still parses, predict returns its real outputs, shutdown is a clean
+    /// exit 0, and all three printed strings (load/predict/unload) were
+    /// captured on stderr rather than lost or leaked onto stdout.
     #[tokio::test]
     async fn stdout_hygiene_survives_printing_impl() {
         let cfg = test_spawn_config();
@@ -1009,8 +1059,85 @@ mod tests {
             ]
         );
 
+        // Keep a handle on the shared tail: shutdown() consumes the worker,
+        // and the unload print only arrives during the graceful stop.
+        let tail = Arc::clone(&worker.stderr);
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
+        let text = tail.lock().unwrap().snapshot();
+        for expected in [
+            "garbage on load stdout",
+            "garbage on predict stdout",
+            "garbage on unload stdout",
+        ] {
+            assert!(
+                text.contains(expected),
+                "stderr tail should contain {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    /// The stderr forwarder must survive arbitrary bytes: badbytes_test
+    /// writes raw invalid UTF-8 and a >64 KiB \r-only run (tqdm-style, no
+    /// newlines) straight to fd 2 during predict. With the old lines()-based
+    /// forwarder the first invalid byte killed the task, the pipe filled,
+    /// and the deadline-less predict hung the worker forever; now both
+    /// predicts succeed and the tail contains the lossily-decoded marker
+    /// written *after* the bad bytes — proof the forwarder kept reading.
+    #[tokio::test]
+    async fn stderr_forwarder_survives_invalid_utf8_and_cr_only_runs() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn(&cfg, "test/badbytes", &spec("badbytes_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        let input = [WorkerInput {
+            data: Some(json!(1)),
+            file: None,
+        }];
+        let outputs = worker
+            .predict(&input)
+            .await
+            .expect("predict succeeds despite stderr garbage");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
+
+        // A follow-up predict proves the worker (and its stderr pipe) is
+        // still fully serviceable.
+        let outputs = worker.predict(&input).await.expect("second predict");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
+
+        // The forwarder drains asynchronously; poll for the marker line
+        // that the fixture writes after the invalid bytes and the \r run.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let tail = worker.stderr_tail_snapshot();
+            if tail.contains("marker-after-bad-bytes") {
+                assert!(!tail.is_empty(), "stderr tail must be non-empty");
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("stderr tail never captured the post-garbage marker: {tail:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// Non-finite floats and binary/ext nested inside a JSON-like output
+    /// have no JSON form: rmpv_to_json must report an error (never silently
+    /// coerce — the Python side would equally fail to JSON-encode them),
+    /// while ordinary finite floats convert cleanly.
+    #[test]
+    fn rmpv_to_json_rejects_nonfinite_and_nested_binary() {
+        assert!(rmpv_to_json(&Value::F64(f64::NAN)).is_err());
+        assert!(rmpv_to_json(&Value::F64(f64::INFINITY)).is_err());
+        assert!(rmpv_to_json(&Value::F32(f32::NEG_INFINITY)).is_err());
+        assert!(rmpv_to_json(&Value::Array(vec![Value::Binary(vec![1, 2])])).is_err());
+        assert!(rmpv_to_json(&Value::Ext(7, vec![0])).is_err());
+        assert_eq!(rmpv_to_json(&Value::F64(1.5)).unwrap(), json!(1.5));
     }
 
     /// Data fidelity: a JSON value exercising nested unicode strings,
