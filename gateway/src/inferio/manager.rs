@@ -52,16 +52,18 @@
 //!   accidental side effect, not ported.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Timelike};
 use hashlink::LinkedHashMap;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, run_dispatcher};
+use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher};
 use super::registry::{Registry, RegistryCache};
 use super::worker::{Worker, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 
@@ -74,6 +76,55 @@ pub struct ManagerConfig {
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
+}
+
+/// `GET /health` response (design §7, additive — Python has no such
+/// endpoint, so this shape is ours to define). Serialized as-is by the HTTP
+/// layer; `Deserialize` exists so tests can round-trip the wire shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthReport {
+    /// `"ok"` normally, `"shutting_down"` once shutdown has begun.
+    pub status: String,
+    /// Same signal as `status`, machine-friendly.
+    pub shutting_down: bool,
+    /// Whether the inference registry currently loads (see `health()` docs
+    /// for exactly what this checks).
+    pub registry_ok: bool,
+    /// Number of loaded models (== `models.len()`).
+    pub model_count: usize,
+    /// Per loaded model liveness/queue snapshot, sorted by inference_id.
+    pub models: Vec<ModelHealth>,
+}
+
+/// One loaded model in the [`HealthReport`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelHealth {
+    pub inference_id: String,
+    /// Monotonic load generation (bumps on every respawn).
+    pub generation: u64,
+    /// Cache keys currently referencing the model, sorted.
+    pub cache_keys: Vec<String>,
+    /// WorkerSet occupancy: `free < total` means replicas are running
+    /// windows right now.
+    pub replicas: ReplicaHealth,
+    /// Requests waiting in the model's FIFO queue.
+    pub queue_depth: usize,
+    /// Windows currently executing on replicas.
+    pub in_flight_windows: usize,
+    /// Effective cap of the most recently dispatched window (design §6);
+    /// `null` until the first window dispatches.
+    pub last_effective_cap: Option<u32>,
+    /// Predict requests ever queued on this model's dispatcher.
+    pub total_predict_requests: u64,
+    /// Windows ever dispatched to a replica.
+    pub total_batches: u64,
+}
+
+/// Replica occupancy of one model's WorkerSet.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplicaHealth {
+    pub total: usize,
+    pub free: usize,
 }
 
 /// Per-cache-key entry expiration. `Never` is Python's `datetime.max`.
@@ -332,6 +383,18 @@ impl CacheState {
             .collect()
     }
 
+    /// Sorted cache keys referencing one model (health reporting); empty
+    /// when the model has no references.
+    fn cache_keys(&self, inference_id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .cache_refs
+            .get(inference_id)
+            .map(|refs| refs.iter().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
     /// `get_ttl_expiration` (manager.py:140-141): unknown keys yield an
     /// empty map (Python's defaultdict).
     fn expirations(&self, cache_key: &str) -> BTreeMap<String, Option<String>> {
@@ -353,6 +416,9 @@ struct ModelHandle {
     /// Monotonic load generation, for death-cleanup races and (in tests)
     /// respawn detection.
     generation: u64,
+    /// Health counters shared with the dispatcher task (design §7): the
+    /// dispatcher writes, `health()` reads — Relaxed atomics, no locking.
+    stats: Arc<ModelStats>,
 }
 
 #[derive(Default)]
@@ -570,6 +636,61 @@ impl ModelManager {
         self.state.lock().unwrap().cache.expirations(cache_key)
     }
 
+    /// `GET /health` (design §7, additive): a snapshot of orchestrator and
+    /// per-model state, assembled from the shared [`ModelStats`] atomics
+    /// without disturbing any dispatcher.
+    ///
+    /// `registry_ok`: the cheapest *correct* signal is `RegistryCache::get()`
+    /// — it is mtime-gated, so when nothing changed on disk it only stats
+    /// the config dirs and returns the cached snapshot; when a file did
+    /// change, the reload it performs is exactly the one `/metadata` and
+    /// the next spawn would run anyway (no extra work is ever forced). A
+    /// broken registry TOML therefore surfaces as `registry_ok: false`
+    /// without affecting already-loaded models. The registry lock is taken
+    /// and released before the state lock (the two are never held together).
+    pub fn health(&self) -> HealthReport {
+        let registry_ok = self.registry.lock().unwrap().get().is_ok();
+        let state = self.state.lock().unwrap();
+        let mut models: Vec<ModelHealth> = state
+            .models
+            .iter()
+            .map(|(inference_id, handle)| {
+                let stats = &handle.stats;
+                ModelHealth {
+                    inference_id: inference_id.clone(),
+                    generation: handle.generation,
+                    cache_keys: state.cache.cache_keys(inference_id),
+                    replicas: ReplicaHealth {
+                        total: stats.replicas_total.load(Relaxed),
+                        free: stats.replicas_free.load(Relaxed),
+                    },
+                    queue_depth: stats.queue_len.load(Relaxed),
+                    in_flight_windows: stats.in_flight_windows.load(Relaxed),
+                    last_effective_cap: match stats.last_effective_cap.load(Relaxed) {
+                        // 0 = no window dispatched yet (real caps are >= 1).
+                        0 => None,
+                        cap => Some(cap),
+                    },
+                    total_predict_requests: stats.total_predict_requests.load(Relaxed),
+                    total_batches: stats.total_batches.load(Relaxed),
+                }
+            })
+            .collect();
+        models.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
+        HealthReport {
+            status: if state.shutting_down {
+                "shutting_down"
+            } else {
+                "ok"
+            }
+            .to_owned(),
+            shutting_down: state.shutting_down,
+            registry_ok,
+            model_count: models.len(),
+            models,
+        }
+    }
+
     /// Graceful shutdown: stop the sweeper, refuse new loads/predicts, fail
     /// queued requests, and run every worker's graceful stop ladder. A load
     /// still in flight when the flag flips finishes its spawn, observes
@@ -750,12 +871,19 @@ impl ModelManager {
         let generation = state.next_generation;
         state.next_generation += 1;
         let (tx, rx) = mpsc::unbounded_channel();
+        // Health counters (design §7): replica counts are seeded here so a
+        // health() call between registration and the dispatcher's first
+        // poll already reports the true WorkerSet size.
+        let stats = Arc::new(ModelStats::default());
+        stats.replicas_total.store(workers.len(), Relaxed);
+        stats.replicas_free.store(workers.len(), Relaxed);
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
             registry_default_batch,
             server_default_batch: self.cfg.default_max_batch,
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
+            stats: Arc::clone(&stats),
         };
         // The dispatcher owns the whole WorkerSet (design §8): every
         // replica serves the one shared FIFO queue behind this sender.
@@ -774,6 +902,7 @@ impl ModelManager {
                 tx,
                 task,
                 generation,
+                stats,
             },
         );
         Ok(sender)
@@ -2019,5 +2148,195 @@ config.replicas = 2
             vec!["g/x".to_string()],
             "the drop released the pin"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // GET /health snapshots (design §7): ModelManager::health() over the
+    // shared ModelStats atomics.
+    // ------------------------------------------------------------------
+
+    /// Health of a fresh manager: status "ok", not shutting down, the test
+    /// registry parses (registry_ok), and no models are reported. After
+    /// shutdown() the same manager flips to status "shutting_down" with
+    /// the flag set — the two fields always agree.
+    #[tokio::test]
+    async fn health_reports_empty_state_then_shutdown() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        let health = manager.health();
+        assert_eq!(health.status, "ok");
+        assert!(!health.shutting_down);
+        assert!(health.registry_ok, "the temp registry TOML parses");
+        assert_eq!(health.model_count, 0);
+        assert!(health.models.is_empty());
+
+        manager.shutdown().await;
+        let health = manager.health();
+        assert_eq!(health.status, "shutting_down");
+        assert!(health.shutting_down);
+        assert_eq!(health.model_count, 0, "shutdown emptied the model map");
+    }
+
+    /// After a completed predict on the echo fixture the health snapshot
+    /// shows the loaded model with its cache key, a single fully-free
+    /// replica, an empty queue, and last_effective_cap = the server default
+    /// (32) — neither the request nor the echo registry entry expressed a
+    /// batch opinion, so the fallback chain bottoms out at the server
+    /// default. The replica returns to the free pool only when the
+    /// dispatcher reaps the finished window (after the reply is sent), so
+    /// the idle counters are polled rather than asserted immediately.
+    #[tokio::test]
+    async fn health_reports_loaded_model_after_predict() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        manager
+            .predict(
+                "echo/test",
+                "key",
+                10,
+                -1,
+                None,
+                vec![data_input(json!({"text": "hi"}))],
+            )
+            .await
+            .expect("predict");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let model = loop {
+            let health = manager.health();
+            assert_eq!(health.status, "ok");
+            assert_eq!(health.model_count, 1);
+            let model = health.models.into_iter().next().expect("one model");
+            assert_eq!(model.inference_id, "echo/test");
+            if model.replicas.free == model.replicas.total && model.in_flight_windows == 0 {
+                break model;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replica never returned to the free pool: {model:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(model.cache_keys, vec!["key".to_string()]);
+        assert_eq!(model.replicas.total, 1, "echo has a single-replica set");
+        assert_eq!(model.queue_depth, 0, "nothing left queued");
+        assert_eq!(
+            model.last_effective_cap,
+            Some(32),
+            "no explicit or registry opinion -> server default"
+        );
+        assert_eq!(model.total_predict_requests, 1);
+        assert_eq!(model.total_batches, 1);
+
+        manager.shutdown().await;
+    }
+
+    /// While a slow predict is outstanding, health shows the activity:
+    /// an in-flight window, a replica out of the free pool, or (if we
+    /// sample before dispatch) a non-empty queue. The assertion is
+    /// race-tolerant — any of the three proves the request is visible —
+    /// and polls while the predict (1.5s in the slow_test fixture) runs.
+    #[tokio::test]
+    async fn health_shows_activity_during_slow_predict() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        // Load first so the observation window is the predict itself, not
+        // the spawn.
+        manager
+            .load_model("slow/test", "k", 10, -1)
+            .await
+            .expect("load");
+
+        let task = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .predict("slow/test", "k", 10, -1, None, vec![data_input(json!(null))])
+                    .await
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let health = manager.health();
+            let busy = health.models.iter().any(|model| {
+                model.inference_id == "slow/test"
+                    && (model.in_flight_windows >= 1
+                        || model.replicas.free < model.replicas.total
+                        || model.queue_depth > 0)
+            });
+            if busy {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the outstanding predict never became visible in health: {health:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.await
+            .unwrap()
+            .expect("the slow predict still completes normally");
+        manager.shutdown().await;
+    }
+
+    /// The Phase 2 cap is observable (design §10: "health endpoint exposes
+    /// it"): after traffic where every request carries max_batch=2, the
+    /// last dispatched window was capped at 2 and health reports exactly
+    /// that — not the server default of 32. Six singles capped at 2 need
+    /// at least 3 windows, which total_batches must reflect.
+    #[tokio::test]
+    async fn health_reports_last_effective_cap_from_capped_traffic() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("batch/test", "k", 10, -1)
+            .await
+            .expect("load");
+
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "batch/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(2),
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().expect("capped predict");
+        }
+
+        let health = manager.health();
+        let model = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "batch/test")
+            .expect("model loaded");
+        assert_eq!(
+            model.last_effective_cap,
+            Some(2),
+            "every window carried the explicit cap of 2"
+        );
+        assert_eq!(model.total_predict_requests, 6);
+        assert!(
+            model.total_batches >= 3,
+            "6 single-unit requests capped at 2 need >= 3 windows, got {}",
+            model.total_batches
+        );
+
+        manager.shutdown().await;
     }
 }

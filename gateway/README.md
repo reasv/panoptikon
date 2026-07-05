@@ -140,6 +140,15 @@ registry reload), so the web UI and all gateway-internal clients work
 unchanged. The routes stay behind the policy layer, which strips DB query
 parameters for inference paths just as it did for the proxy.
 
+`GET /api/inference/health` (additive; no Python counterpart) reports
+orchestrator observability: top-level `status` ("ok"/"shutting_down"),
+`shutting_down`, `registry_ok`, `model_count`, and a `models` array with, per
+loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
+{total, free}`, `queue_depth`, `in_flight_windows`, `last_effective_cap`
+(null until the first window dispatches), `total_predict_requests`, and
+`total_batches`. When local inference is disabled the path proxies upstream
+like any other inference route (a Python upstream 404s it).
+
 When `upstreams.inference` is empty and local inference is enabled, the
 gateway synthesizes a loopback entry pointing at itself so search, jobs, and
 cron preload work with zero extra config. Explicitly configured endpoints are
@@ -171,8 +180,9 @@ cargo run -p gateway -- inferio --config config\gateway\default.toml
 ```
 
 This starts only `/api/inference/*` plus `GET /health` — no proxy, local API,
-jobs, cron, or migrations. Point other panoptikon instances at it with an
-`[[upstreams.inference]]` entry.
+jobs, cron, or migrations. Bare `/health` serves the same health report as
+`/api/inference/health` (which is also available here). Point other
+panoptikon instances at it with an `[[upstreams.inference]]` entry.
 
 On shutdown, local inference workers are stopped via the graceful
 unload → terminate → kill ladder after the job queue stops and before the

@@ -24,8 +24,15 @@
 //!   router.py's exact detail strings for the 500s.
 //!
 //! Additive (design §7): optional `max_batch` query param on predict
-//! (forwarded to the dispatcher's merge cap) and, in standalone `inferio`
-//! mode, `GET /health`.
+//! (forwarded to the dispatcher's merge cap) and `GET /health`
+//! (orchestrator + per-model liveness, queue depths, batch caps — see
+//! [`ModelManager::health`]). `/health` lives on the nested router, so it
+//! is `/api/inference/health` in gateway mode and subcommand mode alike;
+//! standalone mode additionally keeps the original bare `/health` path
+//! (same handler) for anything already probing the subcommand there.
+//! When `inference_local` is disabled, `/api/inference/health` proxies
+//! upstream like every other inference path (a Python upstream 404s it —
+//! fine, the endpoint has no Python counterpart).
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -43,7 +50,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use super::manager::{ManagerConfig, ModelManager};
+use super::manager::{HealthReport, ManagerConfig, ModelManager};
 use super::registry::{RegistryCache, RegistryConfig};
 use super::worker::{WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 use crate::api_error::ApiError;
@@ -147,12 +154,15 @@ pub fn router(state: Arc<InferioState>) -> Router {
         )
         .route("/cache", get(get_cached_models))
         .route("/metadata", get(get_metadata))
+        .route("/health", get(health))
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
-/// Router for the `inferio` subcommand (design §3 "GPU lender" mode): only
-/// the inference surface plus a `/health` endpoint (design §7 addition).
+/// Router for the `inferio` subcommand (design §3 "GPU lender" mode): the
+/// inference surface (which includes `/api/inference/health`) plus the
+/// original bare `/health` path — same handler, kept so existing probes of
+/// the subcommand keep working.
 pub fn standalone_router(state: Arc<InferioState>) -> Router {
     Router::new()
         .nest_service("/api/inference", router(Arc::clone(&state)))
@@ -348,10 +358,13 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
     }
 }
 
-/// `GET /health` (standalone mode; additive, design §7): orchestrator
-/// liveness plus the loaded-model map.
-async fn health(State(state): State<Arc<InferioState>>) -> Json<JsonValue> {
-    Json(json!({"status": "ok", "loaded": state.manager.cached_models()}))
+/// `GET /health` (additive, design §7; no Python counterpart): orchestrator
+/// + per-model liveness, loaded models, queue depths, and batch caps — the
+/// serde shape is [`HealthReport`], assembled by [`ModelManager::health`].
+/// Supersedes the earlier standalone-only `{"status": "ok", "loaded": ...}`
+/// body: the loaded-model map is now the richer `models` array.
+async fn health(State(state): State<Arc<InferioState>>) -> Json<HealthReport> {
+    Json(state.manager.health())
 }
 
 /// Port of `utils.parse_input_request`: the `data` form field is a JSON
@@ -936,6 +949,79 @@ metadata.description = "batch size reporter"
             uncapped.iter().any(|&batch| batch > 2),
             "without max_batch the queued singles merge past 2: {uncapped:?}"
         );
+
+        state.manager.shutdown().await;
+    }
+
+    /// `GET /api/inference/health` through the real HTTP server (gateway-
+    /// mode mounting: the nested inference router, no standalone wrapper)
+    /// returns 200 with the [`HealthReport`] JSON shape — asserted by serde
+    /// round-trip into the same structs the handler serialized from. Empty
+    /// manager: status "ok", registry_ok, zero models. After a real load
+    /// via the gateway client, the model appears with its cache key and
+    /// replica counts. Finally the standalone router's bare `/health`
+    /// (subcommand mode) serves the identical shape — the path existing
+    /// probes rely on keeps working.
+    #[tokio::test]
+    async fn health_endpoint_serves_json_shape_over_http() {
+        let (state, base_url, _registry_dir) = spawn_test_server().await;
+
+        // Empty state over the wire.
+        let response = reqwest::get(format!("{base_url}/api/inference/health"))
+            .await
+            .expect("health request");
+        assert_eq!(response.status(), 200);
+        let health: HealthReport = response
+            .json()
+            .await
+            .expect("health body parses into the HealthReport serde shape");
+        assert_eq!(health.status, "ok");
+        assert!(!health.shutting_down);
+        assert!(health.registry_ok, "the echo fixture registry parses");
+        assert_eq!(health.model_count, 0);
+        assert!(health.models.is_empty());
+
+        // Load a model through the real client, then health reports it.
+        let client = InferenceApiClient::new_with_metadata_cache(base_url.clone(), false)
+            .expect("client builds");
+        client
+            .load_model("echo/test", "key", 10, -1)
+            .await
+            .expect("load");
+        let health: HealthReport = reqwest::get(format!("{base_url}/api/inference/health"))
+            .await
+            .expect("health request")
+            .json()
+            .await
+            .expect("health json");
+        assert_eq!(health.model_count, 1);
+        assert_eq!(health.models.len(), 1);
+        let model = &health.models[0];
+        assert_eq!(model.inference_id, "echo/test");
+        assert_eq!(model.cache_keys, vec!["key".to_string()]);
+        assert_eq!(model.replicas.total, 1);
+        assert_eq!(model.replicas.free, 1, "idle model: replica in the pool");
+        assert_eq!(model.queue_depth, 0);
+        assert_eq!(
+            model.last_effective_cap, None,
+            "no window dispatched yet -> null on the wire"
+        );
+
+        // Standalone (subcommand) mounting: bare /health, same handler.
+        let standalone = standalone_router(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let standalone_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, standalone).await.unwrap();
+        });
+        let health: HealthReport = reqwest::get(format!("{standalone_url}/health"))
+            .await
+            .expect("standalone health request")
+            .json()
+            .await
+            .expect("standalone health json");
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.model_count, 1, "same manager, same report");
 
         state.manager.shutdown().await;
     }

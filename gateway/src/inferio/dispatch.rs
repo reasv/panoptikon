@@ -49,7 +49,8 @@
 //! then every replica gets the graceful unload ladder, concurrently.
 
 use std::collections::VecDeque;
-use std::sync::Weak;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Weak};
 
 use anyhow::{Result, anyhow};
 use futures_util::future::join_all;
@@ -58,6 +59,36 @@ use tokio::task::JoinSet;
 
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput};
+
+/// Lightweight per-model dispatcher statistics for `GET /health` (design
+/// §7). One `Arc` is shared between the dispatcher task (sole writer) and
+/// the manager's `health()` (reader); every field is a Relaxed atomic —
+/// health reads are advisory snapshots, never synchronization points, so
+/// the hot dispatch path pays one uncontended atomic store per event and
+/// takes no locks beyond what already exists.
+#[derive(Debug, Default)]
+pub(crate) struct ModelStats {
+    /// Requests currently waiting in the FIFO queue (stored on every
+    /// push/drain).
+    pub queue_len: AtomicUsize,
+    /// Windows currently running on replicas.
+    pub in_flight_windows: AtomicUsize,
+    /// Replica count of the WorkerSet (constant after load; initialized by
+    /// the manager before the dispatcher task starts).
+    pub replicas_total: AtomicUsize,
+    /// Replicas currently idle in the free pool.
+    pub replicas_free: AtomicUsize,
+    /// Effective cap of the most recently dispatched window (the stateless
+    /// per-merge rule, design §6). 0 = no window dispatched yet — a real
+    /// cap is always >= 1 (`effective_cap` clamps), so 0 is unambiguous.
+    pub last_effective_cap: AtomicU32,
+    /// Predict requests ever queued on this dispatcher.
+    pub total_predict_requests: AtomicU64,
+    /// Windows ever dispatched to a replica. Counts merged dispatches, not
+    /// worker `predict` frames: per-request fallback retries and
+    /// oversized-request sub-batches stay within their window's count.
+    pub total_batches: AtomicU64,
+}
 
 /// One queued predict: the request's inputs, its optional explicit batch
 /// cap, and the oneshot the caller is awaiting.
@@ -90,6 +121,9 @@ pub(crate) struct DispatcherContext {
     /// Back-reference for fatal-death cleanup. Weak: the manager owns the
     /// dispatcher task, not the other way around.
     pub manager: Weak<ModelManager>,
+    /// Shared health counters; the manager keeps the other Arc and reads
+    /// them in `health()` without touching this task.
+    pub stats: Arc<ModelStats>,
 }
 
 /// Effective batch cap for one drain window (design §6, stateless):
@@ -178,6 +212,14 @@ pub(crate) async fn run_dispatcher(
             let take = window_take_count(&unit_counts, cap);
             let window: Vec<DispatchRequest> = queue.drain(..take).collect();
             let worker = free.pop().expect("checked non-empty");
+            // Health counters (Relaxed stores; see ModelStats docs).
+            ctx.stats.queue_len.store(queue.len(), Relaxed);
+            ctx.stats.replicas_free.store(free.len(), Relaxed);
+            ctx.stats
+                .last_effective_cap
+                .store(u32::try_from(cap).unwrap_or(u32::MAX), Relaxed);
+            ctx.stats.total_batches.fetch_add(1, Relaxed);
+            ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
             let inference_id = ctx.inference_id.clone();
             in_flight.spawn(async move { run_batch(&inference_id, worker, window, cap).await });
         }
@@ -188,11 +230,19 @@ pub(crate) async fn run_dispatcher(
         tokio::select! {
             msg = rx.recv() => match msg {
                 None | Some(DispatchMsg::Shutdown) => break End::Graceful,
-                Some(DispatchMsg::Predict(request)) => queue.push_back(request),
+                Some(DispatchMsg::Predict(request)) => {
+                    queue.push_back(request);
+                    ctx.stats.queue_len.store(queue.len(), Relaxed);
+                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+                }
             },
             Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
                 match finished {
-                    Ok((worker, BatchOutcome::Continue)) => free.push(worker),
+                    Ok((worker, BatchOutcome::Continue)) => {
+                        free.push(worker);
+                        ctx.stats.in_flight_windows.fetch_sub(1, Relaxed);
+                        ctx.stats.replicas_free.store(free.len(), Relaxed);
+                    }
                     Ok((worker, BatchOutcome::Fatal(message))) => {
                         // The fatal path in Worker already killed and reaped
                         // the child; kill() is idempotent and completes the
@@ -213,7 +263,11 @@ pub(crate) async fn run_dispatcher(
         // (design §6).
         loop {
             match rx.try_recv() {
-                Ok(DispatchMsg::Predict(request)) => queue.push_back(request),
+                Ok(DispatchMsg::Predict(request)) => {
+                    queue.push_back(request);
+                    ctx.stats.queue_len.store(queue.len(), Relaxed);
+                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+                }
                 Ok(DispatchMsg::Shutdown) => break 'main End::Graceful,
                 Err(_) => break,
             }
