@@ -27,16 +27,34 @@
 //!   request in the window and everything still queued, then report the
 //!   death to the manager so the model is dropped from all LRUs.
 //!
-//! Multi-replica seam (design §8): the dispatcher owns a `WorkerSet`
-//! (`Vec<Worker>`, always length 1 in Phase 1). All dispatch goes through
-//! the set — with N replicas the same window formation would run whenever
-//! any replica frees; nothing outside this module would change.
+//! Multi-replica WorkerSet (design §8, Phase 3): the dispatcher owns N
+//! worker replicas (shape from registry `config.replicas`/`config.devices`,
+//! resolved in `registry.rs`) serving ONE shared FIFO queue. Free replicas
+//! live in a pool; each in-flight window runs as a task in a `JoinSet`
+//! that returns its replica to the pool on completion. Whenever any replica
+//! is free and requests are queued, a window is drained to it — the same
+//! effective_cap/window_take_count/split semantics as Phase 1, computed per
+//! window ("when a worker frees, take up to cap"). Windows on different
+//! replicas run concurrently; *request pickup* stays strictly FIFO (windows
+//! are always queue prefixes), while completion order across replicas may
+//! differ — harmless, since every request replies through its own oneshot.
+//!
+//! Death policy (deliberate for Phase 3; degradation to a smaller set is
+//! future work): ANY replica failing fatally kills the whole model. Queued
+//! requests are failed, windows in flight on other replicas are aborted
+//! (their callers see errors; the dropped workers are reaped by
+//! kill_on_drop + the Job Object), idle replicas get the ladder-less
+//! `kill()`, and `handle_worker_death` runs once under the generation
+//! guard. Graceful shutdown is the opposite: in-flight windows finish,
+//! then every replica gets the graceful unload ladder, concurrently.
 
 use std::collections::VecDeque;
 use std::sync::Weak;
 
 use anyhow::{Result, anyhow};
+use futures_util::future::join_all;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput};
@@ -124,48 +142,81 @@ enum BatchOutcome {
     Fatal(String),
 }
 
-/// Per-model dispatcher task body. Owns the [`Worker`]s (the WorkerSet) for
-/// this model entry; exits after graceful shutdown or fatal worker death.
+/// Per-model dispatcher task body. Owns the WorkerSet (all replicas of this
+/// model entry); exits after graceful shutdown or fatal worker death.
+///
+/// Structure: `free` holds idle replicas, `in_flight` is a JoinSet of
+/// running `(replica, window)` predict tasks; each task returns its worker
+/// so it re-enters the pool. The loop top forms as many windows as there
+/// are free replicas and queued requests, then waits for either a new
+/// message or a completed window. All queue access happens here, so pickup
+/// order is FIFO by construction — a later request can never overtake an
+/// earlier one into a window.
 pub(crate) async fn run_dispatcher(
     ctx: DispatcherContext,
-    mut workers: Vec<Worker>,
+    workers: Vec<Worker>,
     mut rx: mpsc::UnboundedReceiver<DispatchMsg>,
 ) {
     let mut queue: VecDeque<DispatchRequest> = VecDeque::new();
+    let mut free: Vec<Worker> = workers;
+    let mut in_flight: JoinSet<(Worker, BatchOutcome)> = JoinSet::new();
+
     let end = 'main: loop {
-        // Block only when idle; a queued backlog dispatches immediately.
-        if queue.is_empty() {
-            match rx.recv().await {
+        // Dispatch: while any replica is free and requests are queued, that
+        // replica drains a window. The cap is recomputed per window over the
+        // requests still queued (the stateless per-merge rule, design §6);
+        // window formation is unchanged from Phase 1 — this loop simply runs
+        // it once per newly free replica instead of once overall.
+        while !queue.is_empty() && !free.is_empty() {
+            let cap = effective_cap(
+                queue.iter().map(|request| request.max_batch),
+                ctx.registry_default_batch,
+                ctx.server_default_batch,
+            );
+            let unit_counts: Vec<usize> =
+                queue.iter().map(|request| request.inputs.len()).collect();
+            let take = window_take_count(&unit_counts, cap);
+            let window: Vec<DispatchRequest> = queue.drain(..take).collect();
+            let worker = free.pop().expect("checked non-empty");
+            let inference_id = ctx.inference_id.clone();
+            in_flight.spawn(async move { run_batch(&inference_id, worker, window, cap).await });
+        }
+
+        // Wait for work or a freed replica. Block only when nothing is
+        // dispatchable; a queued backlog with a free replica never sits idle
+        // (the while loop above ran until one side was exhausted).
+        tokio::select! {
+            msg = rx.recv() => match msg {
                 None | Some(DispatchMsg::Shutdown) => break End::Graceful,
                 Some(DispatchMsg::Predict(request)) => queue.push_back(request),
+            },
+            Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
+                match finished {
+                    Ok((worker, BatchOutcome::Continue)) => free.push(worker),
+                    Ok((worker, BatchOutcome::Fatal(message))) => {
+                        // The fatal path in Worker already killed and reaped
+                        // the child; kill() is idempotent and completes the
+                        // bookkeeping for this replica before the whole-set
+                        // teardown below.
+                        worker.kill().await;
+                        break End::Fatal(message);
+                    }
+                    Err(join_err) => break End::Fatal(format!(
+                        "a dispatch window task for model {} panicked: {join_err}",
+                        ctx.inference_id
+                    )),
+                }
             }
         }
-        // Drain everything already queued without blocking — this is the
-        // "window": batches form naturally while the worker was busy, with
-        // no batching timer (design §6).
+        // Drain everything already queued without blocking — batches form
+        // naturally while the replicas were busy, no batching timer
+        // (design §6).
         loop {
             match rx.try_recv() {
                 Ok(DispatchMsg::Predict(request)) => queue.push_back(request),
                 Ok(DispatchMsg::Shutdown) => break 'main End::Graceful,
                 Err(_) => break,
             }
-        }
-
-        let cap = effective_cap(
-            queue.iter().map(|request| request.max_batch),
-            ctx.registry_default_batch,
-            ctx.server_default_batch,
-        );
-        let unit_counts: Vec<usize> = queue.iter().map(|request| request.inputs.len()).collect();
-        let take = window_take_count(&unit_counts, cap);
-        let window: Vec<DispatchRequest> = queue.drain(..take).collect();
-
-        // Phase 1: exactly one replica; with N>1 this would pick the free
-        // one and re-drain per newly freed replica.
-        let worker = workers.first_mut().expect("WorkerSet is never empty");
-        match run_batch(&ctx.inference_id, worker, window, cap).await {
-            BatchOutcome::Continue => {}
-            BatchOutcome::Fatal(message) => break End::Fatal(message),
         }
     };
 
@@ -179,8 +230,33 @@ pub(crate) async fn run_dispatcher(
                     fail_requests(std::iter::once(request), &reason);
                 }
             }
-            for worker in workers {
-                if let Err(err) = worker.shutdown().await {
+            // In-flight windows finish first (explicit unload lets running
+            // batches complete — the Phase 1 semantic, per replica). A
+            // replica going fatal *during* this drain is killed here; the
+            // manager entry is already gone, so no death cleanup is needed
+            // (and the generation guard would reject it anyway).
+            while let Some(finished) = in_flight.join_next().await {
+                match finished {
+                    Ok((worker, BatchOutcome::Continue)) => free.push(worker),
+                    Ok((worker, BatchOutcome::Fatal(message))) => {
+                        tracing::warn!(
+                            model = %ctx.inference_id,
+                            "replica died while draining for unload: {message}"
+                        );
+                        worker.kill().await;
+                    }
+                    Err(join_err) => tracing::error!(
+                        model = %ctx.inference_id,
+                        "dispatch window task panicked during unload drain: {join_err}"
+                    ),
+                }
+            }
+            // Then every replica gets the graceful unload -> terminate ->
+            // kill ladder, concurrently (design §8: the LRU/TTL treats the
+            // set as one unit, so the set shuts down as one unit).
+            let results = join_all(free.into_iter().map(Worker::shutdown)).await;
+            for result in results {
+                if let Err(err) = result {
                     tracing::warn!(
                         model = %ctx.inference_id,
                         "worker did not shut down gracefully: {err:#}"
@@ -189,6 +265,8 @@ pub(crate) async fn run_dispatcher(
             }
         }
         End::Fatal(message) => {
+            // Phase 3 death policy: any replica fatal -> the whole model
+            // dies (degradation to a smaller set is future work).
             fail_requests(queue.drain(..), &message);
             rx.close();
             while let Ok(msg) = rx.try_recv() {
@@ -196,12 +274,13 @@ pub(crate) async fn run_dispatcher(
                     fail_requests(std::iter::once(request), &message);
                 }
             }
-            // Fatal paths in Worker already killed and reaped the child;
-            // kill() is idempotent and covers replicas that were not the
-            // one that failed.
-            for worker in workers {
-                worker.kill().await;
-            }
+            // Abort windows still in flight on other replicas: their reply
+            // oneshots drop (callers observe an error) and the dropped
+            // Workers are reaped by kill_on_drop + the Job Object — the
+            // ladder-less kill for busy replicas.
+            in_flight.shutdown().await;
+            // Ladder-less kill for the idle replicas, concurrently.
+            join_all(free.into_iter().map(Worker::kill)).await;
             if let Some(manager) = ctx.manager.upgrade() {
                 manager.handle_worker_death(&ctx.inference_id, ctx.generation);
             }
@@ -209,9 +288,22 @@ pub(crate) async fn run_dispatcher(
     }
 }
 
-/// Dispatch one window to one worker. Replies are delivered here on every
+/// Dispatch one window to one replica. Replies are delivered here on every
 /// path; `Fatal` is returned only after the failing request got its error.
+/// Owns the worker for the duration (it runs as a JoinSet task, potentially
+/// concurrent with windows on other replicas) and returns it so the
+/// dispatcher can put it back in the free pool.
 async fn run_batch(
+    inference_id: &str,
+    mut worker: Worker,
+    window: Vec<DispatchRequest>,
+    cap: usize,
+) -> (Worker, BatchOutcome) {
+    let outcome = run_batch_inner(inference_id, &mut worker, window, cap).await;
+    (worker, outcome)
+}
+
+async fn run_batch_inner(
     inference_id: &str,
     worker: &mut Worker,
     mut window: Vec<DispatchRequest>,

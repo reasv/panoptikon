@@ -109,20 +109,29 @@ impl InferenceApiClient {
         cache_key: &str,
         lru_size: i64,
         ttl_seconds: i64,
+        max_batch: Option<u32>,
         inputs: &[InferenceInput],
     ) -> Result<PredictOutput> {
         let url = format!("{}/predict/{}", self.base_url, inference_id);
+        let mut query: Vec<(&str, String)> = vec![
+            ("cache_key", cache_key.to_string()),
+            ("lru_size", lru_size.to_string()),
+            ("ttl_seconds", ttl_seconds.to_string()),
+        ];
+        // Per-request cap on server-side batch merging (design doc §6):
+        // only sent when the caller has an opinion. Old Python inference
+        // servers (FastAPI) ignore unknown query params, so sending this
+        // to a pre-max_batch upstream is harmless.
+        if let Some(max_batch) = max_batch {
+            query.push(("max_batch", max_batch.to_string()));
+        }
         let mut attempts: u32 = 0;
         loop {
             let form = build_predict_form(inputs).await?;
             let response = self
                 .raw_client
                 .post(&url)
-                .query(&[
-                    ("cache_key", cache_key),
-                    ("lru_size", &lru_size.to_string()),
-                    ("ttl_seconds", &ttl_seconds.to_string()),
-                ])
+                .query(&query)
                 .multipart(form)
                 .send()
                 .await;
@@ -452,4 +461,73 @@ fn extract_filename(headers: &[u8]) -> Option<String> {
 #[allow(dead_code)]
 fn file_input_from_path(path: impl AsRef<Path>) -> InferenceFile {
     InferenceFile::Path(path.as_ref().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::RawQuery;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// The predict request must carry `max_batch` as a query param exactly
+    /// when the caller passes Some (the stateless per-request merge cap,
+    /// design doc §6) and omit it entirely when None — so callers with no
+    /// batch opinion (PQL search embeds) leave the server's own default cap
+    /// in charge, and the param never appears as a spurious `max_batch=`
+    /// empty value. Captured off a stub server because the client builds
+    /// the URL internally.
+    #[tokio::test]
+    async fn predict_url_carries_max_batch_only_when_some() {
+        let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/api/inference/predict/{group}/{id}",
+            post(move |RawQuery(query): RawQuery| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(query.unwrap_or_default());
+                    Json(json!({"outputs": [{"ok": true}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false)
+            .expect("client builds");
+        let inputs = [InferenceInput::new(json!({"text": "x"}), None)];
+        client
+            .predict("group/model", "key", 10, -1, Some(7), &inputs)
+            .await
+            .expect("capped predict");
+        client
+            .predict("group/model", "key", 10, -1, None, &inputs)
+            .await
+            .expect("uncapped predict");
+
+        let queries = captured.lock().unwrap().clone();
+        assert_eq!(queries.len(), 2, "both predicts reached the stub");
+        assert!(
+            queries[0].contains("max_batch=7"),
+            "Some(7) serializes as a max_batch query param: {}",
+            queries[0]
+        );
+        assert!(
+            queries[0].contains("cache_key=key")
+                && queries[0].contains("lru_size=10")
+                && queries[0].contains("ttl_seconds=-1"),
+            "existing params still present alongside max_batch: {}",
+            queries[0]
+        );
+        assert!(
+            !queries[1].contains("max_batch"),
+            "None omits the param entirely: {}",
+            queries[1]
+        );
+    }
 }

@@ -36,6 +36,21 @@
 //! (`clean_dict` is a no-op for TOML-derived plain data). `ray_config` is
 //! therefore *not* forwarded to workers, matching Python.
 //!
+//! Rust-orchestrator extension (design §8, Phase 3): `config.replicas` and
+//! `config.devices` configure the per-model WorkerSet. Both are stripped
+//! from spawn kwargs exactly like `ray_config` (they are orchestrator
+//! directives, not impl constructor arguments) and, being ordinary config
+//! keys, inherit from group config like everything else. Resolution
+//! (`resolve_device_pins`):
+//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned
+//!   `CUDA_VISIBLE_DEVICES=devices[i]`;
+//! - `replicas = N` alone -> N replicas pinned `"0"`..`"N-1"`;
+//! - neither -> 1 replica, no pin (today's behavior);
+//! - both with mismatched lengths, a non-positive/non-integer `replicas`,
+//!   or a non-array-of-strings/empty `devices` -> **registry load error**
+//!   (explicit beats silent), validated per id at load time against the
+//!   merged config so the error names the offending inference id.
+//!
 //! Deviation, deliberate: JSON object key order. Python dicts preserve
 //! insertion order and FastAPI serializes `/metadata` in that order; this
 //! module uses `toml`/`serde_json` default maps, which sort keys
@@ -125,8 +140,13 @@ pub struct Registry {
 pub struct SpawnSpec {
     pub impl_class: String,
     /// Always a JSON object; merged config minus `impl_class`/`ray_config`
-    /// (process_model.py:209-211).
+    /// and the orchestrator-only `replicas`/`devices` keys
+    /// (process_model.py:209-211 for the Python-parity part).
     pub config_kwargs: JsonValue,
+    /// Per-replica `CUDA_VISIBLE_DEVICES` pins (design §8): one entry per
+    /// replica to spawn, `None` = no pin (inherit the parent env). Always
+    /// non-empty; `vec![None]` is the single-replica default.
+    pub device_pins: Vec<Option<String>>,
 }
 
 impl Registry {
@@ -209,6 +229,15 @@ impl Registry {
         // mode; Python strips it before instantiation (process_model.py:211)
         // and it is NOT forwarded to workers.
         kwargs.remove("ray_config");
+        // replicas/devices are orchestrator directives (WorkerSet shape,
+        // design §8), stripped from kwargs exactly like ray_config. Load
+        // already validated them; this re-resolution can only fail if the
+        // registry was constructed without going through load().
+        let device_pins = resolve_device_pins(&kwargs).with_context(|| {
+            format!("invalid replicas/devices config for inference id '{full_inference_id}'")
+        })?;
+        kwargs.remove("replicas");
+        kwargs.remove("devices");
         let impl_class = match impl_class {
             Some(JsonValue::String(name)) => name,
             other => bail!(
@@ -220,7 +249,52 @@ impl Registry {
         Ok(SpawnSpec {
             impl_class,
             config_kwargs: JsonValue::Object(kwargs),
+            device_pins,
         })
+    }
+}
+
+/// Resolve the WorkerSet shape from a merged id config (design §8; see the
+/// module docs for the rules). Returns one entry per replica: the
+/// `CUDA_VISIBLE_DEVICES` value to pin at spawn, or `None` for no pin.
+fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
+    let replicas = match config.get("replicas") {
+        None => None,
+        Some(value) => match value.as_i64() {
+            Some(n) if n >= 1 => Some(n as usize),
+            _ => bail!("'replicas' must be an integer >= 1, got {value}"),
+        },
+    };
+    let devices = match config.get("devices") {
+        None => None,
+        Some(value) => {
+            let items = value
+                .as_array()
+                .with_context(|| format!("'devices' must be an array of strings, got {value}"))?;
+            let devices: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_owned).with_context(|| {
+                        format!("'devices' entries must be strings, got {item}")
+                    })
+                })
+                .collect::<Result<_>>()?;
+            if devices.is_empty() {
+                bail!("'devices' must not be empty (omit it for the single-replica default)");
+            }
+            Some(devices)
+        }
+    };
+    match (replicas, devices) {
+        // Both given: allowed only when consistent (explicit beats silent —
+        // a mismatch is a config contradiction, not something to guess at).
+        (Some(replicas), Some(devices)) if replicas != devices.len() => bail!(
+            "'replicas' ({replicas}) contradicts 'devices' length ({}); drop one or make them match",
+            devices.len()
+        ),
+        (_, Some(devices)) => Ok(devices.into_iter().map(Some).collect()),
+        (Some(replicas), None) => Ok((0..replicas).map(|i| Some(i.to_string())).collect()),
+        (None, None) => Ok(vec![None]),
     }
 }
 
@@ -408,6 +482,14 @@ fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<(
                 })?;
                 merge_table_into(&mut merged_config, table);
             }
+            // Validate the WorkerSet shape now so a bad replicas/devices
+            // combination is a *registry load* error naming the id, not a
+            // spawn-time surprise (design §8; explicit beats silent). The
+            // merged config is what spawn_spec will resolve, so validating
+            // it here covers group-level inheritance too.
+            resolve_device_pins(&merged_config).with_context(|| {
+                format!("invalid replicas/devices config for inference id '{group_name}/{inference_id}'")
+            })?;
             let metadata = match inf_data.get("metadata") {
                 Some(metadata) => {
                     let table = metadata.as_table().with_context(|| {
@@ -532,6 +614,11 @@ mod tests {
             spec.config_kwargs,
             json!({"model_repo": "SmilingWolf/wd-swinv2-tagger-v3"}),
             "kwargs are exactly what Python passes to __init__ — no impl_class"
+        );
+        assert_eq!(
+            spec.device_pins,
+            vec![None],
+            "no replicas/devices in the shipped registry -> single unpinned replica"
         );
     }
 
@@ -912,6 +999,188 @@ config.v = 1
 
         let err = registry.spawn_spec("no-slash").expect_err("malformed id");
         assert!(format!("{err:#}").contains("group/name"));
+    }
+
+    /// WorkerSet resolution (design §8): `devices` alone sets the replica
+    /// count to its length with replica i pinned to devices[i]; `replicas`
+    /// alone pins "0".."N-1"; neither yields today's single unpinned
+    /// replica; both given with *matching* lengths is allowed (devices win,
+    /// same shape). In every case both keys are stripped from the spawn
+    /// kwargs exactly like ray_config — impl constructors never see them.
+    #[test]
+    fn replicas_and_devices_resolve_to_device_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+
+[group.g.inference_ids.devs]
+config.devices = ["3", "7"]
+config.x = 1
+
+[group.g.inference_ids.reps]
+config.replicas = 3
+
+[group.g.inference_ids.plain]
+
+[group.g.inference_ids.both]
+config.replicas = 2
+config.devices = ["a", "b"]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        let spec = registry.spawn_spec("g/devs").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![Some("3".to_string()), Some("7".to_string())],
+            "devices give the count and per-replica pins"
+        );
+        assert_eq!(
+            spec.config_kwargs,
+            json!({"x": 1}),
+            "devices stripped from kwargs like ray_config"
+        );
+
+        let spec = registry.spawn_spec("g/reps").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![
+                Some("0".to_string()),
+                Some("1".to_string()),
+                Some("2".to_string())
+            ],
+            "replicas=N alone pins \"0\"..\"N-1\""
+        );
+        assert_eq!(
+            spec.config_kwargs,
+            json!({}),
+            "replicas stripped from kwargs"
+        );
+
+        let spec = registry.spawn_spec("g/plain").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![None],
+            "neither key -> one replica, no pin (Phase 1 behavior)"
+        );
+
+        let spec = registry.spawn_spec("g/both").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![Some("a".to_string()), Some("b".to_string())],
+            "consistent replicas+devices resolve to the device pins"
+        );
+        assert_eq!(spec.config_kwargs, json!({}));
+    }
+
+    /// `replicas` and `devices` are ordinary config keys, so they inherit
+    /// from group config like everything else, and id-level config
+    /// overrides them per key.
+    #[test]
+    fn replicas_devices_inherit_from_group_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+config.devices = ["0", "1"]
+
+[group.g.inference_ids.inherits]
+
+[group.g.inference_ids.overrides]
+config.devices = ["5"]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+
+        let spec = registry.spawn_spec("g/inherits").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![Some("0".to_string()), Some("1".to_string())],
+            "group-level devices inherited by the id"
+        );
+
+        let spec = registry.spawn_spec("g/overrides").expect("resolves");
+        assert_eq!(
+            spec.device_pins,
+            vec![Some("5".to_string())],
+            "id-level devices override the group's"
+        );
+    }
+
+    /// replicas contradicting devices (mismatched lengths) is a *registry
+    /// load* error naming the offending inference id — explicit beats
+    /// silent, and nothing is partially loaded (same policy as duplicate
+    /// ids and unparseable TOML).
+    #[test]
+    fn replicas_devices_mismatch_fails_registry_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+
+[group.g.inference_ids.bad]
+config.replicas = 3
+config.devices = ["0", "1"]
+"#,
+        );
+        let err = registry_for(&[dir.path()]).expect_err("mismatch must fail the load");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("g/bad") && text.contains("contradicts"),
+            "error names the id and the contradiction: {text}"
+        );
+    }
+
+    /// Malformed replicas/devices values fail the registry load: replicas
+    /// must be an integer >= 1, devices must be a non-empty array of
+    /// strings. The group-inheritance path is covered too — a bad
+    /// group-level value fails at the first id that inherits it.
+    #[test]
+    fn invalid_replicas_or_devices_fail_registry_load() {
+        let cases = [
+            ("config.replicas = 0", "replicas"),
+            ("config.replicas = -2", "replicas"),
+            ("config.replicas = 1.5", "replicas"),
+            ("config.replicas = \"two\"", "replicas"),
+            ("config.devices = []", "devices"),
+            ("config.devices = [3, 7]", "devices"),
+            ("config.devices = \"3\"", "devices"),
+        ];
+        for (line, key) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write_file(
+                dir.path(),
+                "a.toml",
+                &format!(
+                    r#"
+[group.g]
+config.impl_class = "cls"
+{line}
+
+[group.g.inference_ids.x]
+"#
+                ),
+            );
+            let err = match registry_for(&[dir.path()]) {
+                Ok(_) => panic!("`{line}` must fail the registry load"),
+                Err(err) => err,
+            };
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(key) && text.contains("g/x"),
+                "error for `{line}` names '{key}' and the id: {text}"
+            );
+        }
     }
 
     /// inference_id_metadata mirrors Python get_metadata (config.py:120-136):

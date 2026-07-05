@@ -660,9 +660,7 @@ mod tests {
 
     /// In-process server over an ephemeral port, echo fixture registry.
     async fn spawn_test_server() -> (Arc<InferioState>, String, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("registry.toml"),
+        spawn_test_server_with_registry(
             r#"
 [group.echo]
 config.impl_class = "echo_test"
@@ -670,7 +668,17 @@ config.impl_class = "echo_test"
 metadata.description = "echo fixture"
 "#,
         )
-        .unwrap();
+        .await
+    }
+
+    /// In-process server over an ephemeral port with a caller-supplied
+    /// registry TOML (server default_max_batch stays high, 32, so batching
+    /// tests can prove caps come from the request, not the server config).
+    async fn spawn_test_server_with_registry(
+        registry_toml: &str,
+    ) -> (Arc<InferioState>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("registry.toml"), registry_toml).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
             config_dirs: vec![dir.path().to_path_buf()],
         })));
@@ -728,6 +736,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[InferenceInput::new(json!({"text": "hi"}), None)],
             )
             .await
@@ -746,6 +755,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[InferenceInput::new(
                     JsonValue::Null,
                     Some(InferenceFile::Bytes(b"abc".to_vec())),
@@ -767,6 +777,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[
                     InferenceInput::new(
                         JsonValue::Null,
@@ -812,6 +823,119 @@ metadata.description = "echo fixture"
         assert_eq!(unloaded, json!({"status": "unloaded"}));
         let cached = client.get_cached_models().await.expect("cache list");
         assert_eq!(cached, json!({"cache": {}}));
+
+        state.manager.shutdown().await;
+    }
+
+    /// Extracts the `{"batch": n}` sizes the batchsize_test fixture reports
+    /// from a client-side PredictOutput.
+    fn reported_batches(output: &PredictOutput) -> Vec<u64> {
+        match output {
+            PredictOutput::Json(values) => values
+                .iter()
+                .map(|value| value["batch"].as_u64().expect("fixture reports batch"))
+                .collect(),
+            other => panic!("batchsize fixture returns JSON outputs, got {other:?}"),
+        }
+    }
+
+    /// Phase 2/3 cap propagation, proven end-to-end through the job stack:
+    /// predicts driven through the real InferencePool (which wraps the real
+    /// InferenceApiClient over HTTP) carry the extraction job's batch size
+    /// to GPU batch formation as `max_batch`.
+    ///
+    /// Capped phase: a primer request keeps the worker busy (the
+    /// batchsize_test fixture sleeps 300ms per batch) while six concurrent
+    /// single-input requests, all with max_batch=Some(2), queue up behind
+    /// it — every reported GPU batch must be <= 2 even though the server's
+    /// own default cap is 32.
+    ///
+    /// Uncapped contrast phase: the same shape with max_batch=None — the
+    /// six queued singles merge freely under the server default, so at
+    /// least one reported batch exceeds 2. That proves the capped phase's
+    /// ceiling came from the request param, not from timing or server
+    /// config.
+    #[tokio::test]
+    async fn pool_max_batch_caps_gpu_batches_end_to_end() {
+        use crate::config::InferenceEndpointConfig;
+        use crate::jobs::inference_pool::InferencePool;
+
+        let (state, base_url, _registry_dir) = spawn_test_server_with_registry(
+            r#"
+[group.batch]
+config.impl_class = "batchsize_test"
+[group.batch.inference_ids.test]
+metadata.description = "batch size reporter"
+"#,
+        )
+        .await;
+        let pool = InferencePool::new(vec![InferenceEndpointConfig {
+            base_url,
+            weight: 1.0,
+            use_for_jobs: true,
+        }])
+        .expect("pool builds");
+
+        // Preload so the primer isn't skewed by worker spawn latency.
+        pool.load_model_all("batch/test", "key", 10, -1)
+            .await
+            .expect("load");
+
+        // One primer + six queued single-input predicts, all sharing the
+        // given max_batch — returns every reported batch size.
+        async fn run_phase(pool: &InferencePool, max_batch: Option<u32>) -> Vec<u64> {
+            let primer = {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    pool.predict(
+                        "batch/test",
+                        "key",
+                        10,
+                        -1,
+                        max_batch,
+                        &[InferenceInput::new(json!(0), None)],
+                    )
+                    .await
+                })
+            };
+            // Let the primer dispatch alone (worker sleeps 300ms), so the
+            // rest are guaranteed to queue and become mergeable.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut rest = Vec::new();
+            for i in 1..=6 {
+                let pool = pool.clone();
+                rest.push(tokio::spawn(async move {
+                    pool.predict(
+                        "batch/test",
+                        "key",
+                        10,
+                        -1,
+                        max_batch,
+                        &[InferenceInput::new(json!(i), None)],
+                    )
+                    .await
+                }));
+            }
+            let mut batches = reported_batches(&primer.await.unwrap().expect("primer predict"));
+            for task in rest {
+                batches.extend(reported_batches(
+                    &task.await.unwrap().expect("queued predict"),
+                ));
+            }
+            batches
+        }
+
+        let capped = run_phase(&pool, Some(2)).await;
+        assert!(
+            capped.iter().all(|&batch| batch <= 2),
+            "max_batch=2 through pool+client caps every GPU batch: {capped:?}"
+        );
+
+        let uncapped = run_phase(&pool, None).await;
+        assert!(
+            uncapped.iter().any(|&batch| batch > 2),
+            "without max_batch the queued singles merge past 2: {uncapped:?}"
+        );
 
         state.manager.shutdown().await;
     }
