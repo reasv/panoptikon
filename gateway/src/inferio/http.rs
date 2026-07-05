@@ -24,8 +24,15 @@
 //!   router.py's exact detail strings for the 500s.
 //!
 //! Additive (design §7): optional `max_batch` query param on predict
-//! (forwarded to the dispatcher's merge cap) and, in standalone `inferio`
-//! mode, `GET /health`.
+//! (forwarded to the dispatcher's merge cap) and `GET /health`
+//! (orchestrator + per-model liveness, queue depths, batch caps — see
+//! [`ModelManager::health`]). `/health` lives on the nested router, so it
+//! is `/api/inference/health` in gateway mode and subcommand mode alike;
+//! standalone mode additionally keeps the original bare `/health` path
+//! (same handler) for anything already probing the subcommand there.
+//! When `inference_local` is disabled, `/api/inference/health` proxies
+//! upstream like every other inference path (a Python upstream 404s it —
+//! fine, the endpoint has no Python counterpart).
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -43,7 +50,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use super::manager::{ManagerConfig, ModelManager};
+use super::manager::{HealthReport, ManagerConfig, ModelManager};
 use super::registry::{RegistryCache, RegistryConfig};
 use super::worker::{WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 use crate::api_error::ApiError;
@@ -147,12 +154,15 @@ pub fn router(state: Arc<InferioState>) -> Router {
         )
         .route("/cache", get(get_cached_models))
         .route("/metadata", get(get_metadata))
+        .route("/health", get(health))
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
-/// Router for the `inferio` subcommand (design §3 "GPU lender" mode): only
-/// the inference surface plus a `/health` endpoint (design §7 addition).
+/// Router for the `inferio` subcommand (design §3 "GPU lender" mode): the
+/// inference surface (which includes `/api/inference/health`) plus the
+/// original bare `/health` path — same handler, kept so existing probes of
+/// the subcommand keep working.
 pub fn standalone_router(state: Arc<InferioState>) -> Router {
     Router::new()
         .nest_service("/api/inference", router(Arc::clone(&state)))
@@ -348,10 +358,13 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
     }
 }
 
-/// `GET /health` (standalone mode; additive, design §7): orchestrator
-/// liveness plus the loaded-model map.
-async fn health(State(state): State<Arc<InferioState>>) -> Json<JsonValue> {
-    Json(json!({"status": "ok", "loaded": state.manager.cached_models()}))
+/// `GET /health` (additive, design §7; no Python counterpart): orchestrator
+/// + per-model liveness, loaded models, queue depths, and batch caps — the
+/// serde shape is [`HealthReport`], assembled by [`ModelManager::health`].
+/// Supersedes the earlier standalone-only `{"status": "ok", "loaded": ...}`
+/// body: the loaded-model map is now the richer `models` array.
+async fn health(State(state): State<Arc<InferioState>>) -> Json<HealthReport> {
+    Json(state.manager.health())
 }
 
 /// Port of `utils.parse_input_request`: the `data` form field is a JSON
@@ -660,9 +673,7 @@ mod tests {
 
     /// In-process server over an ephemeral port, echo fixture registry.
     async fn spawn_test_server() -> (Arc<InferioState>, String, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("registry.toml"),
+        spawn_test_server_with_registry(
             r#"
 [group.echo]
 config.impl_class = "echo_test"
@@ -670,7 +681,17 @@ config.impl_class = "echo_test"
 metadata.description = "echo fixture"
 "#,
         )
-        .unwrap();
+        .await
+    }
+
+    /// In-process server over an ephemeral port with a caller-supplied
+    /// registry TOML (server default_max_batch stays high, 32, so batching
+    /// tests can prove caps come from the request, not the server config).
+    async fn spawn_test_server_with_registry(
+        registry_toml: &str,
+    ) -> (Arc<InferioState>, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("registry.toml"), registry_toml).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
             config_dirs: vec![dir.path().to_path_buf()],
         })));
@@ -728,6 +749,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[InferenceInput::new(json!({"text": "hi"}), None)],
             )
             .await
@@ -746,6 +768,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[InferenceInput::new(
                     JsonValue::Null,
                     Some(InferenceFile::Bytes(b"abc".to_vec())),
@@ -767,6 +790,7 @@ metadata.description = "echo fixture"
                 "key",
                 10,
                 -1,
+                None,
                 &[
                     InferenceInput::new(
                         JsonValue::Null,
@@ -812,6 +836,192 @@ metadata.description = "echo fixture"
         assert_eq!(unloaded, json!({"status": "unloaded"}));
         let cached = client.get_cached_models().await.expect("cache list");
         assert_eq!(cached, json!({"cache": {}}));
+
+        state.manager.shutdown().await;
+    }
+
+    /// Extracts the `{"batch": n}` sizes the batchsize_test fixture reports
+    /// from a client-side PredictOutput.
+    fn reported_batches(output: &PredictOutput) -> Vec<u64> {
+        match output {
+            PredictOutput::Json(values) => values
+                .iter()
+                .map(|value| value["batch"].as_u64().expect("fixture reports batch"))
+                .collect(),
+            other => panic!("batchsize fixture returns JSON outputs, got {other:?}"),
+        }
+    }
+
+    /// Phase 2/3 cap propagation, proven end-to-end through the job stack:
+    /// predicts driven through the real InferencePool (which wraps the real
+    /// InferenceApiClient over HTTP) carry the extraction job's batch size
+    /// to GPU batch formation as `max_batch`.
+    ///
+    /// Capped phase: a primer request keeps the worker busy (the
+    /// batchsize_test fixture sleeps 300ms per batch) while six concurrent
+    /// single-input requests, all with max_batch=Some(2), queue up behind
+    /// it — every reported GPU batch must be <= 2 even though the server's
+    /// own default cap is 32.
+    ///
+    /// Uncapped contrast phase: the same shape with max_batch=None — the
+    /// six queued singles merge freely under the server default, so at
+    /// least one reported batch exceeds 2. That proves the capped phase's
+    /// ceiling came from the request param, not from timing or server
+    /// config.
+    #[tokio::test]
+    async fn pool_max_batch_caps_gpu_batches_end_to_end() {
+        use crate::config::InferenceEndpointConfig;
+        use crate::jobs::inference_pool::InferencePool;
+
+        let (state, base_url, _registry_dir) = spawn_test_server_with_registry(
+            r#"
+[group.batch]
+config.impl_class = "batchsize_test"
+[group.batch.inference_ids.test]
+metadata.description = "batch size reporter"
+"#,
+        )
+        .await;
+        let pool = InferencePool::new(vec![InferenceEndpointConfig {
+            base_url,
+            weight: 1.0,
+            use_for_jobs: true,
+        }])
+        .expect("pool builds");
+
+        // Preload so the primer isn't skewed by worker spawn latency.
+        pool.load_model_all("batch/test", "key", 10, -1)
+            .await
+            .expect("load");
+
+        // One primer + six queued single-input predicts, all sharing the
+        // given max_batch — returns every reported batch size.
+        async fn run_phase(pool: &InferencePool, max_batch: Option<u32>) -> Vec<u64> {
+            let primer = {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    pool.predict(
+                        "batch/test",
+                        "key",
+                        10,
+                        -1,
+                        max_batch,
+                        &[InferenceInput::new(json!(0), None)],
+                    )
+                    .await
+                })
+            };
+            // Let the primer dispatch alone (worker sleeps 300ms), so the
+            // rest are guaranteed to queue and become mergeable.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut rest = Vec::new();
+            for i in 1..=6 {
+                let pool = pool.clone();
+                rest.push(tokio::spawn(async move {
+                    pool.predict(
+                        "batch/test",
+                        "key",
+                        10,
+                        -1,
+                        max_batch,
+                        &[InferenceInput::new(json!(i), None)],
+                    )
+                    .await
+                }));
+            }
+            let mut batches = reported_batches(&primer.await.unwrap().expect("primer predict"));
+            for task in rest {
+                batches.extend(reported_batches(
+                    &task.await.unwrap().expect("queued predict"),
+                ));
+            }
+            batches
+        }
+
+        let capped = run_phase(&pool, Some(2)).await;
+        assert!(
+            capped.iter().all(|&batch| batch <= 2),
+            "max_batch=2 through pool+client caps every GPU batch: {capped:?}"
+        );
+
+        let uncapped = run_phase(&pool, None).await;
+        assert!(
+            uncapped.iter().any(|&batch| batch > 2),
+            "without max_batch the queued singles merge past 2: {uncapped:?}"
+        );
+
+        state.manager.shutdown().await;
+    }
+
+    /// `GET /api/inference/health` through the real HTTP server (gateway-
+    /// mode mounting: the nested inference router, no standalone wrapper)
+    /// returns 200 with the [`HealthReport`] JSON shape — asserted by serde
+    /// round-trip into the same structs the handler serialized from. Empty
+    /// manager: status "ok", registry_ok, zero models. After a real load
+    /// via the gateway client, the model appears with its cache key and
+    /// replica counts. Finally the standalone router's bare `/health`
+    /// (subcommand mode) serves the identical shape — the path existing
+    /// probes rely on keeps working.
+    #[tokio::test]
+    async fn health_endpoint_serves_json_shape_over_http() {
+        let (state, base_url, _registry_dir) = spawn_test_server().await;
+
+        // Empty state over the wire.
+        let response = reqwest::get(format!("{base_url}/api/inference/health"))
+            .await
+            .expect("health request");
+        assert_eq!(response.status(), 200);
+        let health: HealthReport = response
+            .json()
+            .await
+            .expect("health body parses into the HealthReport serde shape");
+        assert_eq!(health.status, "ok");
+        assert!(!health.shutting_down);
+        assert!(health.registry_ok, "the echo fixture registry parses");
+        assert_eq!(health.model_count, 0);
+        assert!(health.models.is_empty());
+
+        // Load a model through the real client, then health reports it.
+        let client = InferenceApiClient::new_with_metadata_cache(base_url.clone(), false)
+            .expect("client builds");
+        client
+            .load_model("echo/test", "key", 10, -1)
+            .await
+            .expect("load");
+        let health: HealthReport = reqwest::get(format!("{base_url}/api/inference/health"))
+            .await
+            .expect("health request")
+            .json()
+            .await
+            .expect("health json");
+        assert_eq!(health.model_count, 1);
+        assert_eq!(health.models.len(), 1);
+        let model = &health.models[0];
+        assert_eq!(model.inference_id, "echo/test");
+        assert_eq!(model.cache_keys, vec!["key".to_string()]);
+        assert_eq!(model.replicas.total, 1);
+        assert_eq!(model.replicas.free, 1, "idle model: replica in the pool");
+        assert_eq!(model.queue_depth, 0);
+        assert_eq!(
+            model.last_effective_cap, None,
+            "no window dispatched yet -> null on the wire"
+        );
+
+        // Standalone (subcommand) mounting: bare /health, same handler.
+        let standalone = standalone_router(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let standalone_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, standalone).await.unwrap();
+        });
+        let health: HealthReport = reqwest::get(format!("{standalone_url}/health"))
+            .await
+            .expect("standalone health request")
+            .json()
+            .await
+            .expect("standalone health json");
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.model_count, 1, "same manager, same report");
 
         state.manager.shutdown().await;
     }

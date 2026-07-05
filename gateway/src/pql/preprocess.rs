@@ -612,6 +612,9 @@ async fn embed_text_query(
                 &embed.cache_key,
                 embed.lru_size,
                 embed.ttl_seconds,
+                // Search-time embeds have no batch-size opinion: let the
+                // server merge them freely (its own default cap applies).
+                None,
                 &inputs,
             )
             .await
@@ -644,6 +647,9 @@ async fn embed_image_query(
                 &embed.cache_key,
                 embed.lru_size,
                 embed.ttl_seconds,
+                // Search-time embeds have no batch-size opinion: let the
+                // server merge them freely (its own default cap applies).
+                None,
                 &inputs,
             )
             .await

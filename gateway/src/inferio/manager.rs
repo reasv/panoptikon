@@ -52,16 +52,18 @@
 //!   accidental side effect, not ported.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Timelike};
 use hashlink::LinkedHashMap;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, run_dispatcher};
+use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher};
 use super::registry::{Registry, RegistryCache};
 use super::worker::{Worker, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 
@@ -74,6 +76,55 @@ pub struct ManagerConfig {
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
+}
+
+/// `GET /health` response (design §7, additive — Python has no such
+/// endpoint, so this shape is ours to define). Serialized as-is by the HTTP
+/// layer; `Deserialize` exists so tests can round-trip the wire shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthReport {
+    /// `"ok"` normally, `"shutting_down"` once shutdown has begun.
+    pub status: String,
+    /// Same signal as `status`, machine-friendly.
+    pub shutting_down: bool,
+    /// Whether the inference registry currently loads (see `health()` docs
+    /// for exactly what this checks).
+    pub registry_ok: bool,
+    /// Number of loaded models (== `models.len()`).
+    pub model_count: usize,
+    /// Per loaded model liveness/queue snapshot, sorted by inference_id.
+    pub models: Vec<ModelHealth>,
+}
+
+/// One loaded model in the [`HealthReport`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelHealth {
+    pub inference_id: String,
+    /// Monotonic load generation (bumps on every respawn).
+    pub generation: u64,
+    /// Cache keys currently referencing the model, sorted.
+    pub cache_keys: Vec<String>,
+    /// WorkerSet occupancy: `free < total` means replicas are running
+    /// windows right now.
+    pub replicas: ReplicaHealth,
+    /// Requests waiting in the model's FIFO queue.
+    pub queue_depth: usize,
+    /// Windows currently executing on replicas.
+    pub in_flight_windows: usize,
+    /// Effective cap of the most recently dispatched window (design §6);
+    /// `null` until the first window dispatches.
+    pub last_effective_cap: Option<u32>,
+    /// Predict requests ever queued on this model's dispatcher.
+    pub total_predict_requests: u64,
+    /// Windows ever dispatched to a replica.
+    pub total_batches: u64,
+}
+
+/// Replica occupancy of one model's WorkerSet.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReplicaHealth {
+    pub total: usize,
+    pub free: usize,
 }
 
 /// Per-cache-key entry expiration. `Never` is Python's `datetime.max`.
@@ -332,6 +383,18 @@ impl CacheState {
             .collect()
     }
 
+    /// Sorted cache keys referencing one model (health reporting); empty
+    /// when the model has no references.
+    fn cache_keys(&self, inference_id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .cache_refs
+            .get(inference_id)
+            .map(|refs| refs.iter().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
     /// `get_ttl_expiration` (manager.py:140-141): unknown keys yield an
     /// empty map (Python's defaultdict).
     fn expirations(&self, cache_key: &str) -> BTreeMap<String, Option<String>> {
@@ -353,6 +416,9 @@ struct ModelHandle {
     /// Monotonic load generation, for death-cleanup races and (in tests)
     /// respawn detection.
     generation: u64,
+    /// Health counters shared with the dispatcher task (design §7): the
+    /// dispatcher writes, `health()` reads — Relaxed atomics, no locking.
+    stats: Arc<ModelStats>,
 }
 
 #[derive(Default)]
@@ -570,6 +636,61 @@ impl ModelManager {
         self.state.lock().unwrap().cache.expirations(cache_key)
     }
 
+    /// `GET /health` (design §7, additive): a snapshot of orchestrator and
+    /// per-model state, assembled from the shared [`ModelStats`] atomics
+    /// without disturbing any dispatcher.
+    ///
+    /// `registry_ok`: the cheapest *correct* signal is `RegistryCache::get()`
+    /// — it is mtime-gated, so when nothing changed on disk it only stats
+    /// the config dirs and returns the cached snapshot; when a file did
+    /// change, the reload it performs is exactly the one `/metadata` and
+    /// the next spawn would run anyway (no extra work is ever forced). A
+    /// broken registry TOML therefore surfaces as `registry_ok: false`
+    /// without affecting already-loaded models. The registry lock is taken
+    /// and released before the state lock (the two are never held together).
+    pub fn health(&self) -> HealthReport {
+        let registry_ok = self.registry.lock().unwrap().get().is_ok();
+        let state = self.state.lock().unwrap();
+        let mut models: Vec<ModelHealth> = state
+            .models
+            .iter()
+            .map(|(inference_id, handle)| {
+                let stats = &handle.stats;
+                ModelHealth {
+                    inference_id: inference_id.clone(),
+                    generation: handle.generation,
+                    cache_keys: state.cache.cache_keys(inference_id),
+                    replicas: ReplicaHealth {
+                        total: stats.replicas_total.load(Relaxed),
+                        free: stats.replicas_free.load(Relaxed),
+                    },
+                    queue_depth: stats.queue_len.load(Relaxed),
+                    in_flight_windows: stats.in_flight_windows.load(Relaxed),
+                    last_effective_cap: match stats.last_effective_cap.load(Relaxed) {
+                        // 0 = no window dispatched yet (real caps are >= 1).
+                        0 => None,
+                        cap => Some(cap),
+                    },
+                    total_predict_requests: stats.total_predict_requests.load(Relaxed),
+                    total_batches: stats.total_batches.load(Relaxed),
+                }
+            })
+            .collect();
+        models.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
+        HealthReport {
+            status: if state.shutting_down {
+                "shutting_down"
+            } else {
+                "ok"
+            }
+            .to_owned(),
+            shutting_down: state.shutting_down,
+            registry_ok,
+            model_count: models.len(),
+            models,
+        }
+    }
+
     /// Graceful shutdown: stop the sweeper, refuse new loads/predicts, fail
     /// queued requests, and run every worker's graceful stop ladder. A load
     /// still in flight when the flag flips finishes its spawn, observes
@@ -720,7 +841,7 @@ impl ModelManager {
         // Release the spawn pin under the same lock as the bookkeeping
         // below so the sweeper cannot expire the fresh entry in between.
         spawn_pin.release_locked(&mut state.cache);
-        let (worker, registry_default_batch) = match spawn_result {
+        let (workers, registry_default_batch) = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 // Python removes the requesting cache key's entry and
@@ -735,12 +856,13 @@ impl ModelManager {
         };
         if state.shutting_down || !state.cache.refs_non_empty(inference_id) {
             // Explicitly unloaded (or the manager shut down) while the
-            // worker was spawning: discard it instead of registering. The
-            // discard task is parked in `draining` so shutdown() (which
-            // re-checks after taking load_lock) awaits the graceful stop
-            // instead of abandoning it on a detached task.
+            // workers were spawning: discard the whole set instead of
+            // registering it. The discard task is parked in `draining` so
+            // shutdown() (which re-checks after taking load_lock) awaits
+            // the graceful stops instead of abandoning them on a detached
+            // task.
             let discard = tokio::spawn(async move {
-                let _ = worker.shutdown().await;
+                futures_util::future::join_all(workers.into_iter().map(Worker::shutdown)).await;
             });
             state.draining.push(discard);
             drop(state);
@@ -749,16 +871,23 @@ impl ModelManager {
         let generation = state.next_generation;
         state.next_generation += 1;
         let (tx, rx) = mpsc::unbounded_channel();
+        // Health counters (design §7): replica counts are seeded here so a
+        // health() call between registration and the dispatcher's first
+        // poll already reports the true WorkerSet size.
+        let stats = Arc::new(ModelStats::default());
+        stats.replicas_total.store(workers.len(), Relaxed);
+        stats.replicas_free.store(workers.len(), Relaxed);
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
             registry_default_batch,
             server_default_batch: self.cfg.default_max_batch,
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
+            stats: Arc::clone(&stats),
         };
-        // WorkerSet seam (design §8): one replica in Phase 1; the
-        // dispatcher receives a Vec either way.
-        let task = tokio::spawn(run_dispatcher(context, vec![worker], rx));
+        // The dispatcher owns the whole WorkerSet (design §8): every
+        // replica serves the one shared FIFO queue behind this sender.
+        let task = tokio::spawn(run_dispatcher(context, workers, rx));
         let sender = if pin_for_predict {
             state.cache.pin(inference_id);
             let guard =
@@ -773,15 +902,21 @@ impl ModelManager {
                 tx,
                 task,
                 generation,
+                stats,
             },
         );
         Ok(sender)
     }
 
-    /// Spawn + handshake + load one worker. The registry is re-resolved at
-    /// every spawn (design §4: workers are always born on current config).
-    /// Errors carry the worker's traceback/stderr context from `Worker`.
-    async fn spawn_model(&self, inference_id: &str) -> Result<(Worker, Option<u32>)> {
+    /// Spawn + handshake + load the model's whole WorkerSet (design §8):
+    /// one worker per entry of the spec's `device_pins`, each pinned via
+    /// `CUDA_VISIBLE_DEVICES` at spawn, all spawned and loaded
+    /// *concurrently*. Any replica failing kills the others — a load either
+    /// yields the complete set or nothing (no partial sets to reason
+    /// about). The registry is re-resolved at every spawn (design §4:
+    /// workers are always born on current config). Errors carry the
+    /// worker's traceback/stderr context from `Worker`.
+    async fn spawn_model(&self, inference_id: &str) -> Result<(Vec<Worker>, Option<u32>)> {
         let (spec, registry_default_batch) = {
             let mut registry = self.registry.lock().unwrap();
             let snapshot = registry
@@ -790,15 +925,52 @@ impl ModelManager {
             let spec = snapshot.spawn_spec(inference_id)?;
             (spec, registry_default_batch(&snapshot, inference_id))
         };
-        let mut worker = Worker::spawn(&self.cfg.spawn, inference_id, &spec, None).await?;
-        if let Err(err) = worker.load().await {
-            // A load `error` frame leaves the worker alive; kill it either
-            // way so a failed load never leaks a process (fatal paths
-            // already reaped the child — kill is idempotent).
-            worker.kill().await;
+        let replica_count = spec.device_pins.len();
+        let spawns = spec.device_pins.iter().enumerate().map(|(replica, device)| {
+            let spec = &spec;
+            let device = device.clone();
+            async move {
+                let mut worker =
+                    Worker::spawn(&self.cfg.spawn, inference_id, spec, device).await?;
+                if let Err(err) = worker.load().await {
+                    // A load `error` frame leaves the worker alive; kill it
+                    // either way so a failed load never leaks a process
+                    // (fatal paths already reaped the child — kill is
+                    // idempotent).
+                    worker.kill().await;
+                    return Err(err);
+                }
+                anyhow::Ok((replica, worker))
+            }
+        });
+        let mut workers: Vec<Worker> = Vec::with_capacity(replica_count);
+        let mut first_error: Option<anyhow::Error> = None;
+        for result in futures_util::future::join_all(spawns).await {
+            match result {
+                Ok((replica, worker)) => {
+                    if replica_count > 1 {
+                        tracing::debug!(
+                            model = %inference_id,
+                            replica,
+                            device = spec.device_pins[replica].as_deref().unwrap_or("<unpinned>"),
+                            "replica loaded"
+                        );
+                    }
+                    workers.push(worker);
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            // Whole-set load atomicity: kill the replicas that did come up.
+            futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
-        Ok((worker, registry_default_batch))
+        Ok((workers, registry_default_batch))
     }
 
     /// Test hook: the load generation of a currently-loaded model, for
@@ -1115,6 +1287,23 @@ config.impl_class = "nan_test"
 [group.missing]
 config.impl_class = "does_not_exist"
 [group.missing.inference_ids.test]
+
+# Multi-replica WorkerSets (design §8 / Phase 3). devices pins are just env
+# strings the device_test fixture reads back — no GPU involved.
+[group.device]
+config.impl_class = "device_test"
+config.devices = ["3", "7"]
+[group.device.inference_ids.test]
+
+[group.slowpair]
+config.impl_class = "slow_test"
+config.replicas = 2
+[group.slowpair.inference_ids.test]
+
+[group.dieflag]
+config.impl_class = "dieflag_test"
+config.replicas = 2
+[group.dieflag.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -1688,6 +1877,248 @@ config.impl_class = "does_not_exist"
         manager.shutdown().await;
     }
 
+    /// Device string reported by a device_test output.
+    fn reported_device(output: &WorkerOutput) -> String {
+        match output {
+            WorkerOutput::Json(value) => value["device"]
+                .as_str()
+                .expect("device field is a string")
+                .to_owned(),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    /// Multi-replica device pinning end to end (design §8): a model with
+    /// `devices = ["3", "7"]` spawns two replicas, each seeing its own
+    /// CUDA_VISIBLE_DEVICES, and both serve the one shared FIFO queue —
+    /// enough concurrent single predicts (max_batch 1 so windows never
+    /// merge) must be answered by BOTH pins, proving the set has exactly
+    /// the two replicas and the dispatcher actually spreads windows across
+    /// them.
+    #[tokio::test]
+    async fn multi_replica_devices_serve_shared_queue() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("device/test", "k", 10, -1)
+            .await
+            .expect("load spawns both replicas");
+
+        // 4 concurrent singles against 0.5s predicts: the first two windows
+        // occupy both replicas, the rest queue and go to whichever frees.
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "device/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        let mut devices = std::collections::BTreeSet::new();
+        for task in tasks {
+            let outputs = task.await.unwrap().expect("predict on a pinned replica");
+            devices.insert(reported_device(&outputs[0]));
+        }
+        assert_eq!(
+            devices,
+            std::collections::BTreeSet::from(["3".to_string(), "7".to_string()]),
+            "both configured device pins served requests (and no third replica exists)"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Throughput proof that replicas run windows concurrently: slow_test
+    /// predicts take 1.5s each; with 2 replicas and 4 single-input predicts
+    /// capped at max_batch 1 (so nothing merges), the work is 2 rounds of 2
+    /// parallel predicts — ~3s wall, vs ~6s if the set were serialized like
+    /// a single replica. Asserted generously (< 5s) to avoid flake; the
+    /// single-replica behavior would need >= 6s and cannot pass.
+    #[tokio::test]
+    async fn multi_replica_predicts_run_concurrently() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("slowpair/test", "k", 10, -1)
+            .await
+            .expect("load");
+
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "slowpair/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            let outputs = task.await.unwrap().expect("predict");
+            assert_eq!(outputs, vec![WorkerOutput::Json(json!({"slow": true}))]);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "4 x 1.5s singles across 2 replicas must take ~2 rounds, got {elapsed:?}"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// The Phase 3 death policy: ANY replica dying fatally kills the whole
+    /// model. One poison request hard-kills its replica (os._exit) while a
+    /// normal request is in flight on the other replica and more are
+    /// queued; every outstanding request errors (queued ones are failed,
+    /// the in-flight window on the healthy replica is aborted), the model
+    /// vanishes from all caches, and the next predict auto-loads a fresh
+    /// 2-replica set (new generation) that serves normally.
+    #[tokio::test]
+    async fn replica_death_kills_whole_set_and_next_predict_respawns() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("dieflag/test", "k", 10, -1)
+            .await
+            .expect("load spawns both replicas");
+        let generation = manager.loaded_generation("dieflag/test").expect("loaded");
+
+        // The poison request dispatches first (FIFO) and holds replica A for
+        // 200ms before dying; the normal requests sent right after land on
+        // replica B (1s predict) and the queue — all still outstanding when
+        // the death is detected.
+        let die = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .predict(
+                        "dieflag/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        vec![data_input(json!({"die": true}))],
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut normals = Vec::new();
+        for i in 0..3 {
+            let manager = manager.clone();
+            normals.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "dieflag/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+
+        die.await
+            .unwrap()
+            .expect_err("the poison request fails with the fatal death");
+        for task in normals {
+            task.await.unwrap().expect_err(
+                "whole-set death policy: outstanding requests on other replicas error too",
+            );
+        }
+
+        // Death cleanup runs in the dispatcher task; poll briefly.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !manager.cached_models().is_empty() {
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "dead model never dropped from caches: {:?}",
+                    manager.cached_models()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(manager.loaded_generation("dieflag/test"), None);
+
+        // A fresh predict auto-loads a brand new 2-replica set and works.
+        let outputs = manager
+            .predict(
+                "dieflag/test",
+                "k",
+                10,
+                -1,
+                Some(1),
+                vec![data_input(json!("ok"))],
+            )
+            .await
+            .expect("fresh worker set serves after the death");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "ok"}))]);
+        assert!(
+            manager.loaded_generation("dieflag/test").expect("loaded") > generation,
+            "the respawned set has a new generation"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Whole-set unload: unloading a multi-replica model removes it from
+    /// the cache as one unit and gracefully stops BOTH replicas (the
+    /// graceful ladders run concurrently in the dispatcher's shutdown
+    /// path; the drained task is awaited by manager shutdown, so a leaked
+    /// replica would hang this test). A re-load spawns a fresh set —
+    /// generation bump proves nothing from the old set was reused.
+    #[tokio::test]
+    async fn unload_tears_down_whole_replica_set() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        manager
+            .load_model("device/test", "k", 10, -1)
+            .await
+            .expect("load spawns both replicas");
+        let generation = manager.loaded_generation("device/test").expect("loaded");
+
+        assert!(manager.unload_model("k", "device/test").await.unwrap());
+        assert!(
+            manager.cached_models().is_empty(),
+            "the set unloads as one unit"
+        );
+        assert_eq!(manager.loaded_generation("device/test"), None);
+
+        manager
+            .load_model("device/test", "k", 10, -1)
+            .await
+            .expect("re-load spawns a fresh set");
+        assert!(
+            manager.loaded_generation("device/test").expect("loaded") > generation,
+            "fresh generation: no worker from the unloaded set survived"
+        );
+
+        // shutdown() awaits the draining dispatcher task of the unloaded
+        // set as well — completing without a hang is the no-leak assertion.
+        manager.shutdown().await;
+    }
+
     /// Unit test of the guard itself, covering the spawn-phase pin (which
     /// flows through the same PinGuard type as the predict pin): while the
     /// guard is alive the pinned entry cannot expire; dropping the guard
@@ -1717,5 +2148,195 @@ config.impl_class = "does_not_exist"
             vec!["g/x".to_string()],
             "the drop released the pin"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // GET /health snapshots (design §7): ModelManager::health() over the
+    // shared ModelStats atomics.
+    // ------------------------------------------------------------------
+
+    /// Health of a fresh manager: status "ok", not shutting down, the test
+    /// registry parses (registry_ok), and no models are reported. After
+    /// shutdown() the same manager flips to status "shutting_down" with
+    /// the flag set — the two fields always agree.
+    #[tokio::test]
+    async fn health_reports_empty_state_then_shutdown() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        let health = manager.health();
+        assert_eq!(health.status, "ok");
+        assert!(!health.shutting_down);
+        assert!(health.registry_ok, "the temp registry TOML parses");
+        assert_eq!(health.model_count, 0);
+        assert!(health.models.is_empty());
+
+        manager.shutdown().await;
+        let health = manager.health();
+        assert_eq!(health.status, "shutting_down");
+        assert!(health.shutting_down);
+        assert_eq!(health.model_count, 0, "shutdown emptied the model map");
+    }
+
+    /// After a completed predict on the echo fixture the health snapshot
+    /// shows the loaded model with its cache key, a single fully-free
+    /// replica, an empty queue, and last_effective_cap = the server default
+    /// (32) — neither the request nor the echo registry entry expressed a
+    /// batch opinion, so the fallback chain bottoms out at the server
+    /// default. The replica returns to the free pool only when the
+    /// dispatcher reaps the finished window (after the reply is sent), so
+    /// the idle counters are polled rather than asserted immediately.
+    #[tokio::test]
+    async fn health_reports_loaded_model_after_predict() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        manager
+            .predict(
+                "echo/test",
+                "key",
+                10,
+                -1,
+                None,
+                vec![data_input(json!({"text": "hi"}))],
+            )
+            .await
+            .expect("predict");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let model = loop {
+            let health = manager.health();
+            assert_eq!(health.status, "ok");
+            assert_eq!(health.model_count, 1);
+            let model = health.models.into_iter().next().expect("one model");
+            assert_eq!(model.inference_id, "echo/test");
+            if model.replicas.free == model.replicas.total && model.in_flight_windows == 0 {
+                break model;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replica never returned to the free pool: {model:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(model.cache_keys, vec!["key".to_string()]);
+        assert_eq!(model.replicas.total, 1, "echo has a single-replica set");
+        assert_eq!(model.queue_depth, 0, "nothing left queued");
+        assert_eq!(
+            model.last_effective_cap,
+            Some(32),
+            "no explicit or registry opinion -> server default"
+        );
+        assert_eq!(model.total_predict_requests, 1);
+        assert_eq!(model.total_batches, 1);
+
+        manager.shutdown().await;
+    }
+
+    /// While a slow predict is outstanding, health shows the activity:
+    /// an in-flight window, a replica out of the free pool, or (if we
+    /// sample before dispatch) a non-empty queue. The assertion is
+    /// race-tolerant — any of the three proves the request is visible —
+    /// and polls while the predict (1.5s in the slow_test fixture) runs.
+    #[tokio::test]
+    async fn health_shows_activity_during_slow_predict() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        // Load first so the observation window is the predict itself, not
+        // the spawn.
+        manager
+            .load_model("slow/test", "k", 10, -1)
+            .await
+            .expect("load");
+
+        let task = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .predict("slow/test", "k", 10, -1, None, vec![data_input(json!(null))])
+                    .await
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let health = manager.health();
+            let busy = health.models.iter().any(|model| {
+                model.inference_id == "slow/test"
+                    && (model.in_flight_windows >= 1
+                        || model.replicas.free < model.replicas.total
+                        || model.queue_depth > 0)
+            });
+            if busy {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the outstanding predict never became visible in health: {health:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        task.await
+            .unwrap()
+            .expect("the slow predict still completes normally");
+        manager.shutdown().await;
+    }
+
+    /// The Phase 2 cap is observable (design §10: "health endpoint exposes
+    /// it"): after traffic where every request carries max_batch=2, the
+    /// last dispatched window was capped at 2 and health reports exactly
+    /// that — not the server default of 32. Six singles capped at 2 need
+    /// at least 3 windows, which total_batches must reflect.
+    #[tokio::test]
+    async fn health_reports_last_effective_cap_from_capped_traffic() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("batch/test", "k", 10, -1)
+            .await
+            .expect("load");
+
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "batch/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(2),
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().expect("capped predict");
+        }
+
+        let health = manager.health();
+        let model = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "batch/test")
+            .expect("model loaded");
+        assert_eq!(
+            model.last_effective_cap,
+            Some(2),
+            "every window carried the explicit cap of 2"
+        );
+        assert_eq!(model.total_predict_requests, 6);
+        assert!(
+            model.total_batches >= 3,
+            "6 single-unit requests capped at 2 need >= 3 windows, got {}",
+            model.total_batches
+        );
+
+        manager.shutdown().await;
     }
 }

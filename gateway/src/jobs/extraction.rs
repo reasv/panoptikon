@@ -586,6 +586,10 @@ async fn run_chunked_inference(
                 CACHE_KEY,
                 CACHE_LRU_SIZE,
                 CACHE_TTL_SECS,
+                // The job's resolved batch_size doubles as the server-side
+                // merge cap (design doc §6): a local orchestrator must not
+                // form GPU batches larger than what this job was tuned for.
+                Some(u32::try_from(chunk_size).unwrap_or(u32::MAX)),
                 chunk,
             )
             .await;

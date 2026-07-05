@@ -885,6 +885,7 @@ mod tests {
         SpawnSpec {
             impl_class: impl_class.to_owned(),
             config_kwargs: json!({}),
+            device_pins: vec![None],
         }
     }
 
