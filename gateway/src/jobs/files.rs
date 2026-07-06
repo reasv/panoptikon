@@ -42,6 +42,7 @@ use crate::{
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
     },
+    jobs::timing::PhaseTimer,
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
 };
@@ -453,6 +454,18 @@ struct FolderStats {
     blurhash_time: f64,
 }
 
+/// One [`PhaseTimer`] per timed scan phase. The stored per-scan times are the
+/// timers' busy (wall-clock union) totals, so they stay comparable to the
+/// scan duration regardless of worker count; aggregate worker time is only
+/// logged.
+#[derive(Clone, Default)]
+pub(crate) struct ScanTimers {
+    pub(crate) metadata: PhaseTimer,
+    pub(crate) hashing: PhaseTimer,
+    pub(crate) thumbgen: PhaseTimer,
+    pub(crate) blurhash: PhaseTimer,
+}
+
 impl FolderStats {
     fn new() -> Self {
         Self {
@@ -481,7 +494,6 @@ struct HashedFile {
     md5: String,
     sha256: String,
     real_size: i64,
-    hash_time: f64,
 }
 
 struct NewItemData {
@@ -491,9 +503,6 @@ struct NewItemData {
     sha256: String,
     mime_type: String,
     metadata: ItemScanMeta,
-    metadata_time: f64,
-    thumb_time: f64,
-    blurhash_time: f64,
     thumbnails: Vec<StoredImage>,
     frames: Vec<StoredImage>,
     blurhash: Option<String>,
@@ -505,14 +514,10 @@ struct BackfillResult {
     thumbnails: Vec<StoredImage>,
     extracted_frames: Vec<StoredImage>,
     blurhash: Option<String>,
-    thumb_time: f64,
-    blurhash_time: f64,
 }
 
 struct FailedFile {
     path: PathBuf,
-    hash_time: f64,
-    metadata_time: f64,
     error: FileProcessError,
 }
 
@@ -539,6 +544,7 @@ struct ScanContext {
     // then fail to store) the exact same data.
     in_flight_visuals: HashSet<String>,
     stats: FolderStats,
+    timers: ScanTimers,
     error_paths: Vec<String>,
     conn: sqlx::SqliteConnection,
 }
@@ -572,6 +578,7 @@ async fn scan_single_folder(
         task_paths: HashMap::new(),
         in_flight_visuals: HashSet::new(),
         stats: FolderStats::new(),
+        timers: ScanTimers::default(),
         error_paths: Vec::new(),
         conn,
     };
@@ -616,6 +623,7 @@ async fn scan_single_folder(
 
     let ScanContext {
         mut stats,
+        timers,
         error_paths,
         ..
     } = ctx;
@@ -631,6 +639,25 @@ async fn scan_single_folder(
     .await?;
     stats.marked_unavailable = marked_unavailable;
     stats.total_available = total_available;
+
+    // Stored times are phase wall-clock (busy); aggregate worker time only
+    // goes to the log, where work / busy reads as average parallelism.
+    stats.metadata_time = timers.metadata.busy_secs();
+    stats.hashing_time = timers.hashing.busy_secs();
+    stats.thumbgen_time = timers.thumbgen.busy_secs();
+    stats.blurhash_time = timers.blurhash.busy_secs();
+    tracing::info!(
+        folder,
+        hashing_busy_secs = stats.hashing_time,
+        hashing_work_secs = timers.hashing.work_secs(),
+        metadata_busy_secs = stats.metadata_time,
+        metadata_work_secs = timers.metadata.work_secs(),
+        thumbgen_busy_secs = stats.thumbgen_time,
+        thumbgen_work_secs = timers.thumbgen.work_secs(),
+        blurhash_busy_secs = stats.blurhash_time,
+        blurhash_work_secs = timers.blurhash.work_secs(),
+        "file scan phase timing"
+    );
 
     Ok(stats)
 }
@@ -756,8 +783,6 @@ impl ScanContext {
                 Ok(())
             }
             TaskOutcome::Failed(failed) => {
-                self.stats.hashing_time += failed.hash_time;
-                self.stats.metadata_time += failed.metadata_time;
                 self.stats.errors += 1;
                 match &failed.error {
                     FileProcessError::Filtered => {
@@ -791,9 +816,7 @@ impl ScanContext {
             md5,
             sha256,
             real_size,
-            hash_time,
         } = hashed;
-        self.stats.hashing_time += hash_time;
         if real_size != reported_size {
             tracing::warn!(path = %path.display(), real_size, reported_size, "file size mismatch");
         }
@@ -838,10 +861,6 @@ impl ScanContext {
     }
 
     async fn handle_new_item(&mut self, item: NewItemData) -> ApiResult<()> {
-        self.stats.metadata_time += item.metadata_time;
-        self.stats.thumbgen_time += item.thumb_time;
-        self.stats.blurhash_time += item.blurhash_time;
-
         if !item.thumbnails.is_empty()
             && !has_thumbnail(&mut self.conn, &item.sha256, THUMBNAIL_PROCESS_VERSION).await?
         {
@@ -893,8 +912,6 @@ impl ScanContext {
 
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
-        self.stats.thumbgen_time += backfill.thumb_time;
-        self.stats.blurhash_time += backfill.blurhash_time;
 
         // Another task may have stored visuals for the same content while
         // this one was running; re-check before writing so a duplicate store
@@ -1034,6 +1051,7 @@ impl ScanContext {
             path: path.to_string_lossy().to_string(),
             backfill_sha256: Some(sha256.clone()),
         };
+        let timers = self.timers.clone();
         let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let outer_path = path.clone();
@@ -1049,6 +1067,7 @@ impl ScanContext {
                     existing_frames,
                     existing_thumb,
                     video_duration,
+                    &timers,
                 )
             })
             .await;
@@ -1071,8 +1090,6 @@ impl ScanContext {
                         thumbnails: Vec::new(),
                         extracted_frames: Vec::new(),
                         blurhash: None,
-                        thumb_time: 0.0,
-                        blurhash_time: 0.0,
                     })
                 }
             }
@@ -1099,17 +1116,17 @@ impl ScanContext {
             path: path.to_string_lossy().to_string(),
             backfill_sha256: None,
         };
+        let hash_timer = self.timers.hashing.clone();
         let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let hash_path = path.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
-                let result = calculate_hashes(&hash_path);
-                (result, start.elapsed().as_secs_f64())
+                let _span = hash_timer.start();
+                calculate_hashes(&hash_path)
             })
             .await;
             match joined {
-                Ok((Ok((md5, sha256, real_size)), hash_time)) => TaskOutcome::Hashed(HashedFile {
+                Ok(Ok((md5, sha256, real_size))) => TaskOutcome::Hashed(HashedFile {
                     path,
                     last_modified,
                     reported_size,
@@ -1118,18 +1135,13 @@ impl ScanContext {
                     md5,
                     sha256,
                     real_size,
-                    hash_time,
                 }),
-                Ok((Err(err), hash_time)) => TaskOutcome::Failed(FailedFile {
+                Ok(Err(err)) => TaskOutcome::Failed(FailedFile {
                     path,
-                    hash_time,
-                    metadata_time: 0.0,
                     error: FileProcessError::Io(err.to_string()),
                 }),
                 Err(err) => TaskOutcome::Failed(FailedFile {
                     path,
-                    hash_time: 0.0,
-                    metadata_time: 0.0,
                     error: FileProcessError::Worker(err.to_string()),
                 }),
             }
@@ -1160,6 +1172,7 @@ impl ScanContext {
             path: path.to_string_lossy().to_string(),
             backfill_sha256: None,
         };
+        let timers = self.timers.clone();
         let handle = self.tasks.spawn(async move {
             let _permit = permit;
             let outer_path = path.clone();
@@ -1172,6 +1185,7 @@ impl ScanContext {
                     md5,
                     sha256,
                     filter,
+                    &timers,
                 )
             })
             .await;
@@ -1179,8 +1193,6 @@ impl ScanContext {
                 Ok(outcome) => outcome,
                 Err(err) => TaskOutcome::Failed(FailedFile {
                     path: outer_path,
-                    hash_time: 0.0,
-                    metadata_time: 0.0,
                     error: FileProcessError::Worker(err.to_string()),
                 }),
             }
@@ -1215,6 +1227,7 @@ impl ScanContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_new_item(
     path: PathBuf,
     last_modified: String,
@@ -1223,16 +1236,15 @@ fn prepare_new_item(
     md5: String,
     sha256: String,
     filter: Option<Arc<Match>>,
+    timers: &ScanTimers,
 ) -> TaskOutcome {
-    let metadata_start = Instant::now();
+    let metadata_span = timers.metadata.start();
     let preloaded_image = if mime_type.starts_with("image") {
         match open_image(&path) {
             Ok(image) => Some(image),
             Err(err) => {
                 return TaskOutcome::Failed(FailedFile {
                     path,
-                    hash_time: 0.0,
-                    metadata_time: metadata_start.elapsed().as_secs_f64(),
                     error: FileProcessError::Unsupported(err.to_string()),
                 });
             }
@@ -1244,15 +1256,10 @@ fn prepare_new_item(
         match extract_item_metadata_inner(&path, &mime_type, md5, preloaded_image.as_ref()) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return TaskOutcome::Failed(FailedFile {
-                    path,
-                    hash_time: 0.0,
-                    metadata_time: metadata_start.elapsed().as_secs_f64(),
-                    error,
-                });
+                return TaskOutcome::Failed(FailedFile { path, error });
             }
         };
-    let metadata_time = metadata_start.elapsed().as_secs_f64();
+    drop(metadata_span);
 
     if !passes_filescan_filter_stage2(
         filter.as_deref(),
@@ -1266,18 +1273,16 @@ fn prepare_new_item(
     ) {
         return TaskOutcome::Failed(FailedFile {
             path,
-            hash_time: 0.0,
-            metadata_time,
             error: FileProcessError::Filtered,
         });
     }
 
-    let (thumbnails, frames, blurhash, thumb_time, blurhash_time) =
-        match generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image) {
+    let (thumbnails, frames, blurhash) =
+        match generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image, timers) {
             Ok(result) => result,
             Err(err) => {
                 tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
-                (Vec::new(), Vec::new(), None, 0.0, 0.0)
+                (Vec::new(), Vec::new(), None)
             }
         };
 
@@ -1288,9 +1293,6 @@ fn prepare_new_item(
         sha256,
         mime_type,
         metadata,
-        metadata_time,
-        thumb_time,
-        blurhash_time,
         thumbnails,
         frames,
         blurhash,
@@ -1304,10 +1306,6 @@ pub(crate) struct PreparedFile {
     pub(crate) sha256: String,
     pub(crate) mime_type: String,
     pub(crate) metadata: ItemScanMeta,
-    pub(crate) hash_time: f64,
-    pub(crate) metadata_time: f64,
-    pub(crate) thumb_time: f64,
-    pub(crate) blurhash_time: f64,
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
@@ -1437,6 +1435,7 @@ pub(crate) enum FileProcessError {
 pub(crate) fn process_file(
     path: PathBuf,
     filescan_filter: Option<Arc<Match>>,
+    timers: &ScanTimers,
 ) -> Result<PreparedFile, FileProcessError> {
     let (last_modified, file_size) = get_last_modified_time_and_size(&path)
         .map_err(|err| FileProcessError::Io(err.to_string()))?;
@@ -1452,19 +1451,19 @@ pub(crate) fn process_file(
         return Err(FileProcessError::Filtered);
     }
 
-    let hash_start = Instant::now();
+    let hash_span = timers.hashing.start();
     let (md5, sha256, real_size) =
         calculate_hashes(&path).map_err(|err| FileProcessError::Io(err.to_string()))?;
-    let hash_time = hash_start.elapsed().as_secs_f64();
+    drop(hash_span);
 
     if real_size != file_size {
         tracing::warn!(path = %path.display(), real_size, file_size, "file size mismatch");
     }
     let file_size = real_size;
 
-    let metadata_start = Instant::now();
+    let metadata_span = timers.metadata.start();
     let metadata = extract_item_metadata(&path, &mime_type, md5.clone())?;
-    let metadata_time = metadata_start.elapsed().as_secs_f64();
+    drop(metadata_span);
 
     if !passes_filescan_filter_stage2(
         filescan_filter.as_deref(),
@@ -1479,12 +1478,12 @@ pub(crate) fn process_file(
         return Err(FileProcessError::Filtered);
     }
 
-    let (thumbnails, frames, blurhash, thumb_time, blurhash_time) =
-        match generate_new_item_visuals(&path, &mime_type, &metadata, None) {
+    let (thumbnails, frames, blurhash) =
+        match generate_new_item_visuals(&path, &mime_type, &metadata, None, timers) {
             Ok(result) => result,
             Err(err) => {
                 tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
-                (Vec::new(), Vec::new(), None, 0.0, 0.0)
+                (Vec::new(), Vec::new(), None)
             }
         };
 
@@ -1495,10 +1494,6 @@ pub(crate) fn process_file(
         sha256,
         mime_type,
         metadata,
-        hash_time,
-        metadata_time,
-        thumb_time,
-        blurhash_time,
         thumbnails,
         frames,
         blurhash,
@@ -1672,8 +1667,9 @@ fn generate_new_item_visuals(
     mime_type: &str,
     metadata: &ItemScanMeta,
     preloaded_image: Option<DynamicImage>,
-) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<String>, f64, f64), FileProcessError> {
-    let thumb_start = Instant::now();
+    timers: &ScanTimers,
+) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<String>), FileProcessError> {
+    let thumb_span = timers.thumbgen.start();
     let mut thumbnails = Vec::new();
     let mut frames = Vec::new();
     let mut blurhash_source: Option<DynamicImage> = None;
@@ -1733,22 +1729,23 @@ fn generate_new_item_visuals(
         }
     }
 
-    let thumb_time = thumb_start.elapsed().as_secs_f64();
+    drop(thumb_span);
 
-    let blurhash_start = Instant::now();
+    let blurhash_span = timers.blurhash.start();
     let blurhash = if let Some(image) = blurhash_source {
         compute_blurhash(&image).ok()
     } else {
         None
     };
-    let blurhash_time = blurhash_start.elapsed().as_secs_f64();
+    drop(blurhash_span);
 
-    Ok((thumbnails, frames, blurhash, thumb_time, blurhash_time))
+    Ok((thumbnails, frames, blurhash))
 }
 
 /// Regenerates only the visuals a file is missing. Never fails hard: partial
 /// or failed generation degrades to empty results, matching the Python
 /// behavior of catching thumbnail/blurhash errors per file.
+#[allow(clippy::too_many_arguments)]
 fn generate_backfill_visuals(
     path: &Path,
     mime_type: &str,
@@ -1758,8 +1755,9 @@ fn generate_backfill_visuals(
     existing_frames: Vec<Vec<u8>>,
     existing_thumb: Option<Vec<u8>>,
     video_duration: f64,
+    timers: &ScanTimers,
 ) -> BackfillResult {
-    let thumb_start = Instant::now();
+    let thumb_span = timers.thumbgen.start();
     let mut thumbnails = Vec::new();
     let mut extracted_frames = Vec::new();
     let mut blurhash_source: Option<DynamicImage> = None;
@@ -1776,9 +1774,9 @@ fn generate_backfill_visuals(
             }
         }
     }
-    let thumb_time = thumb_start.elapsed().as_secs_f64();
+    drop(thumb_span);
 
-    let blurhash_start = Instant::now();
+    let blurhash_span = timers.blurhash.start();
     let mut blurhash = None;
     if needs_blurhash {
         let source = blurhash_source.or_else(|| {
@@ -1795,7 +1793,7 @@ fn generate_backfill_visuals(
             .as_ref()
             .and_then(|image| compute_blurhash(image).ok());
     }
-    let blurhash_time = blurhash_start.elapsed().as_secs_f64();
+    drop(blurhash_span);
 
     BackfillResult {
         sha256,
@@ -1803,8 +1801,6 @@ fn generate_backfill_visuals(
         thumbnails,
         extracted_frames,
         blurhash,
-        thumb_time,
-        blurhash_time,
     }
 }
 
@@ -1891,18 +1887,10 @@ fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
     if width <= max_dim && height <= max_dim {
         return image.clone();
     }
-    let (new_w, new_h) = if width >= height {
-        (
-            max_dim,
-            (max_dim as f64 * height as f64 / width as f64) as u32,
-        )
-    } else {
-        (
-            (max_dim as f64 * width as f64 / height as f64) as u32,
-            max_dim,
-        )
-    };
-    image.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    // The source is often a full-resolution image (small files never get a
+    // stored thumbnail), and the result only feeds a 4x4-component blurhash,
+    // so use the fast single-pass box filter instead of a quality resampler.
+    image.thumbnail(max_dim, max_dim)
 }
 
 fn generate_thumbnail(

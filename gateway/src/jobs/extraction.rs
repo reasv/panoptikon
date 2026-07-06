@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::TryStreamExt;
@@ -23,6 +22,7 @@ use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
+use crate::jobs::timing::PhaseTimer;
 use crate::pql::builder::filters::OneOrMany;
 use crate::pql::model::{
     AndOperator, Column, EntityType, Match, MatchOps, MatchValues, Matches, NotOperator, PqlQuery,
@@ -109,42 +109,6 @@ struct JobCounters {
     errors: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
-}
-
-/// Wall-clock union of the intervals during which at least one operation of a
-/// phase is in flight. Items pipeline concurrently, so summing per-item spans
-/// would count the same second once per in-flight item (and include time spent
-/// queued on semaphores), inflating totals by orders of magnitude.
-#[derive(Default)]
-struct PhaseTimer {
-    in_flight: u32,
-    span_start: Option<Instant>,
-    total_secs: f64,
-}
-
-impl PhaseTimer {
-    fn enter(&mut self) {
-        if self.in_flight == 0 {
-            self.span_start = Some(Instant::now());
-        }
-        self.in_flight += 1;
-    }
-
-    fn exit(&mut self) {
-        self.in_flight = self.in_flight.saturating_sub(1);
-        if self.in_flight == 0 {
-            if let Some(start) = self.span_start.take() {
-                self.total_secs += start.elapsed().as_secs_f64();
-            }
-        }
-    }
-
-    fn total(&self) -> f64 {
-        match self.span_start {
-            Some(start) => self.total_secs + start.elapsed().as_secs_f64(),
-            None => self.total_secs,
-        }
-    }
 }
 
 pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(), String> {
@@ -399,10 +363,19 @@ async fn run_extraction_job_inner(
             total_segments: guard.total_segments,
             errors: guard.errors,
             total_remaining: remaining_after,
-            data_load_time: guard.data_load_time.total(),
-            inference_time: guard.inference_time.total(),
+            data_load_time: guard.data_load_time.busy_secs(),
+            inference_time: guard.inference_time.busy_secs(),
             finished: !total_failure,
         };
+        // The stored times are phase wall-clock (busy); aggregate worker time
+        // only goes to the log, where work / busy reads as average parallelism.
+        tracing::info!(
+            data_load_busy_secs = guard.data_load_time.busy_secs(),
+            data_load_work_secs = guard.data_load_time.work_secs(),
+            inference_busy_secs = guard.inference_time.busy_secs(),
+            inference_work_secs = guard.inference_time.work_secs(),
+            "extraction job phase timing"
+        );
         (update, total_failure)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
@@ -480,9 +453,9 @@ async fn process_item(
     total_remaining: i64,
 ) -> ApiResult<()> {
     let item_type = item.item_type.clone();
-    counters.lock().await.data_load_time.enter();
+    let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item).await;
-    counters.lock().await.data_load_time.exit();
+    drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -622,7 +595,7 @@ async fn run_chunked_inference(
             .acquire_many_owned(chunk.len() as u32)
             .await
             .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
-        counters.lock().await.inference_time.enter();
+        let inference_span = counters.lock().await.inference_time.start();
         let response = pool
             .predict(
                 setter_name,
@@ -638,7 +611,7 @@ async fn run_chunked_inference(
                 chunk,
             )
             .await;
-        counters.lock().await.inference_time.exit();
+        drop(inference_span);
         drop(permits);
         let outputs = response?;
         merged = Some(match merged {
@@ -700,8 +673,8 @@ async fn finalize_item(
             total_segments: guard.total_segments,
             errors: guard.errors,
             total_remaining: remaining,
-            data_load_time: guard.data_load_time.total(),
-            inference_time: guard.inference_time.total(),
+            data_load_time: guard.data_load_time.busy_secs(),
+            inference_time: guard.inference_time.busy_secs(),
             finished: false,
         }
     };

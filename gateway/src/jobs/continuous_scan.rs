@@ -30,7 +30,8 @@ use crate::jobs::dir_poller::{
     FileMeta, PollFilters, PollOutcome, PollerSnapshot, run_poll_pass, seed_snapshot,
 };
 use crate::jobs::files::{
-    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions, THUMBNAIL_PROCESS_VERSION,
+    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions, ScanTimers,
+    THUMBNAIL_PROCESS_VERSION,
     build_extension_set, build_file_scan_data, check_folder_validity, current_iso_timestamp,
     deduplicate_paths, get_last_modified_time_and_size, has_allowed_extension, is_excluded,
     is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
@@ -59,6 +60,7 @@ struct FileWork {
     scan_time: String,
     index_db: String,
     user_data_db: String,
+    timers: ScanTimers,
     reply_to: ActorRef<ContinuousScanMessage>,
 }
 
@@ -92,6 +94,7 @@ impl Worker for ContinuousWorker {
             scan_time,
             index_db,
             user_data_db,
+            timers,
             reply_to,
         } = job.msg;
 
@@ -122,10 +125,11 @@ impl Worker for ContinuousWorker {
             }
         }
 
-        let result = tokio::task::spawn_blocking(move || process_file(path, filescan_filter))
-            .await
-            .map_err(|err| FileProcessError::Worker(err.to_string()))
-            .and_then(|res| res);
+        let result =
+            tokio::task::spawn_blocking(move || process_file(path, filescan_filter, &timers))
+                .await
+                .map_err(|err| FileProcessError::Worker(err.to_string()))
+                .and_then(|res| res);
 
         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
             epoch,
@@ -215,10 +219,6 @@ struct ScanStats {
     errors: i64,
     total_available: i64,
     false_changes: i64,
-    metadata_time: f64,
-    hashing_time: f64,
-    thumbgen_time: f64,
-    blurhash_time: f64,
 }
 
 impl ScanStats {
@@ -232,10 +232,6 @@ impl ScanStats {
             errors: 0,
             total_available: 0,
             false_changes: 0,
-            metadata_time: 0.0,
-            hashing_time: 0.0,
-            thumbgen_time: 0.0,
-            blurhash_time: 0.0,
         }
     }
 }
@@ -322,6 +318,7 @@ pub(crate) struct ContinuousScanState {
     scan_id: Option<i64>,
     scan_time: Option<String>,
     stats: ScanStats,
+    timers: ScanTimers,
     epoch: u64,
     paused: bool,
     /// Number of jobs currently holding a pause. A refcount, not a bool: a
@@ -339,6 +336,9 @@ pub(crate) struct ContinuousScanState {
 impl ContinuousScanState {
     fn reset_stats(&mut self) {
         self.stats = ScanStats::new();
+        // Fresh timers per scan record; workers still running on the old scan
+        // keep their clones and their spans stay attributed to the old record.
+        self.timers = ScanTimers::default();
     }
 
     fn refresh_roots(&mut self) -> bool {
@@ -377,6 +377,8 @@ impl ContinuousScanState {
             return Ok(());
         };
         let end_time = current_iso_timestamp();
+        // Stored times are phase wall-clock (busy) from the shared timers, not
+        // sums of per-file spans across concurrent workers.
         let update = FileScanUpdate {
             end_time,
             new_items: self.stats.new_items,
@@ -387,10 +389,10 @@ impl ContinuousScanState {
             errors: self.stats.errors,
             total_available: self.stats.total_available,
             false_changes: self.stats.false_changes,
-            metadata_time: self.stats.metadata_time,
-            hashing_time: self.stats.hashing_time,
-            thumbgen_time: self.stats.thumbgen_time,
-            blurhash_time: self.stats.blurhash_time,
+            metadata_time: self.timers.metadata.busy_secs(),
+            hashing_time: self.timers.hashing.busy_secs(),
+            thumbgen_time: self.timers.thumbgen.busy_secs(),
+            blurhash_time: self.timers.blurhash.busy_secs(),
         };
         call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpdateFileScan {
@@ -551,6 +553,7 @@ impl ContinuousScanState {
             scan_time,
             index_db: self.index_db.clone(),
             user_data_db: self.user_data_db.clone(),
+            timers: self.timers.clone(),
             reply_to: self.actor_ref.clone(),
         };
         let _ = self.factory.cast(FactoryMessage::Dispatch(Job {
@@ -725,6 +728,7 @@ impl Actor for ContinuousScanActor {
             scan_id: None,
             scan_time: None,
             stats: ScanStats::new(),
+            timers: ScanTimers::default(),
             epoch: 0,
             paused: false,
             job_pauses: 0,
@@ -991,11 +995,6 @@ impl Actor for ContinuousScanActor {
                         return Ok(());
                     }
                 };
-
-                state.stats.hashing_time += processed.hash_time;
-                state.stats.metadata_time += processed.metadata_time;
-                state.stats.thumbgen_time += processed.thumb_time;
-                state.stats.blurhash_time += processed.blurhash_time;
 
                 let mut conn = match open_index_db_read(&state.index_db, &state.user_data_db).await
                 {
@@ -1575,6 +1574,7 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            &ScanTimers::default(),
         )
         .unwrap();
         actor
@@ -1662,6 +1662,7 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            &ScanTimers::default(),
         )
         .unwrap();
         actor

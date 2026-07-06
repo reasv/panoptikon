@@ -5,3 +5,4 @@ pub(crate) mod extraction;
 pub(crate) mod files;
 pub(crate) mod inference_pool;
 pub(crate) mod queue;
+pub(crate) mod timing;
