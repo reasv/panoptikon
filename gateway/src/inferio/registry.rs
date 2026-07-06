@@ -51,17 +51,17 @@
 //!   (explicit beats silent), validated per id at load time against the
 //!   merged config so the error names the offending inference id.
 //!
-//! Deviation, deliberate: JSON object key order. Python dicts preserve
-//! insertion order and FastAPI serializes `/metadata` in that order; this
-//! module uses `toml`/`serde_json` default maps, which sort keys
-//! alphabetically. Key order is not semantic JSON and every consumer (web
-//! UI, gateway client, Python client) parses into maps. If byte-for-byte
-//! parity is ever required, enable the `preserve_order` features of `toml`
-//! and `serde_json` — the code needs no other change.
+//! JSON object key order IS semantic here: Python dicts preserve insertion
+//! order, FastAPI serializes `/metadata` in that order, and the web UI
+//! renders model-group tabs and model rows in that key order (the registry
+//! TOML deliberately lists the recommended models first). So this module
+//! uses `IndexMap` for groups/ids and relies on the `preserve_order`
+//! features of `toml` and `serde_json` so file order survives parsing and
+//! serialization, matching Python end to end.
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -117,13 +117,13 @@ pub struct InferenceIdEntry {
 pub struct GroupEntry {
     pub group_config: JsonMap<String, JsonValue>,
     pub group_metadata: JsonMap<String, JsonValue>,
-    pub inference_ids: BTreeMap<String, InferenceIdEntry>,
+    pub inference_ids: IndexMap<String, InferenceIdEntry>,
 }
 
 /// Immutable loaded snapshot of the whole registry.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
-    pub groups: BTreeMap<String, GroupEntry>,
+    pub groups: IndexMap<String, GroupEntry>,
 }
 
 /// What a worker needs to instantiate a model: the impl class name and the
@@ -145,7 +145,7 @@ impl Registry {
     /// Load a fresh snapshot from the configured directories, in order.
     /// Any file error fails the whole load (Python re-raises, config.py:79).
     pub fn load(config: &RegistryConfig) -> Result<Self> {
-        let mut groups: BTreeMap<String, GroupEntry> = BTreeMap::new();
+        let mut groups: IndexMap<String, GroupEntry> = IndexMap::new();
         for dir in &config.config_dirs {
             load_folder(dir, &mut groups)?;
         }
@@ -404,7 +404,7 @@ fn latest_config_mtime(dirs: &[PathBuf]) -> Result<Option<SystemTime>> {
 /// Load every TOML file in `folder` into `groups`, mirroring
 /// `load_config_folder` (config.py:24-80). A missing folder logs a warning
 /// and is skipped; any file error aborts the whole load.
-fn load_folder(folder: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<()> {
+fn load_folder(folder: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<()> {
     if !folder.is_dir() {
         tracing::warn!(
             folder = %folder.display(),
@@ -419,7 +419,7 @@ fn load_folder(folder: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Resu
     Ok(())
 }
 
-fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<()> {
+fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<()> {
     let text = fs::read_to_string(file).context("failed to read file")?;
     let mut doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
     // Env templating (`${VAR}` / `${VAR:-default}` in string values): this is
@@ -678,6 +678,54 @@ mod tests {
             tags.get("group_config").is_none(),
             "group config must not leak"
         );
+    }
+
+    /// The web UI renders model-group tabs and model rows in JSON key order,
+    /// and Python serves /metadata in TOML declaration order (tomli + dicts
+    /// + FastAPI). Groups and inference ids must keep file order — not sort
+    /// alphabetically — including across files (first mention pins the
+    /// position, later files append).
+    #[test]
+    fn metadata_preserves_toml_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.zgroup]
+config.impl_class = "cls"
+[group.zgroup.inference_ids.second_id]
+[group.zgroup.inference_ids.first_id]
+[group.agroup]
+config.impl_class = "cls"
+[group.agroup.inference_ids.x]
+"#,
+        );
+        write_file(
+            dir.path(),
+            "b.toml",
+            r#"
+[group.zgroup.inference_ids.third_id]
+[group.bgroup]
+config.impl_class = "cls"
+[group.bgroup.inference_ids.y]
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).unwrap();
+
+        let groups: Vec<&String> = registry.groups.keys().collect();
+        assert_eq!(groups, ["zgroup", "agroup", "bgroup"]);
+        let ids: Vec<&String> = registry.groups["zgroup"].inference_ids.keys().collect();
+        assert_eq!(ids, ["second_id", "first_id", "third_id"]);
+
+        // The order must survive serialization of the /metadata body
+        // (serde_json preserve_order).
+        let body = serde_json::to_string(&registry.metadata_json()).unwrap();
+        let pos = |needle: &str| body.find(needle).expect(needle);
+        assert!(pos("zgroup") < pos("agroup"));
+        assert!(pos("agroup") < pos("bgroup"));
+        assert!(pos("second_id") < pos("first_id"));
+        assert!(pos("first_id") < pos("third_id"));
     }
 
     /// Group-level config is inherited by every inference id, and id-level

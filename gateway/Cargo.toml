@@ -25,8 +25,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
+# preserve_order (serde_json + toml): Python dicts preserve insertion order
+# and the web UI renders model tabs/rows in JSON key order, so map ordering
+# is semantic — inference registry TOML order must survive to /metadata.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "0.8", features = ["preserve_order"] }
+# Insertion-ordered maps for the inference registry (groups/inference_ids).
+indexmap = "2"
 walkdir = "2"
 mime_guess = "2"
 md-5 = "0.10"
