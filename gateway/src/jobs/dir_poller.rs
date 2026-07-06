@@ -12,6 +12,14 @@
 //! ground truth. (FAT-family filesystems don't maintain directory mtimes at all
 //! and are not supported by poll mode.)
 //!
+//! Directory mtimes come from coarse clocks (kernel tick granularity on Linux,
+//! whole seconds on SMB), so an mtime equal to the snapshot's does not prove
+//! the directory is unchanged if it was enumerated within the same tick: an
+//! entry change right after that enumeration leaves the mtime identical and
+//! would otherwise be missed until the *next* change. Directories whose mtime
+//! is within [`MTIME_SETTLE`] of the pass are therefore snapshotted as dirty
+//! and re-enumerated next tick until they settle.
+//!
 //! The poller favors false negatives: any stat or enumeration error marks the
 //! pass as degraded and suppresses the stale-directory cleanup, so a transient
 //! network failure can never translate into a flood of file removals.
@@ -19,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::jobs::files::{
     format_system_time, has_allowed_extension, is_excluded, is_hidden_or_temp,
@@ -181,10 +189,28 @@ fn mark_subtree_visited(snapshot: &PollerSnapshot, dir: &Path, visited: &mut Has
     }
 }
 
+/// Mtimes younger than this relative to the pass are not trusted for the
+/// unchanged-skip (see the module docs). 2s covers Linux coarse-clock ticks
+/// and SMB whole-second stamps; NAS clock skew beyond that is assumed
+/// NTP-bounded. Cost of being hot: one extra enumeration per tick until the
+/// directory goes quiet.
+const MTIME_SETTLE: Duration = Duration::from_secs(2);
+
 /// One poll pass: walk from the roots, stat each directory, and enumerate only
 /// directories whose mtime changed since the snapshot was taken. Consumes the
 /// previous snapshot and returns the updated one alongside the observed diff.
-pub(crate) fn run_poll_pass(mut snapshot: PollerSnapshot, filters: &PollFilters) -> PollOutcome {
+pub(crate) fn run_poll_pass(snapshot: PollerSnapshot, filters: &PollFilters) -> PollOutcome {
+    run_poll_pass_at(snapshot, filters, SystemTime::now())
+}
+
+/// `pass_start` anchors the [`MTIME_SETTLE`] hotness check; a parameter so
+/// tests can control it (a future pass_start makes freshly written test dirs
+/// count as settled).
+fn run_poll_pass_at(
+    mut snapshot: PollerSnapshot,
+    filters: &PollFilters,
+    pass_start: SystemTime,
+) -> PollOutcome {
     let mut changes = Vec::new();
     let mut removals = Vec::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
@@ -255,10 +281,17 @@ pub(crate) fn run_poll_pass(mut snapshot: PollerSnapshot, filters: &PollFilters)
         for sub in &listing.subdirs {
             stack.push(dir.join(sub));
         }
+        // Only a settled mtime may authorize the unchanged-skip next pass; a
+        // hot directory (modified within the coarse-clock window, or even
+        // mid-pass) stays dirty so a same-tick change after this enumeration
+        // cannot be missed.
+        let settled = dir_modified
+            .checked_add(MTIME_SETTLE)
+            .is_some_and(|settle_by| settle_by < pass_start);
         snapshot.dirs.insert(
             dir,
             DirSnapshot {
-                dir_modified: Some(dir_modified),
+                dir_modified: settled.then_some(dir_modified),
                 files: listing.files,
                 subdirs: listing.subdirs,
             },
@@ -409,8 +442,10 @@ mod tests {
     }
 
     // Documents the known poll-mode limitation: in-place content edits do not
-    // bump the parent dir's mtime, so they surface at the next full scan, not
-    // through the poller.
+    // bump the parent dir's mtime, so once the dir has settled they surface at
+    // the next full scan, not through the poller. The future pass_start makes
+    // the freshly created dir count as settled — with a real clock it would be
+    // hot, re-enumerated, and the edit reported opportunistically.
     #[test]
     fn in_place_modify_without_dir_change_is_not_detected() {
         let tmp = TempDir::new().unwrap();
@@ -418,11 +453,12 @@ mod tests {
         let file = root.join("a.png");
         fs::write(&file, "a").unwrap();
 
+        let settled = SystemTime::now() + Duration::from_secs(60);
         let filters = png_filters(root);
-        let first = run_poll_pass(PollerSnapshot::default(), &filters);
+        let first = run_poll_pass_at(PollerSnapshot::default(), &filters, settled);
         // Rewrite contents without adding/removing directory entries.
         fs::write(&file, "different contents").unwrap();
-        let second = run_poll_pass(first.snapshot, &filters);
+        let second = run_poll_pass_at(first.snapshot, &filters, settled);
 
         assert!(second.changes.is_empty());
         assert!(second.removals.is_empty());
