@@ -28,7 +28,9 @@ pub(crate) struct FileScanRecord {
 
 #[derive(Clone)]
 pub(crate) struct FileScanUpdate {
-    pub end_time: String,
+    /// None for mid-scan progress updates: a NULL end_time is what marks the
+    /// scan as still open (stale-scan cleanup and UI status both key on it).
+    pub end_time: Option<String>,
     pub new_items: i64,
     pub unchanged_files: i64,
     pub new_files: i64,
@@ -481,7 +483,7 @@ mod tests {
             &mut dbs.index_conn,
             scan_id,
             FileScanUpdate {
-                end_time: "2024-01-01T00:01:00".to_string(),
+                end_time: Some("2024-01-01T00:01:00".to_string()),
                 new_items: 1,
                 unchanged_files: 2,
                 new_files: 3,

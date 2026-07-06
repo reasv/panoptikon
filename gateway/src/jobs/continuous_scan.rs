@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -30,8 +30,8 @@ use crate::jobs::dir_poller::{
     FileMeta, PollFilters, PollOutcome, PollerSnapshot, run_poll_pass, seed_snapshot,
 };
 use crate::jobs::files::{
-    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, ScanOptions, ScanTimers,
-    THUMBNAIL_PROCESS_VERSION,
+    FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
+    ScanTimers, THUMBNAIL_PROCESS_VERSION,
     build_extension_set, build_file_scan_data, check_folder_validity, current_iso_timestamp,
     deduplicate_paths, get_last_modified_time_and_size, has_allowed_extension, is_excluded,
     is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
@@ -319,6 +319,7 @@ pub(crate) struct ContinuousScanState {
     scan_time: Option<String>,
     stats: ScanStats,
     timers: ScanTimers,
+    last_progress: Instant,
     epoch: u64,
     paused: bool,
     /// Number of jobs currently holding a pause. A refcount, not a bool: a
@@ -339,6 +340,43 @@ impl ContinuousScanState {
         // Fresh timers per scan record; workers still running on the old scan
         // keep their clones and their spans stay attributed to the old record.
         self.timers = ScanTimers::default();
+    }
+
+    /// Throttled mid-scan write of the running counters so the open
+    /// continuous-scan record shows progress. end_time stays NULL — that is
+    /// what marks the scan as open. Write failures are ignored: progress rows
+    /// are cosmetic.
+    async fn maybe_report_progress(&mut self) {
+        let Some(scan_id) = self.scan_id else {
+            return;
+        };
+        if self.last_progress.elapsed() < SCAN_PROGRESS_INTERVAL {
+            return;
+        }
+        self.last_progress = Instant::now();
+        let update = FileScanUpdate {
+            end_time: None,
+            new_items: self.stats.new_items,
+            unchanged_files: self.stats.unchanged_files,
+            new_files: self.stats.new_files,
+            modified_files: self.stats.modified_files,
+            marked_unavailable: self.stats.marked_unavailable,
+            errors: self.stats.errors,
+            total_available: self.stats.total_available,
+            false_changes: self.stats.false_changes,
+            metadata_time: self.timers.metadata.busy_secs(),
+            hashing_time: self.timers.hashing.busy_secs(),
+            thumbgen_time: self.timers.thumbgen.busy_secs(),
+            blurhash_time: self.timers.blurhash.busy_secs(),
+        };
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileScan {
+                scan_id,
+                update: update.clone(),
+                reply,
+            }
+        })
+        .await;
     }
 
     fn refresh_roots(&mut self) -> bool {
@@ -380,7 +418,7 @@ impl ContinuousScanState {
         // Stored times are phase wall-clock (busy) from the shared timers, not
         // sums of per-file spans across concurrent workers.
         let update = FileScanUpdate {
-            end_time,
+            end_time: Some(end_time),
             new_items: self.stats.new_items,
             unchanged_files: self.stats.unchanged_files,
             new_files: self.stats.new_files,
@@ -729,6 +767,7 @@ impl Actor for ContinuousScanActor {
             scan_time: None,
             stats: ScanStats::new(),
             timers: ScanTimers::default(),
+            last_progress: Instant::now(),
             epoch: 0,
             paused: false,
             job_pauses: 0,
@@ -988,10 +1027,12 @@ impl Actor for ContinuousScanActor {
                     Ok(processed) => processed,
                     Err(FileProcessError::Unchanged) => {
                         state.stats.unchanged_files += 1;
+                        state.maybe_report_progress().await;
                         return Ok(());
                     }
                     Err(_) => {
                         state.stats.errors += 1;
+                        state.maybe_report_progress().await;
                         return Ok(());
                     }
                 };
@@ -1124,6 +1165,7 @@ impl Actor for ContinuousScanActor {
                         state.stats.errors += 1;
                     }
                 }
+                state.maybe_report_progress().await;
             }
         }
         Ok(())

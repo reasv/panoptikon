@@ -8,7 +8,7 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ab_glyph::{FontVec, PxScale};
@@ -412,7 +412,7 @@ async fn execute_folder_scan(
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateFileScan {
             scan_id,
             update: FileScanUpdate {
-                end_time: current_iso_timestamp(),
+                end_time: Some(current_iso_timestamp()),
                 new_items: stats.new_items,
                 unchanged_files: stats.unchanged_files,
                 new_files: stats.new_files,
@@ -436,6 +436,9 @@ async fn execute_folder_scan(
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
 pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
+/// Minimum interval between mid-scan writes of the running counters to the
+/// file_scans row (progress display only; the final update is unconditional).
+pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// Images at or below this size never get a stored thumbnail.
 const SMALL_IMAGE_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -545,6 +548,7 @@ struct ScanContext {
     in_flight_visuals: HashSet<String>,
     stats: FolderStats,
     timers: ScanTimers,
+    last_progress: Instant,
     error_paths: Vec<String>,
     conn: sqlx::SqliteConnection,
 }
@@ -579,6 +583,7 @@ async fn scan_single_folder(
         in_flight_visuals: HashSet::new(),
         stats: FolderStats::new(),
         timers: ScanTimers::default(),
+        last_progress: Instant::now(),
         error_paths: Vec::new(),
         conn,
     };
@@ -615,10 +620,12 @@ async fn scan_single_folder(
         }
 
         ctx.scan_path(path).await?;
+        ctx.maybe_report_progress().await;
     }
 
     while let Some(joined) = ctx.tasks.join_next_with_id().await {
         ctx.handle_joined(joined).await?;
+        ctx.maybe_report_progress().await;
     }
 
     let ScanContext {
@@ -663,6 +670,41 @@ async fn scan_single_folder(
 }
 
 impl ScanContext {
+    /// Throttled mid-scan write of the running counters so the UI shows
+    /// progress while a folder scans. end_time stays NULL — that is what
+    /// marks the scan as still open. Write failures are ignored: progress
+    /// rows are cosmetic and must not abort the scan.
+    async fn maybe_report_progress(&mut self) {
+        if self.last_progress.elapsed() < SCAN_PROGRESS_INTERVAL {
+            return;
+        }
+        self.last_progress = Instant::now();
+        let update = FileScanUpdate {
+            end_time: None,
+            new_items: self.stats.new_items,
+            unchanged_files: self.stats.unchanged_files,
+            new_files: self.stats.new_files,
+            modified_files: self.stats.modified_files,
+            marked_unavailable: self.stats.marked_unavailable,
+            errors: self.stats.errors,
+            total_available: self.stats.total_available,
+            false_changes: self.stats.false_changes,
+            metadata_time: self.timers.metadata.busy_secs(),
+            hashing_time: self.timers.hashing.busy_secs(),
+            thumbgen_time: self.timers.thumbgen.busy_secs(),
+            blurhash_time: self.timers.blurhash.busy_secs(),
+        };
+        let scan_id = self.scan_id;
+        let _ = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileScan {
+                scan_id,
+                update: update.clone(),
+                reply,
+            }
+        })
+        .await;
+    }
+
     /// Handles one candidate path from the walk: files whose mtime matches the
     /// database record are updated directly without hashing or decoding;
     /// everything else is dispatched to the worker pool.
