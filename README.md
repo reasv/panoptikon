@@ -26,6 +26,14 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
   <img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
 </a>
 
+## Panoptikon is being rewritten in Rust
+
+This repository contains an **experimental but feature-complete Rust reimplementation** of Panoptikon. It replaces the entire Python server — API, search, job system, cron, file scanning, and inference orchestration — with a single fast native binary, while still using Python where it belongs: running the actual inference models.
+
+**This is the future of Panoptikon, and the Python version will soon be replaced by it.** For now it is in a testing phase, so convenient prebuilt Rust binaries are not yet available and running it means building from source with a Rust toolchain. Once it stabilizes, Panoptikon will become much easier to install and run than it is today.
+
+If you want to try it now, see [Running the Rust version of Panoptikon](docs/rust.md). Otherwise, the instructions below for the Python version remain the default way to run Panoptikon for the time being.
+
 ### Warning
 
 Panoptikon is designed to be used as a local service and is not intended to be exposed to the internet. It does not currently have any authentication features and exposes, among other things, an API that can be abused for remote code execution on your host machine. Panoptikon binds to localhost by default, and if you intend to expose it, you should add a reverse proxy with authentication such as HTTP Basic Auth or OAuth2 in front of it.
