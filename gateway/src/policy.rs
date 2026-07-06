@@ -24,6 +24,13 @@ use crate::config::{
 
 const USERNAME_HASH_LEN: usize = 32;
 
+/// Name of the listener endpoint the connection arrived on ("default" for
+/// the primary `server.host`/`server.port` listener). Inserted as a request
+/// extension by the per-listener `Extension` layer in main — it reflects the
+/// physical TCP listener, so unlike the Host header it cannot be spoofed.
+#[derive(Clone)]
+pub(crate) struct ListenerEndpoint(pub(crate) Arc<str>);
+
 #[derive(Clone)]
 pub struct PolicyLayer {
     settings: Arc<Settings>,
@@ -99,6 +106,7 @@ where
                 method = %decision.method,
                 path = %decision.path,
                 policy = %decision.policy.name,
+                endpoint = decision.endpoint.as_deref().unwrap_or("-"),
                 db_params = %decision.db_action,
                 status = %status,
                 "policy enforced"
@@ -155,6 +163,7 @@ struct PolicyDecision {
     is_db_info: bool,
     method: Method,
     path: String,
+    endpoint: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -182,7 +191,16 @@ fn apply_policy(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let effective_host = resolve_effective_host(req, settings.server.trust_forwarded_headers);
-    let policy = select_policy(settings, effective_host.as_deref()).ok_or(EnforcementError {
+    let endpoint = req
+        .extensions()
+        .get::<ListenerEndpoint>()
+        .map(|endpoint| Arc::clone(&endpoint.0));
+    let policy = select_policy(
+        settings,
+        effective_host.as_deref(),
+        endpoint.as_ref().map(|endpoint| endpoint.as_ref()),
+    )
+    .ok_or(EnforcementError {
         status: StatusCode::FORBIDDEN,
         reason: "no_policy",
     })?;
@@ -243,6 +261,7 @@ fn apply_policy(
         is_db_info,
         method,
         path,
+        endpoint,
     })
 }
 
@@ -368,22 +387,24 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
     false
 }
 
+/// First policy (config order) matching the effective host and the listener
+/// endpoint. An empty `hosts`/`endpoints` list matches anything, including
+/// an unknown host/endpoint (`None`); a non-empty list requires a known
+/// value that matches.
 pub(crate) fn select_policy<'a>(
     settings: &'a Settings,
     host: Option<&str>,
+    endpoint: Option<&str>,
 ) -> Option<&'a PolicyConfig> {
-    let host = host?;
-    for policy in &settings.policies {
-        if policy
-            .match_rule
-            .hosts
-            .iter()
-            .any(|item| host_matches(item, host))
-        {
-            return Some(policy);
-        }
-    }
-    None
+    settings.policies.iter().find(|policy| {
+        let hosts = &policy.match_rule.hosts;
+        let host_ok = hosts.is_empty()
+            || host.is_some_and(|host| hosts.iter().any(|item| host_matches(item, host)));
+        let endpoints = &policy.match_rule.endpoints;
+        let endpoint_ok = endpoints.is_empty()
+            || endpoint.is_some_and(|endpoint| endpoints.iter().any(|item| item == endpoint));
+        host_ok && endpoint_ok
+    })
 }
 
 fn host_matches(pattern: &str, host: &str) -> bool {
@@ -902,6 +923,7 @@ mod tests {
             ruleset: None,
             match_rule: PolicyMatch {
                 hosts: vec!["localhost".to_string()],
+                endpoints: Vec::new(),
             },
             index_db,
             user_data_db,
@@ -921,6 +943,138 @@ mod tests {
             tenant_default: tenant_default.map(|value| value.to_string()),
             tenant_prefix_template: tenant_prefix_template.map(|value| value.to_string()),
         }
+    }
+
+    /// Settings with one extra endpoint ("test") and three policies probing
+    /// the match semantics: hosts+endpoints (AND), endpoints-only, and the
+    /// usual hosts-only localhost policy, in that order.
+    const ENDPOINT_SETTINGS: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[[server.endpoints]]
+name = "test"
+port = 9156
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[[policies]]
+name = "both"
+
+[policies.match]
+hosts = ["special.local"]
+endpoints = ["test"]
+
+[policies.index_db]
+default = "bothdb"
+allow = ["bothdb"]
+
+[policies.user_data_db]
+default = "bothdb"
+allow = ["bothdb"]
+
+[[policies]]
+name = "test-endpoint"
+
+[policies.match]
+endpoints = ["test"]
+
+[policies.index_db]
+default = "testdb"
+allow = ["testdb"]
+
+[policies.user_data_db]
+default = "testdb"
+allow = ["testdb"]
+
+[[policies]]
+name = "localhost"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#;
+
+    fn endpoint_settings() -> Settings {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, ENDPOINT_SETTINGS).unwrap();
+        Settings::load(Some(path)).unwrap()
+    }
+
+    /// select_policy semantics: empty hosts/endpoints lists match anything
+    /// (including an unknown value), non-empty lists require a match, both
+    /// non-empty means AND, and config order decides among matches.
+    #[test]
+    fn select_policy_endpoint_semantics() {
+        let settings = endpoint_settings();
+        let name = |host: Option<&str>, endpoint: Option<&str>| {
+            select_policy(&settings, host, endpoint).map(|policy| policy.name.as_str())
+        };
+
+        // hosts AND endpoints both required by the first policy.
+        assert_eq!(name(Some("special.local"), Some("test")), Some("both"));
+        // Right host, wrong endpoint: nothing matches at all.
+        assert_eq!(name(Some("special.local"), Some("default")), None);
+        // Endpoint-only policy matches any host on its endpoint...
+        assert_eq!(name(Some("localhost"), Some("test")), Some("test-endpoint"));
+        // ...including requests with no Host header at all.
+        assert_eq!(name(None, Some("test")), Some("test-endpoint"));
+        // The primary endpoint falls through to the hosts-only policy,
+        // which still requires a known, matching host.
+        assert_eq!(name(Some("localhost"), Some("default")), Some("localhost"));
+        assert_eq!(name(None, Some("default")), None);
+        // Unknown endpoint (e.g. no extension): endpoint-scoped policies
+        // never match, hosts-only ones are unaffected.
+        assert_eq!(name(Some("localhost"), None), Some("localhost"));
+        assert_eq!(name(None, None), None);
+    }
+
+    /// End-to-end through apply_policy: the ListenerEndpoint request
+    /// extension routes a request to the endpoint-scoped policy (which
+    /// injects that policy's DB defaults); without the extension the same
+    /// request gets the hosts-only policy.
+    #[test]
+    fn endpoint_extension_drives_policy_and_db_defaults() {
+        let settings = endpoint_settings();
+
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ListenerEndpoint(Arc::from("test")));
+        let decision = apply_policy(&mut req, &settings).unwrap();
+        assert_eq!(decision.policy.name, "test-endpoint");
+        assert_eq!(decision.endpoint.as_deref(), Some("test"));
+        let query = parse_query(&req);
+        assert_eq!(query.get("index_db").unwrap(), &vec!["testdb".to_string()]);
+        assert_eq!(
+            query.get("user_data_db").unwrap(),
+            &vec!["testdb".to_string()]
+        );
+
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let decision = apply_policy(&mut req, &settings).unwrap();
+        assert_eq!(decision.policy.name, "localhost");
+        assert_eq!(decision.endpoint, None);
     }
 
     fn parse_query(req: &Request<Body>) -> BTreeMap<String, Vec<String>> {

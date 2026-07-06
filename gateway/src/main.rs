@@ -23,6 +23,7 @@ mod test_utils;
 mod ui;
 
 use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
+use anyhow::Context as _;
 use axum::{
     Router,
     routing::{any, get, post},
@@ -303,30 +304,55 @@ async fn async_main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(policy::PolicyLayer::new(Arc::clone(&settings)));
 
-    let listen_addr = settings.listen_addr();
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    tracing::info!(address = %listen_addr, "gateway listening");
+    // Bind every configured listener (primary + [[server.endpoints]]) before
+    // serving any of them: a config that cannot fully bind fails startup as
+    // a whole instead of running with a partial endpoint set.
+    let mut listeners = Vec::new();
+    for (name, addr) in settings.listener_addrs() {
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("failed to bind endpoint '{name}' on {addr}"))?;
+        tracing::info!(endpoint = %name, address = %addr, "gateway listening");
+        listeners.push((name, listener));
+    }
 
     // First signal: axum stops accepting connections and drains in-flight
     // requests while the cleanup task cancels jobs and flushes the DB writers.
     // Both must finish before main returns; shutdown.rs enforces the deadline.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let inferio_manager = inferio_state
         .as_ref()
         .map(|state| Arc::clone(&state.manager));
     let cleanup = tokio::spawn(async move {
         shutdown::wait_for_signal().await;
-        let _ = shutdown_tx.send(());
+        let _ = shutdown_tx.send(true);
         shutdown::run_cleanup(local_api, inferio_manager, ui_server).await;
     });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    })
-    .await?;
+    // One server task per listener, all serving the same router; the only
+    // difference is the ListenerEndpoint extension the policy layer reads.
+    let mut servers = Vec::new();
+    for (name, listener) in listeners {
+        let app = app
+            .clone()
+            .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
+                name.as_str(),
+            ))));
+        let mut shutdown_rx = shutdown_rx.clone();
+        servers.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await
+        }));
+    }
+    drop(shutdown_rx);
+    for server in servers {
+        server.await??;
+    }
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
     Ok(())
@@ -341,9 +367,14 @@ async fn async_main() -> anyhow::Result<()> {
 /// (defaults to `server.port`).
 async fn inferio_main(settings: Arc<config::Settings>) -> anyhow::Result<()> {
     let state = inferio::http::InferioState::from_settings(&settings)?;
+    // Single listener: extra [[server.endpoints]] do not apply to the
+    // standalone inference service. Its one listener is the primary.
     let app = inferio::http::standalone_router(Arc::clone(&state))
         .layer(TraceLayer::new_for_http())
-        .layer(policy::PolicyLayer::new(Arc::clone(&settings)));
+        .layer(policy::PolicyLayer::new(Arc::clone(&settings)))
+        .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
+            config::PRIMARY_ENDPOINT,
+        ))));
 
     let port = settings
         .inference_local

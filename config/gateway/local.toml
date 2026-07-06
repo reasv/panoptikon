@@ -19,6 +19,15 @@ port = 6342
 # If true, use X-Forwarded-Host / Forwarded to select policy host.
 trust_forwarded_headers = true
 
+# Test endpoint: same gateway, same routes, but the "test_endpoint" policy
+# below locks it to the "stdtest" DBs. Point coding agents (or a browser
+# preview) at http://127.0.0.1:6343 and everything they do defaults to —
+# and cannot leave — the stdtest index/user-data DBs, no manual DB
+# selection needed. (Missing DBs: POST http://127.0.0.1:6343/api/db/create)
+[[server.endpoints]]
+name = "test"
+port = 6343
+
 [upstreams.ui]
 # Next.js frontend base URL; with local = true this is also the host/port
 # the spawned `next start` binds to.
@@ -94,6 +103,24 @@ allow = [
 
 # --------- Policies ---------
 # Policies are checked in order. First match wins.
+
+# Requests arriving on the "test" endpoint (port 6343) are confined to the
+# "stdtest" DBs regardless of Host header. Must come before the localhost
+# policy: those requests would match it too, and first match wins.
+[[policies]]
+name = "test_endpoint"
+ruleset = "allow_all"
+
+[policies.match]
+endpoints = ["test"]
+
+[policies.index_db]
+default = "stdtest"
+allow = ["stdtest"]
+
+[policies.user_data_db]
+default = "stdtest"
+allow = ["stdtest"]
 
 [[policies]]
 name = "localhost"

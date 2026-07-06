@@ -29,9 +29,30 @@ added later.
 
 Paths, methods, headers, and bodies are forwarded as-is.
 
+## Listener endpoints
+
+The gateway can bind multiple listeners. `[server] host`/`port` is the
+primary listener, always named `default`; extra named listeners are declared
+as `[[server.endpoints]]` entries (`name`, `port`, and an optional `host`
+defaulting to `server.host`). Every listener serves the identical routes —
+the point of extra endpoints is policy routing: `[policies.match]` can match
+on `endpoints = ["name", ...]`, and the endpoint a request arrived on is
+determined by the TCP listener, so unlike `Host` matching it cannot be
+influenced by request headers and works with plain local ports. A typical
+use is a second loopback port whose policy defaults to (and is locked to) a
+dedicated test DB — anything pointed at that port operates on the test DB
+with no manual selection (`config/gateway/local.toml` ships this setup on
+port 6343). All listeners are bound before serving starts; if any bind
+fails, startup fails.
+
 ## Policy enforcement
 
-Policies are selected by host, then optionally restrict API routes via reusable
+Policies are selected by effective host and/or listener endpoint: in
+`[policies.match]`, an empty/omitted `hosts` or `endpoints` list matches
+anything, both non-empty means both must match, and at least one must be
+non-empty. Policies are checked in config order and the first match wins, so
+endpoint-scoped policies should be listed before broad host policies.
+Policies then optionally restrict API routes via reusable
 rulesets. DB-aware API routes always receive explicit `index_db` and
 `user_data_db` query parameters, and the gateway validates or rewrites them per
 policy (including optional multi-tenant prefixing).
@@ -368,6 +389,12 @@ level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 host = "0.0.0.0"
 port = 8080
 trust_forwarded_headers = false
+# Extra named listeners (the primary above is always endpoint "default");
+# policies can match on them via [policies.match] endpoints = [...]:
+# [[server.endpoints]]
+# name = "test"
+# port = 8081
+# # host = "127.0.0.1"  # default: server.host
 
 [upstreams.ui]
 base_url = "http://127.0.0.1:6339"

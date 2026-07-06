@@ -416,12 +416,35 @@ impl Settings {
     }
 }
 
+/// Name of the primary listener endpoint (`server.host`/`server.port`).
+/// Extra `[[server.endpoints]]` entries may not reuse it, and policies can
+/// reference it in `match.endpoints` to target the primary listener.
+pub const PRIMARY_ENDPOINT: &str = "default";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+    /// Extra named listener endpoints besides the primary `host`/`port`
+    /// (which is always the endpoint named "default"). Every listener serves
+    /// the identical routes; the difference is that policies can match on
+    /// the endpoint a request arrived on via `[policies.match] endpoints`.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointConfig>,
+}
+
+/// `[[server.endpoints]]`: an extra named listener. Unlike host matching,
+/// the endpoint identity comes from the TCP listener that accepted the
+/// connection, so request headers cannot influence it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EndpointConfig {
+    pub name: String,
+    /// Bind host. Default: `server.host`.
+    #[serde(default)]
+    pub host: Option<String>,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -589,9 +612,19 @@ pub struct PolicyConfig {
     pub identity: Option<IdentityConfig>,
 }
 
+/// `[policies.match]`: which requests a policy applies to. `hosts` matches
+/// the effective Host (header-derived, spoofable by clients that can set
+/// headers); `endpoints` matches the name of the listener endpoint the
+/// connection arrived on (physical, header-independent). An empty list
+/// means "any"; when both are non-empty, both must match. At least one of
+/// the two must be non-empty. Policies are checked in order and the first
+/// match wins, so endpoint-scoped policies belong before broad host ones.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyMatch {
+    #[serde(default)]
     pub hosts: Vec<String>,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -678,6 +711,18 @@ impl Settings {
         format!("{}:{}", self.server.host, self.server.port)
     }
 
+    /// Every listener the gateway binds: the primary (endpoint "default")
+    /// first, then the `[[server.endpoints]]` entries in config order, as
+    /// (endpoint name, bind address) pairs.
+    pub fn listener_addrs(&self) -> Vec<(String, String)> {
+        let mut addrs = vec![(PRIMARY_ENDPOINT.to_string(), self.listen_addr())];
+        for endpoint in &self.server.endpoints {
+            let host = endpoint.host.as_deref().unwrap_or(&self.server.host);
+            addrs.push((endpoint.name.clone(), format!("{}:{}", host, endpoint.port)));
+        }
+        addrs
+    }
+
     fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(value) = env::var("GATEWAY__SERVER_HOST") {
             self.server.host = value;
@@ -716,6 +761,7 @@ impl Settings {
     /// checked against the policies (see
     /// [`Settings::validate_loopback_inference_policy`]).
     fn validate(&self, loopback_synthesized: bool) -> Result<()> {
+        self.validate_endpoints()?;
         self.validate_rulesets()?;
         self.validate_policies()?;
         self.validate_inference_endpoints()?;
@@ -749,6 +795,36 @@ impl Settings {
         }
     }
 
+    fn validate_endpoints(&self) -> Result<()> {
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_addrs = std::collections::HashSet::new();
+        seen_addrs.insert((self.server.host.as_str(), self.server.port));
+        for endpoint in &self.server.endpoints {
+            if !is_safe_identifier(&endpoint.name, MAX_DB_NAME_LEN) {
+                anyhow::bail!("server.endpoints name '{}' is invalid", endpoint.name);
+            }
+            if endpoint.name == PRIMARY_ENDPOINT {
+                anyhow::bail!(
+                    "server.endpoints name '{PRIMARY_ENDPOINT}' is reserved for the primary \
+                     listener (server.host/server.port)"
+                );
+            }
+            if !seen_names.insert(endpoint.name.as_str()) {
+                anyhow::bail!("server.endpoints name '{}' is duplicated", endpoint.name);
+            }
+            let host = endpoint.host.as_deref().unwrap_or(&self.server.host);
+            if !seen_addrs.insert((host, endpoint.port)) {
+                anyhow::bail!(
+                    "server.endpoints '{}' binds {}:{}, which another listener already uses",
+                    endpoint.name,
+                    host,
+                    endpoint.port
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_rulesets(&self) -> Result<()> {
         for (name, ruleset) in &self.rulesets {
             for (idx, rule) in ruleset.allow.iter().enumerate() {
@@ -776,8 +852,32 @@ impl Settings {
 
     fn validate_policies(&self) -> Result<()> {
         for policy in &self.policies {
-            if policy.match_rule.hosts.is_empty() {
-                anyhow::bail!("policy '{}' must list at least one host", policy.name);
+            if policy.match_rule.hosts.is_empty() && policy.match_rule.endpoints.is_empty() {
+                anyhow::bail!(
+                    "policy '{}' must list at least one host or endpoint",
+                    policy.name
+                );
+            }
+            for endpoint in &policy.match_rule.endpoints {
+                let known = endpoint == PRIMARY_ENDPOINT
+                    || self
+                        .server
+                        .endpoints
+                        .iter()
+                        .any(|entry| &entry.name == endpoint);
+                if !known {
+                    anyhow::bail!(
+                        "policy '{}' references unknown endpoint '{}' (known: '{}'{})",
+                        policy.name,
+                        endpoint,
+                        PRIMARY_ENDPOINT,
+                        self.server
+                            .endpoints
+                            .iter()
+                            .map(|entry| format!(", '{}'", entry.name))
+                            .collect::<String>()
+                    );
+                }
             }
             if let Some(ruleset_name) = policy.ruleset.as_deref() {
                 if ruleset_name != "allow_all" && !self.rulesets.contains_key(ruleset_name) {
@@ -805,7 +905,9 @@ impl Settings {
     fn validate_loopback_inference_policy(&self) -> Result<()> {
         let host = crate::policy::normalize_host(loopback_host(&self.server.host));
         let base_url = &self.upstreams.inference[0].base_url;
-        let Some(policy) = crate::policy::select_policy(self, Some(&host)) else {
+        // Self-calls dial server.host:server.port, i.e. the primary listener.
+        let Some(policy) = crate::policy::select_policy(self, Some(&host), Some(PRIMARY_ENDPOINT))
+        else {
             anyhow::bail!(
                 "inference_local.enabled synthesized a loopback inference upstream ({base_url}) \
                  because upstreams.inference is empty, but no policy matches host '{host}' — \
@@ -1526,6 +1628,153 @@ base_url = "http://127.0.0.1:6342"
     }
 
     use crate::test_utils::env_lock;
+
+    /// `[[server.endpoints]]` parse (host defaults to `server.host`), and
+    /// `listener_addrs` lists the primary listener first under its reserved
+    /// name "default". Sharing a port across different hosts is allowed.
+    #[test]
+    fn server_endpoints_parse_and_listener_addrs() {
+        let settings = load_from(&format!(
+            r#"{MINIMAL}
+[[server.endpoints]]
+name = "test"
+port = 9156
+
+[[server.endpoints]]
+name = "lan"
+host = "192.168.1.5"
+port = 9155
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.listener_addrs(),
+            vec![
+                ("default".to_string(), "127.0.0.1:9155".to_string()),
+                ("test".to_string(), "127.0.0.1:9156".to_string()),
+                ("lan".to_string(), "192.168.1.5:9155".to_string()),
+            ]
+        );
+
+        // No endpoints configured: just the primary.
+        let settings = load_from(MINIMAL).unwrap();
+        assert_eq!(
+            settings.listener_addrs(),
+            vec![("default".to_string(), "127.0.0.1:9155".to_string())]
+        );
+    }
+
+    /// Endpoint misconfigurations fail at load: the reserved primary name,
+    /// duplicate names, duplicate bind addresses (host defaulting counts),
+    /// policies referencing unknown endpoint names, and policies matching
+    /// neither hosts nor endpoints.
+    #[test]
+    fn endpoint_validation_errors() {
+        let expect_err = |body: String, needle: &str| {
+            let err = load_from(&body).expect_err(needle);
+            let text = format!("{err:#}");
+            assert!(text.contains(needle), "expected '{needle}' in: {text}");
+        };
+
+        expect_err(
+            format!("{MINIMAL}\n[[server.endpoints]]\nname = \"default\"\nport = 9156\n"),
+            "reserved",
+        );
+        expect_err(
+            format!(
+                "{MINIMAL}\n[[server.endpoints]]\nname = \"test\"\nport = 9156\n\n\
+                 [[server.endpoints]]\nname = \"test\"\nport = 9157\n"
+            ),
+            "duplicated",
+        );
+        // Same port as the primary listener with the host defaulted.
+        expect_err(
+            format!("{MINIMAL}\n[[server.endpoints]]\nname = \"test\"\nport = 9155\n"),
+            "another listener already uses",
+        );
+        expect_err(
+            format!(
+                r#"{MINIMAL}
+[[policies]]
+name = "typo"
+
+[policies.match]
+endpoints = ["tset"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            ),
+            "unknown endpoint 'tset'",
+        );
+        expect_err(
+            format!(
+                r#"{MINIMAL}
+[[policies]]
+name = "matchless"
+
+[policies.match]
+hosts = []
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            ),
+            "at least one host or endpoint",
+        );
+    }
+
+    /// The synthesized loopback inference self-call arrives on the primary
+    /// listener, so an endpoint-scoped policy covering endpoint "default"
+    /// satisfies the load-time policy check even without any host match —
+    /// and one scoped to a different endpoint does not.
+    #[test]
+    fn loopback_policy_check_uses_primary_endpoint() {
+        let body = |endpoint: &str| {
+            format!(
+                r#"{MINIMAL}
+[[server.endpoints]]
+name = "other"
+port = 9156
+
+[inference_local]
+enabled = true
+
+[[policies]]
+name = "scoped"
+
+[policies.match]
+endpoints = ["{endpoint}"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            )
+        };
+
+        load_from(&body("default")).expect("primary-endpoint policy covers self-calls");
+
+        let err = load_from(&body("other")).expect_err("policy misses the primary endpoint");
+        assert!(
+            format!("{err:#}").contains("no policy matches host"),
+            "{err:#}"
+        );
+    }
 
     /// The absorbed env vars became config keys with identical defaults:
     /// data_folder "data", index/user DB "default", readonly false,
