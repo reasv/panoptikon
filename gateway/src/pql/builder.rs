@@ -1047,7 +1047,9 @@ fn build_coalesced_expr(columns: &[Expr], order: Order, rrfs: Option<Vec<Rrf>>) 
         for (col, rrf) in columns.iter().zip(rrfs.iter()) {
             let rank = Func::coalesce([col.clone(), Expr::cust(VERY_LARGE_NUMBER)]);
             let denom = Expr::cust(rrf.k.to_string()).add(rank);
-            let term = Expr::cust("1")
+            // SQLite `/` on two integers is integer division, which truncates
+            // every RRF term to 0; a float numerator forces true division.
+            let term = Expr::cust("1.0")
                 .div(denom)
                 .mul(Expr::cust(rrf.weight.to_string()));
             total = Some(match total {
@@ -1391,6 +1393,90 @@ mod tests {
             partition_by,
             ..Default::default()
         }
+    }
+
+    // Regression: the UI's combined "anytext" query ORs multiple sortable
+    // filters with RRF. SQLite integer division made every RRF term 0, so
+    // ordering silently fell back to last_modified.
+    #[test]
+    fn rrf_order_by_uses_float_division() {
+        let json = serde_json::json!({
+            "query": {
+                "and_": [
+                    {
+                        "or_": [
+                            {
+                                "order_by": true,
+                                "direction": "desc",
+                                "priority": 100,
+                                "row_n_direction": "asc",
+                                "row_n": true,
+                                "rrf": {"k": 10, "weight": 0.5},
+                                "match_text": {
+                                    "match": "hello",
+                                    "raw_fts5_match": false,
+                                    "setters": [],
+                                    "languages": [],
+                                    "min_language_confidence": 0,
+                                    "min_confidence": 0,
+                                    "min_length": 0,
+                                    "max_length": 0
+                                }
+                            },
+                            {
+                                "order_by": true,
+                                "direction": "desc",
+                                "priority": 100,
+                                "row_n_direction": "asc",
+                                "row_n": true,
+                                "rrf": {"k": 10, "weight": 0.6},
+                                "text_embeddings": {
+                                    "query": "hello",
+                                    "model": "textembed/test",
+                                    "distance_aggregation": "MIN",
+                                    "src_text": null,
+                                    "embed": {"cache_key": "search", "lru_size": 1, "ttl_seconds": 60}
+                                }
+                            }
+                        ]
+                    }
+                ],
+            },
+            "order_by": [
+                {"order_by": "last_modified", "order": "desc", "priority": 0}
+            ],
+            "select": ["sha256", "path", "last_modified", "type", "width", "height", "blurhash"],
+            "entity": "file",
+            "page": 1,
+            "page_size": 10,
+            "count": true,
+            "results": true,
+            "check_path": false
+        });
+        let mut query: PqlQuery = serde_json::from_value(json).expect("deserialize PqlQuery");
+        // Bypass async embedding: inject a fake embedding and drop `embed`
+        if let Some(QueryElement::And(and_op)) = &mut query.query {
+            for el in &mut and_op.and_ {
+                if let QueryElement::Or(or_op) = el {
+                    for sub in &mut or_op.or_ {
+                        if let QueryElement::SemanticTextSearch(f) = sub {
+                            f.text_embeddings._embedding = Some(vec![0, 0, 0, 0]);
+                            f.text_embeddings.embed = None;
+                        }
+                    }
+                }
+            }
+        }
+        let built = build_query(query, false).expect("build");
+        let sql = match built.with_clause {
+            Some(with_clause) => built.query.with(with_clause).to_string(SqliteQueryBuilder),
+            None => built.query.to_string(SqliteQueryBuilder),
+        };
+        assert!(
+            sql.contains("(1.0) / ((10)"),
+            "RRF terms must use float division, got: {sql}"
+        );
+        assert!(!sql.contains("(1) / ((10)"), "integer division in RRF: {sql}");
     }
 
     #[test]
