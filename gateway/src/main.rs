@@ -1,3 +1,8 @@
+// rustc ≥1.94 overflows the default query depth computing the layout of
+// the largest async fn bodies (api::jobs::update_config); the compiler's
+// own suggestion is to raise the limit.
+#![recursion_limit = "256"]
+
 mod api;
 mod api_error;
 mod config;

@@ -63,22 +63,16 @@ impl Default for ScanOptions {
 }
 
 pub(crate) struct RescanResult {
+    // Only read by tests; production callers ignore the result.
+    #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
-    pub unavailable_files_deleted: u64,
-    pub orphan_items_deleted: u64,
-    pub rule_files_deleted: u64,
 }
 
 pub(crate) struct FolderUpdateResult {
-    pub included_deleted: u64,
-    pub excluded_deleted: u64,
+    // Only read by tests; production callers ignore the result.
+    #[allow(dead_code)]
     pub included_added: Vec<String>,
-    pub excluded_added: Vec<String>,
-    pub unavailable_files_deleted: u64,
-    pub excluded_folder_files_deleted: u64,
-    pub orphan_files_deleted: u64,
-    pub orphan_items_deleted: u64,
-    pub rule_files_deleted: u64,
+    #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
 }
 
@@ -99,6 +93,8 @@ impl FileScanService {
         }
     }
 
+    // Only used by tests, which need an explicit data_dir and worker count.
+    #[allow(dead_code)]
     pub(crate) fn new(
         index_db: impl Into<String>,
         user_data_db: impl Into<String>,
@@ -172,19 +168,14 @@ impl FileScanService {
             || orphan_thumbnails_deleted > 0;
         run_post_job_maintenance(&self.index_db, vacuum).await;
 
-        Ok(RescanResult {
-            scan_ids,
-            unavailable_files_deleted,
-            orphan_items_deleted,
-            rule_files_deleted,
-        })
+        Ok(RescanResult { scan_ids })
     }
 
     pub(crate) async fn run_folder_update(&self) -> ApiResult<FolderUpdateResult> {
         let config = self.config_store.load(&self.index_db)?;
         self.config_store.save(&self.index_db, &config)?;
 
-        let included_deleted = call_index_db_writer(&self.index_db, |reply| {
+        call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteFoldersNotInList {
                 folder_paths: config.included_folders.clone(),
                 included: true,
@@ -192,7 +183,7 @@ impl FileScanService {
             }
         })
         .await?;
-        let excluded_deleted = call_index_db_writer(&self.index_db, |reply| {
+        call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::DeleteFoldersNotInList {
                 folder_paths: config.excluded_folders.clone(),
                 included: false,
@@ -219,9 +210,8 @@ impl FileScanService {
                 included_added.push(folder.clone());
             }
         }
-        let mut excluded_added = Vec::new();
         for folder in &config.excluded_folders {
-            let inserted = call_index_db_writer(&self.index_db, |reply| {
+            call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::AddFolderToDatabase {
                     time_added: scan_time.clone(),
                     path: folder.clone(),
@@ -230,9 +220,6 @@ impl FileScanService {
                 }
             })
             .await?;
-            if inserted {
-                excluded_added.push(folder.clone());
-            }
         }
 
         // Folder registration and scanning are separate committed writes, so
@@ -324,15 +311,7 @@ impl FileScanService {
         run_post_job_maintenance(&self.index_db, vacuum).await;
 
         Ok(FolderUpdateResult {
-            included_deleted,
-            excluded_deleted,
             included_added,
-            excluded_added,
-            unavailable_files_deleted,
-            excluded_folder_files_deleted,
-            orphan_files_deleted,
-            orphan_items_deleted,
-            rule_files_deleted,
             scan_ids,
         })
     }
@@ -1322,7 +1301,6 @@ pub(crate) struct PreparedFile {
     pub(crate) path: PathBuf,
     pub(crate) last_modified: String,
     pub(crate) file_size: i64,
-    pub(crate) md5: String,
     pub(crate) sha256: String,
     pub(crate) mime_type: String,
     pub(crate) metadata: ItemScanMeta,
@@ -1341,10 +1319,6 @@ pub(crate) struct FileWriteData {
     pub(crate) data: FileScanData,
     pub(crate) new_file_timestamp: bool,
     pub(crate) new_file_hash: bool,
-    pub(crate) hash_time: f64,
-    pub(crate) metadata_time: f64,
-    pub(crate) thumb_time: f64,
-    pub(crate) blurhash_time: f64,
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
@@ -1367,10 +1341,6 @@ impl FileWriteData {
             data,
             new_file_timestamp,
             new_file_hash,
-            hash_time: prepared.hash_time,
-            metadata_time: prepared.metadata_time,
-            thumb_time: prepared.thumb_time,
-            blurhash_time: prepared.blurhash_time,
             thumbnails: prepared.thumbnails,
             frames: prepared.frames,
             blurhash: prepared.blurhash,
@@ -1453,9 +1423,11 @@ pub(crate) async fn build_file_scan_data(
 
 #[derive(Debug)]
 pub(crate) enum FileProcessError {
-    Worker(String),
-    Io(String),
-    Unsupported(String),
+    // The String payloads are only read through the derived Debug impl when
+    // scan errors are logged, which the dead_code lint doesn't count.
+    Worker(#[allow(dead_code)] String),
+    Io(#[allow(dead_code)] String),
+    Unsupported(#[allow(dead_code)] String),
     /// The file was rejected by the user's filescan filter.
     Filtered,
     /// The file's mtime matches the DB record, so hashing was skipped.
@@ -1520,7 +1492,6 @@ pub(crate) fn process_file(
         path,
         last_modified,
         file_size,
-        md5,
         sha256,
         mime_type,
         metadata,
@@ -2575,19 +2546,24 @@ fn extract_video_frames_into(
     Ok(frames)
 }
 
+// Unread fields mirror the ffprobe JSON schema and are kept for Debug output.
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    #[allow(dead_code)]
     index: Option<u64>,
     codec_type: Option<String>,
+    #[allow(dead_code)]
     codec_name: Option<String>,
     duration: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
+    #[allow(dead_code)]
     tags: Option<FfprobeTags>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FfprobeTags {
+    #[allow(dead_code)]
     language: Option<String>,
 }
 

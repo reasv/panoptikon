@@ -23,8 +23,11 @@ pub(crate) struct PqlBuilderResult {
     pub(crate) extra_columns: HashMap<String, String>,
 }
 
+// pub(crate): exposed through `FilterCompiler::build` in the filters
+// submodule (the `private_interfaces` lint flags the narrower visibility,
+// and rendering those diagnostics ICEs rustc 1.94).
 #[derive(Clone, Debug)]
-struct CteRef {
+pub(crate) struct CteRef {
     name: String,
 }
 
@@ -66,8 +69,9 @@ struct OrderByFilter {
     rrf: Option<Rrf>,
 }
 
+// pub(crate) for the same reason as CteRef.
 #[derive(Clone, Debug)]
-struct QueryState {
+pub(crate) struct QueryState {
     order_list: Vec<OrderByFilter>,
     extra_columns: Vec<ExtraColumn>,
     selects: HashMap<String, FilterSelect>,
@@ -132,16 +136,6 @@ impl SelectedColumns {
     fn push(&mut self, name: &str) {
         if self.seen.insert(name.to_string()) {
             self.order.push(name.to_string());
-        }
-    }
-
-    fn extend<I>(&mut self, names: I)
-    where
-        I: IntoIterator,
-        I::Item: AsRef<str>,
-    {
-        for name in names {
-            self.push(name.as_ref());
         }
     }
 }

@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use utoipa::IntoParams;
 
+// OpenAPI documentation only: handlers extract these via the DbConnection
+// extractor, so the fields are never read directly.
+#[allow(dead_code)]
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub(crate) struct DbQueryParams {

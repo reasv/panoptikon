@@ -188,7 +188,6 @@ pub(crate) enum ContinuousScanMessage {
         scan_time: String,
         result: Result<PreparedFile, FileProcessError>,
     },
-    Shutdown,
 }
 
 pub(crate) struct ContinuousScanActor;
@@ -752,7 +751,7 @@ impl Actor for ContinuousScanActor {
 
     async fn handle(
         &self,
-        myself: ActorRef<Self::Msg>,
+        _myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -1126,10 +1125,6 @@ impl Actor for ContinuousScanActor {
                         state.stats.errors += 1;
                     }
                 }
-            }
-            ContinuousScanMessage::Shutdown => {
-                let _ = state.close_scan().await;
-                myself.stop(None);
             }
         }
         Ok(())

@@ -553,7 +553,7 @@ impl SemanticImageSearch {
 }
 
 impl SimilarTo {
-    fn validate_sync(mut self) -> Result<Option<Self>, PqlError> {
+    fn validate_sync(self) -> Result<Option<Self>, PqlError> {
         if self.similar_to.target.trim().is_empty() {
             return Ok(None);
         }

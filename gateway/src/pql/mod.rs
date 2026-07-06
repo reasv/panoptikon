@@ -5,8 +5,7 @@ pub(crate) mod preprocess;
 pub(crate) mod utils;
 
 pub(crate) use builder::{PqlBuilderResult, build_query, build_query_preprocessed};
-pub(crate) use model::{JobFilter, PqlQuery, QueryElement};
 pub(crate) use preprocess::{
     EmbeddingCacheEntry, EmbeddingCacheStats, PqlError, clear_embedding_cache,
-    embedding_cache_stats, preprocess_query, preprocess_query_async,
+    embedding_cache_stats, preprocess_query_async,
 };

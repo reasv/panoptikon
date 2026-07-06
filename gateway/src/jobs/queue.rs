@@ -574,7 +574,6 @@ async fn execute_job(job: Job) -> Result<(), String> {
         }
         #[cfg(test)]
         JobType::TestPanic => panic!("test job panic"),
-        _ => Err("Job type not implemented".to_string()),
     }
 }
 

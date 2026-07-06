@@ -33,7 +33,6 @@ pub(crate) struct FileScanData {
 }
 
 pub(crate) struct FilePathRecord {
-    pub id: i64,
     pub sha256: String,
     pub last_modified: String,
 }
@@ -41,7 +40,6 @@ pub(crate) struct FilePathRecord {
 pub(crate) struct FileDeleteInfo {
     pub item_id: i64,
     pub scan_id: i64,
-    pub sha256: String,
 }
 
 pub(crate) struct FileUpsertResult {
@@ -57,7 +55,7 @@ pub(crate) async fn get_file_by_path(
 ) -> ApiResult<Option<FilePathRecord>> {
     let row = sqlx::query(
         r#"
-SELECT files.id AS file_id, files.sha256 AS sha256, files.last_modified AS last_modified
+SELECT files.sha256 AS sha256, files.last_modified AS last_modified
 FROM files
 JOIN items ON files.sha256 = items.sha256
 WHERE files.path = ?1
@@ -76,10 +74,6 @@ LIMIT 1
         return Ok(None);
     };
 
-    let id: i64 = row.try_get("file_id").map_err(|err| {
-        tracing::error!(error = %err, "failed to read file id");
-        ApiError::internal("Failed to query file")
-    })?;
     let sha256: String = row.try_get("sha256").map_err(|err| {
         tracing::error!(error = %err, "failed to read file sha256");
         ApiError::internal("Failed to query file")
@@ -90,7 +84,6 @@ LIMIT 1
     })?;
 
     Ok(Some(FilePathRecord {
-        id,
         sha256,
         last_modified,
     }))
@@ -121,7 +114,7 @@ pub(crate) async fn get_file_delete_info(
 ) -> ApiResult<Option<FileDeleteInfo>> {
     let row = sqlx::query(
         r#"
-SELECT files.item_id AS item_id, files.scan_id AS scan_id, files.sha256 AS sha256
+SELECT files.item_id AS item_id, files.scan_id AS scan_id
 FROM files
 WHERE files.path = ?1
 LIMIT 1
@@ -147,16 +140,8 @@ LIMIT 1
         tracing::error!(error = %err, "failed to read file scan_id");
         ApiError::internal("Failed to query file")
     })?;
-    let sha256: String = row.try_get("sha256").map_err(|err| {
-        tracing::error!(error = %err, "failed to read file sha256");
-        ApiError::internal("Failed to query file")
-    })?;
 
-    Ok(Some(FileDeleteInfo {
-        item_id,
-        scan_id,
-        sha256,
-    }))
+    Ok(Some(FileDeleteInfo { item_id, scan_id }))
 }
 
 pub(crate) async fn count_files_for_item(

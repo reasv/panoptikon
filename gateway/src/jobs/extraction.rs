@@ -42,6 +42,9 @@ const CACHE_TTL_SECS: i64 = 60;
 #[derive(Debug, Clone)]
 pub(crate) struct ModelMetadata {
     pub group: String,
+    // Mirrors the inference server's model metadata (Python parity); kept for
+    // Debug logging even though nothing reads it directly.
+    #[allow(dead_code)]
     pub inference_id: String,
     pub setter_name: String,
     pub input_handler: String,
@@ -52,8 +55,12 @@ pub(crate) struct ModelMetadata {
     pub default_threshold: Option<f64>,
     pub input_mime_types: Vec<String>,
     pub skip_processed_items: bool,
+    // Informational metadata mirrored from the inference server's config.
+    #[allow(dead_code)]
     pub name: Option<String>,
+    #[allow(dead_code)]
     pub description: Option<String>,
+    #[allow(dead_code)]
     pub link: Option<String>,
 }
 
@@ -67,8 +74,12 @@ struct JobInputData {
     last_modified: String,
     item_type: String,
     duration: Option<f64>,
+    // Loaded from the item row for parity with Python's job input record;
+    // available to input handlers even though none read them yet.
+    #[allow(dead_code)]
     audio_tracks: Option<i64>,
     video_tracks: Option<i64>,
+    #[allow(dead_code)]
     subtitle_tracks: Option<i64>,
     width: Option<i64>,
     height: Option<i64>,
@@ -1028,7 +1039,7 @@ pub(crate) fn resolve_model_metadata(
 }
 
 fn merge_metadata(
-    mut group_metadata: Value,
+    group_metadata: Value,
     inference_metadata: Value,
 ) -> serde_json::Map<String, Value> {
     let mut merged = match group_metadata {

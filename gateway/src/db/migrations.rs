@@ -7,8 +7,6 @@ use sqlx::{
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 static INDEX_MIGRATOR: Migrator = sqlx::migrate!("migrations/index");
@@ -26,12 +24,6 @@ const INDEX_ALEMBIC_HEAD: &str = "b2c3d4e5f6a7";
 const STORAGE_ALEMBIC_HEAD: &str = "31adcda83d69";
 const USER_DATA_ALEMBIC_HEAD: &str = "31adcda83d69";
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MigrationTarget {
-    Disk,
-    Memory,
-}
-
 #[derive(Debug)]
 pub(crate) struct DbPaths {
     pub index_db: String,
@@ -41,20 +33,15 @@ pub(crate) struct DbPaths {
     pub user_db_file: PathBuf,
 }
 
+#[cfg(test)]
 pub(crate) struct InMemoryDatabases {
-    pub index_db: String,
-    pub user_data_db: String,
-    pub index_key: String,
-    pub storage_key: String,
-    pub user_data_key: String,
     pub index_conn: SqliteConnection,
+    // Held open so the shared-cache in-memory databases attached to
+    // index_conn survive for the lifetime of the test.
+    #[allow(dead_code)]
     pub storage_conn: SqliteConnection,
+    #[allow(dead_code)]
     pub user_data_conn: SqliteConnection,
-}
-
-pub(crate) enum MigratedDatabases {
-    Disk(DbPaths),
-    Memory(InMemoryDatabases),
 }
 
 pub(crate) async fn migrate_databases_on_disk(
@@ -133,27 +120,6 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
     }
 
     Ok(())
-}
-
-pub(crate) async fn migrate_databases(
-    index_db: Option<&str>,
-    user_data_db: Option<&str>,
-    target: MigrationTarget,
-) -> Result<MigratedDatabases> {
-    let (default_index, default_user) = db_default_names();
-    let index_db = index_db.unwrap_or(&default_index).to_string();
-    let user_data_db = user_data_db.unwrap_or(&default_user).to_string();
-
-    match target {
-        MigrationTarget::Disk => {
-            let paths = migrate_databases_on_disk(Some(&index_db), Some(&user_data_db)).await?;
-            Ok(MigratedDatabases::Disk(paths))
-        }
-        MigrationTarget::Memory => {
-            let dbs = migrate_in_memory(index_db, user_data_db).await?;
-            Ok(MigratedDatabases::Memory(dbs))
-        }
-    }
 }
 
 fn db_default_names() -> (String, String) {
@@ -340,7 +306,11 @@ async fn has_user_tables(conn: &mut SqliteConnection) -> Result<bool> {
     Ok(row.is_some())
 }
 
+#[cfg(test)]
 async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InMemoryDatabases> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     static MEMORY_KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let suffix = SystemTime::now()
@@ -405,17 +375,13 @@ async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InM
         .context("failed to enable case_sensitive_like for in-memory index db")?;
 
     Ok(InMemoryDatabases {
-        index_db,
-        user_data_db,
-        index_key,
-        storage_key,
-        user_data_key,
         index_conn,
         storage_conn,
         user_data_conn,
     })
 }
 
+#[cfg(test)]
 fn memory_key(label: &str, suffix: &str) -> String {
     let mut normalized = String::with_capacity(label.len());
     for ch in label.chars() {
@@ -430,13 +396,10 @@ fn memory_key(label: &str, suffix: &str) -> String {
 
 #[cfg(test)]
 pub(crate) async fn setup_test_databases() -> InMemoryDatabases {
-    match migrate_databases(None, None, MigrationTarget::Memory)
+    let (index_db, user_data_db) = db_default_names();
+    migrate_in_memory(index_db, user_data_db)
         .await
         .expect("failed to create in-memory test databases")
-    {
-        MigratedDatabases::Memory(databases) => databases,
-        MigratedDatabases::Disk(_) => unreachable!("expected in-memory databases for tests"),
-    }
 }
 
 #[cfg(test)]

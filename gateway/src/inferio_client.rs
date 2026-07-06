@@ -59,10 +59,6 @@ const PREDICT_MIN_DELAY: Duration = Duration::from_secs(1);
 const PREDICT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 impl InferenceApiClient {
-    pub fn new(base_url: impl Into<String>) -> Result<Self> {
-        Self::new_with_metadata_cache(base_url, true)
-    }
-
     pub fn new_with_metadata_cache(
         base_url: impl Into<String>,
         cache_metadata: bool,
@@ -83,10 +79,6 @@ impl InferenceApiClient {
         })
     }
 
-    pub fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::from_settings_with_metadata_cache(settings, true)
-    }
-
     pub fn from_settings_with_metadata_cache(
         settings: &Settings,
         cache_metadata: bool,
@@ -97,10 +89,6 @@ impl InferenceApiClient {
             .first()
             .context("inference upstream missing from settings")?;
         Self::new_with_metadata_cache(inference.base_url.clone(), cache_metadata)
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
     }
 
     pub async fn predict(
@@ -235,6 +223,8 @@ impl InferenceApiClient {
         parse_json_response(response).await
     }
 
+    // Only exercised by the inferio HTTP tests; mirrors the Python client API.
+    #[allow(dead_code)]
     pub async fn get_cached_models(&self) -> Result<Value> {
         let url = format!("{}/cache", self.base_url);
         let response = self

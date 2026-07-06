@@ -18,7 +18,6 @@ use crate::api_error::ApiError;
 
 pub struct ReadOnly;
 pub struct UserDataWrite;
-pub struct SystemWrite;
 
 pub(crate) trait DbMode {
     const WRITE_LOCK: bool;
@@ -35,11 +34,6 @@ impl DbMode for UserDataWrite {
     const USER_DATA_WL: bool = true;
 }
 
-impl DbMode for SystemWrite {
-    const WRITE_LOCK: bool = true;
-    const USER_DATA_WL: bool = false;
-}
-
 pub struct DbConnection<M: DbMode> {
     pub conn: SqliteConnection,
     pub index_db: String,
@@ -53,14 +47,6 @@ pub(crate) async fn open_index_db_read(
 ) -> Result<SqliteConnection, ApiError> {
     let paths = db_paths(index_db, user_data_db)?;
     connect_db(&paths, false, false, true).await
-}
-
-pub(crate) async fn open_index_db_write(
-    index_db: &str,
-    user_data_db: &str,
-) -> Result<SqliteConnection, ApiError> {
-    let paths = db_paths(index_db, user_data_db)?;
-    connect_db(&paths, true, false, true).await
 }
 
 pub(crate) async fn open_index_db_read_no_user_data(
@@ -135,18 +121,6 @@ fn db_default_names() -> (String, String) {
     let index_default = env::var("INDEX_DB").unwrap_or_else(|_| "default".to_string());
     let user_default = env::var("USER_DATA_DB").unwrap_or_else(|_| "default".to_string());
     (index_default, user_default)
-}
-
-pub(crate) fn db_paths_unchecked(index_db: &str, user_data_db: &str) -> DbPaths {
-    let index_paths = index_storage_paths_unchecked(index_db);
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
-    let user_data_db_dir = data_dir.join("user_data");
-
-    DbPaths {
-        index_db_file: index_paths.index_db_file,
-        storage_db_file: index_paths.storage_db_file,
-        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
-    }
 }
 
 pub(crate) fn index_storage_paths_unchecked(index_db: &str) -> IndexStoragePaths {
