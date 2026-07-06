@@ -871,8 +871,8 @@ config.impl_class = "echo_test"
 
     // ------------------------------------------------------------------
     // Eager DB selection, against real on-disk index DBs (the same
-    // migrate_databases_on_disk + DATA_FOLDER fixture the continuous-scan
-    // tests use).
+    // migrate_databases_on_disk + test data-folder fixture the
+    // continuous-scan tests use).
     // ------------------------------------------------------------------
 
     fn unique_db_name(prefix: &str) -> String {

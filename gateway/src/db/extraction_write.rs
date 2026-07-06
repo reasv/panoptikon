@@ -1,5 +1,3 @@
-use std::env;
-
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::FormatItem};
 
@@ -52,10 +50,7 @@ pub(crate) struct EmbeddingEntry {
 }
 
 pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    let atomic_enabled = match env::var("ATOMIC_EXTRACTION_JOBS") {
-        Ok(value) => !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0"),
-        Err(_) => false,
-    };
+    let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
     if !atomic_enabled {
         sqlx::query(

@@ -5,7 +5,7 @@ use sqlx::{
     sqlite::SqliteConnectOptions,
 };
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -69,7 +69,7 @@ pub(crate) async fn migrate_databases_on_disk(
 }
 
 pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let data_dir = crate::config::runtime().data_folder.clone();
     let index_db_dir = data_dir.join("index");
     let user_data_db_dir = data_dir.join("user_data");
 
@@ -123,13 +123,12 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
 }
 
 fn db_default_names() -> (String, String) {
-    let index_default = env::var("INDEX_DB").unwrap_or_else(|_| "default".to_string());
-    let user_default = env::var("USER_DATA_DB").unwrap_or_else(|_| "default".to_string());
-    (index_default, user_default)
+    let runtime = crate::config::runtime();
+    (runtime.index_db.clone(), runtime.user_data_db.clone())
 }
 
 fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let data_dir = crate::config::runtime().data_folder.clone();
     let index_db_dir = data_dir.join("index");
     let user_data_db_dir = data_dir.join("user_data");
 

@@ -27,18 +27,34 @@ class JinaClipModel(InferenceModel):
     def __init__(
         self,
         model_name: str = "jina-clip-v2",
+        api_key: Union[str, None] = None,
+        max_retries: Union[int, str, None] = None,
+        timeout: Union[int, str, None] = None,
         **kwargs: Union[int, str, bool],
     ):
         """
         :param model_name: Name of the Jina model to use, e.g. "jina-clip-v2".
+        :param api_key: Jina API key. Falls back to the JINA_API_KEY
+            environment variable when not given (registry configs can set
+            `config.api_key = "${JINA_API_KEY}"` to pass it explicitly).
+        :param max_retries: Retry count for the API request. Falls back to
+            the JINA_MAX_RETRIES environment variable, then 3.
+        :param timeout: Request timeout in seconds (0 disables). Falls back
+            to the JINA_TIMEOUT environment variable, then no timeout.
         :param dimensions: The number of dimensions in the returned embeddings.
         :param normalized: Whether or not the embeddings should be normalized.
         :param embedding_type: The numeric type of the embeddings: "float" or "int".
         """
         self.model_name = model_name
+        self.api_key = api_key
+        self.max_retries = max_retries
+        self.timeout = timeout
         self.model_config = kwargs
 
         self._model_loaded: bool = False
+
+    def _resolve_api_key(self) -> Union[str, None]:
+        return self.api_key or os.environ.get("JINA_API_KEY")
 
     @classmethod
     def name(cls) -> str:
@@ -52,12 +68,13 @@ class JinaClipModel(InferenceModel):
         if self._model_loaded:
             return
 
-        # Ensure the JINA_API_KEY environment variable is set
-        api_key = os.environ.get("JINA_API_KEY")
+        # Ensure an API key is available (config kwarg or env var)
+        api_key = self._resolve_api_key()
         if not api_key:
             raise EnvironmentError(
-                "JINA_API_KEY environment variable not found. "
-                "Please set it before using JinaClipModel."
+                "No Jina API key found. Set the api_key config option or "
+                "the JINA_API_KEY environment variable before using "
+                "JinaClipModel."
             )
 
         self._model_loaded = True
@@ -123,7 +140,7 @@ class JinaClipModel(InferenceModel):
             return []
 
         # Make the request
-        api_key = os.environ["JINA_API_KEY"]  # already checked in load()
+        api_key = self._resolve_api_key()  # already checked in load()
         url = "https://api.jina.ai/v1/embeddings"
         headers = {
             "Content-Type": "application/json",
@@ -138,8 +155,19 @@ class JinaClipModel(InferenceModel):
 
         # Attempt the request up to 3 times if we detect
         # network failures or 5xx server errors
-        max_retries = int(os.environ.get("JINA_MAX_RETRIES", 3))
-        timeout = int(os.environ.get("JINA_TIMEOUT", 0)) or None
+        max_retries = int(
+            self.max_retries
+            if self.max_retries is not None
+            else os.environ.get("JINA_MAX_RETRIES", 3)
+        )
+        timeout = (
+            int(
+                self.timeout
+                if self.timeout is not None
+                else os.environ.get("JINA_TIMEOUT", 0)
+            )
+            or None
+        )
         response = None
         for attempt in range(max_retries):
             try:

@@ -91,11 +91,7 @@ impl InferioState {
                      the user config dir only (registry may be empty)"
                 );
                 RegistryConfig {
-                    config_dirs: vec![
-                        std::env::var_os("INFERIO_CONFIG_DIR")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| std::path::PathBuf::from("config/inference")),
-                    ],
+                    config_dirs: vec![std::path::PathBuf::from("config/inference")],
                 }
             })
         } else {
@@ -1192,9 +1188,8 @@ config.impl_class = "echo_test"
             InferenceLocalConfig, Settings, UpstreamConfig, UpstreamsConfig,
         };
 
-        // Force the default-dirs error path deterministically: no env
-        // override, and no src/inferio/config relative to the test CWD.
-        unsafe { std::env::remove_var("BASE_INFERENCE_CONFIG_FOLDER") };
+        // Force the default-dirs error path deterministically: no
+        // src/inferio/config relative to the test CWD.
         assert!(
             !std::path::Path::new("src/inferio/config").is_dir(),
             "test premise: the built-in config dir is absent from the crate CWD"
@@ -1220,6 +1215,13 @@ config.impl_class = "echo_test"
                 },
                 inference: Vec::new(),
             },
+            data_folder: std::path::PathBuf::from("data"),
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            readonly: false,
+            temp_dir: std::path::PathBuf::from("data/tmp"),
+            logging: Default::default(),
+            open: Default::default(),
             search: Default::default(),
             jobs: Default::default(),
             rulesets: Default::default(),

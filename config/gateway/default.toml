@@ -1,5 +1,57 @@
 # Panoptikon Gateway default configuration
 # The Gateway loads [cwd]/config/gateway/default.toml by default.
+#
+# --------- Environment variable templating ---------
+# String values may reference environment variables (populated e.g. via the
+# auto-loaded .env file), following the shell/docker-compose conventions:
+#
+#   api_key = "${MY_API_KEY}"            # hard error if MY_API_KEY is unset
+#                                        #   (set-but-empty yields "")
+#   level   = "${LOGLEVEL:-INFO}"        # "INFO" when LOGLEVEL is unset OR
+#                                        #   set but empty (a "LOGLEVEL="
+#                                        #   .env line still gets INFO)
+#   opts    = "${EXTRA_OPTS-none}"       # "none" only when unset; empty
+#                                        #   stays ""
+#   literal = "costs $${notavar}"        # $${ escapes to a literal ${
+#
+# Substitution runs on parsed string values (backslashes in env values are
+# safe) and applies to this file and to every inference registry TOML.
+# Numbers/booleans cannot be templated; use the GATEWAY__* env override
+# layer for those (e.g. GATEWAY__SERVER__PORT=8080). GATEWAY__* override
+# values themselves are never templated — they are taken literally.
+
+# Root folder for all persistent state (index DBs, user data, thumbnails,
+# logs), relative to the working directory unless absolute.
+# data_folder = "data"
+
+# Default database names used when neither the request nor the matched
+# policy picks one.
+# index_db = "default"
+# user_data_db = "default"
+
+# Read-only mode: strips write locks and skips startup migrations.
+# readonly = false
+
+# Scratch directory for extraction intermediates (video frames, rendered
+# pages). Note: the default is literally "data/tmp", not derived from
+# data_folder.
+# temp_dir = "data/tmp"
+
+[logging]
+# Log file path. Default: <data_folder>/panoptikon-gateway.log.
+# An explicit empty string ("") disables file logging (console only).
+# file = ""
+# Default log level / tracing filter. The RUST_LOG environment variable
+# takes precedence when set (per-module directives supported).
+level = "${LOGLEVEL:-INFO}"
+
+# Custom commands for the local /api/open endpoints. {path}, {folder} and
+# {filename} expand to the target file's quoted full path, parent directory
+# and file name. Unset: platform defaults (start/open/xdg-open, explorer).
+# An explicit empty string makes the endpoint a no-op.
+# [open]
+# file_command = "mpv {path}"
+# folder_command = "explorer /select, {path}"
 
 [server]
 # Bind address for the gateway listener.

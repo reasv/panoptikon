@@ -4,6 +4,12 @@
 # panoptikon-ui checkout next to this repo.
 # Run with: gateway --config config/gateway/local.toml
 
+[logging]
+# The .env file keeps auto-loading; LOGLEVEL set there (e.g. DEBUG) feeds
+# this key via env templating, exactly like the old LOGLEVEL env read did.
+# RUST_LOG still takes precedence when set.
+level = "${LOGLEVEL:-INFO}"
+
 [server]
 # Bind address for the gateway listener.
 host = "127.0.0.1"

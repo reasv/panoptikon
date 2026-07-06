@@ -7,6 +7,7 @@ mod api;
 mod api_error;
 mod config;
 mod db;
+mod env_template;
 mod inferio;
 mod inferio_client;
 mod jobs;
@@ -69,16 +70,23 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    // `.env` still auto-loads: it is how users populate the env vars that
+    // config templating (`${VAR}` in TOML values) references, and children
+    // (inference workers, the UI server) inherit it.
     dotenvy::dotenv().ok();
-    // The guard must stay alive for the whole process: dropping it flushes
-    // buffered file-log output.
-    let _log_guard = logging::init();
 
     let args = Args::parse();
     let config_path = args
         .config
         .or_else(|| env::var(config::CONFIG_PATH_ENV).ok().map(PathBuf::from));
+    // Config must load before logging init (logging is configured by
+    // [logging] now); a config-load error is reported on stderr by main.
     let settings = Arc::new(config::Settings::load(config_path)?);
+    config::install_runtime(&settings);
+    // The guard must stay alive for the whole process: dropping it flushes
+    // buffered file-log output.
+    let _log_guard = logging::init(&settings);
+    settings.log_warnings();
 
     if matches!(args.command, Some(Command::Inferio)) {
         return inferio_main(settings).await;
@@ -127,7 +135,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // When the gateway is the API server it owns the databases, so it runs
     // startup migrations like the Python server does (and, like Python,
-    // skips them in READONLY mode): the default databases are created if
+    // skips them in readonly mode): the default databases are created if
     // missing, then every other on-disk DB is brought up to date.
     // Python-created DBs are baselined, not re-migrated — see
     // db::migrations::ensure_baseline_if_needed.

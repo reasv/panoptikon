@@ -1419,13 +1419,11 @@ pub(crate) async fn ensure_continuous_supervisor()
 -> ApiResult<ActorRef<ContinuousScanSupervisorMessage>> {
     SUPERVISOR
         .get_or_try_init(|| async {
-            let data_dir = std::env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string());
+            let data_dir = crate::config::runtime().data_folder.clone();
             let (actor, _handle) = Actor::spawn(
                 Some("continuous-scan-supervisor".to_string()),
                 ContinuousScanSupervisor,
-                ContinuousScanSupervisorArgs {
-                    data_dir: PathBuf::from(data_dir),
-                },
+                ContinuousScanSupervisorArgs { data_dir },
             )
             .await
             .map_err(|err| {
