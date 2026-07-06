@@ -47,15 +47,24 @@
 //! `kill()`, and `handle_worker_death` runs once under the generation
 //! guard. Graceful shutdown is the opposite: in-flight windows finish,
 //! then every replica gets the graceful unload ladder, concurrently.
+//!
+//! The in-flight drain on graceful shutdown is bounded by `unload_grace`:
+//! `predict` itself has no deadline (how long a model legitimately takes is
+//! unknowable), so a worker wedged in a GPU kernel would otherwise hang the
+//! unload — and the manager's shutdown — forever. Once an unload has been
+//! decided the model is gone either way, so past the grace the stuck
+//! windows are aborted and their workers killed like the fatal path.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use futures_util::future::join_all;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput};
@@ -124,6 +133,11 @@ pub(crate) struct DispatcherContext {
     /// Shared health counters; the manager keeps the other Arc and reads
     /// them in `health()` without touching this task.
     pub stats: Arc<ModelStats>,
+    /// Bound on the graceful-unload drain of in-flight windows (the same
+    /// `unload_grace` the worker ladder uses). Predicts have no deadline of
+    /// their own, so this is what guarantees unload/shutdown converge when
+    /// a worker is wedged mid-predict (the stuck-CUDA case).
+    pub unload_grace: Duration,
 }
 
 /// Effective batch cap for one drain window (design §6, stateless):
@@ -289,21 +303,39 @@ pub(crate) async fn run_dispatcher(
             // replica going fatal *during* this drain is killed here; the
             // manager entry is already gone, so no death cleanup is needed
             // (and the generation guard would reject it anyway).
-            while let Some(finished) = in_flight.join_next().await {
-                match finished {
-                    Ok((worker, BatchOutcome::Continue)) => free.push(worker),
-                    Ok((worker, BatchOutcome::Fatal(message))) => {
-                        tracing::warn!(
+            //
+            // The drain is bounded by `unload_grace`: with no deadline on
+            // predict, a worker wedged in a GPU kernel would hang the drain
+            // — and manager shutdown — forever. Past the grace the stuck
+            // windows are aborted like the fatal path: their reply oneshots
+            // drop (callers observe an error) and the dropped Workers are
+            // reaped by kill_on_drop + the Job Object.
+            let drain = async {
+                while let Some(finished) = in_flight.join_next().await {
+                    match finished {
+                        Ok((worker, BatchOutcome::Continue)) => free.push(worker),
+                        Ok((worker, BatchOutcome::Fatal(message))) => {
+                            tracing::warn!(
+                                model = %ctx.inference_id,
+                                "replica died while draining for unload: {message}"
+                            );
+                            worker.kill().await;
+                        }
+                        Err(join_err) => tracing::error!(
                             model = %ctx.inference_id,
-                            "replica died while draining for unload: {message}"
-                        );
-                        worker.kill().await;
+                            "dispatch window task panicked during unload drain: {join_err}"
+                        ),
                     }
-                    Err(join_err) => tracing::error!(
-                        model = %ctx.inference_id,
-                        "dispatch window task panicked during unload drain: {join_err}"
-                    ),
                 }
+            };
+            if timeout(ctx.unload_grace, drain).await.is_err() {
+                tracing::warn!(
+                    model = %ctx.inference_id,
+                    grace_secs = ctx.unload_grace.as_secs(),
+                    stuck_windows = in_flight.len(),
+                    "in-flight predicts did not finish within the unload grace; killing their workers"
+                );
+                in_flight.shutdown().await;
             }
             // Then every replica gets the graceful unload -> terminate ->
             // kill ladder, concurrently (design §8: the LRU/TTL treats the

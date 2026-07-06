@@ -514,10 +514,13 @@ mod tests {
     /// cwd = repo root, PYTHONPATH=src, NO_CUDNN, fixture impl dir.
     fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
-        let python = if cfg!(windows) {
-            root.join(".venv/Scripts/python.exe")
-        } else {
-            root.join(".venv/bin/python")
+        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
+        // python with msgpack works), e.g. running the suite under WSL
+        // against a Windows checkout, whose .venv is a Windows venv.
+        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
+            Some(explicit) => PathBuf::from(explicit),
+            None if cfg!(windows) => root.join(".venv/Scripts/python.exe"),
+            None => root.join(".venv/bin/python"),
         };
         if !python.is_file() {
             panic!(

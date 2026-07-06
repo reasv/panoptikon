@@ -942,6 +942,7 @@ impl ModelManager {
             server_default_batch: self.cfg.default_max_batch,
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
             stats: Arc::clone(&stats),
+            unload_grace: self.cfg.spawn.deadlines.unload_grace,
         };
         // The dispatcher owns the whole WorkerSet (design §8): every
         // replica serves the one shared FIFO queue behind this sender.
@@ -1384,10 +1385,13 @@ config.impl_class = "cls"
     /// repo root, PYTHONPATH=src, NO_CUDNN, fixture impl dir.
     fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
-        let python = if cfg!(windows) {
-            root.join(".venv/Scripts/python.exe")
-        } else {
-            root.join(".venv/bin/python")
+        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
+        // python with msgpack works), e.g. running the suite under WSL
+        // against a Windows checkout, whose .venv is a Windows venv.
+        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
+            Some(explicit) => PathBuf::from(explicit),
+            None if cfg!(windows) => root.join(".venv/Scripts/python.exe"),
+            None => root.join(".venv/bin/python"),
         };
         if !python.is_file() {
             panic!(
@@ -1416,6 +1420,10 @@ config.impl_class = "echo_test"
 [group.slow]
 config.impl_class = "slow_test"
 [group.slow.inference_ids.test]
+
+[group.hang]
+config.impl_class = "hang_test"
+[group.hang.inference_ids.test]
 
 [group.batch]
 config.impl_class = "batchsize_test"
@@ -1461,13 +1469,24 @@ config.replicas = 2
     }
 
     fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
+        test_manager_with_deadlines(sweep_interval, default_max_batch, WorkerDeadlines::default())
+    }
+
+    fn test_manager_with_deadlines(
+        sweep_interval: Duration,
+        default_max_batch: u32,
+        deadlines: WorkerDeadlines,
+    ) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
             config_dirs: vec![dir.path().to_path_buf()],
         })));
         let cfg = ManagerConfig {
-            spawn: test_spawn_config(),
+            spawn: WorkerSpawnConfig {
+                deadlines,
+                ..test_spawn_config()
+            },
             default_max_batch,
             sweep_interval,
             // Pool disabled: these tests cover the manager's Python-parity
@@ -2035,6 +2054,53 @@ config.replicas = 2
         }
 
         manager.shutdown().await;
+    }
+
+    /// A worker wedged in predict (the stuck-CUDA case) must never need a
+    /// manual process kill: predict has no deadline — how long a model
+    /// legitimately takes is unknowable — so the bound sits on the unload
+    /// drain instead. Shutdown gives the in-flight window `unload_grace`,
+    /// then kills the stuck worker, so Ctrl-C always converges. The hang
+    /// fixture sleeps 600s; without the bounded drain this test would hang
+    /// until the fixture returns.
+    #[tokio::test]
+    async fn shutdown_kills_worker_wedged_in_predict() {
+        let deadlines = WorkerDeadlines {
+            unload_grace: Duration::from_secs(1),
+            ..WorkerDeadlines::default()
+        };
+        let setup = test_manager_with_deadlines(Duration::from_secs(60), 32, deadlines);
+        let manager = setup.manager.clone();
+
+        // Load first so shutdown lands mid-predict, not mid-spawn.
+        manager
+            .load_model("hang/test", "k", 10, 60, None)
+            .await
+            .expect("load");
+
+        let task = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .predict("hang/test", "k", 10, 60, None, None, vec![data_input(json!(null))])
+                    .await
+            })
+        };
+        // Let the window dispatch to the worker before shutting down.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let started = std::time::Instant::now();
+        manager.shutdown().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "shutdown must converge on a wedged predict via the bounded drain, took {elapsed:?}"
+        );
+        let result = task.await.expect("predict task must not panic");
+        assert!(
+            result.is_err(),
+            "the wedged predict must observe an error, got {result:?}"
+        );
     }
 
     /// Device string reported by a device_test output.

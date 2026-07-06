@@ -61,6 +61,9 @@ pub struct InferenceLocalConfig {
     pub sweep_interval_secs: u64,
     /// Optional worker lifecycle deadline overrides (protocol doc defaults:
     /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
+    /// The unload grace also bounds how long an unload waits for in-flight
+    /// predicts before killing their workers (predict itself has no
+    /// deadline; this is what lets a wedged GPU worker be reclaimed).
     #[serde(default)]
     pub handshake_secs: Option<u64>,
     #[serde(default)]
