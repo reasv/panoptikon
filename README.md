@@ -28,7 +28,7 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 
 ## Panoptikon is being rewritten in Rust
 
-This repository contains an **experimental but feature-complete Rust reimplementation** of Panoptikon. It replaces the entire Python server — API, search, job system, cron, file scanning, and inference orchestration — with a single fast native binary, while still using Python where it belongs: running the actual inference models.
+This repository contains an **experimental but feature-complete Rust reimplementation** of Panoptikon. It replaces the entire Python server - API, search, job system, cron, file scanning, and inference orchestration - with a single fast native binary, while still using Python where it belongs: running the actual inference models.
 
 **This is the future of Panoptikon, and the Python version will soon be replaced by it.** For now it is in a testing phase, so convenient prebuilt Rust binaries are not yet available and running it means building from source with a Rust toolchain. Once it stabilizes, Panoptikon will become much easier to install and run than it is today.
 
@@ -122,7 +122,7 @@ Afterwards, run `start.sh` (linux/macos) or `start.bat` (windows) to start the s
 
 ## 🛠 Installation (Manual)
 
-This project uses [**UV**](https://github.com/astral-sh/uv) for dependency management — a Python package manager that works with `pyproject.toml`.
+This project uses [**UV**](https://github.com/astral-sh/uv) for dependency management - a Python package manager that works with `pyproject.toml`.
 
 ### ✅ Prerequisites
 
