@@ -239,10 +239,13 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
         }
     }
 
+    // Python reports this as "Index database ... not found" (copy-paste bug
+    // in api/routers/utils.py); deliberately diverge — the wrong label sends
+    // people hunting for a missing index DB when it is the user-data DB.
     if let Some(user_data_db) = user_data_db {
         if !user_data_dbs.iter().any(|entry| entry == user_data_db) {
             return Err(ApiError::not_found(format!(
-                "Index database {user_data_db} not found"
+                "User data database {user_data_db} not found"
             )));
         }
     }
