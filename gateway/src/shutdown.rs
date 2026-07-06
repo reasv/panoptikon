@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::db::index_writer;
 use crate::inferio::manager::ModelManager;
 use crate::jobs::{continuous_scan, cron, queue};
+use crate::ui::UiServerHandle;
 
 /// Upper bound on the actor-coordination part of shutdown. Generous because a
 /// writer may be mid-VACUUM on a large database; past this we exit and let
@@ -88,7 +89,11 @@ pub(crate) async fn wait_for_signal() {
 /// guarantee this function exists for). If a worker wedges past the hard
 /// exit deadline, the kill-on-close Job Object still reaps it on process
 /// exit.
-pub(crate) async fn run_cleanup(local_api: bool, inferio: Option<Arc<ModelManager>>) {
+pub(crate) async fn run_cleanup(
+    local_api: bool,
+    inferio: Option<Arc<ModelManager>>,
+    ui: Option<UiServerHandle>,
+) {
     tracing::info!(
         "shutdown signal received; stopping gracefully (repeat the signal to force exit)"
     );
@@ -96,6 +101,12 @@ pub(crate) async fn run_cleanup(local_api: bool, inferio: Option<Arc<ModelManage
     spawn_force_exit_guards();
 
     let cleanup = async {
+        // The UI server is stateless, so it goes first: stop the restart
+        // loop and kill the node tree outright (no graceful ladder needed).
+        if let Some(ui) = ui {
+            ui.shutdown().await;
+            tracing::info!("UI server stopped");
+        }
         if local_api {
             cron::stop_cron_scheduler();
             continuous_scan::stop_continuous_scanning().await;

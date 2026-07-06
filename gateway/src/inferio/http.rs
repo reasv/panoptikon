@@ -1204,9 +1204,12 @@ config.impl_class = "echo_test"
                 trust_forwarded_headers: false,
             },
             upstreams: UpstreamsConfig {
-                ui: UpstreamConfig {
+                ui: crate::config::UiUpstreamConfig {
                     base_url: "http://127.0.0.1:6339".to_string(),
                     local: false,
+                    dir: None,
+                    node: None,
+                    build: Default::default(),
                 },
                 api: UpstreamConfig {
                     base_url: "http://127.0.0.1:6342".to_string(),

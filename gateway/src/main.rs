@@ -14,6 +14,7 @@ mod proxy;
 mod shutdown;
 #[cfg(test)]
 mod test_utils;
+mod ui;
 
 use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
 use axum::{
@@ -152,6 +153,17 @@ async fn async_main() -> anyhow::Result<()> {
             )));
         }
     }
+
+    // Production UI ([upstreams.ui] local = true): npm install / next build
+    // when stale, then a supervised `next start` on base_url's host/port —
+    // all in a background task, so gateway startup is not blocked (the proxy
+    // 502s until the UI is up). Gateway mode only; the `inferio` subcommand
+    // returned above.
+    let ui_server = if settings.upstreams.ui.local {
+        Some(ui::start(&settings)?)
+    } else {
+        None
+    };
 
     let mut app = Router::new();
     match &inferio_state {
@@ -292,7 +304,7 @@ async fn async_main() -> anyhow::Result<()> {
     let cleanup = tokio::spawn(async move {
         shutdown::wait_for_signal().await;
         let _ = shutdown_tx.send(());
-        shutdown::run_cleanup(local_api, inferio_manager).await;
+        shutdown::run_cleanup(local_api, inferio_manager, ui_server).await;
     });
     axum::serve(
         listener,

@@ -97,10 +97,13 @@ rmpv = "1"
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render
 # ends, including the detached browser the msedge.exe launcher leaves behind.
+# Threading: process-creation flags detaching the UI node children from the
+# console signal path (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

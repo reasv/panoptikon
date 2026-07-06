@@ -238,6 +238,58 @@ explicit error instead of silently assuming the wrong schema. Freshly created
 DBs get the alembic head revision stamped into `alembic_version` so they
 remain manageable by the Python server during the transition.
 
+## Production UI
+
+With `[upstreams.ui] local = true` the gateway also runs the production
+Next.js UI from a panoptikon-ui checkout you manage (port of the Python
+`searchui` router, minus the git clone/pull). In normal gateway mode (not the
+`inferio` subcommand) a background task:
+
+1. runs `npm install --include=dev` when `node_modules` is missing or
+   `package.json` is newer than the last install (tracked via a
+   `node_modules/.gateway-install-stamp` file written after each successful
+   install, falling back to the `node_modules` mtime). npm is invoked as
+   `npm-cli.js` under the resolved node binary when it can be found next to
+   it, falling back to npm on PATH;
+2. runs `next build` per the `build` policy. `"auto"` (default) builds when
+   `.next/BUILD_ID` is missing or the checkout's HEAD differs from the commit
+   recorded in `.next/.gateway-built-commit` by the last gateway-run build (a
+   missing stamp counts as differing; if git fails the HEAD is unknown and
+   only a missing BUILD_ID builds). `"always"` builds on every startup.
+   `"never"` never builds — if no build exists, that is a fatal
+   misconfiguration: an error is logged and the supervisor stops instead of
+   restart-looping;
+3. spawns `next start` bound to the host/port parsed from `base_url` (which
+   must be a plain loopback `http://host:port` URL in this mode — the proxy
+   keeps forwarding to it unchanged), restarting on unexpected exit with
+   capped backoff (1s doubling to 30s, reset after 60s of stable uptime). If
+   the port is already accepting connections before the spawn, a warning
+   names the squatting host:port (usually a still-running Python-managed UI).
+
+Gateway startup is not blocked: the proxy returns 502 until the UI is up, and
+an info line with the final URL is logged once the port accepts connections.
+Child stdout/stderr stream into the gateway log line-by-line. The children
+are detached from the console signal path (new process group on Windows,
+setsid on Unix), so a Ctrl-C hits only the gateway and the supervisor tears
+the UI down in order; on Windows the child tree additionally sits under a
+kill-on-close Job Object (like inferio workers). Graceful shutdown kills the
+UI first — it is stateless.
+
+`[upstreams.ui]` keys:
+
+- `local` (default `false`): spawn and supervise the production UI server.
+- `dir`: path to the panoptikon-ui checkout; required when `local = true`,
+  relative paths resolve against the working directory.
+- `node`: explicit node binary. Default resolution: the repo venv's
+  nodejs-wheel node (the real binary inside the `nodejs_wheel` package,
+  falling back to the `.venv/Scripts/node.exe` / `.venv/bin/node` launcher
+  stub), then `node` from PATH.
+- `build` (default `"auto"`): `"auto"` | `"always"` | `"never"`.
+
+`config/gateway/local.toml` is a ready-made local rust-only production
+config (local API + local inference + local UI); `start-rust.bat` at the
+repo root runs the release binary with it.
+
 ## Configuration
 
 Configuration is TOML and/or environment variables only. The gateway loads
@@ -255,6 +307,11 @@ trust_forwarded_headers = false
 
 [upstreams.ui]
 base_url = "http://127.0.0.1:6339"
+# Run the production UI from a checkout (see "Production UI" above):
+# local = true
+# dir = "../panoptikon-ui"
+# node = "C:/path/to/node.exe"  # default: repo venv's node, then PATH
+# build = "auto"                # "auto" | "always" | "never"
 
 [upstreams.api]
 base_url = "http://127.0.0.1:6342"

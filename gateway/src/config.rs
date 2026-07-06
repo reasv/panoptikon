@@ -241,7 +241,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamsConfig {
-    pub ui: UpstreamConfig,
+    pub ui: UiUpstreamConfig,
     pub api: UpstreamConfig,
     #[serde(default)]
     pub inference: Vec<InferenceEndpointConfig>,
@@ -252,6 +252,94 @@ pub struct UpstreamConfig {
     pub base_url: String,
     #[serde(default)]
     pub local: bool,
+}
+
+/// `[upstreams.ui]`: where the Next.js frontend lives. With `local = true`
+/// the gateway also *runs* it: npm install / `next build` when stale, then
+/// a supervised `next start` bound to the host/port parsed from `base_url`
+/// (single source of truth — the proxy keeps using `base_url` unchanged).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UiUpstreamConfig {
+    pub base_url: String,
+    /// Spawn and supervise the production UI server. Default: false.
+    #[serde(default)]
+    pub local: bool,
+    /// Path to the panoptikon-ui checkout (the user manages the clone).
+    /// Required when `local = true`; relative paths resolve against CWD.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Explicit node binary. Default resolution: the repo venv's
+    /// nodejs-wheel node, then `node` from PATH (see `ui::resolve_node`).
+    #[serde(default)]
+    pub node: Option<PathBuf>,
+    /// When to run `next build`. Default: auto (build-staleness check).
+    #[serde(default)]
+    pub build: UiBuildPolicy,
+}
+
+/// `[upstreams.ui].build`: `next build` policy for local UI mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiBuildPolicy {
+    /// Build when `.next/BUILD_ID` is missing or older than the checkout's
+    /// latest git commit (ported from the Python searchui router).
+    #[default]
+    Auto,
+    /// Build on every startup.
+    Always,
+    /// Never build; `next start` fails visibly if there is no build.
+    Never,
+}
+
+impl UiUpstreamConfig {
+    /// The host/port the spawned `next start` binds to, parsed from
+    /// `base_url`. Local mode requires a plain loopback `http://host:port`
+    /// URL: the gateway proxies to that same URL, so a path/query or a
+    /// non-loopback host means the config cannot describe a server this
+    /// process spawns on this machine.
+    pub fn local_bind_addr(&self) -> Result<(String, u16)> {
+        let parsed = url::Url::parse(&self.base_url).with_context(|| {
+            format!(
+                "upstreams.ui.base_url '{}' is not a valid URL",
+                self.base_url
+            )
+        })?;
+        let describe = |problem: &str| {
+            format!(
+                "upstreams.ui.local = true requires base_url to be a plain loopback \
+                 http://host:port URL (it doubles as the spawned UI server's bind \
+                 address), but '{}' {problem}",
+                self.base_url
+            )
+        };
+        if parsed.scheme() != "http" {
+            anyhow::bail!(describe("does not use the http scheme"));
+        }
+        if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() {
+            anyhow::bail!(describe("has a path or query"));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!(describe("has userinfo"));
+        }
+        let host = match parsed.host() {
+            Some(url::Host::Domain(domain)) => domain.to_string(),
+            Some(url::Host::Ipv4(addr)) => addr.to_string(),
+            Some(url::Host::Ipv6(addr)) => addr.to_string(),
+            None => anyhow::bail!(describe("has no host")),
+        };
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !loopback {
+            anyhow::bail!(describe("has a non-loopback host"));
+        }
+        let port = parsed
+            .port_or_known_default()
+            .expect("http URLs always have a known default port");
+        Ok((host, port))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -441,6 +529,7 @@ impl Settings {
         self.validate_rulesets()?;
         self.validate_policies()?;
         self.validate_inference_endpoints()?;
+        self.validate_ui()?;
         if loopback_synthesized {
             self.validate_loopback_inference_policy()?;
         }
@@ -556,6 +645,22 @@ impl Settings {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Local UI mode needs a checkout to run from and a bind address it can
+    /// derive from `base_url`; both are config mistakes best caught at load.
+    fn validate_ui(&self) -> Result<()> {
+        if !self.upstreams.ui.local {
+            return Ok(());
+        }
+        if self.upstreams.ui.dir.is_none() {
+            anyhow::bail!(
+                "upstreams.ui.local = true requires upstreams.ui.dir (path to the \
+                 panoptikon-ui checkout)"
+            );
+        }
+        self.upstreams.ui.local_bind_addr()?;
         Ok(())
     }
 
@@ -1029,6 +1134,135 @@ allow = "*"
         )
         .unwrap();
         Settings::load(Some(path)).expect("explicit upstreams skip the loopback policy check");
+    }
+
+    /// `[upstreams.ui]` local-mode keys: defaults are off/empty, the new
+    /// keys parse, and `local = true` derives the spawned server's bind
+    /// address from `base_url` (single source of truth).
+    #[test]
+    fn ui_local_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+local = true
+dir = "../panoptikon-ui"
+node = "custom/node.exe"
+build = "always"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        let ui = &settings.upstreams.ui;
+        assert!(ui.local);
+        assert_eq!(ui.dir.as_deref(), Some(std::path::Path::new("../panoptikon-ui")));
+        assert_eq!(ui.node.as_deref(), Some(std::path::Path::new("custom/node.exe")));
+        assert_eq!(ui.build, UiBuildPolicy::Always);
+        assert_eq!(
+            ui.local_bind_addr().unwrap(),
+            ("127.0.0.1".to_string(), 6339)
+        );
+
+        // Defaults: local off, auto build, no dir/node.
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path)).unwrap();
+        let ui = &settings.upstreams.ui;
+        assert!(!ui.local);
+        assert!(ui.dir.is_none() && ui.node.is_none());
+        assert_eq!(ui.build, UiBuildPolicy::Auto);
+    }
+
+    /// Local UI mode fails config load without a checkout dir, and with a
+    /// `base_url` that cannot serve as the spawned server's bind address
+    /// (non-loopback host, path/query, non-http scheme). IPv6 loopback and
+    /// `localhost` pass, and the default port is implied.
+    #[test]
+    fn ui_local_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let write = |ui_block: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+{ui_block}
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write(r#"base_url = "http://127.0.0.1:6339"
+local = true"#);
+        let err = Settings::load(Some(path.clone())).expect_err("dir is required");
+        assert!(format!("{err:#}").contains("upstreams.ui.dir"), "{err:#}");
+
+        for bad in [
+            r#"base_url = "http://192.168.1.5:6339""#,
+            r#"base_url = "http://127.0.0.1:6339/ui""#,
+            r#"base_url = "https://127.0.0.1:6339""#,
+        ] {
+            write(&format!("{bad}\nlocal = true\ndir = \"ui\""));
+            let err = Settings::load(Some(path.clone())).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("plain loopback"),
+                "{bad}: {err:#}"
+            );
+        }
+
+        // Same URLs are fine while local mode is off.
+        write(r#"base_url = "http://192.168.1.5:6339/ui""#);
+        Settings::load(Some(path.clone())).expect("proxy-only ui is unrestricted");
+
+        write(r#"base_url = "http://[::1]:6339"
+local = true
+dir = "ui""#);
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(
+            settings.upstreams.ui.local_bind_addr().unwrap(),
+            ("::1".to_string(), 6339)
+        );
+
+        write(r#"base_url = "http://localhost"
+local = true
+dir = "ui""#);
+        let settings = Settings::load(Some(path)).unwrap();
+        assert_eq!(
+            settings.upstreams.ui.local_bind_addr().unwrap(),
+            ("localhost".to_string(), 80)
+        );
     }
 
     /// impl_dirs defaulting honors INFERIO_CUSTOM_IMPL_PATH exactly like
