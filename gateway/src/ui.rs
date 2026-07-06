@@ -19,7 +19,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::config::{Settings, UiBuildPolicy};
-use crate::process_tree::JobGuard;
+use crate::process_tree::{JobGuard, detach_from_console, die_with_parent};
 
 /// Restart backoff for unexpected exits and failed install/build steps:
 /// 1s doubling to 30s, reset once a start stays up for [`STABLE_UPTIME`].
@@ -291,6 +291,7 @@ async fn run_logged(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     detach_from_console(&mut command);
+    die_with_parent(&mut command);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {what}"))?;
@@ -317,24 +318,6 @@ async fn run_logged(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     Ok(CommandEnd::Exited(status))
-}
-
-/// Keep console signals for the gateway alone: a Ctrl-C that reached the
-/// children directly would kill them before the supervisor is told to stop,
-/// logging spurious "exited unexpectedly" restarts mid-shutdown. Same
-/// treatment the Python router gave the UI child (CREATE_NEW_PROCESS_GROUP
-/// on Windows, setsid on Unix); shutdown delivery is unaffected — the
-/// supervisor kills the tree itself.
-fn detach_from_console(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
 }
 
 /// Resolves when shutdown is requested. A closed channel (handle dropped

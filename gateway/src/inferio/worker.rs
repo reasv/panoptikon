@@ -26,8 +26,10 @@
 //!   exit status plus the stderr tail.
 //! - Graceful stop is the `unload` → terminate → kill ladder with the
 //!   deadlines from [`WorkerDeadlines`]. The child additionally sits under a
-//!   kill-on-close Job Object on Windows and tokio `kill_on_drop`, so no
-//!   drop path can leak a worker tree.
+//!   kill-on-close Job Object on Windows (with PR_SET_PDEATHSIG plus
+//!   process-group SIGKILL filling that role on Unix) and tokio
+//!   `kill_on_drop`, so neither a drop path nor gateway death itself can
+//!   leak a worker tree.
 
 use std::collections::VecDeque;
 use std::env;
@@ -45,7 +47,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use super::registry::SpawnSpec;
-use crate::process_tree::JobGuard;
+use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
 
 /// Protocol version this orchestrator speaks; workers answering anything
 /// else in the handshake are killed.
@@ -256,6 +258,15 @@ impl Worker {
         if let Some(cwd) = &cfg.cwd {
             command.current_dir(cwd);
         }
+        // An interactive Ctrl-C must reach the gateway alone; the shutdown
+        // ladder (unload → terminate → kill) does the stopping. A worker hit
+        // directly by the console signal dies before `unload` is sent and is
+        // reported as an unexpected death.
+        detach_from_console(&mut command);
+        // And if the gateway dies with no cleanup at all (forced exit, OOM
+        // kill), the kernel reaps the worker: job object on Windows,
+        // PR_SET_PDEATHSIG on Unix.
+        die_with_parent(&mut command);
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -580,6 +591,10 @@ impl Worker {
     /// Hard stop: terminate, wait `terminate_grace`, kill again if needed,
     /// and reap. Never fails; also the cancel path for in-flight predicts.
     pub async fn kill(mut self) {
+        // Group first, then the child: descendants must not survive the
+        // reap below turning the group kill into a no-op (Unix; Windows
+        // relies on the job object dropping with self).
+        kill_process_group(&self.child);
         let _ = self.child.start_kill();
         if timeout(self.deadlines.terminate_grace, self.child.wait())
             .await
@@ -705,6 +720,7 @@ impl Worker {
     async fn fatal(&mut self, why: String) -> anyhow::Error {
         self.dead = true;
         self.in_flight = false;
+        kill_process_group(&self.child);
         let _ = self.child.start_kill();
         let status = match timeout(FATAL_REAP_GRACE, self.child.wait()).await {
             Ok(Ok(status)) => status.to_string(),
@@ -738,6 +754,18 @@ impl Worker {
     pub(crate) async fn kill_child_externally_for_test(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+}
+
+/// On Unix a dropped Worker's `kill_on_drop` only reaches the direct child;
+/// SIGKILL its process group too, so drop-kill paths (e.g. the dispatcher
+/// aborting in-flight windows) cannot orphan worker descendants. A no-op
+/// after the explicit kill paths — they reap the child, clearing its id.
+/// Windows needs no Drop: the worker's job object drops with it.
+#[cfg(unix)]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        kill_process_group(&self.child);
     }
 }
 
@@ -943,10 +971,13 @@ mod tests {
     /// test fixture impl dir.
     fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
-        let python = if cfg!(windows) {
-            root.join(".venv/Scripts/python.exe")
-        } else {
-            root.join(".venv/bin/python")
+        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
+        // python with msgpack works), e.g. running the suite under WSL
+        // against a Windows checkout, whose .venv is a Windows venv.
+        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
+            Some(explicit) => PathBuf::from(explicit),
+            None if cfg!(windows) => root.join(".venv/Scripts/python.exe"),
+            None => root.join(".venv/bin/python"),
         };
         if !python.is_file() {
             panic!(

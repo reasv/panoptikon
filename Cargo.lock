@@ -1438,6 +1438,7 @@ dependencies = [
  "hyper-util",
  "image",
  "imageproc",
+ "libc",
  "libsqlite3-sys",
  "lofty",
  "md-5",

@@ -94,6 +94,11 @@ chrono = "0.4.45"
 # rmpv keeps str vs bin distinct, which the protocol relies on.
 rmpv = "1"
 
+[target.'cfg(unix)'.dependencies]
+# PR_SET_PDEATHSIG + process-group SIGKILL: the Unix counterpart of the
+# Windows job objects for reaping worker/UI trees when the gateway dies.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render
 # ends, including the detached browser the msedge.exe launcher leaves behind.
