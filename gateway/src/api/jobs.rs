@@ -1,4 +1,8 @@
-use axum::{Json, extract::Query, http::StatusCode};
+use axum::{Json, http::StatusCode};
+// axum's own Query (serde_urlencoded) cannot deserialize repeated params
+// (?inference_ids=a&inference_ids=b) into a Vec; axum-extra's can, matching
+// FastAPI's List[str] query parameter behavior.
+use axum_extra::extract::Query;
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
@@ -505,4 +509,39 @@ pub(crate) async fn get_cronjob_schedule(
         next_run: status.next_run.map(|time| time.to_rfc3339()),
         last_run: status.last_run.map(|time| time.to_rfc3339()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Uri;
+
+    /// The UI sends list params FastAPI-style
+    /// (?inference_ids=a&inference_ids=b). Plain axum::extract::Query
+    /// (serde_urlencoded) rejects repeated keys into a Vec with a 400, so
+    /// these structs must go through axum-extra's Query.
+    #[test]
+    fn repeated_query_params_parse_into_vecs() {
+        let uri: Uri = "/api/jobs/data/extraction\
+            ?inference_ids=tags/wd-swinv2-tagger-v3\
+            &inference_ids=clip/ViT-H-14-378-quickgelu_dfn5b\
+            &batch_size=64"
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<InferenceQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(
+            q.inference_ids,
+            vec!["tags/wd-swinv2-tagger-v3", "clip/ViT-H-14-378-quickgelu_dfn5b"]
+        );
+        assert_eq!(q.batch_size, Some(64));
+        assert_eq!(q.threshold, None);
+
+        let uri: Uri = "/x?log_ids=1&log_ids=2".parse().unwrap();
+        let Query(q) = Query::<LogIdQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.log_ids, vec![1, 2]);
+
+        let uri: Uri = "/x?queue_ids=3".parse().unwrap();
+        let Query(q) = Query::<QueueCancelQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.queue_ids, vec![3]);
+    }
 }
