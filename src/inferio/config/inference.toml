@@ -152,16 +152,19 @@ metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is re
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
 config.languages  = ["en"]
+config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ja"]
+config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ch_sim"]
+config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
