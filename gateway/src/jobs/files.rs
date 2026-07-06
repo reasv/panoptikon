@@ -1226,7 +1226,7 @@ fn prepare_new_item(
 ) -> TaskOutcome {
     let metadata_start = Instant::now();
     let preloaded_image = if mime_type.starts_with("image") {
-        match image::open(&path) {
+        match open_image(&path) {
             Ok(image) => Some(image),
             Err(err) => {
                 return TaskOutcome::Failed(FailedFile {
@@ -1580,6 +1580,24 @@ fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {
     Ok(mime.essence_str().to_string())
 }
 
+/// Decodes an image like PIL does: the format is sniffed from the file's
+/// magic bytes (the extension is only a fallback when the content is
+/// unrecognized) and decoder allocation limits are lifted. Archives contain
+/// mis-named files (WebP saved as .png) and very large images (20k x 20k
+/// collages exceed the crate's default 512 MiB cap) that Python indexed fine.
+pub(crate) fn open_image(path: impl AsRef<Path>) -> image::ImageResult<DynamicImage> {
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    reader.no_limits();
+    reader.decode()
+}
+
+/// In-memory counterpart of [`open_image`]: content-sniffed, no limits.
+pub(crate) fn decode_image_bytes(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    reader.no_limits();
+    reader.decode()
+}
+
 fn extract_item_metadata(
     path: &Path,
     mime_type: &str,
@@ -1608,7 +1626,7 @@ fn extract_item_metadata_inner(
     if mime_type.starts_with("image") {
         let (width, height) = match preloaded_image {
             Some(image) => image.dimensions(),
-            None => image::open(path)
+            None => open_image(path)
                 .map_err(|err| FileProcessError::Unsupported(err.to_string()))?
                 .dimensions(),
         };
@@ -1680,7 +1698,7 @@ fn generate_new_item_visuals(
         let image = match preloaded_image {
             Some(image) => image,
             None => {
-                image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?
+                open_image(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?
             }
         };
         if let Some(thumb) = generate_thumbnail(path, &image)? {
@@ -1756,11 +1774,11 @@ fn generate_backfill_visuals(
         let source = blurhash_source.or_else(|| {
             existing_thumb
                 .as_deref()
-                .and_then(|bytes| image::load_from_memory(bytes).ok())
+                .and_then(|bytes| decode_image_bytes(bytes).ok())
         });
         let source = match source {
             Some(source) => Some(source),
-            None if mime_type.starts_with("image") => image::open(path).ok(),
+            None if mime_type.starts_with("image") => open_image(path).ok(),
             None => None,
         };
         blurhash = source
@@ -1794,7 +1812,7 @@ fn build_backfill_thumbnails(
         // Reuse frames already stored in the database before re-running ffmpeg.
         let mut frames: Vec<DynamicImage> = existing_frames
             .iter()
-            .filter_map(|bytes| image::load_from_memory(bytes).ok())
+            .filter_map(|bytes| decode_image_bytes(bytes).ok())
             .collect();
         let mut fresh = false;
         if frames.is_empty() {
@@ -1827,7 +1845,7 @@ fn build_backfill_thumbnails(
         // the blurhash fallback opens the image separately when needed.
         if file_size > SMALL_IMAGE_FILE_SIZE {
             let image =
-                image::open(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+                open_image(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
             if let Some(thumb) = generate_thumbnail(path, &image)? {
                 thumbnails.push(encode_image(0, &thumb)?);
                 source = Some(thumb);
@@ -2250,7 +2268,7 @@ fn run_html_screenshot(
     // up.
     let mut last_err = None;
     while Instant::now() < deadline {
-        match image::open(screenshot) {
+        match open_image(screenshot) {
             Ok(image) => return Some(image),
             Err(err) => last_err = Some(err),
         }
@@ -2360,7 +2378,7 @@ fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
                     .map(|value| value.to_string())
                     .unwrap_or_default();
                 if let Some(picture) = tag.pictures().first() {
-                    if let Ok(cover) = image::load_from_memory(picture.data()) {
+                    if let Ok(cover) = decode_image_bytes(picture.data()) {
                         // Cover art gets no text overlay, but is capped in
                         // size: embedded art can be arbitrarily large and
                         // would otherwise be stored full-resolution in the
@@ -2538,7 +2556,7 @@ fn extract_video_frames_into(
     paths.sort();
 
     for frame_path in paths.into_iter().take(num_frames) {
-        if let Ok(image) = image::open(&frame_path) {
+        if let Ok(image) = open_image(&frame_path) {
             frames.push(image);
         }
     }

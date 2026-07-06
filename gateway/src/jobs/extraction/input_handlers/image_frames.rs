@@ -393,7 +393,7 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
 }
 
 fn load_dynamic_image(buffer: &[u8]) -> ApiResult<DynamicImage> {
-    image::load_from_memory(buffer).map_err(|err| {
+    crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
         tracing::error!(error = %err, "failed to decode image");
         ApiError::internal("Failed to decode image")
     })
@@ -418,11 +418,21 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
 }
 
 fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
-    let file = std::fs::File::open(path).map_err(|err| {
+    let buffer = std::fs::read(path).map_err(|err| {
         tracing::error!(error = %err, "failed to open gif");
         ApiError::internal("Failed to open gif")
     })?;
-    let decoder = GifDecoder::new(std::io::BufReader::new(file)).map_err(|err| {
+    // Files are routed here by extension-derived mime type; a mis-named
+    // non-GIF (which PIL decoded regardless of extension) is handled as a
+    // single still frame instead of failing the item.
+    if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
+        let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
+            tracing::error!(error = %err, path, "failed to decode mis-named gif");
+            ApiError::internal("Failed to decode gif")
+        })?;
+        return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
+    }
+    let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
         tracing::error!(error = %err, "failed to decode gif");
         ApiError::internal("Failed to decode gif")
     })?;
@@ -514,7 +524,7 @@ fn extract_video_frames_into(
         // These PNGs were just written by our own ffmpeg run; one being
         // unreadable means something is broken (disk full, races), so fail
         // the item rather than silently tagging it from fewer frames.
-        let image = image::open(&frame_path)
+        let image = crate::jobs::files::open_image(&frame_path)
             .map_err(|err| ApiError::internal(format!("Failed to read extracted frame: {err}")))?;
         frames.push(image);
     }
