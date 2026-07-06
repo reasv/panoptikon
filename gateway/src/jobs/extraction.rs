@@ -107,8 +107,44 @@ struct JobCounters {
     other_files: i64,
     total_segments: i64,
     errors: i64,
-    data_load_time: f64,
-    inference_time: f64,
+    data_load_time: PhaseTimer,
+    inference_time: PhaseTimer,
+}
+
+/// Wall-clock union of the intervals during which at least one operation of a
+/// phase is in flight. Items pipeline concurrently, so summing per-item spans
+/// would count the same second once per in-flight item (and include time spent
+/// queued on semaphores), inflating totals by orders of magnitude.
+#[derive(Default)]
+struct PhaseTimer {
+    in_flight: u32,
+    span_start: Option<Instant>,
+    total_secs: f64,
+}
+
+impl PhaseTimer {
+    fn enter(&mut self) {
+        if self.in_flight == 0 {
+            self.span_start = Some(Instant::now());
+        }
+        self.in_flight += 1;
+    }
+
+    fn exit(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            if let Some(start) = self.span_start.take() {
+                self.total_secs += start.elapsed().as_secs_f64();
+            }
+        }
+    }
+
+    fn total(&self) -> f64 {
+        match self.span_start {
+            Some(start) => self.total_secs + start.elapsed().as_secs_f64(),
+            None => self.total_secs,
+        }
+    }
 }
 
 pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(), String> {
@@ -363,8 +399,8 @@ async fn run_extraction_job_inner(
             total_segments: guard.total_segments,
             errors: guard.errors,
             total_remaining: remaining_after,
-            data_load_time: guard.data_load_time,
-            inference_time: guard.inference_time,
+            data_load_time: guard.data_load_time.total(),
+            inference_time: guard.inference_time.total(),
             finished: !total_failure,
         };
         (update, total_failure)
@@ -443,18 +479,17 @@ async fn process_item(
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
 ) -> ApiResult<()> {
-    let load_start = Instant::now();
     let item_type = item.item_type.clone();
-    let prepared = match input_handlers::prepare_item(index_db, model, item).await {
+    counters.lock().await.data_load_time.enter();
+    let prepare_result = input_handlers::prepare_item(index_db, model, item).await;
+    counters.lock().await.data_load_time.exit();
+    let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
-            let load_time = load_start.elapsed().as_secs_f64();
             finalize_item(
                 index_db,
                 job_id,
                 &item_type,
-                load_time,
-                0.0,
                 0,
                 false,
                 true,
@@ -465,7 +500,6 @@ async fn process_item(
             return Err(err);
         }
     };
-    let load_time = load_start.elapsed().as_secs_f64();
 
     if prepared.inputs.is_empty() {
         let result =
@@ -474,8 +508,6 @@ async fn process_item(
             index_db,
             job_id,
             &prepared.item.item_type,
-            load_time,
-            0.0,
             0,
             result.is_ok(),
             result.is_err(),
@@ -509,26 +541,23 @@ async fn process_item(
     drop(loader_permit);
 
     let segments = inference_inputs.len() as i64;
-    let inf_start = Instant::now();
     let outputs = match run_chunked_inference(
         &model.setter_name,
         pool,
         unit_slots,
         unit_capacity,
         &inference_inputs,
+        &counters,
     )
     .await
     {
         Ok(outputs) => outputs,
         Err(err) => {
-            let inference_time = inf_start.elapsed().as_secs_f64();
             let api_err = ApiError::internal(format!("Inference failed: {err}"));
             finalize_item(
                 index_db,
                 job_id,
                 &prepared.item.item_type,
-                load_time,
-                inference_time,
                 segments,
                 false,
                 true,
@@ -539,7 +568,6 @@ async fn process_item(
             return Err(api_err);
         }
     };
-    let inference_time = inf_start.elapsed().as_secs_f64();
 
     let result =
         output_handlers::handle_outputs(index_db, model, job_id, prepared.item.clone(), outputs)
@@ -548,8 +576,6 @@ async fn process_item(
         index_db,
         job_id,
         &prepared.item.item_type,
-        load_time,
-        inference_time,
         segments,
         result.is_ok(),
         result.is_err(),
@@ -586,6 +612,7 @@ async fn run_chunked_inference(
     unit_slots: &Arc<Semaphore>,
     unit_capacity: usize,
     inputs: &[InferenceInput],
+    counters: &Arc<Mutex<JobCounters>>,
 ) -> anyhow::Result<PredictOutput> {
     let chunk_size = unit_capacity.max(1);
     let mut merged: Option<PredictOutput> = None;
@@ -595,6 +622,7 @@ async fn run_chunked_inference(
             .acquire_many_owned(chunk.len() as u32)
             .await
             .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
+        counters.lock().await.inference_time.enter();
         let response = pool
             .predict(
                 setter_name,
@@ -610,6 +638,7 @@ async fn run_chunked_inference(
                 chunk,
             )
             .await;
+        counters.lock().await.inference_time.exit();
         drop(permits);
         let outputs = response?;
         merged = Some(match merged {
@@ -640,8 +669,6 @@ async fn finalize_item(
     index_db: &str,
     job_id: i64,
     item_type: &str,
-    load_time: f64,
-    inference_time: f64,
     segments: i64,
     count_file: bool,
     is_error: bool,
@@ -651,8 +678,6 @@ async fn finalize_item(
     let update = {
         let mut guard = counters.lock().await;
         guard.processed += 1;
-        guard.data_load_time += load_time;
-        guard.inference_time += inference_time;
         guard.total_segments += segments;
 
         if count_file {
@@ -675,8 +700,8 @@ async fn finalize_item(
             total_segments: guard.total_segments,
             errors: guard.errors,
             total_remaining: remaining,
-            data_load_time: guard.data_load_time,
-            inference_time: guard.inference_time,
+            data_load_time: guard.data_load_time.total(),
+            inference_time: guard.inference_time.total(),
             finished: false,
         }
     };
