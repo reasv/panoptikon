@@ -100,7 +100,7 @@ for write transactions.
 When `upstreams.api.local = true`, `/api/jobs/*` is implemented locally and
 the cron scheduler runs in the gateway. Local mode means the gateway owns the
 databases outright: do not run the Python server's cron (or the Python server
-at all) against the same `DATA_FOLDER`, or extraction jobs will be scheduled
+at all) against the same data folder, or extraction jobs will be scheduled
 twice. A global job-queue actor holds the in-memory queue and running job
 state, and a job-runner actor executes one job at a time. File scan jobs
 (`folder_rescan`, `folder_update`) run through `FileScanService`, which writes
@@ -227,8 +227,8 @@ Programmatic creation and migration lives in `gateway/src/db/migrations.rs`
 (`migrate_databases`) and supports both on-disk databases and shared
 in-memory databases for tests.
 
-When `upstreams.api.local = true` (and `READONLY` is not set), the gateway
-runs migrations across every on-disk DB in `DATA_FOLDER` at startup, like the
+When `upstreams.api.local = true` (and `readonly` is not enabled), the gateway
+runs migrations across every on-disk DB in `data_folder` at startup, like the
 Python server does. Existing Python-created DBs are baselined: the init
 snapshot is recorded as applied without executing any SQL — the only write is
 the `_sqlx_migrations` bookkeeping table. Baselining requires the DB to be at
@@ -292,14 +292,78 @@ repo root runs the release binary with it.
 
 ## Configuration
 
-Configuration is TOML and/or environment variables only. The gateway loads
-`.env` at startup when present, then reads `[cwd]/config/gateway/default.toml`.
-Override the path with `--config` or the `GATEWAY_CONFIG_PATH` environment
-variable.
+All global configuration is TOML. The gateway reads
+`[cwd]/config/gateway/default.toml`; override the path with `--config` or the
+`GATEWAY_CONFIG_PATH` environment variable. Environment variables are **not**
+a parallel configuration mechanism: they feed TOML values through templating
+(below), plus a small keep-list of bootstrap/diagnostic variables.
+
+### Env templating
+
+String values in the settings file — and in every inference registry TOML —
+may reference environment variables:
+
+```toml
+[logging]
+level = "${LOGLEVEL:-INFO}"   # LOGLEVEL, or "INFO" when unset or empty
+
+[open]
+file_command = "player ${PLAYER_FLAGS:-} {path}"
+
+# In a registry TOML: secrets reach impl constructors as config kwargs.
+# [group.clip-api.inference_ids.jina-clip-v2]
+# config.api_key = "${JINA_API_KEY}"
+```
+
+The forms follow the shell / docker-compose conventions:
+
+- `${NAME}` — replaced with the variable's value; **hard error** at load
+  time when unset (fail loudly for secrets), naming the file and variable.
+  Set-but-empty is not an error: it yields the empty string, as in shell.
+- `${NAME:-default}` — the literal default when the variable is unset **or
+  set but empty** (so a `.env` line like `LOGLEVEL=` still gets the default).
+- `${NAME-default}` — the default only when the variable is *unset*; a
+  set-but-empty variable yields the empty string.
+- `$${` — a literal `${`.
+- Multiple placeholders per string are allowed; substitution is one pass
+  (values are never re-expanded). `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
+
+Substitution runs on *parsed* string values, so env values containing
+backslashes or quotes (Windows paths) cannot corrupt the TOML. Only strings
+can be templated — for numeric/boolean keys use the `GATEWAY__*` override
+layer instead. Values arriving through the `GATEWAY__*` override layer are
+**not** templated: overrides are applied after substitution and are taken
+literally (they already come from the environment). Registry TOMLs are
+re-substituted on every mtime-gated reload. Per-DB system configs
+(`data/index/<name>/config.toml`) are **not** templated: the gateway writes
+them back, which would destroy the templates.
+
+The gateway auto-loads `.env` from the working directory at startup — that is
+the intended way to populate the variables templating references, and child
+processes (inference workers, the UI server) inherit them.
+
+### Settings
 
 Create `config/gateway/default.toml`:
 
 ```toml
+# Top level (all optional):
+# data_folder = "data"       # root for index DBs, user data, thumbnails, logs
+# index_db = "default"       # default DB names when neither the request nor
+# user_data_db = "default"   #   the matched policy picks one
+# readonly = false           # strip write locks, skip startup migrations
+# temp_dir = "data/tmp"      # extraction scratch space (literal default —
+                             #   not derived from data_folder)
+
+[logging]
+# file = ""                  # default: <data_folder>/panoptikon-gateway.log;
+                             #   explicit "" disables file logging
+level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
+
+# [open]                     # custom /api/open commands; {path} {folder}
+# file_command = "mpv {path}"          #   {filename} placeholders; "" = no-op
+# folder_command = "explorer {folder}" # (was: show in file manager)
+
 [server]
 host = "0.0.0.0"
 port = 8080
@@ -333,6 +397,11 @@ enabled = false
 [search]
 embedding_cache_size = 16
 
+[jobs]
+# loader_concurrency = 8
+# intermediate_data_budget_mb = 1024
+# atomic_extraction_jobs = false  # delete (not fail) incomplete jobs at start
+
 [rulesets.allow_all]
 allow_all = true
 
@@ -352,7 +421,40 @@ default = "default"
 allow = "*"
 ```
 
-Environment variables override the file:
+Registry/impl directory resolution for local inference is configured only by
+`[inference_local].config_dirs` / `impl_dirs` (defaults:
+`["src/inferio/config", "config/inference"]` and
+`["src/inferio/impl", "inferio_custom"]`).
+
+### Environment variables that remain
+
+These are deliberately *not* TOML keys:
+
+- `GATEWAY_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
+  live inside it. (`--config` wins over it.)
+- `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
+  set and supports per-module directives.
+- `GATEWAY__*` — generic config override layer (see below); works for every
+  key, including the new ones (e.g. `GATEWAY__DATA_FOLDER`,
+  `GATEWAY__LOGGING__LEVEL`, `GATEWAY__READONLY`).
+- Variables the gateway *sets* on child processes (internal protocol):
+  `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
+  `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
+  inheritance — workers and the UI server see the gateway's env (and thus
+  `.env`), unfiltered.
+- Dev/diagnostic overrides for bundled native dependencies: `PDFIUM_PATH`,
+  `HTML_RENDERER_PATH`, `PANOPTIKON_FONT`; `PANOPTIKON_TEST_PYTHON` is
+  test-only.
+
+The former `DATA_FOLDER`, `INDEX_DB`, `USER_DATA_DB`, `READONLY`, `TEMP_DIR`,
+`LOGLEVEL`, `LOGS_FILE`, `OPEN_FILE_COMMAND`, `SHOW_IN_FM_COMMAND`,
+`ATOMIC_EXTRACTION_JOBS`, `INFERIO_CONFIG_DIR`, `BASE_INFERENCE_CONFIG_FOLDER`
+and `INFERIO_CUSTOM_IMPL_PATH` env vars are no longer read: use the TOML keys
+(templated from env if desired, e.g. `level = "${LOGLEVEL:-INFO}"`).
+
+### GATEWAY__ overrides
+
+Environment variables with the `GATEWAY__` prefix override the file:
 
 ```bash
 GATEWAY_CONFIG_PATH=config\gateway\default.toml
@@ -374,12 +476,11 @@ cargo run -p gateway -- --config config\gateway\userconfig.toml
 ## Logging and shutdown
 
 Log output goes to the console and, by default, to
-`$DATA_FOLDER/panoptikon-gateway.log` (append; the name is distinct from the
+`<data_folder>/panoptikon-gateway.log` (append; the name is distinct from the
 Python server's `panoptikon.log` so the two processes never interleave one
-file). `LOGS_FILE` overrides the path; setting it to an empty string disables
-file logging. `LOGLEVEL` sets the default level (same variable the Python
-server uses); `RUST_LOG` takes precedence when set and supports per-module
-directives.
+file). `[logging].file` overrides the path; setting it to an empty string
+disables file logging. `[logging].level` sets the default level; `RUST_LOG`
+takes precedence when set and supports per-module directives.
 
 On SIGINT/SIGTERM (Ctrl-C, `docker stop`, systemd) the gateway shuts down
 gracefully: it stops accepting connections, drains in-flight requests, stops
@@ -402,6 +503,8 @@ GATEWAY__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342
 GATEWAY__UPSTREAMS__INFERENCE__0__WEIGHT=1.0
 GATEWAY__UPSTREAMS__INFERENCE__0__USE_FOR_JOBS=true
 GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
+GATEWAY__DATA_FOLDER=data
+GATEWAY__LOGGING__LEVEL=debug
 ```
 
 ## Running locally

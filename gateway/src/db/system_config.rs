@@ -137,10 +137,10 @@ pub(crate) struct SystemConfigStore {
 }
 
 impl SystemConfigStore {
+    /// A store rooted at the configured `data_folder`.
     pub(crate) fn from_env() -> Self {
-        let data_dir = env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string());
         Self {
-            data_dir: PathBuf::from(data_dir),
+            data_dir: crate::config::runtime().data_folder.clone(),
         }
     }
 

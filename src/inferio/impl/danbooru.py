@@ -202,8 +202,20 @@ async def find_on_sauce_nao_async(
 
 
 class DanbooruTagger(InferenceModel):
-    def __init__(self, sauce_nao_enabled: bool = False):
+    def __init__(
+        self,
+        sauce_nao_enabled: bool = False,
+        api_key: Optional[str] = None,
+    ):
+        """
+        :param sauce_nao_enabled: Fall back to SauceNAO for images not found
+            on Danbooru by md5.
+        :param api_key: SauceNAO API key. Falls back to the SAUCENAO_API_KEY
+            environment variable when not given (registry configs can set
+            `config.api_key = "${SAUCENAO_API_KEY}"` to pass it explicitly).
+        """
         self.sauce_nao_enabled: bool = sauce_nao_enabled
+        self.api_key: Optional[str] = api_key
         self._model_loaded: bool = False
         self.saucenao_daily_limit_reached: bool = False
         self.limit_reached_time: Optional[float] = None
@@ -216,12 +228,16 @@ class DanbooruTagger(InferenceModel):
     def load(self):
         self._model_loaded = True
 
+    def _resolve_api_key(self) -> Optional[str]:
+        return self.api_key or os.getenv("SAUCENAO_API_KEY")
+
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        
-        if self.sauce_nao_enabled and not os.getenv("SAUCENAO_API_KEY"):
+
+        if self.sauce_nao_enabled and not self._resolve_api_key():
             raise ValueError(
-                "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
+                "A SauceNAO API key (api_key config option or SAUCENAO_API_KEY "
+                "environment variable) must be set for SauceNAO search"
             )
         
         self.reset_limit_reached()
@@ -272,8 +288,8 @@ class DanbooruTagger(InferenceModel):
             # If SauceNAO is enabled, try to find the image on SauceNAO for any None results
             # Due to SauceNAO's low rate limit, we do not use it concurrently
             final_results: List[dict] = []
-            sauce_nao_key = os.getenv("SAUCENAO_API_KEY")
-            assert sauce_nao_key, "SAUCENAO_API_KEY environment variable must be set for SauceNAO search"
+            sauce_nao_key = self._resolve_api_key()
+            assert sauce_nao_key, "A SauceNAO API key (api_key config option or SAUCENAO_API_KEY environment variable) must be set for SauceNAO search"
             for i, result in enumerate(results):
                 if result is not None:
                     # Already found on Danbooru, add to final results

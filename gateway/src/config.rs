@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use axum::http::Method;
 use serde::Deserialize;
 use serde::de::{self, SeqAccess, Visitor};
+use std::sync::OnceLock;
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
 pub const MAX_DB_NAME_LEN: usize = 64;
@@ -12,6 +13,31 @@ pub const CONFIG_PATH_ENV: &str = "GATEWAY_CONFIG_PATH";
 pub struct Settings {
     pub server: ServerConfig,
     pub upstreams: UpstreamsConfig,
+    /// Root folder for all persistent state (index DBs, user data DBs,
+    /// thumbnails, logs). Default: `data`, relative to the working directory.
+    #[serde(default = "default_data_folder")]
+    pub data_folder: PathBuf,
+    /// Default index DB name used when neither the request nor the policy
+    /// picks one. Default: `default`.
+    #[serde(default = "default_db_name")]
+    pub index_db: String,
+    /// Default user-data DB name used when neither the request nor the
+    /// policy picks one. Default: `default`.
+    #[serde(default = "default_db_name")]
+    pub user_data_db: String,
+    /// Read-only mode: strips write locks and skips startup migrations
+    /// (Python-parity with the old READONLY env var). Default: false.
+    #[serde(default)]
+    pub readonly: bool,
+    /// Scratch directory for extraction intermediates (video frames, rendered
+    /// pages). Default: `data/tmp` — a literal, matching the old TEMP_DIR
+    /// env default, deliberately NOT derived from `data_folder`.
+    #[serde(default = "default_temp_dir")]
+    pub temp_dir: PathBuf,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub open: OpenConfig,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -22,6 +48,61 @@ pub struct Settings {
     pub policies: Vec<PolicyConfig>,
     #[serde(default)]
     pub inference_local: InferenceLocalConfig,
+}
+
+fn default_data_folder() -> PathBuf {
+    PathBuf::from("data")
+}
+
+fn default_db_name() -> String {
+    "default".to_string()
+}
+
+fn default_temp_dir() -> PathBuf {
+    PathBuf::from("data/tmp")
+}
+
+/// `[logging]`: console + file logging.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    /// Log file path. Absent: `<data_folder>/panoptikon-gateway.log`.
+    /// Explicit empty string: file logging disabled (console only) — the
+    /// same semantics the old `LOGS_FILE=""` had.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Default level / tracing filter (e.g. "INFO", "DEBUG"). The RUST_LOG
+    /// environment variable takes precedence when set — it is the standard
+    /// tracing debug tool and supports per-module directives.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+fn default_log_level() -> String {
+    "INFO".to_string()
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            file: None,
+            level: default_log_level(),
+        }
+    }
+}
+
+/// `[open]`: custom commands for the local `/api/open/*` endpoints.
+/// `{path}`, `{folder}`, and `{filename}` placeholders expand to the target
+/// file's quoted full path, parent directory, and file name. Absent: the
+/// platform default (`start`/`open`/`xdg-open`, `explorer /select` etc.).
+/// An explicit empty string makes the endpoint a no-op.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OpenConfig {
+    /// Command template for "open file" (was the OPEN_FILE_COMMAND env var).
+    #[serde(default)]
+    pub file_command: Option<String>,
+    /// Command template for "show in file manager" (was SHOW_IN_FM_COMMAND).
+    #[serde(default)]
+    pub folder_command: Option<String>,
 }
 
 /// `[inference_local]`: the in-process inferio orchestrator (design doc §3).
@@ -42,10 +123,9 @@ pub struct InferenceLocalConfig {
     /// `["src/inferio/impl", "inferio_custom"]`.
     #[serde(default)]
     pub impl_dirs: Vec<PathBuf>,
-    /// Registry TOML directories, built-in first. Empty (default) means the
-    /// Python default resolution: `BASE_INFERENCE_CONFIG_FOLDER` env or
-    /// `src/inferio/config`, then `INFERIO_CONFIG_DIR` env or
-    /// `config/inference`.
+    /// Registry TOML directories, built-in first. Empty (default) means
+    /// `["src/inferio/config", "config/inference"]`; this key is the only
+    /// override (the old env fallbacks are gone).
     #[serde(default)]
     pub config_dirs: Vec<PathBuf>,
     /// Entries prepended to the workers' PYTHONPATH so the `inferio_worker`
@@ -158,26 +238,18 @@ impl InferenceLocalConfig {
     /// Impl-class search dirs, defaulted and absolutized (the worker
     /// handshake forwards them verbatim; workers skip missing dirs).
     ///
-    /// The default custom dir honors `INFERIO_CUSTOM_IMPL_PATH` like the
-    /// Python server (utils.py: env or `./inferio_custom`). Explicitly
-    /// configured `impl_dirs` win over the env var. Note there is no
-    /// local-mode analogue of `INFERIO_ALLOW_BUILT_IN_OVERRIDE`: dirs are
-    /// searched in order (built-ins first, customs later) and the first
-    /// module providing a matching `name()` wins.
+    /// Empty (default) means `["src/inferio/impl", "inferio_custom"]` —
+    /// `[inference_local].impl_dirs` is the only way to change this. Note
+    /// there is no local-mode analogue of `INFERIO_ALLOW_BUILT_IN_OVERRIDE`:
+    /// dirs are searched in order (built-ins first, customs later) and the
+    /// first module providing a matching `name()` wins.
     pub fn resolved_impl_dirs(&self) -> Vec<PathBuf> {
-        let custom_env = env::var_os("INFERIO_CUSTOM_IMPL_PATH");
         let dirs = if self.impl_dirs.is_empty() {
-            let custom = custom_env
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("inferio_custom"));
-            vec![PathBuf::from("src/inferio/impl"), custom]
+            vec![
+                PathBuf::from("src/inferio/impl"),
+                PathBuf::from("inferio_custom"),
+            ]
         } else {
-            if custom_env.is_some() {
-                tracing::warn!(
-                    "INFERIO_CUSTOM_IMPL_PATH is set but [inference_local].impl_dirs is \
-                     configured explicitly; the environment variable is ignored"
-                );
-            }
             self.impl_dirs.clone()
         };
         dirs.into_iter().map(absolutize).collect()
@@ -215,6 +287,11 @@ pub struct JobsConfig {
     /// larger than the whole budget still runs, but alone.
     #[serde(default = "default_intermediate_data_budget_mb")]
     pub intermediate_data_budget_mb: u64,
+    /// When true, incomplete extraction jobs found at job start are deleted
+    /// (with their data, via cascade) instead of being marked failed.
+    /// Python parity: the ATOMIC_EXTRACTION_JOBS env var. Default: false.
+    #[serde(default)]
+    pub atomic_extraction_jobs: bool,
 }
 
 fn default_loader_concurrency() -> usize {
@@ -230,6 +307,94 @@ impl Default for JobsConfig {
         Self {
             loader_concurrency: default_loader_concurrency(),
             intermediate_data_budget_mb: default_intermediate_data_budget_mb(),
+            atomic_extraction_jobs: false,
+        }
+    }
+}
+
+/// Process-global copy of the config values needed deep inside code that has
+/// no `Settings` handle (DB path resolution, job helpers, the open API).
+/// Installed exactly once by `main` right after config load; the defaults
+/// (matching the shipped config defaults) apply if nothing was installed.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub data_folder: PathBuf,
+    pub index_db: String,
+    pub user_data_db: String,
+    pub readonly: bool,
+    pub temp_dir: PathBuf,
+    pub atomic_extraction_jobs: bool,
+    pub open: OpenConfig,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            data_folder: default_data_folder(),
+            index_db: default_db_name(),
+            user_data_db: default_db_name(),
+            readonly: false,
+            temp_dir: default_temp_dir(),
+            atomic_extraction_jobs: false,
+            open: OpenConfig::default(),
+        }
+    }
+}
+
+static RUNTIME: OnceLock<RuntimeConfig> = OnceLock::new();
+
+/// Install the process-global runtime config. Called once from `main` after
+/// `Settings::load`; a second call is a programming error.
+pub fn install_runtime(settings: &Settings) {
+    RUNTIME
+        .set(settings.runtime_config())
+        .expect("runtime config installed twice");
+}
+
+/// The process-global runtime config.
+///
+/// Outside tests this **panics** when called before [`install_runtime`]:
+/// silently locking in defaults here would make a future pre-install call
+/// site read the wrong config and then blow up `install_runtime` with a
+/// misleading "installed twice" — fail at the actual offender instead.
+pub(crate) fn runtime() -> &'static RuntimeConfig {
+    #[cfg(test)]
+    {
+        // Tests must never touch ./data: default the data folder to the
+        // shared per-process temp root instead. Tests that need the data
+        // dir serialize through test_utils::test_data_dir, which installs
+        // this same root explicitly.
+        RUNTIME.get_or_init(|| RuntimeConfig {
+            data_folder: crate::test_utils::test_data_root().to_path_buf(),
+            ..RuntimeConfig::default()
+        })
+    }
+    #[cfg(not(test))]
+    {
+        RUNTIME.get().expect(
+            "runtime config accessed before install: call config::install_runtime \
+             right after Settings::load (main does this before anything else runs)",
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_runtime_for_tests(config: RuntimeConfig) -> &'static RuntimeConfig {
+    let _ = RUNTIME.set(config);
+    runtime()
+}
+
+impl Settings {
+    /// The [`RuntimeConfig`] slice of these settings.
+    pub fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            data_folder: self.data_folder.clone(),
+            index_db: self.index_db.clone(),
+            user_data_db: self.user_data_db.clone(),
+            readonly: self.readonly,
+            temp_dir: self.temp_dir.clone(),
+            atomic_extraction_jobs: self.jobs.atomic_extraction_jobs,
+            open: self.open.clone(),
         }
     }
 }
@@ -467,7 +632,7 @@ impl Settings {
             Some(path) => path,
             None => default_config_path()?,
         };
-        let builder = config::Config::builder()
+        let mut builder = config::Config::builder()
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 8080)?
             .set_default("server.trust_forwarded_headers", false)?
@@ -476,9 +641,14 @@ impl Settings {
             .set_default(
                 "search.embedding_cache_size",
                 default_embedding_cache_size() as i64,
-            )?
-            .add_source(config::File::from(config_path).required(false))
-            .add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
+            )?;
+        // A missing config file is fine (defaults + env only), matching the
+        // old `required(false)` behavior.
+        if let Some(source) = templated_file_source(&config_path)? {
+            builder = builder.add_source(source);
+        }
+        let builder =
+            builder.add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
         settings.apply_env_overrides()?;
@@ -536,8 +706,14 @@ impl Settings {
         if loopback_synthesized {
             self.validate_loopback_inference_policy()?;
         }
-        self.warn_inference_local();
         Ok(())
+    }
+
+    /// Non-fatal configuration warnings. Called from `main` *after* logging
+    /// is initialized (logging needs the settings, so tracing events emitted
+    /// during `Settings::load` itself would be dropped).
+    pub fn log_warnings(&self) {
+        self.warn_inference_local();
     }
 
     /// Local inference spawns workers lazily, so a missing interpreter is a
@@ -740,6 +916,32 @@ fn loopback_host(host: &str) -> &str {
 fn default_config_path() -> Result<PathBuf> {
     let cwd = env::current_dir().context("failed to resolve current directory")?;
     Ok(cwd.join("config").join("gateway").join("default.toml"))
+}
+
+/// Read the settings file, run env templating over its parsed string values
+/// (see `env_template`), and hand the substituted document to the config
+/// crate. Returns `None` when the file does not exist.
+fn templated_file_source(path: &PathBuf) -> Result<Option<config::File<config::FileSourceString, config::FileFormat>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read config file {}", path.display()));
+        }
+    };
+    let mut value: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    crate::env_template::substitute_toml_value(&mut value, path)?;
+    // Re-serialize the substituted tree: the TOML serializer escapes
+    // whatever the env values contained (backslashes, quotes), so this can
+    // never corrupt the document the way raw-text substitution would.
+    let substituted = toml::to_string(&value)
+        .with_context(|| format!("failed to re-serialize config file {}", path.display()))?;
+    Ok(Some(config::File::from_str(
+        &substituted,
+        config::FileFormat::Toml,
+    )))
 }
 
 fn validate_db_policy(label: &str, policy: &DbPolicy) -> Result<()> {
@@ -1268,33 +1470,249 @@ dir = "ui""#);
         );
     }
 
-    /// impl_dirs defaulting honors INFERIO_CUSTOM_IMPL_PATH exactly like
-    /// the Python server (utils.py: env var, default ./inferio_custom);
-    /// explicitly configured impl_dirs win and the env var is ignored.
+    /// impl_dirs defaulting: the config key is the only source. Empty means
+    /// the built-in pair; explicit entries replace it entirely (the old
+    /// INFERIO_CUSTOM_IMPL_PATH env fallback is gone).
     #[test]
-    fn impl_dirs_default_honors_custom_impl_path_env() {
+    fn impl_dirs_default_and_explicit_config() {
         let mut local = InferenceLocalConfig::default();
 
-        // Without the env var: the Python default pair.
         let dirs = local.resolved_impl_dirs();
         assert_eq!(dirs.len(), 2);
         assert!(dirs[0].ends_with("src/inferio/impl"), "got {dirs:?}");
         assert!(dirs[1].ends_with("inferio_custom"), "got {dirs:?}");
 
-        // With the env var: it replaces the custom-dir default.
-        unsafe { env::set_var("INFERIO_CUSTOM_IMPL_PATH", "my/custom_impls") };
-        let dirs = local.resolved_impl_dirs();
-        unsafe { env::remove_var("INFERIO_CUSTOM_IMPL_PATH") };
-        assert_eq!(dirs.len(), 2);
-        assert!(dirs[0].ends_with("src/inferio/impl"), "got {dirs:?}");
-        assert!(dirs[1].ends_with("my/custom_impls"), "got {dirs:?}");
-
-        // Explicit impl_dirs win over the env var (warned, not honored).
         local.impl_dirs = vec![PathBuf::from("explicit_dir")];
-        unsafe { env::set_var("INFERIO_CUSTOM_IMPL_PATH", "my/custom_impls") };
         let dirs = local.resolved_impl_dirs();
-        unsafe { env::remove_var("INFERIO_CUSTOM_IMPL_PATH") };
         assert_eq!(dirs.len(), 1);
         assert!(dirs[0].ends_with("explicit_dir"), "got {dirs:?}");
+    }
+
+    /// Minimal valid config file body for tests exercising the new keys.
+    const MINIMAL: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#;
+
+    fn load_from(body: &str) -> Result<Settings> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, body).unwrap();
+        Settings::load(Some(path))
+    }
+
+    use crate::test_utils::env_lock;
+
+    /// The absorbed env vars became config keys with identical defaults:
+    /// data_folder "data", index/user DB "default", readonly false,
+    /// temp_dir "data/tmp", logging (no file override, level INFO), no open
+    /// command overrides, atomic_extraction_jobs false.
+    #[test]
+    fn absorbed_keys_have_env_parity_defaults() {
+        let _guard = env_lock();
+        let settings = load_from(MINIMAL).unwrap();
+        assert_eq!(settings.data_folder, PathBuf::from("data"));
+        assert_eq!(settings.index_db, "default");
+        assert_eq!(settings.user_data_db, "default");
+        assert!(!settings.readonly);
+        assert_eq!(settings.temp_dir, PathBuf::from("data/tmp"));
+        assert_eq!(settings.logging.file, None);
+        assert_eq!(settings.logging.level, "INFO");
+        assert_eq!(settings.open.file_command, None);
+        assert_eq!(settings.open.folder_command, None);
+        assert!(!settings.jobs.atomic_extraction_jobs);
+
+        // And the RuntimeConfig defaults agree with the settings defaults,
+        // so code paths hit before/without install behave identically.
+        let runtime = RuntimeConfig::default();
+        assert_eq!(runtime.data_folder, settings.data_folder);
+        assert_eq!(runtime.index_db, settings.index_db);
+        assert_eq!(runtime.user_data_db, settings.user_data_db);
+        assert_eq!(runtime.readonly, settings.readonly);
+        assert_eq!(runtime.temp_dir, settings.temp_dir);
+        assert_eq!(
+            runtime.atomic_extraction_jobs,
+            settings.jobs.atomic_extraction_jobs
+        );
+    }
+
+    /// The new keys parse from TOML, including the logging/open sections and
+    /// the empty-string semantics (`logging.file = ""` disables file logging,
+    /// preserved from `LOGS_FILE=""`).
+    #[test]
+    fn absorbed_keys_parse() {
+        let _guard = env_lock();
+        let settings = load_from(&format!(
+            r#"
+data_folder = "D:/pan/data"
+index_db = "main"
+user_data_db = "bob"
+readonly = true
+temp_dir = "D:/scratch"
+{MINIMAL}
+[logging]
+file = ""
+level = "DEBUG"
+
+[open]
+file_command = "mpv {{path}}"
+folder_command = "explorer {{folder}}"
+
+[jobs]
+atomic_extraction_jobs = true
+"#
+        ))
+        .unwrap();
+        assert_eq!(settings.data_folder, PathBuf::from("D:/pan/data"));
+        assert_eq!(settings.index_db, "main");
+        assert_eq!(settings.user_data_db, "bob");
+        assert!(settings.readonly);
+        assert_eq!(settings.temp_dir, PathBuf::from("D:/scratch"));
+        assert_eq!(settings.logging.file.as_deref(), Some(""));
+        assert_eq!(settings.logging.level, "DEBUG");
+        assert_eq!(settings.open.file_command.as_deref(), Some("mpv {path}"));
+        assert_eq!(
+            settings.open.folder_command.as_deref(),
+            Some("explorer {folder}")
+        );
+        assert!(settings.jobs.atomic_extraction_jobs);
+
+        let runtime = settings.runtime_config();
+        assert_eq!(runtime.data_folder, PathBuf::from("D:/pan/data"));
+        assert!(runtime.readonly);
+        assert!(runtime.atomic_extraction_jobs);
+        assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
+    }
+
+    /// The GATEWAY__ env override layer covers the new keys too, both
+    /// top-level (GATEWAY__DATA_FOLDER) and nested (GATEWAY__LOGGING__LEVEL).
+    #[test]
+    fn gateway_env_overrides_cover_new_keys() {
+        let _guard = env_lock();
+        unsafe {
+            env::set_var("GATEWAY__DATA_FOLDER", "env_data");
+            env::set_var("GATEWAY__READONLY", "true");
+            env::set_var("GATEWAY__LOGGING__LEVEL", "trace");
+        }
+        let settings = load_from(MINIMAL);
+        unsafe {
+            env::remove_var("GATEWAY__DATA_FOLDER");
+            env::remove_var("GATEWAY__READONLY");
+            env::remove_var("GATEWAY__LOGGING__LEVEL");
+        }
+        let settings = settings.unwrap();
+        assert_eq!(settings.data_folder, PathBuf::from("env_data"));
+        assert!(settings.readonly);
+        assert_eq!(settings.logging.level, "trace");
+    }
+
+    /// Env templating applies to the gateway settings file: `${VAR}` and
+    /// `${VAR:-default}` expand inside string values (nested tables and
+    /// arrays included), Windows backslash values survive, and `$${` stays a
+    /// literal `${`.
+    #[test]
+    fn settings_file_is_env_templated() {
+        let _guard = env_lock();
+        unsafe {
+            env::set_var("GW_TEST_DATA_DIR", r"C:\pan data\root");
+            env::set_var("GW_TEST_LEVEL", "warn");
+        }
+        let settings = load_from(&format!(
+            r#"
+data_folder = "${{GW_TEST_DATA_DIR}}"
+index_db = "${{GW_TEST_UNSET_DB:-default}}"
+{MINIMAL}
+[logging]
+level = "${{GW_TEST_LEVEL:-INFO}}"
+
+[open]
+file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
+"#
+        ));
+        unsafe {
+            env::remove_var("GW_TEST_DATA_DIR");
+            env::remove_var("GW_TEST_LEVEL");
+        }
+        let settings = settings.unwrap();
+        assert_eq!(settings.data_folder, PathBuf::from(r"C:\pan data\root"));
+        assert_eq!(settings.index_db, "default");
+        assert_eq!(settings.logging.level, "warn");
+        assert_eq!(
+            settings.open.file_command.as_deref(),
+            Some("run ${literal} warn")
+        );
+    }
+
+    /// The shipped configs load end-to-end through templating. Their
+    /// `[logging] level = "${LOGLEVEL:-INFO}"` resolves the LOGLEVEL env var
+    /// (the user's .env sets it) and defaults to INFO when LOGLEVEL is unset
+    /// *or* empty (a `.env` line `LOGLEVEL=` leaves it set to "") — this is
+    /// what keeps the live behavior identical after the LOGLEVEL env *read*
+    /// was replaced by the config key.
+    #[test]
+    fn shipped_configs_load_and_template_loglevel() {
+        let _guard = env_lock();
+        // Restore whatever LOGLEVEL was set before this test (the dev shell
+        // may legitimately have one), even if an assertion panics.
+        struct RestoreLoglevel(Option<String>);
+        impl Drop for RestoreLoglevel {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => env::set_var("LOGLEVEL", value),
+                        None => env::remove_var("LOGLEVEL"),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreLoglevel(env::var("LOGLEVEL").ok());
+
+        let config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("config")
+            .join("gateway");
+
+        for file in ["default.toml", "local.toml"] {
+            unsafe { env::remove_var("LOGLEVEL") };
+            let settings =
+                Settings::load(Some(config_dir.join(file))).unwrap_or_else(|err| {
+                    panic!("shipped {file} must load: {err:#}");
+                });
+            assert_eq!(settings.logging.level, "INFO", "{file}: LOGLEVEL unset");
+
+            // `.env` empty assignment (`LOGLEVEL=`): set-but-empty must also
+            // fall back to INFO under the shell `:-` convention.
+            unsafe { env::set_var("LOGLEVEL", "") };
+            let settings = Settings::load(Some(config_dir.join(file))).unwrap();
+            assert_eq!(settings.logging.level, "INFO", "{file}: LOGLEVEL empty");
+
+            unsafe { env::set_var("LOGLEVEL", "DEBUG") };
+            let settings = Settings::load(Some(config_dir.join(file))).unwrap();
+            assert_eq!(settings.logging.level, "DEBUG", "{file}: LOGLEVEL=DEBUG");
+        }
+    }
+
+    /// `${VAR}` without a default and with the variable unset fails config
+    /// load with an error naming both the file and the variable.
+    #[test]
+    fn settings_file_unset_var_fails_load() {
+        let _guard = env_lock();
+        let err = load_from(&format!(
+            "data_folder = \"${{GW_TEST_DEFINITELY_UNSET_XYZ}}\"\n{MINIMAL}"
+        ))
+        .expect_err("unset ${VAR} must fail the load");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("GW_TEST_DEFINITELY_UNSET_XYZ"),
+            "names the variable: {text}"
+        );
+        assert!(text.contains("gw.toml"), "names the file: {text}");
     }
 }

@@ -1,7 +1,7 @@
 use axum::{Json, extract::Path};
 use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
-use std::{env, path::Path as FsPath};
+use std::path::Path as FsPath;
 use tokio::process::Command;
 use utoipa::{IntoParams, ToSchema};
 
@@ -102,8 +102,8 @@ async fn execute_custom_command(
 ///
 /// `path`: The path to the file to be opened.
 async fn open_file(path: &FsPath) -> ApiResult<()> {
-    if let Ok(custom_cmd) = env::var("OPEN_FILE_COMMAND") {
-        execute_custom_command("OPEN_FILE_COMMAND", &custom_cmd, path).await?;
+    if let Some(custom_cmd) = crate::config::runtime().open.file_command.clone() {
+        execute_custom_command("open.file_command", &custom_cmd, path).await?;
         return Ok(());
     }
 
@@ -165,8 +165,8 @@ async fn show_in_fm(path: &FsPath) -> ApiResult<()> {
         )));
     }
 
-    if let Ok(custom_cmd) = env::var("SHOW_IN_FM_COMMAND") {
-        execute_custom_command("SHOW_IN_FM_COMMAND", &custom_cmd, path).await?;
+    if let Some(custom_cmd) = crate::config::runtime().open.folder_command.clone() {
+        execute_custom_command("open.folder_command", &custom_cmd, path).await?;
         return Ok(());
     }
 

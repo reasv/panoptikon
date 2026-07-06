@@ -2731,9 +2731,9 @@ fn temp_dir_path() -> PathBuf {
             .map(|elapsed| elapsed.as_nanos() as u64)
             .unwrap_or(0)
     });
-    let base = env::var("TEMP_DIR").unwrap_or_else(|_| "data/tmp".to_string());
+    let base = crate::config::runtime().temp_dir.clone();
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(base).join(format!("frames-{}-{nonce:x}-{unique}", std::process::id()))
+    base.join(format!("frames-{}-{nonce:x}-{unique}", std::process::id()))
 }
 
 pub(crate) fn check_folder_validity(folder: &str) -> bool {

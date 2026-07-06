@@ -7,7 +7,7 @@ use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::{
-    env, fs,
+    fs,
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -118,13 +118,12 @@ fn resolve_db_names(query: DbQuery) -> Result<DbNames, ApiError> {
 }
 
 fn db_default_names() -> (String, String) {
-    let index_default = env::var("INDEX_DB").unwrap_or_else(|_| "default".to_string());
-    let user_default = env::var("USER_DATA_DB").unwrap_or_else(|_| "default".to_string());
-    (index_default, user_default)
+    let runtime = crate::config::runtime();
+    (runtime.index_db.clone(), runtime.user_data_db.clone())
 }
 
 pub(crate) fn index_storage_paths_unchecked(index_db: &str) -> IndexStoragePaths {
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let data_dir = crate::config::runtime().data_folder.clone();
     let index_db_dir = data_dir.join("index");
     let index_dir = index_db_dir.join(index_db);
     IndexStoragePaths {
@@ -160,11 +159,7 @@ fn db_paths_index_only(index_db: &str) -> Result<DbPaths, ApiError> {
 
 fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
     let index_paths = index_storage_paths(index_db)?;
-    let user_data_db_dir = {
-        let data_dir =
-            PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
-        data_dir.join("user_data")
-    };
+    let user_data_db_dir = crate::config::runtime().data_folder.join("user_data");
     fs::create_dir_all(&user_data_db_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create user data dir");
         ApiError::internal("Failed to prepare database directories")
@@ -178,7 +173,7 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
 }
 
 fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let data_dir = crate::config::runtime().data_folder.clone();
     let index_dir = data_dir.join("index");
     let user_data_dir = data_dir.join("user_data");
 
@@ -255,16 +250,11 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
     Ok(())
 }
 
-/// True when the READONLY env var requests read-only mode. Python parity:
-/// the same variable strips write locks and skips startup migrations there.
+/// True when the `readonly` config key requests read-only mode. Python
+/// parity (READONLY env var there): strips write locks and skips startup
+/// migrations.
 pub(crate) fn readonly_mode() -> bool {
-    env::var("READONLY")
-        .ok()
-        .map(|value| {
-            let value = value.to_lowercase();
-            matches!(value.as_str(), "true" | "1")
-        })
-        .unwrap_or(false)
+    crate::config::runtime().readonly
 }
 
 async fn connect_db(

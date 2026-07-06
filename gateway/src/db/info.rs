@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::{env, fs, path::PathBuf};
+use std::fs;
 
 use crate::policy::{DbInfo, SingleDbInfo};
 
@@ -19,13 +19,12 @@ pub(crate) fn load_db_info() -> Result<DbInfo> {
 }
 
 pub(crate) fn db_defaults() -> (String, String) {
-    let index_default = env::var("INDEX_DB").unwrap_or_else(|_| "default".to_string());
-    let user_default = env::var("USER_DATA_DB").unwrap_or_else(|_| "default".to_string());
-    (index_default, user_default)
+    let runtime = crate::config::runtime();
+    (runtime.index_db.clone(), runtime.user_data_db.clone())
 }
 
 pub(crate) fn db_lists() -> Result<(Vec<String>, Vec<String>)> {
-    let data_dir = PathBuf::from(env::var("DATA_FOLDER").unwrap_or_else(|_| "data".to_string()));
+    let data_dir = crate::config::runtime().data_folder.clone();
     let index_dir = data_dir.join("index");
     let user_data_dir = data_dir.join("user_data");
 

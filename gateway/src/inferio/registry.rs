@@ -62,10 +62,10 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{env, fs};
 
 /// Ordered list of directories scanned for `*.toml` registry files.
 /// Built-in (repo) config first, user config after, so user files can extend
@@ -76,36 +76,28 @@ pub struct RegistryConfig {
 }
 
 impl RegistryConfig {
-    /// Mirror Python's default folder resolution:
+    /// Default folder resolution when `[inference_local].config_dirs` is
+    /// empty (the config key is the only override — the old
+    /// `BASE_INFERENCE_CONFIG_FOLDER`/`INFERIO_CONFIG_DIR` env fallbacks are
+    /// gone):
     ///
-    /// - Base folder: `BASE_INFERENCE_CONFIG_FOLDER` env if set (returned
-    ///   without an existence check, exactly like `get_base_config_folder`,
-    ///   config.py:159-160); otherwise `src/inferio/config`, which must
-    ///   exist (config.py:168-171). Python resolves this relative to the
-    ///   `inferio` package's `__file__`; Rust has no equivalent, so the
-    ///   default is relative to the current working directory — the gateway
-    ///   is run from the repo root in the dev layout, where the two agree.
-    ///   Windows nuance: relative paths resolve against the drive+dir of the
-    ///   process CWD like on Unix; no special handling is needed.
-    /// - User folder: `INFERIO_CONFIG_DIR` env or `config/inference`
-    ///   (config.py:88), never existence-checked (a missing folder is
-    ///   skipped with a warning at load time).
+    /// - Base folder: `src/inferio/config`, which must exist (Python parity:
+    ///   config.py:168-171). Python resolves this relative to the `inferio`
+    ///   package's `__file__`; Rust has no equivalent, so the default is
+    ///   relative to the current working directory — the gateway is run from
+    ///   the repo root in the dev layout, where the two agree. Windows
+    ///   nuance: relative paths resolve against the drive+dir of the process
+    ///   CWD like on Unix; no special handling is needed.
+    /// - User folder: `config/inference` (config.py:88), never
+    ///   existence-checked (a missing folder is skipped with a warning at
+    ///   load time).
     pub fn default_dirs() -> Result<Self> {
-        let base = match env::var_os("BASE_INFERENCE_CONFIG_FOLDER") {
-            Some(dir) => PathBuf::from(dir),
-            None => {
-                let dir = PathBuf::from("src/inferio/config");
-                if !dir.is_dir() {
-                    bail!("Base configuration folder not found at: {}", dir.display());
-                }
-                dir
-            }
-        };
-        let user = env::var_os("INFERIO_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("config/inference"));
+        let base = PathBuf::from("src/inferio/config");
+        if !base.is_dir() {
+            bail!("Base configuration folder not found at: {}", base.display());
+        }
         Ok(Self {
-            config_dirs: vec![base, user],
+            config_dirs: vec![base, PathBuf::from("config/inference")],
         })
     }
 }
@@ -429,7 +421,14 @@ fn load_folder(folder: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Resu
 
 fn load_file(file: &Path, groups: &mut BTreeMap<String, GroupEntry>) -> Result<()> {
     let text = fs::read_to_string(file).context("failed to read file")?;
-    let doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
+    let mut doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
+    // Env templating (`${VAR}` / `${VAR:-default}` in string values): this is
+    // how secrets and URLs reach inference impls — a registry file can set
+    // `config.api_key = "${SOME_API_KEY}"` and the substituted value flows
+    // into the impl constructor kwargs. Applied on every (re)load, so the
+    // mtime-gated reload path re-substitutes too. A substitution error fails
+    // the whole load like any other file error.
+    crate::env_template::substitute_toml_value(&mut doc, file)?;
 
     // Python evaluates the flag's *truthiness* (`data.get("allow_override",
     // False)` used in a boolean context, config.py:39,59), so non-bool
@@ -1200,6 +1199,84 @@ config.impl_class = "cls"
                 "error for `{line}` names '{key}' and the id: {text}"
             );
         }
+    }
+
+    /// Env templating applies to registry files: `${VAR}` in `config.*`
+    /// values reaches the merged config and the spawn kwargs (the mechanism
+    /// for feeding secrets/URLs to impl constructors), `${VAR:-default}`
+    /// falls back when unset, and an unset `${VAR}` without a default fails
+    /// the whole load naming the file and the variable.
+    #[test]
+    fn registry_values_are_env_templated() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+
+[group.g.inference_ids.x]
+config.api_key = "${REGISTRY_TEST_KEY}"
+config.endpoint = "${REGISTRY_TEST_ENDPOINT:-https://default.example}"
+"#,
+        );
+
+        // Unset required var: the load fails, naming file and variable.
+        let err = registry_for(&[dir.path()]).expect_err("unset ${VAR} fails the load");
+        let text = format!("{err:#}");
+        assert!(text.contains("REGISTRY_TEST_KEY"), "{text}");
+        assert!(text.contains("a.toml"), "{text}");
+
+        unsafe { std::env::set_var("REGISTRY_TEST_KEY", "sekrit") };
+        let registry = registry_for(&[dir.path()]);
+        unsafe { std::env::remove_var("REGISTRY_TEST_KEY") };
+        let registry = registry.expect("loads once the variable is set");
+
+        let spec = registry.spawn_spec("g/x").expect("resolves");
+        assert_eq!(
+            spec.config_kwargs,
+            json!({"api_key": "sekrit", "endpoint": "https://default.example"}),
+            "substituted values reach the impl constructor kwargs"
+        );
+    }
+
+    /// The mtime-gated reload re-substitutes: after the env value changes,
+    /// a reload (triggered by an mtime bump) reflects the new value.
+    #[test]
+    fn cache_reload_resubstitutes_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.x]
+config.token = "${REGISTRY_RELOAD_TOKEN:-none}"
+"#,
+        );
+        let mut cache = RegistryCache::new(RegistryConfig {
+            config_dirs: vec![dir.path().to_path_buf()],
+        });
+
+        let first = cache.get().expect("initial load");
+        assert_eq!(
+            first.spawn_spec("g/x").unwrap().config_kwargs,
+            json!({"token": "none"})
+        );
+
+        unsafe { std::env::set_var("REGISTRY_RELOAD_TOKEN", "fresh") };
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        set_mtime(&file, mtime + Duration::from_secs(2));
+        let reloaded = cache.get();
+        unsafe { std::env::remove_var("REGISTRY_RELOAD_TOKEN") };
+        let reloaded = reloaded.expect("reload succeeds");
+        assert_eq!(
+            reloaded.spawn_spec("g/x").unwrap().config_kwargs,
+            json!({"token": "fresh"}),
+            "reload re-runs substitution with the current environment"
+        );
     }
 
     /// inference_id_metadata mirrors Python get_metadata (config.py:120-136):
