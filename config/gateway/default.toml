@@ -81,6 +81,22 @@ use_for_jobs = true
 # Size of the in-process embedding cache used by search preprocessing.
 embedding_cache_size = 16
 
+# Host-resource limits for scan/extraction jobs.
+# [jobs]
+# Concurrent extraction input loaders (decode processes and file reads).
+# loader_concurrency = 8
+# Cap in MiB on loaded-but-unfinished intermediate input data (frames,
+# audio, rendered pages) held in memory across in-flight items.
+# intermediate_data_budget_mb = 1024
+# Per-image decode allocation ceiling in MiB. Image formats are detected by
+# content sniffing (mis-named files decode fine), and this ceiling is the
+# only guard against decompression bombs — legitimate very large images
+# must fit under it. 0 = unlimited.
+# image_decode_memory_limit_mb = 8192
+# When true, incomplete extraction jobs found at job start are deleted
+# (with their data) instead of being marked failed.
+# atomic_extraction_jobs = false
+
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
 # If a policy references a ruleset, anything not matched is denied.

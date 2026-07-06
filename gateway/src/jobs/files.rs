@@ -1582,20 +1582,30 @@ fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {
 
 /// Decodes an image like PIL does: the format is sniffed from the file's
 /// magic bytes (the extension is only a fallback when the content is
-/// unrecognized) and decoder allocation limits are lifted. Archives contain
-/// mis-named files (WebP saved as .png) and very large images (20k x 20k
-/// collages exceed the crate's default 512 MiB cap) that Python indexed fine.
+/// unrecognized) and the crate's default 512 MiB allocation cap is replaced
+/// by the configurable `[jobs].image_decode_memory_limit_mb` ceiling.
+/// Archives contain mis-named files (WebP saved as .png) and very large
+/// images (20k x 20k collages) that Python indexed fine.
 pub(crate) fn open_image(path: impl AsRef<Path>) -> image::ImageResult<DynamicImage> {
     let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
-    reader.no_limits();
+    reader.limits(decode_limits());
     reader.decode()
 }
 
-/// In-memory counterpart of [`open_image`]: content-sniffed, no limits.
+/// In-memory counterpart of [`open_image`]: content-sniffed, same ceiling.
 pub(crate) fn decode_image_bytes(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
-    reader.no_limits();
+    reader.limits(decode_limits());
     reader.decode()
+}
+
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::no_limits();
+    let limit_mb = crate::config::runtime().image_decode_memory_limit_mb;
+    if limit_mb > 0 {
+        limits.max_alloc = Some(limit_mb.saturating_mul(1024 * 1024));
+    }
+    limits
 }
 
 fn extract_item_metadata(

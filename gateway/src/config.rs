@@ -292,6 +292,15 @@ pub struct JobsConfig {
     /// Python parity: the ATOMIC_EXTRACTION_JOBS env var. Default: false.
     #[serde(default)]
     pub atomic_extraction_jobs: bool,
+    /// Per-image decode allocation ceiling in MiB, applied everywhere the
+    /// gateway decodes an image (scan metadata/thumbnails/blurhash,
+    /// extraction slicing). Image formats are detected by content sniffing
+    /// with the image crate's built-in 512 MiB cap replaced by this one, so
+    /// this is the only guard against decompression bombs; legitimate very
+    /// large images (20k x 20k collages) must fit under it. 0 = unlimited.
+    /// Default: 8192 (8 GiB).
+    #[serde(default = "default_image_decode_memory_limit_mb")]
+    pub image_decode_memory_limit_mb: u64,
 }
 
 fn default_loader_concurrency() -> usize {
@@ -302,12 +311,17 @@ fn default_intermediate_data_budget_mb() -> u64 {
     1024
 }
 
+fn default_image_decode_memory_limit_mb() -> u64 {
+    8192
+}
+
 impl Default for JobsConfig {
     fn default() -> Self {
         Self {
             loader_concurrency: default_loader_concurrency(),
             intermediate_data_budget_mb: default_intermediate_data_budget_mb(),
             atomic_extraction_jobs: false,
+            image_decode_memory_limit_mb: default_image_decode_memory_limit_mb(),
         }
     }
 }
@@ -324,6 +338,7 @@ pub struct RuntimeConfig {
     pub readonly: bool,
     pub temp_dir: PathBuf,
     pub atomic_extraction_jobs: bool,
+    pub image_decode_memory_limit_mb: u64,
     pub open: OpenConfig,
 }
 
@@ -336,6 +351,7 @@ impl Default for RuntimeConfig {
             readonly: false,
             temp_dir: default_temp_dir(),
             atomic_extraction_jobs: false,
+            image_decode_memory_limit_mb: default_image_decode_memory_limit_mb(),
             open: OpenConfig::default(),
         }
     }
@@ -394,6 +410,7 @@ impl Settings {
             readonly: self.readonly,
             temp_dir: self.temp_dir.clone(),
             atomic_extraction_jobs: self.jobs.atomic_extraction_jobs,
+            image_decode_memory_limit_mb: self.jobs.image_decode_memory_limit_mb,
             open: self.open.clone(),
         }
     }
@@ -1528,6 +1545,7 @@ base_url = "http://127.0.0.1:6342"
         assert_eq!(settings.open.file_command, None);
         assert_eq!(settings.open.folder_command, None);
         assert!(!settings.jobs.atomic_extraction_jobs);
+        assert_eq!(settings.jobs.image_decode_memory_limit_mb, 8192);
 
         // And the RuntimeConfig defaults agree with the settings defaults,
         // so code paths hit before/without install behave identically.
@@ -1540,6 +1558,10 @@ base_url = "http://127.0.0.1:6342"
         assert_eq!(
             runtime.atomic_extraction_jobs,
             settings.jobs.atomic_extraction_jobs
+        );
+        assert_eq!(
+            runtime.image_decode_memory_limit_mb,
+            settings.jobs.image_decode_memory_limit_mb
         );
     }
 
@@ -1567,6 +1589,7 @@ folder_command = "explorer {{folder}}"
 
 [jobs]
 atomic_extraction_jobs = true
+image_decode_memory_limit_mb = 2048
 "#
         ))
         .unwrap();
@@ -1583,11 +1606,13 @@ atomic_extraction_jobs = true
             Some("explorer {folder}")
         );
         assert!(settings.jobs.atomic_extraction_jobs);
+        assert_eq!(settings.jobs.image_decode_memory_limit_mb, 2048);
 
         let runtime = settings.runtime_config();
         assert_eq!(runtime.data_folder, PathBuf::from("D:/pan/data"));
         assert!(runtime.readonly);
         assert!(runtime.atomic_extraction_jobs);
+        assert_eq!(runtime.image_decode_memory_limit_mb, 2048);
         assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
     }
 

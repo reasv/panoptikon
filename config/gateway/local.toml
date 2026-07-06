@@ -43,6 +43,13 @@ enabled = true
 # Size of the in-process embedding cache used by search preprocessing.
 embedding_cache_size = 16
 
+# Host-resource limits for scan/extraction jobs (see default.toml for the
+# full key list).
+# [jobs]
+# Per-image decode allocation ceiling in MiB (decompression-bomb guard;
+# legitimate very large images must fit under it). 0 = unlimited.
+# image_decode_memory_limit_mb = 8192
+
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
 # If a policy references a ruleset, anything not matched is denied.
