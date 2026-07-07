@@ -563,29 +563,28 @@ pub(crate) async fn get_text_stats(conn: &mut sqlx::SqliteConnection) -> ApiResu
         languages.push(language);
     }
 
-    let row = sqlx::query(
-        r#"
-        SELECT MIN(language_confidence) AS min_language_confidence,
-               MIN(confidence) AS min_confidence
-        FROM extracted_text
-        "#,
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to read text confidence stats");
-        ApiError::internal("Failed to get text stats")
-    })?;
-
+    // Run the two MIN() aggregates as separate queries. SQLite only applies
+    // its MIN/MAX index optimization when a query has a *single* aggregate;
+    // combining MIN(language_confidence) and MIN(confidence) in one SELECT
+    // forces a full scan of the (large) extracted_text table. Split apart,
+    // each query uses a covering index (idx_extracted_text_language_confidence
+    // / idx_extracted_text_confidence) and returns in microseconds.
     let lowest_language_confidence: Option<f64> =
-        row.try_get("min_language_confidence").map_err(|err| {
-            tracing::error!(error = %err, "failed to parse language confidence");
-            ApiError::internal("Failed to get text stats")
-        })?;
-    let lowest_confidence: Option<f64> = row.try_get("min_confidence").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse text confidence");
-        ApiError::internal("Failed to get text stats")
-    })?;
+        sqlx::query_scalar("SELECT MIN(language_confidence) FROM extracted_text")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read language confidence stat");
+                ApiError::internal("Failed to get text stats")
+            })?;
+    let lowest_confidence: Option<f64> =
+        sqlx::query_scalar("SELECT MIN(confidence) FROM extracted_text")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read text confidence stat");
+                ApiError::internal("Failed to get text stats")
+            })?;
 
     Ok(TextStats {
         languages,
