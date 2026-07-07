@@ -310,14 +310,22 @@ pub(crate) async fn get_existing_files_for_sha256(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Vec<FileRecord>> {
-    let rows = sqlx::query(
+    // A full sha256 is 64 hex chars; anything shorter is treated as a prefix
+    // (the pinboard stores only a 10-char prefix), matching the item-lookup
+    // endpoint's behaviour.
+    let where_clause = if sha256.len() < 64 {
+        "WHERE sha256 LIKE ? || '%'"
+    } else {
+        "WHERE sha256 = ?"
+    };
+    let rows = sqlx::query(&format!(
         r#"
         SELECT id, sha256, path, last_modified, filename
         FROM files
-        WHERE sha256 = ?
+        {where_clause}
         ORDER BY available DESC
-        "#,
-    )
+        "#
+    ))
     .bind(sha256)
     .fetch_all(conn)
     .await
