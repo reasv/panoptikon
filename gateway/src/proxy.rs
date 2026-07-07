@@ -96,6 +96,16 @@ enum UpstreamKind {
     Inference,
 }
 
+/// Counts how many times a request has already passed through a panoptikon
+/// gateway, so a self-referential upstream (a base_url pointing back at one
+/// of our own listeners) is cut off after a few hops instead of recursing
+/// until the ephemeral port range is exhausted.
+const HOP_COUNT_HEADER: &str = "x-panoptikon-gateway-hops";
+/// Legitimate gateway chains (e.g. forwarding inference to another
+/// machine's gateway) are one or two hops deep; anything deeper is a
+/// routing loop.
+const MAX_PROXY_HOPS: u64 = 4;
+
 async fn proxy_request(
     client_addr: SocketAddr,
     state: Arc<ProxyState>,
@@ -121,6 +131,26 @@ async fn proxy_request(
         UpstreamKind::Api => state.api.clone(),
         UpstreamKind::Inference => state.inference.clone(),
     };
+
+    let hops = req
+        .headers()
+        .get(HOP_COUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if hops >= MAX_PROXY_HOPS {
+        tracing::error!(
+            upstream = %upstream.name,
+            path = %path_and_query,
+            hops,
+            "proxy loop detected; refusing to forward"
+        );
+        return StatusCode::LOOP_DETECTED.into_response();
+    }
+    req.headers_mut().insert(
+        HeaderName::from_static(HOP_COUNT_HEADER),
+        HeaderValue::from(hops + 1),
+    );
 
     if let Err(err) = build_upstream_request(
         &upstream,
@@ -218,4 +248,45 @@ fn append_forwarded_for(
     };
     headers.insert(name, HeaderValue::from_str(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::any;
+
+    // Regression test for the /api self-proxy recursion (2026-07-07): an
+    // upstream that points back at the proxy's own listener must be cut off
+    // by the hop guard instead of recursing until the ephemeral port range
+    // is exhausted.
+    #[tokio::test]
+    async fn self_referential_upstream_is_cut_off() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = Upstream::parse("api", &format!("http://{addr}")).unwrap();
+        let inference_client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+        let state = Arc::new(ProxyState::new(
+            upstream.clone(),
+            upstream.clone(),
+            upstream,
+            inference_client,
+            0,
+        ));
+        let app = axum::Router::new()
+            .route("/api/{*path}", any(proxy_api))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let response = reqwest::get(format!("http://{addr}/api/no-such-route"))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), StatusCode::LOOP_DETECTED.as_u16());
+    }
 }

@@ -37,7 +37,9 @@ local = true
 dir = "../panoptikon-ui"
 
 [upstreams.api]
-# FastAPI backend base URL (unused for the local routes when local = true).
+# FastAPI backend base URL. Unused when local = true: every /api route is
+# served in-process and unmatched /api paths return 404 (they must not be
+# proxied — this base_url points back at the gateway itself).
 base_url = "http://127.0.0.1:6342"
 local = true
 

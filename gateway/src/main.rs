@@ -191,9 +191,21 @@ async fn async_main() -> anyhow::Result<()> {
                 .route("/api/inference/{*path}", any(proxy::proxy_inference));
         }
     }
+    // With a local API there is no separate backend: upstreams.api.base_url
+    // points back at this gateway, so the catch-all proxy would forward any
+    // unmatched /api path to ourselves and recurse. Each hop holds a live
+    // loopback connection, so one such request exhausts the ephemeral port
+    // range within seconds and starves every other connection on the machine
+    // (observed: GET /api/search/ — a Python-era path — reached 15k hops).
+    // Unknown API paths must 404 instead.
+    let app = if local_api {
+        app.route("/api", any(api_not_found))
+            .route("/api/{*path}", any(api_not_found))
+    } else {
+        app.route("/api", any(proxy::proxy_api))
+            .route("/api/{*path}", any(proxy::proxy_api))
+    };
     let mut app = app
-        .route("/api", any(proxy::proxy_api))
-        .route("/api/{*path}", any(proxy::proxy_api))
         .route("/docs", any(proxy::proxy_api))
         .route("/openapi.json", any(proxy::proxy_api))
         .fallback(any(proxy::proxy_ui));
@@ -356,6 +368,12 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
     Ok(())
+}
+
+/// Replaces the /api catch-all proxy when the API is served locally: the
+/// proxy target would be this gateway itself (see router setup above).
+async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
+    api_error::ApiError::not_found(format!("Unknown API endpoint: {}", uri.path()))
 }
 
 /// `panoptikon-gateway inferio`: the standalone inference service (design
