@@ -11,6 +11,7 @@ tokio = { version = "1.39", features = [
     "macros",
     "process",
     "fs",
+    "io-util",
     "signal",
 ] }
 hyper = { version = "1", features = ["http1", "http2", "client"] }

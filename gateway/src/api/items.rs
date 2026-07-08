@@ -1,12 +1,14 @@
 use axum::{
     Json,
     body::Body,
-    http::{Response, header},
+    http::{HeaderMap, Response, StatusCode, header},
 };
 use axum_extra::extract::Query;
 
 use serde::{Deserialize, Serialize};
+use std::io::SeekFrom;
 use std::path::Path;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
 
@@ -135,15 +137,18 @@ pub(crate) struct ThumbnailQuery {
     path = "/api/items/item/file",
     tag = "items",
     summary = "Get actual file contents for an item",
-    description = "Returns the actual file contents for a given item.\nContent type is determined by the file extension.",
+    description = "Returns the actual file contents for a given item.\nContent type is determined by the file extension.\nSupports HTTP Range requests (single byte ranges) for seeking in media files.",
     params(DbQueryParams, ItemQuery),
     responses(
-        (status = 200, description = "Item file contents")
+        (status = 200, description = "Item file contents"),
+        (status = 206, description = "Partial item file contents (Range request)"),
+        (status = 416, description = "Requested range not satisfiable")
     )
 )]
 pub async fn item_file(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ItemQuery>,
+    request_headers: HeaderMap,
 ) -> ApiResult<Response<Body>> {
     let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
@@ -160,7 +165,7 @@ pub async fn item_file(
         filename = file.filename.clone();
     }
 
-    file_response(&item, file, &filename, "inline").await
+    file_response(&item, file, &filename, "inline", &request_headers).await
 }
 
 #[utoipa::path(
@@ -300,6 +305,7 @@ pub async fn texts_any(
 pub async fn item_thumbnail(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<ThumbnailQuery>,
+    request_headers: HeaderMap,
 ) -> ApiResult<Response<Body>> {
     let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
@@ -327,6 +333,7 @@ pub async fn item_thumbnail(
         &original_filename,
         original_filename_no_ext,
         query.big,
+        &request_headers,
     )
     .await
     {
@@ -345,10 +352,11 @@ async fn thumbnail_response(
     original_filename: &str,
     original_filename_no_ext: &str,
     big: bool,
+    request_headers: &HeaderMap,
 ) -> ApiResult<Response<Body>> {
     let mime = item.mime_type.as_str();
     if mime.is_empty() || mime.starts_with("image/gif") {
-        return file_response(item, file, original_filename, "inline").await;
+        return file_response(item, file, original_filename, "inline", request_headers).await;
     }
 
     let index = if mime.starts_with("video") {
@@ -363,11 +371,93 @@ async fn thumbnail_response(
     }
 
     if mime.starts_with("image") {
-        return file_response(item, file, original_filename, "inline").await;
+        return file_response(item, file, original_filename, "inline", request_headers).await;
     }
 
     let filename = format!("{original_filename_no_ext}.png");
     bytes_response(PLACEHOLDER_PNG.to_vec(), "image/png", &filename)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RangeOutcome {
+    /// No usable Range header: serve the whole file with 200.
+    Full,
+    /// A single satisfiable byte range (inclusive): serve 206.
+    Partial { start: u64, end: u64 },
+    /// Range header was valid but no requested range overlaps the file: 416.
+    Unsatisfiable,
+}
+
+/// Parses a `Range` request header against a resource of `size` bytes.
+///
+/// Handles all RFC 9110 byte-range forms: `start-end`, `start-`, and the
+/// suffix form `-N`. Out-of-bounds ends are clamped. Multiple ranges are
+/// accepted syntactically, but if more than one is satisfiable the header is
+/// ignored (full 200) rather than answered with multipart/byteranges, which
+/// RFC 9110 permits. Malformed headers are ignored entirely.
+fn parse_range_header(value: &str, size: u64) -> RangeOutcome {
+    let trimmed = value.trim();
+    let Some(specs) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
+        .map(|_| &trimmed[6..])
+    else {
+        return RangeOutcome::Full;
+    };
+
+    let mut satisfiable = Vec::new();
+    let mut any_valid = false;
+    for spec in specs.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let Some((start_str, end_str)) = spec.split_once('-') else {
+            return RangeOutcome::Full;
+        };
+        let start_str = start_str.trim();
+        let end_str = end_str.trim();
+        if start_str.is_empty() {
+            // Suffix form: last N bytes.
+            let Ok(suffix) = end_str.parse::<u64>() else {
+                return RangeOutcome::Full;
+            };
+            any_valid = true;
+            if suffix == 0 || size == 0 {
+                continue;
+            }
+            satisfiable.push((size.saturating_sub(suffix), size - 1));
+        } else {
+            let Ok(start) = start_str.parse::<u64>() else {
+                return RangeOutcome::Full;
+            };
+            let end = if end_str.is_empty() {
+                size.checked_sub(1)
+            } else {
+                let Ok(end) = end_str.parse::<u64>() else {
+                    return RangeOutcome::Full;
+                };
+                if end < start {
+                    return RangeOutcome::Full;
+                }
+                size.checked_sub(1).map(|last| end.min(last))
+            };
+            any_valid = true;
+            match end {
+                Some(end) if start <= end => satisfiable.push((start, end)),
+                _ => {}
+            }
+        }
+    }
+
+    match satisfiable.as_slice() {
+        [(start, end)] => RangeOutcome::Partial {
+            start: *start,
+            end: *end,
+        },
+        [] if any_valid => RangeOutcome::Unsatisfiable,
+        _ => RangeOutcome::Full,
+    }
 }
 
 async fn file_response(
@@ -375,28 +465,97 @@ async fn file_response(
     file: &FileRecord,
     filename: &str,
     content_disposition_type: &str,
+    request_headers: &HeaderMap,
 ) -> ApiResult<Response<Body>> {
-    let size = item
-        .size
-        .ok_or_else(|| ApiError::internal("Failed to get item"))?;
-    let file_handle = tokio::fs::File::open(&file.path).await.map_err(|err| {
+    let mut file_handle = tokio::fs::File::open(&file.path).await.map_err(|err| {
         tracing::error!(error = %err, "failed to open file");
         ApiError::not_found("No file found for item")
     })?;
-    let stream = ReaderStream::new(file_handle);
-    let body = Body::from_stream(stream);
+    // The size on disk is authoritative for range math; the DB value can be
+    // stale if the file changed since the last scan.
+    let size = file_handle
+        .metadata()
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to read file metadata");
+            ApiError::internal("Failed to read file metadata")
+        })?
+        .len();
+
+    let last_modified = iso_to_system_time(&file.last_modified).map(httpdate::fmt_http_date);
+
+    let mut range = request_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_range_header(value, size))
+        .unwrap_or(RangeOutcome::Full);
+
+    // If-Range: only honor the range when the validator still matches;
+    // otherwise the client's partial state is stale and it needs the full
+    // body. We emit no ETag, so Last-Modified is the only validator.
+    if range != RangeOutcome::Full {
+        if let Some(if_range) = request_headers
+            .get(header::IF_RANGE)
+            .and_then(|value| value.to_str().ok())
+        {
+            if last_modified.as_deref() != Some(if_range.trim()) {
+                range = RangeOutcome::Full;
+            }
+        }
+    }
+
+    let (status, body, content_length, content_range) = match range {
+        RangeOutcome::Full => (
+            StatusCode::OK,
+            Body::from_stream(ReaderStream::new(file_handle)),
+            size,
+            None,
+        ),
+        RangeOutcome::Partial { start, end } => {
+            file_handle
+                .seek(SeekFrom::Start(start))
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to seek file");
+                    ApiError::internal("Failed to read file")
+                })?;
+            let length = end - start + 1;
+            (
+                StatusCode::PARTIAL_CONTENT,
+                Body::from_stream(ReaderStream::new(file_handle.take(length))),
+                length,
+                Some(format!("bytes {start}-{end}/{size}")),
+            )
+        }
+        RangeOutcome::Unsatisfiable => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            Body::empty(),
+            0,
+            Some(format!("bytes */{size}")),
+        ),
+    };
+
     let mut response = Response::new(body);
+    *response.status_mut() = status;
     let headers = response.headers_mut();
 
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
     if let Ok(value) = header::HeaderValue::from_str(&item.mime_type) {
         headers.insert(header::CONTENT_TYPE, value);
     }
-    if let Ok(value) = header::HeaderValue::from_str(&size.to_string()) {
+    if let Ok(value) = header::HeaderValue::from_str(&content_length.to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }
-    if let Some(last_modified) = iso_to_system_time(&file.last_modified) {
-        let formatted = httpdate::fmt_http_date(last_modified);
-        if let Ok(value) = header::HeaderValue::from_str(&formatted) {
+    if let Some(content_range) = content_range {
+        if let Ok(value) = header::HeaderValue::from_str(&content_range) {
+            headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    if let Some(last_modified) = &last_modified {
+        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
             headers.insert(header::LAST_MODIFIED, value);
         }
     }
@@ -474,12 +633,7 @@ mod tests {
         std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
     }
 
-    // Ensures file responses include content headers derived from item metadata.
-    #[tokio::test]
-    async fn file_response_sets_headers() {
-        let file_path = temp_path("file_response");
-        std::fs::write(&file_path, b"test").unwrap();
-
+    fn test_records(file_path: &PathBuf) -> (ItemRecord, FileRecord) {
         let item = ItemRecord {
             id: 1,
             sha256: "sha256".to_string(),
@@ -502,18 +656,184 @@ mod tests {
             last_modified: "2024-01-01T00:00:00".to_string(),
             filename: "file.png".to_string(),
         };
+        (item, file)
+    }
 
-        let response = file_response(&item, &file, "file.png", "inline")
+    async fn body_bytes(response: Response<Body>) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    // Ensures file responses include content headers derived from item metadata.
+    #[tokio::test]
+    async fn file_response_sets_headers() {
+        let file_path = temp_path("file_response");
+        std::fs::write(&file_path, b"test").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let response = file_response(&item, &file, "file.png", "inline", &HeaderMap::new())
             .await
             .unwrap();
         let headers = response.headers();
 
         assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
         assert_eq!(headers.get(header::CONTENT_LENGTH).unwrap(), "4");
+        assert_eq!(headers.get(header::ACCEPT_RANGES).unwrap(), "bytes");
         assert_eq!(
             headers.get(header::CONTENT_DISPOSITION).unwrap(),
             "inline; filename=\"file.png\""
         );
         assert!(headers.get(header::LAST_MODIFIED).is_some());
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn file_response_serves_byte_range() {
+        let file_path = temp_path("file_range");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, "bytes=2-5".parse().unwrap());
+        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = response.headers();
+        assert_eq!(headers.get(header::CONTENT_RANGE).unwrap(), "bytes 2-5/10");
+        assert_eq!(headers.get(header::CONTENT_LENGTH).unwrap(), "4");
+        assert_eq!(headers.get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(body_bytes(response).await, b"2345");
+    }
+
+    #[tokio::test]
+    async fn file_response_serves_open_ended_and_suffix_ranges() {
+        let file_path = temp_path("file_range_open");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, "bytes=7-".parse().unwrap());
+        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 7-9/10"
+        );
+        assert_eq!(body_bytes(response).await, b"789");
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, "bytes=-3".parse().unwrap());
+        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 7-9/10"
+        );
+        assert_eq!(body_bytes(response).await, b"789");
+    }
+
+    #[tokio::test]
+    async fn file_response_rejects_unsatisfiable_range() {
+        let file_path = temp_path("file_range_416");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, "bytes=100-".parse().unwrap());
+        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+        assert!(body_bytes(response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_response_ignores_range_on_stale_if_range() {
+        let file_path = temp_path("file_if_range");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::RANGE, "bytes=2-5".parse().unwrap());
+        request_headers.insert(
+            header::IF_RANGE,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    #[test]
+    fn parse_range_header_cases() {
+        use RangeOutcome::*;
+
+        // Basic forms.
+        assert_eq!(
+            parse_range_header("bytes=0-499", 1000),
+            Partial { start: 0, end: 499 }
+        );
+        assert_eq!(
+            parse_range_header("bytes=500-", 1000),
+            Partial {
+                start: 500,
+                end: 999
+            }
+        );
+        assert_eq!(
+            parse_range_header("bytes=-300", 1000),
+            Partial {
+                start: 700,
+                end: 999
+            }
+        );
+        // End clamped to the last byte; suffix longer than the file covers it all.
+        assert_eq!(
+            parse_range_header("bytes=990-2000", 1000),
+            Partial {
+                start: 990,
+                end: 999
+            }
+        );
+        assert_eq!(
+            parse_range_header("bytes=-5000", 1000),
+            Partial { start: 0, end: 999 }
+        );
+        // Whitespace and case tolerance.
+        assert_eq!(
+            parse_range_header(" BYTES= 0 - 4 ", 1000),
+            Partial { start: 0, end: 4 }
+        );
+        // Unsatisfiable: beyond EOF, zero suffix, empty file.
+        assert_eq!(parse_range_header("bytes=1000-", 1000), Unsatisfiable);
+        assert_eq!(parse_range_header("bytes=-0", 1000), Unsatisfiable);
+        assert_eq!(parse_range_header("bytes=0-", 0), Unsatisfiable);
+        // Ignored: other units, malformed specs, inverted ranges,
+        // multiple satisfiable ranges (no multipart support).
+        assert_eq!(parse_range_header("items=0-4", 1000), Full);
+        assert_eq!(parse_range_header("bytes=abc", 1000), Full);
+        assert_eq!(parse_range_header("bytes=5-2", 1000), Full);
+        assert_eq!(parse_range_header("bytes=0-4,10-14", 1000), Full);
+        // One satisfiable range among unsatisfiable ones is still served.
+        assert_eq!(
+            parse_range_header("bytes=2000-,0-4", 1000),
+            Partial { start: 0, end: 4 }
+        );
     }
 }
