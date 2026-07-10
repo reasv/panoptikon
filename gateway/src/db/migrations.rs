@@ -1,17 +1,54 @@
 use anyhow::{Context, Result};
 use sqlx::{
     Connection, SqliteConnection,
-    migrate::{Migrate, Migrator},
+    migrate::{Migrate, Migration, Migrator},
     sqlite::SqliteConnectOptions,
 };
 use std::{
+    borrow::Cow,
     fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
-static INDEX_MIGRATOR: Migrator = sqlx::migrate!("migrations/index");
-static STORAGE_MIGRATOR: Migrator = sqlx::migrate!("migrations/storage");
-static USER_DATA_MIGRATOR: Migrator = sqlx::migrate!("migrations/user_data");
+// sqlx checksums migration files byte-for-byte, but git autocrlf renders the
+// same commit with LF or CRLF depending on platform and config — so two
+// builds of identical sources embed different checksums and refuse each
+// other's databases ("previously applied but has been modified"). Normalize
+// to LF before the Migrator ever sees the SQL: checksums are then a function
+// of content, not of checkout flavor. Databases that already recorded CRLF
+// checksums are repaired at startup by repair_line_ending_checksums.
+static INDEX_MIGRATOR: LazyLock<Migrator> =
+    LazyLock::new(|| normalize_line_endings(sqlx::migrate!("migrations/index")));
+static STORAGE_MIGRATOR: LazyLock<Migrator> =
+    LazyLock::new(|| normalize_line_endings(sqlx::migrate!("migrations/storage")));
+static USER_DATA_MIGRATOR: LazyLock<Migrator> =
+    LazyLock::new(|| normalize_line_endings(sqlx::migrate!("migrations/user_data")));
+
+fn normalize_line_endings(raw: Migrator) -> Migrator {
+    let migrations: Vec<Migration> = raw
+        .migrations
+        .iter()
+        .map(|migration| {
+            if migration.sql.contains('\r') {
+                // Migration::new recomputes the checksum from the given SQL.
+                Migration::new(
+                    migration.version,
+                    migration.description.clone(),
+                    migration.migration_type,
+                    migration.sql.replace("\r\n", "\n").into(),
+                    migration.no_tx,
+                )
+            } else {
+                migration.clone()
+            }
+        })
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ..raw
+    }
+}
 
 // Alembic head revisions of the Python-managed schemas (see
 // src/panoptikon/db/migrations/*/versions). Each init.sql is a snapshot of
@@ -165,6 +202,9 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
     ensure_baseline_if_needed(&mut conn, migrator, expected_alembic_head)
         .await
         .with_context(|| format!("refusing to migrate database {}", path.display()))?;
+    reconcile_recorded_checksums(&mut conn, migrator)
+        .await
+        .with_context(|| format!("failed to reconcile checksums in {}", path.display()))?;
     migrator
         .run(&mut conn)
         .await
@@ -282,6 +322,91 @@ INSERT OR IGNORE INTO _sqlx_migrations (
         .context("failed to record baseline migration")?;
     }
 
+    Ok(())
+}
+
+/// Reconciles recorded checksums with the embedded (LF-normalized)
+/// migrations so a checksum mismatch on an already-applied migration can
+/// never fail startup.
+///
+/// sqlx checksums the migration file bytes, which vary by checkout: git
+/// autocrlf renders the same blob with LF or CRLF per platform/config, and
+/// a working tree can even hold a MIXED rendering git considers unmodified
+/// (it cleans to the same blob — observed in the wild: 227 CRLF + 2 LF
+/// lines). Two correct builds of identical sources can therefore embed
+/// different checksums and refuse each other's databases with "previously
+/// applied but has been modified" — which would hit every user whose
+/// binary's build environment ever changes, including everyone upgrading
+/// across releases built on different platforms.
+///
+/// Policy, per successfully-applied migration whose recorded checksum
+/// differs from the embedded one:
+/// - matches the CRLF rendering of the embedded SQL → provably the same
+///   content; re-record silently.
+/// - anything else (e.g. a hash of a mixed rendering, which cannot be
+///   reconstructed) → re-record with a WARNING. Migrations in this project
+///   are append-only and never edited after shipping, so a mismatch here
+///   is a rendering artifact, not divergent SQL; and failing startup would
+///   not repair a genuinely divergent history anyway — it would only lock
+///   the user out of their data. This mirrors alembic (which this schema
+///   migrated from): applied migrations are identified by version, with
+///   checksums as a diagnostic rather than a gate.
+///
+/// Nothing is ever executed here; pending migrations still run normally.
+async fn reconcile_recorded_checksums(
+    conn: &mut SqliteConnection,
+    migrator: &Migrator,
+) -> Result<()> {
+    if !table_exists(conn, "_sqlx_migrations").await? {
+        return Ok(());
+    }
+    let applied: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations")
+            .fetch_all(&mut *conn)
+            .await
+            .context("failed to read applied migration checksums")?;
+    for migration in migrator.iter() {
+        if migration.migration_type.is_down_migration() {
+            continue;
+        }
+        let Some((_, recorded, success)) = applied
+            .iter()
+            .find(|(version, _, _)| *version == migration.version)
+        else {
+            continue;
+        };
+        if !success || recorded.as_slice() == migration.checksum.as_ref() {
+            continue;
+        }
+        let crlf_variant = Migration::new(
+            migration.version,
+            migration.description.clone(),
+            migration.migration_type,
+            migration.sql.replace('\n', "\r\n").into(),
+            migration.no_tx,
+        );
+        if recorded.as_slice() == crlf_variant.checksum.as_ref() {
+            tracing::info!(
+                version = migration.version,
+                "re-recording checksum of applied migration (line-ending rendering difference)"
+            );
+        } else {
+            tracing::warn!(
+                version = migration.version,
+                "recorded checksum of applied migration does not match the shipped SQL in any \
+                 known line-ending rendering; re-recording it (migrations are append-only, so \
+                 this is expected to be a checkout-rendering artifact of an older build — if \
+                 you have actually edited a shipped migration file, this database may not \
+                 match the schema the gateway expects)"
+            );
+        }
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(migration.checksum.as_ref())
+            .bind(migration.version)
+            .execute(&mut *conn)
+            .await
+            .context("failed to re-record migration checksum")?;
+    }
     Ok(())
 }
 
@@ -508,6 +633,130 @@ mod tests {
             .await
             .expect_err("missing alembic_version must be refused");
         assert!(format!("{err:#}").contains("no alembic_version"), "{err:#}");
+    }
+
+    // Embedded migration SQL is LF-normalized no matter how the checkout
+    // rendered the files (git autocrlf), so checksums are content-addressed
+    // rather than platform-addressed.
+    #[test]
+    fn embedded_migrations_are_lf_normalized() {
+        for migrator in [&*INDEX_MIGRATOR, &*STORAGE_MIGRATOR, &*USER_DATA_MIGRATOR] {
+            for migration in migrator.iter() {
+                assert!(
+                    !migration.sql.contains('\r'),
+                    "migration {} carries CR bytes into its checksum",
+                    migration.version
+                );
+            }
+        }
+    }
+
+    /// The CRLF rendering's checksum — what a binary built from a CRLF
+    /// checkout would have recorded for the same migration.
+    fn crlf_checksum(migration: &Migration) -> Vec<u8> {
+        Migration::new(
+            migration.version,
+            migration.description.clone(),
+            migration.migration_type,
+            migration.sql.replace('\n', "\r\n").into(),
+            migration.no_tx,
+        )
+        .checksum
+        .to_vec()
+    }
+
+    // A DB whose checksums were recorded by a CRLF-checkout build is
+    // accepted: the line-ending-only mismatch is repaired in place instead
+    // of failing "previously applied but has been modified".
+    #[tokio::test]
+    async fn crlf_recorded_checksums_are_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .unwrap();
+
+        let mut conn = connect(&path).await;
+        for migration in USER_DATA_MIGRATOR.iter() {
+            if migration.migration_type.is_down_migration() {
+                continue;
+            }
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+                .bind(crlf_checksum(migration))
+                .bind(migration.version)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        conn.close().await.unwrap();
+
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect("CRLF-recorded checksums must be repaired, not refused");
+
+        let mut conn = connect(&path).await;
+        let rows: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        for migration in USER_DATA_MIGRATOR.iter() {
+            if migration.migration_type.is_down_migration() {
+                continue;
+            }
+            let recorded = &rows
+                .iter()
+                .find(|(version, _)| *version == migration.version)
+                .expect("migration row present")
+                .1;
+            assert_eq!(
+                recorded.as_slice(),
+                migration.checksum.as_ref(),
+                "repair rewrote version {} to the embedded checksum",
+                migration.version
+            );
+        }
+        conn.close().await.unwrap();
+    }
+
+    // A recorded checksum matching NO known rendering (e.g. the hash of a
+    // mixed-line-ending checkout that cannot be reconstructed) must not
+    // fail startup either: an applied migration is identified by its
+    // version, the checksum is re-recorded (with a warning), and
+    // subsequent runs are clean.
+    #[tokio::test]
+    async fn unexplained_checksum_mismatch_is_rerecorded_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .unwrap();
+
+        let mut conn = connect(&path).await;
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = (SELECT MIN(version) FROM _sqlx_migrations)")
+            .bind(vec![0u8; 48])
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+            .await
+            .expect("an applied migration must never fail startup on a checksum");
+
+        let mut conn = connect(&path).await;
+        let (recorded,): (Vec<u8>,) = sqlx::query_as(
+            "SELECT checksum FROM _sqlx_migrations WHERE version = (SELECT MIN(version) FROM _sqlx_migrations)",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        let first = USER_DATA_MIGRATOR
+            .iter()
+            .find(|migration| !migration.migration_type.is_down_migration())
+            .unwrap();
+        assert_eq!(recorded.as_slice(), first.checksum.as_ref());
+        conn.close().await.unwrap();
     }
 
     // A fresh file gets the real schema from init.sql, including the
