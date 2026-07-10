@@ -26,7 +26,7 @@ use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_in
 use anyhow::Context as _;
 use axum::{
     Router,
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
 };
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -236,6 +236,29 @@ async fn async_main() -> anyhow::Result<()> {
                 get(api::bookmarks::get_bookmark)
                     .put(api::bookmarks::add_bookmark_by_sha256)
                     .delete(api::bookmarks::delete_bookmark_by_sha256),
+            )
+            .route(
+                "/api/pinboards",
+                get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}",
+                get(api::pinboards::get_pinboard)
+                    .patch(api::pinboards::update_pinboard)
+                    .delete(api::pinboards::delete_pinboard),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}/versions",
+                get(api::pinboards::list_pinboard_versions)
+                    .post(api::pinboards::save_pinboard_version),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}/versions/{version_id}",
+                delete(api::pinboards::delete_pinboard_version),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
+                get(api::pinboards::pinboard_version_preview),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))

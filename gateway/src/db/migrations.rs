@@ -448,6 +448,15 @@ mod tests {
         count.0
     }
 
+    /// Number of up migrations shipped for user_data; baselining records the
+    /// init snapshot and executes the rest, so a migrated DB records all.
+    fn user_data_migration_total() -> i64 {
+        USER_DATA_MIGRATOR
+            .iter()
+            .filter(|migration| !migration.migration_type.is_down_migration())
+            .count() as i64
+    }
+
     // A Python DB at alembic head is baselined: the init migration is
     // recorded as applied but never executed (the fake bookmarks shape
     // survives untouched).
@@ -461,7 +470,7 @@ mod tests {
             .await
             .expect("baseline at head should succeed");
 
-        assert_eq!(sqlx_migration_count(&path).await, 1);
+        assert_eq!(sqlx_migration_count(&path).await, user_data_migration_total());
         let mut conn = connect(&path).await;
         let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
             sqlx::query_as("SELECT * FROM pragma_table_info('bookmarks')")
@@ -512,7 +521,7 @@ mod tests {
             .await
             .expect("fresh database creation should succeed");
 
-        assert_eq!(sqlx_migration_count(&path).await, 1);
+        assert_eq!(sqlx_migration_count(&path).await, user_data_migration_total());
         let mut conn = connect(&path).await;
         let version: (String,) = sqlx::query_as("SELECT version_num FROM alembic_version")
             .fetch_one(&mut conn)

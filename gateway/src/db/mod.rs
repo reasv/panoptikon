@@ -9,6 +9,7 @@ pub(crate) mod index_writer;
 pub(crate) mod info;
 pub(crate) mod items;
 pub(crate) mod migrations;
+pub(crate) mod pinboards;
 pub(crate) mod pql;
 pub(crate) mod storage;
 pub(crate) mod system_config;

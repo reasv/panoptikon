@@ -4,5 +4,6 @@ pub(crate) mod db_params;
 pub(crate) mod items;
 pub(crate) mod jobs;
 pub(crate) mod open;
+pub(crate) mod pinboards;
 pub(crate) mod search;
 pub(crate) mod utils;
