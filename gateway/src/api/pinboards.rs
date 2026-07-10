@@ -227,6 +227,7 @@ fn map_version(version: pinboards::PinboardVersionRecord) -> PinboardVersionResp
 
 #[utoipa::path(
     get,
+    operation_id = "list_pinboards",
     path = "/api/pinboards",
     tag = "pinboards",
     summary = "List saved pinboards",
@@ -249,6 +250,7 @@ pub async fn list_pinboards(
 
 #[utoipa::path(
     post,
+    operation_id = "create_pinboard",
     path = "/api/pinboards",
     tag = "pinboards",
     summary = "Create a pinboard",
@@ -303,6 +305,7 @@ pub async fn create_pinboard(
 
 #[utoipa::path(
     get,
+    operation_id = "get_pinboard",
     path = "/api/pinboards/{pinboard_id}",
     tag = "pinboards",
     summary = "Get a pinboard with its head version",
@@ -338,6 +341,7 @@ pub async fn get_pinboard(
 
 #[utoipa::path(
     patch,
+    operation_id = "update_pinboard",
     path = "/api/pinboards/{pinboard_id}",
     tag = "pinboards",
     summary = "Rename a pinboard",
@@ -389,6 +393,7 @@ pub async fn update_pinboard(
 
 #[utoipa::path(
     delete,
+    operation_id = "delete_pinboard",
     path = "/api/pinboards/{pinboard_id}",
     tag = "pinboards",
     summary = "Delete a pinboard and its entire version history",
@@ -429,6 +434,7 @@ pub async fn delete_pinboard(
 
 #[utoipa::path(
     get,
+    operation_id = "list_pinboard_versions",
     path = "/api/pinboards/{pinboard_id}/versions",
     tag = "pinboards",
     summary = "List all versions of a pinboard",
@@ -459,6 +465,7 @@ pub async fn list_pinboard_versions(
 
 #[utoipa::path(
     post,
+    operation_id = "save_pinboard_version",
     path = "/api/pinboards/{pinboard_id}/versions",
     tag = "pinboards",
     summary = "Save a new version of a pinboard",
@@ -535,6 +542,7 @@ pub async fn save_pinboard_version(
 
 #[utoipa::path(
     delete,
+    operation_id = "delete_pinboard_version",
     path = "/api/pinboards/{pinboard_id}/versions/{version_id}",
     tag = "pinboards",
     summary = "Delete one version of a pinboard",
@@ -587,6 +595,7 @@ pub async fn delete_pinboard_version(
 
 #[utoipa::path(
     get,
+    operation_id = "pinboard_version_preview",
     path = "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
     tag = "pinboards",
     summary = "Get the stored preview image for a pinboard version",

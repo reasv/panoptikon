@@ -9,6 +9,7 @@ use crate::db::migrations::migrate_databases_on_disk;
 
 #[utoipa::path(
     get,
+    operation_id = "db_info",
     path = "/api/db",
     tag = "database",
     summary = "Get information about all available databases",
@@ -44,6 +45,7 @@ pub(crate) struct DbCreateResponse {
 
 #[utoipa::path(
     post,
+    operation_id = "db_create",
     path = "/api/db/create",
     tag = "database",
     summary = "Create new databases",

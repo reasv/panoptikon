@@ -233,6 +233,7 @@ pub(crate) struct SearchStats {
 
 #[utoipa::path(
     get,
+    operation_id = "get_tags",
     path = "/api/search/tags",
     tag = "search",
     summary = "Search tag names for autocompletion",
@@ -252,6 +253,7 @@ pub async fn get_tags(
 
 #[utoipa::path(
     get,
+    operation_id = "get_top_tags",
     path = "/api/search/tags/top",
     tag = "search",
     summary = "Get the most common tags in the database",
@@ -286,6 +288,7 @@ pub async fn get_top_tags(
 
 #[utoipa::path(
     get,
+    operation_id = "get_stats",
     path = "/api/search/stats",
     tag = "search",
     summary = "Get statistics on the searchable data",
@@ -305,6 +308,7 @@ pub async fn get_stats(
 
 #[utoipa::path(
     post,
+    operation_id = "search_pql",
     path = "/api/search/pql",
     tag = "search",
     summary = "Search for files and items in the database",
@@ -372,6 +376,7 @@ pub async fn search_pql(
 
 #[utoipa::path(
     post,
+    operation_id = "search_pql_build",
     path = "/api/search/pql/build",
     tag = "search",
     summary = "Build PQL search queries without executing them",
@@ -548,6 +553,7 @@ pub(crate) struct CacheQuery {
 
 #[utoipa::path(
     get,
+    operation_id = "get_search_cache",
     path = "/api/search/embeddings/cache",
     tag = "search",
     summary = "Get embedding cache stats",
@@ -569,6 +575,7 @@ pub async fn get_search_cache(
 
 #[utoipa::path(
     delete,
+    operation_id = "clear_search_cache",
     path = "/api/search/embeddings/cache",
     tag = "search",
     summary = "Clear embedding cache",

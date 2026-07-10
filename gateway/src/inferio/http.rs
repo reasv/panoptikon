@@ -51,6 +51,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use super::manager::{HealthReport, ManagerConfig, ModelManager};
 use super::prewarm::PrewarmConfig;
@@ -174,7 +175,8 @@ pub fn standalone_router(state: Arc<InferioState>) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct LoadParams {
     cache_key: String,
     lru_size: i64,
@@ -185,7 +187,8 @@ struct LoadParams {
     prewarm: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct PredictParams {
     cache_key: String,
     lru_size: i64,
@@ -196,11 +199,97 @@ struct PredictParams {
     prewarm: Option<bool>,
 }
 
+// ----------------------------------------------------------------------
+// Doc-only OpenAPI shapes. The predict request/response wire formats are
+// hand-rolled above the serde layer (multipart parsing, three response
+// encodings), so these structs exist purely to document them — none of
+// them are ever (de)serialized by the handlers.
+// ----------------------------------------------------------------------
+
+/// A raw binary payload (schema: string, format binary).
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct BinaryBlob(#[allow(dead_code)] String);
+
+/// Multipart form body of `POST /predict/{group}/{inference_id}`.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct InferencePredictRequest {
+    /// JSON string of the batch: `{"inputs": [...]}` where each entry is an
+    /// object, a string, or null (null = file-only input).
+    data: String,
+    /// Binary batch inputs. Each part's *filename* must be the integer
+    /// index of the `inputs` entry it attaches to.
+    files: Option<Vec<BinaryBlob>>,
+}
+
+/// JSON envelope of a predict response (used whenever the outputs are not
+/// all binary).
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct PredictJsonResponse {
+    /// One output per input; binary outputs are wrapped as
+    /// `{"__type__": "base64", "content": "<base64>"}`.
+    outputs: Vec<JsonValue>,
+}
+
+/// `{"status": "loaded" | "unloaded" | "cleared"}` (Python parity).
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct StatusResponse {
+    status: String,
+}
+
+/// Response of `GET /cache/{cache_key}`.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct CacheKeyResponse {
+    /// inference_id -> ISO-8601 expiration; never-expiring entries
+    /// (ttl -1) render as `9999-12-31T23:59:59.999999`.
+    expirations: std::collections::BTreeMap<String, String>,
+}
+
+/// Response of `GET /cache`.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct CacheListResponse {
+    /// inference_id -> cache keys currently referencing it.
+    cache: std::collections::BTreeMap<String, Vec<String>>,
+}
+
 /// `POST /predict/{group}/{inference_id}` — router.py `predict`.
 /// Parses the multipart request, auto-loads the model (pinned for the
 /// duration, TTL restored afterwards — the manager owns those semantics),
 /// runs the batch, and encodes the response exactly like
 /// `utils.encode_output_response`.
+#[utoipa::path(
+    post,
+    operation_id = "predict",
+    path = "/predict/{group}/{inference_id}",
+    tag = "inference",
+    summary = "Run a batch prediction on a model",
+    description = "Runs a batch of inputs through a model, auto-loading it into the \
+        given cache slot first if needed. The response encoding depends on the \
+        outputs: exactly one binary output is returned raw as \
+        `application/octet-stream`; all-binary outputs use `multipart/mixed`; \
+        anything else is the JSON `{\"outputs\": [...]}` envelope.",
+    params(
+        ("group" = String, Path, description = "Model group (first segment of the inference ID)"),
+        ("inference_id" = String, Path, description = "Model ID within the group"),
+        PredictParams
+    ),
+    request_body(content = InferencePredictRequest, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Model outputs", content(
+            (PredictJsonResponse = "application/json"),
+            (BinaryBlob = "application/octet-stream"),
+            (BinaryBlob = "multipart/mixed")
+        )),
+        (status = 400, description = "Malformed multipart body or inputs", body = crate::api_error::ErrorBody),
+        (status = 422, description = "Missing required `data` form field", body = crate::api_error::ErrorBody),
+        (status = 500, description = "Model load or prediction failure", body = crate::api_error::ErrorBody)
+    )
+)]
 async fn predict(
     State(state): State<Arc<InferioState>>,
     Path((group, inference_id)): Path<(String, String)>,
@@ -277,6 +366,22 @@ async fn predict(
 /// `PUT /load/{group}/{inference_id}` — router.py `load_model`:
 /// `{"status": "loaded"}` on success, 500 `"Failed to load model"` on any
 /// error (details go to the log, like Python's `logger.error`).
+#[utoipa::path(
+    put,
+    operation_id = "load_model",
+    path = "/load/{group}/{inference_id}",
+    tag = "inference",
+    summary = "Load a model into a cache slot",
+    params(
+        ("group" = String, Path, description = "Model group (first segment of the inference ID)"),
+        ("inference_id" = String, Path, description = "Model ID within the group"),
+        LoadParams
+    ),
+    responses(
+        (status = 200, description = "Model loaded", body = StatusResponse),
+        (status = 500, description = "Load failure", body = crate::api_error::ErrorBody)
+    )
+)]
 async fn load_model(
     State(state): State<Arc<InferioState>>,
     Path((group, inference_id)): Path<(String, String)>,
@@ -303,6 +408,22 @@ async fn load_model(
 /// `DELETE /cache/{cache_key}/{group}/{inference_id}` — router.py
 /// `unload_model`: always `{"status": "unloaded"}` (Python doesn't report
 /// whether the entry existed).
+#[utoipa::path(
+    delete,
+    operation_id = "unload_model",
+    path = "/cache/{cache_key}/{group}/{inference_id}",
+    tag = "inference",
+    summary = "Unload a model from a cache slot",
+    params(
+        ("cache_key" = String, Path, description = "Cache slot the model was loaded under"),
+        ("group" = String, Path, description = "Model group (first segment of the inference ID)"),
+        ("inference_id" = String, Path, description = "Model ID within the group")
+    ),
+    responses(
+        (status = 200, description = "Unloaded (whether or not the entry existed)", body = StatusResponse),
+        (status = 500, description = "Unload failure", body = crate::api_error::ErrorBody)
+    )
+)]
 async fn unload_model(
     State(state): State<Arc<InferioState>>,
     Path((cache_key, group, inference_id)): Path<(String, String, String)>,
@@ -318,6 +439,18 @@ async fn unload_model(
 
 /// `DELETE /cache/{cache_key}` — router.py `clear_cache`:
 /// `{"status": "cleared"}`.
+#[utoipa::path(
+    delete,
+    operation_id = "clear_cache",
+    path = "/cache/{cache_key}",
+    tag = "inference",
+    summary = "Unload every model in a cache slot",
+    params(("cache_key" = String, Path, description = "Cache slot to clear")),
+    responses(
+        (status = 200, description = "Cache cleared", body = StatusResponse),
+        (status = 500, description = "Clear failure", body = crate::api_error::ErrorBody)
+    )
+)]
 async fn clear_cache(
     State(state): State<Arc<InferioState>>,
     Path(cache_key): Path<String>,
@@ -332,6 +465,17 @@ async fn clear_cache(
 
 /// `GET /cache/{cache_key}` — router.py `get_cache_expiration`:
 /// `{"expirations": {id: isoformat}}`, with `datetime.max` for ttl -1.
+#[utoipa::path(
+    get,
+    operation_id = "get_cache_expiration",
+    path = "/cache/{cache_key}",
+    tag = "inference",
+    summary = "Get model expiration times for a cache slot",
+    params(("cache_key" = String, Path, description = "Cache slot to inspect")),
+    responses(
+        (status = 200, description = "Expiration times per loaded model", body = CacheKeyResponse)
+    )
+)]
 async fn get_cache_expiration(
     State(state): State<Arc<InferioState>>,
     Path(cache_key): Path<String>,
@@ -352,6 +496,16 @@ async fn get_cache_expiration(
 
 /// `GET /cache` — router.py `get_cached_models`:
 /// `{"cache": {inference_id: [cache_keys]}}`.
+#[utoipa::path(
+    get,
+    operation_id = "get_cached_models",
+    path = "/cache",
+    tag = "inference",
+    summary = "List loaded models and the cache slots referencing them",
+    responses(
+        (status = 200, description = "Loaded models per cache slot", body = CacheListResponse)
+    )
+)]
 async fn get_cached_models(State(state): State<Arc<InferioState>>) -> Json<JsonValue> {
     Json(json!({"cache": state.manager.cached_models()}))
 }
@@ -359,6 +513,20 @@ async fn get_cached_models(State(state): State<Arc<InferioState>>) -> Json<JsonV
 /// `GET /metadata` — router.py `get_metadata`: mtime-gated registry reload
 /// (RegistryCache mirrors `load_config(config, mtime)`), then the
 /// `list_inference_ids` shape.
+#[utoipa::path(
+    get,
+    operation_id = "get_metadata",
+    path = "/metadata",
+    tag = "inference",
+    summary = "Get the inference model registry",
+    description = "Free-form registry metadata: `{group: {\"inference_ids\": {id: \
+        {\"description\", ...}}, <group metadata>...}}`. The shape of the \
+        per-model and per-group metadata is registry-defined.",
+    responses(
+        (status = 200, description = "Registry metadata by group", body = JsonValue),
+        (status = 500, description = "Registry failed to load", body = crate::api_error::ErrorBody)
+    )
+)]
 async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<JsonValue>, ApiError> {
     let snapshot = state.registry.lock().unwrap().get();
     match snapshot {
@@ -375,6 +543,19 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
 /// serde shape is [`HealthReport`], assembled by [`ModelManager::health`].
 /// Supersedes the earlier standalone-only `{"status": "ok", "loaded": ...}`
 /// body: the loaded-model map is now the richer `models` array.
+#[utoipa::path(
+    get,
+    operation_id = "health",
+    path = "/health",
+    tag = "inference",
+    summary = "Inference service health",
+    description = "Orchestrator + per-model liveness, queue depths, and batch \
+        caps. Gateway addition — the Python inference server has no such \
+        endpoint (a proxied upstream 404s it).",
+    responses(
+        (status = 200, description = "Health report", body = HealthReport)
+    )
+)]
 async fn health(State(state): State<Arc<InferioState>>) -> Json<HealthReport> {
     Json(state.manager.health())
 }
@@ -483,6 +664,40 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
         .collect();
     Json(json!({"outputs": encoded})).into_response()
 }
+
+/// OpenAPI subdocument for the inference surface, nested under
+/// `/api/inference` by the gateway's main doc (`openapi.rs`). Paths here
+/// are router-relative, matching how [`router`] is mounted. Documented
+/// regardless of `inference_local`: when disabled, the same paths proxy to
+/// an upstream serving the same contract (minus `/health` on Python).
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        predict,
+        load_model,
+        unload_model,
+        get_cache_expiration,
+        clear_cache,
+        get_cached_models,
+        get_metadata,
+        health
+    ),
+    components(schemas(
+        InferencePredictRequest,
+        BinaryBlob,
+        PredictJsonResponse,
+        StatusResponse,
+        CacheKeyResponse,
+        CacheListResponse,
+        crate::api_error::ErrorBody,
+        HealthReport,
+        super::manager::ModelHealth,
+        super::manager::ReplicaHealth,
+        super::prewarm::PrewarmHealth,
+        super::prewarm::PrewarmWorkerHealth
+    ))
+)]
+pub struct InferioApiDoc;
 
 #[cfg(test)]
 mod tests {

@@ -180,6 +180,9 @@ impl Modify for JsonValueSchema {
             crate::pql::model::EmbedArgs
         )
     ),
+    nest(
+        (path = "/api/inference", api = crate::inferio::http::InferioApiDoc)
+    ),
     tags(
         (name = "search", description = "Search and PQL endpoints"),
         (name = "items"),
@@ -187,9 +190,180 @@ impl Modify for JsonValueSchema {
         (name = "jobs"),
         (name = "bookmarks"),
         (name = "pinboards", description = "Saved pinboard arrangements with version history"),
-        (name = "database")
+        (name = "database"),
+        (name = "inference", description = "Model inference service (served locally or proxied upstream — same contract either way)")
     ),
     modifiers(&JsonValueSchema)
 )]
 #[allow(dead_code)]
 pub struct ApiDoc;
+
+// The generated spec is a public contract: the UI's `lib/panoptikon.d.ts` is
+// generated from it, so any drift is a (potentially breaking) client change.
+// These tests pin the contract two ways: structural invariants with useful
+// failure messages, and byte-equality against the committed `openapi.json`
+// fixture at the crate root (regenerate deliberately with
+// `UPDATE_OPENAPI_FIXTURE=1 cargo test openapi`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::HashSet;
+
+    fn spec() -> Value {
+        serde_json::to_value(ApiDoc::openapi()).expect("spec serializes")
+    }
+
+    const METHODS: [&str; 7] = ["get", "post", "put", "delete", "patch", "head", "options"];
+
+    /// Every operation carries an explicit, unique operationId — generated
+    /// clients key their types on these names, so a Rust fn rename must
+    /// never silently rename one.
+    #[test]
+    fn operation_ids_are_present_and_unique() {
+        let spec = spec();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (path, item) in spec["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                if !METHODS.contains(&method.as_str()) {
+                    continue;
+                }
+                let id = op["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} has no operationId"));
+                assert!(
+                    seen.insert(id.to_string()),
+                    "duplicate operationId `{id}` at {method} {path}"
+                );
+            }
+        }
+        assert!(!seen.is_empty(), "spec has no operations");
+    }
+
+    fn collect_refs(value: &Value, refs: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "$ref" {
+                        if let Some(target) = child.as_str() {
+                            refs.push(target.to_string());
+                        }
+                    }
+                    collect_refs(child, refs);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    collect_refs(child, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every `$ref` in the document resolves to a registered component.
+    /// utoipa does NOT verify this: a `body = T` whose `T` was never listed
+    /// in `components(schemas(...))` produces a dangling reference, and a
+    /// duplicate component name silently overwrites rather than erroring.
+    #[test]
+    fn all_schema_refs_resolve() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas object");
+        let mut refs = Vec::new();
+        collect_refs(&spec, &mut refs);
+        assert!(!refs.is_empty());
+        for target in refs {
+            let name = target
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("non-schema or external $ref: {target}"));
+            assert!(
+                schemas.contains_key(name),
+                "dangling $ref to unregistered schema `{name}`"
+            );
+        }
+    }
+
+    /// The shared DB-selection query params are optional AND nullable
+    /// (`type: ["string", "null"]`): clients that model "no selection" as
+    /// an explicit null (the UI does) must type-check against the spec.
+    #[test]
+    fn db_selection_params_are_nullable() {
+        let spec = spec();
+        let params = spec["paths"]["/api/items/item"]["get"]["parameters"]
+            .as_array()
+            .expect("item_meta parameters");
+        for wanted in ["index_db", "user_data_db"] {
+            let param = params
+                .iter()
+                .find(|param| param["name"] == wanted)
+                .unwrap_or_else(|| panic!("{wanted} param missing"));
+            assert_eq!(param["required"], Value::Bool(false), "{wanted} required");
+            let types = param["schema"]["type"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{wanted} should have a type array, got {}", param["schema"]));
+            assert!(
+                types.contains(&Value::String("null".into())),
+                "{wanted} not nullable: {types:?}"
+            );
+        }
+    }
+
+    /// The inference surface is documented (nested subdocument), including
+    /// the gateway-only /health addition.
+    #[test]
+    fn inference_paths_are_documented() {
+        let spec = spec();
+        let paths = spec["paths"].as_object().expect("paths object");
+        for wanted in [
+            "/api/inference/predict/{group}/{inference_id}",
+            "/api/inference/load/{group}/{inference_id}",
+            "/api/inference/cache/{cache_key}/{group}/{inference_id}",
+            "/api/inference/cache/{cache_key}",
+            "/api/inference/cache",
+            "/api/inference/metadata",
+            "/api/inference/health",
+        ] {
+            assert!(paths.contains_key(wanted), "missing inference path {wanted}");
+        }
+    }
+
+    /// Byte-for-byte comparison against the committed fixture, which is
+    /// also the input for regenerating the UI's `lib/panoptikon.d.ts`.
+    /// On intentional spec changes: `UPDATE_OPENAPI_FIXTURE=1 cargo test
+    /// openapi`, commit the new fixture, and regenerate the UI types.
+    #[test]
+    fn spec_matches_committed_fixture() {
+        let rendered =
+            serde_json::to_string_pretty(&spec()).expect("spec serializes") + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
+        if std::env::var_os("UPDATE_OPENAPI_FIXTURE").is_some() {
+            std::fs::write(&path, &rendered).expect("write fixture");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path)
+            .expect("openapi.json fixture missing — generate it with UPDATE_OPENAPI_FIXTURE=1 cargo test openapi")
+            .replace("\r\n", "\n");
+        if committed != rendered {
+            let diverged = committed
+                .lines()
+                .zip(rendered.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| committed.lines().count().min(rendered.lines().count()));
+            let context: Vec<&str> = rendered
+                .lines()
+                .skip(diverged.saturating_sub(2))
+                .take(5)
+                .collect();
+            panic!(
+                "OpenAPI spec drifted from the committed openapi.json fixture \
+                 (first difference near line {}):\n{}\n\nIf the change is \
+                 intentional, regenerate with UPDATE_OPENAPI_FIXTURE=1 cargo \
+                 test openapi, commit the fixture, and regenerate the UI types.",
+                diverged + 1,
+                context.join("\n")
+            );
+        }
+    }
+}

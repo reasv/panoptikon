@@ -32,8 +32,11 @@ impl ApiError {
     }
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
+/// The single error body shape every gateway error path serializes.
+/// (Unlike FastAPI there is no structured 422 validation body: axum
+/// extractor rejections and all `ApiError`s use this `detail` string.)
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct ErrorBody {
     detail: String,
 }
 

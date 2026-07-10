@@ -90,13 +90,23 @@ pub(crate) struct ItemRecordResponse {
     md5: String,
     #[serde(rename = "type")]
     item_type: String,
+    // Always serialized (no skip_serializing_if): required-but-nullable in
+    // the schema, so generated clients don't have to treat them as absent.
+    #[schema(required)]
     size: Option<i64>,
+    #[schema(required)]
     width: Option<i64>,
+    #[schema(required)]
     height: Option<i64>,
+    #[schema(required)]
     duration: Option<f64>,
+    #[schema(required)]
     audio_tracks: Option<i64>,
+    #[schema(required)]
     video_tracks: Option<i64>,
+    #[schema(required)]
     subtitle_tracks: Option<i64>,
+    #[schema(required)]
     blurhash: Option<String>,
     time_added: String,
 }
@@ -134,6 +144,7 @@ pub(crate) struct ThumbnailQuery {
 
 #[utoipa::path(
     get,
+    operation_id = "item_file",
     path = "/api/items/item/file",
     tag = "items",
     summary = "Get actual file contents for an item",
@@ -170,6 +181,7 @@ pub async fn item_file(
 
 #[utoipa::path(
     get,
+    operation_id = "item_meta",
     path = "/api/items/item",
     tag = "items",
     summary = "Get item metadata and associated file metadata",
@@ -198,6 +210,7 @@ pub async fn item_meta(
 
 #[utoipa::path(
     get,
+    operation_id = "item_text",
     path = "/api/items/item/text",
     tag = "items",
     summary = "Get all text extracted from an item",
@@ -241,6 +254,7 @@ pub async fn item_text(
 
 #[utoipa::path(
     get,
+    operation_id = "item_tags",
     path = "/api/items/item/tags",
     tag = "items",
     summary = "Get tags for an item",
@@ -274,6 +288,7 @@ pub async fn item_tags(
 
 #[utoipa::path(
     get,
+    operation_id = "texts_any",
     path = "/api/items/text/any",
     tag = "items",
     summary = "Get text from text_ids",
@@ -293,6 +308,7 @@ pub async fn texts_any(
 
 #[utoipa::path(
     get,
+    operation_id = "item_thumbnail",
     path = "/api/items/item/thumbnail",
     tag = "items",
     summary = "Get thumbnail for an item",

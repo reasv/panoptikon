@@ -169,6 +169,7 @@ pub(crate) struct MessageResult {
 
 #[utoipa::path(
     get,
+    operation_id = "bookmark_namespaces",
     path = "/api/bookmarks/ns",
     tag = "bookmarks",
     summary = "Get all bookmark namespaces",
@@ -186,6 +187,7 @@ pub async fn bookmark_namespaces(
 
 #[utoipa::path(
     get,
+    operation_id = "bookmark_users",
     path = "/api/bookmarks/users",
     tag = "bookmarks",
     summary = "Get all users with bookmarks",
@@ -201,6 +203,7 @@ pub async fn bookmark_users(mut db: DbConnection<ReadOnly>) -> ApiResult<Json<Bo
 
 #[utoipa::path(
     get,
+    operation_id = "bookmarks_by_namespace",
     path = "/api/bookmarks/ns/{namespace}",
     tag = "bookmarks",
     summary = "Get all bookmarks in a namespace",
@@ -235,6 +238,7 @@ pub async fn bookmarks_by_namespace(
 
 #[utoipa::path(
     delete,
+    operation_id = "delete_bookmarks_by_namespace",
     path = "/api/bookmarks/ns/{namespace}",
     tag = "bookmarks",
     summary = "Delete all/many bookmarks in a namespace",
@@ -270,6 +274,7 @@ pub async fn delete_bookmarks_by_namespace(
 
 #[utoipa::path(
     post,
+    operation_id = "add_bookmarks_by_namespace",
     path = "/api/bookmarks/ns/{namespace}",
     tag = "bookmarks",
     summary = "Add multiple bookmarks to a namespace",
@@ -298,6 +303,7 @@ pub async fn add_bookmarks_by_namespace(
 
 #[utoipa::path(
     get,
+    operation_id = "get_bookmark",
     path = "/api/bookmarks/ns/{namespace}/{sha256}",
     tag = "bookmarks",
     summary = "Get a bookmark by namespace and sha256",
@@ -323,6 +329,7 @@ pub async fn get_bookmark(
 
 #[utoipa::path(
     put,
+    operation_id = "add_bookmark_by_sha256",
     path = "/api/bookmarks/ns/{namespace}/{sha256}",
     tag = "bookmarks",
     summary = "Add a bookmark by namespace and sha256",
@@ -359,6 +366,7 @@ pub async fn add_bookmark_by_sha256(
 
 #[utoipa::path(
     get,
+    operation_id = "bookmarks_item",
     path = "/api/bookmarks/item/{sha256}",
     tag = "bookmarks",
     summary = "Get all bookmarks for an item",
@@ -383,6 +391,7 @@ pub async fn bookmarks_item(
 
 #[utoipa::path(
     delete,
+    operation_id = "delete_bookmark_by_sha256",
     path = "/api/bookmarks/ns/{namespace}/{sha256}",
     tag = "bookmarks",
     summary = "Delete a specific bookmark by namespace and sha256",

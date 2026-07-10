@@ -84,7 +84,7 @@ pub struct ManagerConfig {
 /// `GET /health` response (design §7, additive — Python has no such
 /// endpoint, so this shape is ours to define). Serialized as-is by the HTTP
 /// layer; `Deserialize` exists so tests can round-trip the wire shape.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HealthReport {
     /// `"ok"` normally, `"shutting_down"` once shutdown has begun.
     pub status: String,
@@ -104,7 +104,7 @@ pub struct HealthReport {
 }
 
 /// One loaded model in the [`HealthReport`].
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ModelHealth {
     pub inference_id: String,
     /// Monotonic load generation (bumps on every respawn).
@@ -128,7 +128,7 @@ pub struct ModelHealth {
 }
 
 /// Replica occupancy of one model's WorkerSet.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaHealth {
     pub total: usize,
     pub free: usize,

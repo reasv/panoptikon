@@ -52,9 +52,13 @@ pub(crate) struct ExtractedTextRecord {
     pub id: i64,
     pub item_sha256: String,
     pub setter_name: String,
+    // Always serialized (no skip_serializing_if): required-but-nullable.
+    #[schema(required)]
     pub language: Option<String>,
+    #[schema(required)]
     pub language_confidence: Option<f64>,
     pub text: String,
+    #[schema(required)]
     pub confidence: Option<f64>,
     pub length: i64,
 }

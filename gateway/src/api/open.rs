@@ -289,6 +289,7 @@ async fn get_correct_path(
 
 #[utoipa::path(
     post,
+    operation_id = "open_file_on_host",
     path = "/api/open/file/{sha256}",
     tag = "open",
     summary = "Open a file in the default application",
@@ -317,6 +318,7 @@ pub async fn open_file_on_host(
 
 #[utoipa::path(
     post,
+    operation_id = "show_in_file_manager",
     path = "/api/open/folder/{sha256}",
     tag = "open",
     summary = "Show a file in the host system's file manager",

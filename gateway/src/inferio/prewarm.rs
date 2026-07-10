@@ -80,7 +80,7 @@ impl Default for PrewarmConfig {
 }
 
 /// `prewarm` section of the `GET /health` report.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PrewarmHealth {
     pub enabled: bool,
     pub lazy: bool,
@@ -88,7 +88,7 @@ pub struct PrewarmHealth {
     pub warm: Vec<PrewarmWorkerHealth>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PrewarmWorkerHealth {
     pub impl_class: String,
     /// `"warm"` (parked, prepare() succeeded or was absent), `"spawning"`
