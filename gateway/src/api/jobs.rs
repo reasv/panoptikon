@@ -529,6 +529,105 @@ pub(crate) async fn get_cronjob_schedule(
     }))
 }
 
+/// Change-detection mode configured for the continuous filescan.
+#[derive(serde::Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContinuousScanMode {
+    /// Native OS filesystem watcher. Only reliable on local folders.
+    Watcher,
+    /// Recurring directory-mtime poller. Required for network mounts
+    /// (NFS/SMB), where native watchers do not receive events.
+    Poller,
+}
+
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct ContinuousScanStatusResponse {
+    /// Whether continuous scanning is enabled in this database's config.
+    enabled: bool,
+    /// Whether the scanner is currently watching for changes. False when
+    /// disabled, while paused for a running job, or when the configured
+    /// watched folders produced no valid watch roots.
+    active: bool,
+    /// Whether the scanner is temporarily paused while a job runs on this
+    /// database. It resumes automatically when the job finishes.
+    paused_for_job: bool,
+    /// Change-detection mode from the configuration.
+    mode: ContinuousScanMode,
+    /// Poll interval in effect when `mode` is `poller`.
+    poll_interval_secs: Option<u64>,
+    /// The folder roots being watched for changes (the global included
+    /// folders when no continuous watched folders are configured).
+    watch_roots: Vec<String>,
+    /// Configured watched folders that were rejected because they are not
+    /// inside an included folder or fall under an excluded folder.
+    invalid_includes: Vec<String>,
+    /// False when every configured watched folder was rejected; continuous
+    /// scanning is inactive in that case even when enabled.
+    roots_valid: bool,
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "get_continuous_scan_status",
+    path = "/api/jobs/continuous/status",
+    tag = "jobs",
+    summary = "Get the continuous filescan status",
+    description = "Report the live state of the continuous filescan for the selected database: \
+        whether it is enabled and actively watching, the change-detection mode in effect, the \
+        effective watch roots, and any configured watched folders that were rejected.",
+    params(DbQueryParams),
+    responses(
+        (status = 200, description = "Continuous filescan status", body = ContinuousScanStatusResponse)
+    )
+)]
+pub(crate) async fn get_continuous_scan_status(
+    conn: DbConnection<ReadOnly>,
+) -> Result<Json<ContinuousScanStatusResponse>, ApiError> {
+    let store = SystemConfigStore::from_env();
+    let config = store.load(&conn.index_db)?;
+    let poll_interval_secs = config
+        .continuous_filescan
+        .poll_interval_secs
+        .filter(|secs| *secs > 0);
+    let mode = match poll_interval_secs {
+        Some(_) => ContinuousScanMode::Poller,
+        None => ContinuousScanMode::Watcher,
+    };
+    let snapshot = continuous_scan::get_scan_status(&conn.index_db).await?;
+    let response = match snapshot {
+        Some(snapshot) => ContinuousScanStatusResponse {
+            enabled: config.continuous_filescan.enabled,
+            active: !snapshot.paused,
+            paused_for_job: snapshot.paused_for_job,
+            mode,
+            poll_interval_secs,
+            watch_roots: snapshot.watch_roots,
+            invalid_includes: snapshot.invalid_includes,
+            roots_valid: snapshot.roots_valid,
+        },
+        // No scanner actor: evaluate the configured roots directly so the UI
+        // still gets validation feedback while scanning is disabled.
+        None => {
+            let outcome = continuous_scan::compute_watch_roots(&config);
+            ContinuousScanStatusResponse {
+                enabled: config.continuous_filescan.enabled,
+                active: false,
+                paused_for_job: false,
+                mode,
+                poll_interval_secs,
+                watch_roots: outcome
+                    .watch_roots
+                    .iter()
+                    .map(|root| root.to_string_lossy().to_string())
+                    .collect(),
+                invalid_includes: outcome.invalid_includes,
+                roots_valid: outcome.valid,
+            }
+        }
+    };
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

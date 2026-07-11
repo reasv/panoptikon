@@ -331,6 +331,10 @@ async fn async_main() -> anyhow::Result<()> {
             .route(
                 "/api/jobs/cronjob/schedule",
                 get(api::jobs::get_cronjob_schedule),
+            )
+            .route(
+                "/api/jobs/continuous/status",
+                get(api::jobs::get_continuous_scan_status),
             );
     }
 

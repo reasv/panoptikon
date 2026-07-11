@@ -192,6 +192,20 @@ pub(crate) enum ContinuousScanMessage {
         scan_time: String,
         result: Result<PreparedFile, FileProcessError>,
     },
+    /// Point-in-time state for the status endpoint.
+    GetStatus {
+        reply: oneshot::Sender<ContinuousScanSnapshot>,
+    },
+}
+
+/// Live scanner state reported to the status endpoint. Paths are stringified
+/// here so the API layer never handles `PathBuf`s from actor state.
+pub(crate) struct ContinuousScanSnapshot {
+    pub paused: bool,
+    pub paused_for_job: bool,
+    pub watch_roots: Vec<String>,
+    pub invalid_includes: Vec<String>,
+    pub roots_valid: bool,
 }
 
 pub(crate) struct ContinuousScanActor;
@@ -203,11 +217,11 @@ pub(crate) struct ContinuousScanActorArgs {
     pub enable_watcher: bool,
 }
 
-struct WatchRootsOutcome {
-    watch_roots: Vec<PathBuf>,
-    excluded_roots: Vec<PathBuf>,
-    valid: bool,
-    invalid_includes: Vec<String>,
+pub(crate) struct WatchRootsOutcome {
+    pub watch_roots: Vec<PathBuf>,
+    pub excluded_roots: Vec<PathBuf>,
+    pub valid: bool,
+    pub invalid_includes: Vec<String>,
 }
 
 struct ScanStats {
@@ -236,7 +250,7 @@ impl ScanStats {
     }
 }
 
-fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
+pub(crate) fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
     let mut included = config.included_folders.clone();
     included.retain(|folder| check_folder_validity(folder));
     let global_included = deduplicate_paths(&included);
@@ -313,6 +327,9 @@ pub(crate) struct ContinuousScanState {
     config: SystemConfig,
     watch_roots: Vec<PathBuf>,
     excluded_roots: Vec<PathBuf>,
+    /// Latest root-validation outcome, kept for the status endpoint.
+    invalid_includes: Vec<String>,
+    roots_valid: bool,
     allowed_extensions: HashSet<String>,
     filescan_filter: Option<Arc<Match>>,
     scan_id: Option<i64>,
@@ -383,12 +400,14 @@ impl ContinuousScanState {
         let outcome = compute_watch_roots(&self.config);
         self.watch_roots = outcome.watch_roots;
         self.excluded_roots = outcome.excluded_roots;
+        self.invalid_includes = outcome.invalid_includes;
+        self.roots_valid = outcome.valid;
         self.allowed_extensions = build_extension_set(&self.config);
         self.filescan_filter = parse_filescan_filter(&self.config).map(Arc::new);
         if !outcome.valid {
             tracing::warn!(
                 index_db = %self.index_db,
-                invalid_includes = ?outcome.invalid_includes,
+                invalid_includes = ?self.invalid_includes,
                 "continuous scan disabled: includes must be within global included roots and not under excluded roots"
             );
         }
@@ -761,6 +780,8 @@ impl Actor for ContinuousScanActor {
             config,
             watch_roots: Vec::new(),
             excluded_roots: Vec::new(),
+            invalid_includes: Vec::new(),
+            roots_valid: true,
             allowed_extensions: HashSet::new(),
             filescan_filter: None,
             scan_id: None,
@@ -1167,6 +1188,19 @@ impl Actor for ContinuousScanActor {
                 }
                 state.maybe_report_progress().await;
             }
+            ContinuousScanMessage::GetStatus { reply } => {
+                let _ = reply.send(ContinuousScanSnapshot {
+                    paused: state.paused,
+                    paused_for_job: state.job_pauses > 0,
+                    watch_roots: state
+                        .watch_roots
+                        .iter()
+                        .map(|root| root.to_string_lossy().to_string())
+                        .collect(),
+                    invalid_includes: state.invalid_includes.clone(),
+                    roots_valid: state.roots_valid,
+                });
+            }
         }
         Ok(())
     }
@@ -1219,6 +1253,11 @@ pub(crate) enum ContinuousScanSupervisorMessage {
     },
     ResumeAfterJob {
         index_db: String,
+    },
+    /// Live state of one DB's scanner; None when no actor is running for it.
+    GetStatus {
+        index_db: String,
+        reply: oneshot::Sender<Option<ContinuousScanSnapshot>>,
     },
     /// Process shutdown: stops every per-DB scan actor and refuses to spawn
     /// new ones. The scan actors are not linked to the supervisor, so merely
@@ -1283,6 +1322,8 @@ impl Actor for ContinuousScanSupervisor {
                 let _ = reply.send(());
             } else if let ContinuousScanSupervisorMessage::PauseForJob { reply, .. } = message {
                 let _ = reply.send(());
+            } else if let ContinuousScanSupervisorMessage::GetStatus { reply, .. } = message {
+                let _ = reply.send(None);
             }
             return Ok(());
         }
@@ -1307,6 +1348,19 @@ impl Actor for ContinuousScanSupervisor {
                 } else {
                     let _ = sync_single_db(state, &index_db).await;
                 }
+            }
+            ContinuousScanSupervisorMessage::GetStatus { index_db, reply } => {
+                // Awaited inline like PauseForJob: the child answers from
+                // in-memory state, so this cannot stall the supervisor.
+                let snapshot = match state.actors.get(&index_db) {
+                    Some(actor) => {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = actor.cast(ContinuousScanMessage::GetStatus { reply: tx });
+                        rx.await.ok()
+                    }
+                    None => None,
+                };
+                let _ = reply.send(snapshot);
             }
             ContinuousScanSupervisorMessage::Shutdown { reply } => {
                 state.shutting_down = true;
@@ -1501,6 +1555,21 @@ pub(crate) async fn notify_config_change(index_db: &str) -> ApiResult<()> {
         })
         .map_err(|_| ApiError::internal("Failed to notify continuous scan supervisor"))?;
     Ok(())
+}
+
+/// Live scanner state for the status endpoint; None when no scanner actor is
+/// running for this DB (continuous scanning disabled, or DB missing on disk).
+pub(crate) async fn get_scan_status(index_db: &str) -> ApiResult<Option<ContinuousScanSnapshot>> {
+    let supervisor = ensure_continuous_supervisor().await?;
+    let (reply, rx) = oneshot::channel();
+    supervisor
+        .cast(ContinuousScanSupervisorMessage::GetStatus {
+            index_db: index_db.to_string(),
+            reply,
+        })
+        .map_err(|_| ApiError::internal("Failed to query continuous scan status"))?;
+    rx.await
+        .map_err(|_| ApiError::internal("Continuous scan supervisor dropped status request"))
 }
 
 pub(crate) async fn pause_for_job(index_db: &str) -> ApiResult<()> {
@@ -1875,6 +1944,78 @@ mod tests {
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
         assert!(outcome.watch_roots.is_empty());
+    }
+
+    /// GetStatus reflects the evaluated roots and the pause refcount: a valid
+    /// subset include is watched, an existing-but-outside include is reported
+    /// as invalid, and a job pause flips both paused flags.
+    #[tokio::test]
+    async fn get_status_reports_roots_and_pauses() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("status");
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("statuswatch");
+        let subset = watch_dir.join("subset");
+        let outside = root.join("statusoutside");
+        fs::create_dir_all(&subset).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // Folder validity requires non-empty directories.
+        fs::write(subset.join("dummy.txt"), "x").unwrap();
+        fs::write(outside.join("dummy.txt"), "x").unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        config.continuous_filescan.included_folders = vec![
+            subset.to_string_lossy().to_string(),
+            outside.to_string_lossy().to_string(),
+        ];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        actor
+            .cast(ContinuousScanMessage::GetStatus { reply: tx })
+            .unwrap();
+        let snapshot = rx.await.unwrap();
+        assert!(!snapshot.paused);
+        assert!(!snapshot.paused_for_job);
+        assert!(snapshot.roots_valid);
+        assert_eq!(snapshot.watch_roots.len(), 1);
+        assert_eq!(snapshot.invalid_includes.len(), 1);
+
+        let (tx, rx) = oneshot::channel();
+        actor
+            .cast(ContinuousScanMessage::Pause { reply: tx })
+            .unwrap();
+        let _ = rx.await;
+
+        let (tx, rx) = oneshot::channel();
+        actor
+            .cast(ContinuousScanMessage::GetStatus { reply: tx })
+            .unwrap();
+        let snapshot = rx.await.unwrap();
+        assert!(snapshot.paused);
+        assert!(snapshot.paused_for_job);
+
+        actor.stop(None);
     }
 
     #[test]

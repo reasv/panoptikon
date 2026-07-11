@@ -1770,6 +1770,54 @@
         }
       }
     },
+    "/api/jobs/continuous/status": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get the continuous filescan status",
+        "description": "Report the live state of the continuous filescan for the selected database: whether it is enabled and actively watching, the change-detection mode in effect, the effective watch roots, and any configured watched folders that were rejected.",
+        "operationId": "get_continuous_scan_status",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Continuous filescan status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContinuousScanStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/jobs/cronjob/run": {
       "post": {
         "tags": [
@@ -3976,6 +4024,71 @@
             ],
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "ContinuousScanMode": {
+        "type": "string",
+        "description": "Change-detection mode configured for the continuous filescan.",
+        "enum": [
+          "watcher",
+          "poller"
+        ]
+      },
+      "ContinuousScanStatusResponse": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "active",
+          "paused_for_job",
+          "mode",
+          "watch_roots",
+          "invalid_includes",
+          "roots_valid"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the scanner is currently watching for changes. False when\ndisabled, while paused for a running job, or when the configured\nwatched folders produced no valid watch roots."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether continuous scanning is enabled in this database's config."
+          },
+          "invalid_includes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured watched folders that were rejected because they are not\ninside an included folder or fall under an excluded folder."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ContinuousScanMode",
+            "description": "Change-detection mode from the configuration."
+          },
+          "paused_for_job": {
+            "type": "boolean",
+            "description": "Whether the scanner is temporarily paused while a job runs on this\ndatabase. It resumes automatically when the job finishes."
+          },
+          "poll_interval_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Poll interval in effect when `mode` is `poller`.",
+            "minimum": 0
+          },
+          "roots_valid": {
+            "type": "boolean",
+            "description": "False when every configured watched folder was rejected; continuous\nscanning is inactive in that case even when enabled."
+          },
+          "watch_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The folder roots being watched for changes (the global included\nfolders when no continuous watched folders are configured)."
           }
         }
       },
