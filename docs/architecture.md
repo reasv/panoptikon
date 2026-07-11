@@ -118,7 +118,8 @@ embedding and read the source tree as usual) and materialized at first run:
   `node server.js` (PORT/HOSTNAME env vars, not `next start`) with the
   managed venv's Node. Install/build staleness checks are skipped — the
   bundle is immutable. Requires `output: 'standalone'` in the UI repo's
-  next config. Embedding is deliberate: single CI build, no dependency on
+  next config — opt-in via `BUILD_STANDALONE=true next build` there, since
+  `next start` refuses to run with standalone output. Embedding is deliberate: single CI build, no dependency on
   GitHub artifacts at runtime, and fully offline operation once `setup` has
   run — no phone-home, no git-pull deployment.
 
@@ -146,8 +147,8 @@ use platform dirs (AppData/XDG) through the same root abstraction.
   rewritten) with the Rust flow as the installation path.
 - **M2**: `panoptikon setup` + the locked accelerator matrix.
 - **M3**: embedded resources + first-run extraction (done: `bundled` /
-  `bundled-ui` features, `--root`) + release CI (pending; blocked for the UI
-  half on panoptikon-ui enabling `output: 'standalone'`).
+  `bundled-ui` features, `--root`) + release CI (pending; panoptikon-ui
+  supports `output: 'standalone'` via `BUILD_STANDALONE=true next build`).
 - **M4 — the swap**: `master` is renamed `python-legacy` and this branch
   becomes `master`. A permanent worktree of `python-legacy` is mounted in the
   repo folder (gitignored) so the old implementation stays available

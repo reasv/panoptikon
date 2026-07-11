@@ -2805,7 +2805,14 @@ pub(crate) fn check_folder_validity(folder: &str) -> bool {
         return false;
     }
     match fs::read_dir(path) {
-        Ok(mut entries) => entries.next().is_some(),
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                true
+            } else {
+                tracing::warn!(path = %path.display(), "folder is empty, skipping");
+                false
+            }
+        }
         Err(err) => {
             tracing::error!(error = %err, path = %path.display(), "failed to read directory");
             false
@@ -2918,6 +2925,30 @@ mod tests {
     fn next_db_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         format!("testdb_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    // Folder validity gates which configured folders get scanned: missing
+    // paths, non-directories, and empty directories are all skipped (the
+    // empty-dir skip matches Python, which never scanned empty folders).
+    #[test]
+    fn folder_validity_rejects_missing_nondir_and_empty() {
+        let root = tempfile::TempDir::new().unwrap();
+
+        let missing = root.path().join("missing");
+        assert!(!check_folder_validity(&missing.to_string_lossy()));
+
+        let file_path = root.path().join("file.txt");
+        fs::write(&file_path, b"x").unwrap();
+        assert!(!check_folder_validity(&file_path.to_string_lossy()));
+
+        let empty_dir = root.path().join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+        assert!(!check_folder_validity(&empty_dir.to_string_lossy()));
+
+        let populated = root.path().join("populated");
+        fs::create_dir_all(&populated).unwrap();
+        fs::write(populated.join("f.txt"), b"x").unwrap();
+        assert!(check_folder_validity(&populated.to_string_lossy()));
     }
 
     // Ensures rescans persist items, files, and blurhash data.

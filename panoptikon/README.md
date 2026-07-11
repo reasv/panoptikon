@@ -393,8 +393,14 @@ resources into the binary (docs/architecture.md "Self-contained releases"):
   standalone output directory — `server.js` + `node_modules` at the root
   with the build's `.next/static` (and `public/`, if any) copied in;
   the build fails with a clear error when it is unset or invalid. The
-  panoptikon-ui repo must be built with `output: 'standalone'` in
-  `next.config.mjs` to produce such a directory.
+  panoptikon-ui repo produces such a directory when built with
+  `BUILD_STANDALONE=true next build` (the env var opts `next.config.mjs`
+  into `output: 'standalone'`; it is not on by default because `next start`
+  — plain and gateway-managed — refuses to run with standalone output).
+  Note the standalone server bakes the config's rewrites and their env vars
+  (`PANOPTIKON_API_URL`, `RESTRICTED_MODE`, ...) in at build time; behind
+  the gateway they are dormant anyway, since the gateway serves `/api`,
+  `/docs` and `/openapi.json` itself and only forwards the rest to the UI.
 
 First run of a `bundled` binary materializes what is missing — loudly, in
 the log:
