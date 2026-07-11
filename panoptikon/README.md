@@ -221,7 +221,64 @@ enabled = true
 # enabled = true          # master switch for the warm-worker pool
 # lazy = true             # keep one warm worker per class after each load
 # always_warm = []        # impl classes warmed unconditionally at startup
+
+# [inference_local.python_env]  # managed venv policy (`panoptikon setup`)
+# accelerator = "auto"    # "auto" | "cuda" | "rocm" | "cpu"
+# auto_setup = true       # run setup at startup when python/.venv is missing
 ```
+
+### The managed Python environment (`panoptikon setup`)
+
+```bash
+panoptikon setup [--accelerator auto|cuda|rocm|cpu] [--force]
+```
+
+Creates or updates the managed inference venv at **`python/.venv`** (fixed
+location, relative to the working directory like every other path). The
+flow:
+
+1. **uv discovery** — `uv` on PATH is used when `uv --version` works and the
+   version is at least 0.6.13 (the verified floor for the current lockfile);
+   otherwise a pinned standalone build (see `UV_VERSION` in `src/setup.rs`)
+   is downloaded from the official astral-sh/uv GitHub release into
+   `runtime/uv/<version>/` and reused on later runs. Downloads are verified
+   against SHA-256 checksums pinned in the binary (from the release's
+   `.sha256` companion files) before extraction.
+2. **Accelerator selection** — `--accelerator` beats
+   `[inference_local.python_env] accelerator` (default `"auto"`). Auto
+   detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
+   `nvidia-smi` is on PATH, `System32\nvidia-smi.exe` exists (Windows), or
+   `/proc/driver/nvidia` exists (Linux); ROCm on Linux when `/opt/rocm` or
+   `rocm-smi` is found; otherwise CPU. The decision and its evidence are
+   logged.
+3. **Locked sync** — `uv venv --python 3.12` when the venv is missing (uv
+   auto-fetches CPython), then `uv sync --locked --extra <variant>` in
+   `python/` (`cuda` → the `cu128` extra; the committed `uv.lock` is
+   authoritative and covers all variants). Child output streams to the log.
+
+Re-running converges (idempotent, fast when nothing changed); `--force`
+deletes `python/.venv` first. As a safety guard, setup refuses to operate on
+any venv other than `python/.venv` — a user-configured
+`[inference_local].python` interpreter is never touched.
+
+After every successful sync, setup writes a completion sentinel
+(`python/.venv/.panoptikon-setup-complete`, recording the installed extra
+and the `uv.lock` hash). With `auto_setup = true` (the default) and no
+explicit `python` configured, startup (gateway and `inferio` modes) re-runs
+setup automatically when the environment doesn't exist yet, when the
+sentinel is missing (an interrupted first sync leaves an interpreter but no
+sentinel), or when it is stale (`uv.lock` changed, e.g. after a pull). A
+legacy pre-restructure root `.venv` without a managed venv suppresses the
+trigger — it keeps working and is never auto-managed. An explicit
+`panoptikon setup` always runs regardless of the sentinel. Auto-setup runs
+blocking before the orchestrator serves; on failure the server continues
+with local inference unavailable.
+
+Concurrent runs (e.g. a gateway and an `inferio` process starting together)
+are serialized by an exclusive lock on `runtime/setup.lock`: the second
+process logs that it is waiting, then no-ops if the first already converged
+the environment. macOS x86_64 is unsupported (PyTorch publishes no wheels
+for it and the lock excludes it) — setup fails fast there.
 
 A machine that only lends its GPU can run the standalone service:
 

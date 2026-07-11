@@ -168,6 +168,53 @@ pub struct InferenceLocalConfig {
     /// per impl class; no TTL by design).
     #[serde(default)]
     pub prewarm: PrewarmSettings,
+    /// `[inference_local.python_env]`: managed-venv policy for
+    /// `panoptikon setup` (accelerator choice, startup auto-setup).
+    #[serde(default)]
+    pub python_env: PythonEnvConfig,
+}
+
+/// `[inference_local.python_env]`: how the binary manages the Python
+/// inference environment. Only ever applies to the managed venv at
+/// `python/.venv` — a user-configured `[inference_local].python` interpreter
+/// is never touched (setup refuses to operate on any other path).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PythonEnvConfig {
+    /// Accelerator variant for the locked sync: "auto" (detect CUDA/ROCm at
+    /// setup time), "cuda", "rocm", or "cpu". Default: "auto".
+    #[serde(default)]
+    pub accelerator: Accelerator,
+    /// Run `panoptikon setup` automatically at startup (gateway and
+    /// `inferio` modes) when `[inference_local]` is enabled, no explicit
+    /// `python` interpreter is configured, and the managed interpreter does
+    /// not exist yet. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_setup: bool,
+}
+
+impl Default for PythonEnvConfig {
+    fn default() -> Self {
+        Self {
+            accelerator: Accelerator::Auto,
+            auto_setup: true,
+        }
+    }
+}
+
+/// Accelerator selection for the managed Python environment. Shared between
+/// the config (`[inference_local.python_env] accelerator`) and the
+/// `panoptikon setup --accelerator` CLI flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Accelerator {
+    /// Detect at setup time: CUDA if an NVIDIA driver is present, ROCm on
+    /// Linux with a ROCm install, otherwise CPU (macOS always uses the
+    /// default PyPI wheels, which include MPS on Apple Silicon).
+    #[default]
+    Auto,
+    Cuda,
+    Rocm,
+    Cpu,
 }
 
 /// `[inference_local.prewarm]` (design §8, policy decided 2026-07-05).
@@ -226,6 +273,7 @@ impl Default for InferenceLocalConfig {
             terminate_grace_secs: None,
             port: None,
             prewarm: PrewarmSettings::default(),
+            python_env: PythonEnvConfig::default(),
         }
     }
 }
@@ -797,16 +845,54 @@ impl Settings {
 
     /// Local inference spawns workers lazily, so a missing interpreter is a
     /// warning at load time, not an error — the first model load surfaces it.
+    /// When the managed environment is missing/incomplete but the startup
+    /// auto-setup is about to handle it, this logs that instead of a
+    /// misleading "model loads will fail" warning.
     fn warn_inference_local(&self) {
-        if !self.inference_local.enabled {
+        let local = &self.inference_local;
+        if !local.enabled {
             return;
         }
-        let python = self.inference_local.resolved_python();
-        if !python.is_file() {
+        if let Some(python) = &local.python {
+            // User-managed interpreter: existence is all we can check (no
+            // sentinel semantics; setup never touches it).
+            if !python.is_file() {
+                tracing::warn!(
+                    python = %python.display(),
+                    "inference_local is enabled but the configured Python \
+                     interpreter was not found; model loads will fail until \
+                     it exists"
+                );
+            }
+            return;
+        }
+        let Some(reason) = crate::setup::auto_setup_needed() else {
+            // Complete managed venv or legacy root .venv fallback: still
+            // sanity-check that the resolved interpreter exists (defensive;
+            // the decision above should guarantee it).
+            let python = local.resolved_python();
+            if !python.is_file() {
+                tracing::warn!(
+                    python = %python.display(),
+                    "inference_local is enabled but the worker Python \
+                     interpreter was not found; model loads will fail until \
+                     it exists"
+                );
+            }
+            return;
+        };
+        if local.python_env.auto_setup {
+            tracing::info!(
+                reason,
+                "the managed Python environment is missing or incomplete; \
+                 setup will run automatically at startup"
+            );
+        } else {
             tracing::warn!(
-                python = %python.display(),
-                "inference_local is enabled but the worker Python interpreter \
-                 was not found; model loads will fail until it exists"
+                reason,
+                "the managed Python environment is missing or incomplete and \
+                 auto_setup is disabled; run `panoptikon setup` (model loads \
+                 will fail until then)"
             );
         }
     }
@@ -1381,6 +1467,68 @@ base_url = "http://127.0.0.1:6342"
         assert!(!settings.inference_local.enabled);
         assert_eq!(settings.inference_local.default_max_batch, 32);
         assert_eq!(settings.inference_local.sweep_interval_secs, 10);
+    }
+
+    /// `[inference_local.python_env]` parsing: defaults are
+    /// accelerator = "auto" / auto_setup = true, every accelerator name
+    /// parses lowercase, and unknown names fail config load.
+    #[test]
+    fn python_env_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let base = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#;
+
+        // Section omitted entirely -> defaults.
+        std::fs::write(&path, base).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(
+            settings.inference_local.python_env.accelerator,
+            Accelerator::Auto
+        );
+        assert!(settings.inference_local.python_env.auto_setup);
+
+        // Explicit values.
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n[inference_local.python_env]\naccelerator = \"cuda\"\nauto_setup = false\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(
+            settings.inference_local.python_env.accelerator,
+            Accelerator::Cuda
+        );
+        assert!(!settings.inference_local.python_env.auto_setup);
+
+        for accelerator in ["rocm", "cpu", "auto"] {
+            std::fs::write(
+                &path,
+                format!("{base}\n[inference_local.python_env]\naccelerator = \"{accelerator}\"\n"),
+            )
+            .unwrap();
+            Settings::load(Some(path.clone()))
+                .unwrap_or_else(|err| panic!("accelerator {accelerator} should parse: {err:#}"));
+        }
+
+        // Unknown accelerator names are a config error, not a silent default.
+        std::fs::write(
+            &path,
+            format!("{base}\n[inference_local.python_env]\naccelerator = \"cu128\"\n"),
+        )
+        .unwrap();
+        assert!(Settings::load(Some(path)).is_err());
     }
 
     /// A synthesized loopback inference upstream must be reachable through

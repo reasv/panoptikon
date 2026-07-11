@@ -190,3 +190,7 @@ data/
 
 /.cargo-target*
 .claude/
+
+# Binary-owned runtime resources (managed uv downloads, extracted
+# embedded sets — docs/architecture.md)
+/runtime/

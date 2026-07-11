@@ -17,6 +17,7 @@ mod policy;
 mod pql;
 mod process_tree;
 mod proxy;
+mod setup;
 mod shutdown;
 #[cfg(test)]
 mod test_utils;
@@ -55,6 +56,19 @@ enum Command {
     /// no proxy, API, jobs, cron, or migrations. For machines that just lend
     /// their GPU to other panoptikon instances (design doc §3).
     Inferio,
+    /// Create or update the managed Python inference environment at
+    /// python/.venv: find or download uv, detect the accelerator, and run a
+    /// locked `uv sync`. Idempotent — re-running converges on the lockfile.
+    Setup {
+        /// Accelerator variant to install. Default: the config's
+        /// `[inference_local.python_env] accelerator` (itself defaulting to
+        /// auto-detection).
+        #[arg(long, value_enum)]
+        accelerator: Option<config::Accelerator>,
+        /// Delete python/.venv first and recreate it from scratch.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -89,8 +103,22 @@ async fn async_main() -> anyhow::Result<()> {
     let _log_guard = logging::init(&settings);
     settings.log_warnings();
 
-    if matches!(args.command, Some(Command::Inferio)) {
-        return inferio_main(settings).await;
+    match args.command {
+        Some(Command::Inferio) => return inferio_main(settings).await,
+        Some(Command::Setup { accelerator, force }) => {
+            // An explicit `panoptikon setup` always runs (never skipped by
+            // the completion sentinel; a successful sync rewrites it).
+            return setup::run(
+                &settings,
+                setup::SetupOptions {
+                    accelerator,
+                    force,
+                    skip_if_converged: false,
+                },
+            )
+            .await;
+        }
+        None => {}
     }
 
     let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;
@@ -144,6 +172,13 @@ async fn async_main() -> anyhow::Result<()> {
         db::migrations::migrate_databases_on_disk(None, None).await?;
         db::migrations::migrate_all_databases_on_disk().await?;
     }
+
+    // Managed Python environment: when local inference is enabled with no
+    // user-configured interpreter and the managed venv is missing, run
+    // `panoptikon setup` now (blocking, before the orchestrator starts
+    // serving). A failure logs and continues — the server comes up with
+    // inference unavailable instead of dying.
+    setup::maybe_auto_setup(&settings, settings.inference_local.enabled).await;
 
     // Local inference (design doc §3): when enabled, the /api/inference/*
     // paths that used to be proxied are served in-process by the inferio
@@ -411,6 +446,10 @@ async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
 /// subcommand; `[inference_local].port` overrides the listen port
 /// (defaults to `server.port`).
 async fn inferio_main(settings: Arc<config::Settings>) -> anyhow::Result<()> {
+    // Same managed-venv auto-setup as gateway mode: this subcommand spawns
+    // the same Python workers (local inference is implied here, so the
+    // config's `enabled` flag is not consulted).
+    setup::maybe_auto_setup(&settings, true).await;
     let state = inferio::http::InferioState::from_settings(&settings)?;
     // Single listener: extra [[server.endpoints]] do not apply to the
     // standalone inference service. Its one listener is the primary.

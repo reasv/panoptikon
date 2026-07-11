@@ -75,7 +75,8 @@ shell-words = "1"
 utoipa = "5.4"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 utoipa-redoc = { version = "6", features = ["axum"] }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+# `stream`: setup.rs streams the pinned uv download to disk with progress.
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"
@@ -104,18 +105,27 @@ rmpv = "1"
 # PR_SET_PDEATHSIG + process-group SIGKILL: the Unix counterpart of the
 # Windows job objects for reaping worker/UI trees when the gateway dies.
 libc = "0.2"
+# Extraction of the pinned uv standalone build (setup.rs): tar.gz on Unix.
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render
 # ends, including the detached browser the msedge.exe launcher leaves behind.
 # Threading: process-creation flags detaching the UI node children from the
 # console signal path (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
+# Win32_Storage_FileSystem + Win32_System_IO: LockFileEx for the advisory
+# lock serializing concurrent setup runs (setup.rs).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+# Extraction of the pinned uv standalone build (setup.rs): zip on Windows.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

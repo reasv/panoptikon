@@ -61,10 +61,15 @@ template variables. Bootstrap/diagnostic env vars (`GATEWAY_CONFIG_PATH`,
 ## Python environment management
 
 Owned by the binary. `panoptikon setup` (also auto-triggered at startup when
-`[inference_local]` is enabled and the configured interpreter is missing):
+`[inference_local]` is enabled, no interpreter is explicitly configured, and
+the managed environment is missing or incomplete — completion is tracked by
+a sentinel inside `python/.venv` recording the synced extra and the uv.lock
+hash, so an interrupted first sync or a changed lock re-arms the trigger,
+while a legacy root `.venv` alone suppresses it; concurrent runs serialize
+on a `runtime/setup.lock` file lock):
 
-1. Locates `uv` on PATH, else downloads a pinned standalone `uv` into the
-   managed root.
+1. Locates `uv` on PATH, else downloads a pinned, checksum-verified
+   standalone `uv` into the managed root.
 2. Detects the accelerator (`[inference_local.python_env] accelerator =
    "auto" | "cuda" | "rocm" | "cpu"`; auto = our detection, ported from the old
    install scripts — uv's `--torch-backend=auto` exists only in its pip
@@ -76,7 +81,14 @@ extras (`[tool.uv] conflicts`), explicit PyTorch indexes per extra
 (`[tool.uv.sources]`), and macOS routed to default PyPI wheels via markers.
 One universal `uv.lock` covers Windows/Linux × CUDA/CPU, macOS aarch64, and
 (untested) ROCm. Because the accelerator variant is locked, `uv sync` can never
-downgrade torch out from under a working environment again.
+downgrade torch out from under a working environment again (a
+`constraint-dependencies` pin keeps even an extra-less `uv sync` on the same
+torch). `[tool.uv] environments` restricts the lock to the platforms we
+actually target — Windows x86_64, Linux x86_64, macOS aarch64; Linux aarch64
+is excluded because torch 2.7.1's pinned triton publishes no aarch64 wheels.
+The extras spell the CUDA variant `cu128` (torch 2.7.1); `panoptikon setup`
+maps `accelerator = "cuda"` to it, so a future CUDA bump is a pyproject +
+setup.rs change, not a config change.
 
 Escape hatch: `[inference_local].python` points at any interpreter the user
 manages themselves. Never run `uv sync` against a user-managed venv.

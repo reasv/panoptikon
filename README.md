@@ -92,17 +92,17 @@ API endpoints support specifying the name of the `index` and `user_data` databas
 
 ## 🛠 Installation
 
-Prebuilt binaries and an automated `panoptikon setup` command are planned;
-until they arrive you build from source.
+Prebuilt binaries are planned; until they arrive you build from source.
 
 ### Prerequisites
 
 - **Git**
 - **A Rust toolchain** (stable, via [rustup](https://rustup.rs/))
-- **Python 3.12** and [**uv**](https://github.com/astral-sh/uv) — the server
-  spawns Python workers for inference. You do **not** need Node.js: the
-  Python venv bundles it, and the server uses that to build and run the web
-  UI.
+
+That's it — you do **not** need to install Python, uv, or Node.js.
+`panoptikon setup` (below) finds or downloads [uv](https://docs.astral.sh/uv/),
+which in turn fetches Python 3.12 and every locked dependency; the web UI
+runs on the Node.js runtime bundled inside that same environment.
 
 ### Setup
 
@@ -116,31 +116,41 @@ until they arrive you build from source.
 
    (For an existing clone: `git submodule update --init`.)
 
-2. Create the Python inference environment. A future `panoptikon setup`
-   command will do this for you (including accelerator detection); until
-   then, create it manually with uv **inside `python/`**:
-
-   ```bash
-   cd python
-   uv venv -p 3.12
-   uv sync
-   ```
-
-   For an NVIDIA GPU (highly recommended if you have one), install the CUDA
-   build of PyTorch into the venv afterwards:
-
-   ```bash
-   uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-   ```
-
-   Re-run that command after any future `uv sync` — syncing restores the
-   locked (CPU) build until the accelerator matrix lands in the lockfile.
-
-3. Build the server (from the repository root):
+2. Build the server:
 
    ```bash
    cargo build --release -p panoptikon
    ```
+
+3. Create the Python inference environment:
+
+   ```bash
+   target/release/panoptikon setup
+   ```
+
+   This finds `uv` on PATH (or downloads a pinned copy into `runtime/uv/`),
+   detects your accelerator, creates `python/.venv`, and installs the locked
+   dependency set for it. Accelerator selection is automatic — **CUDA** when
+   an NVIDIA driver is present, **ROCm** on Linux with a ROCm install
+   (untested), otherwise **CPU**; macOS always gets the standard PyPI wheels
+   (which include MPS support on Apple Silicon). Override it with
+   `--accelerator cuda|rocm|cpu` or pin it in the config
+   (`[inference_local.python_env] accelerator`). `--force` recreates the
+   venv from scratch; re-running without it is a fast no-op.
+
+   The first CUDA install downloads several GB of PyTorch wheels — watch the
+   log. You can also skip this step entirely: on first start the server runs
+   setup automatically when the environment is missing (disable with
+   `[inference_local.python_env] auto_setup = false`).
+
+#### Manual/custom environments
+
+If you'd rather manage the Python environment yourself, point
+`[inference_local].python` at any interpreter — the server never runs uv
+against a user-configured interpreter (or against anything but
+`python/.venv`). For a DIY environment with the repo's locked versions, use
+the accelerator extras in `python/pyproject.toml` directly:
+`uv sync --locked --extra cu128` (or `cpu`/`rocm`) inside `python/`.
 
 ### cuDNN
 
@@ -172,6 +182,8 @@ inference, and serves everything — UI included — on
 
 On first start it will:
 
+- create the Python inference environment if it is missing (`panoptikon
+  setup` runs automatically; see Installation),
 - create and migrate the databases under `data/`,
 - install dependencies and produce a production build of the web UI (this
   takes a few minutes the first time; watch the log),

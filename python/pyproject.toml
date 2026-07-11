@@ -18,6 +18,39 @@ dependencies = [
     "nodejs-wheel>=20.17.0,<21",
 ]
 
+# Accelerator matrix (docs/architecture.md "Python environment management"):
+# exactly one extra is installed at a time (`uv sync --extra <variant>`,
+# normally driven by `panoptikon setup`). The extras are declared mutually
+# exclusive via [tool.uv] conflicts, and [tool.uv.sources] below routes
+# torch/torchvision/torchaudio to the matching PyTorch index per extra.
+# macOS has no CUDA/ROCm wheels: the markers on the source entries leave it
+# on default PyPI wheels (which include MPS support on aarch64) whichever
+# extra is selected — `cpu` is the canonical choice there.
+[project.optional-dependencies]
+cpu = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+]
+cu128 = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+    # cuBLAS/cuDNN wheels for CTranslate2 (faster-whisper); CUDA-only and
+    # unavailable on macOS, hence the platform markers.
+    "nvidia-cublas-cu12>=12.1.3.1; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cudnn-cu12>=9.1.0.70; sys_platform == 'linux' or sys_platform == 'win32'",
+]
+# Aspirational and untested — it exists so the lock covers it (tech debt
+# register in docs/architecture.md). Linux x86_64 only: PyTorch publishes no
+# ROCm wheels for other platforms/architectures.
+rocm = [
+    "torch==2.7.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision==0.22.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio==2.7.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "pytorch-triton-rocm; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 [dependency-groups]
 inference = [
     "open-clip-torch>=3.2.0,<4",
@@ -31,8 +64,6 @@ inference = [
     "easyocr>=1.7.2,<2",
     "einops>=0.8.1",
     "qwen-vl-utils>=0.0.14",
-    "nvidia-cublas-cu12>=12.1.3.1",
-    "nvidia-cudnn-cu12>=9.1.0.70",
 ]
 # Python tests live in tests/ next to this file and run from this directory:
 #   uv sync --group test   (the test group is not in default-groups)
@@ -46,6 +77,65 @@ test = [
 [tool.uv]
 package = false
 default-groups = ["inference"]
+# The accelerator extras are mutually exclusive: conflicts lets one universal
+# uv.lock carry all variants while `uv sync --extra <one>` installs exactly one.
+conflicts = [[{ extra = "cpu" }, { extra = "cu128" }, { extra = "rocm" }]]
+# Keep the extra-less resolution fork (torch pulled in transitively by
+# open-clip-torch etc. when syncing without an accelerator extra) on the same
+# torch as the extras, so no sync flavor can downgrade torch.
+constraint-dependencies = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+]
+# Restrict resolution to the platforms Panoptikon actually targets (keeps the
+# universal lock small and avoids resolving GPU wheels for platforms PyTorch
+# does not publish for — e.g. torch 2.7.1's triton==3.3.1 has no linux
+# aarch64 wheels, so linux aarch64 cannot be part of this lock).
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+# `explicit = true`: these indexes are only used for packages pinned to them
+# below, never for general resolution.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.3"
+explicit = true
+
+# Index routing per extra. macOS (darwin) matches no entry and falls through
+# to default PyPI wheels for every extra.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
