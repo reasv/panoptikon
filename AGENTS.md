@@ -1,22 +1,28 @@
 Panoptikon Repository Guide
 
 Overview
-- This repo contains the core Panoptikon services and UI.
-- Each component has its own README and internal agent notes where applicable.
+- Panoptikon is one Rust binary (`panoptikon`) plus Python inference workers.
+- The legacy Python server lives on the `python-legacy` branch, not here
+  (until the switchover completes, that branch is still `master`).
+- See `docs/architecture.md` for the charter: repository layout, configuration,
+  Python environment management, and the release roadmap.
 
 Components
-- panoptikon (Python backend): `src/panoptikon`
-  - Primary API service today (FastAPI).
-  - See `src/panoptikon/README.md` for details.
-- inferio (Inference server): `src/inferio`
-  - Optional inference service used for GPU/remote inference.
-- searchui (Next.js frontend): `src/searchui/panoptikon-ui`
-  - Web UI and API docs rewrites for demo mode.
-- gateway (Rust HTTP entrypoint): `gateway`
-  - Reverse proxy + policy enforcement, and gradually adds local API routes.
-  - See `gateway/AGENTS.md` for engineering notes.
-  - See `gateway/README.md` for setup and configuration.
+- panoptikon (Rust server crate): `panoptikon/`
+  - The single entrypoint: HTTP server, policy layer, full API, PQL search,
+    job system, cron, file scanning, database migrations, the inference
+    orchestrator, and supervision of the production web UI.
+  - See `panoptikon/AGENTS.md` for engineering notes.
+  - See `panoptikon/README.md` for setup and configuration.
+- python (inference workers): `python/`
+  - `python/inferio_worker/` — the worker harness (protocol v2), spawned by
+    the orchestrator as `python -m inferio_worker`.
+  - `python/inferio/` — impl classes (`impl/`) and the built-in model
+    registry TOMLs (`config/`).
+  - `python/pyproject.toml` + `python/uv.lock` — worker/inference deps only.
+- ui (Next.js frontend): `ui/` (git submodule → panoptikon-ui)
 
 When changes are made
-- If you alter gateway behavior, update `gateway/AGENTS.md` and `gateway/README.md`.
-- If you alter Python backend behavior, update `src/panoptikon/README.md`.
+- If you alter server behavior, update `panoptikon/AGENTS.md` and
+  `panoptikon/README.md`.
+- If you alter the worker protocol, update `docs/inferio-worker-protocol.md`.

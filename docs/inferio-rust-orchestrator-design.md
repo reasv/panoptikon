@@ -1,6 +1,13 @@
 # Inferio Orchestrator in Rust — Design
 
 Status: DRAFT for review — 2026-07-05
+
+> **Layout note (2026-07-11, M1 restructure):** paths in this document
+> reflect the pre-restructure layout it was written against:
+> `src/inferio/...` is now `python/inferio/...`, `src/inferio_worker/` is now
+> `python/inferio_worker/`, and the `gateway` crate is now `panoptikon/`.
+> The legacy Python inference server described in §2 survives on the
+> `python-legacy` branch.
 Scope: port inferio's orchestration layer (model lifecycle, process supervision,
 request routing, batching) to Rust. Inference itself stays in Python worker
 processes running the existing `src/inferio/impl/` classes, unchanged.

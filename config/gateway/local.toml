@@ -1,8 +1,8 @@
 # Panoptikon Gateway local rust-only production configuration:
 # the gateway serves the API locally, runs the inferio orchestrator
-# in-process, and builds + runs the production Next.js UI itself from a
-# panoptikon-ui checkout next to this repo.
-# Run with: gateway --config config/gateway/local.toml
+# in-process, and builds + runs the production Next.js UI itself from the
+# ui/ submodule checkout.
+# Run with: panoptikon --config config/gateway/local.toml
 
 [logging]
 # The .env file keeps auto-loading; LOGLEVEL set there (e.g. DEBUG) feeds
@@ -33,11 +33,15 @@ port = 6343
 # the spawned `next start` binds to.
 base_url = "http://127.0.0.1:6339"
 local = true
-# Path to the panoptikon-ui checkout (managed by you, not the gateway).
-dir = "../panoptikon-ui"
+# Path to the panoptikon-ui checkout. The standard location is the ui/
+# git submodule (populated by cloning with --recurse-submodules, or by
+# `git submodule update --init`).
+dir = "ui"
+# If you manage a separate UI checkout yourself, point dir at it instead:
+# dir = "../panoptikon-ui"
 
 [upstreams.api]
-# FastAPI backend base URL. Unused when local = true: every /api route is
+# API backend base URL. Unused when local = true: every /api route is
 # served in-process and unmatched /api paths return 404 (they must not be
 # proxied — this base_url points back at the gateway itself).
 base_url = "http://127.0.0.1:6342"

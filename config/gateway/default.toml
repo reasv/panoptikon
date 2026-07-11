@@ -74,11 +74,17 @@ trust_forwarded_headers = true
 # # host = "127.0.0.1" # default: server.host
 
 [upstreams.ui]
-# Next.js frontend base URL.
+# Next.js frontend base URL; with local = true this is also the host/port
+# the spawned `next start` binds to.
 base_url = "http://127.0.0.1:6339"
+# Path to the panoptikon-ui checkout the server builds and runs when
+# local = true. The standard location is the ui/ git submodule.
+# local = true
+# dir = "ui"
 
 [upstreams.api]
-# FastAPI backend base URL.
+# API backend base URL. Unused when local = true: every /api route is
+# served in-process.
 base_url = "http://127.0.0.1:6342"
 local = true
 

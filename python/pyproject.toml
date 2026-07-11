@@ -1,0 +1,57 @@
+[project]
+name = "panoptikon-inference"
+version = "1.0.0"
+description = "Python inference workers for Panoptikon (spawned by the Rust server as `python -m inferio_worker`)"
+authors = [{ name = "reasv" }]
+requires-python = "~=3.12"
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "pillow>=10.4.0,<11",
+    "numpy",
+    "pandas>=2.2.3,<3",
+    "aiohttp>=3.11.0,<4",
+    "requests",
+    "psutil>=7.0.0",
+    "msgpack>=1.0",
+    # Not imported by the worker: the Rust server resolves the UI's Node.js
+    # runtime from this venv (see docs/architecture.md, tech debt register).
+    "nodejs-wheel>=20.17.0,<21",
+]
+
+[dependency-groups]
+inference = [
+    "open-clip-torch>=3.2.0,<4",
+    "python-doctr>=1.0.0,<2",
+    "timm>=1.0.24,<2",
+    "faster-whisper>=1.2.1,<2",
+    "sentence-transformers>=5.2.0,<6",
+    "transformers==4.57.3",
+    "pyvips-binary>=8.18.0,<9",
+    "pyvips>=3.1.1,<4",
+    "easyocr>=1.7.2,<2",
+    "einops>=0.8.1",
+    "qwen-vl-utils>=0.0.14",
+    "nvidia-cublas-cu12>=12.1.3.1",
+    "nvidia-cudnn-cu12>=9.1.0.70",
+]
+# Python tests live in tests/ next to this file and run from this directory:
+#   uv sync --group test   (the test group is not in default-groups)
+#   .venv/Scripts/python -m pytest        (or .venv/bin/python -m pytest)
+test = [
+    "pytest>=8.3.4,<9",
+    # conftest.py loads the repo-root .env for integration tests.
+    "python-dotenv>=1.0.1,<2",
+]
+
+[tool.uv]
+package = false
+default-groups = ["inference"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: integration tests that download models or call external services",
+]
+
+[tool.black]
+line-length = 80

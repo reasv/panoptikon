@@ -173,10 +173,10 @@ data/
 # But don't ignore the .gitpreserve file
 !/cudnn/.gitpreserve
 
-/src/searchui/panoptikon-ui/
 .infinity_cache/
 
 /.ray_tmp
+
 
 /inferio_custom/*
 !/inferio_custom/__init__.py
@@ -187,7 +187,6 @@ data/
 !/config/inference/example.toml
 
 /target
-gateway/target
 
 /.cargo-target*
 .claude/
