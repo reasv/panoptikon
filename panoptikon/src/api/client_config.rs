@@ -271,6 +271,7 @@ disable_backend_open = true
             0,
             Arc::clone(&settings),
             Arc::new(crate::policy_token::TokenKey::random()),
+            tokio::sync::watch::channel(false).1,
         ));
         let context = PolicyContext {
             policy_name: "demo".to_string(),

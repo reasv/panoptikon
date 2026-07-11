@@ -186,6 +186,13 @@ async fn async_main() -> anyhow::Result<()> {
         )
         .unwrap_or(u32::MAX),
     })?;
+    // Created here (not at serve time) because ProxyState carries a receiver:
+    // proxied Upgrade bridges (WebSockets) select on it so they cannot
+    // outlive graceful shutdown. First signal: axum stops accepting
+    // connections and drains in-flight requests, bridges close, and the
+    // cleanup task cancels jobs and flushes the DB writers.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
         api_upstream,
@@ -194,6 +201,7 @@ async fn async_main() -> anyhow::Result<()> {
         settings.search.embedding_cache_size,
         Arc::clone(&settings),
         Arc::clone(&token_key),
+        shutdown_rx.clone(),
     ));
 
     let local_api = settings.upstreams.api.local;
@@ -436,10 +444,8 @@ async fn async_main() -> anyhow::Result<()> {
         listeners.push((name, listener));
     }
 
-    // First signal: axum stops accepting connections and drains in-flight
-    // requests while the cleanup task cancels jobs and flushes the DB writers.
-    // Both must finish before main returns; shutdown.rs enforces the deadline.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Cleanup task and HTTP drain both must finish before main returns;
+    // shutdown.rs enforces the deadline.
     let inferio_manager = inferio_state
         .as_ref()
         .map(|state| Arc::clone(&state.manager));
