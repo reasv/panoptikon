@@ -73,7 +73,8 @@ impl Modify for JsonValueSchema {
         crate::api::pinboards::delete_pinboard_version,
         crate::api::pinboards::pinboard_version_preview,
         crate::api::db::db_info,
-        crate::api::db::db_create
+        crate::api::db::db_create,
+        crate::api::client_config::client_config
     ),
     components(
         schemas(
@@ -137,6 +138,8 @@ impl Modify for JsonValueSchema {
             crate::policy::DbInfo,
             crate::policy::SingleDbInfo,
             crate::api::db::DbCreateResponse,
+            crate::api::client_config::ClientConfigResponse,
+            crate::api::client_config::ClientCapabilities,
             crate::pql::EmbeddingCacheEntry,
             crate::pql::EmbeddingCacheStats,
             crate::pql::model::PqlQuery,
@@ -194,6 +197,7 @@ impl Modify for JsonValueSchema {
         (name = "bookmarks"),
         (name = "pinboards", description = "Saved pinboard arrangements with version history"),
         (name = "database"),
+        (name = "client", description = "Per-policy client configuration and derived capabilities"),
         (name = "inference", description = "Model inference service (served locally or proxied upstream — same contract either way)")
     ),
     modifiers(&JsonValueSchema)

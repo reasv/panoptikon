@@ -1429,6 +1429,7 @@ config.impl_class = "echo_test"
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 trust_forwarded_headers: false,
+                policy_token_key: None,
                 endpoints: Vec::new(),
             },
             upstreams: UpstreamsConfig {

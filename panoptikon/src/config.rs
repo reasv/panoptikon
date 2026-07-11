@@ -479,6 +479,16 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+    /// Hex-encoded 256-bit HMAC key for policy tokens (the
+    /// `x-panoptikon-policy` header injected on UI-bound proxied requests —
+    /// see `policy_token.rs`). Default: a fresh random key per gateway
+    /// boot, which is right for every single-gateway deployment. Setting it
+    /// is niche: only multi-gateway setups where one gateway's tokens must
+    /// verify on another (e.g. the UI upstream is reached through a second
+    /// gateway) need a shared, configured key. Env-templatable like every
+    /// string value (`policy_token_key = "${POLICY_TOKEN_KEY}"`).
+    #[serde(default)]
+    pub policy_token_key: Option<String>,
     /// Extra named listener endpoints besides the primary `host`/`port`
     /// (which is always the endpoint named "default"). Every listener serves
     /// the identical routes; the difference is that policies can match on
@@ -662,6 +672,17 @@ pub struct PolicyConfig {
     pub user_data_db: DbPolicy,
     #[serde(default)]
     pub identity: Option<IdentityConfig>,
+    /// `[policies.client]`: free-form table returned verbatim as the
+    /// `client` object of `GET /api/client-config`. The gateway attaches no
+    /// semantics to it — it is per-policy configuration for UI clients.
+    /// Recognized-by-convention keys (documented, not enforced):
+    /// `search_throttle_ms`, `disable_backend_open`. Default: empty object.
+    #[serde(default = "default_client_table")]
+    pub client: serde_json::Value,
+}
+
+pub(crate) fn default_client_table() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 /// `[policies.match]`: which requests a policy applies to. `hosts` matches
@@ -942,6 +963,40 @@ impl Settings {
 
     fn validate_policies(&self) -> Result<()> {
         for policy in &self.policies {
+            // Policy names travel inside the x-panoptikon-policy header
+            // (policy_token.rs): restrict them to header-safe visible ASCII
+            // so token minting can never hit the HeaderValue failure path
+            // and silently disable SSR policy scoping for one policy.
+            if !is_safe_identifier(&policy.name, MAX_DB_NAME_LEN) {
+                anyhow::bail!(
+                    "policy name '{}' is invalid: names must be 1-{} characters from \
+                     [a-zA-Z0-9._-] (they are embedded in the x-panoptikon-policy header)",
+                    policy.name,
+                    MAX_DB_NAME_LEN
+                );
+            }
+            // The x-panoptikon-* header namespace is gateway-reserved:
+            // ingress hygiene strips those headers from client requests
+            // before identity extraction runs, so a user header inside it
+            // would never be seen — every request would silently fall back
+            // to the un-tenanted defaults, defeating tenant isolation.
+            if let Some(identity) = &policy.identity {
+                if identity
+                    .user_header
+                    .to_ascii_lowercase()
+                    .starts_with("x-panoptikon-")
+                {
+                    anyhow::bail!(
+                        "policy '{}' identity.user_header '{}' is invalid: the \
+                         x-panoptikon-* header namespace is gateway-reserved and is \
+                         stripped from inbound requests at ingress, so this header \
+                         would never reach identity extraction; use a different \
+                         header name",
+                        policy.name,
+                        identity.user_header
+                    );
+                }
+            }
             if policy.match_rule.hosts.is_empty() && policy.match_rule.endpoints.is_empty() {
                 anyhow::bail!(
                     "policy '{}' must list at least one host or endpoint",
@@ -2145,6 +2200,147 @@ file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
             unsafe { env::set_var("LOGLEVEL", "DEBUG") };
             let settings = Settings::load(Some(config_dir.join(file))).unwrap();
             assert_eq!(settings.logging.level, "DEBUG", "{file}: LOGLEVEL=DEBUG");
+        }
+    }
+
+    /// `[policies.client]` is a free-form pass-through table: absent means
+    /// an empty object, arbitrary keys/types survive verbatim (numbers,
+    /// bools, strings, nested tables), and env templating applies to string
+    /// values inside it like everywhere else in the file.
+    #[test]
+    fn policy_client_table_parses_and_templates() {
+        let _guard = env_lock();
+        let policy_block = |client_block: &str| {
+            format!(
+                r#"{MINIMAL}
+[[policies]]
+name = "test"
+
+[policies.match]
+hosts = ["localhost"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+{client_block}"#
+            )
+        };
+
+        // Absent -> empty object (not null).
+        let settings = load_from(&policy_block("")).unwrap();
+        assert_eq!(settings.policies[0].client, serde_json::json!({}));
+
+        // Arbitrary keys and value types pass through verbatim, and ${VAR}
+        // templating expands inside the table.
+        unsafe { env::set_var("GW_TEST_CLIENT_LABEL", "demo instance") };
+        let settings = load_from(&policy_block(
+            r#"
+[policies.client]
+search_throttle_ms = 250
+disable_backend_open = true
+label = "${GW_TEST_CLIENT_LABEL}"
+nested = { depth = 2 }
+"#,
+        ));
+        unsafe { env::remove_var("GW_TEST_CLIENT_LABEL") };
+        let settings = settings.unwrap();
+        assert_eq!(
+            settings.policies[0].client,
+            serde_json::json!({
+                "search_throttle_ms": 250,
+                "disable_backend_open": true,
+                "label": "demo instance",
+                "nested": { "depth": 2 },
+            })
+        );
+    }
+
+    /// Policy names are restricted to header-safe visible ASCII
+    /// ([a-zA-Z0-9._-], 1-64 chars): they are embedded in the
+    /// x-panoptikon-policy header, and an unmintable name would silently
+    /// disable SSR policy scoping for that policy. Dotted names stay legal
+    /// (token parsing splits from the right).
+    #[test]
+    fn policy_names_must_be_header_safe() {
+        let policy_named = |name: &str| {
+            format!(
+                r#"{MINIMAL}
+[[policies]]
+name = "{name}"
+
+[policies.match]
+hosts = ["localhost"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            )
+        };
+
+        for good in ["localhost", "public_demo", "a.b.c", "Test-1"] {
+            load_from(&policy_named(good))
+                .unwrap_or_else(|err| panic!("'{good}' should be a valid name: {err:#}"));
+        }
+        for bad in ["with space", "caf\\u00e9", "emoji\\u2603", "tab\\there"] {
+            let err = load_from(&policy_named(bad)).expect_err(bad);
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("policy name") && text.contains("x-panoptikon-policy"),
+                "'{bad}': {text}"
+            );
+        }
+    }
+
+    /// identity.user_header may not live in the gateway-reserved
+    /// x-panoptikon-* namespace (case-insensitive): ingress hygiene strips
+    /// those headers before identity extraction, so such a header would
+    /// silently defeat tenant isolation. This must be a hard startup error.
+    #[test]
+    fn identity_user_header_rejects_reserved_namespace() {
+        let policy_with_header = |header: &str| {
+            format!(
+                r#"{MINIMAL}
+[[policies]]
+name = "tenants"
+
+[policies.match]
+hosts = ["localhost"]
+
+[policies.identity]
+user_header = "{header}"
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#
+            )
+        };
+
+        load_from(&policy_with_header("X-Forwarded-User")).expect("normal header is fine");
+        for reserved in [
+            "x-panoptikon-user",
+            "X-Panoptikon-User",
+            "X-PANOPTIKON-POLICY",
+        ] {
+            let err = load_from(&policy_with_header(reserved)).expect_err(reserved);
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("gateway-reserved") && text.contains(reserved),
+                "'{reserved}': {text}"
+            );
         }
     }
 

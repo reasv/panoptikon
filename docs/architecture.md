@@ -58,6 +58,25 @@ special env-passing channel. `.env` is auto-loaded as a convenience source for
 template variables. Bootstrap/diagnostic env vars (`GATEWAY_CONFIG_PATH`,
 `RUST_LOG`, `GATEWAY__*` overrides) are the documented exceptions.
 
+### Policy-scoped SSR
+
+The gateway stamps every UI-bound proxied request with a short-lived HMAC
+token (`x-panoptikon-policy: <policy>.<expiry>.<hmac>`, key random per boot,
+overridable via `[server] policy_token_key` for multi-gateway setups) naming
+the policy that request matched. The Next.js server echoes the token on its
+SSR API calls back into the gateway, where a verified token selects the
+named policy ahead of listener/host matching — SSR renders with the
+browser request's authority, not the UI server's network position. Invalid
+or absent tokens fall back to normal selection, so the SSR's API base URL
+should point at the most restricted listener. At the same choke point all
+other inbound `x-panoptikon-*` headers are stripped (except
+`x-panoptikon-gateway-hops`, the self-proxy loop guard, which must survive
+gateway→gateway forwarding). `GET /api/client-config` — exempt from ruleset
+enforcement by design — tells any client its matched policy, capability
+booleans derived from the policy's ruleset via probe routes, and the
+free-form `[policies.client]` table verbatim. Details in
+`panoptikon/README.md`.
+
 ## Python environment management
 
 Owned by the binary. `panoptikon setup` (also auto-triggered at startup when

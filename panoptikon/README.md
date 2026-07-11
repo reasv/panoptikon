@@ -98,6 +98,98 @@ Special handling:
   enabled for `entity = file` with no `partition_by`, missing paths are dropped
   instead of substituting a different file (matching Python behavior).
 
+### Policy-scoped SSR tokens (`x-panoptikon-policy`)
+
+The gateway injects `x-panoptikon-policy: <policy>.<expiry_unix>.<hmac_hex>`
+into every request it proxies to the UI upstream, naming the policy the
+policy layer matched for that request (HMAC-SHA256 over `<policy>.<expiry>`,
+5-minute expiry). When the Next.js server renders a page it echoes the token
+on its own API calls back into the gateway; at policy ingress a token that
+parses, verifies (constant-time), is unexpired, and names a configured
+policy selects that policy instead of listener/host matching — so SSR acts
+with the authority of the browser request that triggered the render, not
+with the authority of the UI server's network position.
+
+Threat model, in short: the UI process holds no authority of its own — the
+token is minted per request and expires quickly. A forged, tampered,
+expired, or absent token is silently ignored (reason logged at debug:
+`malformed`/`bad-hmac`/`expired`/`unknown-policy`) and selection falls back
+to listener/host matching, so point the SSR's API base URL at the listener
+whose policy is the most restricted one. Every request log line records the
+selection mechanism (`selected_by = token` or `listener/host`) and the
+policy name.
+
+The HMAC key is a random 256 bits generated at gateway boot. `[server]
+policy_token_key` (64 hex chars, env-templatable) pins it — a niche option
+needed only when tokens minted by one gateway must verify on another.
+
+### Ingress header hygiene
+
+At the policy-layer choke point, inbound `x-panoptikon-*` headers are
+stripped from client requests so gateway-internal metadata can only ever be
+set by the gateway itself. Two exceptions:
+
+- `x-panoptikon-policy` is verified first, then consumed — it never travels
+  upstream or into local handlers, valid or not.
+- `x-panoptikon-gateway-hops` is **preserved** with its inbound value
+  intact: it counts how many panoptikon gateways a request has passed
+  through and is the self-proxy loop guard (`MAX_PROXY_HOPS` in proxy.rs,
+  added after the 2026-07-07 port-exhaustion incident). Legitimate
+  gateway→gateway forwarding re-enters the policy layer on the next
+  gateway, so stripping it there would reset the count on every hop and
+  disable loop detection. A client sending a bogus value can only lower its
+  own hop budget, never bypass the guard.
+
+The `x-panoptikon-*` namespace is therefore gateway-reserved. In
+particular, `[policies.identity] user_header` may not name a header in that
+namespace: the strip runs before identity extraction, so such a header
+would never be seen and tenant isolation would silently fall back to the
+un-tenanted defaults — config load rejects it with a hard error. Policy
+names are likewise validated at config load (`[a-zA-Z0-9._-]`, max 64
+chars) so every name is embeddable in the token header.
+
+### `GET /api/client-config`
+
+Local API endpoint (`upstreams.api.local = true` only) answering "what may
+this client do, and how should it behave?". In local-API mode it is exempt
+from ruleset enforcement (built-in, not configurable): a client must always
+be able to ask what it may do — it is how restricted UIs learn which
+controls to hide. With a proxied API the route does not exist and no
+exemption applies (the path is subject to the ruleset like any other
+upstream API route). Responses are policy-scoped and carry
+`Cache-Control: no-store`, so an intermediary cache can never serve one
+audience's capabilities to another. Response:
+
+```json
+{
+  "policy": "public_demo",
+  "capabilities": {
+    "search": true, "items": true, "bookmarks": true,
+    "scan_jobs": false, "open_files": false, "db_create": false,
+    "inference": false, "pinboards": false
+  },
+  "client": { "search_throttle_ms": 1500, "disable_backend_open": true }
+}
+```
+
+`capabilities` are derived, not configured: each is one representative
+probe from the real route list — `search` → `POST /api/search/pql`,
+`items` → `GET /api/items/item`, `bookmarks` →
+`PUT /api/bookmarks/ns/{ns}/{sha256}`, `scan_jobs` →
+`POST /api/jobs/folders/rescan`, `open_files` →
+`POST /api/open/file/{sha256}`, `db_create` → `POST /api/db/create`,
+`inference` → `POST /api/inference/predict/{group}/{id}`, `pinboards` →
+`POST /api/pinboards` — evaluated against the matched policy's ruleset with
+the same rule-matching code enforcement uses. Under the shipped
+`restricted_demo` ruleset that yields search/items/bookmarks true and
+everything host-side false.
+
+`client` is the policy's `[policies.client]` TOML table passed through
+verbatim (default: empty object). The gateway attaches no semantics to it;
+recognized-by-convention keys are `search_throttle_ms` and
+`disable_backend_open`. Env templating applies inside it like everywhere
+else in the config file.
+
 ## Database migrations
 
 The gateway tracks three SQLite schemas (index, storage, user_data) using SQLx

@@ -682,6 +682,28 @@
         }
       }
     },
+    "/api/client-config": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Get the matched policy's client configuration and capabilities",
+        "description": "Returns the name of the policy that matched this request, coarse capability booleans derived from the policy's ruleset (which controls to show), and the policy's free-form `[policies.client]` table verbatim. Always allowed regardless of ruleset restrictions.",
+        "operationId": "client_config",
+        "responses": {
+          "200": {
+            "description": "Client configuration for the matched policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientConfigResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/db": {
       "get": {
         "tags": [
@@ -3953,6 +3975,75 @@
         "properties": {
           "detail": {
             "type": "string"
+          }
+        }
+      },
+      "ClientCapabilities": {
+        "type": "object",
+        "description": "Coarse feature switches derived from the matched policy's ruleset. Each\ncapability is one representative probe from the real route list in\nmain.rs, evaluated with the exact rule-matching code enforcement uses\n(`policy::ruleset_allows`) — true means the probe request would pass the\nruleset gate.",
+        "required": [
+          "search",
+          "items",
+          "bookmarks",
+          "scan_jobs",
+          "open_files",
+          "db_create",
+          "inference",
+          "pinboards"
+        ],
+        "properties": {
+          "bookmarks": {
+            "type": "boolean",
+            "description": "PUT /api/bookmarks/ns/{namespace}/{sha256}"
+          },
+          "db_create": {
+            "type": "boolean",
+            "description": "POST /api/db/create"
+          },
+          "inference": {
+            "type": "boolean",
+            "description": "POST /api/inference/predict/{group}/{inference_id}"
+          },
+          "items": {
+            "type": "boolean",
+            "description": "GET /api/items/item"
+          },
+          "open_files": {
+            "type": "boolean",
+            "description": "POST /api/open/file/{sha256}"
+          },
+          "pinboards": {
+            "type": "boolean",
+            "description": "POST /api/pinboards"
+          },
+          "scan_jobs": {
+            "type": "boolean",
+            "description": "POST /api/jobs/folders/rescan"
+          },
+          "search": {
+            "type": "boolean",
+            "description": "POST /api/search/pql"
+          }
+        }
+      },
+      "ClientConfigResponse": {
+        "type": "object",
+        "required": [
+          "policy",
+          "capabilities",
+          "client"
+        ],
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ClientCapabilities",
+            "description": "Ruleset-derived feature switches (see ClientCapabilities)."
+          },
+          "client": {
+            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms` and `disable_backend_open`."
+          },
+          "policy": {
+            "type": "string",
+            "description": "Name of the policy that matched this request."
           }
         }
       },
@@ -7809,6 +7900,10 @@
     },
     {
       "name": "database"
+    },
+    {
+      "name": "client",
+      "description": "Per-policy client configuration and derived capabilities"
     },
     {
       "name": "inference",

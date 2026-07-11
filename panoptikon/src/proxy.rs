@@ -14,8 +14,10 @@ use hyper_util::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
+use crate::config::Settings;
 use crate::inferio_client::InferenceApiClient;
 use crate::policy::PolicyContext;
+use crate::policy_token::{POLICY_TOKEN_HEADER, TokenKey};
 
 #[derive(Clone)]
 pub struct Upstream {
@@ -43,6 +45,11 @@ pub struct ProxyState {
     pub inference: Upstream,
     pub inference_client: InferenceApiClient,
     pub search_embedding_cache_size: usize,
+    /// Full gateway settings, for handlers that need policy/ruleset config
+    /// (the /api/client-config capability derivation).
+    pub settings: Arc<Settings>,
+    /// Mints the `x-panoptikon-policy` token injected on UI-bound requests.
+    pub token_key: Arc<TokenKey>,
 }
 
 impl ProxyState {
@@ -52,6 +59,8 @@ impl ProxyState {
         inference: Upstream,
         inference_client: InferenceApiClient,
         search_embedding_cache_size: usize,
+        settings: Arc<Settings>,
+        token_key: Arc<TokenKey>,
     ) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self {
@@ -61,6 +70,8 @@ impl ProxyState {
             inference,
             inference_client,
             search_embedding_cache_size,
+            settings,
+            token_key,
         }
     }
 }
@@ -100,7 +111,7 @@ enum UpstreamKind {
 /// gateway, so a self-referential upstream (a base_url pointing back at one
 /// of our own listeners) is cut off after a few hops instead of recursing
 /// until the ephemeral port range is exhausted.
-const HOP_COUNT_HEADER: &str = "x-panoptikon-gateway-hops";
+pub(crate) const HOP_COUNT_HEADER: &str = "x-panoptikon-gateway-hops";
 /// Legitimate gateway chains (e.g. forwarding inference to another
 /// machine's gateway) are one or two hops deep; anything deeper is a
 /// routing loop.
@@ -152,6 +163,30 @@ async fn proxy_request(
         HeaderValue::from(hops + 1),
     );
 
+    // Policy token injection (policy_token.rs): UI-bound requests carry a
+    // short-lived signed token naming the policy the policy layer matched
+    // for THIS request, so the Next.js server's SSR API calls back into the
+    // gateway inherit exactly that policy instead of whatever its own
+    // network position would match. Any inbound value was already
+    // verified-and-consumed at policy ingress, so this insert cannot be
+    // forwarding a client header.
+    if upstream_kind == UpstreamKind::Ui {
+        if let Some(context) = &policy_context {
+            let token = state.token_key.mint(&context.policy_name);
+            match HeaderValue::from_str(&token) {
+                Ok(value) => {
+                    req.headers_mut()
+                        .insert(HeaderName::from_static(POLICY_TOKEN_HEADER), value);
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    policy = %context.policy_name,
+                    "policy token not header-safe; UI request sent without one"
+                ),
+            }
+        }
+    }
+
     if let Err(err) = build_upstream_request(
         &upstream,
         client_addr,
@@ -179,6 +214,7 @@ async fn proxy_request(
             upstream = %upstream.name,
             status = %status,
             policy = %context.policy_name,
+            selected_by = %context.selected_by,
             db_params = %context.db_action,
             "proxied request"
         );
@@ -255,6 +291,45 @@ mod tests {
     use super::*;
     use axum::routing::any;
 
+    /// Minimal settings for constructing a ProxyState in tests.
+    fn test_settings() -> Arc<Settings> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+"#,
+        )
+        .unwrap();
+        Arc::new(Settings::load(Some(path)).unwrap())
+    }
+
+    fn test_state(upstream: Upstream) -> Arc<ProxyState> {
+        let inference_client = InferenceApiClient::new_with_metadata_cache(
+            format!("http://{}", upstream.base_uri.authority().unwrap()),
+            false,
+        )
+        .unwrap();
+        Arc::new(ProxyState::new(
+            upstream.clone(),
+            upstream.clone(),
+            upstream,
+            inference_client,
+            0,
+            test_settings(),
+            Arc::new(TokenKey::random()),
+        ))
+    }
+
     // Regression test for the /api self-proxy recursion (2026-07-07): an
     // upstream that points back at the proxy's own listener must be cut off
     // by the hop guard instead of recursing until the ephemeral port range
@@ -264,15 +339,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let upstream = Upstream::parse("api", &format!("http://{addr}")).unwrap();
-        let inference_client =
-            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
-        let state = Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            inference_client,
-            0,
-        ));
+        let state = test_state(upstream);
         let app = axum::Router::new()
             .route("/api/{*path}", any(proxy_api))
             .with_state(state);
@@ -288,5 +355,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), StatusCode::LOOP_DETECTED.as_u16());
+    }
+
+    /// UI-bound proxied requests carry a freshly minted policy token naming
+    /// the policy the policy layer matched (from the PolicyContext
+    /// extension); requests without a PolicyContext get none, and API-bound
+    /// requests never get one.
+    #[tokio::test]
+    async fn ui_requests_carry_a_minted_policy_token() {
+        // Echo server: returns the received x-panoptikon-policy header (or
+        // "absent") in the response body.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = axum::Router::new().fallback(any(
+            |req: Request<Body>| async move {
+                req.headers()
+                    .get(POLICY_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("absent")
+                    .to_string()
+            },
+        ));
+        tokio::spawn(async move {
+            axum::serve(listener, echo).await.unwrap();
+        });
+
+        let upstream = Upstream::parse("ui", &format!("http://{addr}")).unwrap();
+        let state = test_state(upstream);
+        let key = Arc::clone(&state.token_key);
+        let client_addr: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+
+        // With a PolicyContext (as the policy layer would insert).
+        let mut req = Request::builder()
+            .uri("http://gateway/some/page")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(PolicyContext {
+            policy_name: "demo".to_string(),
+            db_action: crate::policy::DbAction::Skipped,
+            selected_by: crate::policy::PolicySelection::ListenerHost,
+        });
+        let response =
+            proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let token = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(key.verify(&token), Ok("demo"), "token: {token}");
+
+        // Without a PolicyContext: no token minted.
+        let req = Request::builder()
+            .uri("http://gateway/some/page")
+            .body(Body::empty())
+            .unwrap();
+        let response =
+            proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"absent");
+
+        // API-bound requests never carry one, PolicyContext or not.
+        let mut req = Request::builder()
+            .uri("http://gateway/api/things")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(PolicyContext {
+            policy_name: "demo".to_string(),
+            db_action: crate::policy::DbAction::Skipped,
+            selected_by: crate::policy::PolicySelection::ListenerHost,
+        });
+        let response = proxy_request(client_addr, state, UpstreamKind::Api, req).await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"absent");
     }
 }

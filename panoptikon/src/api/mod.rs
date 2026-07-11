@@ -1,4 +1,5 @@
 pub(crate) mod bookmarks;
+pub(crate) mod client_config;
 pub(crate) mod db;
 pub(crate) mod db_params;
 pub(crate) mod items;

@@ -60,6 +60,12 @@ host = "127.0.0.1"
 port = 8080
 # If true, use X-Forwarded-Host / Forwarded to select policy host.
 trust_forwarded_headers = true
+# HMAC key for the x-panoptikon-policy tokens the gateway injects on
+# UI-bound requests (so SSR API calls inherit the browser request's policy).
+# Default: a fresh random key per gateway boot — correct for every
+# single-gateway setup. Only configure this (64 hex chars = 32 bytes) in the
+# niche multi-gateway case where one gateway's tokens must verify on another.
+# policy_token_key = "${POLICY_TOKEN_KEY}"
 
 # Extra named listener endpoints, in addition to the primary host/port above
 # (which is always the endpoint named "default"). Every listener serves the
@@ -206,6 +212,14 @@ allow = "*"
 default = "default"
 allow = "*"
 
+# Free-form per-policy client settings, returned verbatim by
+# GET /api/client-config as the "client" object (alongside capability
+# booleans derived from the policy's ruleset). Recognized-by-convention
+# keys: search_throttle_ms, disable_backend_open — but anything passes
+# through. Default: empty object.
+# [policies.client]
+# search_throttle_ms = 0
+
 # Example: public demo policy with a restricted ruleset.
 #
 # [[policies]]
@@ -222,6 +236,10 @@ allow = "*"
 # [policies.user_data_db]
 # default = "default"
 # allow = ["default"]
+#
+# [policies.client]
+# search_throttle_ms = 1500      # demo visitors get throttled search
+# disable_backend_open = true    # hide "open on host" controls entirely
 
 # Example: multi-tenant policy using a username header.
 #

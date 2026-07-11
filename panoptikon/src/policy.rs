@@ -21,6 +21,7 @@ use crate::config::{
     DbPolicy, MAX_DB_NAME_LEN, MAX_USERNAME_LEN, PolicyConfig, RuleConfig, Settings,
     is_safe_identifier,
 };
+use crate::policy_token::{POLICY_TOKEN_HEADER, TokenKey};
 
 const USERNAME_HASH_LEN: usize = 32;
 
@@ -34,11 +35,15 @@ pub(crate) struct ListenerEndpoint(pub(crate) Arc<str>);
 #[derive(Clone)]
 pub struct PolicyLayer {
     settings: Arc<Settings>,
+    token_key: Arc<TokenKey>,
 }
 
 impl PolicyLayer {
-    pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+    pub fn new(settings: Arc<Settings>, token_key: Arc<TokenKey>) -> Self {
+        Self {
+            settings,
+            token_key,
+        }
     }
 }
 
@@ -46,6 +51,7 @@ impl PolicyLayer {
 pub struct PolicyService<S> {
     inner: S,
     settings: Arc<Settings>,
+    token_key: Arc<TokenKey>,
 }
 
 impl<S> Layer<S> for PolicyLayer {
@@ -55,6 +61,7 @@ impl<S> Layer<S> for PolicyLayer {
         Self::Service {
             inner,
             settings: Arc::clone(&self.settings),
+            token_key: Arc::clone(&self.token_key),
         }
     }
 }
@@ -77,10 +84,11 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let settings = Arc::clone(&self.settings);
+        let token_key = Arc::clone(&self.token_key);
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let decision = match apply_policy(&mut req, &settings) {
+            let decision = match apply_policy(&mut req, &settings, &token_key) {
                 Ok(decision) => decision,
                 Err(err) => {
                     tracing::warn!(
@@ -106,6 +114,7 @@ where
                 method = %decision.method,
                 path = %decision.path,
                 policy = %decision.policy.name,
+                selected_by = %decision.selected_by,
                 endpoint = decision.endpoint.as_deref().unwrap_or("-"),
                 db_params = %decision.db_action,
                 status = %status,
@@ -150,10 +159,28 @@ impl std::fmt::Display for DbAction {
     }
 }
 
+/// How the request's policy was selected: a verified `x-panoptikon-policy`
+/// token, or the normal listener/host matching. Logged with every request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PolicySelection {
+    Token,
+    ListenerHost,
+}
+
+impl std::fmt::Display for PolicySelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PolicySelection::Token => "token",
+            PolicySelection::ListenerHost => "listener/host",
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PolicyContext {
     pub policy_name: String,
     pub db_action: DbAction,
+    pub selected_by: PolicySelection,
 }
 
 struct PolicyDecision {
@@ -164,6 +191,7 @@ struct PolicyDecision {
     method: Method,
     path: String,
     endpoint: Option<Arc<str>>,
+    selected_by: PolicySelection,
 }
 
 #[derive(Debug)]
@@ -187,31 +215,58 @@ pub(crate) struct SingleDbInfo {
 fn apply_policy(
     req: &mut Request<Body>,
     settings: &Settings,
+    token_key: &TokenKey,
 ) -> std::result::Result<PolicyDecision, EnforcementError> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    // Policy token first: the header is consumed (removed) here whether or
+    // not it verifies — it is gateway-internal and must never travel
+    // upstream or reach local handlers. Verification runs on the inbound
+    // value, before the general hygiene strip below.
+    let token_policy = consume_policy_token(req, settings, token_key);
+    // Ingress hygiene: drop every other client-supplied `x-panoptikon-*`
+    // header at this choke point so clients cannot smuggle gateway-internal
+    // metadata (see strip_inbound_panoptikon_headers for the one exemption).
+    strip_inbound_panoptikon_headers(req.headers_mut());
+
     let effective_host = resolve_effective_host(req, settings.server.trust_forwarded_headers);
     let endpoint = req
         .extensions()
         .get::<ListenerEndpoint>()
         .map(|endpoint| Arc::clone(&endpoint.0));
-    let policy = select_policy(
-        settings,
-        effective_host.as_deref(),
-        endpoint.as_ref().map(|endpoint| endpoint.as_ref()),
-    )
-    .ok_or(EnforcementError {
-        status: StatusCode::FORBIDDEN,
-        reason: "no_policy",
-    })?;
+    let (policy, selected_by) = match token_policy {
+        Some(policy) => (policy, PolicySelection::Token),
+        None => (
+            select_policy(
+                settings,
+                effective_host.as_deref(),
+                endpoint.as_ref().map(|endpoint| endpoint.as_ref()),
+            )
+            .ok_or(EnforcementError {
+                status: StatusCode::FORBIDDEN,
+                reason: "no_policy",
+            })?,
+            PolicySelection::ListenerHost,
+        ),
+    };
     let policy = policy.clone();
 
     let is_inference = is_inference_path(&path);
     let is_api = is_api_surface(&path);
     let is_db_info = is_db_info_path(&path);
     let is_db_create = is_db_create_path(&path);
+    // GET /api/client-config is exempt from ruleset enforcement: a client
+    // must always be able to ask what it may do — it is how restricted UIs
+    // learn which controls to hide, so gating it behind the ruleset would
+    // defeat its purpose. Local API only: the endpoint exists solely as a
+    // local route, and in proxied-API mode the exemption would forward the
+    // path to the upstream past a restrictive ruleset.
+    let is_client_config = settings.upstreams.api.local
+        && method == Method::GET
+        && is_client_config_path(&path);
 
-    if is_api {
+    if is_api && !is_client_config {
         if !ruleset_allows(settings, &policy, &method, &path) {
             return Err(EnforcementError {
                 status: StatusCode::FORBIDDEN,
@@ -234,6 +289,11 @@ fn apply_policy(
         false
     } else if is_db_info || is_db_create {
         false
+    } else if is_client_config {
+        // Local-mode client-config takes no DB params (same gate as its
+        // ruleset exemption above; in proxied-API mode the path is treated
+        // like any other upstream API route).
+        false
     } else if is_api {
         needs_db_params(&path)
     } else {
@@ -252,6 +312,7 @@ fn apply_policy(
     req.extensions_mut().insert(PolicyContext {
         policy_name: policy.name.clone(),
         db_action,
+        selected_by,
     });
 
     Ok(PolicyDecision {
@@ -262,7 +323,75 @@ fn apply_policy(
         method,
         path,
         endpoint,
+        selected_by,
     })
+}
+
+/// Remove the `x-panoptikon-policy` header and, when it carries a valid
+/// token naming a configured policy, return that policy. Any failure
+/// (malformed, bad HMAC, expired, unknown policy name) is logged at debug
+/// and yields `None` — selection then falls back to listener/host matching.
+/// The header is consumed in every case: it authenticates the *gateway's
+/// own* mint (see policy_token.rs) and must never proceed upstream or into
+/// local handlers.
+fn consume_policy_token<'a>(
+    req: &mut Request<Body>,
+    settings: &'a Settings,
+    token_key: &TokenKey,
+) -> Option<&'a PolicyConfig> {
+    let value = req.headers_mut().remove(POLICY_TOKEN_HEADER)?;
+    let token = match value.to_str() {
+        Ok(token) => token,
+        Err(_) => {
+            tracing::debug!(reason = "malformed", "policy token ignored");
+            return None;
+        }
+    };
+    let name = match token_key.verify(token) {
+        Ok(name) => name,
+        Err(err) => {
+            tracing::debug!(reason = err.as_str(), "policy token ignored");
+            return None;
+        }
+    };
+    match settings.policies.iter().find(|policy| policy.name == name) {
+        Some(policy) => Some(policy),
+        None => {
+            tracing::debug!(
+                reason = "unknown-policy",
+                policy = name,
+                "policy token ignored"
+            );
+            None
+        }
+    }
+}
+
+/// Strip inbound `x-panoptikon-*` headers from client requests at the
+/// policy-layer choke point, so gateway-internal metadata can only ever be
+/// set by the gateway itself. One deliberate exemption:
+/// `x-panoptikon-gateway-hops` is PRESERVED — it counts how many panoptikon
+/// gateways a request has already passed through and is the self-proxy loop
+/// guard (see proxy.rs MAX_PROXY_HOPS and the 2026-07-07 port-exhaustion
+/// incident). Legitimate gateway→gateway forwarding re-enters this layer on
+/// the next gateway, so stripping the count here would reset it every hop
+/// and disable loop detection entirely. Its semantics stay exactly as
+/// before: clients sending a bogus value can only *lower* their own hop
+/// budget, never bypass the guard.
+/// (`x-panoptikon-policy` is not handled here: consume_policy_token has
+/// already verified-then-removed it before this runs.)
+fn strip_inbound_panoptikon_headers(headers: &mut header::HeaderMap) {
+    let doomed: Vec<header::HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            name.starts_with("x-panoptikon-") && name != crate::proxy::HOP_COUNT_HEADER
+        })
+        .cloned()
+        .collect();
+    for name in doomed {
+        headers.remove(name);
+    }
 }
 
 fn is_api_surface(path: &str) -> bool {
@@ -285,6 +414,10 @@ fn is_db_create_path(path: &str) -> bool {
     path == "/api/db/create"
 }
 
+fn is_client_config_path(path: &str) -> bool {
+    path == "/api/client-config"
+}
+
 fn needs_db_params(path: &str) -> bool {
     if path == "/docs" || path == "/redoc" || path == "/openapi.json" {
         return false;
@@ -292,6 +425,8 @@ fn needs_db_params(path: &str) -> bool {
     if is_db_info_path(path) || is_db_create_path(path) || is_inference_path(path) {
         return false;
     }
+    // /api/client-config is handled by the caller: its DB-param skip is
+    // gated on upstreams.api.local, like its ruleset exemption.
     path == "/api" || path.starts_with("/api/")
 }
 
@@ -928,6 +1063,7 @@ mod tests {
             index_db,
             user_data_db,
             identity: None,
+            client: crate::config::default_client_table(),
         }
     }
 
@@ -1049,6 +1185,7 @@ allow = "*"
     #[test]
     fn endpoint_extension_drives_policy_and_db_defaults() {
         let settings = endpoint_settings();
+        let key = TokenKey::random();
 
         let mut req = Request::builder()
             .uri("http://localhost/api/items")
@@ -1057,9 +1194,10 @@ allow = "*"
             .unwrap();
         req.extensions_mut()
             .insert(ListenerEndpoint(Arc::from("test")));
-        let decision = apply_policy(&mut req, &settings).unwrap();
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
         assert_eq!(decision.policy.name, "test-endpoint");
         assert_eq!(decision.endpoint.as_deref(), Some("test"));
+        assert_eq!(decision.selected_by, PolicySelection::ListenerHost);
         let query = parse_query(&req);
         assert_eq!(query.get("index_db").unwrap(), &vec!["testdb".to_string()]);
         assert_eq!(
@@ -1072,9 +1210,184 @@ allow = "*"
             .header("host", "localhost")
             .body(Body::empty())
             .unwrap();
-        let decision = apply_policy(&mut req, &settings).unwrap();
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
         assert_eq!(decision.policy.name, "localhost");
         assert_eq!(decision.endpoint, None);
+    }
+
+    /// A valid policy token overrides listener/host selection: the same
+    /// localhost request that would match the "localhost" policy gets the
+    /// token-named "both" policy instead (with its DB defaults injected),
+    /// and the decision records the token mechanism. Invalid tokens of
+    /// every stripe — forged (wrong key), expired, unknown policy name,
+    /// garbage — fall back to normal selection.
+    #[test]
+    fn policy_token_overrides_selection_and_falls_back() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+
+        let request_with_token = |token: &str| {
+            Request::builder()
+                .uri("http://localhost/api/items")
+                .header("host", "localhost")
+                .header(POLICY_TOKEN_HEADER, token)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Valid token naming a policy this request would never match by
+        // host/endpoint ("both" needs host special.local AND endpoint test).
+        let mut req = request_with_token(&key.mint("both"));
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
+        assert_eq!(decision.policy.name, "both");
+        assert_eq!(decision.selected_by, PolicySelection::Token);
+        let query = parse_query(&req);
+        assert_eq!(query.get("index_db").unwrap(), &vec!["bothdb".to_string()]);
+        // The token header was consumed before the request proceeds.
+        assert!(req.headers().get(POLICY_TOKEN_HEADER).is_none());
+
+        // Fallback cases: all select "localhost" via listener/host.
+        let other_key = TokenKey::random();
+        for bad in [
+            other_key.mint("both"),        // forged: wrong key
+            key.sign("both", 42),          // expired long ago
+            key.mint("no-such-policy"),    // unknown policy name
+            "total.garbage".to_string(),   // malformed
+        ] {
+            let mut req = request_with_token(&bad);
+            let decision = apply_policy(&mut req, &settings, &key).unwrap();
+            assert_eq!(decision.policy.name, "localhost", "token: {bad}");
+            assert_eq!(decision.selected_by, PolicySelection::ListenerHost);
+            assert!(req.headers().get(POLICY_TOKEN_HEADER).is_none());
+        }
+    }
+
+    /// Ingress hygiene: client-supplied `x-panoptikon-*` headers are
+    /// stripped at the policy layer — except `x-panoptikon-gateway-hops`,
+    /// the self-proxy loop guard, which must survive gateway→gateway
+    /// forwarding with its value intact. Unrelated headers pass through.
+    #[test]
+    fn inbound_panoptikon_headers_are_stripped_except_hops() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+
+        let mut req = Request::builder()
+            .uri("http://localhost/api/items")
+            .header("host", "localhost")
+            .header("x-panoptikon-junk", "1")
+            .header("x-panoptikon-policy", "not-even-a-token")
+            .header("x-panoptikon-gateway-hops", "2")
+            .header("x-unrelated", "keep")
+            .body(Body::empty())
+            .unwrap();
+        apply_policy(&mut req, &settings, &key).unwrap();
+
+        assert!(req.headers().get("x-panoptikon-junk").is_none());
+        assert!(req.headers().get("x-panoptikon-policy").is_none());
+        assert_eq!(
+            req.headers()
+                .get("x-panoptikon-gateway-hops")
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "hop count must survive with its value intact"
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-unrelated")
+                .and_then(|value| value.to_str().ok()),
+            Some("keep")
+        );
+    }
+
+    /// GET /api/client-config bypasses ruleset enforcement (a client must
+    /// always be able to ask what it may do) and gets no DB params
+    /// injected — but only when the API is served locally, because that is
+    /// the only mode where the endpoint exists; with a proxied API the
+    /// exemption would forward the path upstream past a restrictive
+    /// ruleset, so it must not apply. The ruleset always still applies to
+    /// everything else under the same restricted policy.
+    #[test]
+    fn client_config_is_exempt_from_rulesets_in_local_api_mode_only() {
+        let settings_with_api = |api_local: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gw.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+local = {api_local}
+
+[rulesets.nothing]
+allow = [{{ methods = ["GET"], path = "/api/db" }}]
+
+[[policies]]
+name = "locked"
+ruleset = "nothing"
+
+[policies.match]
+hosts = ["localhost"]
+
+[policies.index_db]
+default = "default"
+allow = ["default"]
+
+[policies.user_data_db]
+default = "default"
+allow = ["default"]
+"#
+                ),
+            )
+            .unwrap();
+            Settings::load(Some(path)).unwrap()
+        };
+        let key = TokenKey::random();
+
+        // Local API: exempt from the ruleset, no DB params injected.
+        let settings = settings_with_api(true);
+        let mut req = Request::builder()
+            .uri("http://localhost/api/client-config")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
+        assert_eq!(decision.policy.name, "locked");
+        assert!(parse_query(&req).is_empty(), "no DB params injected");
+
+        // Anything else under the same ruleset is still denied.
+        let mut req = Request::builder()
+            .uri("http://localhost/api/search/pql")
+            .method(Method::POST)
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let err = apply_policy(&mut req, &settings, &key)
+            .err()
+            .expect("restricted ruleset must deny search");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.reason, "ruleset_denied");
+
+        // Proxied API: no exemption — the restrictive ruleset applies to
+        // the path like to any other upstream API route.
+        let settings = settings_with_api(false);
+        let mut req = Request::builder()
+            .uri("http://localhost/api/client-config")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let err = apply_policy(&mut req, &settings, &key)
+            .err()
+            .expect("proxied-API mode must not exempt client-config");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.reason, "ruleset_denied");
     }
 
     fn parse_query(req: &Request<Body>) -> BTreeMap<String, Vec<String>> {

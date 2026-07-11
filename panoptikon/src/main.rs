@@ -14,6 +14,7 @@ mod jobs;
 mod logging;
 mod openapi;
 mod policy;
+mod policy_token;
 mod pql;
 mod process_tree;
 mod proxy;
@@ -131,8 +132,13 @@ async fn async_main() -> anyhow::Result<()> {
     }
     settings.log_warnings();
 
+    // Policy-token HMAC key: random per boot unless [server]
+    // policy_token_key pins it (policy_token.rs). Needed by the policy
+    // layer (verify) and the UI proxy (mint) in every serving mode.
+    let token_key = Arc::new(policy_token::TokenKey::from_settings(&settings)?);
+
     match args.command {
-        Some(Command::Inferio) => return inferio_main(settings).await,
+        Some(Command::Inferio) => return inferio_main(settings, token_key).await,
         Some(Command::Setup { accelerator, force }) => {
             // An explicit `panoptikon setup` always runs (never skipped by
             // the completion sentinel; a successful sync rewrites it).
@@ -186,6 +192,8 @@ async fn async_main() -> anyhow::Result<()> {
         inference_upstream,
         inference_client,
         settings.search.embedding_cache_size,
+        Arc::clone(&settings),
+        Arc::clone(&token_key),
     ));
 
     let local_api = settings.upstreams.api.local;
@@ -276,7 +284,14 @@ async fn async_main() -> anyhow::Result<()> {
     if local_api {
         app = app
             .route("/api/db", get(api::db::db_info))
-            .route("/api/db/create", post(api::db::db_create));
+            .route("/api/db/create", post(api::db::db_create))
+            // Always allowed regardless of ruleset (the policy layer
+            // exempts GET on this path): clients discover their policy's
+            // capabilities and [policies.client] settings here.
+            .route(
+                "/api/client-config",
+                get(api::client_config::client_config),
+            );
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app
             .route(
@@ -404,7 +419,10 @@ async fn async_main() -> anyhow::Result<()> {
     let app = app
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(policy::PolicyLayer::new(Arc::clone(&settings)));
+        .layer(policy::PolicyLayer::new(
+            Arc::clone(&settings),
+            Arc::clone(&token_key),
+        ));
 
     // Bind every configured listener (primary + [[server.endpoints]]) before
     // serving any of them: a config that cannot fully bind fails startup as
@@ -473,7 +491,10 @@ async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
 /// jobs, cron, or migrations. `inference_local.enabled` is implied by the
 /// subcommand; `[inference_local].port` overrides the listen port
 /// (defaults to `server.port`).
-async fn inferio_main(settings: Arc<config::Settings>) -> anyhow::Result<()> {
+async fn inferio_main(
+    settings: Arc<config::Settings>,
+    token_key: Arc<policy_token::TokenKey>,
+) -> anyhow::Result<()> {
     // Same managed-venv auto-setup as gateway mode: this subcommand spawns
     // the same Python workers (local inference is implied here, so the
     // config's `enabled` flag is not consulted).
@@ -483,7 +504,7 @@ async fn inferio_main(settings: Arc<config::Settings>) -> anyhow::Result<()> {
     // standalone inference service. Its one listener is the primary.
     let app = inferio::http::standalone_router(Arc::clone(&state))
         .layer(TraceLayer::new_for_http())
-        .layer(policy::PolicyLayer::new(Arc::clone(&settings)))
+        .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
         .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
             config::PRIMARY_ENDPOINT,
         ))));
