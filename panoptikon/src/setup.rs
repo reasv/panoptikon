@@ -6,19 +6,24 @@
 //! locate `uv` (PATH, then a previously downloaded managed copy, then
 //! download the pinned standalone build — checksum-verified against
 //! [`UV_ASSET_SHA256`]), pick the accelerator variant (config/CLI, `auto`
-//! probes for NVIDIA/ROCm), then create `python/.venv` if missing and run a
-//! locked `uv sync --extra <variant>` against `python/pyproject.toml` +
-//! `python/uv.lock`. The lock is authoritative (`--locked`): syncing can
-//! never resolve versions the repository does not pin, and re-running
-//! converges (idempotent). A successful sync writes a completion sentinel
-//! ([`SETUP_SENTINEL`]) recording the extra and the uv.lock hash; the
-//! startup auto-trigger keys on it, so an interrupted first sync (which
-//! leaves an interpreter but no sentinel) or a changed lock re-arms it.
+//! probes for NVIDIA/ROCm), then create the managed venv if missing and run
+//! a locked `uv sync --extra <variant>` against the active Python project
+//! dir's `pyproject.toml` + `uv.lock`. The project dir and venv follow
+//! `resources::py_source_mode`: `python/` + `python/.venv` in the dev
+//! layout, `runtime/pysrc/<version>/` + `runtime/venv` when a `bundled`
+//! build runs from its extracted source set (see [`ManagedPython`]). The
+//! lock is authoritative (`--locked`): syncing can never resolve versions
+//! the repository does not pin, and re-running converges (idempotent). A
+//! successful sync writes a completion sentinel ([`SETUP_SENTINEL`])
+//! recording the extra and the uv.lock hash; the startup auto-trigger keys
+//! on it, so an interrupted first sync (which leaves an interpreter but no
+//! sentinel) or a changed lock (a git pull in dev, a re-extracted source
+//! set after a version bump in bundled mode) re-arms it.
 //!
-//! Safety: this module refuses to operate on any venv other than
-//! [`MANAGED_VENV`] — a user-configured `[inference_local].python`
-//! interpreter is never created, deleted, or synced (see
-//! [`guard_managed_venv`], enforced on every mutating step, and
+//! Safety: this module refuses to operate on any venv other than the
+//! active mode's managed venv — a user-configured
+//! `[inference_local].python` interpreter is never created, deleted, or
+//! synced (see [`guard_managed_venv`], enforced on every mutating step, and
 //! `UV_PROJECT_ENVIRONMENT`, pinned on every child so ambient uv
 //! configuration cannot redirect the sync).
 
@@ -76,13 +81,6 @@ const UV_ASSET_SHA256: &[(&str, &str)] = &[
 /// mid-sync.
 const UV_MIN_VERSION: (u64, u64, u64) = (0, 6, 13);
 
-/// The project directory `uv` runs in (contains pyproject.toml + uv.lock).
-const PYTHON_DIR: &str = "python";
-
-/// The ONLY venv this module is allowed to touch, relative to the CWD like
-/// every other path in the config.
-const MANAGED_VENV: &str = "python/.venv";
-
 /// Where managed uv downloads live, relative to the CWD.
 const UV_RUNTIME_DIR: &str = "runtime/uv";
 
@@ -105,13 +103,46 @@ const STDERR_TAIL_LINES: usize = 20;
 /// by `--force`.
 const SETUP_SENTINEL: &str = ".panoptikon-setup-complete";
 
-/// The committed lockfile whose hash the sentinel records: when it changes
-/// (e.g. after a git pull), the sentinel goes stale and auto-setup re-syncs.
-const UV_LOCK_PATH: &str = "python/uv.lock";
-
 /// The legacy pre-restructure venv at the repo root. Setup NEVER touches
-/// it; its existence only suppresses the fresh-install auto-trigger.
+/// it; its existence only suppresses the fresh-install auto-trigger (dev
+/// layout only — extracted bundled mode has no legacy installs).
 const LEGACY_VENV: &str = ".venv";
+
+/// The paths setup manages, resolved from the active Python source mode
+/// (docs/architecture.md "Self-contained releases"): the project dir `uv`
+/// runs in (pyproject.toml + uv.lock), the ONLY venv this module may touch,
+/// and whether a legacy root `.venv` suppresses the auto-trigger. All
+/// relative to the CWD like every other path in the config.
+struct ManagedPython {
+    /// `python` (dev) or `runtime/pysrc/<version>` (extracted).
+    project_dir: PathBuf,
+    /// `python/.venv` (dev) or `runtime/venv` (extracted — outside the
+    /// version-keyed dir so version bumps keep the venv; the sentinel's
+    /// lock hash triggers the re-sync instead).
+    venv: PathBuf,
+    /// `<project_dir>/uv.lock`: the lockfile the sentinel hash records.
+    uv_lock: PathBuf,
+    /// Dev layout only: pre-restructure root `.venv` installs keep working
+    /// untouched. Meaningless in extracted mode.
+    legacy_suppresses: bool,
+}
+
+impl ManagedPython {
+    fn for_mode(mode: crate::resources::PySourceMode) -> Self {
+        let project_dir = crate::resources::python_project_dir(mode);
+        Self {
+            venv: crate::resources::managed_venv_dir(mode),
+            uv_lock: project_dir.join("uv.lock"),
+            legacy_suppresses: mode == crate::resources::PySourceMode::Dev,
+            project_dir,
+        }
+    }
+
+    /// The paths for the active mode.
+    fn active() -> Self {
+        Self::for_mode(crate::resources::py_source_mode())
+    }
+}
 
 /// Advisory lock file serializing concurrent setup runs (gateway and the
 /// `inferio` subcommand starting together), relative to the CWD.
@@ -123,7 +154,7 @@ pub struct SetupOptions {
     /// CLI override; `None` falls back to
     /// `[inference_local.python_env] accelerator`.
     pub accelerator: Option<Accelerator>,
-    /// Delete `python/.venv` and recreate it from scratch.
+    /// Delete the managed venv and recreate it from scratch.
     pub force: bool,
     /// Auto-trigger mode: after acquiring the setup lock, skip the run if
     /// the environment converged in the meantime (a concurrent process —
@@ -143,17 +174,20 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
              macOS is supported)"
         );
     }
-    let python_dir = std::path::absolute(PYTHON_DIR)
-        .with_context(|| format!("failed to resolve '{PYTHON_DIR}'"))?;
+    let managed = ManagedPython::active();
+    let python_dir = std::path::absolute(&managed.project_dir)
+        .with_context(|| format!("failed to resolve '{}'", managed.project_dir.display()))?;
     if !python_dir.join("pyproject.toml").is_file() {
         bail!(
             "'{}' has no pyproject.toml — run setup from the panoptikon root \
-             (the managed environment always lives at {MANAGED_VENV})",
-            python_dir.display()
+             (the managed environment lives at '{}'; a bundled binary \
+             extracts its Python source set on startup first)",
+            python_dir.display(),
+            managed.venv.display()
         );
     }
-    let venv = std::path::absolute(MANAGED_VENV)
-        .with_context(|| format!("failed to resolve '{MANAGED_VENV}'"))?;
+    let venv = std::path::absolute(&managed.venv)
+        .with_context(|| format!("failed to resolve '{}'", managed.venv.display()))?;
     guard_managed_venv(&venv)?;
 
     // Serialize concurrent setups (gateway + `inferio` starting together):
@@ -193,7 +227,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
 
     if !venv.join(python_relpath()).is_file() {
         tracing::info!(venv = %venv.display(), python = PYTHON_VERSION, "creating the managed venv (uv venv)");
-        run_uv_logged(&uv.path, &uv_venv_args(), &python_dir, &venv, "uv venv").await?;
+        run_uv_logged(&uv.path, &uv_venv_args(&venv), &python_dir, &venv, "uv venv").await?;
     }
 
     tracing::info!(
@@ -211,7 +245,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
             interpreter.display()
         );
     }
-    write_sentinel(&venv, extra)?;
+    write_sentinel(&venv, extra, &managed.uv_lock)?;
     tracing::info!(
         interpreter = %interpreter.display(),
         extra,
@@ -224,20 +258,24 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
 /// plus the hash of the uv.lock it was synced from. Its absence marks an
 /// interrupted setup; a hash mismatch marks a changed lock — both re-arm
 /// the startup auto-trigger.
-fn write_sentinel(venv: &Path, extra: &str) -> Result<()> {
+fn write_sentinel(venv: &Path, extra: &str, uv_lock: &Path) -> Result<()> {
     guard_managed_venv(venv)?;
-    let hash = current_lock_hash()
-        .with_context(|| format!("failed to hash '{UV_LOCK_PATH}' for the setup sentinel"))?;
+    let hash = current_lock_hash(uv_lock).with_context(|| {
+        format!(
+            "failed to hash '{}' for the setup sentinel",
+            uv_lock.display()
+        )
+    })?;
     let path = venv.join(SETUP_SENTINEL);
     std::fs::write(&path, format!("extra={extra}\nuv_lock_sha256={hash}\n"))
         .with_context(|| format!("failed to write '{}'", path.display()))?;
     Ok(())
 }
 
-/// SHA-256 (hex) of the committed uv.lock, as recorded in the sentinel.
-fn current_lock_hash() -> Result<String> {
-    let bytes = std::fs::read(UV_LOCK_PATH)
-        .with_context(|| format!("failed to read '{UV_LOCK_PATH}'"))?;
+/// SHA-256 (hex) of the active uv.lock, as recorded in the sentinel.
+fn current_lock_hash(uv_lock: &Path) -> Result<String> {
+    let bytes = std::fs::read(uv_lock)
+        .with_context(|| format!("failed to read '{}'", uv_lock.display()))?;
     Ok(sha256_hex_of(&bytes))
 }
 
@@ -285,21 +323,24 @@ fn sentinel_status_from(content: Option<&str>, current_lock_hash: Option<&str>) 
 /// environment needs nothing). Callers gate on config themselves
 /// (`auto_setup`, explicit `python`); this only inspects the filesystem.
 pub(crate) fn auto_setup_needed() -> Option<String> {
-    let managed_interpreter = Path::new(MANAGED_VENV).join(python_relpath()).is_file();
-    let legacy_interpreter = Path::new(LEGACY_VENV).join(python_relpath()).is_file();
+    let managed = ManagedPython::active();
+    let managed_interpreter = managed.venv.join(python_relpath()).is_file();
+    let legacy_interpreter = managed.legacy_suppresses
+        && Path::new(LEGACY_VENV).join(python_relpath()).is_file();
     let sentinel = sentinel_status_from(
-        std::fs::read_to_string(Path::new(MANAGED_VENV).join(SETUP_SENTINEL))
+        std::fs::read_to_string(managed.venv.join(SETUP_SENTINEL))
             .ok()
             .as_deref(),
-        current_lock_hash().ok().as_deref(),
+        current_lock_hash(&managed.uv_lock).ok().as_deref(),
     );
     auto_setup_decision(managed_interpreter, legacy_interpreter, sentinel)
 }
 
 /// The auto-trigger decision table. A managed interpreter is judged by its
 /// sentinel (missing → interrupted setup, stale → lock changed); without
-/// one, a legacy root `.venv` (pre-restructure install) suppresses the
-/// trigger — that environment keeps working and is never auto-managed.
+/// one, a legacy root `.venv` (pre-restructure install, dev layout only)
+/// suppresses the trigger — that environment keeps working and is never
+/// auto-managed.
 fn auto_setup_decision(
     managed_interpreter: bool,
     legacy_interpreter: bool,
@@ -314,7 +355,7 @@ fn auto_setup_decision(
                     .into(),
             ),
             SentinelStatus::Stale => {
-                Some("python/uv.lock changed since setup last completed".into())
+                Some("uv.lock changed since setup last completed".into())
             }
         };
     }
@@ -326,19 +367,17 @@ fn auto_setup_decision(
 
 /// The interpreter path inside a venv, relative to the venv root.
 fn python_relpath() -> &'static Path {
-    Path::new(if cfg!(windows) {
-        "Scripts/python.exe"
-    } else {
-        "bin/python"
-    })
+    crate::resources::venv_python_relpath()
 }
 
-/// Refuse to operate on anything but the managed venv (`python/.venv`
+/// Refuse to operate on anything but the active mode's managed venv
+/// (`python/.venv` in dev, `runtime/venv` in extracted bundled mode, both
 /// resolved against the CWD). Defense in depth for the "never touch a
 /// user-managed environment" rule: every create/delete/sync call re-checks.
 fn guard_managed_venv(venv: &Path) -> Result<()> {
-    let managed = std::path::absolute(MANAGED_VENV)
-        .with_context(|| format!("failed to resolve '{MANAGED_VENV}'"))?;
+    let active = ManagedPython::active().venv;
+    let managed = std::path::absolute(&active)
+        .with_context(|| format!("failed to resolve '{}'", active.display()))?;
     if venv != managed {
         bail!(
             "refusing to operate on venv '{}': setup only manages '{}'",
@@ -349,14 +388,18 @@ fn guard_managed_venv(venv: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `uv venv` argument construction (separated for tests).
-fn uv_venv_args() -> Vec<String> {
+/// `uv venv` argument construction (separated for tests). The venv path is
+/// passed positionally: `UV_PROJECT_ENVIRONMENT` (pinned by the runner) is
+/// honored by `uv sync` but not reliably by `uv venv`, and in extracted
+/// bundled mode the managed venv (`runtime/venv`) is NOT the project-dir
+/// default. Both spellings come from the same guarded absolute path, so
+/// they cannot disagree.
+fn uv_venv_args(venv: &Path) -> Vec<String> {
     vec![
         "venv".into(),
+        venv.display().to_string(),
         "--python".into(),
         PYTHON_VERSION.into(),
-        // The guard already pinned UV_PROJECT_ENVIRONMENT; the positional
-        // path is omitted on purpose so both agree on the project default.
     ]
 }
 
@@ -1080,22 +1123,69 @@ mod tests {
             uv_sync_args("cu128"),
             ["sync", "--locked", "--extra", "cu128"]
         );
-        assert_eq!(uv_venv_args(), ["venv", "--python", PYTHON_VERSION]);
+        let venv = std::env::temp_dir().join("pan-venv");
+        assert_eq!(
+            uv_venv_args(&venv),
+            [
+                "venv".to_string(),
+                venv.display().to_string(),
+                "--python".into(),
+                PYTHON_VERSION.into()
+            ]
+        );
     }
 
-    /// The safety guard: only the CWD-resolved `python/.venv` passes; the
-    /// repo-root legacy venv, sibling paths, and arbitrary paths are all
-    /// refused.
+    /// The per-mode managed paths (docs/architecture.md): the dev layout is
+    /// the pre-bundling one; extracted mode keys the project dir by version
+    /// but keeps the venv outside it (version bumps re-extract sources, the
+    /// sentinel's lock hash drives the re-sync).
+    #[test]
+    fn managed_python_paths_per_mode() {
+        use crate::resources::PySourceMode::*;
+        let dev = ManagedPython::for_mode(Dev);
+        assert_eq!(dev.project_dir, PathBuf::from("python"));
+        assert_eq!(dev.venv, PathBuf::from("python/.venv"));
+        assert_eq!(dev.uv_lock, PathBuf::from("python/uv.lock"));
+        assert!(dev.legacy_suppresses);
+
+        let extracted = ManagedPython::for_mode(Extracted);
+        assert_eq!(
+            extracted.project_dir,
+            Path::new("runtime/pysrc").join(crate::resources::VERSION)
+        );
+        assert_eq!(extracted.venv, PathBuf::from("runtime/venv"));
+        assert_eq!(
+            extracted.uv_lock,
+            Path::new("runtime/pysrc")
+                .join(crate::resources::VERSION)
+                .join("uv.lock")
+        );
+        assert!(!extracted.legacy_suppresses);
+    }
+
+    /// The safety guard: only the CWD-resolved managed venv of the ACTIVE
+    /// mode passes; the repo-root legacy venv, sibling paths, the other
+    /// mode's venv, and arbitrary paths are all refused.
     #[test]
     fn venv_guard_refuses_everything_but_the_managed_venv() {
-        let managed = std::path::absolute(MANAGED_VENV).unwrap();
+        use crate::resources::PySourceMode::*;
+        let active_mode = crate::resources::py_source_mode();
+        let active = ManagedPython::for_mode(active_mode).venv;
+        let managed = std::path::absolute(&active).unwrap();
         assert!(guard_managed_venv(&managed).is_ok());
 
+        let other_mode = match active_mode {
+            Dev => Extracted,
+            Extracted => Dev,
+        };
         for bad in [
             std::path::absolute(".venv").unwrap(),
             std::path::absolute("python/.venv2").unwrap(),
             std::path::absolute("python").unwrap(),
-            PathBuf::from(MANAGED_VENV), // relative spelling is refused too
+            // The OTHER mode's managed venv is refused too: the guard is
+            // strict about the active mode.
+            std::path::absolute(ManagedPython::for_mode(other_mode).venv).unwrap(),
+            active.clone(), // relative spelling is refused too
             std::env::temp_dir().join("some-venv"),
         ] {
             let err = guard_managed_venv(&bad).unwrap_err();
@@ -1196,7 +1286,8 @@ mod tests {
     #[test]
     fn write_sentinel_is_guarded() {
         let dir = tempfile::tempdir().unwrap();
-        let err = write_sentinel(dir.path(), "cpu").unwrap_err();
+        let err =
+            write_sentinel(dir.path(), "cpu", Path::new("python/uv.lock")).unwrap_err();
         assert!(err.to_string().contains("refusing to operate"), "{err}");
     }
 }

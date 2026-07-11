@@ -4,6 +4,20 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
+[features]
+# Self-contained releases (docs/architecture.md): embed the default configs
+# (config/gateway/default.toml, config/inference/example.toml) and the
+# Python source set (python/inferio_worker, python/inferio, pyproject.toml,
+# uv.lock — no tests, no .venv) into the binary; first run materializes
+# them (config dump if absent, extraction to runtime/pysrc/<version>).
+# Plain builds (no features) read the source tree exactly as before.
+bundled = []
+# Additive: embed a Next.js standalone UI bundle from the build-time env var
+# PANOPTIKON_UI_BUNDLE (a compile error names the variable when it is unset
+# or invalid). Extracted to runtime/ui/<version> and run as `node server.js`
+# when [upstreams.ui] local = true and the configured checkout is absent.
+bundled-ui = []
+
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1.39", features = [
@@ -100,14 +114,16 @@ chrono = "0.4.45"
 # Dynamic msgpack values for the inferio worker protocol (framed stdio):
 # rmpv keeps str vs bin distinct, which the protocol relies on.
 rmpv = "1"
+# tar.gz handling: extraction of the pinned uv standalone build on Unix
+# (setup.rs) and of the embedded resource archives on every platform
+# (resources.rs, `bundled`/`bundled-ui` features).
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # PR_SET_PDEATHSIG + process-group SIGKILL: the Unix counterpart of the
 # Windows job objects for reaping worker/UI trees when the gateway dies.
 libc = "0.2"
-# Extraction of the pinned uv standalone build (setup.rs): tar.gz on Unix.
-flate2 = "1"
-tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Job objects: kill the whole headless-browser process tree when a render
@@ -129,3 +145,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+# build.rs packages the embedded resource archives (`bundled`/`bundled-ui`);
+# with neither feature enabled it only declares cfg/rerun directives.
+flate2 = "1"
+tar = "0.4"

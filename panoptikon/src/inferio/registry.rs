@@ -82,18 +82,20 @@ impl RegistryConfig {
     /// `BASE_INFERENCE_CONFIG_FOLDER`/`INFERIO_CONFIG_DIR` env fallbacks are
     /// gone):
     ///
-    /// - Base folder: `python/inferio/config`, which must exist (Python
-    ///   parity: legacy config.py:168-171). Python resolved this relative to
-    ///   the `inferio` package's `__file__`; Rust has no equivalent, so the
-    ///   default is relative to the current working directory — the server
-    ///   is run from the repo root in the dev layout, where the two agree.
-    ///   Windows nuance: relative paths resolve against the drive+dir of the
+    /// - Base folder: the active mode's built-in registry dir — dev:
+    ///   `python/inferio/config` (Python parity: legacy config.py:168-171),
+    ///   extracted bundled mode: `runtime/pysrc/<version>/inferio/config`.
+    ///   Must exist. Python resolved this relative to the `inferio`
+    ///   package's `__file__`; Rust has no equivalent, so the default is
+    ///   relative to the current working directory — the server is run from
+    ///   the repo root in the dev layout, where the two agree. Windows
+    ///   nuance: relative paths resolve against the drive+dir of the
     ///   process CWD like on Unix; no special handling is needed.
     /// - User folder: `config/inference` (legacy config.py:88), never
     ///   existence-checked (a missing folder is skipped with a warning at
     ///   load time).
     pub fn default_dirs() -> Result<Self> {
-        let base = PathBuf::from("python/inferio/config");
+        let base = crate::resources::builtin_registry_dir(crate::resources::py_source_mode());
         if !base.is_dir() {
             bail!("Base configuration folder not found at: {}", base.display());
         }

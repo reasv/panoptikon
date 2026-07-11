@@ -234,8 +234,10 @@ panoptikon setup [--accelerator auto|cuda|rocm|cpu] [--force]
 ```
 
 Creates or updates the managed inference venv at **`python/.venv`** (fixed
-location, relative to the working directory like every other path). The
-flow:
+location, relative to the working directory like every other path; a
+`bundled` binary running outside a source checkout manages
+**`runtime/venv`** against its extracted source set instead — see
+"Self-contained builds" below). The flow:
 
 1. **uv discovery** — `uv` on PATH is used when `uv --version` works and the
    version is at least 0.6.13 (the verified floor for the current lockfile);
@@ -257,8 +259,9 @@ flow:
    authoritative and covers all variants). Child output streams to the log.
 
 Re-running converges (idempotent, fast when nothing changed); `--force`
-deletes `python/.venv` first. As a safety guard, setup refuses to operate on
-any venv other than `python/.venv` — a user-configured
+deletes the managed venv first. As a safety guard, setup refuses to operate
+on any venv other than the active managed one (`python/.venv` in a source
+checkout, `runtime/venv` in extracted bundled mode) — a user-configured
 `[inference_local].python` interpreter is never touched.
 
 After every successful sync, setup writes a completion sentinel
@@ -368,6 +371,77 @@ UI first — it is stateless.
 `config/gateway/local.toml` is a ready-made local rust-only production
 config (local API + local inference + local UI); `start.bat` / `start.sh` at
 the repo root runs the release binary with it.
+
+In a `bundled-ui` build, a missing checkout at `dir` falls back to the
+embedded UI bundle instead of failing: it is extracted to
+`runtime/ui/<version>/` and supervised as `node server.js` (see
+"Self-contained builds" below). A checkout that *does* exist at `dir`
+always wins over the embedded bundle.
+
+## Self-contained builds (`bundled`, `bundled-ui`)
+
+Plain builds read the source tree exactly as documented everywhere else in
+this file. Release builds enable cargo features that embed the runtime
+resources into the binary (docs/architecture.md "Self-contained releases"):
+
+- **`bundled`** embeds the default configs (`config/gateway/default.toml`,
+  `config/inference/example.toml`) and the Python source set
+  (`python/inferio_worker`, `python/inferio`, `pyproject.toml`, `uv.lock` —
+  no tests, no venv, no bytecode caches) as a compressed archive.
+- **`bundled-ui`** (additive) embeds a production UI bundle. The build-time
+  env var `PANOPTIKON_UI_BUNDLE` must point at a **fully assembled** Next.js
+  standalone output directory — `server.js` + `node_modules` at the root
+  with the build's `.next/static` (and `public/`, if any) copied in;
+  the build fails with a clear error when it is unset or invalid. The
+  panoptikon-ui repo must be built with `output: 'standalone'` in
+  `next.config.mjs` to produce such a directory.
+
+First run of a `bundled` binary materializes what is missing — loudly, in
+the log:
+
+- No `config/gateway/default.toml` (and no `--config`/`GATEWAY_CONFIG_PATH`
+  pointing elsewhere): the embedded default configs are written to
+  `config/`. Each file is written only if absent and **never overwritten** —
+  they are user-owned from then on.
+- No `python/inferio_worker` dev tree: the embedded Python source set is
+  extracted to `runtime/pysrc/<version>/` (version = the binary's crate
+  version). Extraction is atomic (temp dir + rename) and marker-verified
+  (`.panoptikon-extracted` records the archive hash), so a corrupted or
+  partial extraction is redone on the next start. `panoptikon setup` then
+  manages the venv at `runtime/venv` — outside the version-keyed dir, so a
+  version bump re-extracts sources but keeps the venv; the setup sentinel's
+  uv.lock hash triggers the re-sync.
+- UI (`bundled-ui`, `[upstreams.ui] local = true`, and the configured `dir`
+  absent): the embedded bundle is extracted to `runtime/ui/<version>/` and
+  run as `node server.js` with the bind address in the `PORT`/`HOSTNAME`
+  env vars (the standalone server is not `next start`). npm install / build
+  staleness steps are skipped — the bundle is immutable. Node comes from
+  the managed venv's nodejs-wheel as usual.
+
+Resource resolution order everywhere: **explicit config > dev source tree
+(when present) > extracted embedded set**. A bundled binary dropped into a
+source checkout behaves exactly like a plain build.
+
+Housekeeping: the extracted sets are version-keyed, so
+`runtime/pysrc/<version>/` and `runtime/ui/<version>/` accumulate one
+directory per binary version you have run. Old version dirs are never
+removed automatically (an older binary may still be running against them) —
+deleting the ones for versions you no longer run is always safe. Orphaned
+`.tmp-*` extraction leftovers from crashed runs are swept automatically
+once they are over a day old.
+
+### `--root`
+
+The global `--root <dir>` flag (default: the current working directory) is
+the base for all relative path resolution — `data_folder`, `config/`, the
+python tree, `runtime/`. It is implemented as a chdir at startup before
+anything else runs, so every CWD-relative default (including the `.env`
+auto-load) resolves under it — portable-app style:
+
+```bash
+panoptikon --root D:/panoptikon-home
+panoptikon setup --root D:/panoptikon-home --accelerator cpu
+```
 
 ## Configuration
 

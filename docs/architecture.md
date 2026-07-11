@@ -100,22 +100,33 @@ time (cargo feature `bundled`, used by release CI; plain dev builds skip
 embedding and read the source tree as usual) and materialized at first run:
 
 - **Default configs** (server TOML, example inference TOML): written to
-  `config/` only if absent — user-owned afterwards.
+  `config/` only if absent — user-owned afterwards, never overwritten.
 - **Built-in Python source set** (`inferio_worker`, `inferio` impls + built-in
-  registry, `pyproject.toml` + `uv.lock`): extracted to a version-keyed,
-  binary-owned dir under `<root>/runtime/` that users never edit. User
-  extensions live in `inferio_custom/` and `config/inference/` and merge as a
-  set, exactly like the dev-layout `impl_dirs`/`config_dirs`.
+  registry, `pyproject.toml` + `uv.lock`): extracted to the version-keyed,
+  binary-owned `<root>/runtime/pysrc/<version>/` that users never edit
+  (atomic temp-dir + rename, redone when the `.panoptikon-extracted` marker
+  is missing or its archive hash mismatches). The managed venv lives at
+  `<root>/runtime/venv` — outside the version-keyed dir, so version bumps
+  re-extract sources but keep the venv; the setup sentinel's uv.lock hash
+  drives the re-sync. User extensions live in `inferio_custom/` and
+  `config/inference/` and merge as a set, exactly like the dev-layout
+  `impl_dirs`/`config_dirs`.
 - **UI production bundle** (Next.js standalone output, built in the same CI
-  run as the binary): embedded compressed, extracted like the Python set, run
-  with the managed venv's Node. Embedding is deliberate: single CI build, no
-  dependency on GitHub artifacts at runtime, and fully offline operation once
-  `setup` has run — no phone-home, no git-pull deployment.
+  run as the binary and passed to cargo via the `PANOPTIKON_UI_BUNDLE` env
+  var — additive feature `bundled-ui`): embedded compressed, extracted like
+  the Python set to `<root>/runtime/ui/<version>/`, run as the standalone
+  `node server.js` (PORT/HOSTNAME env vars, not `next start`) with the
+  managed venv's Node. Install/build staleness checks are skipped — the
+  bundle is immutable. Requires `output: 'standalone'` in the UI repo's
+  next config. Embedding is deliberate: single CI build, no dependency on
+  GitHub artifacts at runtime, and fully offline operation once `setup` has
+  run — no phone-home, no git-pull deployment.
 
 Resource resolution order everywhere: explicit config > dev source tree (when
 present) > extracted embedded set. The root for all of this is `--root`
-(default: CWD, portable-app style). A future installer distribution will use
-platform dirs (AppData/XDG) through the same root abstraction.
+(default: CWD, portable-app style; implemented as a chdir at startup, before
+`.env` loading and config resolution). A future installer distribution will
+use platform dirs (AppData/XDG) through the same root abstraction.
 
 ## Technical debt register
 
@@ -134,7 +145,9 @@ platform dirs (AppData/XDG) through the same root abstraction.
   binary renamed `panoptikon`; `ui/` submodule; README updated (not
   rewritten) with the Rust flow as the installation path.
 - **M2**: `panoptikon setup` + the locked accelerator matrix.
-- **M3**: embedded resources + first-run extraction + release CI.
+- **M3**: embedded resources + first-run extraction (done: `bundled` /
+  `bundled-ui` features, `--root`) + release CI (pending; blocked for the UI
+  half on panoptikon-ui enabling `output: 'standalone'`).
 - **M4 — the swap**: `master` is renamed `python-legacy` and this branch
   becomes `master`. A permanent worktree of `python-legacy` is mounted in the
   repo folder (gitignored) so the old implementation stays available

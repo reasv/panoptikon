@@ -88,12 +88,20 @@ base_url = "http://127.0.0.1:6339"
 base_url = "http://127.0.0.1:6342"
 local = true
 
-# Inference upstreams (first entry is used for search + metadata + /api/inference proxy).
-# Each entry can be excluded from batch jobs with `use_for_jobs = false`.
-[[upstreams.inference]]
-base_url = "http://127.0.0.1:6342"
-weight = 1.0
-use_for_jobs = true
+# Inference upstreams (first entry is used for search + metadata + the
+# /api/inference proxy). Each entry can be excluded from batch jobs with
+# `use_for_jobs = false`. With [inference_local] enabled and no entries
+# here, the gateway synthesizes a loopback entry pointing at itself.
+# [[upstreams.inference]]
+# base_url = "http://other-machine:6342"
+# weight = 1.0
+# use_for_jobs = true
+
+# Serve /api/inference/* in-process (the Rust inferio orchestrator spawns
+# Python worker processes on demand; `panoptikon setup` provisions the
+# managed Python environment automatically on first start).
+[inference_local]
+enabled = true
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.

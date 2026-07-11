@@ -3,11 +3,7 @@ use axum::http::Method;
 use serde::Deserialize;
 use serde::de::{self, SeqAccess, Visitor};
 use std::sync::OnceLock;
-use std::{
-    collections::BTreeMap,
-    env, fmt,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
@@ -118,25 +114,27 @@ pub struct InferenceLocalConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Python interpreter used to spawn workers. Default: auto-detect the
-    /// managed venv (`python/.venv/Scripts/python.exe` on Windows,
-    /// `python/.venv/bin/python` elsewhere) relative to the working
-    /// directory, falling back to the legacy root `.venv` when the managed
-    /// one does not exist (pre-restructure installs).
+    /// managed venv (`python/.venv` relative to the working directory,
+    /// falling back to the legacy root `.venv` of pre-restructure installs;
+    /// `runtime/venv` when a `bundled` build runs from its extracted set —
+    /// see `resources::py_source_mode`).
     #[serde(default)]
     pub python: Option<PathBuf>,
     /// Directories searched (in order) for impl-class modules; forwarded to
-    /// workers in the spawn handshake. Empty (default) means
-    /// `["python/inferio/impl", "inferio_custom"]`.
+    /// workers in the spawn handshake. Empty (default) means the mode's
+    /// built-in impl dir plus `inferio_custom` (dev:
+    /// `["python/inferio/impl", "inferio_custom"]`).
     #[serde(default)]
     pub impl_dirs: Vec<PathBuf>,
-    /// Registry TOML directories, built-in first. Empty (default) means
-    /// `["python/inferio/config", "config/inference"]`; this key is the only
-    /// override (the old env fallbacks are gone).
+    /// Registry TOML directories, built-in first. Empty (default) means the
+    /// mode's built-in registry dir plus `config/inference` (dev:
+    /// `["python/inferio/config", "config/inference"]`); this key is the
+    /// only override (the old env fallbacks are gone).
     #[serde(default)]
     pub config_dirs: Vec<PathBuf>,
     /// Entries prepended to the workers' PYTHONPATH so the `inferio_worker`
-    /// package resolves in the python/ layout. Empty (default) means
-    /// `["python"]`.
+    /// package resolves. Empty (default) means the mode's Python project
+    /// dir (dev: `["python"]`).
     #[serde(default)]
     pub pythonpath: Vec<PathBuf>,
     /// Server-wide default batch cap when neither the request nor the
@@ -175,9 +173,10 @@ pub struct InferenceLocalConfig {
 }
 
 /// `[inference_local.python_env]`: how the binary manages the Python
-/// inference environment. Only ever applies to the managed venv at
-/// `python/.venv` — a user-configured `[inference_local].python` interpreter
-/// is never touched (setup refuses to operate on any other path).
+/// inference environment. Only ever applies to the managed venv
+/// (`python/.venv` in the dev layout, `runtime/venv` in extracted bundled
+/// mode) — a user-configured `[inference_local].python` interpreter is
+/// never touched (setup refuses to operate on any other path).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PythonEnvConfig {
     /// Accelerator variant for the locked sync: "auto" (detect CUDA/ROCm at
@@ -279,40 +278,29 @@ impl Default for InferenceLocalConfig {
 }
 
 impl InferenceLocalConfig {
-    /// The worker interpreter: configured path or the managed venv default
-    /// (`python/.venv`), falling back to the legacy root `.venv` when the
-    /// managed venv is absent (pre-restructure installs).
+    /// The worker interpreter: configured path (explicit config always
+    /// wins) or the mode's managed venv default — `python/.venv` in the dev
+    /// layout (falling back to the legacy root `.venv` of pre-restructure
+    /// installs), `runtime/venv` when a `bundled` build runs from its
+    /// extracted source set.
     pub fn resolved_python(&self) -> PathBuf {
         self.python.clone().unwrap_or_else(|| {
-            let rel = if cfg!(windows) {
-                "Scripts/python.exe"
-            } else {
-                "bin/python"
-            };
-            let managed = Path::new("python/.venv").join(rel);
-            if managed.is_file() {
-                managed
-            } else {
-                let legacy = Path::new(".venv").join(rel);
-                if legacy.is_file() { legacy } else { managed }
-            }
+            crate::resources::default_worker_python(crate::resources::py_source_mode())
         })
     }
 
     /// Impl-class search dirs, defaulted and absolutized (the worker
     /// handshake forwards them verbatim; workers skip missing dirs).
     ///
-    /// Empty (default) means `["python/inferio/impl", "inferio_custom"]` —
-    /// `[inference_local].impl_dirs` is the only way to change this. Note
-    /// there is no local-mode analogue of `INFERIO_ALLOW_BUILT_IN_OVERRIDE`:
-    /// dirs are searched in order (built-ins first, customs later) and the
-    /// first module providing a matching `name()` wins.
+    /// Empty (default) means the mode's built-in impl dir plus
+    /// `inferio_custom` — `[inference_local].impl_dirs` is the only way to
+    /// change this. Note there is no local-mode analogue of
+    /// `INFERIO_ALLOW_BUILT_IN_OVERRIDE`: dirs are searched in order
+    /// (built-ins first, customs later) and the first module providing a
+    /// matching `name()` wins.
     pub fn resolved_impl_dirs(&self) -> Vec<PathBuf> {
         let dirs = if self.impl_dirs.is_empty() {
-            vec![
-                PathBuf::from("python/inferio/impl"),
-                PathBuf::from("inferio_custom"),
-            ]
+            crate::resources::default_impl_dirs(crate::resources::py_source_mode())
         } else {
             self.impl_dirs.clone()
         };
@@ -322,7 +310,7 @@ impl InferenceLocalConfig {
     /// PYTHONPATH prepends for workers, defaulted and absolutized.
     pub fn resolved_pythonpath(&self) -> Vec<PathBuf> {
         let dirs = if self.pythonpath.is_empty() {
-            vec![PathBuf::from("python")]
+            crate::resources::default_pythonpath(crate::resources::py_source_mode())
         } else {
             self.pythonpath.clone()
         };
@@ -1753,22 +1741,45 @@ dir = "ui""#);
         );
     }
 
-    /// impl_dirs defaulting: the config key is the only source. Empty means
-    /// the built-in pair; explicit entries replace it entirely (the old
-    /// INFERIO_CUSTOM_IMPL_PATH env fallback is gone).
+    /// Resolution order for the worker paths: explicit config entries
+    /// replace the defaults entirely (the old INFERIO_CUSTOM_IMPL_PATH env
+    /// fallback is gone); empty means the active mode's defaults (dev
+    /// source tree in plain builds, the extracted set in bundled builds
+    /// running outside a checkout — the per-mode table itself is tested in
+    /// resources.rs).
     #[test]
     fn impl_dirs_default_and_explicit_config() {
         let mut local = InferenceLocalConfig::default();
+        let mode = crate::resources::py_source_mode();
 
         let dirs = local.resolved_impl_dirs();
-        assert_eq!(dirs.len(), 2);
-        assert!(dirs[0].ends_with("python/inferio/impl"), "got {dirs:?}");
-        assert!(dirs[1].ends_with("inferio_custom"), "got {dirs:?}");
+        let expected: Vec<PathBuf> = crate::resources::default_impl_dirs(mode)
+            .into_iter()
+            .map(absolutize)
+            .collect();
+        assert_eq!(dirs, expected);
 
+        let paths = local.resolved_pythonpath();
+        let expected: Vec<PathBuf> = crate::resources::default_pythonpath(mode)
+            .into_iter()
+            .map(absolutize)
+            .collect();
+        assert_eq!(paths, expected);
+
+        // Explicit config always wins, whatever the mode.
         local.impl_dirs = vec![PathBuf::from("explicit_dir")];
         let dirs = local.resolved_impl_dirs();
         assert_eq!(dirs.len(), 1);
         assert!(dirs[0].ends_with("explicit_dir"), "got {dirs:?}");
+        local.pythonpath = vec![PathBuf::from("explicit_pp")];
+        let paths = local.resolved_pythonpath();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("explicit_pp"), "got {paths:?}");
+        local.python = Some(PathBuf::from("explicit/python.exe"));
+        assert_eq!(
+            local.resolved_python(),
+            PathBuf::from("explicit/python.exe")
+        );
     }
 
     /// Minimal valid config file body for tests exercising the new keys.

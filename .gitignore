@@ -194,3 +194,4 @@ data/
 # Binary-owned runtime resources (managed uv downloads, extracted
 # embedded sets — docs/architecture.md)
 /runtime/
+/target-m3

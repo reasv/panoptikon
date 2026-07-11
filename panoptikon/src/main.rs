@@ -17,6 +17,7 @@ mod policy;
 mod pql;
 mod process_tree;
 mod proxy;
+mod resources;
 mod setup;
 mod shutdown;
 #[cfg(test)]
@@ -46,6 +47,13 @@ struct Args {
     /// Config file path (global: also valid after the subcommand).
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
+    /// Root directory for all relative path resolution: data_folder,
+    /// config, python sources, runtime/ (global: also valid after the
+    /// subcommand). Default: the current working directory. Implemented as
+    /// a chdir at startup before anything else runs, so every CWD-relative
+    /// default resolves under it — .env auto-loading included.
+    #[arg(long, value_name = "DIR", global = true)]
+    root: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -56,8 +64,9 @@ enum Command {
     /// no proxy, API, jobs, cron, or migrations. For machines that just lend
     /// their GPU to other panoptikon instances (design doc §3).
     Inferio,
-    /// Create or update the managed Python inference environment at
-    /// python/.venv: find or download uv, detect the accelerator, and run a
+    /// Create or update the managed Python inference environment
+    /// (python/.venv in a source checkout, runtime/venv for a bundled
+    /// binary): find or download uv, detect the accelerator, and run a
     /// locked `uv sync`. Idempotent — re-running converges on the lockfile.
     Setup {
         /// Accelerator variant to install. Default: the config's
@@ -65,7 +74,7 @@ enum Command {
         /// auto-detection).
         #[arg(long, value_enum)]
         accelerator: Option<config::Accelerator>,
-        /// Delete python/.venv first and recreate it from scratch.
+        /// Delete the managed venv first and recreate it from scratch.
         #[arg(long)]
         force: bool,
     },
@@ -85,15 +94,29 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    // `--root` is the base for ALL relative path resolution (data_folder,
+    // config, python, runtime). It is implemented as exactly that: a chdir
+    // before anything else touches the filesystem, so every CWD-relative
+    // default below — including the .env auto-load — resolves under it.
+    if let Some(root) = &args.root {
+        env::set_current_dir(root)
+            .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
+    }
     // `.env` still auto-loads: it is how users populate the env vars that
     // config templating (`${VAR}` in TOML values) references, and children
     // (inference workers, the UI server) inherit it.
     dotenvy::dotenv().ok();
 
-    let args = Args::parse();
     let config_path = args
         .config
         .or_else(|| env::var(config::CONFIG_PATH_ENV).ok().map(PathBuf::from));
+    // Bundled builds materialize embedded resources on first run (write the
+    // default configs when no config exists or was pointed at, extract the
+    // Python source set when no dev tree is present); plain builds no-op.
+    // This must precede Settings::load — it may create the very file that
+    // load is about to read.
+    let first_run_messages = resources::materialize_first_run(config_path.is_some())?;
     // Config must load before logging init (logging is configured by
     // [logging] now); a config-load error is reported on stderr by main.
     let settings = Arc::new(config::Settings::load(config_path)?);
@@ -101,6 +124,11 @@ async fn async_main() -> anyhow::Result<()> {
     // The guard must stay alive for the whole process: dropping it flushes
     // buffered file-log output.
     let _log_guard = logging::init(&settings);
+    // First-run actions went to stderr when they happened (pre-logging);
+    // repeat them through tracing so they land in the log file too.
+    for message in &first_run_messages {
+        tracing::info!("{message}");
+    }
     settings.log_warnings();
 
     match args.command {

@@ -164,11 +164,10 @@ async fn run_once(
     announcer_started: &mut bool,
 ) -> Result<RunOutcome> {
     if !plan.dir.is_dir() {
-        bail!(
-            "upstreams.ui.dir '{}' does not exist; clone panoptikon-ui there \
-             (the gateway does not manage the checkout)",
-            plan.dir.display()
-        );
+        // Resolution order (docs/architecture.md): a dev checkout at the
+        // configured dir always wins; only when it is absent does a
+        // bundled-ui build fall back to the embedded bundle.
+        return run_once_without_checkout(plan, stop, announcer_started).await;
     }
     let node = resolve_node(plan.node_override.as_deref(), Path::new("."));
 
@@ -230,20 +229,7 @@ async fn run_once(
         BuildDecision::Skip => {}
     }
 
-    // A foreign process already answering on the UI port means `next start`
-    // will fail to bind — and the readiness announcer would credit the
-    // wrong server. The Python-managed UI is the usual suspect.
-    if tokio::net::TcpStream::connect((plan.host.as_str(), plan.port))
-        .await
-        .is_ok()
-    {
-        tracing::warn!(
-            host = %plan.host,
-            port = plan.port,
-            "UI port is already accepting connections before next start; another \
-             process (e.g. a Python-managed UI) appears to hold it"
-        );
-    }
+    warn_if_port_taken(plan, "next start").await;
 
     tracing::info!(url = %plan.base_url, node = %node.display(), "starting UI server (next start)");
     let mut command = Command::new(&node);
@@ -251,6 +237,107 @@ async fn run_once(
         .arg(NEXT_BIN)
         .args(["start", "-p", &plan.port.to_string(), "-H", &plan.host])
         .current_dir(&plan.dir);
+    start_announcer_once(plan, stop, announcer_started);
+    let started = Instant::now();
+    match run_logged(command, "next start", stop).await? {
+        CommandEnd::Stopped => Ok(RunOutcome::Stopped),
+        CommandEnd::Exited(status) => Ok(RunOutcome::Exited {
+            status,
+            uptime: started.elapsed(),
+        }),
+    }
+}
+
+/// The configured checkout dir does not exist and this build embeds no UI
+/// bundle: an unrecoverable setup problem, reported as before.
+#[cfg(not(all(feature = "bundled-ui", ui_bundle_present)))]
+async fn run_once_without_checkout(
+    plan: &UiPlan,
+    _stop: &mut watch::Receiver<bool>,
+    _announcer_started: &mut bool,
+) -> Result<RunOutcome> {
+    bail!(
+        "upstreams.ui.dir '{}' does not exist; clone panoptikon-ui there \
+         (the gateway does not manage the checkout)",
+        plan.dir.display()
+    );
+}
+
+/// Embedded-bundle mode (`bundled-ui`, docs/architecture.md): the
+/// configured checkout dir is absent, so extract the embedded Next.js
+/// standalone bundle to `runtime/ui/<version>` (no-op when already there)
+/// and supervise `node server.js` bound via the PORT/HOSTNAME env vars —
+/// the standalone server is NOT `next start`. Install/build staleness steps
+/// are skipped entirely: the bundle is immutable.
+#[cfg(all(feature = "bundled-ui", ui_bundle_present))]
+async fn run_once_without_checkout(
+    plan: &UiPlan,
+    stop: &mut watch::Receiver<bool>,
+    announcer_started: &mut bool,
+) -> Result<RunOutcome> {
+    let bundle_dir = crate::resources::ensure_ui_bundle_extracted()?;
+    let server_js = bundle_dir.join("server.js");
+    if !server_js.is_file() {
+        bail!(
+            "extracted UI bundle at '{}' has no server.js — delete the directory \
+             and restart to re-extract",
+            bundle_dir.display()
+        );
+    }
+    let node = resolve_node(plan.node_override.as_deref(), Path::new("."));
+
+    warn_if_port_taken(plan, "node server.js").await;
+
+    tracing::info!(
+        url = %plan.base_url,
+        node = %node.display(),
+        dir = %bundle_dir.display(),
+        "starting embedded UI server (node server.js)"
+    );
+    let mut command = Command::new(&node);
+    command
+        .arg(&server_js)
+        .current_dir(&bundle_dir)
+        // The Next standalone server takes its bind address from the
+        // environment, not CLI flags.
+        .env("PORT", plan.port.to_string())
+        .env("HOSTNAME", &plan.host)
+        .env("NODE_ENV", "production");
+    start_announcer_once(plan, stop, announcer_started);
+    let started = Instant::now();
+    match run_logged(command, "ui server", stop).await? {
+        CommandEnd::Stopped => Ok(RunOutcome::Stopped),
+        CommandEnd::Exited(status) => Ok(RunOutcome::Exited {
+            status,
+            uptime: started.elapsed(),
+        }),
+    }
+}
+
+/// A foreign process already answering on the UI port means the spawn will
+/// fail to bind — and the readiness announcer would credit the wrong
+/// server. The Python-managed UI is the usual suspect.
+async fn warn_if_port_taken(plan: &UiPlan, what: &str) {
+    if tokio::net::TcpStream::connect((plan.host.as_str(), plan.port))
+        .await
+        .is_ok()
+    {
+        tracing::warn!(
+            host = %plan.host,
+            port = plan.port,
+            "UI port is already accepting connections before {what}; another \
+             process (e.g. a Python-managed UI) appears to hold it"
+        );
+    }
+}
+
+/// Start the "UI is up" readiness announcer with the first spawn attempt;
+/// it survives restarts, so later attempts must not start a second one.
+fn start_announcer_once(
+    plan: &UiPlan,
+    stop: &watch::Receiver<bool>,
+    announcer_started: &mut bool,
+) {
     if !*announcer_started {
         *announcer_started = true;
         tokio::spawn(announce_when_up(
@@ -259,14 +346,6 @@ async fn run_once(
             plan.base_url.clone(),
             stop.clone(),
         ));
-    }
-    let started = Instant::now();
-    match run_logged(command, "next start", stop).await? {
-        CommandEnd::Stopped => Ok(RunOutcome::Stopped),
-        CommandEnd::Exited(status) => Ok(RunOutcome::Exited {
-            status,
-            uptime: started.elapsed(),
-        }),
     }
 }
 
@@ -505,8 +584,9 @@ fn absolutize(path: PathBuf) -> PathBuf {
 /// 1. `upstreams.ui.node` from config — a bare name is left for PATH
 ///    lookup, a path is absolutized against the CWD (like `dir`).
 /// 2. The managed venv's nodejs-wheel node (`python/.venv`, then the legacy
-///    root `.venv` of pre-restructure installs), relative to `base` (the
-///    CWD). The pip entry point (`.venv/Scripts/node.exe` /
+///    root `.venv` of pre-restructure installs; `runtime/venv` when a
+///    `bundled` build runs from its extracted source set), relative to
+///    `base` (the CWD). The pip entry point (`.venv/Scripts/node.exe` /
 ///    `.venv/bin/node`) is a launcher stub that re-execs the real binary
 ///    through Python, so the actual node inside the `nodejs_wheel` package
 ///    is preferred — running it directly drops the Python hop and puts
@@ -528,7 +608,12 @@ fn resolve_node(explicit: Option<&Path>, base: &Path) -> PathBuf {
 }
 
 fn venv_node_candidates(base: &Path) -> Vec<PathBuf> {
-    let venvs = [base.join("python/.venv"), base.join(".venv")];
+    let venvs = match crate::resources::py_source_mode() {
+        crate::resources::PySourceMode::Dev => {
+            vec![base.join("python/.venv"), base.join(".venv")]
+        }
+        crate::resources::PySourceMode::Extracted => vec![base.join("runtime/venv")],
+    };
     let mut candidates = Vec::new();
     for venv in &venvs {
         if cfg!(windows) {
