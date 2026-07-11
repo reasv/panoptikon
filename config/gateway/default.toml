@@ -215,8 +215,8 @@ allow = "*"
 # Free-form per-policy client settings, returned verbatim by
 # GET /api/client-config as the "client" object (alongside capability
 # booleans derived from the policy's ruleset). Recognized-by-convention
-# keys: search_throttle_ms, disable_backend_open — but anything passes
-# through. Default: empty object.
+# keys: search_throttle_ms, disable_backend_open, home_redirect — but
+# anything passes through. Default: empty object.
 # [policies.client]
 # search_throttle_ms = 0
 
@@ -240,6 +240,7 @@ allow = "*"
 # [policies.client]
 # search_throttle_ms = 1500      # demo visitors get throttled search
 # disable_backend_open = true    # hide "open on host" controls entirely
+# home_redirect = "/search"      # land visitors on search, not the guide
 
 # Example: multi-tenant policy using a username header.
 #

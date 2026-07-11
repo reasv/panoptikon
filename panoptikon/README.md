@@ -186,9 +186,10 @@ everything host-side false.
 
 `client` is the policy's `[policies.client]` TOML table passed through
 verbatim (default: empty object). The gateway attaches no semantics to it;
-recognized-by-convention keys are `search_throttle_ms` and
-`disable_backend_open`. Env templating applies inside it like everywhere
-else in the config file.
+recognized-by-convention keys are `search_throttle_ms`,
+`disable_backend_open`, and `home_redirect` (a string path the UI's root
+page redirects to, e.g. `"/search"`; unset = no redirect). Env templating
+applies inside it like everywhere else in the config file.
 
 ## Database migrations
 
