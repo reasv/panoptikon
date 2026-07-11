@@ -18,3 +18,10 @@ metadata.description = "ViT-bigG-14-CLIPA model pretrained on DataComp1B"
 # Almost anything about the model's configuration can be overridden here.
 # See `src/inferio/impl/` for the available implementation classes and how they use the configuration you pass to them.
 # The object in the `config` field is passed to the implementation class's constructor directly as **kwargs.
+
+# String values support environment variable templating, useful for secrets:
+#   ${VAR}           -> value of VAR (error if VAR is unset)
+#   ${VAR:-default}  -> "default" when VAR is unset or empty
+#   $${              -> a literal "${"
+# For example, to pass an API key from the environment:
+# config.api_key = "${JINA_API_KEY:-}"

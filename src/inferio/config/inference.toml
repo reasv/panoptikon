@@ -106,8 +106,10 @@ metadata.description = """Finds your images and videos on Danbooru and downloads
 
 [group.tagmatch.inference_ids.danbooru-saucenao]
 config.sauce_nao_enabled = true
+config.api_key = "${SAUCENAO_API_KEY:-}"
 metadata.input_spec.handler = "md5_image"
-metadata.description = """Requires SAUCENAO_API_KEY environment variable to be set. \
+metadata.description = """Requires a SauceNAO API key, provided through the \
+  SAUCENAO_API_KEY environment variable or the api_key config option. \
   Falls back to SauceNAO if it can't find your exact image on Danbooru. \
   Finds your images and videos on Danbooru and downloads the tags. \
   Applies the confidence threshold to the SauceNAO similarity level."""
@@ -449,9 +451,11 @@ config.impl_class    = "jina-clip-api"
 config.dimensions    = 1024
 config.embedding_type = "float"
 config.task          = "text-matching"
+config.api_key       = "${JINA_API_KEY:-}"
 metadata.description = """Not local (API-based). You must set the JINA_API_KEY \
-  env var before using this model. jina-embeddings-v3 is a multilingual \
-  multi-task text embedding model designed for a variety of NLP applications."""
+  env var (or the api_key config option) before using this model. \
+  jina-embeddings-v3 is a multilingual multi-task text embedding model \
+  designed for a variety of NLP applications."""
 
 
 # ===================================================================
@@ -622,10 +626,12 @@ config.impl_class     = "jina-clip-api"
 config.dimensions     = 1024
 config.normalized     = true
 config.embedding_type = "float"
+config.api_key        = "${JINA_API_KEY:-}"
 metadata.distance_func = "L2"
 metadata.description  = """Not local (API-based). You must set the JINA_API_KEY \
-  env var before using this model. jina-clip-v2 is a general-purpose \
-  multilingual multimodal embedding model for text & images."""
+  env var (or the api_key config option) before using this model. \
+  jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
+  for text & images."""
 
 [group.clip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
 config.model_name = "ViT-SO400M-14-SigLIP-384"
@@ -838,10 +844,12 @@ config.impl_class     = "jina-clip-api"
 config.dimensions     = 1024
 config.normalized     = true
 config.embedding_type = "float"
+config.api_key        = "${JINA_API_KEY:-}"
 metadata.distance_func = "L2"
 metadata.description  = """Not local (API-based). You must set the JINA_API_KEY \
-  env var before using this model. jina-clip-v2 is a general-purpose \
-  multilingual multimodal embedding model for text & images."""
+  env var (or the api_key config option) before using this model. \
+  jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
+  for text & images."""
 
 [group.tclip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
 config.model_name = "ViT-SO400M-14-SigLIP-384"

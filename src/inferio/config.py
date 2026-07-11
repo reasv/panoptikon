@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -7,6 +8,119 @@ from typing import Any, Dict, Optional, Tuple
 import tomli
 
 logger = logging.getLogger(__name__)
+
+# --- Environment-variable templating for TOML config values -----------------
+#
+# Mirrors the Rust gateway's gateway/src/env_template.rs exactly, so the same
+# registry TOML behaves identically under both implementations. Syntax, inside
+# string values only (shell / docker-compose conventions):
+#
+# - `${NAME}`         -> env value; hard error when unset (set-but-empty -> "")
+# - `${NAME:-default}` -> default when unset OR set-but-empty
+# - `${NAME-default}`  -> default only when unset
+# - `$${`             -> literal `${` (never re-scanned)
+# - NAME matches [A-Za-z_][A-Za-z0-9_]*; anything else after `${` is an error.
+#   A `$` not followed by `{` is literal.
+#
+# Substitution is a single pass over parsed values: placeholder-looking text
+# inside a substituted env value is NOT re-expanded (no recursion).
+
+_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _template_snippet(text: str) -> str:
+    """A short prefix of the offending text for error messages."""
+    return text[:24]
+
+
+def _substitute_env_str(text: str) -> str:
+    """Substitute env placeholders in one string (single pass, no recursion)."""
+    out: list[str] = []
+    rest = text
+    while (pos := rest.find("$")) != -1:
+        out.append(rest[:pos])
+        tail = rest[pos:]
+        if tail.startswith("$${"):
+            # `$${` -> literal `${`, never re-scanned (single pass).
+            out.append("${")
+            rest = tail[3:]
+        elif tail.startswith("${"):
+            inner = tail[2:]
+            name_match = _ENV_VAR_NAME_RE.match(inner)
+            if not name_match:
+                raise ValueError(
+                    f"malformed substitution '{_template_snippet(tail)}': "
+                    "expected a variable name ([A-Za-z_][A-Za-z0-9_]*) after "
+                    "'${' (write '$${' for a literal '${')"
+                )
+            name = name_match.group(0)
+            after_name = inner[len(name):]
+            if after_name.startswith("}"):
+                # ${NAME}: unset is a hard error -- this form is for secrets
+                # and required values, which must fail loudly. Set-but-empty
+                # yields "" (shell semantics).
+                value = os.environ.get(name)
+                if value is None:
+                    raise ValueError(
+                        f"environment variable '{name}' is not set "
+                        f"(referenced as '${{{name}}}'; use "
+                        f"'${{{name}:-default}}' to provide a fallback)"
+                    )
+                out.append(value)
+                rest = after_name[1:]
+            elif after_name.startswith(":-") or after_name.startswith("-"):
+                # Shell conventions: `:-` substitutes the default when the
+                # variable is unset OR set-but-empty; `-` only when unset.
+                empty_uses_default = after_name.startswith(":-")
+                after_op = after_name[2 if empty_uses_default else 1:]
+                end = after_op.find("}")
+                if end == -1:
+                    raise ValueError(
+                        f"malformed substitution '{_template_snippet(tail)}': "
+                        "missing closing '}'"
+                    )
+                default = after_op[:end]
+                value = os.environ.get(name)
+                if value is not None and not (
+                    empty_uses_default and value == ""
+                ):
+                    out.append(value)
+                else:
+                    out.append(default)
+                rest = after_op[end + 1:]
+            else:
+                raise ValueError(
+                    f"malformed substitution '{_template_snippet(tail)}': "
+                    "expected '}', ':-default}' or '-default}' after the "
+                    "variable name"
+                )
+        else:
+            # A lone `$` (or `$$` not followed by `{`) is literal.
+            out.append("$")
+            rest = tail[1:]
+    out.append(rest)
+    return "".join(out)
+
+
+def _substitute_env_walk(value: Any) -> Any:
+    """Recursively substitute env templates in every string value."""
+    if isinstance(value, str):
+        return _substitute_env_str(value) if "$" in value else value
+    if isinstance(value, list):
+        return [_substitute_env_walk(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute_env_walk(item) for key, item in value.items()}
+    return value
+
+
+def substitute_env_templates(data: Any, source: Path | str) -> Any:
+    """Substitute `${NAME}` / `${NAME:-default}` env placeholders in every
+    string value of a parsed TOML tree (dicts and lists included). Errors name
+    `source` (the file the value came from) and the offending variable."""
+    try:
+        return _substitute_env_walk(data)
+    except ValueError as e:
+        raise ValueError(f"in config file {source}: {e}") from e
 
 def get_config_mtime(base_folder: Path, user_folder: Path) -> float:
     latest_time = 0.0
@@ -36,6 +150,7 @@ def load_config_folder(
             with open(file, "rb") as f:
                 data = tomli.load(f)
                 logger.debug(f"Loading TOML file: {file}")
+            data = substitute_env_templates(data, file)
             allow_inference_id_overrides = data.get("allow_override", False)
             groups: Dict[str, Dict[str, Any]] = data.get("group", {})
             for group_name, group_data in groups.items():
