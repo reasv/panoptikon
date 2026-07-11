@@ -1,3 +1,4 @@
 [submodule "ui"]
 	path = ui
 	url = https://github.com/reasv/panoptikon-ui
+	branch = rust-ui
