@@ -144,7 +144,7 @@ pub fn builtin_registry_dir(mode: PySourceMode) -> PathBuf {
 /// extracted uv.lock is what the setup sentinel is judged against):
 ///
 /// - When the gateway config is not explicitly located (no `--config` /
-///   `GATEWAY_CONFIG_PATH`), the embedded default configs are written to
+///   `PANOPTIKON_CONFIG_PATH`), the embedded default configs are written to
 ///   their default paths — each file only if absent, never overwriting.
 /// - When the dev Python tree is absent ([`py_source_mode`] =
 ///   [`PySourceMode::Extracted`]), the embedded Python source set is
@@ -188,10 +188,10 @@ mod embedded {
     /// The Python source set staged by build.rs (see build.rs for the
     /// exact contents).
     pub static PYSRC_TAR_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pysrc.tar.gz"));
-    /// The default gateway config, written to `config/gateway/default.toml`
+    /// The default server config, written to `config/server/default.toml`
     /// on first run when absent.
-    pub static GATEWAY_DEFAULT_TOML: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../config/gateway/default.toml"));
+    pub static SERVER_DEFAULT_TOML: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../config/server/default.toml"));
     /// The example user inference registry, written to
     /// `config/inference/example.toml` on first run when absent.
     pub static INFERENCE_EXAMPLE_TOML: &str = include_str!(concat!(
@@ -208,9 +208,9 @@ fn write_default_configs_in(base: &Path) -> Result<Vec<String>> {
     let mut messages = Vec::new();
     for (rel, content, what) in [
         (
-            "config/gateway/default.toml",
-            embedded::GATEWAY_DEFAULT_TOML,
-            "default gateway config",
+            "config/server/default.toml",
+            embedded::SERVER_DEFAULT_TOML,
+            "default server config",
         ),
         (
             "config/inference/example.toml",
@@ -648,11 +648,11 @@ mod tests {
 
         let messages = write_default_configs_in(root.path()).unwrap();
         assert_eq!(messages.len(), 2, "{messages:?}");
-        let gateway = root.path().join("config/gateway/default.toml");
+        let gateway = root.path().join("config/server/default.toml");
         let example = root.path().join("config/inference/example.toml");
         assert_eq!(
             std::fs::read_to_string(&gateway).unwrap(),
-            embedded::GATEWAY_DEFAULT_TOML
+            embedded::SERVER_DEFAULT_TOML
         );
         assert_eq!(
             std::fs::read_to_string(&example).unwrap(),

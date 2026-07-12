@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
-pub const CONFIG_PATH_ENV: &str = "GATEWAY_CONFIG_PATH";
+pub const CONFIG_PATH_ENV: &str = "PANOPTIKON_CONFIG_PATH";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
@@ -65,7 +65,7 @@ fn default_temp_dir() -> PathBuf {
 /// `[logging]`: console + file logging.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
-    /// Log file path. Absent: `<data_folder>/panoptikon-gateway.log`.
+    /// Log file path. Absent: `<data_folder>/panoptikon.log`.
     /// Explicit empty string: file logging disabled (console only) — the
     /// same semantics the old `LOGS_FILE=""` had.
     #[serde(default)]
@@ -361,6 +361,22 @@ pub struct JobsConfig {
     /// Explicit ffprobe executable; same default chain as `ffmpeg`.
     #[serde(default)]
     pub ffprobe: Option<PathBuf>,
+    /// Explicit pdfium dynamic library path (file or containing directory)
+    /// for PDF thumbnails/extraction. Default: the executable's directory,
+    /// the working directory, then the system library. Empty string = unset
+    /// (the shipped configs template this as `${PDFIUM_PATH:-}`).
+    #[serde(default)]
+    pub pdfium: Option<PathBuf>,
+    /// Explicit Chromium-family browser executable for headless HTML
+    /// thumbnails. Default: well-known Edge/Chrome/Chromium install paths.
+    /// Empty string = unset (templated as `${HTML_RENDERER_PATH:-}`).
+    #[serde(default)]
+    pub html_renderer: Option<PathBuf>,
+    /// Explicit TTF font file for thumbnail text labels. Default:
+    /// well-known system fonts (Segoe UI/Arial/DejaVu). Empty string =
+    /// unset (templated as `${PANOPTIKON_FONT:-}`).
+    #[serde(default)]
+    pub thumbnail_font: Option<PathBuf>,
 }
 
 fn default_loader_concurrency() -> usize {
@@ -384,6 +400,9 @@ impl Default for JobsConfig {
             image_decode_memory_limit_mb: default_image_decode_memory_limit_mb(),
             ffmpeg: None,
             ffprobe: None,
+            pdfium: None,
+            html_renderer: None,
+            thumbnail_font: None,
         }
     }
 }
@@ -404,6 +423,9 @@ pub struct RuntimeConfig {
     pub open: OpenConfig,
     pub ffmpeg: Option<PathBuf>,
     pub ffprobe: Option<PathBuf>,
+    pub pdfium: Option<PathBuf>,
+    pub html_renderer: Option<PathBuf>,
+    pub thumbnail_font: Option<PathBuf>,
     /// The venv interpreter `media_tools` probes for static-ffmpeg —
     /// the same one that runs inference workers.
     pub venv_python: PathBuf,
@@ -422,6 +444,9 @@ impl Default for RuntimeConfig {
             open: OpenConfig::default(),
             ffmpeg: None,
             ffprobe: None,
+            pdfium: None,
+            html_renderer: None,
+            thumbnail_font: None,
             venv_python: crate::resources::default_worker_python(
                 crate::resources::py_source_mode(),
             ),
@@ -486,6 +511,9 @@ impl Settings {
             open: self.open.clone(),
             ffmpeg: self.jobs.ffmpeg.clone(),
             ffprobe: self.jobs.ffprobe.clone(),
+            pdfium: self.jobs.pdfium.clone(),
+            html_renderer: self.jobs.html_renderer.clone(),
+            thumbnail_font: self.jobs.thumbnail_font.clone(),
             venv_python: self.inference_local.resolved_python(),
         }
     }
@@ -794,10 +822,11 @@ impl Settings {
             builder = builder.add_source(source);
         }
         let builder =
-            builder.add_source(config::Environment::with_prefix("GATEWAY").separator("__"));
+            builder.add_source(config::Environment::with_prefix("PANOPTIKON").separator("__"));
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
         settings.apply_env_overrides()?;
+        settings.normalize_empty_tool_paths();
         let loopback_synthesized = settings.apply_inference_default();
         settings.validate(loopback_synthesized)?;
         Ok(settings)
@@ -820,36 +849,54 @@ impl Settings {
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
-        if let Ok(value) = env::var("GATEWAY__SERVER_HOST") {
+        if let Ok(value) = env::var("PANOPTIKON__SERVER_HOST") {
             self.server.host = value;
         }
-        if let Ok(value) = env::var("GATEWAY__SERVER_PORT") {
+        if let Ok(value) = env::var("PANOPTIKON__SERVER_PORT") {
             self.server.port = value
                 .parse()
-                .context("GATEWAY__SERVER_PORT must be a valid u16")?;
+                .context("PANOPTIKON__SERVER_PORT must be a valid u16")?;
         }
-        if let Ok(value) = env::var("GATEWAY__SERVER_TRUST_FORWARDED_HEADERS") {
+        if let Ok(value) = env::var("PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS") {
             self.server.trust_forwarded_headers = value
                 .parse()
-                .context("GATEWAY__SERVER_TRUST_FORWARDED_HEADERS must be a boolean")?;
+                .context("PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS must be a boolean")?;
         }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_UI") {
+        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_UI") {
             self.upstreams.ui.base_url = value;
         }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_UI_LOCAL") {
+        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_UI_LOCAL") {
             self.upstreams.ui.local = value
                 .parse()
-                .context("GATEWAY__UPSTREAM_UI_LOCAL must be a boolean")?;
+                .context("PANOPTIKON__UPSTREAM_UI_LOCAL must be a boolean")?;
         }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_API") {
+        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_API") {
             self.upstreams.api.base_url = value;
         }
-        if let Ok(value) = env::var("GATEWAY__UPSTREAM_API_LOCAL") {
+        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_API_LOCAL") {
             self.upstreams.api.local = value
                 .parse()
-                .context("GATEWAY__UPSTREAM_API_LOCAL must be a boolean")?;
+                .context("PANOPTIKON__UPSTREAM_API_LOCAL must be a boolean")?;
         }
         Ok(())
+    }
+
+    /// Empty-string tool paths mean "unset": the shipped configs template
+    /// these keys as `${VAR:-}`, which substitutes to `""` when the
+    /// variable is not set, and an empty path must behave exactly like an
+    /// absent key (fall through to the built-in search order).
+    fn normalize_empty_tool_paths(&mut self) {
+        for slot in [
+            &mut self.jobs.ffmpeg,
+            &mut self.jobs.ffprobe,
+            &mut self.jobs.pdfium,
+            &mut self.jobs.html_renderer,
+            &mut self.jobs.thumbnail_font,
+        ] {
+            if slot.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+                *slot = None;
+            }
+        }
     }
 
     /// `loopback_synthesized` is true when `apply_inference_default` just
@@ -1202,7 +1249,7 @@ fn loopback_host(host: &str) -> &str {
 
 fn default_config_path() -> Result<PathBuf> {
     let cwd = env::current_dir().context("failed to resolve current directory")?;
-    Ok(cwd.join("config").join("gateway").join("default.toml"))
+    Ok(cwd.join("config").join("server").join("default.toml"))
 }
 
 /// Read the settings file, run env templating over its parsed string values
@@ -2118,21 +2165,21 @@ image_decode_memory_limit_mb = 2048
         assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
     }
 
-    /// The GATEWAY__ env override layer covers the new keys too, both
-    /// top-level (GATEWAY__DATA_FOLDER) and nested (GATEWAY__LOGGING__LEVEL).
+    /// The PANOPTIKON__ env override layer covers the new keys too, both
+    /// top-level (PANOPTIKON__DATA_FOLDER) and nested (PANOPTIKON__LOGGING__LEVEL).
     #[test]
-    fn gateway_env_overrides_cover_new_keys() {
+    fn panoptikon_env_overrides_cover_new_keys() {
         let _guard = env_lock();
         unsafe {
-            env::set_var("GATEWAY__DATA_FOLDER", "env_data");
-            env::set_var("GATEWAY__READONLY", "true");
-            env::set_var("GATEWAY__LOGGING__LEVEL", "trace");
+            env::set_var("PANOPTIKON__DATA_FOLDER", "env_data");
+            env::set_var("PANOPTIKON__READONLY", "true");
+            env::set_var("PANOPTIKON__LOGGING__LEVEL", "trace");
         }
         let settings = load_from(MINIMAL);
         unsafe {
-            env::remove_var("GATEWAY__DATA_FOLDER");
-            env::remove_var("GATEWAY__READONLY");
-            env::remove_var("GATEWAY__LOGGING__LEVEL");
+            env::remove_var("PANOPTIKON__DATA_FOLDER");
+            env::remove_var("PANOPTIKON__READONLY");
+            env::remove_var("PANOPTIKON__LOGGING__LEVEL");
         }
         let settings = settings.unwrap();
         assert_eq!(settings.data_folder, PathBuf::from("env_data"));
@@ -2204,7 +2251,7 @@ file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
         let config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("config")
-            .join("gateway");
+            .join("server");
 
         for file in ["default.toml", "local.toml"] {
             unsafe { env::remove_var("LOGLEVEL") };

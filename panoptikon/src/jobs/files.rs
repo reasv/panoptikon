@@ -1991,8 +1991,8 @@ fn pdfium() -> Option<&'static Pdfium> {
     PDFIUM
         .get_or_init(|| {
             let mut candidates: Vec<PathBuf> = Vec::new();
-            if let Ok(custom) = env::var("PDFIUM_PATH") {
-                candidates.push(PathBuf::from(custom));
+            if let Some(custom) = &crate::config::runtime().pdfium {
+                candidates.push(custom.clone());
             }
             if let Some(exe_dir) = env::current_exe()
                 .ok()
@@ -2092,8 +2092,8 @@ fn html_renderer() -> Option<&'static PathBuf> {
     HTML_RENDERER
         .get_or_init(|| {
             let mut candidates: Vec<PathBuf> = Vec::new();
-            if let Ok(custom) = env::var("HTML_RENDERER_PATH") {
-                candidates.push(PathBuf::from(custom));
+            if let Some(custom) = &crate::config::runtime().html_renderer {
+                candidates.push(custom.clone());
             }
             candidates.extend(
                 [
@@ -2327,8 +2327,8 @@ fn label_font() -> Option<&'static FontVec> {
     LABEL_FONT
         .get_or_init(|| {
             let mut candidates: Vec<PathBuf> = Vec::new();
-            if let Ok(custom) = env::var("PANOPTIKON_FONT") {
-                candidates.push(PathBuf::from(custom));
+            if let Some(custom) = &crate::config::runtime().thumbnail_font {
+                candidates.push(custom.clone());
             }
             candidates.extend(
                 [

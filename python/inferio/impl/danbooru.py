@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -210,12 +209,17 @@ class DanbooruTagger(InferenceModel):
         """
         :param sauce_nao_enabled: Fall back to SauceNAO for images not found
             on Danbooru by md5.
-        :param api_key: SauceNAO API key. Falls back to the SAUCENAO_API_KEY
-            environment variable when not given (registry configs can set
-            `config.api_key = "${SAUCENAO_API_KEY}"` to pass it explicitly).
+        :param api_key: SauceNAO API key. Configuration reaches this impl
+            only through registry config kwargs; the shipped registry
+            templates it as `config.api_key = "${SAUCENAO_API_KEY:-}"`, so
+            the env var feeds it via TOML templating. An empty string means
+            "not configured" (what the `${VAR:-}` template yields when the
+            variable is unset).
         """
         self.sauce_nao_enabled: bool = sauce_nao_enabled
-        self.api_key: Optional[str] = api_key
+        # Falsy values ("" from an unset ${VAR:-} template, None) mean
+        # "not configured".
+        self.api_key: Optional[str] = api_key or None
         self._model_loaded: bool = False
         self.saucenao_daily_limit_reached: bool = False
         self.limit_reached_time: Optional[float] = None
@@ -228,16 +232,14 @@ class DanbooruTagger(InferenceModel):
     def load(self):
         self._model_loaded = True
 
-    def _resolve_api_key(self) -> Optional[str]:
-        return self.api_key or os.getenv("SAUCENAO_API_KEY")
-
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
 
-        if self.sauce_nao_enabled and not self._resolve_api_key():
+        if self.sauce_nao_enabled and not self.api_key:
             raise ValueError(
-                "A SauceNAO API key (api_key config option or SAUCENAO_API_KEY "
-                "environment variable) must be set for SauceNAO search"
+                "A SauceNAO API key (the api_key config option; the shipped "
+                "registry fills it from the SAUCENAO_API_KEY environment "
+                "variable) must be set for SauceNAO search"
             )
         
         self.reset_limit_reached()
@@ -288,8 +290,8 @@ class DanbooruTagger(InferenceModel):
             # If SauceNAO is enabled, try to find the image on SauceNAO for any None results
             # Due to SauceNAO's low rate limit, we do not use it concurrently
             final_results: List[dict] = []
-            sauce_nao_key = self._resolve_api_key()
-            assert sauce_nao_key, "A SauceNAO API key (api_key config option or SAUCENAO_API_KEY environment variable) must be set for SauceNAO search"
+            sauce_nao_key = self.api_key
+            assert sauce_nao_key, "A SauceNAO API key (the api_key config option) must be set for SauceNAO search"
             for i, result in enumerate(results):
                 if result is not None:
                     # Already found on Danbooru, add to final results

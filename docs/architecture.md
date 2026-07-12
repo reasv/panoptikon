@@ -55,8 +55,8 @@ TOML with env templating is THE configuration mechanism (see
 escapes. Applied to the server config and every inference registry TOML —
 secrets reach inference impls via inference-ID `config.*` kwargs, never via a
 special env-passing channel. `.env` is auto-loaded as a convenience source for
-template variables. Bootstrap/diagnostic env vars (`GATEWAY_CONFIG_PATH`,
-`RUST_LOG`, `GATEWAY__*` overrides) are the documented exceptions.
+template variables. Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`,
+`RUST_LOG`, `PANOPTIKON__*` overrides) are the documented exceptions.
 
 ### Policy-scoped SSR
 
@@ -70,7 +70,7 @@ browser request's authority, not the UI server's network position. Invalid
 or absent tokens fall back to normal selection, so the SSR's API base URL
 should point at the most restricted listener. At the same choke point all
 other inbound `x-panoptikon-*` headers are stripped (except
-`x-panoptikon-gateway-hops`, the self-proxy loop guard, which must survive
+`x-panoptikon-hops`, the self-proxy loop guard, which must survive
 gateway→gateway forwarding). `GET /api/client-config` — exempt from ruleset
 enforcement by design — tells any client its matched policy, capability
 booleans derived from the policy's ruleset via probe routes, and the

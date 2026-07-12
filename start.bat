@@ -5,4 +5,4 @@ if not exist target\release\panoptikon.exe (
     echo Build it first with: cargo build --release -p panoptikon
     exit /b 1
 )
-target\release\panoptikon.exe --config config\gateway\local.toml %*
+target\release\panoptikon.exe --config config\server\local.toml %*

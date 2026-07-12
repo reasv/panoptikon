@@ -8,7 +8,7 @@ enforcement, and structured logging.
 
 ## Where it fits
 
-In the standard local setup (`config/gateway/local.toml`) the binary serves
+In the standard local setup (`config/server/local.toml`) the binary serves
 everything itself:
 
 - Every `/api` route is handled in-process (`upstreams.api.local = true`).
@@ -50,7 +50,7 @@ determined by the TCP listener, so unlike `Host` matching it cannot be
 influenced by request headers and works with plain local ports. A typical
 use is a second loopback port whose policy defaults to (and is locked to) a
 dedicated test DB — anything pointed at that port operates on the test DB
-with no manual selection (`config/gateway/local.toml` ships this setup on
+with no manual selection (`config/server/local.toml` ships this setup on
 port 6343). All listeners are bound before serving starts; if any bind
 fails, startup fails.
 
@@ -140,7 +140,7 @@ set by the gateway itself. Two exceptions:
 
 - `x-panoptikon-policy` is verified first, then consumed — it never travels
   upstream or into local handlers, valid or not.
-- `x-panoptikon-gateway-hops` is **preserved** with its inbound value
+- `x-panoptikon-hops` is **preserved** with its inbound value
   intact: it counts how many panoptikon gateways a request has passed
   through and is the self-proxy loop guard (`MAX_PROXY_HOPS` in proxy.rs,
   added after the 2026-07-07 port-exhaustion incident). Legitimate
@@ -388,7 +388,7 @@ for it and the lock excludes it) — setup fails fast there.
 A machine that only lends its GPU can run the standalone service:
 
 ```bash
-cargo run -p panoptikon -- inferio --config config\gateway\default.toml
+cargo run -p panoptikon -- inferio --config config\server\default.toml
 ```
 
 This starts only `/api/inference/*` plus `GET /health` — no proxy, local API,
@@ -470,7 +470,7 @@ UI first — it is stateless.
   `Scripts/node.exe` / `bin/node` launcher stub), then `node` from PATH.
 - `build` (default `"auto"`): `"auto"` | `"always"` | `"never"`.
 
-`config/gateway/local.toml` is a ready-made local rust-only production
+`config/server/local.toml` is a ready-made local rust-only production
 config (local API + local inference + local UI); `start.bat` / `start.sh` at
 the repo root runs the release binary with it.
 
@@ -486,7 +486,7 @@ Plain builds read the source tree exactly as documented everywhere else in
 this file. Release builds enable cargo features that embed the runtime
 resources into the binary (docs/architecture.md "Self-contained releases"):
 
-- **`bundled`** embeds the default configs (`config/gateway/default.toml`,
+- **`bundled`** embeds the default configs (`config/server/default.toml`,
   `config/inference/example.toml`) and the Python source set
   (`python/inferio_worker`, `python/inferio`, `pyproject.toml`, `uv.lock` —
   no tests, no venv, no bytecode caches) as a compressed archive.
@@ -507,7 +507,7 @@ resources into the binary (docs/architecture.md "Self-contained releases"):
 First run of a `bundled` binary materializes what is missing — loudly, in
 the log:
 
-- No `config/gateway/default.toml` (and no `--config`/`GATEWAY_CONFIG_PATH`
+- No `config/server/default.toml` (and no `--config`/`PANOPTIKON_CONFIG_PATH`
   pointing elsewhere): the embedded default configs are written to
   `config/`. Each file is written only if absent and **never overwritten** —
   they are user-owned from then on.
@@ -554,8 +554,8 @@ panoptikon setup --root D:/panoptikon-home --accelerator cpu
 ## Configuration
 
 All global configuration is TOML. The gateway reads
-`[cwd]/config/gateway/default.toml`; override the path with `--config` or the
-`GATEWAY_CONFIG_PATH` environment variable. Environment variables are **not**
+`[cwd]/config/server/default.toml`; override the path with `--config` or the
+`PANOPTIKON_CONFIG_PATH` environment variable. Environment variables are **not**
 a parallel configuration mechanism: they feed TOML values through templating
 (below), plus a small keep-list of bootstrap/diagnostic variables.
 
@@ -591,8 +591,8 @@ The forms follow the shell / docker-compose conventions:
 
 Substitution runs on *parsed* string values, so env values containing
 backslashes or quotes (Windows paths) cannot corrupt the TOML. Only strings
-can be templated — for numeric/boolean keys use the `GATEWAY__*` override
-layer instead. Values arriving through the `GATEWAY__*` override layer are
+can be templated — for numeric/boolean keys use the `PANOPTIKON__*` override
+layer instead. Values arriving through the `PANOPTIKON__*` override layer are
 **not** templated: overrides are applied after substitution and are taken
 literally (they already come from the environment). Registry TOMLs are
 re-substituted on every mtime-gated reload. Per-DB system configs
@@ -605,7 +605,7 @@ processes (inference workers, the UI server) inherit them.
 
 ### Settings
 
-Create `config/gateway/default.toml`:
+Create `config/server/default.toml`:
 
 ```toml
 # Top level (all optional):
@@ -617,7 +617,7 @@ Create `config/gateway/default.toml`:
                              #   not derived from data_folder)
 
 [logging]
-# file = ""                  # default: <data_folder>/panoptikon-gateway.log;
+# file = ""                  # default: <data_folder>/panoptikon.log;
                              #   explicit "" disables file logging
 level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 
@@ -668,6 +668,13 @@ embedding_cache_size = 16
 # loader_concurrency = 8
 # intermediate_data_budget_mb = 1024
 # atomic_extraction_jobs = false  # delete (not fail) incomplete jobs at start
+# Explicit tool paths; empty string = unset (use the built-in search order).
+# The shipped configs template these from env, e.g. "${PDFIUM_PATH:-}".
+# ffmpeg = ""          # video/audio processing (default: venv static-ffmpeg, PATH)
+# ffprobe = ""
+# pdfium = ""          # pdfium dynamic library (PDF thumbnails/extraction)
+# html_renderer = ""   # Chromium-family browser (HTML thumbnails)
+# thumbnail_font = ""  # TTF font for thumbnail text labels
 
 [rulesets.allow_all]
 allow_all = true
@@ -697,55 +704,58 @@ Registry/impl directory resolution for local inference is configured only by
 
 These are deliberately *not* TOML keys:
 
-- `GATEWAY_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
+- `PANOPTIKON_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
   live inside it. (`--config` wins over it.)
 - `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
   set and supports per-module directives.
-- `GATEWAY__*` — generic config override layer (see below); works for every
-  key, including the new ones (e.g. `GATEWAY__DATA_FOLDER`,
-  `GATEWAY__LOGGING__LEVEL`, `GATEWAY__READONLY`).
+- `PANOPTIKON__*` — generic config override layer (see below); works for every
+  key, including the new ones (e.g. `PANOPTIKON__DATA_FOLDER`,
+  `PANOPTIKON__LOGGING__LEVEL`, `PANOPTIKON__READONLY`).
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
   `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
   inheritance — workers and the UI server see the gateway's env (and thus
   `.env`), unfiltered.
-- Dev/diagnostic overrides for bundled native dependencies: `PDFIUM_PATH`,
-  `HTML_RENDERER_PATH`, `PANOPTIKON_FONT`; `PANOPTIKON_TEST_PYTHON` is
-  test-only.
+- `PANOPTIKON_TEST_PYTHON` — test-only (points the inferio worker tests at
+  an interpreter).
 
 The former `DATA_FOLDER`, `INDEX_DB`, `USER_DATA_DB`, `READONLY`, `TEMP_DIR`,
 `LOGLEVEL`, `LOGS_FILE`, `OPEN_FILE_COMMAND`, `SHOW_IN_FM_COMMAND`,
 `ATOMIC_EXTRACTION_JOBS`, `INFERIO_CONFIG_DIR`, `BASE_INFERENCE_CONFIG_FOLDER`
 and `INFERIO_CUSTOM_IMPL_PATH` env vars are no longer read: use the TOML keys
-(templated from env if desired, e.g. `level = "${LOGLEVEL:-INFO}"`).
+(templated from env if desired, e.g. `level = "${LOGLEVEL:-INFO}"`). The
+same goes for `PDFIUM_PATH`, `HTML_RENDERER_PATH` and `PANOPTIKON_FONT`:
+they became the `[jobs]` keys `pdfium`, `html_renderer` and
+`thumbnail_font`, which the shipped configs template as `${PDFIUM_PATH:-}`
+etc., so setting the variables in `.env` still works — through the
+templating layer, not a direct read.
 
-### GATEWAY__ overrides
+### PANOPTIKON__ overrides
 
-Environment variables with the `GATEWAY__` prefix override the file:
+Environment variables with the `PANOPTIKON__` prefix override the file:
 
 ```bash
-GATEWAY_CONFIG_PATH=config\gateway\default.toml
-GATEWAY__SERVER_HOST=0.0.0.0
-GATEWAY__SERVER_PORT=8080
-GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
-GATEWAY__UPSTREAM_UI=http://127.0.0.1:6340
-GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
-GATEWAY__UPSTREAM_API_LOCAL=false
-GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
+PANOPTIKON_CONFIG_PATH=config\server\default.toml
+PANOPTIKON__SERVER_HOST=0.0.0.0
+PANOPTIKON__SERVER_PORT=8080
+PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS=false
+PANOPTIKON__UPSTREAM_UI=http://127.0.0.1:6340
+PANOPTIKON__UPSTREAM_API=http://127.0.0.1:6342
+PANOPTIKON__UPSTREAM_API_LOCAL=false
+PANOPTIKON__SEARCH__EMBEDDING_CACHE_SIZE=16
 ```
 
 CLI override example:
 
 ```bash
-cargo run -p panoptikon -- --config config\gateway\userconfig.toml
+cargo run -p panoptikon -- --config config\server\userconfig.toml
 ```
 
 ## Logging and shutdown
 
 Log output goes to the console and, by default, to
-`<data_folder>/panoptikon-gateway.log` (append; the name is distinct from the
-Python server's `panoptikon.log` so the two processes never interleave one
-file). `[logging].file` overrides the path; setting it to an empty string
+`<data_folder>/panoptikon.log` (append).
+`[logging].file` overrides the path; setting it to an empty string
 disables file logging. `[logging].level` sets the default level; `RUST_LOG`
 takes precedence when set and supports per-module directives.
 
@@ -760,18 +770,18 @@ SQLite transaction, which rolls back on next open.
 The nested style supported by the config crate also works:
 
 ```bash
-GATEWAY__SERVER__HOST=0.0.0.0
-GATEWAY__SERVER__PORT=8080
-GATEWAY__SERVER__TRUST_FORWARDED_HEADERS=false
-GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6340
-GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
-GATEWAY__UPSTREAMS__API__LOCAL=false
-GATEWAY__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342
-GATEWAY__UPSTREAMS__INFERENCE__0__WEIGHT=1.0
-GATEWAY__UPSTREAMS__INFERENCE__0__USE_FOR_JOBS=true
-GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
-GATEWAY__DATA_FOLDER=data
-GATEWAY__LOGGING__LEVEL=debug
+PANOPTIKON__SERVER__HOST=0.0.0.0
+PANOPTIKON__SERVER__PORT=8080
+PANOPTIKON__SERVER__TRUST_FORWARDED_HEADERS=false
+PANOPTIKON__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6340
+PANOPTIKON__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
+PANOPTIKON__UPSTREAMS__API__LOCAL=false
+PANOPTIKON__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342
+PANOPTIKON__UPSTREAMS__INFERENCE__0__WEIGHT=1.0
+PANOPTIKON__UPSTREAMS__INFERENCE__0__USE_FOR_JOBS=true
+PANOPTIKON__SEARCH__EMBEDDING_CACHE_SIZE=16
+PANOPTIKON__DATA_FOLDER=data
+PANOPTIKON__LOGGING__LEVEL=debug
 ```
 
 ## Running locally

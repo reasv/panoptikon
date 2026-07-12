@@ -141,17 +141,23 @@ def test_clip_model_runs_text_and_image(model_cache_env):
 
 
 @pytest.mark.integration
-def test_jina_clip_model_runs_if_api_key_present(model_cache_env, monkeypatch):
+def test_jina_clip_model_runs_if_api_key_present(model_cache_env):
     if not os.environ.get("JINA_API_KEY"):
         pytest.skip("JINA_API_KEY not set")
 
     from inferio.impl.jina_clip import JinaClipModel
     from inferio.inferio_types import PredictionInput
 
-    monkeypatch.setenv("JINA_MAX_RETRIES", "1")
-    monkeypatch.setenv("JINA_TIMEOUT", "30")
-
-    model = JinaClipModel(model_name="jina-clip-v2", dimensions=1024, normalized=True)
+    # The impl no longer reads env vars itself: everything arrives as
+    # config kwargs (in production, via registry TOML env templating).
+    model = JinaClipModel(
+        model_name="jina-clip-v2",
+        api_key=os.environ["JINA_API_KEY"],
+        max_retries=1,
+        timeout=30,
+        dimensions=1024,
+        normalized=True,
+    )
     image_bytes = _make_test_image_bytes()
     outputs = _predict_and_unload(
         model,

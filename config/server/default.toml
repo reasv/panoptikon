@@ -1,5 +1,5 @@
-# Panoptikon Gateway default configuration
-# The Gateway loads [cwd]/config/gateway/default.toml by default.
+# Panoptikon server default configuration
+# The server loads [cwd]/config/server/default.toml by default.
 #
 # --------- Environment variable templating ---------
 # String values may reference environment variables (populated e.g. via the
@@ -16,8 +16,8 @@
 #
 # Substitution runs on parsed string values (backslashes in env values are
 # safe) and applies to this file and to every inference registry TOML.
-# Numbers/booleans cannot be templated; use the GATEWAY__* env override
-# layer for those (e.g. GATEWAY__SERVER__PORT=8080). GATEWAY__* override
+# Numbers/booleans cannot be templated; use the PANOPTIKON__* env override
+# layer for those (e.g. PANOPTIKON__SERVER__PORT=8080). PANOPTIKON__* override
 # values themselves are never templated — they are taken literally.
 
 # Root folder for all persistent state (index DBs, user data, thumbnails,
@@ -38,7 +38,7 @@
 # temp_dir = "data/tmp"
 
 [logging]
-# Log file path. Default: <data_folder>/panoptikon-gateway.log.
+# Log file path. Default: <data_folder>/panoptikon.log.
 # An explicit empty string ("") disables file logging (console only).
 # file = ""
 # Default log level / tracing filter. The RUST_LOG environment variable
@@ -115,8 +115,17 @@ enabled = true
 # Size of the in-process embedding cache used by search preprocessing.
 embedding_cache_size = 16
 
-# Host-resource limits for scan/extraction jobs.
-# [jobs]
+# Host-resource limits and external tools for scan/extraction jobs.
+[jobs]
+# Explicit paths to bundled native dependencies. Empty means "unset": the
+# built-in search order applies (pdfium: exe dir, CWD, system library;
+# html_renderer: well-known Edge/Chrome/Chromium paths; thumbnail_font:
+# well-known system fonts). The ${VAR:-} templates keep .env-based
+# overrides working.
+pdfium = "${PDFIUM_PATH:-}"                 # pdfium dynamic library (PDF thumbnails)
+html_renderer = "${HTML_RENDERER_PATH:-}"   # Chromium-family browser (HTML thumbnails)
+thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
+# Other keys (all optional):
 # Concurrent extraction input loaders (decode processes and file reads).
 # loader_concurrency = 8
 # Cap in MiB on loaded-but-unfinished intermediate input data (frames,

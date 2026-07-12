@@ -1,4 +1,3 @@
-import os
 import base64
 import json
 import numpy as np
@@ -34,27 +33,29 @@ class JinaClipModel(InferenceModel):
     ):
         """
         :param model_name: Name of the Jina model to use, e.g. "jina-clip-v2".
-        :param api_key: Jina API key. Falls back to the JINA_API_KEY
-            environment variable when not given (registry configs can set
-            `config.api_key = "${JINA_API_KEY}"` to pass it explicitly).
-        :param max_retries: Retry count for the API request. Falls back to
-            the JINA_MAX_RETRIES environment variable, then 3.
-        :param timeout: Request timeout in seconds (0 disables). Falls back
-            to the JINA_TIMEOUT environment variable, then no timeout.
+        :param api_key: Jina API key. Configuration reaches this impl only
+            through registry config kwargs; the shipped registry templates
+            it as `config.api_key = "${JINA_API_KEY:-}"`, so the env var
+            feeds it via TOML templating. An empty string means "not
+            configured" (that is what the `${VAR:-}` template yields when
+            the variable is unset).
+        :param max_retries: Retry count for the API request. Default: 3.
+        :param timeout: Request timeout in seconds (0 or empty disables).
         :param dimensions: The number of dimensions in the returned embeddings.
         :param normalized: Whether or not the embeddings should be normalized.
         :param embedding_type: The numeric type of the embeddings: "float" or "int".
         """
         self.model_name = model_name
-        self.api_key = api_key
-        self.max_retries = max_retries
-        self.timeout = timeout
+        # Falsy values ("" from an unset ${VAR:-} template, None) mean
+        # "not configured".
+        self.api_key = api_key or None
+        self.max_retries = (
+            int(max_retries) if max_retries not in (None, "") else 3
+        )
+        self.timeout = (int(timeout) if timeout not in (None, "") else 0) or None
         self.model_config = kwargs
 
         self._model_loaded: bool = False
-
-    def _resolve_api_key(self) -> Union[str, None]:
-        return self.api_key or os.environ.get("JINA_API_KEY")
 
     @classmethod
     def name(cls) -> str:
@@ -63,18 +64,18 @@ class JinaClipModel(InferenceModel):
     def load(self) -> None:
         """
         Jina doesn't require a local model load. Instead, we only check if
-        the API key environment variable is available.
+        the API key is configured.
         """
         if self._model_loaded:
             return
 
-        # Ensure an API key is available (config kwarg or env var)
-        api_key = self._resolve_api_key()
-        if not api_key:
+        # Ensure an API key is configured (the shipped registry templates
+        # the api_key config option from the JINA_API_KEY env var).
+        if not self.api_key:
             raise EnvironmentError(
-                "No Jina API key found. Set the api_key config option or "
-                "the JINA_API_KEY environment variable before using "
-                "JinaClipModel."
+                "No Jina API key found. Set the api_key config option "
+                "(the shipped registry fills it from the JINA_API_KEY "
+                "environment variable) before using JinaClipModel."
             )
 
         self._model_loaded = True
@@ -140,7 +141,7 @@ class JinaClipModel(InferenceModel):
             return []
 
         # Make the request
-        api_key = self._resolve_api_key()  # already checked in load()
+        api_key = self.api_key  # already checked in load()
         url = "https://api.jina.ai/v1/embeddings"
         headers = {
             "Content-Type": "application/json",
@@ -153,21 +154,10 @@ class JinaClipModel(InferenceModel):
             "input": jina_input,
         }
 
-        # Attempt the request up to 3 times if we detect
+        # Attempt the request up to max_retries times if we detect
         # network failures or 5xx server errors
-        max_retries = int(
-            self.max_retries
-            if self.max_retries is not None
-            else os.environ.get("JINA_MAX_RETRIES", 3)
-        )
-        timeout = (
-            int(
-                self.timeout
-                if self.timeout is not None
-                else os.environ.get("JINA_TIMEOUT", 0)
-            )
-            or None
-        )
+        max_retries = self.max_retries
+        timeout = self.timeout
         response = None
         for attempt in range(max_retries):
             try:

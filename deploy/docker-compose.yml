@@ -21,10 +21,10 @@
 #         proxy before exposing it beyond your LAN.
 #
 # Configuration lives on the panoptikon-config volume (seeded from the image
-# on first run): edit config/gateway/docker.toml on it and restart. The image
+# on first run): edit config/server/docker.toml on it and restart. The image
 # ships no editor; use a throwaway container, e.g.
 #   docker run --rm -it -v panoptikon_panoptikon-config:/cfg debian \
-#     sh -c 'apt-get update -qq && apt-get install -y -qq nano && nano /cfg/gateway/docker.toml'
+#     sh -c 'apt-get update -qq && apt-get install -y -qq nano && nano /cfg/server/docker.toml'
 
 services:
   panoptikon:

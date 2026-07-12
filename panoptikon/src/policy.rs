@@ -370,7 +370,7 @@ fn consume_policy_token<'a>(
 /// Strip inbound `x-panoptikon-*` headers from client requests at the
 /// policy-layer choke point, so gateway-internal metadata can only ever be
 /// set by the gateway itself. One deliberate exemption:
-/// `x-panoptikon-gateway-hops` is PRESERVED — it counts how many panoptikon
+/// `x-panoptikon-hops` is PRESERVED — it counts how many panoptikon
 /// gateways a request has already passed through and is the self-proxy loop
 /// guard (see proxy.rs MAX_PROXY_HOPS and the 2026-07-07 port-exhaustion
 /// incident). Legitimate gateway→gateway forwarding re-enters this layer on
@@ -1263,7 +1263,7 @@ allow = "*"
     }
 
     /// Ingress hygiene: client-supplied `x-panoptikon-*` headers are
-    /// stripped at the policy layer — except `x-panoptikon-gateway-hops`,
+    /// stripped at the policy layer — except `x-panoptikon-hops`,
     /// the self-proxy loop guard, which must survive gateway→gateway
     /// forwarding with its value intact. Unrelated headers pass through.
     #[test]
@@ -1276,7 +1276,7 @@ allow = "*"
             .header("host", "localhost")
             .header("x-panoptikon-junk", "1")
             .header("x-panoptikon-policy", "not-even-a-token")
-            .header("x-panoptikon-gateway-hops", "2")
+            .header("x-panoptikon-hops", "2")
             .header("x-unrelated", "keep")
             .body(Body::empty())
             .unwrap();
@@ -1286,7 +1286,7 @@ allow = "*"
         assert!(req.headers().get("x-panoptikon-policy").is_none());
         assert_eq!(
             req.headers()
-                .get("x-panoptikon-gateway-hops")
+                .get("x-panoptikon-hops")
                 .and_then(|value| value.to_str().ok()),
             Some("2"),
             "hop count must survive with its value intact"

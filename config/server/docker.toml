@@ -1,7 +1,7 @@
 # Panoptikon Gateway configuration for the official Docker image.
 #
-# Baked into the image at /app/config/gateway/docker.toml and selected via
-# GATEWAY_CONFIG_PATH. The compose file mounts a volume over /app/config, so
+# Baked into the image at /app/config/server/docker.toml and selected via
+# PANOPTIKON_CONFIG_PATH. The compose file mounts a volume over /app/config, so
 # this file seeds the volume on the first run and is user-owned afterwards:
 # edit it and restart the container to reconfigure. Full reference (every
 # key, templating, policies/rulesets): panoptikon/README.md.
@@ -61,6 +61,12 @@ local = true
 [jobs]
 ffmpeg = "/usr/bin/ffmpeg"
 ffprobe = "/usr/bin/ffprobe"
+# Explicit paths to bundled native dependencies. Empty means "unset": the
+# built-in search order applies. The ${VAR:-} templates let container env
+# vars override them.
+pdfium = "${PDFIUM_PATH:-}"
+html_renderer = "${HTML_RENDERER_PATH:-}"
+thumbnail_font = "${PANOPTIKON_FONT:-}"
 
 # In-process inference orchestrator. The Python environment was provisioned
 # at image build time (CPU wheels by default; the CUDA image variant is a

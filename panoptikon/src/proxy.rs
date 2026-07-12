@@ -120,7 +120,7 @@ enum UpstreamKind {
 /// gateway, so a self-referential upstream (a base_url pointing back at one
 /// of our own listeners) is cut off after a few hops instead of recursing
 /// until the ephemeral port range is exhausted.
-pub(crate) const HOP_COUNT_HEADER: &str = "x-panoptikon-gateway-hops";
+pub(crate) const HOP_COUNT_HEADER: &str = "x-panoptikon-hops";
 /// Legitimate gateway chains (e.g. forwarding inference to another
 /// machine's gateway) are one or two hops deep; anything deeper is a
 /// routing loop.
@@ -835,7 +835,7 @@ base_url = "http://127.0.0.1:6342"
         assert!(forwarded.contains("upgrade: websocket"));
         assert!(forwarded.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq=="));
         assert!(!forwarded.contains("keep-alive:"));
-        assert!(forwarded.contains("x-panoptikon-gateway-hops: 1"));
+        assert!(forwarded.contains("x-panoptikon-hops: 1"));
         assert!(forwarded.contains("x-forwarded-for: 127.0.0.1"));
 
         // Bytes flow both ways through the bridge.

@@ -1,9 +1,6 @@
 //! Console + file logging setup, configured by the `[logging]` config
 //! section: `level` sets the default level and `file` the log file path,
-//! defaulting to `<data_folder>/panoptikon-gateway.log`. The file name is
-//! gateway-specific on purpose — while the Python server still runs alongside
-//! the gateway it keeps appending to `panoptikon.log`, and two processes
-//! interleaving one file makes both unreadable. Setting `file` to an empty
+//! defaulting to `<data_folder>/panoptikon.log`. Setting `file` to an empty
 //! string disables file logging. The `RUST_LOG` env var takes precedence over
 //! `[logging].level` when set, so targeted per-module directives keep
 //! working — it is deliberately NOT absorbed into the config file.
@@ -40,7 +37,7 @@ fn logs_file_path(settings: &Settings) -> Option<PathBuf> {
     match &settings.logging.file {
         Some(value) if value.trim().is_empty() => None,
         Some(value) => Some(PathBuf::from(value)),
-        None => Some(settings.data_folder.join("panoptikon-gateway.log")),
+        None => Some(settings.data_folder.join("panoptikon.log")),
     }
 }
 
@@ -116,7 +113,7 @@ base_url = "http://127.0.0.1:6342"
 "#,
         )
         .unwrap();
-        // Settings::load reads GATEWAY__* env overrides: hold the shared
+        // Settings::load reads PANOPTIKON__* env overrides: hold the shared
         // env lock so tests mutating those vars cannot interleave.
         let settings = {
             let _env = crate::test_utils::env_lock();
@@ -129,7 +126,7 @@ base_url = "http://127.0.0.1:6342"
     }
 
     /// `[logging].file` resolution preserves the old LOGS_FILE semantics:
-    /// absent -> `<data_folder>/panoptikon-gateway.log`, explicit path ->
+    /// absent -> `<data_folder>/panoptikon.log`, explicit path ->
     /// that path, empty/blank string -> file logging disabled.
     #[test]
     fn logs_file_path_semantics() {
@@ -144,7 +141,7 @@ base_url = "http://127.0.0.1:6342"
         );
         assert_eq!(
             logs_file_path(&settings),
-            Some(PathBuf::from("d:/pan").join("panoptikon-gateway.log"))
+            Some(PathBuf::from("d:/pan").join("panoptikon.log"))
         );
 
         let settings = settings_with(

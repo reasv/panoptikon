@@ -125,7 +125,7 @@ mod tests {
     /// Settings with the shipped-config policy shapes: an allow_all
     /// "desktop" policy with a [policies.client] table, and a "demo" policy
     /// on the restricted_demo ruleset copied verbatim from
-    /// config/gateway/default.toml.
+    /// config/server/default.toml.
     fn two_policy_settings() -> Settings {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gw.toml");

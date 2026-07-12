@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /src
+# .cargo/config.toml sets LIBSQLITE3_FLAGS so the bundled SQLite includes
+# the math functions PQL's POW() expressions need.
+COPY .cargo/ .cargo/
 COPY Cargo.toml Cargo.lock ./
 COPY panoptikon/ panoptikon/
 COPY python/ python/
@@ -65,14 +68,14 @@ LABEL org.opencontainers.image.source="https://github.com/reasv/panoptikon" \
 COPY --from=rust-build /src/target/release/panoptikon /usr/local/bin/panoptikon
 
 WORKDIR /app
-COPY config/gateway/docker.toml config/gateway/docker.toml
+COPY config/server/docker.toml config/server/docker.toml
 COPY config/inference/example.toml config/inference/example.toml
 # /app/data must exist owned by the runtime user (ubuntu:24.04's built-in
 # uid-1000 `ubuntu` user): a named volume mounted there inherits this
 # ownership (Docker creates missing mountpoints as root).
 RUN mkdir -p data && chown -R ubuntu:ubuntu /app
 USER ubuntu
-ENV GATEWAY_CONFIG_PATH=/app/config/gateway/docker.toml
+ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
 
 # Provision the Python inference environment at build time so first boot is
 # fast: extracts the embedded Python source set to /app/runtime and creates
@@ -87,7 +90,7 @@ RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && rm -rf /app/runtime/venv/lib/python*/site-packages/static_ffmpeg/bin \
     && mkdir -p /home/ubuntu/.cache
 
-# 6342 private admin, 6339 public restricted (see config/gateway/docker.toml).
+# 6342 private admin, 6339 public restricted (see config/server/docker.toml).
 EXPOSE 6342 6339
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
     CMD curl -fsS http://127.0.0.1:6342/api/client-config > /dev/null || exit 1

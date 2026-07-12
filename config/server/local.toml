@@ -2,7 +2,7 @@
 # the gateway serves the API locally, runs the inferio orchestrator
 # in-process, and builds + runs the production Next.js UI itself from the
 # ui/ submodule checkout.
-# Run with: panoptikon --config config/gateway/local.toml
+# Run with: panoptikon --config config/server/local.toml
 
 [logging]
 # The .env file keeps auto-loading; LOGLEVEL set there (e.g. DEBUG) feeds
@@ -67,9 +67,15 @@ enabled = true
 # Size of the in-process embedding cache used by search preprocessing.
 embedding_cache_size = 16
 
-# Host-resource limits for scan/extraction jobs (see default.toml for the
-# full key list).
-# [jobs]
+# Host-resource limits and external tools for scan/extraction jobs (see
+# default.toml for the full key list).
+[jobs]
+# Explicit paths to bundled native dependencies. Empty means "unset": the
+# built-in search order applies. The ${VAR:-} templates keep .env-based
+# overrides working.
+pdfium = "${PDFIUM_PATH:-}"                 # pdfium dynamic library (PDF thumbnails)
+html_renderer = "${HTML_RENDERER_PATH:-}"   # Chromium-family browser (HTML thumbnails)
+thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
 # Per-image decode allocation ceiling in MiB (decompression-bomb guard;
 # legitimate very large images must fit under it). 0 = unlimited.
 # image_decode_memory_limit_mb = 8192

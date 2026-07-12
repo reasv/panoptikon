@@ -175,7 +175,7 @@ For Windows, run:
 ```
 
 Both run the release binary with the all-in-one configuration at
-`config/gateway/local.toml`: the server owns the databases, jobs, cron, and
+`config/server/local.toml`: the server owns the databases, jobs, cron, and
 inference, and serves everything — UI included — on
 **http://127.0.0.1:6342**.
 
@@ -206,7 +206,7 @@ Then open http://127.0.0.1:6342.
 A machine that only lends its GPU can run the standalone inference service:
 
 ```bash
-target/release/panoptikon inferio --config config/gateway/local.toml
+target/release/panoptikon inferio --config config/server/local.toml
 ```
 
 This serves only the inference API (`/api/inference/*`). Point other
@@ -233,20 +233,20 @@ See `config/inference/example.toml` for examples on how to add custom models fro
 ## Configuration
 
 All global configuration is TOML: the server reads
-`config/gateway/default.toml` (override with `--config` or
-`GATEWAY_CONFIG_PATH`; `config/gateway/local.toml` is the all-in-one config
+`config/server/default.toml` (override with `--config` or
+`PANOPTIKON_CONFIG_PATH`; `config/server/local.toml` is the all-in-one config
 the start scripts use). Environment variables are no longer a parallel
 configuration mechanism: string values in the TOML (and in every inference
 registry TOML) can reference environment variables with `${VAR}` /
 `${VAR:-default}` templating, and a `.env` file in the repo root is still
 auto-loaded as a convenient source for those variables (see `.env.example`).
 The remaining real environment variables are bootstrap/diagnostic:
-`GATEWAY_CONFIG_PATH`, `RUST_LOG`, and the generic `GATEWAY__*` config
+`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`, and the generic `PANOPTIKON__*` config
 override layer.
 
 See [`panoptikon/README.md`](panoptikon/README.md) for the full configuration
 reference: every key, the templating syntax, policies and rulesets, and the
-`GATEWAY__*` override forms.
+`PANOPTIKON__*` override forms.
 
 # Docker
 
@@ -282,7 +282,7 @@ compose file (e.g. `/path/to/pictures:/media/pictures:ro`), restart, then
 add the container-side paths as allowed folders in the UI and run a file
 scan. Databases, configuration, and the model cache live on named volumes
 and survive image updates; the gateway config
-(`config/gateway/docker.toml` on the config volume, seeded from the image
+(`config/server/docker.toml` on the config volume, seeded from the image
 on first run) is user-owned — edit it and restart to reconfigure.
 
 Since the server cannot open files on *your* machine from inside a
