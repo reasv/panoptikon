@@ -79,6 +79,16 @@ feeds the identical vector to both sides — as a base64 `.npy` string with
 bytes into the validated filter model for Python (whose `embed` field cannot
 be null on the wire; `set_validated(True)` skips its inference call).
 
+`image_embeddings` and `similar_to` additionally resolve per-model
+`distance_func` overrides from the inference server's metadata endpoint on
+both sides. The suite runs without an inference server, so it starts a tiny
+metadata stub (ephemeral port) that serves the discovered model groups/ids
+with no `distance_func`, points the Rust gateway at it via
+`[[upstreams.inference]]`, and patches the legacy
+`get_distance_func_override` to return `None`. "No override" matches the
+production config for every embedding model the corpus can discover; both
+sides therefore use the query's declared distance function unchanged.
+
 ## Reading the output
 
 - `PASS` — identical counts and rows (floats compared with tolerance).

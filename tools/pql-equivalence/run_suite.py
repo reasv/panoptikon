@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.server
 import io
 import json
 import math
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -85,9 +87,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_config(
-    scratch: Path, args: argparse.Namespace, readonly: bool
+    scratch: Path,
+    args: argparse.Namespace,
+    readonly: bool,
+    inference_url: str | None = None,
 ) -> Path:
     data_folder = args.data_folder.resolve().as_posix()
+    inference_upstream = (
+        f'\n[[upstreams.inference]]\nbase_url = "{inference_url}"\n'
+        if inference_url
+        else ""
+    )
     cfg = f"""\
 data_folder = "{data_folder}"
 readonly = {"true" if readonly else "false"}
@@ -103,7 +113,7 @@ local = false
 [upstreams.api]
 base_url = "http://127.0.0.1:{args.port}"
 local = true
-
+{inference_upstream}
 [inference_local]
 enabled = false
 
@@ -179,6 +189,77 @@ class Gateway:
                 self.proc.kill()
                 self.proc.wait(timeout=15)
         self.log_file.close()
+
+
+# ---------------------------------------------------------------------------
+# Inference metadata stub
+#
+# image_embeddings and similar_to resolve per-model `distance_func` overrides
+# from the inference server's metadata endpoint on both sides (Rust over
+# HTTP, legacy Python via get_model_metadata -> HTTP). The suite runs with
+# no inference server, so:
+#   - the Rust gateway gets a [[upstreams.inference]] pointing at this stub,
+#     which serves the discovered model groups/ids with NO distance_func --
+#     the production config defines distance_func for none of the embedding
+#     models the corpus can discover, so "no override" is production-faithful;
+#   - the legacy side gets get_distance_func_override patched to return None
+#     (its real implementation drags in panoptikon.data_extractors.models,
+#     whose import chain needs packages absent from the suite venv, and would
+#     then call the inference server anyway).
+# Both sides therefore use the query's declared distance function unchanged.
+
+
+def build_stub_metadata(d: dict) -> dict:
+    meta: dict = {}
+    for setter, _dim in d["text_emb"] + d["clip_emb"]:
+        group, inference_id = setter.split("/", 1)
+        entry = meta.setdefault(
+            group, {"group_metadata": {}, "inference_ids": {}}
+        )
+        entry["inference_ids"][inference_id] = {}
+    return meta
+
+
+class _MetadataStubHandler(http.server.BaseHTTPRequestHandler):
+    metadata: dict = {}
+
+    def do_GET(self):  # noqa: N802
+        if self.path.rstrip("/").endswith("/metadata"):
+            body = json.dumps(self.metadata).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def log_message(self, *args):  # silence per-request stderr noise
+        pass
+
+
+def start_metadata_stub(metadata: dict) -> tuple[http.server.ThreadingHTTPServer, str]:
+    handler = type(
+        "MetadataStubHandler", (_MetadataStubHandler,), {"metadata": metadata}
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def install_legacy_distance_override_stub() -> None:
+    from panoptikon.db.pql.filters.sortable import (
+        image_embeddings,
+        item_similarity,
+        utils,
+    )
+
+    def _no_override(model_name):  # matches production config: no override
+        return None
+
+    utils.get_distance_func_override = _no_override
+    item_similarity.get_distance_func_override = _no_override
+    image_embeddings.get_distance_func_override = _no_override
 
 
 def http_json(
@@ -1128,6 +1209,7 @@ def main() -> int:
         prepare_databases(args, scratch)
 
     conn = open_legacy_conn(args)
+    install_legacy_distance_override_stub()
     d = discover(conn)
     print(
         f"[discovery] tags={len(d['tags'])} tag_setters={d['tag_setters']} "
@@ -1141,7 +1223,8 @@ def main() -> int:
         cases = [c for c in cases if args.only in c["name"]]
     marker_to_b64, b64_to_bytes = collect_embeddings(cases, d)
 
-    cfg = write_config(scratch, args, readonly=True)
+    stub, stub_url = start_metadata_stub(build_stub_metadata(d))
+    cfg = write_config(scratch, args, readonly=True, inference_url=stub_url)
     gw = Gateway(args.rust_bin, cfg, scratch, args.port)
     report = {"cases": [], "meta": {
         "data_folder": str(args.data_folder.resolve()),
@@ -1211,6 +1294,7 @@ def main() -> int:
             )
     finally:
         gw.stop()
+        stub.shutdown()
         conn.close()
 
     report["tally"] = tally
