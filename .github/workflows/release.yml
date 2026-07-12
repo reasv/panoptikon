@@ -1,8 +1,10 @@
 # Release builds: triggered ONLY by version tags (vX.Y.Z), never per-push.
 # Builds a self-contained binary per platform (--features bundled,bundled-ui),
 # smoke-tests each artifact against the ci-fixture release asset (generated
-# locally by .github/scripts/generate_ci_fixture.ps1), and attaches the artifacts to
-# a draft GitHub release for the tag.
+# locally by .github/scripts/generate_ci_fixture.ps1), and attaches the
+# artifacts to a published GitHub release for the tag. In parallel, the
+# docker job builds the container image, smoke-tests it, and pushes it to
+# ghcr.io (it never gates the binary release).
 
 name: Release
 
@@ -252,6 +254,142 @@ jobs:
           name: dist-${{ matrix.label }}
           path: dist/*
           if-no-files-found: error
+
+  # Docker image: build, smoke-test the container, push to GHCR. Runs in
+  # parallel with the binary matrix and does NOT gate the release publish —
+  # a docker-only failure must never block the binary release.
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # linux/amd64 only: the Python inference lockfile excludes
+      # linux/aarch64 (no triton wheels), and a QEMU cross-build of the
+      # Rust binary + multi-GB venv would multiply CI time for nothing.
+      - name: Build image
+        run: docker build -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest" .
+
+      # Same spirit as the binary smoke test: boot the container with the
+      # fixture DB mounted as the data volume, then assert the API and the
+      # embedded UI respond on both listeners, the public listener is
+      # actually restricted, and (when the fixture is available) that
+      # scan/search/thumbnail work end to end — the search going through the
+      # PUBLIC listener to exercise the restricted ruleset's allow side.
+      - name: Smoke test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SMOKE="$RUNNER_TEMP/docker-smoke"
+          mkdir -p "$SMOKE/fixture/files"
+          HAVE_FIXTURE=0
+          if gh release download ci-fixture --pattern fixture.tar.gz --dir "$SMOKE"; then
+            tar -xzf "$SMOKE/fixture.tar.gz" -C "$SMOKE/fixture"
+            HAVE_FIXTURE=1
+          else
+            echo "::warning::ci-fixture release asset not found - running boot-only container smoke test"
+          fi
+          # The container runs as uid 1000; the runner user is not — the
+          # mounted data dir must be writable (scan results, thumbnails).
+          chmod -R a+rwX "$SMOKE/fixture"
+
+          docker run -d --name smoke \
+            -p 127.0.0.1:6342:6342 -p 127.0.0.1:6339:6339 \
+            -v "$SMOKE/fixture:/app/data" \
+            "$IMAGE:$GITHUB_REF_NAME"
+
+          echo "Waiting for the gateway..."
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:6342/api/client-config > /dev/null 2>&1 && break
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
+              echo "container died during startup"; docker logs smoke; exit 1
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:6342/api/client-config > /dev/null
+
+          echo "Waiting for the embedded UI (extraction + node server spawn)..."
+          UI_OK=0
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:6342/ 2>/dev/null | grep -qi "<html"; then UI_OK=1; break; fi
+            sleep 2
+          done
+          if [ "$UI_OK" != "1" ]; then
+            echo "UI did not serve HTML"; docker logs smoke; exit 1
+          fi
+          curl -fsS http://127.0.0.1:6339/ | grep -qi "<html"
+          echo "UI serves HTML on both listeners"
+
+          echo "Asserting the public listener is restricted..."
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6342/api/jobs/queue)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6339/api/jobs/queue)" = "403"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6339/api/jobs/config)" = "403"
+          curl -fsS http://127.0.0.1:6339/api/client-config > /dev/null
+          echo "Policy enforcement OK"
+
+          if [ "$HAVE_FIXTURE" = "1" ]; then
+            DB=$(jq -r .db "$SMOKE/fixture/manifest.json")
+            TAG=$(jq -r .tag "$SMOKE/fixture/manifest.json")
+            MIN=$(jq -r .count "$SMOKE/fixture/manifest.json")
+
+            curl -fsS -X POST "http://127.0.0.1:6342/api/db/create?new_index_db=$DB&new_user_data_db=$DB" > /dev/null
+
+            # Container-side path of the fixture media (the fixture dir IS
+            # the data volume). APPEND to included_folders: replacing would
+            # prune the fixture's items before the scan can attach the new
+            # paths.
+            FILES_DIR=/app/data/files
+            curl -fsS "http://127.0.0.1:6342/api/jobs/config?index_db=$DB" > "$SMOKE/sysconf.json"
+            jq --arg d "$FILES_DIR" '.included_folders += [$d]' "$SMOKE/sysconf.json" > "$SMOKE/sysconf_new.json"
+            curl -fsS -X PUT -H 'Content-Type: application/json' \
+              --data @"$SMOKE/sysconf_new.json" "http://127.0.0.1:6342/api/jobs/config?index_db=$DB" > /dev/null
+            curl -fsS -X POST "http://127.0.0.1:6342/api/jobs/folders/rescan?index_db=$DB" > /dev/null
+
+            echo "Waiting for the scan (hash-reattaches fixture items to container paths)..."
+            SCAN_OK=0
+            for i in $(seq 1 300); do
+              N=$(curl -fsS "http://127.0.0.1:6342/api/jobs/queue" | jq --arg db "$DB" '[.queue[] | select(.index_db == $db)] | length')
+              if [ "$N" = "0" ]; then SCAN_OK=1; break; fi
+              sleep 2
+            done
+            if [ "$SCAN_OK" != "1" ]; then
+              echo "scan jobs did not finish"; docker logs smoke; exit 1
+            fi
+
+            echo "Asserting tag search for '$TAG' via the public listener (baseline: $MIN files)..."
+            RESP=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+              -d "{\"query\":{\"match_tags\":{\"tags\":[\"$TAG\"],\"match_any\":true}},\"page_size\":5}" \
+              "http://127.0.0.1:6339/api/search/pql?index_db=$DB")
+            COUNT=$(echo "$RESP" | jq .count)
+            echo "tag '$TAG' matched $COUNT files"
+            if [ "$COUNT" -lt "$MIN" ]; then
+              echo "tag search returned fewer files than the fixture baseline ($COUNT < $MIN)"; exit 1
+            fi
+
+            SHA=$(echo "$RESP" | jq -r '.results[0].sha256')
+            curl -fsS -o "$SMOKE/thumb.bin" "http://127.0.0.1:6339/api/items/item/thumbnail?id=$SHA&id_type=sha256&index_db=$DB"
+            test -s "$SMOKE/thumb.bin"
+            echo "Fixture assertions passed"
+          fi
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs smoke 2>&1 || true
+
+      - name: Push to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$GITHUB_REF_NAME"
+          docker push "$IMAGE:latest"
 
   # Attach all platform artifacts and publish the release in a single job so
   # the three matrix builds don't race to create it. Published directly (not

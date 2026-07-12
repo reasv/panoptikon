@@ -1,0 +1,152 @@
+# Panoptikon Gateway configuration for the official Docker image.
+#
+# Baked into the image at /app/config/gateway/docker.toml and selected via
+# GATEWAY_CONFIG_PATH. The compose file mounts a volume over /app/config, so
+# this file seeds the volume on the first run and is user-owned afterwards:
+# edit it and restart the container to reconfigure. Full reference (every
+# key, templating, policies/rulesets): panoptikon/README.md.
+#
+# Two listeners, one process:
+#   6342 "default"  PRIVATE admin — full API (allow_all policy). The API can
+#                   open files and trigger arbitrary command execution in the
+#                   container; NEVER expose this port to untrusted clients.
+#   6339 "public"   PUBLIC — locked to the restricted_demo ruleset below
+#                   (search, item/file serving, bookmarks; no jobs/config).
+
+# All persistent state (index DBs, user data, thumbnails), on the data volume.
+data_folder = "data"
+
+[logging]
+# Console only: containers log to stdout/stderr (`docker logs panoptikon`).
+file = ""
+level = "${LOGLEVEL:-INFO}"
+
+# "Open file / show in folder" cannot reach a file manager from inside a
+# container; make the endpoints no-ops. Use Panoptikon Relay on the client
+# machine instead (see the README).
+[open]
+file_command = ""
+folder_command = ""
+
+[server]
+# 0.0.0.0: listeners must be reachable through Docker's port mapping. Access
+# control is the compose port mapping + the policies below.
+host = "0.0.0.0"
+port = 6342
+trust_forwarded_headers = true
+
+# The public listener. Endpoint identity comes from the TCP listener a
+# connection arrived on, so it cannot be spoofed via request headers.
+[[server.endpoints]]
+name = "public"
+port = 6339
+
+[upstreams.ui]
+# Internal upstream only (the embedded Next.js server the gateway spawns);
+# never mapped out of the container.
+base_url = "http://127.0.0.1:6340"
+local = true
+# No UI checkout exists in the image: a nonexistent dir makes the gateway
+# fall back to the UI bundle embedded in the binary.
+dir = "no-checkout-use-embedded-bundle"
+# The image ships a native Node.js.
+node = "node"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+local = true
+
+# In-process inference orchestrator. The Python environment was provisioned
+# at image build time (CPU wheels by default; the CUDA image variant is a
+# build arg — see the README's Docker section).
+[inference_local]
+enabled = true
+
+[search]
+embedding_cache_size = 16
+
+# --------- Rulesets ---------
+# Rulesets define which methods + paths are allowed for a policy.
+# If a policy references a ruleset, anything not matched is denied.
+
+[rulesets.allow_all]
+allow_all = true
+
+# What the public listener may do: search, item metadata/thumbnails/files,
+# bookmarks, and read-only DB info. Jobs, config, folder management, and
+# inference administration are denied.
+[rulesets.restricted_demo]
+allow = [
+    { methods = [
+        "GET",
+    ], path_prefix = "/docs" },
+    { methods = [
+        "GET",
+    ], path = "/openapi.json" },
+
+    { methods = [
+        "GET",
+        "POST",
+    ], path_prefix = "/api/search/" },
+    { methods = [
+        "GET",
+    ], path_prefix = "/api/items/" },
+
+    { methods = [
+        "GET",
+        "POST",
+        "DELETE",
+        "PUT",
+    ], path_prefix = "/api/bookmarks/" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/db" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/inference/cache" },
+]
+
+# --------- Policies ---------
+# Policies are checked in order, first match wins: the endpoint-scoped
+# public policy must come before the catch-all private one.
+
+[[policies]]
+name = "public"
+ruleset = "restricted_demo"
+
+[policies.match]
+endpoints = ["public"]
+
+[policies.index_db]
+default = "default"
+# Public visitors may select any index DB via ?index_db=. To confine them to
+# specific databases, list them instead: allow = ["public"].
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+[policies.client]
+# Hide "open on host" controls in the public UI (the API side is a no-op in
+# the container and denied by the ruleset regardless).
+disable_backend_open = true
+# search_throttle_ms = 1500    # throttle instant search for demo visitors
+
+# Private admin: everything arriving on the primary listener, unrestricted.
+[[policies]]
+name = "private"
+ruleset = "allow_all"
+
+[policies.match]
+endpoints = ["default"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"

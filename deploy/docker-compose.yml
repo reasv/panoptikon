@@ -1,0 +1,71 @@
+# Panoptikon — self-contained Docker deployment. No repo clone needed:
+# save this file into an empty directory and run
+#
+#   docker compose up -d
+#
+# then open http://localhost:6342. First boot creates the databases and
+# unpacks the web UI (a few seconds); models are downloaded on first use.
+#
+# One container, one process, TWO ports:
+#
+#   6342  PRIVATE admin — the full API. It can open files and trigger
+#         arbitrary command execution inside the container: NEVER expose
+#         this port to the internet or untrusted networks. It is mapped to
+#         127.0.0.1 below on purpose; reach it remotely via an SSH tunnel or
+#         a VPN, or put an authenticating reverse proxy in front.
+#
+#   6339  PUBLIC restricted — locked by the server's policy/ruleset system
+#         to search, item/thumbnail/file serving, and bookmarks (the
+#         Python-era "restricted mode" service). Safer by design, but it
+#         still serves your indexed files: add authentication at a reverse
+#         proxy before exposing it beyond your LAN.
+#
+# Configuration lives on the panoptikon-config volume (seeded from the image
+# on first run): edit config/gateway/docker.toml on it and restart. The image
+# ships no editor; use a throwaway container, e.g.
+#   docker run --rm -it -v panoptikon_panoptikon-config:/cfg debian \
+#     sh -c 'apt-get update -qq && apt-get install -y -qq nano && nano /cfg/gateway/docker.toml'
+
+services:
+  panoptikon:
+    image: ghcr.io/reasv/panoptikon:latest
+    container_name: panoptikon
+    restart: unless-stopped
+    ports:
+      # PRIVATE admin listener — keep the 127.0.0.1 prefix (see above).
+      - "127.0.0.1:6342:6342"
+      # PUBLIC restricted listener.
+      - "6339:6339"
+    volumes:
+      # Index databases, user data, thumbnails.
+      - panoptikon-data:/app/data
+      # Gateway config + custom inference model registries (config/inference/).
+      - panoptikon-config:/app/config
+      # Model weights (Hugging Face cache) — survives container updates.
+      - panoptikon-cache:/home/node/.cache
+      # YOUR MEDIA: mount every directory you want indexed (read-only), then
+      # add the container-side paths (e.g. /media/pictures) as allowed
+      # folders in the UI and run a file scan. The container runs as uid
+      # 1000; bind-mounted media must be readable by that uid.
+      # - /path/to/your/pictures:/media/pictures:ro
+      # - /path/to/your/videos:/media/videos:ro
+    # environment:
+    #   - LOGLEVEL=DEBUG
+    #
+    # GPU (CUDA) variant: the published image is CPU-only. Build the CUDA
+    # image from a repo checkout —
+    #   git clone --recurse-submodules https://github.com/reasv/panoptikon
+    #   docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda panoptikon/
+    # — then replace `image:` above with panoptikon:cuda and uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  panoptikon-data:
+  panoptikon-config:
+  panoptikon-cache:

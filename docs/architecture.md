@@ -174,5 +174,12 @@ use platform dirs (AppData/XDG) through the same root abstraction.
   the old implementation stays available side-by-side — for reference and for
   the PQL equivalence suite that runs both implementations against the same
   database snapshot and diffs results.
-- **M5 — Docker rework**: one container around the Rust binary (native Node,
-  new layout), replacing the Python-era nginx + two-service compose setup.
+- **M5 — Docker rework** (done 2026-07-12): one container, one process — the
+  Rust binary built with `bundled,bundled-ui`, a native Node.js, and the
+  managed venv provisioned at image build time (CPU wheels by default,
+  `--build-arg ACCELERATOR=cuda` for the CUDA variant). Two listeners with
+  endpoint-scoped policies (private admin 6342 allow-all, public 6339
+  `restricted_demo`) replace the Python-era nginx + two-UI-service compose
+  stack. Image: `ghcr.io/reasv/panoptikon` (linux/amd64 — the lock excludes
+  linux/aarch64), built/smoke-tested/pushed by the release workflow's docker
+  job; the distributable compose file is `deploy/docker-compose.yml`.

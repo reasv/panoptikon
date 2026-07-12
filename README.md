@@ -44,7 +44,7 @@ Panoptikon is designed to be used as a local service and is not intended to be e
 
 ### Public Instance (panoptikon.dev)
 
-The **only** deployment style we endorse for a public Panoptikon instance is a Docker setup that exposes a restricted public service (blocking all dangerous APIs) separately from an unrestricted private admin service, with authentication added at the reverse proxy if needed. The Python-era docker-compose configuration that implemented this was removed along with the rest of the Docker files; Docker deployment is temporarily unavailable and will be rebuilt for the Rust binary (see the Docker section below). The policy/ruleset system in the server config (`config/gateway/`) provides the equivalent restricted-vs-admin split — see the `restricted_demo` ruleset shipped in the default config.
+The **only** deployment style we endorse for a public Panoptikon instance is the Docker setup (see the Docker section below): the container exposes a restricted public listener (blocking all dangerous APIs via the server's policy/ruleset system — see the `restricted_demo` ruleset shipped in the config) separately from the unrestricted private admin listener, with authentication added at your reverse proxy if needed.
 
 A public demonstration instance runs at [panoptikon.dev](https://panoptikon.dev/search) for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
 
@@ -250,11 +250,58 @@ reference: every key, the templating syntax, policies and rulesets, and the
 
 # Docker
 
-Docker support is **temporarily unavailable**: the
-`Dockerfile`/`docker-compose.yml` of the Python era were removed and the
-Docker setup will be rebuilt for the Rust binary (with a natively installed
-Node.js). Until then, run from source or use the release binaries as
-described above.
+The official image (`ghcr.io/reasv/panoptikon`, linux/amd64, CPU inference)
+packages everything in one container: the Rust binary, a native Node.js for
+the web UI, and the Python inference environment — no nginx, no separate UI
+services.
+
+You do **not** need to clone the repository. Download the compose file into
+an empty directory and start it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/reasv/panoptikon/master/deploy/docker-compose.yml
+docker compose up -d
+```
+
+Then open http://localhost:6342. The container runs a single server process
+with **two listeners**:
+
+- **6342 — private admin** (full API): mapped to `127.0.0.1` only in the
+  compose file. The API on this port can open files and trigger arbitrary
+  command execution inside the container — **never** expose it to the
+  internet or untrusted networks; reach it remotely via an SSH tunnel or
+  VPN, or put an authenticating reverse proxy in front.
+- **6339 — public restricted**: locked by an endpoint-scoped policy to the
+  `restricted_demo` ruleset (search, item/thumbnail/file serving,
+  bookmarks). This is the Rust equivalent of the Python-era "restricted
+  mode" service. Still add authentication at a reverse proxy before
+  exposing it publicly — it serves your indexed files.
+
+To index your media, uncomment and edit the media bind mounts in the
+compose file (e.g. `/path/to/pictures:/media/pictures:ro`), restart, then
+add the container-side paths as allowed folders in the UI and run a file
+scan. Databases, configuration, and the model cache live on named volumes
+and survive image updates; the gateway config
+(`config/gateway/docker.toml` on the config volume, seeded from the image
+on first run) is user-owned — edit it and restart to reconfigure.
+
+Since the server cannot open files on *your* machine from inside a
+container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
+on your client (see above).
+
+### GPU (CUDA) variant
+
+The published image installs CPU-only PyTorch. For NVIDIA GPU inference,
+build the image yourself with the CUDA build arg and run it with GPU access
+(requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html)):
+
+```bash
+git clone --recurse-submodules https://github.com/reasv/panoptikon.git
+docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda panoptikon/
+```
+
+Then point the compose file's `image:` at `panoptikon:cuda` and uncomment
+its GPU `deploy` section (or pass `--gpus all` to `docker run`).
 
 # License
 

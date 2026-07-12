@@ -1,0 +1,25 @@
+# Keep the build context to sources: everything else is build output,
+# runtime state, or the python-legacy worktree (all huge).
+.git
+python-legacy
+target
+target-*
+runtime
+data
+cache
+cudnn
+inferio_custom
+ci-fixture
+deploy
+docs
+scripts
+tools
+static
+panoptikon/data
+python/.venv
+python/tests
+.venv
+ui/node_modules
+ui/.next
+*.log
+.env
