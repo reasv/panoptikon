@@ -1,0 +1,263 @@
+# Release builds: triggered ONLY by version tags (vX.Y.Z), never per-push.
+# Builds a self-contained binary per platform (--features bundled,bundled-ui),
+# smoke-tests each artifact against the ci-fixture release asset (generated
+# locally by .github/scripts/generate_ci_fixture.ps1), and attaches the artifacts to
+# a draft GitHub release for the tag.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            bin: target/release/panoptikon.exe
+          - os: ubuntu-latest
+            label: linux-x86_64
+            bin: target/release/panoptikon
+          - os: macos-latest
+            label: macos-aarch64
+            bin: target/release/panoptikon
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The standalone bundle vendors node_modules (incl. sharp's native
+      # binaries), so it must be built on the same OS/arch it ships for.
+      # Next.js does not copy static assets into the standalone output;
+      # the bundle is assembled by hand per docs/architecture.md.
+      - name: Build UI standalone bundle
+        shell: bash
+        working-directory: ui
+        env:
+          BUILD_STANDALONE: "true"
+        run: |
+          npm ci
+          npm run build
+          cp -r .next/static .next/standalone/.next/static
+          if [ -d public ]; then cp -r public .next/standalone/public; fi
+          test -f .next/standalone/server.js
+
+      - name: Build release binary
+        shell: bash
+        env:
+          PANOPTIKON_UI_BUNDLE: ${{ github.workspace }}/ui/.next/standalone
+        run: cargo build --release -p panoptikon --features bundled,bundled-ui
+
+      # Boot the freshly built artifact in an empty directory with an explicit
+      # config (inference disabled so it never provisions the Python venv),
+      # then exercise it against the fixture DB: migrate, hash-rescan the
+      # fixture media so runner-local paths attach to existing items, and
+      # assert tag search, thumbnail serving, and file serving all work.
+      - name: Smoke test
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BIN="$PWD/${{ matrix.bin }}"
+
+          mkdir -p smoke/fixture
+          HAVE_FIXTURE=0
+          if gh release download ci-fixture --pattern fixture.tar.gz --dir smoke; then
+            tar -xzf smoke/fixture.tar.gz -C smoke/fixture
+            HAVE_FIXTURE=1
+          else
+            echo "::warning::ci-fixture release asset not found - running boot-only smoke test (no scan/search/thumbnail assertions)"
+          fi
+
+          cat > smoke/smoke.toml <<'EOF'
+          data_folder = "fixture"
+
+          [server]
+          host = "127.0.0.1"
+          port = 6342
+
+          [upstreams.ui]
+          base_url = "http://127.0.0.1:6340"
+          local = true
+          dir = "no-checkout-use-embedded-bundle"
+
+          [upstreams.api]
+          base_url = "http://127.0.0.1:6342"
+          local = true
+
+          [inference_local]
+          enabled = false
+
+          [inference_local.python_env]
+          auto_setup = false
+
+          [rulesets.allow_all]
+          allow_all = true
+
+          [[policies]]
+          name = "localhost"
+          ruleset = "allow_all"
+
+          [policies.match]
+          hosts = ["localhost", "127.0.0.1"]
+
+          [policies.index_db]
+          default = "default"
+          allow = "*"
+
+          [policies.user_data_db]
+          default = "default"
+          allow = "*"
+          EOF
+
+          cd smoke
+          "$BIN" --config smoke.toml > gateway.log 2>&1 &
+          GW_PID=$!
+          trap 'kill $GW_PID 2>/dev/null || true' EXIT
+
+          echo "Waiting for the gateway..."
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:6342/api/client-config > /dev/null 2>&1 && break
+            if ! kill -0 $GW_PID 2>/dev/null; then
+              echo "gateway process died during startup"; cat gateway.log; exit 1
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:6342/api/client-config > /dev/null
+
+          echo "Waiting for the embedded UI (extraction + node server spawn)..."
+          UI_OK=0
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:6342/ 2>/dev/null | grep -qi "<html"; then UI_OK=1; break; fi
+            sleep 2
+          done
+          if [ "$UI_OK" != "1" ]; then
+            echo "UI did not serve HTML"; cat gateway.log; exit 1
+          fi
+          echo "UI serves HTML"
+
+          if [ "$HAVE_FIXTURE" = "1" ]; then
+            DB=$(jq -r .db fixture/manifest.json)
+            TAG=$(jq -r .tag fixture/manifest.json)
+            MIN=$(jq -r .count fixture/manifest.json)
+
+            # Ensure the fixture DB (generated by an older binary) is migrated
+            # to this build's schema. Idempotent.
+            curl -fsS -X POST "http://127.0.0.1:6342/api/db/create?new_index_db=$DB&new_user_data_db=$DB" > /dev/null
+
+            # Native path of the fixture media dir on this runner. APPEND it to
+            # included_folders: replacing would prune the fixture's items
+            # before the scan can attach the new paths.
+            FILES_DIR="$(cd fixture/files && (pwd -W 2>/dev/null || pwd))"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              FILES_DIR=$(printf '%s' "$FILES_DIR" | tr '/' '\\')
+            fi
+            curl -fsS "http://127.0.0.1:6342/api/jobs/config?index_db=$DB" > sysconf.json
+            jq --arg d "$FILES_DIR" '.included_folders += [$d]' sysconf.json > sysconf_new.json
+            curl -fsS -X PUT -H 'Content-Type: application/json' \
+              --data @sysconf_new.json "http://127.0.0.1:6342/api/jobs/config?index_db=$DB" > /dev/null
+            curl -fsS -X POST "http://127.0.0.1:6342/api/jobs/folders/rescan?index_db=$DB" > /dev/null
+
+            echo "Waiting for the scan (hash-reattaches fixture items to runner paths)..."
+            SCAN_OK=0
+            for i in $(seq 1 300); do
+              N=$(curl -fsS "http://127.0.0.1:6342/api/jobs/queue" | jq --arg db "$DB" '[.queue[] | select(.index_db == $db)] | length')
+              if [ "$N" = "0" ]; then SCAN_OK=1; break; fi
+              sleep 2
+            done
+            if [ "$SCAN_OK" != "1" ]; then
+              echo "scan jobs did not finish"; cat gateway.log; exit 1
+            fi
+
+            echo "Asserting tag search for '$TAG' (fixture baseline: $MIN files)..."
+            RESP=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+              -d "{\"query\":{\"match_tags\":{\"tags\":[\"$TAG\"],\"match_any\":true}},\"page_size\":5}" \
+              "http://127.0.0.1:6342/api/search/pql?index_db=$DB")
+            COUNT=$(echo "$RESP" | jq .count)
+            echo "tag '$TAG' matched $COUNT files"
+            if [ "$COUNT" -lt "$MIN" ]; then
+              echo "tag search returned fewer files than the fixture baseline ($COUNT < $MIN)"; exit 1
+            fi
+
+            SHA=$(echo "$RESP" | jq -r '.results[0].sha256')
+            echo "Asserting thumbnail + file serving for $SHA..."
+            curl -fsS -o thumb.bin "http://127.0.0.1:6342/api/items/item/thumbnail?id=$SHA&id_type=sha256&index_db=$DB"
+            test -s thumb.bin
+
+            # Serve original bytes via a runner-local path attached by the scan.
+            FIRST_FILE=$(ls fixture/files | head -1)
+            if [ "$RUNNER_OS" = "Windows" ]; then SEP='\'; else SEP='/'; fi
+            curl -fsS -G -o file.bin \
+              --data-urlencode "id=${FILES_DIR}${SEP}${FIRST_FILE}" \
+              --data-urlencode "id_type=path" \
+              --data-urlencode "index_db=$DB" \
+              "http://127.0.0.1:6342/api/items/item/file"
+            test -s file.bin
+            echo "Fixture assertions passed"
+          fi
+
+          kill $GW_PID
+
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.label }}
+          path: smoke/gateway.log
+          if-no-files-found: ignore
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="panoptikon-${GITHUB_REF_NAME}-${{ matrix.label }}"
+          mkdir -p "pkg/$NAME" dist
+          cp "${{ matrix.bin }}" README.md LICENSE "pkg/$NAME/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            (cd pkg && 7z a "../dist/$NAME.zip" "$NAME")
+          else
+            tar -czf "dist/$NAME.tar.gz" -C pkg "$NAME"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Attach all platform artifacts to one draft release in a single job so the
+  # three matrix builds don't race to create it.
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

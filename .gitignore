@@ -195,3 +195,4 @@ data/
 # embedded sets — docs/architecture.md)
 /runtime/
 /target-m3
+/ci-fixture/
