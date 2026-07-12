@@ -44,8 +44,8 @@ panoptikon/
 
 The Python server, searchui (runtime git-clone machinery), alembic, the Python
 inferio HTTP server/orchestrator, and the install/start batch scripts of the
-Python era are deleted on this branch. The pre-switchover code survives on the
-`python-legacy` branch (see Roadmap).
+Python era are deleted. The old code survives on the `python-legacy` branch,
+mounted as a permanent gitignored worktree at `python-legacy/` (see Roadmap).
 
 ## Configuration
 
@@ -161,16 +161,18 @@ use platform dirs (AppData/XDG) through the same root abstraction.
 
 ## Roadmap
 
-- **M1** (this branch): repository restructure per the layout above; crate and
+- **M1**: repository restructure per the layout above; crate and
   binary renamed `panoptikon`; `ui/` submodule; README updated (not
   rewritten) with the Rust flow as the installation path.
 - **M2**: `panoptikon setup` + the locked accelerator matrix.
 - **M3**: embedded resources + first-run extraction (done: `bundled` /
   `bundled-ui` features, `--root`) + release CI (pending; panoptikon-ui
   supports `output: 'standalone'` via `BUILD_STANDALONE=true next build`).
-- **M4 — the swap**: `master` is renamed `python-legacy` and this branch
-  becomes `master`. A permanent worktree of `python-legacy` is mounted in the
-  repo folder (gitignored) so the old implementation stays available
-  side-by-side — for reference and for a PQL equivalence suite that runs both
-  implementations against the same database snapshot and diffs results.
-  Docker is reworked after the swap (native Node, new layout).
+- **M4 — the swap** (done 2026-07-12): `master` was renamed `python-legacy`
+  and the Rust branch became `master` (also the GitHub default). A permanent
+  worktree of `python-legacy` is mounted in the repo folder (gitignored) so
+  the old implementation stays available side-by-side — for reference and for
+  the PQL equivalence suite that runs both implementations against the same
+  database snapshot and diffs results.
+- **M5 — Docker rework**: one container around the Rust binary (native Node,
+  new layout), replacing the Python-era nginx + two-service compose setup.

@@ -35,9 +35,8 @@ orchestrator, and the production web UI. Python is used for exactly one
 thing: the inference worker processes that load and run the AI models,
 spawned by the server on demand.
 
-The legacy Python implementation lives on the `python-legacy` branch
-(until the switchover completes, this is still `master`) and is no longer
-developed.
+The legacy Python implementation lives on the `python-legacy` branch and is
+no longer developed.
 
 ### Warning
 
@@ -45,7 +44,7 @@ Panoptikon is designed to be used as a local service and is not intended to be e
 
 ### Public Instance (panoptikon.dev)
 
-The **only** deployment style we endorse for a public Panoptikon instance is a Docker setup that exposes a restricted public service (blocking all dangerous APIs) separately from an unrestricted private admin service, with authentication added at the reverse proxy if needed. The Python-era docker-compose configuration that implemented this was removed on this branch along with the rest of the Docker files; Docker deployment is temporarily unavailable and will be rebuilt for the Rust binary after the switchover (see the Docker section below). On this branch, the policy/ruleset system in the server config (`config/gateway/`) provides the equivalent restricted-vs-admin split — see the `restricted_demo` ruleset shipped in the default config.
+The **only** deployment style we endorse for a public Panoptikon instance is a Docker setup that exposes a restricted public service (blocking all dangerous APIs) separately from an unrestricted private admin service, with authentication added at the reverse proxy if needed. The Python-era docker-compose configuration that implemented this was removed along with the rest of the Docker files; Docker deployment is temporarily unavailable and will be rebuilt for the Rust binary (see the Docker section below). The policy/ruleset system in the server config (`config/gateway/`) provides the equivalent restricted-vs-admin split — see the `restricted_demo` ruleset shipped in the default config.
 
 A public demonstration instance runs at [panoptikon.dev](https://panoptikon.dev/search) for users to try Panoptikon before installing it locally. Certain features, such as the ability to open files and folders in the file manager, have been disabled in the public instance for security reasons.
 
@@ -251,11 +250,11 @@ reference: every key, the templating syntax, policies and rulesets, and the
 
 # Docker
 
-Docker support is **temporarily unavailable on this branch**: the
+Docker support is **temporarily unavailable**: the
 `Dockerfile`/`docker-compose.yml` of the Python era were removed and the
 Docker setup will be rebuilt for the Rust binary (with a natively installed
-Node.js) after the switchover. Until then, run from source as described
-above.
+Node.js). Until then, run from source or use the release binaries as
+described above.
 
 # License
 

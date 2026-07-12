@@ -2,8 +2,9 @@ Panoptikon Repository Guide
 
 Overview
 - Panoptikon is one Rust binary (`panoptikon`) plus Python inference workers.
-- The legacy Python server lives on the `python-legacy` branch, not here
-  (until the switchover completes, that branch is still `master`).
+- The legacy Python server lives on the `python-legacy` branch, not here.
+  A permanent worktree of that branch is mounted (gitignored) at
+  `python-legacy/` for reference and equivalence testing.
 - See `docs/architecture.md` for the charter: repository layout, configuration,
   Python environment management, and the release roadmap.
 

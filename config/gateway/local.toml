@@ -13,8 +13,8 @@ level = "${LOGLEVEL:-INFO}"
 [server]
 # Bind address for the gateway listener.
 host = "127.0.0.1"
-# Port for the gateway listener. 6342 is the port the Python server used,
-# so existing links and clients keep working after the switchover.
+# Port for the gateway listener. 6342 is the port the legacy Python server
+# used, so existing links and clients keep working.
 port = 6342
 # If true, use X-Forwarded-Host / Forwarded to select policy host.
 trust_forwarded_headers = true

@@ -1,33 +1,42 @@
 # Panoptikon server (Rust)
 
-This crate is the single HTTP entrypoint for Panoptikon. It forwards requests
-to the Next.js UI or the Python API based on path, with streaming
-request/response bodies, policy enforcement, structured logging, and optional
-local API handling when `upstreams.api.local = true`.
+This crate is Panoptikon: a single native binary that owns the HTTP
+server, the full API, PQL search, the job system and cron scheduler, file
+scanning, database migrations, the inference orchestrator, and supervision
+of the production web UI — with streaming request/response bodies, policy
+enforcement, and structured logging.
 
 ## Where it fits
 
-Panoptikon currently runs:
+In the standard local setup (`config/gateway/local.toml`) the binary serves
+everything itself:
 
-- Next.js frontend (dev server on `http://127.0.0.1:6340`)
-- Python backend (FastAPI on `http://127.0.0.1:6342`)
+- Every `/api` route is handled in-process (`upstreams.api.local = true`).
+- The Next.js production UI runs as a supervised child process on an
+  internal port (`upstreams.ui`, default `http://127.0.0.1:6340`); the
+  gateway builds and starts it when `upstreams.ui.local = true`. It is an
+  internal upstream only, never an entrypoint — users open the gateway port.
+- Inference is served in-process by the Rust inferio orchestrator
+  (`[inference_local].enabled = true`), which spawns Python worker processes
+  on demand.
 
-The gateway sits in front of both, so the browser only talks to the Rust
-process. This keeps the entrypoint stable as more native Rust endpoints are
-added later.
+The browser only ever talks to the Rust process. For split deployments each
+of these can instead point at a remote upstream: `upstreams.api.local =
+false` proxies `/api/*` to another Panoptikon instance, and
+`[[upstreams.inference]]` entries route inference to dedicated GPU machines.
 
 ## Routing
 
-- `/api/*` goes to the Python backend, except local routes when enabled
-- `/api/inference/*` goes to the first inference upstream (defaults to the API
-  upstream) — or is served in-process by the Rust inferio orchestrator when
-  `[inference_local].enabled = true` (see below)
-- `/docs` goes to the Python backend unless `upstreams.api.local = true`
-- `/redoc` goes to the Python backend unless `upstreams.api.local = true`
-- `/openapi.json` goes to the Python backend unless `upstreams.api.local = true`
+- `/api/*` is served in-process when `upstreams.api.local = true` (unmatched
+  `/api` paths return 404); otherwise it is proxied to `upstreams.api`
+- `/api/inference/*` is served in-process by the inferio orchestrator when
+  `[inference_local].enabled = true` (see below); otherwise it goes to the
+  first inference upstream (defaulting to the API upstream)
+- `/docs`, `/redoc`, and `/openapi.json` are served in-process unless
+  `upstreams.api.local = false`
 - everything else goes to the Next.js frontend
 
-Paths, methods, headers, and bodies are forwarded as-is.
+Proxied paths, methods, headers, and bodies are forwarded as-is.
 
 ## Listener endpoints
 
