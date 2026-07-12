@@ -72,6 +72,42 @@ ranked + snippet), `match_tags` (any/all/confidence/setters/namespaces),
 search, `similar_to` (L2/COSINE), RRF hybrid ranking, sortable options
 (`select_as`, `gt` cursor), and `check_path`.
 
+The `ui_*` cases replicate the exact JSON shapes the production web UI
+sends to `POST /api/search/pql` (`queryFromState` /
+`sbSimilarityQueryFromState` in `ui/lib/state/searchQuery/searchQuery.ts`,
+plus `FindButton`'s folder lookup), including its quirks: every filter arg
+present at its nuqs url-state default (zeros, empty lists,
+`select_snippet_as: ""`), `order: null` in `order_by`, an explicit
+`partition_by: null`, extra url-state keys spread into `match_tags`
+(`pos_match_all` & co.) and `src_text` (`raw_fts5_match`), `page_size: -1`
+(FindButton, no limit), and the UI's fixed priorities/directions/RRF
+constants (bookmarks/path/text 0, tags 50, semantic 60, anytext 100 with
+rrf k=5/w=1 for path+text and k=10/w=0.5/0.7 for semantic text/image,
+similarity 150). They cover: the default empty-`and_` search page (with
+partition and ordering variants), mime/path prefix + exclusion `match`
+filters, bookmark filtering/ordering/sub-namespaces, path/text FTS as
+filter and rank source, `filter_only`, snippets, all four tag list slots
+(pos/neg × any/all) plus confidence/setter/namespace variants and
+`all_setters_required`, semantic text search with `src_text` variants
+(length bounds, setters+languages, confidence weights), semantic image
+search (plain and `clip_xmodal`), the "anytext" combined search as
+single-filter and multi-filter RRF hybrids (up to path+text+two semantic
+sources), its count-query twin, item similarity search-page mode
+(CLIP COSINE, xmodal, text L2, `src_text` setter restriction), and the
+similar-items sidebar queries (page_size 6, `count: false`, partition).
+
+Two `ui_*` cases are intentional-failure reproducers for real divergences
+found in the Rust port (see the comments at their definitions):
+`ui_match_text_filter` (`select_snippet_as: ""` — legacy treats the empty
+string as unset, Rust `is_some()` computes a snippet and returns it under
+the key `""` in `extra`; the UI sends `""` on every text search) and
+`ui_semantic_text_conf_weight` (`src_text` confidence weights emit
+`POW(...)`, and the Rust gateway's SQLite has no `pow` function — every
+weighted query returns HTTP 500; legacy additionally cross-joins when only
+weights are set with no other src_text criteria, which the Rust port
+fixed). Expect RESULT_DIFF and RUST_ERROR respectively until those are
+fixed in the gateway.
+
 Semantic queries never call inference: the driver generates a deterministic
 pseudo-embedding per model (seeded by the model name, correct dimension) and
 feeds the identical vector to both sides — as a base64 `.npy` string with

@@ -421,6 +421,8 @@ def discover(conn: sqlite3.Connection) -> dict:
         "types": [],
         "median_size": None,
         "sample_sha256": None,
+        "sample_path": None,
+        "sample_folder": None,
         "path_fragment": None,
         "bookmark_users": [],
         "bookmark_namespaces": [],
@@ -483,12 +485,19 @@ def discover(conn: sqlite3.Connection) -> dict:
         )
     ]
     d["median_size"] = sizes[0] if sizes else None
-    sample = rows("SELECT i.sha256, f.filename FROM items i JOIN files f ON f.item_id = i.id LIMIT 1")
+    sample = rows(
+        "SELECT i.sha256, f.filename, f.path FROM items i "
+        "JOIN files f ON f.item_id = i.id LIMIT 1"
+    )
     if sample:
         d["sample_sha256"] = sample[0][0]
         stem = Path(sample[0][1]).stem
         frag = "".join(c if c.isalnum() else " " for c in stem).split()
         d["path_fragment"] = frag[0] if frag else None
+        path = sample[0][2] or ""
+        d["sample_path"] = path or None
+        cut = max(path.rfind("/"), path.rfind("\\"))
+        d["sample_folder"] = path[:cut] if cut > 0 else None
 
     for row in rows("SELECT text FROM extracted_text LIMIT 20"):
         words = [
@@ -1050,6 +1059,820 @@ def build_corpus(d: dict, page_size: int) -> list[dict]:
         if tag
         else None,
         no_tags,
+    )
+
+    # ==================================================================
+    # ui_* cases: exact JSON shapes produced by the production web UI
+    # (ui/lib/state/searchQuery/searchQuery.ts queryFromState and
+    # sbSimilarityQueryFromState, ui/components/gallery/FindButton.tsx).
+    # Field values (filter args, priorities, directions, rrf k/weights,
+    # embed args, zero-valued nuqs defaults, the extra url-state keys the
+    # UI spreads into match_tags/src_text) mirror what the UI actually
+    # sends. The only deviations: the deterministic file_id tiebreaker
+    # appended to order_by (the UI sends a single entry), and __EMB__
+    # markers standing in for semantic query strings (the UI sends raw
+    # text and lets the server embed it; the suite injects deterministic
+    # embeddings instead).
+
+    UI_SELECT = [
+        "sha256", "path", "last_modified", "type",
+        "width", "height", "blurhash",
+    ]
+    UI_EMBED = {"cache_key": "search", "lru_size": 3, "ttl_seconds": 600}
+
+    def ui_base(query, **kw) -> dict:
+        # queryFromState output + the partition_by key useSearch spreads in
+        # (null unless the "one result per item" toggle is on); order is
+        # null until the user picks a direction
+        q = {
+            "query": query,
+            "order_by": [
+                {"order_by": "last_modified", "order": None, "priority": 0},
+                dict(TIEBREAK),
+            ],
+            "select": list(UI_SELECT),
+            "entity": "file",
+            "page": 1,
+            "page_size": 10,
+            "count": True,
+            "results": True,
+            "check_path": False,
+            "partition_by": None,
+        }
+        q.update(kw)
+        return q
+
+    def ui_sort(order_by, direction, priority, row_n=False, rrf=None):
+        s = {
+            "order_by": order_by,
+            "direction": direction,
+            "priority": priority,
+            "row_n_direction": "asc",
+            "row_n": row_n,
+        }
+        if rrf is not None:
+            s["rrf"] = dict(rrf)
+        return s
+
+    def ui_text_args(match, **over) -> dict:
+        # full MatchText url-state: every field present, at its nuqs
+        # default (note select_snippet_as is "" — empty string, not null)
+        a = {
+            "match": match,
+            "setters": [],
+            "languages": [],
+            "min_language_confidence": 0,
+            "min_confidence": 0,
+            "raw_fts5_match": False,
+            "min_length": 0,
+            "max_length": 0,
+            "select_snippet_as": "",
+            "s_max_len": 30,
+            "s_ellipsis": "...",
+            "s_start_tag": "<b>",
+            "s_end_tag": "</b>",
+            "filter_only": False,
+        }
+        a.update(over)
+        return a
+
+    def ui_tags_args(field, tags_list, match_any, **over) -> dict:
+        # the UI spreads its whole MatchTags url-state into the args, so
+        # pos_match_all/pos_match_any/neg_match_any/neg_match_all ride
+        # along as extra keys both servers must tolerate
+        a = {
+            "pos_match_all": [],
+            "pos_match_any": [],
+            "neg_match_any": [],
+            "neg_match_all": [],
+            "all_setters_required": False,
+            "setters": [],
+            "namespaces": [],
+            "min_confidence": 0,
+            "match_any": match_any,
+            "tags": list(tags_list),
+        }
+        a[field] = list(tags_list)
+        a.update(over)
+        return a
+
+    def ui_tag_filter(field, tags_list, match_any, order_by=False, **over):
+        return dict(
+            ui_sort(order_by, "desc", 50),
+            match_tags=ui_tags_args(field, tags_list, match_any, **over),
+        )
+
+    def ui_src_args(**over) -> dict:
+        # sourceFilters() sends the full SourceArgs url-state (zeros and
+        # all, plus a raw_fts5_match key the schema doesn't define)
+        # whenever any single field is non-default
+        a = {
+            "setters": [],
+            "languages": [],
+            "min_language_confidence": 0,
+            "min_confidence": 0,
+            "raw_fts5_match": False,
+            "min_length": 0,
+            "max_length": 0,
+            "confidence_weight": 0,
+            "language_confidence_weight": 0,
+        }
+        a.update(over)
+        return a
+
+    def ui_temb_args(setter, **over) -> dict:
+        a = {
+            "query": f"{EMB_MARKER}{setter}",
+            "model": setter,
+            "distance_aggregation": "AVG",
+            "src_text": None,
+            "embed": dict(UI_EMBED),
+        }
+        a.update(over)
+        return a
+
+    def ui_iemb_args(setter, **over) -> dict:
+        # image_embeddings from the UI has no src_text key at all
+        a = {
+            "query": f"{EMB_MARKER}{setter}",
+            "model": setter,
+            "distance_aggregation": "AVG",
+            "clip_xmodal": False,
+            "embed": dict(UI_EMBED),
+        }
+        a.update(over)
+        return a
+
+    def ui_sim_args(setter, dist_fn, **over) -> dict:
+        a = {
+            "target": d["similar_targets"].get(setter),
+            "model": setter,
+            "distance_aggregation": "AVG",
+            "distance_function": dist_fn,
+            "clip_xmodal": False,
+            "xmodal_t2t": True,
+            "xmodal_i2i": True,
+            "src_text": None,
+        }
+        a.update(over)
+        return a
+
+    def ui_sb_base(query, **kw) -> dict:
+        # sbSimilarityQueryFromState: page_size 6, count false, order null
+        q = ui_base(query, page_size=6, count=False)
+        q.update(kw)
+        return q
+
+    folder = d.get("sample_folder")
+    sample_path = d.get("sample_path")
+    mime_prefix = d["types"][0].split("/")[0] + "/" if d["types"] else None
+    lang = d["languages"][0] if d["languages"] else None
+    tag3 = d["tags"][2] if len(d["tags"]) > 2 else tag
+    tag4 = d["tags"][3] if len(d["tags"]) > 3 else tag2
+    text_setter = d["text_setters"][0] if d["text_setters"] else None
+    bm_ns = d["bookmark_namespaces"][0] if d["bookmark_namespaces"] else None
+    c_target_ok = c_setter is not None and c_setter in d["similar_targets"]
+    t_target_ok = t_setter is not None and t_setter in d["similar_targets"]
+
+    # anytext sort args: >1 enabled filters -> direction flipped to desc,
+    # row_n on; exactly 1 -> asc, row_n off; rrf always set when sorting
+    AT_RRF_PATH = {"k": 5, "weight": 1}
+    AT_RRF_TXT = {"k": 5, "weight": 1}
+    AT_RRF_ST = {"k": 10, "weight": 0.5}
+    AT_RRF_SI = {"k": 10, "weight": 0.7}
+
+    def at_multi(rrf):
+        return ui_sort(True, "desc", 100, row_n=True, rrf=rrf)
+
+    def at_single(rrf):
+        return ui_sort(True, "asc", 100, row_n=False, rrf=rrf)
+
+    def at_path_child(sort_args):
+        return dict(
+            sort_args,
+            match_path={
+                "match": word,
+                "filename_only": False,
+                "raw_fts5_match": False,
+            },
+        )
+
+    def at_text_child(sort_args):
+        # select_snippet_as None instead of the UI's "" to keep these cases
+        # focused on ranking; the empty-string divergence has a dedicated
+        # reproducer (ui_match_text_filter)
+        return dict(
+            sort_args, match_text=ui_text_args(word, select_snippet_as=None)
+        )
+
+    # --- main search page, no filters enabled
+    case("ui_search_default", ui_base({"and_": []}))
+    case(
+        "ui_search_partition_item",
+        ui_base({"and_": []}, partition_by=["item_id"]),
+    )
+    case(
+        "ui_search_order_size_asc",
+        ui_base(
+            {"and_": []},
+            order_by=[
+                {"order_by": "size", "order": "asc", "priority": 0},
+                dict(TIEBREAK),
+            ],
+        ),
+    )
+
+    # --- mime type / path prefix filters (e_mime, e_path, e_path_neg)
+    case(
+        "ui_filters_path_mime_exclude",
+        ui_base(
+            {
+                "and_": [
+                    {
+                        "match": {
+                            "startswith": {
+                                "path": [folder],
+                                "type": [mime_prefix],
+                            },
+                            "not_startswith": {"path": [sample_path]},
+                        }
+                    }
+                ]
+            }
+        )
+        if folder and sample_path and mime_prefix
+        else None,
+        None
+        if folder and sample_path and mime_prefix
+        else "no sample folder/path/type",
+    )
+    case(
+        "ui_filters_mime_only",
+        ui_base({"and_": [{"match": {"startswith": {"type": [mime_prefix]}}}]})
+        if mime_prefix
+        else None,
+        None if mime_prefix else "no item types",
+    )
+
+    # --- FindButton "navigate to folder" lookup (page_size -1 = no limit)
+    case(
+        "ui_findbutton_folder_listing",
+        {
+            "page": 1,
+            "page_size": -1,
+            "results": True,
+            "count": False,
+            "check_path": False,
+            "order_by": [
+                {"order_by": "last_modified", "order": None, "priority": 0},
+                dict(TIEBREAK),
+            ],
+            "select": ["item_id"],
+            "entity": "file",
+            "query": {
+                "and_": [{"match": {"startswith": {"path": [folder]}}}]
+            },
+        }
+        if folder
+        else None,
+        None if folder else "no sample folder",
+    )
+
+    # --- bookmarks filter (InBookmarks wrapper with sortable args)
+    ui_bm_args = {
+        "filter": True,
+        "namespaces": [],
+        "sub_ns": False,
+        "user": bm_user,
+        "include_wildcard": True,
+    }
+    case(
+        "ui_bookmarks_filter",
+        ui_base(
+            {"and_": [dict(ui_sort(False, "desc", 0), in_bookmarks=dict(ui_bm_args))]}
+        )
+        if bm_user
+        else None,
+        no_bm,
+    )
+    case(
+        "ui_bookmarks_order_time",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "desc", 0), in_bookmarks=dict(ui_bm_args))]}
+        )
+        if bm_user
+        else None,
+        no_bm,
+    )
+    case(
+        "ui_bookmarks_sub_ns",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(False, "desc", 0),
+                        in_bookmarks=dict(
+                            ui_bm_args, namespaces=[bm_ns], sub_ns=True
+                        ),
+                    )
+                ]
+            }
+        )
+        if bm_user and bm_ns
+        else None,
+        no_bm,
+    )
+
+    # --- path text search (e_pt)
+    ui_path_args = {
+        "match": frag,
+        "filename_only": False,
+        "raw_fts5_match": False,
+    }
+    case(
+        "ui_match_path_filter",
+        ui_base(
+            {"and_": [dict(ui_sort(False, "asc", 0), match_path=dict(ui_path_args))]}
+        )
+        if frag
+        else None,
+        None if frag else "no path fragment",
+    )
+    case(
+        "ui_match_path_order",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "asc", 0), match_path=dict(ui_path_args))]}
+        )
+        if frag
+        else None,
+        None if frag else "no path fragment",
+    )
+
+    # --- extracted text search (e_txt), full url-state defaults
+    # KNOWN DIVERGENCE reproducer: the UI always sends select_snippet_as ""
+    # (nuqs string default). Legacy Python treats "" as unset (truthiness);
+    # the Rust port checks is_some(), so Some("") computes a snippet and
+    # returns it under the key "" in `extra`. Expected RESULT_DIFF until the
+    # Rust side treats the empty string as disabled.
+    case(
+        "ui_match_text_filter",
+        ui_base(
+            {"and_": [dict(ui_sort(False, "asc", 0), match_text=ui_text_args(word))]}
+        )
+        if word
+        else None,
+        no_text,
+    )
+    case(
+        "ui_match_text_order",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 0),
+                        match_text=ui_text_args(
+                            word, select_snippet_as=None
+                        ),
+                    )
+                ]
+            }
+        )
+        if word
+        else None,
+        no_text,
+    )
+    case(
+        "ui_match_text_filter_only",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(False, "asc", 0),
+                        match_text=ui_text_args(
+                            word,
+                            filter_only=True,
+                            min_length=1,
+                            setters=d["text_setters"][:1],
+                        ),
+                    )
+                ]
+            }
+        )
+        if word and text_setter
+        else None,
+        no_text,
+    )
+    case(
+        "ui_match_text_snippet",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 0),
+                        match_text=ui_text_args(
+                            word, select_snippet_as="snippet"
+                        ),
+                    )
+                ]
+            }
+        )
+        if word
+        else None,
+        no_text,
+    )
+
+    # --- tag search (e_tags / tag mode); priority 50, extra url-state keys
+    case(
+        "ui_tags_pos_any",
+        ui_base({"and_": [ui_tag_filter("pos_match_any", [tag, tag2], True)]})
+        if tag and tag2
+        else None,
+        no_tags,
+    )
+    case(
+        "ui_tags_pos_all",
+        ui_base({"and_": [ui_tag_filter("pos_match_all", [tag, tag2], False)]})
+        if tag and tag2
+        else None,
+        no_tags,
+    )
+    case(
+        "ui_tags_neg_any",
+        ui_base(
+            {"and_": [{"not_": ui_tag_filter("neg_match_any", [tag2], True)}]}
+        )
+        if tag2
+        else None,
+        no_tags,
+    )
+    case(
+        "ui_tags_combined",
+        ui_base(
+            {
+                "and_": [
+                    ui_tag_filter("pos_match_all", [tag], False),
+                    ui_tag_filter("pos_match_any", [tag2, tag3], True),
+                    {"not_": ui_tag_filter("neg_match_all", [tag4], False)},
+                    {"not_": ui_tag_filter("neg_match_any", [tag4], True)},
+                ]
+            }
+        )
+        if len(d["tags"]) > 3
+        else None,
+        None if len(d["tags"]) > 3 else "fewer than 4 tags",
+    )
+    case(
+        "ui_tags_order_confidence",
+        ui_base(
+            {"and_": [ui_tag_filter("pos_match_any", [tag], True, order_by=True)]}
+        )
+        if tag
+        else None,
+        no_tags,
+    )
+    case(
+        "ui_tags_setters_ns_confidence",
+        ui_base(
+            {
+                "and_": [
+                    ui_tag_filter(
+                        "pos_match_any",
+                        [tag],
+                        True,
+                        min_confidence=0.5,
+                        setters=d["tag_setters"][:1],
+                        namespaces=d["tag_namespaces"][:1],
+                    )
+                ]
+            }
+        )
+        if tag and d["tag_setters"] and d["tag_namespaces"]
+        else None,
+        no_tags,
+    )
+    case(
+        "ui_tags_all_setters_required",
+        ui_base(
+            {
+                "and_": [
+                    ui_tag_filter(
+                        "pos_match_all",
+                        [tag, tag2],
+                        False,
+                        all_setters_required=True,
+                        setters=d["tag_setters"][:1],
+                    )
+                ]
+            }
+        )
+        if tag and tag2 and d["tag_setters"]
+        else None,
+        no_tags,
+    )
+
+    # --- semantic text search (e_temb): priority 60, AVG, embed args,
+    # src_text null unless a source filter field is non-default
+    case(
+        "ui_semantic_text",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "asc", 60), text_embeddings=ui_temb_args(t_setter))]}
+        )
+        if t_setter
+        else None,
+        no_temb,
+    )
+    case(
+        "ui_semantic_text_src_length",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 60),
+                        text_embeddings=ui_temb_args(
+                            t_setter,
+                            src_text=ui_src_args(min_length=3, max_length=10000),
+                        ),
+                    )
+                ]
+            }
+        )
+        if t_setter
+        else None,
+        no_temb,
+    )
+    case(
+        "ui_semantic_text_src_setters_lang",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 60),
+                        text_embeddings=ui_temb_args(
+                            t_setter,
+                            src_text=ui_src_args(
+                                setters=d["text_setters"][:1],
+                                languages=[lang],
+                            ),
+                        ),
+                    )
+                ]
+            }
+        )
+        if t_setter and text_setter and lang
+        else None,
+        no_temb if not t_setter else (None if text_setter and lang else "no text setters/languages"),
+    )
+    # KNOWN DIVERGENCE reproducer: confidence weights make both builders
+    # emit POW(...) in SQL. The Rust gateway's SQLite has no pow() function
+    # ("no such function: pow" -> HTTP 500), so expect RUST_ERROR until the
+    # gateway registers/enables SQLite math functions. (The setters filter
+    # matters on the legacy side: with ONLY weights set, legacy skips the
+    # extracted_text join it gates on `len(criteria) > 0` while the rank
+    # expression still references extracted_text.confidence, and SQLAlchemy
+    # silently emits a cartesian CROSS JOIN — the Rust port fixed that by
+    # also joining when weights are used.)
+    case(
+        "ui_semantic_text_conf_weight",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 60),
+                        text_embeddings=ui_temb_args(
+                            t_setter,
+                            src_text=ui_src_args(
+                                setters=d["text_setters"][:1],
+                                confidence_weight=1,
+                                language_confidence_weight=1,
+                            ),
+                        ),
+                    )
+                ]
+            }
+        )
+        if t_setter and text_setter
+        else None,
+        no_temb,
+    )
+
+    # --- semantic image search (e_iemb)
+    case(
+        "ui_semantic_image",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "asc", 60), image_embeddings=ui_iemb_args(c_setter))]}
+        )
+        if c_setter
+        else None,
+        no_cemb,
+    )
+    case(
+        "ui_semantic_image_xmodal",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 60),
+                        image_embeddings=ui_iemb_args(c_setter, clip_xmodal=True),
+                    )
+                ]
+            }
+        )
+        if c_setter
+        else None,
+        no_cemb,
+    )
+
+    # --- "anytext" combined search (at_query): OR of enabled filters,
+    # each with priority 100 sortable args and its own RRF constants;
+    # multiple filters flip direction to desc and enable row_n
+    case(
+        "ui_anytext_path_text",
+        ui_base(
+            {
+                "and_": [
+                    {
+                        "or_": [
+                            at_path_child(at_multi(AT_RRF_PATH)),
+                            at_text_child(at_multi(AT_RRF_TXT)),
+                        ]
+                    }
+                ]
+            }
+        )
+        if word
+        else None,
+        no_text,
+    )
+    case(
+        "ui_anytext_path_only",
+        ui_base({"and_": [{"or_": [at_path_child(at_single(AT_RRF_PATH))]}]})
+        if word
+        else None,
+        no_text,
+    )
+    case(
+        "ui_anytext_text_only",
+        ui_base({"and_": [{"or_": [at_text_child(at_single(AT_RRF_TXT))]}]})
+        if word
+        else None,
+        no_text,
+    )
+    case(
+        "ui_anytext_full_hybrid",
+        ui_base(
+            {
+                "and_": [
+                    {
+                        "or_": [
+                            at_path_child(at_multi(AT_RRF_PATH)),
+                            at_text_child(at_multi(AT_RRF_TXT)),
+                            dict(
+                                at_multi(AT_RRF_SI),
+                                image_embeddings=ui_iemb_args(c_setter),
+                            ),
+                            dict(
+                                at_multi(AT_RRF_ST),
+                                text_embeddings=ui_temb_args(t_setter),
+                            ),
+                        ]
+                    }
+                ]
+            }
+        )
+        if word and t_setter and c_setter
+        else None,
+        None
+        if word and t_setter and c_setter
+        else "needs extracted text plus text and clip embeddings",
+    )
+    case(
+        "ui_anytext_semantic_only",
+        ui_base(
+            {
+                "and_": [
+                    {
+                        "or_": [
+                            dict(
+                                at_single(AT_RRF_ST),
+                                text_embeddings=ui_temb_args(t_setter),
+                            )
+                        ]
+                    }
+                ]
+            }
+        )
+        if t_setter
+        else None,
+        no_temb,
+    )
+    # the count half of the UI's paired requests: same body, results off
+    case(
+        "ui_count_query_anytext",
+        ui_base(
+            {
+                "and_": [
+                    {
+                        "or_": [
+                            at_path_child(at_multi(AT_RRF_PATH)),
+                            at_text_child(at_multi(AT_RRF_TXT)),
+                        ]
+                    }
+                ]
+            },
+            results=False,
+            count=True,
+        )
+        if word
+        else None,
+        no_text,
+    )
+
+    # --- item similarity search mode (e_iss): priority 150
+    case(
+        "ui_similar_page_clip_cosine",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "asc", 150), similar_to=ui_sim_args(c_setter, "COSINE"))]}
+        )
+        if c_target_ok
+        else None,
+        None if c_target_ok else "no clip embedding target",
+    )
+    case(
+        "ui_similar_page_clip_xmodal",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 150),
+                        similar_to=ui_sim_args(
+                            c_setter, "COSINE", clip_xmodal=True
+                        ),
+                    )
+                ]
+            }
+        )
+        if c_target_ok
+        else None,
+        None if c_target_ok else "no clip embedding target",
+    )
+    case(
+        "ui_similar_page_text_l2",
+        ui_base(
+            {"and_": [dict(ui_sort(True, "asc", 150), similar_to=ui_sim_args(t_setter, "L2"))]}
+        )
+        if t_target_ok
+        else None,
+        None if t_target_ok else "no text embedding target",
+    )
+    case(
+        "ui_similar_page_text_l2_src",
+        ui_base(
+            {
+                "and_": [
+                    dict(
+                        ui_sort(True, "asc", 150),
+                        similar_to=ui_sim_args(
+                            t_setter,
+                            "L2",
+                            src_text=ui_src_args(setters=d["text_setters"][:1]),
+                        ),
+                    )
+                ]
+            }
+        )
+        if t_target_ok and text_setter
+        else None,
+        None if t_target_ok and text_setter else "no text embedding target",
+    )
+
+    # --- similar-items sidebar (page_size 6, count false)
+    case(
+        "ui_sb_similar_clip",
+        ui_sb_base(
+            {"and_": [dict(ui_sort(True, "asc", 150), similar_to=ui_sim_args(c_setter, "COSINE"))]}
+        )
+        if c_target_ok
+        else None,
+        None if c_target_ok else "no clip embedding target",
+    )
+    case(
+        "ui_sb_similar_text",
+        ui_sb_base(
+            {"and_": [dict(ui_sort(True, "asc", 150), similar_to=ui_sim_args(t_setter, "L2"))]}
+        )
+        if t_target_ok
+        else None,
+        None if t_target_ok else "no text embedding target",
+    )
+    case(
+        "ui_sb_similar_clip_partition",
+        ui_sb_base(
+            {"and_": [dict(ui_sort(True, "asc", 150), similar_to=ui_sim_args(c_setter, "COSINE"))]},
+            partition_by=["item_id"],
+        )
+        if c_target_ok
+        else None,
+        None if c_target_ok else "no clip embedding target",
     )
 
     return cases
