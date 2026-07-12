@@ -76,7 +76,7 @@ fn serialize_npy_f32(values: &[f32]) -> Vec<u8> {
 }
 
 fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
-    let output = std::process::Command::new("ffmpeg")
+    let output = std::process::Command::new(crate::media_tools::ffmpeg())
         .arg("-nostdin")
         .arg("-threads")
         .arg("0")
@@ -110,7 +110,7 @@ fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
 }
 
 fn has_audio_stream(path: &str) -> ApiResult<bool> {
-    let output = std::process::Command::new("ffprobe")
+    let output = std::process::Command::new(crate::media_tools::ffprobe())
         .arg("-v")
         .arg("error")
         .arg("-show_entries")

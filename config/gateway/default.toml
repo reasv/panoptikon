@@ -130,6 +130,11 @@ embedding_cache_size = 16
 # When true, incomplete extraction jobs found at job start are deleted
 # (with their data) instead of being marked failed.
 # atomic_extraction_jobs = false
+# Explicit ffmpeg/ffprobe executables for video and audio processing.
+# Default: the managed venv's static-ffmpeg binaries (prefetched by
+# `panoptikon setup`), falling back to ffmpeg/ffprobe from PATH.
+# ffmpeg = "C:/tools/ffmpeg.exe"
+# ffprobe = "C:/tools/ffprobe.exe"
 
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.

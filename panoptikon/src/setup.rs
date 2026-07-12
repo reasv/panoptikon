@@ -246,12 +246,40 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
         );
     }
     write_sentinel(&venv, extra, &managed.uv_lock)?;
+    prefetch_static_ffmpeg(&interpreter).await;
     tracing::info!(
         interpreter = %interpreter.display(),
         extra,
         "Python inference environment is ready"
     );
     Ok(())
+}
+
+/// Best-effort prefetch of static-ffmpeg's platform binaries (ffmpeg +
+/// ffprobe) so the one-time download happens here, not in the middle of
+/// the first video scan. Failure is non-fatal: media jobs fall back to
+/// PATH ffmpeg/ffprobe at resolution time (see `media_tools`).
+async fn prefetch_static_ffmpeg(interpreter: &Path) {
+    tracing::info!("fetching the ffmpeg/ffprobe binaries (static-ffmpeg)");
+    match tokio::process::Command::new(interpreter)
+        .args(["-c", crate::media_tools::STATIC_FFMPEG_PROBE])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!("ffmpeg/ffprobe are ready");
+        }
+        Ok(output) => tracing::warn!(
+            stderr = %crate::jobs::files::stderr_tail(&output.stderr),
+            "static-ffmpeg prefetch failed; video/audio jobs fall back to \
+             ffmpeg from PATH"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "static-ffmpeg prefetch failed; video/audio jobs fall back to \
+             ffmpeg from PATH"
+        ),
+    }
 }
 
 /// Write the completion sentinel after a successful sync: the synced extra

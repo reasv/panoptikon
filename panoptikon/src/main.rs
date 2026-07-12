@@ -12,6 +12,7 @@ mod inferio;
 mod inferio_client;
 mod jobs;
 mod logging;
+mod media_tools;
 mod openapi;
 mod policy;
 mod policy_token;

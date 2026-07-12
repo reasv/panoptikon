@@ -2564,7 +2564,7 @@ fn extract_video_frames_into(
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full) instead of just "ffmpeg
     // failed"; it is only surfaced on a non-zero exit.
-    let output = Command::new("ffmpeg")
+    let output = Command::new(crate::media_tools::ffmpeg())
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -2655,7 +2655,7 @@ struct MediaInfo {
 }
 
 fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(crate::media_tools::ffprobe())
         .arg("-v")
         .arg("error")
         .arg("-show_entries")

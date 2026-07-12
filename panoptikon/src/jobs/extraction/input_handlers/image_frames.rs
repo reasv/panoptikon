@@ -490,7 +490,7 @@ fn extract_video_frames_into(
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full); it is only surfaced on a
     // non-zero exit.
-    let output = std::process::Command::new("ffmpeg")
+    let output = std::process::Command::new(crate::media_tools::ffmpeg())
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -532,7 +532,7 @@ fn extract_video_frames_into(
 }
 
 fn probe_duration(path: &str) -> ApiResult<f64> {
-    let output = std::process::Command::new("ffprobe")
+    let output = std::process::Command::new(crate::media_tools::ffprobe())
         .arg("-v")
         .arg("error")
         .arg("-show_entries")

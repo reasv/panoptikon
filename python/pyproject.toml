@@ -16,6 +16,10 @@ dependencies = [
     # Not imported by the worker: the Rust server resolves the UI's Node.js
     # runtime from this venv (see docs/architecture.md, tech debt register).
     "nodejs-wheel>=20.17.0,<21",
+    # Also not imported by the worker: ships the ffmpeg/ffprobe binaries the
+    # Rust server uses for video/audio processing (the package downloads them
+    # on first use; `panoptikon setup` prefetches them after syncing).
+    "static-ffmpeg>=3.0",
 ]
 
 # Accelerator matrix (docs/architecture.md "Python environment management"):
@@ -77,6 +81,10 @@ test = [
 [tool.uv]
 package = false
 default-groups = ["inference"]
+# static-ffmpeg wrongly declares the PyPI publishing tool twine as a runtime
+# dependency; nothing it does at runtime (nor anything we call) imports it.
+# The impossible marker drops it from the resolution entirely.
+override-dependencies = ["twine; python_version < '0'"]
 # The accelerator extras are mutually exclusive: conflicts lets one universal
 # uv.lock carry all variants while `uv sync --extra <one>` installs exactly one.
 conflicts = [[{ extra = "cpu" }, { extra = "cu128" }, { extra = "rocm" }]]

@@ -353,6 +353,14 @@ pub struct JobsConfig {
     /// Default: 8192 (8 GiB).
     #[serde(default = "default_image_decode_memory_limit_mb")]
     pub image_decode_memory_limit_mb: u64,
+    /// Explicit ffmpeg executable for video/audio processing. Default:
+    /// the managed venv's static-ffmpeg binaries, then `ffmpeg` from PATH
+    /// (see `media_tools`).
+    #[serde(default)]
+    pub ffmpeg: Option<PathBuf>,
+    /// Explicit ffprobe executable; same default chain as `ffmpeg`.
+    #[serde(default)]
+    pub ffprobe: Option<PathBuf>,
 }
 
 fn default_loader_concurrency() -> usize {
@@ -374,6 +382,8 @@ impl Default for JobsConfig {
             intermediate_data_budget_mb: default_intermediate_data_budget_mb(),
             atomic_extraction_jobs: false,
             image_decode_memory_limit_mb: default_image_decode_memory_limit_mb(),
+            ffmpeg: None,
+            ffprobe: None,
         }
     }
 }
@@ -392,6 +402,11 @@ pub struct RuntimeConfig {
     pub atomic_extraction_jobs: bool,
     pub image_decode_memory_limit_mb: u64,
     pub open: OpenConfig,
+    pub ffmpeg: Option<PathBuf>,
+    pub ffprobe: Option<PathBuf>,
+    /// The venv interpreter `media_tools` probes for static-ffmpeg —
+    /// the same one that runs inference workers.
+    pub venv_python: PathBuf,
 }
 
 impl Default for RuntimeConfig {
@@ -405,6 +420,11 @@ impl Default for RuntimeConfig {
             atomic_extraction_jobs: false,
             image_decode_memory_limit_mb: default_image_decode_memory_limit_mb(),
             open: OpenConfig::default(),
+            ffmpeg: None,
+            ffprobe: None,
+            venv_python: crate::resources::default_worker_python(
+                crate::resources::py_source_mode(),
+            ),
         }
     }
 }
@@ -464,6 +484,9 @@ impl Settings {
             atomic_extraction_jobs: self.jobs.atomic_extraction_jobs,
             image_decode_memory_limit_mb: self.jobs.image_decode_memory_limit_mb,
             open: self.open.clone(),
+            ffmpeg: self.jobs.ffmpeg.clone(),
+            ffprobe: self.jobs.ffprobe.clone(),
+            venv_python: self.inference_local.resolved_python(),
         }
     }
 }
