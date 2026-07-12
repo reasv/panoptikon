@@ -78,16 +78,22 @@ jobs:
           set -euo pipefail
           BIN="$PWD/${{ matrix.bin }}"
 
-          mkdir -p smoke/fixture
+          # Run entirely outside the checkout so the binary's CWD-relative
+          # resolution (data_folder, runtime/ extraction, python/ and ui/
+          # presence checks) and ancestor traversals (.env autoload) can't
+          # accidentally pick up repo files - this must behave like a user's
+          # empty install dir.
+          SMOKE="$RUNNER_TEMP/smoke"
+          mkdir -p "$SMOKE/fixture"
           HAVE_FIXTURE=0
-          if gh release download ci-fixture --pattern fixture.tar.gz --dir smoke; then
-            tar -xzf smoke/fixture.tar.gz -C smoke/fixture
+          if gh release download ci-fixture --pattern fixture.tar.gz --dir "$SMOKE"; then
+            tar -xzf "$SMOKE/fixture.tar.gz" -C "$SMOKE/fixture"
             HAVE_FIXTURE=1
           else
             echo "::warning::ci-fixture release asset not found - running boot-only smoke test (no scan/search/thumbnail assertions)"
           fi
 
-          cat > smoke/smoke.toml <<'EOF'
+          cat > "$SMOKE/smoke.toml" <<'EOF'
           data_folder = "fixture"
 
           [server]
@@ -128,7 +134,7 @@ jobs:
           allow = "*"
           EOF
 
-          cd smoke
+          cd "$SMOKE"
           "$BIN" --config smoke.toml > gateway.log 2>&1 &
           GW_PID=$!
           trap 'kill $GW_PID 2>/dev/null || true' EXIT
@@ -221,7 +227,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: smoke-logs-${{ matrix.label }}
-          path: smoke/gateway.log
+          path: ${{ runner.temp }}/smoke/gateway.log
           if-no-files-found: ignore
 
       - name: Package artifact
