@@ -33,14 +33,18 @@ pub(crate) fn detach_from_console(command: &mut tokio::process::Command) {
 /// or OOM kill of the gateway — none of which run destructors, so
 /// `kill_on_drop` never fires). Windows is a no-op: the kill-on-close job
 /// object already makes worker death a kernel-enforced consequence of
-/// gateway death. On Unix the equivalent is PR_SET_PDEATHSIG: the kernel
+/// gateway death. On Linux the equivalent is PR_SET_PDEATHSIG: the kernel
 /// delivers SIGKILL to the child when the spawning *thread* dies — safe
 /// here because spawns happen on tokio core worker threads, which live
 /// until the runtime (and thus the process) goes down. The fork→prctl gap
 /// is closed by re-checking the parent after arming: if the gateway died in
 /// between, the signal never armed, so the child exits itself.
+/// macOS has no PR_SET_PDEATHSIG equivalent (prctl is Linux-only), so there
+/// this is a no-op: `kill_process_group` still covers every orderly shutdown
+/// path, and only a gateway death where no gateway code runs can leave the
+/// child behind.
 pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let gateway = std::process::id() as libc::pid_t;
         // SAFETY: runs between fork and exec in the child; prctl, getppid,
@@ -57,7 +61,7 @@ pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
             });
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = command;
     }
