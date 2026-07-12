@@ -253,10 +253,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Attach all platform artifacts to one draft release in a single job so the
-  # three matrix builds don't race to create it.
+  # Attach all platform artifacts and publish the release in a single job so
+  # the three matrix builds don't race to create it. Published directly (not
+  # a draft): every job above must already be green, and the notes are
+  # generated from the commit history since the previous tag.
   release:
-    name: Draft release
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -268,5 +270,5 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
-          draft: true
+          generate_release_notes: true
           files: dist/*
