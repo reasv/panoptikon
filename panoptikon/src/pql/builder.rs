@@ -642,6 +642,11 @@ fn add_extra_columns(
 ) -> (SelectStatement, HashMap<String, String>) {
     let mut column_aliases = HashMap::new();
     for (index, extra_column) in state.extra_columns.iter().enumerate() {
+        // Python treats an empty select_as / select_snippet_as alias as "not
+        // requested" (truthiness); the UI relies on this by always sending "".
+        if extra_column.alias.is_empty() {
+            continue;
+        }
         let column_name = extra_column.column.as_str();
         if Some(extra_column.cte.name.as_str()) == root_cte_name {
             column_aliases.insert(column_name.to_string(), extra_column.alias.clone());

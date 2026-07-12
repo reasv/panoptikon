@@ -1,3 +1,9 @@
+# The bundled SQLite (sqlx → libsqlite3-sys) must include the math functions:
+# PQL's confidence-weight expressions emit POW(), which the legacy Python
+# implementation gets from CPython's SQLite build.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:8388608"]
 

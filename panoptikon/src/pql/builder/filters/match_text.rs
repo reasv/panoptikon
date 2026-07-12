@@ -140,7 +140,13 @@ impl FilterCompiler for MatchText {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
         let args = &self.match_text;
         let cte_name = format!("n{}_MatchText", state.cte_counter);
-        let want_snippet = args.select_snippet_as.is_some() && !state.is_count_query;
+        // An empty alias means "no snippet", matching Python's truthiness
+        // gate — the UI sends select_snippet_as: "" on every text search.
+        let snippet_alias = args
+            .select_snippet_as
+            .as_deref()
+            .filter(|alias| !alias.is_empty());
+        let want_snippet = snippet_alias.is_some() && !state.is_count_query;
 
         let mut criteria = Vec::new();
         if !args.filter_only {
@@ -316,11 +322,11 @@ impl FilterCompiler for MatchText {
                         alias: alias.clone(),
                     });
                 }
-                if let Some(alias) = &args.select_snippet_as {
+                if let Some(alias) = snippet_alias {
                     state.extra_columns.push(ExtraColumn {
                         column: "snip".to_string(),
                         cte: cte.clone(),
-                        alias: alias.clone(),
+                        alias: alias.to_string(),
                     });
                 }
                 if self.sort.order_by {
@@ -419,11 +425,11 @@ impl FilterCompiler for MatchText {
                     alias: alias.clone(),
                 });
             }
-            if let Some(alias) = &args.select_snippet_as {
+            if let Some(alias) = snippet_alias {
                 state.extra_columns.push(ExtraColumn {
                     column: "snip".to_string(),
                     cte: cte.clone(),
-                    alias: alias.clone(),
+                    alias: alias.to_string(),
                 });
             }
             if self.sort.order_by {

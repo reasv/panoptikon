@@ -96,17 +96,16 @@ sources), its count-query twin, item similarity search-page mode
 (CLIP COSINE, xmodal, text L2, `src_text` setter restriction), and the
 similar-items sidebar queries (page_size 6, `count: false`, partition).
 
-Two `ui_*` cases are intentional-failure reproducers for real divergences
-found in the Rust port (see the comments at their definitions):
-`ui_match_text_filter` (`select_snippet_as: ""` — legacy treats the empty
-string as unset, Rust `is_some()` computes a snippet and returns it under
-the key `""` in `extra`; the UI sends `""` on every text search) and
-`ui_semantic_text_conf_weight` (`src_text` confidence weights emit
-`POW(...)`, and the Rust gateway's SQLite has no `pow` function — every
-weighted query returns HTTP 500; legacy additionally cross-joins when only
-weights are set with no other src_text criteria, which the Rust port
-fixed). Expect RESULT_DIFF and RUST_ERROR respectively until those are
-fixed in the gateway.
+Two `ui_*` cases are regression reproducers for real divergences the suite
+found in the Rust port, both since fixed: `ui_match_text_filter`
+(`select_snippet_as: ""` — legacy treats the empty string as unset; Rust
+used to gate on `is_some()` and computed/returned a spurious snippet under
+the key `""`; empty aliases are now ignored everywhere, matching Python
+truthiness) and `ui_semantic_text_conf_weight` (`src_text` confidence
+weights emit `POW(...)`, which the bundled SQLite lacked — now enabled via
+`LIBSQLITE3_FLAGS` in `.cargo/config.toml`; legacy additionally cross-joins
+when only weights are set with no other src_text criteria, which the Rust
+port fixed). Both must PASS.
 
 Semantic queries never call inference: the driver generates a deterministic
 pseudo-embedding per model (seeded by the model name, correct dimension) and
