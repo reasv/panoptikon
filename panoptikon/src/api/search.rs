@@ -768,11 +768,13 @@ fn map_search_result(
         if is_known_column(column) {
             continue;
         }
+        // Only requested extra columns (select_as / select_snippet_as) are part
+        // of the response; internal helper columns like order_rank and rn are
+        // not, matching the Python implementation.
+        let Some(alias) = extra_columns.get(column) else {
+            continue;
+        };
         if let Some(value) = read_extra_value(row, column)? {
-            let alias = extra_columns
-                .get(column)
-                .map(|alias| alias.as_str())
-                .unwrap_or(column);
             extras.insert(alias.to_string(), value);
         }
     }
