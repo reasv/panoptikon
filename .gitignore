@@ -199,3 +199,4 @@ data/
 
 # Permanent worktree of the deprecated Python implementation (python-legacy branch)
 /python-legacy/
+/target-pql
