@@ -11,7 +11,7 @@
 # (torch's pinned triton publishes no aarch64 wheels).
 
 # ---- UI build: Next.js standalone bundle, embedded into the binary ----
-FROM node:22-bookworm-slim AS ui-build
+FROM node:24-trixie-slim AS ui-build
 WORKDIR /ui
 COPY ui/ ./
 ENV BUILD_STANDALONE=true
@@ -24,7 +24,7 @@ RUN npm ci \
     && test -f .next/standalone/server.js
 
 # ---- Rust build: bundled binary (embeds the Python source set + UI) ----
-FROM rust:1-bookworm AS rust-build
+FROM rust:1-trixie AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY panoptikon/ panoptikon/
@@ -35,11 +35,11 @@ ENV PANOPTIKON_UI_BUNDLE=/ui-bundle
 RUN cargo build --release -p panoptikon --features bundled,bundled-ui
 
 # ---- Runtime: native Node.js + the managed Python venv ----
-FROM node:22-bookworm-slim
-# libgl1/libglib2.0-0/libsm6/libxext6/libxrender1: OpenCV (EasyOCR) runtime
-# libraries. curl: the container healthcheck.
+FROM node:24-trixie-slim
+# libgl1/libglib2.0-0t64/libsm6/libxext6/libxrender1: OpenCV (EasyOCR)
+# runtime libraries. curl: the container healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 curl ca-certificates \
+        libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.source="https://github.com/reasv/panoptikon" \
