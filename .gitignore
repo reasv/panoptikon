@@ -196,3 +196,6 @@ data/
 /runtime/
 /target-m3
 /ci-fixture/
+
+# Permanent worktree of the deprecated Python implementation (python-legacy branch)
+/python-legacy/
