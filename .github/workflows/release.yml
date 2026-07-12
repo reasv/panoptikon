@@ -84,6 +84,9 @@ jobs:
           # accidentally pick up repo files - this must behave like a user's
           # empty install dir.
           SMOKE="$RUNNER_TEMP/smoke"
+          # Git Bash tools (tar) read the colon in D:\... as a remote-host
+          # separator; hand them a POSIX path instead.
+          case "$(uname -s)" in MINGW*|MSYS*) SMOKE="$(cygpath -u "$SMOKE")" ;; esac
           mkdir -p "$SMOKE/fixture"
           HAVE_FIXTURE=0
           if gh release download ci-fixture --pattern fixture.tar.gz --dir "$SMOKE"; then
