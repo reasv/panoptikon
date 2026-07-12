@@ -23,8 +23,12 @@
 //!
 //! Multiple placeholders per string are fine. Substitution is a single pass:
 //! placeholder-looking text inside a substituted value is *not* re-expanded.
-//! Only strings can be templated — TOML numbers/booleans have no placeholder
-//! form; use the `PANOPTIKON__*` env override layer for those.
+//! Substitution itself only touches strings, but numeric/boolean/float
+//! keys in the *server* config can still be templated by quoting the whole
+//! value (`port = "${PORT:-6342}"`): the substituted string is handed to
+//! the config crate, whose deserializer coerces it to the target key's
+//! type (string-typed keys keep the string verbatim — nothing is ever
+//! round-tripped through a number).
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;

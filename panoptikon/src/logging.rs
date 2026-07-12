@@ -113,8 +113,9 @@ base_url = "http://127.0.0.1:6342"
 "#,
         )
         .unwrap();
-        // Settings::load reads PANOPTIKON__* env overrides: hold the shared
-        // env lock so tests mutating those vars cannot interleave.
+        // Settings::load resolves ${VAR} templates from the environment:
+        // hold the shared env lock so tests mutating env vars cannot
+        // interleave.
         let settings = {
             let _env = crate::test_utils::env_lock();
             Settings::load(Some(path)).unwrap()

@@ -55,8 +55,10 @@ TOML with env templating is THE configuration mechanism (see
 escapes. Applied to the server config and every inference registry TOML —
 secrets reach inference impls via inference-ID `config.*` kwargs, never via a
 special env-passing channel. `.env` is auto-loaded as a convenience source for
-template variables. Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`,
-`RUST_LOG`, `PANOPTIKON__*` overrides) are the documented exceptions.
+template variables; numeric/boolean keys are templated as quoted
+whole-value templates (`port = "${PORT:-6342}"`), coerced at load.
+Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
+the documented exceptions.
 
 ### Policy-scoped SSR
 

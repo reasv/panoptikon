@@ -568,6 +568,10 @@ may reference environment variables:
 [logging]
 level = "${LOGLEVEL:-INFO}"   # LOGLEVEL, or "INFO" when unset or empty
 
+[server]
+port = "${PORT:-6342}"        # numeric/boolean keys: quote the whole value;
+                              # the substituted string is coerced at load
+
 [open]
 file_command = "player ${PLAYER_FLAGS:-} {path}"
 
@@ -590,11 +594,14 @@ The forms follow the shell / docker-compose conventions:
   (values are never re-expanded). `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
 
 Substitution runs on *parsed* string values, so env values containing
-backslashes or quotes (Windows paths) cannot corrupt the TOML. Only strings
-can be templated — for numeric/boolean keys use the `PANOPTIKON__*` override
-layer instead. Values arriving through the `PANOPTIKON__*` override layer are
-**not** templated: overrides are applied after substitution and are taken
-literally (they already come from the environment). Registry TOMLs are
+backslashes or quotes (Windows paths) cannot corrupt the TOML. Numeric,
+boolean and float keys in the settings file can be templated by writing the
+whole value as a quoted template — `port = "${PORT:-6342}"`, `readonly =
+"${RO:-false}"` — because the config crate coerces the substituted string
+to the target key's type at load (garbage in a numeric key fails the load
+loudly). String-typed keys always keep the substituted string verbatim, so
+numeric-looking values like a DB name `"0123"` are never mangled. There is
+no separate env override layer. Registry TOMLs are
 re-substituted on every mtime-gated reload. Per-DB system configs
 (`data/index/<name>/config.toml`) are **not** templated: the gateway writes
 them back, which would destroy the templates.
@@ -708,9 +715,6 @@ These are deliberately *not* TOML keys:
   live inside it. (`--config` wins over it.)
 - `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
   set and supports per-module directives.
-- `PANOPTIKON__*` — generic config override layer (see below); works for every
-  key, including the new ones (e.g. `PANOPTIKON__DATA_FOLDER`,
-  `PANOPTIKON__LOGGING__LEVEL`, `PANOPTIKON__READONLY`).
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
   `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
@@ -730,22 +734,7 @@ they became the `[jobs]` keys `pdfium`, `html_renderer` and
 etc., so setting the variables in `.env` still works — through the
 templating layer, not a direct read.
 
-### PANOPTIKON__ overrides
-
-Environment variables with the `PANOPTIKON__` prefix override the file:
-
-```bash
-PANOPTIKON_CONFIG_PATH=config\server\default.toml
-PANOPTIKON__SERVER_HOST=0.0.0.0
-PANOPTIKON__SERVER_PORT=8080
-PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS=false
-PANOPTIKON__UPSTREAM_UI=http://127.0.0.1:6340
-PANOPTIKON__UPSTREAM_API=http://127.0.0.1:6342
-PANOPTIKON__UPSTREAM_API_LOCAL=false
-PANOPTIKON__SEARCH__EMBEDDING_CACHE_SIZE=16
-```
-
-CLI override example:
+The config file path itself can be overridden on the CLI:
 
 ```bash
 cargo run -p panoptikon -- --config config\server\userconfig.toml
@@ -766,23 +755,6 @@ path as `POST /api/jobs/cancel`), and flushes the index DB writers so every
 queued write commits. Cleanup is bounded by a 10s grace period and a 20s hard
 deadline; a second signal exits immediately. Anything cut off is a single
 SQLite transaction, which rolls back on next open.
-
-The nested style supported by the config crate also works:
-
-```bash
-PANOPTIKON__SERVER__HOST=0.0.0.0
-PANOPTIKON__SERVER__PORT=8080
-PANOPTIKON__SERVER__TRUST_FORWARDED_HEADERS=false
-PANOPTIKON__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6340
-PANOPTIKON__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
-PANOPTIKON__UPSTREAMS__API__LOCAL=false
-PANOPTIKON__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342
-PANOPTIKON__UPSTREAMS__INFERENCE__0__WEIGHT=1.0
-PANOPTIKON__UPSTREAMS__INFERENCE__0__USE_FOR_JOBS=true
-PANOPTIKON__SEARCH__EMBEDDING_CACHE_SIZE=16
-PANOPTIKON__DATA_FOLDER=data
-PANOPTIKON__LOGGING__LEVEL=debug
-```
 
 ## Running locally
 

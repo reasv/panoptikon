@@ -16,9 +16,9 @@
 #
 # Substitution runs on parsed string values (backslashes in env values are
 # safe) and applies to this file and to every inference registry TOML.
-# Numbers/booleans cannot be templated; use the PANOPTIKON__* env override
-# layer for those (e.g. PANOPTIKON__SERVER__PORT=8080). PANOPTIKON__* override
-# values themselves are never templated — they are taken literally.
+# Numeric/boolean keys can be templated too by quoting the whole value —
+# e.g. port = "${PORT:-8080}" — the substituted string is coerced to the
+# key's type at load (string keys always keep the string verbatim).
 
 # Root folder for all persistent state (index DBs, user data, thumbnails,
 # logs), relative to the working directory unless absolute.

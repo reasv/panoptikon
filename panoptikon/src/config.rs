@@ -816,16 +816,18 @@ impl Settings {
                 "search.embedding_cache_size",
                 default_embedding_cache_size() as i64,
             )?;
-        // A missing config file is fine (defaults + env only), matching the
-        // old `required(false)` behavior.
+        // A missing config file is fine (defaults only), matching the old
+        // `required(false)` behavior. There is no env override layer: env
+        // vars influence configuration exclusively through `${VAR}`
+        // templating inside the file's string values — including
+        // numeric/boolean keys, via whole-value templates like
+        // `port = "${PORT:-6342}"` (the config crate coerces the
+        // substituted string at deserialization; regression-tested below).
         if let Some(source) = templated_file_source(&config_path)? {
             builder = builder.add_source(source);
         }
-        let builder =
-            builder.add_source(config::Environment::with_prefix("PANOPTIKON").separator("__"));
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
-        settings.apply_env_overrides()?;
         settings.normalize_empty_tool_paths();
         let loopback_synthesized = settings.apply_inference_default();
         settings.validate(loopback_synthesized)?;
@@ -846,39 +848,6 @@ impl Settings {
             addrs.push((endpoint.name.clone(), format!("{}:{}", host, endpoint.port)));
         }
         addrs
-    }
-
-    fn apply_env_overrides(&mut self) -> Result<()> {
-        if let Ok(value) = env::var("PANOPTIKON__SERVER_HOST") {
-            self.server.host = value;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__SERVER_PORT") {
-            self.server.port = value
-                .parse()
-                .context("PANOPTIKON__SERVER_PORT must be a valid u16")?;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS") {
-            self.server.trust_forwarded_headers = value
-                .parse()
-                .context("PANOPTIKON__SERVER_TRUST_FORWARDED_HEADERS must be a boolean")?;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_UI") {
-            self.upstreams.ui.base_url = value;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_UI_LOCAL") {
-            self.upstreams.ui.local = value
-                .parse()
-                .context("PANOPTIKON__UPSTREAM_UI_LOCAL must be a boolean")?;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_API") {
-            self.upstreams.api.base_url = value;
-        }
-        if let Ok(value) = env::var("PANOPTIKON__UPSTREAM_API_LOCAL") {
-            self.upstreams.api.local = value
-                .parse()
-                .context("PANOPTIKON__UPSTREAM_API_LOCAL must be a boolean")?;
-        }
-        Ok(())
     }
 
     /// Empty-string tool paths mean "unset": the shipped configs template
@@ -2165,26 +2134,110 @@ image_decode_memory_limit_mb = 2048
         assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
     }
 
-    /// The PANOPTIKON__ env override layer covers the new keys too, both
-    /// top-level (PANOPTIKON__DATA_FOLDER) and nested (PANOPTIKON__LOGGING__LEVEL).
+    /// There is no env override layer: PANOPTIKON__* variables (the removed
+    /// mechanism) have no effect on config load whatsoever. Env vars reach
+    /// the config exclusively through `${VAR}` templating in the file.
     #[test]
-    fn panoptikon_env_overrides_cover_new_keys() {
+    fn panoptikon_env_overrides_are_gone() {
         let _guard = env_lock();
         unsafe {
             env::set_var("PANOPTIKON__DATA_FOLDER", "env_data");
             env::set_var("PANOPTIKON__READONLY", "true");
-            env::set_var("PANOPTIKON__LOGGING__LEVEL", "trace");
+            env::set_var("PANOPTIKON__SERVER_PORT", "1");
+            env::set_var("PANOPTIKON__SERVER__PORT", "2");
         }
         let settings = load_from(MINIMAL);
         unsafe {
             env::remove_var("PANOPTIKON__DATA_FOLDER");
             env::remove_var("PANOPTIKON__READONLY");
-            env::remove_var("PANOPTIKON__LOGGING__LEVEL");
+            env::remove_var("PANOPTIKON__SERVER_PORT");
+            env::remove_var("PANOPTIKON__SERVER__PORT");
         }
         let settings = settings.unwrap();
-        assert_eq!(settings.data_folder, PathBuf::from("env_data"));
+        assert_eq!(settings.data_folder, PathBuf::from("data"));
+        assert!(!settings.readonly);
+        assert_eq!(settings.server.port, 9155, "the file's port stands");
+    }
+
+    /// Whole-value templating covers numeric/boolean/float keys: a quoted
+    /// TOML string consisting entirely of a template expression (e.g.
+    /// `port = "${PORT:-6342}"`) substitutes to a string that the config
+    /// crate coerces to the target key's type at deserialization. String
+    /// keys with numeric-looking templated values stay strings, untouched —
+    /// substitution never converts types itself.
+    #[test]
+    fn whole_value_templates_cover_numeric_and_boolean_keys() {
+        let _guard = env_lock();
+        let body = r#"
+readonly = "${GW_TPL_RO:-false}"
+index_db = "${GW_TPL_DB:-0123}"
+
+[server]
+host = "127.0.0.1"
+port = "${GW_TPL_PORT:-9155}"
+trust_forwarded_headers = "${GW_TPL_TRUST:-true}"
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[[upstreams.inference]]
+base_url = "http://127.0.0.1:6342"
+weight = "${GW_TPL_WEIGHT:-1.5}"
+
+[search]
+embedding_cache_size = "${GW_TPL_CACHE:-16}"
+"#;
+
+        // Variables unset: the template defaults land as the typed values.
+        let settings = load_from(body).unwrap();
+        assert_eq!(settings.server.port, 9155u16);
+        assert!(settings.server.trust_forwarded_headers);
+        assert!(!settings.readonly);
+        assert_eq!(settings.upstreams.inference[0].weight, 1.5f64);
+        assert_eq!(settings.search.embedding_cache_size, 16usize);
+        // Numeric-looking value on a string key: stays a string verbatim
+        // (never round-tripped through a number — the leading zero lives).
+        assert_eq!(settings.index_db, "0123");
+
+        // Variables set: the env values win, coerced to the target types.
+        unsafe {
+            env::set_var("GW_TPL_PORT", "6355");
+            env::set_var("GW_TPL_TRUST", "false");
+            env::set_var("GW_TPL_RO", "true");
+            env::set_var("GW_TPL_WEIGHT", "2.25");
+            env::set_var("GW_TPL_CACHE", "32");
+            env::set_var("GW_TPL_DB", "007");
+        }
+        let settings = load_from(body);
+        unsafe {
+            for name in [
+                "GW_TPL_PORT",
+                "GW_TPL_TRUST",
+                "GW_TPL_RO",
+                "GW_TPL_WEIGHT",
+                "GW_TPL_CACHE",
+                "GW_TPL_DB",
+            ] {
+                env::remove_var(name);
+            }
+        }
+        let settings = settings.unwrap();
+        assert_eq!(settings.server.port, 6355u16);
+        assert!(!settings.server.trust_forwarded_headers);
         assert!(settings.readonly);
-        assert_eq!(settings.logging.level, "trace");
+        assert_eq!(settings.upstreams.inference[0].weight, 2.25f64);
+        assert_eq!(settings.search.embedding_cache_size, 32usize);
+        assert_eq!(settings.index_db, "007");
+
+        // A non-numeric value on a numeric key fails the load loudly
+        // instead of silently defaulting.
+        unsafe { env::set_var("GW_TPL_PORT", "not-a-port") };
+        let result = load_from(body);
+        unsafe { env::remove_var("GW_TPL_PORT") };
+        assert!(result.is_err(), "garbage in a numeric key must fail");
     }
 
     /// Env templating applies to the gateway settings file: `${VAR}` and

@@ -22,8 +22,8 @@ pub(crate) fn test_data_root() -> &'static std::path::Path {
 }
 
 /// Serializes tests that read or mutate process-global environment variables
-/// consumed by `Settings::load` (the PANOPTIKON__* override layer, templated
-/// variables like LOGLEVEL). Every test that calls `Settings::load` *or*
+/// consumed by `Settings::load` (templated variables like LOGLEVEL).
+/// Every test that calls `Settings::load` *or*
 /// sets such variables must hold this lock, otherwise parallel tests can
 /// observe each other's overrides.
 pub(crate) fn env_lock() -> MutexGuard<'static, ()> {

@@ -240,13 +240,13 @@ configuration mechanism: string values in the TOML (and in every inference
 registry TOML) can reference environment variables with `${VAR}` /
 `${VAR:-default}` templating, and a `.env` file in the repo root is still
 auto-loaded as a convenient source for those variables (see `.env.example`).
-The remaining real environment variables are bootstrap/diagnostic:
-`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`, and the generic `PANOPTIKON__*` config
-override layer.
+Numeric and boolean keys can be templated too, as quoted whole-value
+templates (e.g. `port = "${PORT:-6342}"` — coerced to the key's type at
+load). The remaining real environment variables are bootstrap/diagnostic:
+`PANOPTIKON_CONFIG_PATH` and `RUST_LOG`.
 
 See [`panoptikon/README.md`](panoptikon/README.md) for the full configuration
-reference: every key, the templating syntax, policies and rulesets, and the
-`PANOPTIKON__*` override forms.
+reference: every key, the templating syntax, and policies and rulesets.
 
 # Docker
 
