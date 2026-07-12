@@ -759,7 +759,7 @@ impl Settings {
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 8080)?
             .set_default("server.trust_forwarded_headers", false)?
-            .set_default("upstreams.ui.base_url", "http://127.0.0.1:6339")?
+            .set_default("upstreams.ui.base_url", "http://127.0.0.1:6340")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
             .set_default(
                 "search.embedding_cache_size",

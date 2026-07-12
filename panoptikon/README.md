@@ -9,7 +9,7 @@ local API handling when `upstreams.api.local = true`.
 
 Panoptikon currently runs:
 
-- Next.js frontend (dev server on `http://127.0.0.1:6339`)
+- Next.js frontend (dev server on `http://127.0.0.1:6340`)
 - Python backend (FastAPI on `http://127.0.0.1:6342`)
 
 The gateway sits in front of both, so the browser only talks to the Rust
@@ -628,7 +628,7 @@ trust_forwarded_headers = false
 # # host = "127.0.0.1"  # default: server.host
 
 [upstreams.ui]
-base_url = "http://127.0.0.1:6339"
+base_url = "http://127.0.0.1:6340"
 # Run the production UI from a checkout (see "Production UI" above):
 # local = true
 # dir = "ui"                  # the ui/ git submodule is the standard spot
@@ -719,7 +719,7 @@ GATEWAY_CONFIG_PATH=config\gateway\default.toml
 GATEWAY__SERVER_HOST=0.0.0.0
 GATEWAY__SERVER_PORT=8080
 GATEWAY__SERVER_TRUST_FORWARDED_HEADERS=false
-GATEWAY__UPSTREAM_UI=http://127.0.0.1:6339
+GATEWAY__UPSTREAM_UI=http://127.0.0.1:6340
 GATEWAY__UPSTREAM_API=http://127.0.0.1:6342
 GATEWAY__UPSTREAM_API_LOCAL=false
 GATEWAY__SEARCH__EMBEDDING_CACHE_SIZE=16
@@ -754,7 +754,7 @@ The nested style supported by the config crate also works:
 GATEWAY__SERVER__HOST=0.0.0.0
 GATEWAY__SERVER__PORT=8080
 GATEWAY__SERVER__TRUST_FORWARDED_HEADERS=false
-GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6339
+GATEWAY__UPSTREAMS__UI__BASE_URL=http://127.0.0.1:6340
 GATEWAY__UPSTREAMS__API__BASE_URL=http://127.0.0.1:6342
 GATEWAY__UPSTREAMS__API__LOCAL=false
 GATEWAY__UPSTREAMS__INFERENCE__0__BASE_URL=http://127.0.0.1:6342

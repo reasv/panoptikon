@@ -28,10 +28,19 @@ trust_forwarded_headers = true
 name = "test"
 port = 6343
 
+# Legacy entrypoint: 6339 was the UI port back when the Next.js frontend
+# was the entry point, so old links and bookmarks land here. Serves the
+# same routes as the primary listener; the "localhost" policy below
+# matches it by host.
+[[server.endpoints]]
+name = "legacy_ui"
+port = 6339
+
 [upstreams.ui]
 # Next.js frontend base URL; with local = true this is also the host/port
-# the spawned `next start` binds to.
-base_url = "http://127.0.0.1:6339"
+# the spawned `next start` binds to. Internal upstream only — never an
+# entrypoint (that's what freed 6339 for the legacy_ui listener above).
+base_url = "http://127.0.0.1:6340"
 local = true
 # Path to the panoptikon-ui checkout. The standard location is the ui/
 # git submodule (populated by cloning with --recurse-submodules, or by
