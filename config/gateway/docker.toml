@@ -56,6 +56,12 @@ node = "node"
 base_url = "http://127.0.0.1:6342"
 local = true
 
+# ffmpeg/ffprobe from the image's apt packages — the venv's static-ffmpeg
+# binaries are removed at image build time.
+[jobs]
+ffmpeg = "/usr/bin/ffmpeg"
+ffprobe = "/usr/bin/ffprobe"
+
 # In-process inference orchestrator. The Python environment was provisioned
 # at image build time (CPU wheels by default; the CUDA image variant is a
 # build arg — see the README's Docker section).

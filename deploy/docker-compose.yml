@@ -42,7 +42,7 @@ services:
       # Gateway config + custom inference model registries (config/inference/).
       - panoptikon-config:/app/config
       # Model weights (Hugging Face cache) — survives container updates.
-      - panoptikon-cache:/home/node/.cache
+      - panoptikon-cache:/home/ubuntu/.cache
       # YOUR MEDIA: mount every directory you want indexed (read-only), then
       # add the container-side paths (e.g. /media/pictures) as allowed
       # folders in the UI and run a file scan. The container runs as uid
