@@ -551,6 +551,24 @@ panoptikon --root D:/panoptikon-home
 panoptikon setup --root D:/panoptikon-home --accelerator cpu
 ```
 
+### Desktop-managed mode
+
+`--desktop-managed` is a hidden integration flag reserved for the bundled
+Panoptikon Desktop supervisor. Desktop launches the sidecar with
+`--root <platform-data>/server --config
+<root>/config/server/desktop.toml --disable-update-check --desktop-managed`.
+In this mode stdin is also a lifecycle control channel: `shutdown`, or
+parent-pipe EOF, initiates the same graceful cleanup path as an OS signal. The
+Server holds an exclusive advisory lock at `<root>/runtime/server.lock`; a
+second process for that root fails clearly.
+
+Desktop-managed mode adds `desktop_managed = true` to `/api/client-config` and
+enables `POST /api/desktop/onboarding` with body
+`{"state":"complete"}` or `{"state":"skipped"}`. The endpoint atomically
+writes `<root>/runtime/desktop-onboarding.toml`. Ordinary Server processes
+reject this Desktop-only endpoint. Bare `panoptikon`, explicit `--root`,
+Docker, signals, and foreground behavior are otherwise unchanged.
+
 ## Configuration
 
 All global configuration is TOML. The gateway reads
@@ -558,6 +576,10 @@ All global configuration is TOML. The gateway reads
 `PANOPTIKON_CONFIG_PATH` environment variable. Environment variables are **not**
 a parallel configuration mechanism: they feed TOML values through templating
 (below), plus a small keep-list of bootstrap/diagnostic variables.
+
+`config/server/desktop.toml` is the bundled loopback-only local configuration
+used by Desktop. It is materialized into the Desktop-owned Server root on first
+run and is then user-owned and never overwritten.
 
 ### Env templating
 

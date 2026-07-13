@@ -25,6 +25,12 @@ Behavior (important)
   configured with 8MB stacks.
 - `upstreams.api.local = true` means the gateway owns the databases outright: it serves the full API locally (including `/api/jobs/*` and `/api/db/create`), runs the cron scheduler, and runs startup migrations across all on-disk DBs in `data_folder` (skipped when `readonly = true`, matching Python's READONLY). Do not run the Python server's cron against the same `data_folder` in this mode — it would double-schedule extraction jobs.
 - Graceful shutdown (`shutdown.rs`): first SIGINT/SIGTERM drains HTTP, stops cron + continuous-scan actors, cancels the running job (queued jobs dropped, new enqueues refused), and flushes index DB writers; 10s cleanup grace, 20s hard exit deadline, second signal exits immediately.
+- Desktop supervision: the hidden `--desktop-managed` flag enables parent
+  control over stdin (`shutdown` or EOF use the normal graceful path), exposes
+  `desktop_managed` in client config, and admits the local-only
+  `POST /api/desktop/onboarding` marker route. Serving processes take an
+  advisory `<root>/runtime/server.lock`; lock contention is a clear startup
+  error. Ordinary foreground/Server behavior is unchanged.
 - Logging (`logging.rs`): console plus append-mode file, default `<data_folder>/panoptikon.log`; `[logging].file` overrides (empty string disables), `[logging].level` sets the level, `RUST_LOG` wins when set. Config-file string values support env templating (`${VAR}` / `${VAR:-default}`, see `env_template.rs`); global keys reach settings-less code via `config::runtime()` (installed once in main; tests default it to a shared temp root).
 - Inference upstreams are configured as an array; the first entry is the proxy + metadata target and may be marked `use_for_jobs = false` to keep it search-only. Extraction jobs only use endpoints with `use_for_jobs = true`. With `[inference_local].enabled = true` the `/api/inference/*` routes are served in-process instead of proxied (see the inferio orchestrator section), and an empty `upstreams.inference` synthesizes a loopback self entry so the gateway's own clients keep working.
 - DB param enforcement:

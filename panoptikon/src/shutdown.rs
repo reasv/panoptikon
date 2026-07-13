@@ -33,7 +33,42 @@ const FORCE_EXIT_AFTER: Duration = Duration::from_secs(20);
 /// (SIGINT/SIGTERM on Unix; Ctrl-C/Break/Close/Shutdown on Windows). If no
 /// handler can be installed, logs the error and never resolves — the process
 /// then only stops by external kill, matching a failed signal(2) registration.
-pub(crate) async fn wait_for_signal() {
+pub(crate) async fn wait_for_signal(desktop_managed: bool) {
+    if desktop_managed {
+        tokio::select! {
+            _ = wait_for_os_signal() => {}
+            _ = wait_for_parent_control() => {}
+        }
+    } else {
+        wait_for_os_signal().await;
+    }
+}
+
+async fn wait_for_parent_control() {
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) if line.trim().eq_ignore_ascii_case("shutdown") => {
+                tracing::info!("Desktop parent requested graceful shutdown");
+                return;
+            }
+            Ok(Some(line)) => {
+                tracing::warn!(command = %line, "ignored unknown Desktop control command")
+            }
+            Ok(None) => {
+                tracing::info!("Desktop parent control channel closed; shutting down");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Desktop parent control channel failed; shutting down");
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_os_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -155,7 +190,7 @@ pub(crate) async fn run_inferio_cleanup(manager: Arc<ModelManager>) {
 /// cleanup paths.
 fn spawn_force_exit_guards() {
     tokio::spawn(async {
-        wait_for_signal().await;
+        wait_for_signal(false).await;
         // process::exit skips destructors, so buffered file-log output is
         // lost — acceptable on an explicitly forced exit.
         tracing::warn!("second shutdown signal received; exiting immediately");

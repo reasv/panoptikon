@@ -1,8 +1,8 @@
 # Release builds: triggered ONLY by version tags (vX.Y.Z), never per-push.
-# Builds a self-contained binary per platform (--features bundled,bundled-ui),
-# smoke-tests each artifact against the ci-fixture release asset (generated
-# locally by .github/scripts/generate_ci_fixture.ps1), and attaches the
-# artifacts to a published GitHub release for the tag. In parallel, the
+# Builds Panoptikon Server once per platform, smoke-tests it, reuses that exact
+# executable as the Panoptikon Desktop sidecar, builds the platform Desktop
+# package and signed Tauri updater payload, and attaches both distributions to
+# one release. In parallel, the
 # docker job builds the container image, smoke-tests it, and pushes it to
 # ghcr.io (it never gates the binary release).
 
@@ -27,15 +27,27 @@ jobs:
           - os: windows-latest
             label: windows-x86_64
             bin: target/release/panoptikon.exe
-            asset: panoptikon-windows-x86_64.exe
+            server_asset: panoptikon-server-windows-x86_64.exe
+            triple: x86_64-pc-windows-msvc
+            desktop_bundle: nsis
+            desktop_asset: Panoptikon-Desktop-windows-x86_64.exe
+            updater_asset: panoptikon-desktop-updater-windows-x86_64.exe
           - os: ubuntu-latest
             label: linux-x86_64
             bin: target/release/panoptikon
-            asset: panoptikon-linux-x86_64
+            server_asset: panoptikon-server-linux-x86_64
+            triple: x86_64-unknown-linux-gnu
+            desktop_bundle: appimage
+            desktop_asset: Panoptikon-Desktop-linux-x86_64.AppImage
+            updater_asset: panoptikon-desktop-updater-linux-x86_64.AppImage
           - os: macos-latest
             label: macos-aarch64
             bin: target/release/panoptikon
-            asset: panoptikon-macos-aarch64
+            server_asset: panoptikon-server-macos-aarch64
+            triple: aarch64-apple-darwin
+            desktop_bundle: dmg
+            desktop_asset: Panoptikon-Desktop-macos-aarch64.dmg
+            updater_asset: panoptikon-desktop-updater-macos-aarch64.app.tar.gz
 
     steps:
       - uses: actions/checkout@v7
@@ -47,6 +59,14 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux Desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf libfuse2
 
       # The standalone bundle vendors node_modules (incl. sharp's native
       # binaries), so it must be built on the same OS/arch it ships for.
@@ -69,6 +89,16 @@ jobs:
         env:
           PANOPTIKON_UI_BUNDLE: ${{ github.workspace }}/ui/.next/standalone
         run: cargo build --release -p panoptikon --features bundled,bundled-ui
+
+      - name: Verify canonical release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "panoptikon") | .version')" = "$version"
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "panoptikon-desktop") | .version')" = "$version"
+          test "$(jq -r .version panoptikon-desktop/src-tauri/tauri.conf.json)" = "$version"
+          test "$(jq -r .version ui/package.json)" = "$version"
 
       # Boot the freshly built artifact in an empty directory with an explicit
       # config (inference disabled so it never provisions the Python venv),
@@ -238,23 +268,59 @@ jobs:
           path: ${{ runner.temp }}/smoke/gateway.log
           if-no-files-found: ignore
 
-      # Ship the bare executable — the whole point of the self-contained
-      # build is a single file to download. Names carry NO version so the
-      # releases/latest/download/<name> permalinks stay constant across
-      # releases (the version lives in the binary and in latest.json). The
-      # sidecar <label>.sha256 is consumed by the release job to build the
-      # update manifest; it is not itself a release asset.
-      - name: Package artifact
+      - name: Stage Server as the exact Tauri sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p panoptikon-desktop/src-tauri/binaries
+          ext=""; if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          cp "${{ matrix.bin }}" "panoptikon-desktop/src-tauri/binaries/panoptikon-${{ matrix.triple }}${ext}"
+
+      - name: Install pinned Tauri CLI
+        run: npm install --global @tauri-apps/cli@2.11.4
+
+      - name: Build signed Desktop package
+        working-directory: panoptikon-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: tauri build --bundles ${{ matrix.desktop_bundle }}
+
+      # Direct-download installers and updater payloads are intentionally
+      # separate names, even on platforms where Tauri signs the installer or
+      # AppImage bytes directly. latest-desktop.json points only at updater_*.
+      - name: Package Server, Desktop, and updater artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          cp "${{ matrix.bin }}" "dist/${{ matrix.server_asset }}"
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.label }}.sha256"
+            sha256sum "dist/${{ matrix.server_asset }}" | awk '{print $1}' > "dist/server-${{ matrix.label }}.sha256"
           else
-            shasum -a 256 "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.label }}.sha256"
+            shasum -a 256 "dist/${{ matrix.server_asset }}" | awk '{print $1}' > "dist/server-${{ matrix.label }}.sha256"
           fi
+
+          case "$RUNNER_OS" in
+            Windows)
+              updater=$(find target/release/bundle/nsis -maxdepth 1 -name '*.exe' -print -quit)
+              human="$updater"
+              ;;
+            Linux)
+              updater=$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)
+              human="$updater"
+              ;;
+            macOS)
+              human=$(find target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)
+              updater=$(find target/release/bundle/macos -maxdepth 1 -name '*.app.tar.gz' -print -quit)
+              ;;
+          esac
+          test -n "$human" -a -f "$human"
+          test -n "$updater" -a -f "$updater"
+          test -s "$updater.sig"
+          cp "$human" "dist/${{ matrix.desktop_asset }}"
+          cp "$updater" "dist/${{ matrix.updater_asset }}"
+          cp "$updater.sig" "dist/${{ matrix.updater_asset }}.sig"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
@@ -439,7 +505,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Build latest.json: the updater manifest. Panoptikon fetches it via the
+      # Build latest.json: the Panoptikon Server updater manifest. The Desktop
+      # updater uses the separate Tauri-signature manifest below.
       # stable permalink https://github.com/<repo>/releases/latest/download/
       # latest.json, compares .version to its own, and (later) uses the
       # per-platform url+sha256 to self-update. The download URLs are the
@@ -455,16 +522,50 @@ jobs:
             --arg version "${TAG#v}" \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
-            --arg win_url "$base/panoptikon-windows-x86_64.exe" --arg win_sha "$(cat dist/windows-x86_64.sha256)" \
-            --arg lin_url "$base/panoptikon-linux-x86_64"       --arg lin_sha "$(cat dist/linux-x86_64.sha256)" \
-            --arg mac_url "$base/panoptikon-macos-aarch64"      --arg mac_sha "$(cat dist/macos-aarch64.sha256)" \
+            --arg win_url "$base/panoptikon-server-windows-x86_64.exe" --arg win_sha "$(cat dist/server-windows-x86_64.sha256)" \
+            --arg lin_url "$base/panoptikon-server-linux-x86_64"       --arg lin_sha "$(cat dist/server-linux-x86_64.sha256)" \
+            --arg mac_url "$base/panoptikon-server-macos-aarch64"      --arg mac_sha "$(cat dist/server-macos-aarch64.sha256)" \
             '{version: $version, pub_date: $pub_date, notes: $notes, platforms: {
                "windows-x86_64": {url: $win_url, sha256: $win_sha},
                "linux-x86_64":   {url: $lin_url, sha256: $lin_sha},
                "macos-aarch64":  {url: $mac_url, sha256: $mac_sha}}}' > dist/latest.json
           cat dist/latest.json
-          # Sidecar hashes are inputs to the manifest, not release assets.
-          rm -f dist/*.sha256
+          # Server hashes are inputs to the manifest, not release assets.
+          rm -f dist/server-*.sha256
+
+      - name: Assemble signed Desktop update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          jq -n \
+            --arg version "${TAG#v}" \
+            --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg win_url "$base/panoptikon-desktop-updater-windows-x86_64.exe" \
+            --arg win_sig "$(cat dist/panoptikon-desktop-updater-windows-x86_64.exe.sig)" \
+            --arg lin_url "$base/panoptikon-desktop-updater-linux-x86_64.AppImage" \
+            --arg lin_sig "$(cat dist/panoptikon-desktop-updater-linux-x86_64.AppImage.sig)" \
+            --arg mac_url "$base/panoptikon-desktop-updater-macos-aarch64.app.tar.gz" \
+            --arg mac_sig "$(cat dist/panoptikon-desktop-updater-macos-aarch64.app.tar.gz.sig)" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {
+              "windows-x86_64": {url: $win_url, signature: $win_sig},
+              "linux-x86_64": {url: $lin_url, signature: $lin_sig},
+              "darwin-aarch64": {url: $mac_url, signature: $mac_sig}}}' > dist/latest-desktop.json
+
+          # Refuse a partial or crossed product manifest before release.
+          jq -e '.platforms | length == 3 and all(.[]; (.url | contains("desktop-updater")) and (.signature | length > 40))' dist/latest-desktop.json
+          jq -e '.platforms | all(.[]; (.url | contains("panoptikon-server")))' dist/latest.json
+          for asset in \
+            Panoptikon-Desktop-windows-x86_64.exe \
+            Panoptikon-Desktop-linux-x86_64.AppImage \
+            Panoptikon-Desktop-macos-aarch64.dmg \
+            panoptikon-desktop-updater-windows-x86_64.exe \
+            panoptikon-desktop-updater-linux-x86_64.AppImage \
+            panoptikon-desktop-updater-macos-aarch64.app.tar.gz; do
+            test -s "dist/$asset"
+          done
 
       - uses: softprops/action-gh-release@v3
         with:

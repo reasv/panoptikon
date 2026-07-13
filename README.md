@@ -28,15 +28,36 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 
 ## Download
 
-One self-contained binary — no installer, no runtime to set up. It bundles the web UI and provisions its Python inference environment on first run. These links always resolve to the **latest release**:
+### Panoptikon Desktop — recommended for your computer
+
+Desktop installs the complete application, runs without a terminal, keeps the
+local Server healthy from a tray icon, opens search in your normal browser,
+and updates Desktop, Relay, the control UI, and Server as one signed unit.
 
 | Platform | Download |
 | --- | --- |
-| **Windows** · x86-64 | [`panoptikon-windows-x86_64.exe`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-windows-x86_64.exe) |
-| **Linux** · x86-64 | [`panoptikon-linux-x86_64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-linux-x86_64) |
-| **macOS** · Apple Silicon | [`panoptikon-macos-aarch64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-macos-aarch64) |
+| **Windows** · x86-64 | [`Panoptikon-Desktop-windows-x86_64.exe`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-windows-x86_64.exe) |
+| **Linux** · x86-64 | [`Panoptikon-Desktop-linux-x86_64.AppImage`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-linux-x86_64.AppImage) |
+| **macOS** · Apple Silicon | [`Panoptikon-Desktop-macos-aarch64.dmg`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-macos-aarch64.dmg) |
 
-On Linux and macOS, mark the file executable first: `chmod +x panoptikon-*`. Per-release changelogs and the `latest.json` checksum manifest are on the [releases page](https://github.com/reasv/panoptikon/releases). Prefer containers? See the Docker section below.
+Windows and macOS builds are intentionally not code-signed/notarized in this
+initial release, so the operating system may show an unknown-publisher warning.
+Updater payloads are nevertheless signed with Panoptikon's dedicated Tauri
+update key and verified before installation.
+
+### Panoptikon Server — command line, servers, Docker, and portable use
+
+The self-contained console binary preserves the existing foreground and
+`--root` workflows. On Linux/macOS, mark it executable with `chmod +x`.
+
+| Platform | Download |
+| --- | --- |
+| **Windows** · x86-64 | [`panoptikon-server-windows-x86_64.exe`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-server-windows-x86_64.exe) |
+| **Linux** · x86-64 | [`panoptikon-server-linux-x86_64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-server-linux-x86_64) |
+| **macOS** · Apple Silicon | [`panoptikon-server-macos-aarch64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-server-macos-aarch64) |
+
+Per-release changelogs and the separate Server/Desktop update manifests are on
+the [releases page](https://github.com/reasv/panoptikon/releases).
 
 ## This is the Rust implementation
 
@@ -70,28 +91,16 @@ The public instance is meant for demonstration purposes only, to show the capabi
 
 Although large parts of the API are disabled in the public instance, you can still consult the full API documentation at [panoptikon.dev/docs](https://panoptikon.dev/docs).
 
-## Optional Companion: Panoptikon Relay (NEW)
+## Relay for remote Panoptikon instances
 
-In scenarios where Panoptikon is running on a remote server, inside a container, or in any environment where it cannot directly access your local file system to open files or reveal them in your file manager, **Panoptikon Relay** comes to the rescue.
-
-If you can access the files indexed by Panoptikon directly on your client machine (e.g., via network shares like SMB/NFS), Panoptikon Relay bridges this gap. It's a lightweight tray icon application and local HTTP server that runs on your client machine.
-
-**How it works with Panoptikon:**
-
-1.  You run Panoptikon Relay on your client machine.
-2.  In Panoptikon's web UI (under "File Details" -> "File Open Relay"), you configure Panoptikon to use the Relay by providing its address (e.g., `http://127.0.0.1:17600`) and an API key.
-3.  When you click "Open File" or "Show in Folder" in Panoptikon, the request is sent to Panoptikon Relay.
-4.  The Relay authenticates the request, translates the server-side path (as Panoptikon sees it) to a local client-side path using configurable mappings, and then executes local commands to open the file or show it in your file manager.
-
-**Key Features of Panoptikon Relay:**
-
-- **Tray Icon:** For easy access to API key, configuration, and logs.
-- **Secure API:** Uses a Bearer Token (API Key) for authentication.
-- **Path Mapping:** Flexible `config.toml` to map server paths to client paths.
-- **Customizable Commands:** Define your own shell commands for opening/showing files.
-- **Platform-Aware Defaults:** Sensible default commands for Windows, macOS, and Linux.
-
-For more details, installation instructions, and configuration options, please visit the [Panoptikon Relay GitHub repository](https://github.com/reasv/panoptikon-relay).
+Relay is built into Panoptikon Desktop. It lets a remote or containerized
+Panoptikon ask your computer to open a locally mounted copy of an indexed file.
+Enable Relay in Desktop, start pairing from the remote web UI, approve the
+origin-bound request locally, then configure component-aware path mappings.
+Credentials are generated once, stored only as salted hashes by Desktop, and
+can be revoked at any time. Relay listens on loopback only and does not execute
+user-configurable shell commands. Desktop can run in Relay-only mode with its
+local Server disabled.
 
 ## REST API
 

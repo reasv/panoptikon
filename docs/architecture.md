@@ -34,6 +34,7 @@ panoptikon/
 │   ├── inferio_worker/   # worker entrypoint (protocol v2)
 │   └── inferio/          # impl classes + built-in registry TOMLs
 ├── ui/                   # git submodule → panoptikon-ui
+├── panoptikon-desktop/   # Tauri v2 shell, control UI, Relay, sidecar bundle
 ├── config/
 │   ├── gateway/          # server TOML config (default.toml, local.toml)
 │   └── inference/        # user model-registry TOMLs (merged with built-ins)
@@ -147,8 +148,37 @@ embedding and read the source tree as usual) and materialized at first run:
 Resource resolution order everywhere: explicit config > dev source tree (when
 present) > extracted embedded set. The root for all of this is `--root`
 (default: CWD, portable-app style; implemented as a chdir at startup, before
-`.env` loading and config resolution). A future installer distribution will
-use platform dirs (AppData/XDG) through the same root abstraction.
+`.env` loading and config resolution). Panoptikon Desktop uses platform
+application-data directories through this same root abstraction.
+
+## Desktop distribution
+
+`panoptikon-desktop/src-tauri` is the non-portable Tauri v2 application. It
+owns a single tray icon, a least-privilege bundled control webview, login
+startup, signed updates, and the loopback Relay v1 service. Search and normal
+application navigation remain in the default browser. The Server executable is
+bundled as a Tauri sidecar and spawned with an explicit platform-data root and
+the materialized `config/server/desktop.toml`; Desktop never relies on its
+launch working directory.
+
+The supervisor has explicit lifecycle states, captures and redacts Server
+output, waits for both client-config and UI readiness, performs bounded
+1/2/4-second crash restarts, and stops through the Server's stdin control
+channel before escalating. The Server independently prevents two processes
+from owning one root with `runtime/server.lock`.
+
+Desktop settings live in the platform config directory. Server data, managed
+Python/Node runtimes, and materialized resources live below platform local
+data. Relay has separate settings and may run while the local Server is
+disabled; that mode does not create or migrate the Server root. Malformed
+settings are quarantined and surfaced in the control window.
+
+Release CI builds Server and Desktop per target, stages the exact Server under
+Tauri's target-triple sidecar name, produces NSIS, AppImage, and DMG artifacts,
+and signs Tauri updater payloads. `latest.json` remains the Server checksum
+manifest; `latest-desktop.json` is the Desktop Tauri signature manifest.
+Windows Authenticode and Apple Developer signing/notarization are intentionally
+out of scope for the initial release.
 
 ## Technical debt register
 
@@ -168,7 +198,7 @@ use platform dirs (AppData/XDG) through the same root abstraction.
   rewritten) with the Rust flow as the installation path.
 - **M2**: `panoptikon setup` + the locked accelerator matrix.
 - **M3**: embedded resources + first-run extraction (done: `bundled` /
-  `bundled-ui` features, `--root`) + release CI (pending; panoptikon-ui
+  `bundled-ui` features, `--root`) + release CI (done; panoptikon-ui
   supports `output: 'standalone'` via `BUILD_STANDALONE=true next build`).
 - **M4 — the swap** (done 2026-07-12): `master` was renamed `python-legacy`
   and the Rust branch became `master` (also the GitHub default). A permanent

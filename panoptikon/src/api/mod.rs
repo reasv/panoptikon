@@ -2,6 +2,7 @@ pub(crate) mod bookmarks;
 pub(crate) mod client_config;
 pub(crate) mod db;
 pub(crate) mod db_params;
+pub(crate) mod desktop;
 pub(crate) mod items;
 pub(crate) mod jobs;
 pub(crate) mod open;

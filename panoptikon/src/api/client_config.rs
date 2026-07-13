@@ -50,6 +50,9 @@ pub(crate) struct ClientConfigResponse {
     /// unset). Free-form; recognized-by-convention keys include
     /// `search_throttle_ms` and `disable_backend_open`.
     pub client: serde_json::Value,
+    /// True only when this Server process is the bundled sidecar owned by
+    /// Panoptikon Desktop. API semantics are otherwise identical.
+    pub desktop_managed: bool,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -78,6 +81,7 @@ pub(crate) fn build_client_config(
         policy: policy.name.clone(),
         capabilities: derive_capabilities(settings, policy),
         client: policy.client.clone(),
+        desktop_managed: crate::desktop::is_managed(),
     }
 }
 

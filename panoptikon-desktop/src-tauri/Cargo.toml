@@ -1,0 +1,51 @@
+[package]
+name = "panoptikon-desktop"
+version = "0.1.4"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Panoptikon Desktop tray, supervisor, updater, and Relay"
+
+[lib]
+name = "panoptikon_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "panoptikon-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+axum = "0.8"
+base64 = "0.22"
+http = "1"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-single-instance = "2.4.2"
+tauri-plugin-updater = "2.10.1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "sync", "time", "net", "process", "io-util", "fs"] }
+toml = { version = "0.8", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = "0.5"
+

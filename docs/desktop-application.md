@@ -1,6 +1,6 @@
 # Panoptikon Desktop design and implementation specification
 
-Status: **accepted design; implementation pending**
+Status: **implemented**
 
 Audience: Panoptikon server, UI, release-engineering, and desktop implementers
 

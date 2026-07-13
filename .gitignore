@@ -200,3 +200,9 @@ data/
 # Permanent worktree of the deprecated Python implementation (python-legacy branch)
 /python-legacy/
 /target-pql
+# Local release credentials and generated Desktop sidecar staging.
+/.local-secrets/
+/panoptikon-desktop/src-tauri/binaries/
+/panoptikon-desktop/src-tauri/gen/
+!/panoptikon-desktop/dist/
+!/panoptikon-desktop/dist/**

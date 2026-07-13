@@ -7,6 +7,7 @@ mod api;
 mod api_error;
 mod config;
 mod db;
+mod desktop;
 mod env_template;
 mod inferio;
 mod inferio_client;
@@ -60,6 +61,10 @@ struct Args {
     /// Skip the best-effort startup check for a newer Panoptikon release.
     #[arg(long, global = true)]
     disable_update_check: bool,
+    /// Internal: the process is a Panoptikon Desktop-owned sidecar. Enables
+    /// stdin shutdown/EOF handling and identifies Desktop mode to clients.
+    #[arg(long, global = true, hide = true)]
+    desktop_managed: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -116,6 +121,7 @@ async fn async_main() -> anyhow::Result<()> {
         env::set_current_dir(root)
             .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
     }
+    desktop::set_managed(args.desktop_managed);
     // `.env` still auto-loads: it is how users populate the env vars that
     // config templating (`${VAR}` in TOML values) references, and children
     // (inference workers, the UI server) inherit it.
@@ -124,6 +130,15 @@ async fn async_main() -> anyhow::Result<()> {
     let config_path = args
         .config
         .or_else(|| env::var(config::CONFIG_PATH_ENV).ok().map(PathBuf::from));
+    // A serving process owns its complete root. This prevents a foreground
+    // Server and Desktop sidecar (or two foreground Servers) from opening the
+    // same SQLite databases. Setup/update/inferio retain their existing,
+    // narrower concurrency behavior.
+    let _root_lock = if args.command.is_none() {
+        Some(desktop::RootLock::acquire(std::env::current_dir()?)?)
+    } else {
+        None
+    };
     // Bundled builds materialize embedded resources on first run (write the
     // default configs when no config exists or was pointed at, extract the
     // Python source set when no dev tree is present); plain builds no-op.
@@ -318,10 +333,13 @@ async fn async_main() -> anyhow::Result<()> {
             // Always allowed regardless of ruleset (the policy layer
             // exempts GET on this path): clients discover their policy's
             // capabilities and [policies.client] settings here.
-            .route(
-                "/api/client-config",
-                get(api::client_config::client_config),
+            .route("/api/client-config", get(api::client_config::client_config));
+        if desktop::is_managed() {
+            app = app.route(
+                "/api/desktop/onboarding",
+                post(api::desktop::complete_onboarding),
             );
+        }
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app
             .route(
@@ -472,7 +490,7 @@ async fn async_main() -> anyhow::Result<()> {
         .as_ref()
         .map(|state| Arc::clone(&state.manager));
     let cleanup = tokio::spawn(async move {
-        shutdown::wait_for_signal().await;
+        shutdown::wait_for_signal(args.desktop_managed).await;
         let _ = shutdown_tx.send(true);
         shutdown::run_cleanup(local_api, inferio_manager, ui_server).await;
     });
@@ -548,7 +566,7 @@ async fn inferio_main(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let manager = Arc::clone(&state.manager);
     let cleanup = tokio::spawn(async move {
-        shutdown::wait_for_signal().await;
+        shutdown::wait_for_signal(false).await;
         let _ = shutdown_tx.send(());
         shutdown::run_inferio_cleanup(manager).await;
     });

@@ -190,8 +190,15 @@ mod embedded {
     pub static PYSRC_TAR_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pysrc.tar.gz"));
     /// The default server config, written to `config/server/default.toml`
     /// on first run when absent.
-    pub static SERVER_DEFAULT_TOML: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../config/server/default.toml"));
+    pub static SERVER_DEFAULT_TOML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../config/server/default.toml"
+    ));
+    /// The loopback-only Server config used by the Desktop sidecar.
+    pub static SERVER_DESKTOP_TOML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../config/server/desktop.toml"
+    ));
     /// The example user inference registry, written to
     /// `config/inference/example.toml` on first run when absent.
     pub static INFERENCE_EXAMPLE_TOML: &str = include_str!(concat!(
@@ -211,6 +218,11 @@ fn write_default_configs_in(base: &Path) -> Result<Vec<String>> {
             "config/server/default.toml",
             embedded::SERVER_DEFAULT_TOML,
             "default server config",
+        ),
+        (
+            "config/server/desktop.toml",
+            embedded::SERVER_DESKTOP_TOML,
+            "Desktop server config",
         ),
         (
             "config/inference/example.toml",
@@ -239,7 +251,11 @@ fn write_if_absent(path: &Path, content: &str) -> Result<Option<PathBuf>> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
-    let mut file = match std::fs::File::options().write(true).create_new(true).open(path) {
+    let mut file = match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
         Err(err) => {
@@ -282,11 +298,7 @@ fn marker_matches(dest: &Path, hash: &str) -> bool {
 /// state from a meddled-with dir). Returns `true` when a fresh extraction
 /// happened.
 #[cfg(any(feature = "bundled", feature = "bundled-ui", test))]
-pub(crate) fn ensure_extracted_archive(
-    archive_gz: &[u8],
-    dest: &Path,
-    what: &str,
-) -> Result<bool> {
+pub(crate) fn ensure_extracted_archive(archive_gz: &[u8], dest: &Path, what: &str) -> Result<bool> {
     let hash = archive_hash(archive_gz);
     if marker_matches(dest, &hash) {
         return Ok(false);
@@ -309,14 +321,22 @@ pub(crate) fn ensure_extracted_archive(
             .with_context(|| format!("failed to clear stale '{}'", temp.display()))?;
     }
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive_gz));
-    archive
-        .unpack(&temp)
-        .with_context(|| format!("failed to extract the embedded {what} to '{}'", temp.display()))?;
+    archive.unpack(&temp).with_context(|| {
+        format!(
+            "failed to extract the embedded {what} to '{}'",
+            temp.display()
+        )
+    })?;
     std::fs::write(
         temp.join(EXTRACT_MARKER),
         format!("archive_sha256={hash}\n"),
     )
-    .with_context(|| format!("failed to write the extraction marker in '{}'", temp.display()))?;
+    .with_context(|| {
+        format!(
+            "failed to write the extraction marker in '{}'",
+            temp.display()
+        )
+    })?;
     let committed = commit_extraction(&temp, dest, &hash, what)?;
     if committed {
         sweep_stale_temp_dirs(parent, STALE_TEMP_MAX_AGE);
@@ -452,7 +472,9 @@ mod tests {
         assert_eq!(
             default_impl_dirs(Extracted),
             [
-                Path::new("runtime/pysrc").join(VERSION).join("inferio/impl"),
+                Path::new("runtime/pysrc")
+                    .join(VERSION)
+                    .join("inferio/impl"),
                 PathBuf::from("inferio_custom")
             ]
         );
@@ -467,7 +489,9 @@ mod tests {
         );
         assert_eq!(
             builtin_registry_dir(Extracted),
-            Path::new("runtime/pysrc").join(VERSION).join("inferio/config")
+            Path::new("runtime/pysrc")
+                .join(VERSION)
+                .join("inferio/config")
         );
         // Extracted mode never falls back to a legacy root .venv: the
         // interpreter is always the runtime/venv one.
@@ -619,9 +643,7 @@ mod tests {
     fn sweeper_removes_only_stale_foreign_temp_dirs() {
         let root = tempfile::tempdir().unwrap();
         let foreign_temp = root.path().join(".tmp-set-99999999");
-        let own_temp = root
-            .path()
-            .join(format!(".tmp-set-{}", std::process::id()));
+        let own_temp = root.path().join(format!(".tmp-set-{}", std::process::id()));
         let version_dir = root.path().join("1.0.0");
         for dir in [&foreign_temp, &own_temp, &version_dir] {
             std::fs::create_dir_all(dir).unwrap();
@@ -647,12 +669,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let messages = write_default_configs_in(root.path()).unwrap();
-        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages.len(), 3, "{messages:?}");
         let gateway = root.path().join("config/server/default.toml");
+        let desktop = root.path().join("config/server/desktop.toml");
         let example = root.path().join("config/inference/example.toml");
         assert_eq!(
             std::fs::read_to_string(&gateway).unwrap(),
             embedded::SERVER_DEFAULT_TOML
+        );
+        assert_eq!(
+            std::fs::read_to_string(&desktop).unwrap(),
+            embedded::SERVER_DESKTOP_TOML
         );
         assert_eq!(
             std::fs::read_to_string(&example).unwrap(),
@@ -661,10 +688,15 @@ mod tests {
 
         // User edits both; a re-run writes nothing and changes nothing.
         std::fs::write(&gateway, "# user edited").unwrap();
+        std::fs::write(&desktop, "# desktop user edited").unwrap();
         std::fs::write(&example, "# user edited too").unwrap();
         let messages = write_default_configs_in(root.path()).unwrap();
         assert!(messages.is_empty(), "{messages:?}");
         assert_eq!(std::fs::read_to_string(&gateway).unwrap(), "# user edited");
+        assert_eq!(
+            std::fs::read_to_string(&desktop).unwrap(),
+            "# desktop user edited"
+        );
         assert_eq!(
             std::fs::read_to_string(&example).unwrap(),
             "# user edited too"

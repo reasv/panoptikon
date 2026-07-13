@@ -1,0 +1,13 @@
+{
+  "productName": "Panoptikon Desktop Dev",
+  "identifier": "app.panoptikon.desktop.dev",
+  "bundle": {
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    }
+  }
+}
+
