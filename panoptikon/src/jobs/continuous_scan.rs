@@ -859,25 +859,59 @@ impl Actor for ContinuousScanActor {
             }
             ContinuousScanMessage::UpdateConfig { config } => {
                 let was_enabled = state.config.continuous_filescan.enabled;
+                // Snapshot the parameters the poller/scan actually depends on
+                // so we can tell a real change from a spurious config reload.
+                let prev_roots = state.watch_roots.clone();
+                let prev_excluded = state.excluded_roots.clone();
+                let prev_extensions = state.allowed_extensions.clone();
+                let prev_interval = state.config.continuous_filescan.poll_interval_secs;
+
                 state.config = config;
                 let roots_ok = state.refresh_roots();
                 let now_enabled = state.config.continuous_filescan.enabled;
                 if !now_enabled || !roots_ok {
                     state.paused = true;
-                    state.epoch = state.epoch.wrapping_add(1);
-                    state.watcher = None;
-                    state.poller = None;
-                    let _ = state.close_scan().await;
+                    // Only tear down when something was actually running, so a
+                    // reload for an already-disabled DB is a no-op.
+                    let was_active = state.poller.is_some()
+                        || state.watcher.is_some()
+                        || state.scan_id.is_some();
+                    if was_active {
+                        state.epoch = state.epoch.wrapping_add(1);
+                        state.watcher = None;
+                        state.poller = None;
+                        let _ = state.close_scan().await;
+                    }
                     return Ok(());
                 }
 
                 if state.job_pauses == 0 {
-                    state.paused = false;
-                    state.epoch = state.epoch.wrapping_add(1);
-                    if !was_enabled {
-                        let _ = state.start_scan().await;
+                    // The supervisor's config watcher covers `data/index`, and
+                    // the index DBs live there — so SQLite's own WAL/shm and
+                    // checkpoint writes during scanning arrive here as "config
+                    // changed". Restarting rebuilds the poller by reloading the
+                    // entire file-path snapshot from the DB
+                    // (get_all_file_paths_with_mtime), so restart ONLY when a
+                    // scan-relevant parameter changed or nothing is running.
+                    // Other config (filescan filter, cron, scan-type flags) is
+                    // already applied by refresh_roots above and takes effect on
+                    // the next dispatch without a reseed.
+                    let scan_relevant_changed = !was_enabled
+                        || state.watch_roots != prev_roots
+                        || state.excluded_roots != prev_excluded
+                        || state.allowed_extensions != prev_extensions
+                        || state.config.continuous_filescan.poll_interval_secs != prev_interval;
+                    let needs_restart = scan_relevant_changed
+                        || state.paused
+                        || (state.enable_watcher && state.poller.is_none());
+                    if needs_restart {
+                        state.paused = false;
+                        state.epoch = state.epoch.wrapping_add(1);
+                        if !was_enabled {
+                            let _ = state.start_scan().await;
+                        }
+                        state.start_watching().await;
                     }
-                    state.start_watching().await;
                 }
             }
             ContinuousScanMessage::FsEvent(event) => {
@@ -1487,6 +1521,30 @@ async fn sync_single_db(
     Ok(())
 }
 
+/// True for the SQLite files the scanner rewrites constantly: the main DB plus
+/// its WAL/SHM/journal sidecars. Events touching only these are DB activity,
+/// not configuration changes.
+fn is_sqlite_db_file(path: &Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => {
+            name.ends_with(".db")
+                || name.ends_with(".db-wal")
+                || name.ends_with(".db-shm")
+                || name.ends_with(".db-journal")
+        }
+        None => false,
+    }
+}
+
+/// Whether a supervisor-watcher event should trigger a resync. The index DBs
+/// live under the watched tree, so scanning rewrites their DB files on every
+/// transaction and checkpoint; an event touching only those is skipped. Events
+/// touching anything else (a `config.toml`, or a DB directory being added or
+/// removed) are relevant, as are path-less events some backends emit.
+fn event_is_relevant(event: &Event) -> bool {
+    event.paths.is_empty() || event.paths.iter().any(|p| !is_sqlite_db_file(p))
+}
+
 fn start_supervisor_watcher(
     actor: ActorRef<ContinuousScanSupervisorMessage>,
     data_dir: &Path,
@@ -1495,8 +1553,13 @@ fn start_supervisor_watcher(
     let _ = std::fs::create_dir_all(&watch_root);
     let mut watcher = RecommendedWatcher::new(
         move |res| match res {
-            Ok(_event) => {
-                let _ = actor.cast(ContinuousScanSupervisorMessage::ResyncFromDisk);
+            Ok(event) => {
+                // Ignore the scanner's own DB writes; real config saves also
+                // arrive out-of-band via notify_config_change, so this watcher
+                // is only a backstop for on-disk edits and DB dir changes.
+                if event_is_relevant(&event) {
+                    let _ = actor.cast(ContinuousScanSupervisorMessage::ResyncFromDisk);
+                }
             }
             Err(err) => {
                 tracing::error!(error = ?err, "continuous scan supervisor watcher error");
@@ -2036,5 +2099,45 @@ mod tests {
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
         assert!(outcome.watch_roots.is_empty());
+    }
+
+    #[test]
+    fn sqlite_db_files_are_recognized() {
+        let dir = std::path::Path::new("data/index/mydb");
+        for name in [
+            "index.db",
+            "index.db-wal",
+            "index.db-shm",
+            "index.db-journal",
+            "storage.db",
+        ] {
+            assert!(is_sqlite_db_file(&dir.join(name)), "{name} should match");
+        }
+        // Config and directory entries must not be mistaken for DB files.
+        for name in ["config.toml", "mydb", "index.db.pkl"] {
+            assert!(
+                !is_sqlite_db_file(&dir.join(name)),
+                "{name} should not match"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_watcher_skips_db_only_events() {
+        let db = std::path::Path::new("data/index/mydb/index.db-wal").to_path_buf();
+        let cfg = std::path::Path::new("data/index/mydb/config.toml").to_path_buf();
+
+        // The scanner's own DB writes must not trigger a resync.
+        assert!(!event_is_relevant(&Event::new(EventKind::Any).add_path(db.clone())));
+        // A config.toml change must.
+        assert!(event_is_relevant(
+            &Event::new(EventKind::Any).add_path(cfg.clone())
+        ));
+        // A DB write coinciding with a config write still counts as relevant.
+        assert!(event_is_relevant(
+            &Event::new(EventKind::Any).add_path(db).add_path(cfg)
+        ));
+        // Path-less events (some backends emit them) are treated as relevant.
+        assert!(event_is_relevant(&Event::new(EventKind::Any)));
     }
 }
