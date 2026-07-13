@@ -25,6 +25,7 @@ mod shutdown;
 #[cfg(test)]
 mod test_utils;
 mod ui;
+mod update;
 
 use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
 use anyhow::Context as _;
@@ -56,6 +57,9 @@ struct Args {
     /// default resolves under it — .env auto-loading included.
     #[arg(long, value_name = "DIR", global = true)]
     root: Option<PathBuf>,
+    /// Skip the best-effort startup check for a newer Panoptikon release.
+    #[arg(long, global = true)]
+    disable_update_check: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -79,6 +83,13 @@ enum Command {
         /// Delete the managed venv first and recreate it from scratch.
         #[arg(long)]
         force: bool,
+    },
+    /// Download and install the latest release, replacing this executable.
+    /// Checks GitHub every time (ignoring the startup-check throttle).
+    Update {
+        /// Skip the confirmation prompt and update immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -153,7 +164,17 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await;
         }
+        Some(Command::Update { yes }) => {
+            return update::run_update_command(crate::resources::VERSION, yes).await;
+        }
         None => {}
+    }
+
+    // Server path only (Setup/Inferio/Update returned above). Fire-and-forget a
+    // best-effort, throttled check for a newer release; it prints a banner if
+    // one exists.
+    if !args.disable_update_check && settings.server.check_for_updates {
+        crate::update::spawn_startup_check(crate::resources::VERSION);
     }
 
     let ui_upstream = proxy::Upstream::parse("ui", &settings.upstreams.ui.base_url)?;

@@ -1431,6 +1431,7 @@ config.impl_class = "echo_test"
                 trust_forwarded_headers: false,
                 policy_token_key: None,
                 endpoints: Vec::new(),
+                check_for_updates: false,
             },
             upstreams: UpstreamsConfig {
                 ui: crate::config::UiUpstreamConfig {

@@ -2249,7 +2249,8 @@ fn run_html_screenshot(
     // Edge's new headless mode never produce a screenshot (verified against
     // Edge 13x), and with the network dead a runaway script can only burn CPU
     // until the deadline, where the job object kills the process tree.
-    let mut child = match Command::new(browser)
+    let mut command = Command::new(browser);
+    command
         .arg("--headless")
         .arg("--disable-gpu")
         .arg("--no-first-run")
@@ -2259,12 +2260,15 @@ fn run_html_screenshot(
         .arg("--window-size=1280,2000")
         .arg("--default-background-color=FFFFFFFF")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--screenshot={}", screenshot.display()))
+        .arg(format!("--screenshot={}", screenshot.display()));
+    for extra in &crate::config::runtime().html_renderer_args {
+        command.arg(extra);
+    }
+    command
         .arg(url)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             tracing::error!(error = %err, browser = %browser.display(), "failed to launch headless browser");

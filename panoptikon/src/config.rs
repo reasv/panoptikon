@@ -372,6 +372,13 @@ pub struct JobsConfig {
     /// Empty string = unset (templated as `${HTML_RENDERER_PATH:-}`).
     #[serde(default)]
     pub html_renderer: Option<PathBuf>,
+    /// Extra command-line arguments appended to the headless browser
+    /// invocation for HTML thumbnails (before the target URL). Default:
+    /// empty. Containers running the browser as a non-root user set this to
+    /// ["--no-sandbox"], which Chromium requires when its sandbox cannot be
+    /// used.
+    #[serde(default)]
+    pub html_renderer_args: Vec<String>,
     /// Explicit TTF font file for thumbnail text labels. Default:
     /// well-known system fonts (Segoe UI/Arial/DejaVu). Empty string =
     /// unset (templated as `${PANOPTIKON_FONT:-}`).
@@ -402,6 +409,7 @@ impl Default for JobsConfig {
             ffprobe: None,
             pdfium: None,
             html_renderer: None,
+            html_renderer_args: Vec::new(),
             thumbnail_font: None,
         }
     }
@@ -425,6 +433,7 @@ pub struct RuntimeConfig {
     pub ffprobe: Option<PathBuf>,
     pub pdfium: Option<PathBuf>,
     pub html_renderer: Option<PathBuf>,
+    pub html_renderer_args: Vec<String>,
     pub thumbnail_font: Option<PathBuf>,
     /// The venv interpreter `media_tools` probes for static-ffmpeg —
     /// the same one that runs inference workers.
@@ -446,6 +455,7 @@ impl Default for RuntimeConfig {
             ffprobe: None,
             pdfium: None,
             html_renderer: None,
+            html_renderer_args: Vec::new(),
             thumbnail_font: None,
             venv_python: crate::resources::default_worker_python(
                 crate::resources::py_source_mode(),
@@ -513,6 +523,7 @@ impl Settings {
             ffprobe: self.jobs.ffprobe.clone(),
             pdfium: self.jobs.pdfium.clone(),
             html_renderer: self.jobs.html_renderer.clone(),
+            html_renderer_args: self.jobs.html_renderer_args.clone(),
             thumbnail_font: self.jobs.thumbnail_font.clone(),
             venv_python: self.inference_local.resolved_python(),
         }
@@ -546,6 +557,11 @@ pub struct ServerConfig {
     /// the endpoint a request arrived on via `[policies.match] endpoints`.
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+    /// Check GitHub for a newer release on startup and log a notice if one
+    /// exists (best-effort, non-blocking, no telemetry — a single anonymous
+    /// GET of the public release manifest). Default: true.
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
 }
 
 /// `[[server.endpoints]]`: an extra named listener. Unlike host matching,
