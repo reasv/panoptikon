@@ -22,9 +22,9 @@ repository:
 
 This is a committed architecture, not a feasibility experiment. Tauri's tray,
 single-instance, sidecar, updater, Windows installer, Linux AppImage, and macOS
-bundle facilities are established capabilities, and the project maintainer has
-already shipped a multi-platform Tauri application using the relevant lifecycle
-and updater patterns.
+bundle facilities are established capabilities. The implementation requirements
+below account for known platform and packaging failure modes rather than
+assuming that Tauri's default configuration is sufficient for this application.
 
 There is no Panoptikon Desktop portable mode in the initial scope. Users who
 want a portable, terminal-managed deployment use Panoptikon Server and
@@ -134,6 +134,41 @@ Exact crate names MAY change, but these boundaries are normative:
 - The Desktop control frontend MUST remain small and separate from the main
   Next.js application.
 
+### 5.1 Tauri dependency and plugin policy
+
+The initial Desktop crate MUST keep its Tauri surface explicit. Use these
+components unless implementation evidence requires a documented change:
+
+| Component | Initial decision | Constraint |
+|---|---|---|
+| Tauri `tray-icon` feature | Required | Desktop owns the only tray icon. |
+| `tauri-plugin-single-instance` | Required | Register it first, before any plugin or setup code that can create state. |
+| `tauri-plugin-updater` | Required | Drive it from Rust and the restricted control UI; do not expose raw updater commands to server-hosted pages. |
+| `tauri-plugin-dialog` | Required | Native bootstrap/emergency confirmations only; richer routine flows use the bundled control UI. |
+| `tauri-plugin-opener` | Required | Rust-owned opening of browser URLs and known local folders; do not grant a generic opener capability to remote pages. |
+| `tauri-plugin-autostart` | Required | User-scoped Start at Login, always with background activation intent. |
+| `tauri-plugin-shell` | Required for the sidecar | Use its Rust sidecar API only. No webview receives generic shell or spawn permission. |
+
+Do **not** initially add `tauri-plugin-localhost`, `tauri-plugin-fs`,
+`tauri-plugin-http`, `tauri-plugin-store`, or generic process permissions. The
+bundled control frontend can use Tauri's asset protocol and narrow Rust
+commands; the Panoptikon frontend already has its real HTTP server. Adding a
+second localhost asset server, or granting generic filesystem/HTTP access,
+would enlarge the attack surface without solving a Panoptikon requirement.
+
+`tauri-plugin-window-state` is deferred until a persistent settings or
+diagnostics window benefits from it. If added, visibility MUST be excluded from
+saved/restored state so login startup cannot unexpectedly show a window. Native
+notifications are also deferred; if required later, prefer the maintained
+Tauri notification plugin over a direct `notify-rust` integration unless a
+concrete missing capability justifies the latter.
+
+Release builds MUST NOT enable Tauri developer tools. The control frontend MUST
+use a strict CSP: no `unsafe-eval`, broad network access, or generic localhost
+capabilities. Every plugin and feature addition requires a stated use case, its
+capability grants, and a security review of which window labels and origins
+receive them.
+
 ## 6. Runtime architecture
 
 ```text
@@ -172,7 +207,9 @@ Tauri SHOULD be configured with no initial window (`app.windows` empty). The
 tray and supervisor are created from Rust during application setup. Webview
 windows are created programmatically only when needed. If a platform limitation
 requires a window to exist, it MUST be a minimal hidden bundled-assets window;
-that fallback does not change any user-facing behavior.
+that fallback does not change any user-facing behavior. The build script MUST
+explicitly watch the control frontend's generated entry point or asset manifest
+so an in-place frontend rebuild cannot leave stale assets embedded in Desktop.
 
 ### 6.1 Server sidecar invocation
 
@@ -257,7 +294,9 @@ counter.
 ## 8. Single-instance behavior
 
 Panoptikon Desktop MUST be single-instance per logged-in user. Use the Tauri
-single-instance plugin or equivalent registration before launching the sidecar.
+single-instance plugin, registered as the first plugin, before launching the
+sidecar or initializing logs, paths, Relay, tray state, or updater state that a
+secondary instance could contend over.
 
 A secondary launch MUST forward its arguments and activation intent to the
 existing process, then exit without creating a tray, Relay listener, or Server
@@ -273,6 +312,12 @@ Activation behavior:
 The existing process MUST be brought out of a hidden/minimized control state
 when the forwarded action requires a Desktop window. Single-instance handling
 also prevents two processes from opening the same SQLite databases.
+
+Production and development builds MUST use different application identifiers,
+product names, single-instance namespaces, and data/config roots (for example,
+`app.panoptikon.desktop` and `app.panoptikon.desktop.dev`). Development builds
+MUST have production updating disabled. Running a development shell must never
+activate, update, or reuse the production installation.
 
 The Server SHOULD additionally gain a root-scoped advisory lock. That broader
 safety measure prevents a foreground Server or service from using the Desktop
@@ -323,7 +368,10 @@ state = "not_started"
 
 Relay settings remain in `relay.toml` so Relay-only use does not require Server
 configuration. Unknown settings MUST be preserved when Desktop rewrites its
-own TOML, enabling forward-compatible downgrade/recovery behavior.
+own TOML, enabling forward-compatible downgrade/recovery behavior. Settings and
+secrets MUST be written atomically. Invalid files are quarantined and surfaced
+in Recovery; Desktop MUST NOT silently replace a corrupt file with defaults and
+then overwrite the user's recoverable content.
 
 Expected platform homes are `%LOCALAPPDATA%` on Windows,
 `$XDG_DATA_HOME`/`$XDG_CONFIG_HOME` on Linux, and Application Support on
@@ -390,6 +438,14 @@ Requirements:
 Linux tray interaction has platform limitations; the context menu is the
 normative interface and behavior MUST not depend on left-click events that are
 unsupported by Linux tray implementations.
+
+Tray creation MUST handle both returned errors and backend panics. In
+particular, the Linux AppIndicator backend can panic when its dynamically loaded
+`libayatana-appindicator` stack is incompatible with GLib bundled by an
+AppImage. If tray initialization fails, Desktop MUST log the diagnostic and
+show a persistent bundled control window with status, Open, Settings, and Quit;
+it MUST NOT continue as an invisible background process. The same fallback
+applies on any platform where a tray is unavailable.
 
 ## 11. Browser and onboarding UX
 
@@ -656,6 +712,9 @@ secrets and the public key is compiled into Desktop.
   bundled control window.
 - Stop the sidecar gracefully before installation when it is running.
 - Install/restart using Tauri's platform updater bundle.
+- On Windows, allow the updater/NSIS process to complete replacement and
+  relaunch rather than also calling an in-process restart. On Linux and macOS,
+  use Tauri's documented post-install restart path.
 - On restart, the new sidecar performs existing version-keyed embedded-resource
   extraction, venv lock-hash reconciliation, and migrations.
 - Keep enough previous runtime state for recovery; do not eagerly delete old
@@ -683,8 +742,16 @@ bundled sidecar together. Mixed Desktop/sidecar versions are unsupported.
 
 - Produce one x86_64 AppImage containing Desktop, the sidecar, icons, desktop
   metadata, and required GUI libraries.
-- Build on the oldest supported Tauri/WebKitGTK base (initially Ubuntu 22.04 or
-  Debian 12 class) to control the glibc floor.
+- Build the initial AppImage on Ubuntu 24.04-class CI and document its glibc
+  2.39 compatibility floor. A nominally older build host is not automatically
+  more compatible: an AppImage can load its bundled GLib ahead of a host
+  `libayatana-appindicator` built against newer symbols and crash during tray
+  initialization. Lowering the build baseline is allowed only after the
+  complete AppImage passes the tray/runtime matrix below; glibc age alone is
+  not sufficient evidence.
+- Install and pin the WebKitGTK 4.1, GTK 3, librsvg, FUSE/AppImage tooling, and
+  Ayatana AppIndicator build dependencies in CI. Record the resulting runtime
+  floor in release notes rather than advertising generic “all Linux” support.
 - Test normal FUSE launch and document AppImage's extract-and-run fallback.
 - Do not publish a second raw Desktop ELF initially; the raw Server executable
   remains available.
@@ -709,7 +776,7 @@ sidecars. Each platform job SHOULD:
 3. stage the binary using Tauri's required target-triple sidecar name;
 4. build and package Panoptikon Desktop for that platform;
 5. run Desktop packaging and lifecycle smoke tests;
-6. generate Tauri updater artifacts and signatures; and
+6. generate current-format Tauri updater artifacts and signatures; and
 7. upload both Server and Desktop products to the release aggregation job.
 
 This produces six product artifacts but does not require six independent
@@ -728,6 +795,23 @@ The release job MUST:
 - never publish a partial Desktop manifest whose listed platform artifact or
   signature is missing; and
 - keep Desktop update-signing secrets unavailable to pull-request builds.
+
+Direct-download packages and updater payloads are different artifacts. Publish
+the friendly NSIS installer EXE, AppImage, and DMG for humans. Also publish the
+Tauri-generated updater archives (for example the Windows NSIS updater archive,
+Linux AppImage archive, and macOS app archive) and their `.sig` files;
+`latest-desktop.json` MUST point to those updater payloads, not merely to the
+friendly download. Use the current Tauri v2 updater artifact format. Do not copy
+the legacy `createUpdaterArtifacts = "v1Compatible"` setting; Panoptikon
+Desktop has no Tauri v1 updater compatibility requirement.
+
+There is one canonical release version. A tag preflight MUST verify or generate
+the Cargo package version, frontend package version, Tauri bundle version,
+updater manifest version, and sidecar compatibility metadata from it. Do not
+normalize a permanently duplicated set of version strings by convention alone.
+Local unsigned builds SHOULD apply an explicit development configuration
+overlay that disables updater artifact generation, rather than requiring
+release signing keys or weakening production updater configuration.
 
 macOS signing/notarization and Windows code-signing credentials are release
 prerequisites. Tauri updater signatures do not replace operating-system code
@@ -828,7 +912,12 @@ For Windows, Linux, and macOS release candidates:
     profile, and exercise Relay-only startup, update, and shutdown.
 
 Linux testing MUST cover at least GNOME and KDE tray behavior plus one
-non-Debian-family distribution. macOS release testing includes Gatekeeper,
+non-Debian-family distribution. The Linux matrix MUST run the packaged
+AppImage, not only the raw binary, and include: a system with Ayatana
+AppIndicator installed, one without it, a host near the declared glibc floor,
+FUSE launch, and extract-and-run. It MUST verify either a working tray or the
+visible control-window fallback—never a panic or an invisible live process.
+macOS release testing includes Gatekeeper,
 notarization, DMG install, and login startup. Windows testing includes clean
 per-user installation, uninstall, update without elevation, and WebView2
 bootstrap behavior on the oldest supported Windows version.
@@ -856,7 +945,8 @@ The first Desktop release is complete only when:
 1. Rename release/README presentation to Panoptikon Server without renaming the
    CLI command.
 2. Add `panoptikon-desktop` Tauri crate with no initial window, tray, bundled
-   diagnostics assets, single-instance handling, and platform identifiers.
+   diagnostics assets, the plugin set in section 5.1, single-instance handling,
+   and distinct production/development identifiers.
 3. Add Desktop server config/resource materialization.
 4. Package the existing Server build as a Tauri sidecar.
 5. Implement process supervision, readiness, logs, graceful control, restart
