@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-or-later",
       "identifier": "AGPL-3.0-or-later"
     },
-    "version": "0.1.2"
+    "version": "0.1.4"
   },
   "paths": {
     "/api/bookmarks/item/{sha256}": {

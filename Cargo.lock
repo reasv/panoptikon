@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "panoptikon"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "ab_glyph",
  "anyhow",
