@@ -79,7 +79,9 @@ The initial implementation MUST NOT:
 - add Relay functionality or commands to the console Server binary;
 - expose arbitrary shell, filesystem, sidecar, or updater access to a webview;
   or
-- make the desktop sidecar independently updateable.
+- make the desktop sidecar independently updateable; or
+- acquire, require, or configure commercial Windows Authenticode certificates,
+  Apple Developer credentials, Developer ID signing, or Apple notarization.
 
 Native Linux packages (`.deb`, RPM, Flatpak, distribution repositories) are
 future packaging work. The initial Linux Desktop artifact is AppImage only.
@@ -735,7 +737,10 @@ bundled sidecar together. Mixed Desktop/sidecar versions are unsupported.
 - Install Start Menu/uninstall metadata and an optional user login-start entry.
 - Use the Windows GUI subsystem; no console flashes are permitted during normal
   Desktop or sidecar operation.
-- Bundle and code-sign the Server sidecar before signing the outer installer.
+- Bundle the Server sidecar inside the installer and cover the complete Desktop
+  update with the Tauri updater signature. The initial project does not use
+  Authenticode; release notes and installation documentation MUST set the
+  expectation that Windows/SmartScreen may show an unknown-publisher warning.
 - Do not publish an MSI or portable Desktop build initially.
 
 ### 15.2 Linux
@@ -759,8 +764,12 @@ bundled sidecar together. Mixed Desktop/sidecar versions are unsupported.
 
 ### 15.3 macOS
 
-- Produce a signed and notarized `.app` inside a DMG.
-- Sign nested helpers/sidecars before signing the enclosing app and DMG.
+- Produce a `.app` inside a DMG without requiring an Apple Developer account,
+  Developer ID certificate, or notarization. Apply ad-hoc code signatures to
+  nested helpers and the enclosing app where macOS requires bundle integrity;
+  an ad-hoc signature is not represented as Apple trust-signing.
+- Document the macOS first-launch approval procedure and the warnings caused by
+  distributing an unnotarized application.
 - Use the aarch64 target initially, matching current Server support.
 - Store state under Application Support/log directories, never inside the
   read-only application bundle.
@@ -813,9 +822,11 @@ Local unsigned builds SHOULD apply an explicit development configuration
 overlay that disables updater artifact generation, rather than requiring
 release signing keys or weakening production updater configuration.
 
-macOS signing/notarization and Windows code-signing credentials are release
-prerequisites. Tauri updater signatures do not replace operating-system code
-signing.
+Tauri updater signing is the only project-managed release-signing requirement.
+It authenticates update payloads but does not suppress Windows
+unknown-publisher warnings or establish Gatekeeper/notarization trust on macOS.
+Those limitations are accepted for the initial Desktop distribution and MUST
+be documented honestly.
 
 ## 17. Security model
 
@@ -838,8 +849,8 @@ Normative controls:
 - Remote URLs receive no Tauri IPC except individually named operations that
   cannot be implemented through the normal Panoptikon API.
 - Sidecar arguments are constructed as an argument vector.
-- Updates require Tauri signature verification and operating-system signing
-  where supported.
+- Updates require Tauri signature verification. Operating-system publisher
+  trust signing is not part of the initial distribution.
 - Relay requires per-instance credentials, origin binding, local approval,
   traversal-safe mappings, and no wildcard CORS.
 - Diagnostic export is redacted.
@@ -917,8 +928,8 @@ AppImage, not only the raw binary, and include: a system with Ayatana
 AppIndicator installed, one without it, a host near the declared glibc floor,
 FUSE launch, and extract-and-run. It MUST verify either a working tray or the
 visible control-window fallback—never a panic or an invisible live process.
-macOS release testing includes Gatekeeper,
-notarization, DMG install, and login startup. Windows testing includes clean
+macOS release testing includes the documented unnotarized-app approval flow,
+DMG install, Tauri-signed update, and login startup. Windows testing includes clean
 per-user installation, uninstall, update without elevation, and WebView2
 bootstrap behavior on the oldest supported Windows version.
 
@@ -926,7 +937,8 @@ bootstrap behavior on the oldest supported Windows version.
 
 The first Desktop release is complete only when:
 
-- all three supported Desktop artifacts are built and signed as applicable;
+- all three supported Desktop artifacts are built and their updater payloads
+  carry valid Tauri signatures;
 - Desktop installs from one user-facing artifact per platform;
 - the complete first-run/onboarding/search path works without a terminal;
 - the existing Panoptikon Server and Docker workflows remain unchanged in
@@ -966,7 +978,8 @@ The first Desktop release is complete only when:
 
 1. Integrate the Tauri updater and `latest-desktop.json`.
 2. Rename Server release assets and update `latest.json` generation.
-3. Add updater signing, Windows signing, and macOS signing/notarization.
+3. Add Tauri updater signing and document the unsigned/unnotarized Windows and
+   macOS installation experience.
 4. Add update coordination around the sidecar and post-update recovery.
 5. Complete release workflow and platform update tests.
 
@@ -995,8 +1008,8 @@ Implementation changes require coordinated updates to:
 - `panoptikon/README.md`: Server label, managed Desktop invocation, and config;
 - `panoptikon/AGENTS.md`: new lifecycle/control and API behavior;
 - `panoptikon-ui` documentation: `/desktop/setup` and Relay v1;
-- release documentation: signing keys, manifests, platform packages, and
-  rollback; and
+- release documentation: updater signing keys, manifests, platform packages,
+  Windows/macOS trust-warning procedures, and rollback; and
 - the archived Relay README: replacement and migration statement (no automatic
   migration).
 
