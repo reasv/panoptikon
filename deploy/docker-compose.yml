@@ -52,18 +52,11 @@ services:
     # environment:
     #   - LOGLEVEL=DEBUG
     #
-    # GPU (CUDA) variant: the published image is CPU-only. Build the CUDA
-    # image from a repo checkout —
-    #   git clone --recurse-submodules https://github.com/reasv/panoptikon
-    #   docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda panoptikon/
-    # — then replace `image:` above with panoptikon:cuda and uncomment:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    # This file runs the CPU-only image (ghcr.io/reasv/panoptikon:latest).
+    # For GPU inference — which is what most users want — use
+    # docker-compose.cuda.yml instead: it pulls the published CUDA image
+    # (:latest-cuda) and adds the NVIDIA device reservation. No repo clone
+    # needed for either.
 
 volumes:
   panoptikon-data:

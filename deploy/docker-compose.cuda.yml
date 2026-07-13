@@ -1,0 +1,64 @@
+# Panoptikon — self-contained Docker deployment, GPU (CUDA) variant. This is
+# the deployment most users want: inference (tagging, embeddings, OCR,
+# captioning, Whisper) runs on an NVIDIA GPU. No repo clone needed — save this
+# file into an empty directory and run
+#
+#   docker compose -f docker-compose.cuda.yml up -d
+#
+# then open http://localhost:6342. First boot creates the databases and
+# unpacks the web UI (a few seconds); models are downloaded on first use.
+#
+# REQUIREMENTS: an NVIDIA GPU with recent drivers on the host, plus the
+# NVIDIA Container Toolkit (https://docs.nvidia.com/datacenter/cloud-native/
+# container-toolkit/latest/install-guide.html) so Docker can pass the GPU into
+# the container. Without it, `up` fails on the device reservation below —
+# switch to docker-compose.yml (CPU) if you have no GPU.
+#
+# Everything else (the two listeners, volumes, media mounts) matches the CPU
+# compose — see docker-compose.yml for the full port/security notes:
+#
+#   6342  PRIVATE admin — full API, NEVER expose to untrusted networks
+#         (mapped to 127.0.0.1 below). Reach it via SSH tunnel / VPN.
+#   6339  PUBLIC restricted — policy-locked to search + file/thumbnail serving
+#         + bookmarks. Still serves your files: add auth at a reverse proxy
+#         before exposing beyond your LAN.
+
+services:
+  panoptikon:
+    image: ghcr.io/reasv/panoptikon:latest-cuda
+    container_name: panoptikon
+    restart: unless-stopped
+    # Pass the host GPU(s) into the container (needs the NVIDIA Container
+    # Toolkit). `count: all` uses every visible GPU; set a number to limit it.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      # PRIVATE admin listener — keep the 127.0.0.1 prefix (see above).
+      - "127.0.0.1:6342:6342"
+      # PUBLIC restricted listener.
+      - "6339:6339"
+    volumes:
+      # Index databases, user data, thumbnails.
+      - panoptikon-data:/app/data
+      # Gateway config + custom inference model registries (config/inference/).
+      - panoptikon-config:/app/config
+      # Model weights (Hugging Face cache) — survives container updates.
+      - panoptikon-cache:/home/ubuntu/.cache
+      # YOUR MEDIA: mount every directory you want indexed (read-only), then
+      # add the container-side paths (e.g. /media/pictures) as allowed
+      # folders in the UI and run a file scan. The container runs as uid
+      # 1000; bind-mounted media must be readable by that uid.
+      # - /path/to/your/pictures:/media/pictures:ro
+      # - /path/to/your/videos:/media/videos:ro
+    # environment:
+    #   - LOGLEVEL=DEBUG
+
+volumes:
+  panoptikon-data:
+  panoptikon-config:
+  panoptikon-cache:

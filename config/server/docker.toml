@@ -61,12 +61,19 @@ local = true
 [jobs]
 ffmpeg = "/usr/bin/ffmpeg"
 ffprobe = "/usr/bin/ffprobe"
-# Explicit paths to bundled native dependencies. Empty means "unset": the
-# built-in search order applies. The ${VAR:-} templates let container env
-# vars override them.
-pdfium = "${PDFIUM_PATH:-}"
+# Native render dependencies shipped in the image. The ${VAR:-default}
+# templates keep them overridable via container env vars.
+#   pdfium: libpdfium.so is copied out of the venv's pypdfium2 to a stable
+#           path at build time (PDF thumbnails/extraction).
+#   html_renderer: left unset — the built-in search order finds the apt
+#           google-chrome-stable at /usr/bin/google-chrome-stable.
+pdfium = "${PDFIUM_PATH:-/app/libpdfium.so}"
 html_renderer = "${HTML_RENDERER_PATH:-}"
 thumbnail_font = "${PANOPTIKON_FONT:-}"
+# Chromium refuses to run without a usable sandbox as a non-root user inside
+# a container; --disable-dev-shm-usage avoids crashes on Docker's small
+# default /dev/shm. Harmless off-container (this key is empty there).
+html_renderer_args = ["--no-sandbox", "--disable-dev-shm-usage"]
 
 # In-process inference orchestrator. The Python environment was provisioned
 # at image build time (CPU wheels by default; the CUDA image variant is a

@@ -57,6 +57,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Headless Chrome for HTML thumbnails/extraction. google-chrome-stable lands
+# at /usr/bin/google-chrome-stable, which the renderer's built-in search order
+# finds (files.rs). It runs with --no-sandbox/--disable-dev-shm-usage inside
+# the container (config/server/docker.toml [jobs] html_renderer_args), which
+# Chromium requires as a non-root user under Docker's default seccomp.
+RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        -o /usr/share/keyrings/google-chrome.asc \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
 # The exact uv release `panoptikon setup` pins (setup.rs UV_VERSION): found
 # on PATH, it is used as-is and setup skips its own download.
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
@@ -86,6 +99,8 @@ ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
+    && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
+          /app/libpdfium.so \
     && rm -rf /home/ubuntu/.cache/uv \
     && rm -rf /app/runtime/venv/lib/python*/site-packages/static_ffmpeg/bin \
     && mkdir -p /home/ubuntu/.cache

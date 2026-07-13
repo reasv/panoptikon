@@ -1,0 +1,59 @@
+# Panoptikon — DEVELOPMENT compose. Unlike deploy/docker-compose*.yml (which
+# pull the published GHCR images and need no repo), this BUILDS the image from
+# the local checkout, so it picks up your local changes to the Rust gateway,
+# the UI, the config, or the Python inference set.
+#
+#   git clone --recurse-submodules https://github.com/reasv/panoptikon
+#   cd panoptikon
+#   docker compose up -d --build
+#
+# (If you cloned without --recurse-submodules, run
+#  `git submodule update --init --recursive` first — the UI is a submodule.)
+#
+# Defaults to the CUDA build with the GPU passed through (needs an NVIDIA GPU +
+# the NVIDIA Container Toolkit). For a CPU-only dev image, set
+# ACCELERATOR=cpu and drop the `deploy:` block:
+#
+#   ACCELERATOR=cpu docker compose up -d --build
+#
+# Ports and security model are identical to the distributable composes
+# (6342 private admin on 127.0.0.1, 6339 public restricted) — see
+# deploy/docker-compose.yml for the full notes.
+
+services:
+  panoptikon:
+    build:
+      context: .
+      args:
+        # cpu or cuda. CUDA pulls multi-GB torch/nvidia wheels — the first
+        # build is slow.
+        ACCELERATOR: ${ACCELERATOR:-cuda}
+    image: panoptikon:dev
+    container_name: panoptikon-dev
+    restart: unless-stopped
+    # GPU passthrough for the CUDA build (needs the NVIDIA Container Toolkit).
+    # Remove this block for a CPU-only build.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "127.0.0.1:6342:6342"
+      - "6339:6339"
+    volumes:
+      - panoptikon-data:/app/data
+      - panoptikon-config:/app/config
+      - panoptikon-cache:/home/ubuntu/.cache
+      # YOUR MEDIA (read-only), then add the container-side paths as allowed
+      # folders in the UI and run a scan. Container runs as uid 1000.
+      # - /path/to/your/pictures:/media/pictures:ro
+    environment:
+      - LOGLEVEL=DEBUG
+
+volumes:
+  panoptikon-data:
+  panoptikon-config:
+  panoptikon-cache:
