@@ -26,6 +26,18 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
   <img alt="Panoptikon Screenshot" src="https://raw.githubusercontent.com/reasv/panoptikon/refs/heads/master/static/screenshot_1.jpg">
 </a>
 
+## Download
+
+One self-contained binary — no installer, no runtime to set up. It bundles the web UI and provisions its Python inference environment on first run. These links always resolve to the **latest release**:
+
+| Platform | Download |
+| --- | --- |
+| **Windows** · x86-64 | [`panoptikon-windows-x86_64.exe`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-windows-x86_64.exe) |
+| **Linux** · x86-64 | [`panoptikon-linux-x86_64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-linux-x86_64) |
+| **macOS** · Apple Silicon | [`panoptikon-macos-aarch64`](https://github.com/reasv/panoptikon/releases/latest/download/panoptikon-macos-aarch64) |
+
+On Linux and macOS, mark the file executable first: `chmod +x panoptikon-*`. Per-release changelogs and the `latest.json` checksum manifest are on the [releases page](https://github.com/reasv/panoptikon/releases). Prefer containers? See the Docker section below.
+
 ## This is the Rust implementation
 
 Panoptikon is implemented in Rust: a single native binary owns the HTTP
@@ -250,13 +262,16 @@ reference: every key, the templating syntax, and policies and rulesets.
 
 # Docker
 
-The official image (`ghcr.io/reasv/panoptikon`, linux/amd64, CPU inference)
-packages everything in one container: the Rust binary, a native Node.js for
-the web UI, and the Python inference environment — no nginx, no separate UI
-services.
+The official image (`ghcr.io/reasv/panoptikon`, linux/amd64) packages
+everything in one container: the Rust binary, a native Node.js for the web
+UI, and the Python inference environment — no nginx, no separate UI services.
+Two variants are published: a CPU image (`:latest`) and a **CUDA/GPU image**
+(`:latest-cuda`) — most users want the GPU one, see [GPU (CUDA)](#gpu-cuda)
+below. Both include the optional PDF and HTML renderers (bundled `libpdfium`
+and a headless Chrome).
 
 You do **not** need to clone the repository. Download the compose file into
-an empty directory and start it:
+an empty directory and start it (this uses the CPU image):
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/reasv/panoptikon/master/deploy/docker-compose.yml
@@ -289,19 +304,31 @@ Since the server cannot open files on *your* machine from inside a
 container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
 on your client (see above).
 
-### GPU (CUDA) variant
+### GPU (CUDA)
 
-The published image installs CPU-only PyTorch. For NVIDIA GPU inference,
-build the image yourself with the CUDA build arg and run it with GPU access
-(requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html)):
+For NVIDIA GPU inference — recommended, and what most users want — use the
+published CUDA image (`ghcr.io/reasv/panoptikon:latest-cuda`) via its own
+compose file. It needs an NVIDIA GPU with recent drivers and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html);
+no repo clone required:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/reasv/panoptikon/master/deploy/docker-compose.cuda.yml
+docker compose -f docker-compose.cuda.yml up -d
+```
+
+The CUDA compose passes the host GPU(s) into the container; everything else
+(ports, volumes, media mounts) matches the CPU compose.
+
+**Building from source instead of pulling** — for development or local
+changes — use the repo-root `docker-compose.yml`, which builds the image with
+the `ACCELERATOR` build arg (`cuda` by default, `cpu` to override):
 
 ```bash
 git clone --recurse-submodules https://github.com/reasv/panoptikon.git
-docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda panoptikon/
+cd panoptikon
+docker compose up -d --build              # ACCELERATOR=cpu for a CPU image
 ```
-
-Then point the compose file's `image:` at `panoptikon:cuda` and uncomment
-its GPU `deploy` section (or pass `--gpus all` to `docker run`).
 
 # License
 

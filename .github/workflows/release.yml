@@ -27,12 +27,15 @@ jobs:
           - os: windows-latest
             label: windows-x86_64
             bin: target/release/panoptikon.exe
+            asset: panoptikon-windows-x86_64.exe
           - os: ubuntu-latest
             label: linux-x86_64
             bin: target/release/panoptikon
+            asset: panoptikon-linux-x86_64
           - os: macos-latest
             label: macos-aarch64
             bin: target/release/panoptikon
+            asset: panoptikon-macos-aarch64
 
     steps:
       - uses: actions/checkout@v7
@@ -235,17 +238,22 @@ jobs:
           path: ${{ runner.temp }}/smoke/gateway.log
           if-no-files-found: ignore
 
+      # Ship the bare executable — the whole point of the self-contained
+      # build is a single file to download. Names carry NO version so the
+      # releases/latest/download/<name> permalinks stay constant across
+      # releases (the version lives in the binary and in latest.json). The
+      # sidecar <label>.sha256 is consumed by the release job to build the
+      # update manifest; it is not itself a release asset.
       - name: Package artifact
         shell: bash
         run: |
           set -euo pipefail
-          NAME="panoptikon-${GITHUB_REF_NAME}-${{ matrix.label }}"
-          mkdir -p "pkg/$NAME" dist
-          cp "${{ matrix.bin }}" README.md LICENSE "pkg/$NAME/"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            (cd pkg && 7z a "../dist/$NAME.zip" "$NAME")
+          mkdir -p dist
+          cp "${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.label }}.sha256"
           else
-            tar -czf "dist/$NAME.tar.gz" -C pkg "$NAME"
+            shasum -a 256 "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.label }}.sha256"
           fi
 
       - name: Upload build artifact
@@ -259,12 +267,24 @@ jobs:
   # parallel with the binary matrix and does NOT gate the release publish —
   # a docker-only failure must never block the binary release.
   docker:
-    name: Docker image
+    name: Docker image (${{ matrix.accelerator }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CPU image: :latest / :vX.Y.Z — small, runs anywhere.
+          - accelerator: cpu
+            suffix: ""
+          # CUDA image: :latest-cuda / :vX.Y.Z-cuda — the GPU deployment most
+          # users run (deploy/docker-compose.cuda.yml). Needs --gpus all at
+          # runtime; the image itself builds and boots without a GPU.
+          - accelerator: cuda
+            suffix: "-cuda"
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
@@ -272,11 +292,24 @@ jobs:
         with:
           submodules: recursive
 
+      # The CUDA venv (torch + nvidia-* wheels) is several GB; the default
+      # hosted-runner free space is too tight for that image build.
+      - name: Free disk space
+        if: matrix.accelerator == 'cuda'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h
+
       # linux/amd64 only: the Python inference lockfile excludes
       # linux/aarch64 (no triton wheels), and a QEMU cross-build of the
       # Rust binary + multi-GB venv would multiply CI time for nothing.
       - name: Build image
-        run: docker build -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest" .
+        run: |
+          docker build --build-arg ACCELERATOR=${{ matrix.accelerator }} \
+            -t "$IMAGE:${GITHUB_REF_NAME}${{ matrix.suffix }}" \
+            -t "$IMAGE:latest${{ matrix.suffix }}" .
 
       # Same spirit as the binary smoke test: boot the container with the
       # fixture DB mounted as the data volume, then assert the API and the
@@ -305,7 +338,7 @@ jobs:
           docker run -d --name smoke \
             -p 127.0.0.1:6342:6342 -p 127.0.0.1:6339:6339 \
             -v "$SMOKE/fixture:/app/data" \
-            "$IMAGE:$GITHUB_REF_NAME"
+            "$IMAGE:${GITHUB_REF_NAME}${{ matrix.suffix }}"
 
           echo "Waiting for the gateway..."
           for i in $(seq 1 60); do
@@ -388,8 +421,8 @@ jobs:
       - name: Push to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$IMAGE:$GITHUB_REF_NAME"
-          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${GITHUB_REF_NAME}${{ matrix.suffix }}"
+          docker push "$IMAGE:latest${{ matrix.suffix }}"
 
   # Attach all platform artifacts and publish the release in a single job so
   # the three matrix builds don't race to create it. Published directly (not
@@ -405,6 +438,33 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
+
+      # Build latest.json: the updater manifest. Panoptikon fetches it via the
+      # stable permalink https://github.com/<repo>/releases/latest/download/
+      # latest.json, compares .version to its own, and (later) uses the
+      # per-platform url+sha256 to self-update. The download URLs are the
+      # immutable per-tag ones; the manifest itself is what's reached by the
+      # "latest" permalink.
+      - name: Assemble update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          jq -n \
+            --arg version "${TAG#v}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg win_url "$base/panoptikon-windows-x86_64.exe" --arg win_sha "$(cat dist/windows-x86_64.sha256)" \
+            --arg lin_url "$base/panoptikon-linux-x86_64"       --arg lin_sha "$(cat dist/linux-x86_64.sha256)" \
+            --arg mac_url "$base/panoptikon-macos-aarch64"      --arg mac_sha "$(cat dist/macos-aarch64.sha256)" \
+            '{version: $version, pub_date: $pub_date, notes: $notes, platforms: {
+               "windows-x86_64": {url: $win_url, sha256: $win_sha},
+               "linux-x86_64":   {url: $lin_url, sha256: $lin_sha},
+               "macos-aarch64":  {url: $mac_url, sha256: $mac_sha}}}' > dist/latest.json
+          cat dist/latest.json
+          # Sidecar hashes are inputs to the manifest, not release assets.
+          rm -f dist/*.sha256
 
       - uses: softprops/action-gh-release@v3
         with:
