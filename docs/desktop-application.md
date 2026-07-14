@@ -146,7 +146,7 @@ components unless implementation evidence requires a documented change:
 | Tauri `tray-icon` feature | Required | Desktop owns the only tray icon. |
 | `tauri-plugin-single-instance` | Required | Register it first, before any plugin or setup code that can create state. |
 | `tauri-plugin-updater` | Required | Drive it from Rust and the restricted control UI; do not expose raw updater commands to server-hosted pages. |
-| `tauri-plugin-dialog` | Required | Native bootstrap/emergency confirmations only; richer routine flows use the bundled control UI. |
+| `tauri-plugin-dialog` | Required | Native bootstrap/emergency confirmations and the setup wizard's platform folder picker; richer routine flows use the bundled control UI. |
 | `tauri-plugin-opener` | Required | Rust-owned opening of browser URLs and known local folders; do not grant a generic opener capability to remote pages. |
 | `tauri-plugin-autostart` | Required | User-scoped Start at Login, always with background activation intent. |
 | `tauri-plugin-shell` | Required for the sidecar | Use its Rust sidecar API only. No webview receives generic shell or spawn permission. |
@@ -539,11 +539,35 @@ The initial wizard MUST support:
 
 1. explaining Panoptikon and the separate-database model, including the actual
    name of the configured default database;
-2. selecting at least one included folder;
-3. saving the scan configuration and starting the initial scan;
-4. explaining extraction/model setup without requiring a long extraction job
+2. staging at least one included folder and optional absolute exclusions in a
+   two-tab editor, with no configuration writes while moving between steps;
+3. normalizing and validating reachability on Continue, with path-specific
+   failures displayed inside the scrolling content region;
+4. staging optional continuous scanning, including a local/native versus
+   network/polling choice, polling interval, and an optional watched-folder
+   whitelist constrained by the previously selected full-scan folders;
+5. saving the staged scan configuration and starting the initial scan only at
+   final completion;
+6. explaining extraction/model setup without requiring a long extraction job
    to finish before onboarding completes; and
-5. opening `/search` only after first-database readiness is satisfied.
+7. opening `/search` only after first-database readiness is satisfied.
+
+The folder editor keeps textareas for pasted one-path-per-line input and, in
+Desktop, offers a native multi-folder picker that appends selections to the
+active tab. Exclusions must be descendants of an included root and are
+absolute: a nested include never overrides an excluded ancestor. Empty roots
+are accepted only when the target index has no file rows beneath them; this
+supports new/future watch targets without weakening protection for temporarily
+empty external drives or shares.
+
+The Continuous scan step explains that native filesystem events are the
+efficient choice for local-only indices, while a database containing SMB/NFS
+or other network mounts should use periodic polling. The polling implementation
+checks directory mtimes and enumerates only changed directories rather than
+rescanning or hashing every file; it may miss in-place edits until a scheduled
+full scan. Its optional whitelist and nested reminder of the staged full-scan
+folders are collapsed by default. An empty whitelist watches every included
+folder. All controls remain staged until final completion.
 
 The wizard fills its webview as three independent vertical regions: a fixed
 step indicator, a `min-height: 0` internally scrolling step-content region,
@@ -557,12 +581,13 @@ surfaces.
 
 - The bundled control frontend receives only narrow, window-labelled Tauri
   capabilities.
-- A webview loading `http://localhost:<port>/desktop/setup` receives no generic
-  Tauri capability.
-- If native folder selection is needed, expose only a purpose-built command
-  such as `choose_scan_folder`, scoped to the setup window label and exact
-  loopback origin. Readiness itself comes from the Server's narrow Desktop
-  status endpoint and requires no privileged Tauri completion signal.
+- The `launch` webview on an `http://localhost:<port>` origin receives only core
+  IPC access and the purpose-built `choose_scan_folders` command. Tauri applies
+  remote capabilities to an IPC caller's origin rather than its current path,
+  so the command independently verifies the setup window label and exact
+  `/desktop/setup` route before opening the platform picker. It exposes no
+  generic filesystem access. Readiness and completion use the Server's narrow
+  Desktop endpoints.
 - Generic shell execution, sidecar spawning, unrestricted filesystem access,
   updater installation, and Relay secret access MUST remain Rust-only.
 - Tauri commands MUST validate the calling window and all arguments even when
