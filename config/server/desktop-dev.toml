@@ -1,0 +1,50 @@
+# Development-only Panoptikon Server configuration owned by Panoptikon Desktop Dev.
+# It deliberately uses ports distinct from the production Desktop installation.
+data_folder = "data"
+
+[server]
+host = "127.0.0.1"
+port = 16342
+check_for_updates = false
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:16340"
+local = true
+dir = "runtime/desktop-ui-bundle"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:16342"
+local = true
+
+[inference_local]
+enabled = true
+
+[inference_local.python_env]
+auto_setup = true
+accelerator = "auto"
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "desktop"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+endpoints = ["default"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+[policies.client]
+desktop = true
+home_redirect = "/search"
+
+[logging]
+level = "info"

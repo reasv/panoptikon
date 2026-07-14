@@ -144,7 +144,12 @@ async fn async_main() -> anyhow::Result<()> {
     // Python source set when no dev tree is present); plain builds no-op.
     // This must precede Settings::load — it may create the very file that
     // load is about to read.
-    let first_run_messages = resources::materialize_first_run(config_path.is_some())?;
+    // Desktop always names its managed config explicitly, but that file still
+    // has to be materialized on a fresh Desktop-owned root. Treat managed
+    // invocation as the bundled first-run case while preserving the ordinary
+    // Server rule that an explicit config path is never synthesized.
+    let first_run_messages =
+        resources::materialize_first_run(config_path.is_some() && !args.desktop_managed)?;
     // Config must load before logging init (logging is configured by
     // [logging] now); a config-load error is reported on stderr by main.
     let settings = Arc::new(config::Settings::load(config_path)?);

@@ -31,6 +31,12 @@ use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+const DEV_IDENTIFIER: &str = "app.panoptikon.desktop.dev";
+const PROD_SERVER_CONFIG: &str = "config/server/desktop.toml";
+const DEV_SERVER_CONFIG: &str = "config/server/desktop-dev.toml";
+const PROD_SERVER_PORT: u16 = 6342;
+const DEV_SERVER_PORT: u16 = 16342;
+
 struct RuntimeState {
     relay_handle: Mutex<Option<RelayHandle>>,
     tray: Mutex<Option<TrayUi>>,
@@ -76,6 +82,12 @@ pub fn run() {
             relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
         ])
         .setup(|app| {
+            let development = app.config().identifier == DEV_IDENTIFIER;
+            let (server_config, default_port) = if development {
+                (DEV_SERVER_CONFIG, DEV_SERVER_PORT)
+            } else {
+                (PROD_SERVER_CONFIG, PROD_SERVER_PORT)
+            };
             let resolver = app.path();
             let paths = DesktopPaths::new(
                 resolver.app_config_dir()?,
@@ -92,14 +104,19 @@ pub fn run() {
                     SettingsDocument::defaults(paths.desktop_settings.clone())?
                 }
             };
-            let relay_config = match relay::load_config(&paths.relay_settings) {
+            let relay_config = match relay::load_config(&paths.relay_settings, development) {
                 Ok(config) => config,
                 Err(error) => {
                     startup_warnings.push(error.to_string());
-                    relay::RelayConfig::desktop_default()
+                    relay::RelayConfig::desktop_default(development)
                 }
             };
-            let supervisor = Arc::new(Supervisor::new(paths.clone(), settings));
+            let supervisor = Arc::new(Supervisor::new(
+                paths.clone(),
+                settings,
+                server_config,
+                default_port,
+            ));
             let opener = app.handle().clone();
             let action_handler = Arc::new(move |action: RelayAction, path: std::path::PathBuf| {
                 match action {
@@ -175,9 +192,20 @@ pub fn run() {
             Ok(())
         });
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running Panoptikon Desktop");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building Panoptikon Desktop");
+    app.run(|_app, event| {
+        if let tauri::RunEvent::ExitRequested {
+            code: None, api, ..
+        } = event
+        {
+            // Closing the last webview must not terminate the tray process.
+            // Explicit Quit and updater restart requests carry an exit code
+            // and are therefore allowed through.
+            api.prevent_exit();
+        }
+    });
 }
 
 fn init_logging(
@@ -348,9 +376,20 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
         return show_control_window(app, true).map_err(|e| e.to_string());
     }
     if snapshot.state != LifecycleState::Ready {
-        app.state::<RuntimeState>()
-            .pending_open
-            .store(true, Ordering::Release);
+        if matches!(
+            snapshot.state,
+            LifecycleState::Installing
+                | LifecycleState::Starting
+                | LifecycleState::SettingUp
+                | LifecycleState::Restarting
+        ) {
+            // A normal activation during startup stays tray-only and is
+            // fulfilled once readiness succeeds. Recovery remains explicit.
+            app.state::<RuntimeState>()
+                .pending_open
+                .store(true, Ordering::Release);
+            return Ok(());
+        }
         return show_control_window(app, true).map_err(|e| e.to_string());
     }
     let onboarding = {
@@ -364,10 +403,7 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
         OnboardingState::Complete | OnboardingState::Skipped
     ) {
         app.opener()
-            .open_url(
-                format!("http://127.0.0.1:{}/search", snapshot.port),
-                None::<&str>,
-            )
+            .open_url(local_browser_url(snapshot.port, "/search"), None::<&str>)
             .map_err(|e| e.to_string())
     } else {
         show_setup_window(app, snapshot.port).map_err(|e| e.to_string())
@@ -391,11 +427,20 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
     let window = if let Some(window) = app.get_webview_window("control") {
         window
     } else {
-        WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
-            .title("Panoptikon Desktop")
-            .inner_size(780.0, 680.0)
-            .min_inner_size(560.0, 480.0)
-            .build()?
+        let window =
+            WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
+                .title("Panoptikon Desktop")
+                .inner_size(780.0, 680.0)
+                .min_inner_size(560.0, 480.0)
+                .build()?;
+        let close_window = window.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = close_window.hide();
+            }
+        });
+        window
     };
     window.show()?;
     if focus {
@@ -406,7 +451,7 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
 }
 
 fn show_setup_window(app: &AppHandle, port: u16) -> tauri::Result<()> {
-    let url = format!("http://127.0.0.1:{port}/desktop/setup")
+    let url = local_browser_url(port, "/desktop/setup")
         .parse()
         .map_err(|error| tauri::Error::InvalidUrl(error))?;
     let window = if let Some(window) = app.get_webview_window("setup") {
@@ -419,6 +464,10 @@ fn show_setup_window(app: &AppHandle, port: u16) -> tauri::Result<()> {
     };
     window.show()?;
     window.set_focus()
+}
+
+fn local_browser_url(port: u16, path: &str) -> String {
+    format!("http://localhost:{port}{path}")
 }
 
 #[tauri::command]
@@ -838,6 +887,8 @@ async fn quit_inner(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use super::local_browser_url;
+
     /// Production and development manifests stay product-separated, updater
     /// signing metadata is present only in production, and the Server is an
     /// explicit sidecar rather than an arbitrary shell permission.
@@ -881,6 +932,14 @@ mod tests {
         assert_eq!(
             capability["permissions"],
             serde_json::json!(["core:default"])
+        );
+    }
+
+    #[test]
+    fn browser_facing_desktop_urls_use_localhost() {
+        assert_eq!(
+            local_browser_url(16342, "/desktop/setup"),
+            "http://localhost:16342/desktop/setup"
         );
     }
 }

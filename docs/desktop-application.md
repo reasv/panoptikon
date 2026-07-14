@@ -460,7 +460,7 @@ The Open action is state-aware:
    window.
 2. If Server is not ready, show the bundled Startup/Recovery window.
 3. If Desktop onboarding is incomplete, show the onboarding webview.
-4. Otherwise open `http://127.0.0.1:<port>/search` in the default browser.
+4. Otherwise open `http://localhost:<port>/search` in the default browser.
 
 Login startup never invokes Open automatically. An explicit first launch MAY
 show bootstrap progress immediately and MUST show onboarding once the UI is
@@ -526,7 +526,7 @@ surfaces.
 
 - The bundled control frontend receives only narrow, window-labelled Tauri
   capabilities.
-- A webview loading `http://127.0.0.1:<port>/desktop/setup` receives no generic
+- A webview loading `http://localhost:<port>/desktop/setup` receives no generic
   Tauri capability.
 - If native folder selection or completion signaling is needed, expose only
   purpose-built commands such as `choose_scan_folder` and

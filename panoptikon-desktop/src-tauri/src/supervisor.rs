@@ -31,6 +31,8 @@ pub struct Supervisor {
     pub paths: DesktopPaths,
     pub settings: Mutex<SettingsDocument>,
     pub state: RwLock<LifecycleState>,
+    server_config: &'static str,
+    default_port: u16,
     child: Mutex<Option<RunningSidecar>>,
     restart_budget: Mutex<RestartBudget>,
     intentional_stop: AtomicBool,
@@ -52,8 +54,12 @@ pub struct StatusSnapshot {
 }
 
 impl Supervisor {
-    pub fn new(paths: DesktopPaths, settings: SettingsDocument) -> Self {
-        let initial_port = settings.typed.local_server.port;
+    pub fn new(
+        paths: DesktopPaths,
+        settings: SettingsDocument,
+        server_config: &'static str,
+        default_port: u16,
+    ) -> Self {
         let initial = if settings.typed.local_server.enabled {
             LifecycleState::Installing
         } else {
@@ -63,11 +69,13 @@ impl Supervisor {
             paths,
             settings: Mutex::new(settings),
             state: RwLock::new(initial),
+            server_config,
+            default_port,
             child: Mutex::new(None),
             restart_budget: Mutex::new(RestartBudget::default()),
             intentional_stop: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            active_port: AtomicU16::new(initial_port),
+            active_port: AtomicU16::new(default_port),
             log_tail: Mutex::new(VecDeque::with_capacity(500)),
         }
     }
@@ -126,13 +134,14 @@ impl Supervisor {
         }
         let port = effective_port(
             &supervisor.paths,
-            supervisor.settings.lock().await.typed.local_server.port,
+            supervisor.server_config,
+            supervisor.default_port,
         )?;
         supervisor.active_port.store(port, Ordering::Release);
         supervisor.intentional_stop.store(false, Ordering::Release);
         supervisor.set_state(&app, LifecycleState::Starting).await;
         let generation = supervisor.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let args = sidecar_arguments(&supervisor.paths);
+        let args = sidecar_arguments(&supervisor.paths, supervisor.server_config);
         let command = app
             .shell()
             .sidecar("panoptikon")
@@ -156,18 +165,22 @@ impl Supervisor {
             while let Some(event) = events.recv().await {
                 match event {
                     CommandEvent::Stdout(bytes) => {
-                        let line = String::from_utf8_lossy(&bytes).into_owned();
-                        event_app
-                            .state::<Arc<Supervisor>>()
-                            .record(format!("server: {line}"))
-                            .await;
+                        let line = clean_terminal_output(&String::from_utf8_lossy(&bytes));
+                        if !line.is_empty() {
+                            event_app
+                                .state::<Arc<Supervisor>>()
+                                .record(format!("server: {line}"))
+                                .await;
+                        }
                     }
                     CommandEvent::Stderr(bytes) => {
-                        let line = String::from_utf8_lossy(&bytes).into_owned();
-                        event_app
-                            .state::<Arc<Supervisor>>()
-                            .record(format!("server stderr: {line}"))
-                            .await;
+                        let line = clean_terminal_output(&String::from_utf8_lossy(&bytes));
+                        if !line.is_empty() {
+                            event_app
+                                .state::<Arc<Supervisor>>()
+                                .record(format!("server stderr: {line}"))
+                                .await;
+                        }
                     }
                     CommandEvent::Error(error) => {
                         event_app
@@ -328,8 +341,8 @@ async fn handle_exit(app: AppHandle, generation: u64, code: Option<i32>) {
     }
 }
 
-fn effective_port(paths: &DesktopPaths, fallback: u16) -> anyhow::Result<u16> {
-    let config = paths.server_root.join("config/server/desktop.toml");
+fn effective_port(paths: &DesktopPaths, server_config: &str, fallback: u16) -> anyhow::Result<u16> {
+    let config = paths.server_root.join(server_config);
     if !config.exists() {
         return Ok(fallback);
     }
@@ -349,12 +362,12 @@ fn effective_port(paths: &DesktopPaths, fallback: u16) -> anyhow::Result<u16> {
     u16::try_from(port).context("Desktop Server port is outside 1..65535")
 }
 
-pub fn sidecar_arguments(paths: &DesktopPaths) -> Vec<OsString> {
+pub fn sidecar_arguments(paths: &DesktopPaths, server_config: &str) -> Vec<OsString> {
     vec![
         OsString::from("--root"),
         paths.server_root.as_os_str().to_owned(),
         OsString::from("--config"),
-        OsString::from("config/server/desktop.toml"),
+        OsString::from(server_config),
         OsString::from("--disable-update-check"),
         OsString::from("--desktop-managed"),
     ]
@@ -430,6 +443,54 @@ fn client_config_is_desktop_managed(value: &serde_json::Value) -> bool {
     value.get("desktop_managed").and_then(|v| v.as_bool()) == Some(true)
 }
 
+fn clean_terminal_output(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            index += 1;
+            match bytes.get(index).copied() {
+                Some(b'[') => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                Some(b']') => {
+                    index += 1;
+                    while index < bytes.len() {
+                        if bytes[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                Some(_) => index += 1,
+                None => {}
+            }
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            if byte >= 0x20 || matches!(byte, b'\t' | b'\n') {
+                output.push(byte);
+            }
+        }
+    }
+    String::from_utf8_lossy(&output)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned()
+}
+
 fn redact(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
     if [
@@ -462,8 +523,9 @@ mod tests {
             "C:/Données utilisateur".into(),
             "C:/logs".into(),
         );
-        let args = sidecar_arguments(&paths);
+        let args = sidecar_arguments(&paths, "config/server/desktop-dev.toml");
         assert_eq!(args[1], paths.server_root.as_os_str());
+        assert_eq!(args[3], OsString::from("config/server/desktop-dev.toml"));
         assert_eq!(args[5], OsString::from("--desktop-managed"));
     }
 
@@ -478,6 +540,14 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_output_strips_terminal_sequences_and_line_endings() {
+        assert_eq!(
+            clean_terminal_output("\u{1b}[2m2026-07-14\u{1b}[0m \u{1b}[32mINFO\u{1b}[0m\r\n"),
+            "2026-07-14 INFO"
+        );
+    }
+
+    #[test]
     fn effective_port_comes_from_the_user_owned_server_config() {
         let temp = tempfile::tempdir().unwrap();
         let paths = DesktopPaths::new(
@@ -488,7 +558,10 @@ mod tests {
         paths.materialize_server_root().unwrap();
         let config = paths.server_root.join("config/server/desktop.toml");
         std::fs::write(&config, "[server]\nport = 7123\n").unwrap();
-        assert_eq!(effective_port(&paths, 6342).unwrap(), 7123);
+        assert_eq!(
+            effective_port(&paths, "config/server/desktop.toml", 6342).unwrap(),
+            7123
+        );
     }
 
     #[test]

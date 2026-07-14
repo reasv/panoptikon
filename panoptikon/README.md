@@ -581,6 +581,13 @@ a parallel configuration mechanism: they feed TOML values through templating
 used by Desktop. It is materialized into the Desktop-owned Server root on first
 run and is then user-owned and never overwritten.
 
+`config/server/desktop-dev.toml` is the corresponding isolated development
+profile. It uses gateway/UI ports 16342/16340, while production Desktop uses
+6342/6340. The supervised Next.js process receives the effective gateway URL
+through `PANOPTIKON_API_URL`, so server-rendered routes use the selected profile.
+In managed mode these embedded configs are materialized when missing despite
+the explicit `--config` argument; existing files are never overwritten.
+
 ### Env templating
 
 String values in the settings file — and in every inference registry TOML —

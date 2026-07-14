@@ -74,6 +74,7 @@ struct UiPlan {
     host: String,
     port: u16,
     base_url: String,
+    api_url: String,
     node_override: Option<PathBuf>,
     build: UiBuildPolicy,
 }
@@ -96,6 +97,7 @@ pub(crate) fn start(settings: &Settings) -> Result<UiServerHandle> {
         host,
         port,
         base_url: ui.base_url.clone(),
+        api_url: crate::config::loopback_base_url(&settings.server.host, settings.server.port),
         node_override: ui.node.clone(),
         build: ui.build,
     };
@@ -214,7 +216,11 @@ async fn run_once(
         BuildDecision::Build => {
             tracing::info!(dir = %plan.dir.display(), "building the UI (next build); this can take minutes");
             let mut command = Command::new(&node);
-            command.arg(NEXT_BIN).arg("build").current_dir(&plan.dir);
+            command
+                .arg(NEXT_BIN)
+                .arg("build")
+                .current_dir(&plan.dir)
+                .env("PANOPTIKON_API_URL", &plan.api_url);
             match run_logged(command, "next build", stop).await? {
                 CommandEnd::Stopped => return Ok(RunOutcome::Stopped),
                 CommandEnd::Exited(status) if !status.success() => {
@@ -236,7 +242,8 @@ async fn run_once(
     command
         .arg(NEXT_BIN)
         .args(["start", "-p", &plan.port.to_string(), "-H", &plan.host])
-        .current_dir(&plan.dir);
+        .current_dir(&plan.dir)
+        .env("PANOPTIKON_API_URL", &plan.api_url);
     start_announcer_once(plan, stop, announcer_started);
     let started = Instant::now();
     match run_logged(command, "next start", stop).await? {
@@ -302,6 +309,7 @@ async fn run_once_without_checkout(
         // environment, not CLI flags.
         .env("PORT", plan.port.to_string())
         .env("HOSTNAME", &plan.host)
+        .env("PANOPTIKON_API_URL", &plan.api_url)
         .env("NODE_ENV", "production");
     start_announcer_once(plan, stop, announcer_started);
     let started = Instant::now();
@@ -333,11 +341,7 @@ async fn warn_if_port_taken(plan: &UiPlan, what: &str) {
 
 /// Start the "UI is up" readiness announcer with the first spawn attempt;
 /// it survives restarts, so later attempts must not start a second one.
-fn start_announcer_once(
-    plan: &UiPlan,
-    stop: &watch::Receiver<bool>,
-    announcer_started: &mut bool,
-) {
+fn start_announcer_once(plan: &UiPlan, stop: &watch::Receiver<bool>, announcer_started: &mut bool) {
     if !*announcer_started {
         *announcer_started = true;
         tokio::spawn(announce_when_up(
@@ -434,7 +438,12 @@ async fn forward_lines(stream: impl AsyncRead + Unpin, what: &'static str, name:
 /// Poll the UI port and log the final URL once it accepts TCP connections.
 /// Started with the first `next start` and survives restarts; gives up
 /// logging after [`PORT_POLL_GIVE_UP`] without touching the server.
-async fn announce_when_up(host: String, port: u16, base_url: String, mut stop: watch::Receiver<bool>) {
+async fn announce_when_up(
+    host: String,
+    port: u16,
+    base_url: String,
+    mut stop: watch::Receiver<bool>,
+) {
     let deadline = Instant::now() + PORT_POLL_GIVE_UP;
     loop {
         if tokio::net::TcpStream::connect((host.as_str(), port))

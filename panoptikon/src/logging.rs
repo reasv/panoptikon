@@ -70,9 +70,13 @@ fn open_logs_file(settings: &Settings) -> Option<(PathBuf, fs::File)> {
 /// than refusing to start. The returned guard must stay alive for the process
 /// lifetime; dropping it flushes buffered file output.
 pub(crate) fn init(settings: &Settings) -> Option<WorkerGuard> {
+    // Desktop captures stdout/stderr through a pipe for its diagnostics UI.
+    // ANSI styling is useful in an interactive terminal but becomes raw
+    // control characters in that transport.
+    let console_layer = tracing_subscriber::fmt::layer().with_ansi(!crate::desktop::is_managed());
     let registry = tracing_subscriber::registry()
         .with(env_filter(&settings.logging.level))
-        .with(tracing_subscriber::fmt::layer());
+        .with(console_layer);
 
     match open_logs_file(settings) {
         Some((path, file)) => {

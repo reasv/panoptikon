@@ -199,6 +199,11 @@ mod embedded {
         env!("CARGO_MANIFEST_DIR"),
         "/../config/server/desktop.toml"
     ));
+    /// The isolated Server config used by Panoptikon Desktop Dev.
+    pub static SERVER_DESKTOP_DEV_TOML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../config/server/desktop-dev.toml"
+    ));
     /// The example user inference registry, written to
     /// `config/inference/example.toml` on first run when absent.
     pub static INFERENCE_EXAMPLE_TOML: &str = include_str!(concat!(
@@ -223,6 +228,11 @@ fn write_default_configs_in(base: &Path) -> Result<Vec<String>> {
             "config/server/desktop.toml",
             embedded::SERVER_DESKTOP_TOML,
             "Desktop server config",
+        ),
+        (
+            "config/server/desktop-dev.toml",
+            embedded::SERVER_DESKTOP_DEV_TOML,
+            "Desktop development server config",
         ),
         (
             "config/inference/example.toml",
@@ -669,9 +679,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         let messages = write_default_configs_in(root.path()).unwrap();
-        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages.len(), 4, "{messages:?}");
         let gateway = root.path().join("config/server/default.toml");
         let desktop = root.path().join("config/server/desktop.toml");
+        let desktop_dev = root.path().join("config/server/desktop-dev.toml");
         let example = root.path().join("config/inference/example.toml");
         assert_eq!(
             std::fs::read_to_string(&gateway).unwrap(),
@@ -682,6 +693,10 @@ mod tests {
             embedded::SERVER_DESKTOP_TOML
         );
         assert_eq!(
+            std::fs::read_to_string(&desktop_dev).unwrap(),
+            embedded::SERVER_DESKTOP_DEV_TOML
+        );
+        assert_eq!(
             std::fs::read_to_string(&example).unwrap(),
             embedded::INFERENCE_EXAMPLE_TOML
         );
@@ -689,6 +704,7 @@ mod tests {
         // User edits both; a re-run writes nothing and changes nothing.
         std::fs::write(&gateway, "# user edited").unwrap();
         std::fs::write(&desktop, "# desktop user edited").unwrap();
+        std::fs::write(&desktop_dev, "# desktop dev user edited").unwrap();
         std::fs::write(&example, "# user edited too").unwrap();
         let messages = write_default_configs_in(root.path()).unwrap();
         assert!(messages.is_empty(), "{messages:?}");
@@ -696,6 +712,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&desktop).unwrap(),
             "# desktop user edited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&desktop_dev).unwrap(),
+            "# desktop dev user edited"
         );
         assert_eq!(
             std::fs::read_to_string(&example).unwrap(),

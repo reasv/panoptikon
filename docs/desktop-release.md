@@ -27,3 +27,16 @@ and an update from the preceding release on every supported platform.
 Windows packages are per-user NSIS installers. macOS is ad-hoc signed only and
 not notarized. Document the expected unknown-publisher/Gatekeeper prompts; do
 not describe these packages as Authenticode- or Developer-ID-signed.
+
+## Windows development installer and clean-state testing
+
+Run `scripts/build-desktop-dev.ps1` from the repository to build the standalone
+UI, bundled Server sidecar, and an unsigned NSIS installer using the mandatory
+`app.panoptikon.desktop.dev` Tauri overlay. The development profile uses gateway
+port 16342, UI port 16340, and Relay port 17601; browser-facing URLs use
+`localhost` while listeners remain explicitly bound to IPv4 loopback.
+
+After quitting Desktop Dev, run `scripts/reset-desktop-dev.ps1` to remove only
+its roaming and local application-data roots. The already-installed app will
+repeat extraction, environment setup, and onboarding on its next launch. Use
+`-WhatIf` to print the guarded targets and `-Force` to skip the RESET prompt.

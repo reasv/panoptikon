@@ -42,9 +42,13 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
-    pub fn desktop_default() -> Self {
+    pub fn desktop_default(development: bool) -> Self {
         Self {
-            bind: default_bind(),
+            bind: if development {
+                "127.0.0.1:17601".into()
+            } else {
+                default_bind()
+            },
             ..Self::default()
         }
     }
@@ -54,9 +58,9 @@ fn default_bind() -> String {
     "127.0.0.1:17600".into()
 }
 
-pub fn load_config(path: &Path) -> anyhow::Result<RelayConfig> {
+pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig> {
     if !path.exists() {
-        return Ok(RelayConfig::desktop_default());
+        return Ok(RelayConfig::desktop_default(development));
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read Relay settings '{}'", path.display()))?;
@@ -838,7 +842,7 @@ mod tests {
 
     fn test_state(temp: &tempfile::TempDir) -> Arc<RelayState> {
         Arc::new(RelayState::new(
-            RelayConfig::desktop_default(),
+            RelayConfig::desktop_default(false),
             temp.path().join("relay.toml"),
             Arc::new(|_, _| Ok(())),
         ))
