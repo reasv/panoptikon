@@ -85,7 +85,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
-            set_start_at_login, open_known_folder, log_tail, choose_scan_folders,
+            set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
             relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
         ])
@@ -860,6 +860,31 @@ async fn choose_scan_folders(window: WebviewWindow) -> Result<Vec<String>, Strin
 }
 
 #[tauri::command]
+async fn open_panoptikon_page(
+    window: WebviewWindow,
+    app: AppHandle,
+    page: String,
+    index_db: String,
+) -> Result<(), String> {
+    validate_setup_window(&window)?;
+    let path = match page.as_str() {
+        "search" => "/search",
+        "scan" => "/scan",
+        _ => return Err("only the Search and Scan pages can be opened from setup".into()),
+    };
+    let snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
+    if !snapshot.local_server_enabled || snapshot.state != LifecycleState::Ready {
+        return Err("the local Server is not ready".into());
+    }
+    let mut url = url::Url::parse(&local_browser_url(snapshot.port, path))
+        .map_err(|error| error.to_string())?;
+    url.query_pairs_mut().append_pair("index_db", &index_db);
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_status(window: WebviewWindow, app: AppHandle) -> Result<StatusSnapshot, String> {
     validate_control(&window)?;
     let mut snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
@@ -1302,7 +1327,7 @@ mod tests {
     }
 
     /// The bundled control window remains core-only. The external setup page
-    /// receives one app command, whose implementation validates its URL again.
+    /// receives only the setup commands whose implementations validate its URL again.
     #[test]
     fn control_capability_is_window_scoped_and_core_only() {
         let capability: serde_json::Value =
@@ -1327,11 +1352,17 @@ mod tests {
         );
         assert_eq!(
             setup["permissions"],
-            serde_json::json!(["core:default", "allow-choose-scan-folders"])
+            serde_json::json!([
+                "core:default",
+                "allow-choose-scan-folders",
+                "allow-open-panoptikon-page"
+            ])
         );
         assert_eq!(setup["local"], false);
         let picker_permission = include_str!("../permissions/choose_scan_folders.toml");
         assert!(picker_permission.contains("commands.allow = [\"choose_scan_folders\"]"));
+        let browser_permission = include_str!("../permissions/open_panoptikon_page.toml");
+        assert!(browser_permission.contains("commands.allow = [\"open_panoptikon_page\"]"));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "setup-window",
-  "description": "Allow the local Panoptikon setup page to invoke its narrowly validated native folder picker.",
+  "description": "Allow the local Panoptikon setup page to invoke its narrowly validated folder picker and browser navigation.",
   "local": false,
   "windows": ["launch"],
   "remote": {
     "urls": ["http://localhost:*"]
   },
-  "permissions": ["core:default", "allow-choose-scan-folders"]
+  "permissions": ["core:default", "allow-choose-scan-folders", "allow-open-panoptikon-page"]
 }

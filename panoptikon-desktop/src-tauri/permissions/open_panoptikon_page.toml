@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-open-panoptikon-page"
+description = "Allows the setup window to open a database-scoped Panoptikon Search or Scan page in the system browser."
+commands.allow = ["open_panoptikon_page"]
