@@ -11,8 +11,6 @@ pub struct DesktopSettings {
     pub startup: StartupSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
-    #[serde(default)]
-    pub onboarding: OnboardingSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,24 +33,6 @@ pub struct UpdateSettings {
     pub check_automatically: bool,
     #[serde(default)]
     pub last_checked_unix: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OnboardingSettings {
-    #[serde(default)]
-    pub server_instance_id: String,
-    #[serde(default)]
-    pub state: OnboardingState,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OnboardingState {
-    #[default]
-    NotStarted,
-    InProgress,
-    Complete,
-    Skipped,
 }
 
 fn yes() -> bool {
@@ -84,7 +64,6 @@ impl Default for DesktopSettings {
             local_server: LocalServerSettings::default(),
             startup: StartupSettings::default(),
             updates: UpdateSettings::default(),
-            onboarding: OnboardingSettings::default(),
         }
     }
 }
@@ -206,40 +185,6 @@ fn quarantine_path(path: &Path) -> PathBuf {
     path.with_extension(format!("toml.invalid-{stamp}"))
 }
 
-pub fn ensure_instance_id(paths: &DesktopPaths) -> anyhow::Result<String> {
-    let path = paths.instance_id_path();
-    if let Ok(value) = std::fs::read_to_string(&path) {
-        let value = value.trim();
-        if uuid::Uuid::parse_str(value).is_ok() {
-            return Ok(value.to_owned());
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    atomic_write(&path, format!("{id}\n").as_bytes())?;
-    Ok(id)
-}
-
-pub fn sync_onboarding_marker(
-    paths: &DesktopPaths,
-    document: &mut SettingsDocument,
-) -> anyhow::Result<bool> {
-    let marker = paths.server_root.join("runtime/desktop-onboarding-state");
-    let Ok(value) = std::fs::read_to_string(marker) else {
-        return Ok(false);
-    };
-    let state = match value.trim() {
-        "complete" => OnboardingState::Complete,
-        "skipped" => OnboardingState::Skipped,
-        _ => return Ok(false),
-    };
-    if document.typed.onboarding.state != state {
-        document.typed.onboarding.state = state;
-        document.save()?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,22 +219,5 @@ mod tests {
         assert!(error.contains("quarantined"), "{error}");
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
-    }
-
-    /// Replacing a Server root yields a new instance ID and therefore
-    /// re-arms onboarding rather than inferring completion from databases.
-    #[test]
-    fn instance_id_is_stable_per_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = DesktopPaths::new(
-            temp.path().join("cfg"),
-            temp.path().join("data"),
-            temp.path().join("log"),
-        );
-        paths.materialize_server_root().unwrap();
-        let first = ensure_instance_id(&paths).unwrap();
-        assert_eq!(first, ensure_instance_id(&paths).unwrap());
-        std::fs::remove_file(paths.instance_id_path()).unwrap();
-        assert_ne!(first, ensure_instance_id(&paths).unwrap());
     }
 }

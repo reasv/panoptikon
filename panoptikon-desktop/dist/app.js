@@ -17,6 +17,12 @@ async function refresh() {
     byId('root').textContent = status.server_root;
     byId('port').textContent = status.port;
     byId('local').checked = status.local_server_enabled;
+    const databaseReady = status.default_database_ready === true;
+    byId('setup-title').textContent = databaseReady ? 'New Database' : 'Set Up Panoptikon';
+    byId('setup-description').textContent = databaseReady
+      ? 'Create a separate index database with its own folders, models, settings, and indexed data.'
+      : 'Choose the folders and indexing options for your first database.';
+    byId('setup-button').textContent = databaseReady ? 'Create New Database' : 'Continue Setup';
     byId('logs').textContent = (await invoke('log_tail', { lines: 150 })).join('\n') || 'No log entries yet.';
     const pending = await invoke('relay_pending');
     const relayStatus = await invoke('relay_status');
@@ -57,7 +63,6 @@ document.addEventListener('click', async (event) => {
     if (button.dataset.action === 'open') await invoke('open_action_command');
     if (button.dataset.action === 'setup') await invoke('open_setup_command');
     if (button.dataset.action === 'restart') await invoke('restart_server');
-    if (button.dataset.action === 'skip') await invoke('complete_onboarding', { skipped: true });
     if (button.dataset.action === 'updates') { const update = await invoke('check_for_updates'); if (update) showUpdate(update); else alert('No update is available.'); }
     if (button.dataset.action === 'refresh') await refresh();
     if (button.dataset.action === 'quit' && confirm('Quit Panoptikon Desktop and stop the local Server?')) await invoke('quit_desktop');

@@ -161,9 +161,11 @@ would enlarge the attack surface without solving a Panoptikon requirement.
 `tauri-plugin-window-state` is deferred until a persistent settings or
 diagnostics window benefits from it. If added, visibility MUST be excluded from
 saved/restored state so login startup cannot unexpectedly show a window. Native
-notifications are also deferred; if required later, prefer the maintained
-Tauri notification plugin over a direct `notify-rust` integration unless a
-concrete missing capability justifies the latter.
+notifications use `notify-rust` directly. This is the documented exception to
+preferring the Tauri notification plugin: Desktop requires a cross-platform
+body/action response callback so clicking a preparation, readiness, or failure
+notification can run the state-aware Open action, while the Tauri plugin does
+not expose desktop click responses.
 
 Release builds MUST NOT enable Tauri developer tools. The control frontend MUST
 use a strict CSP: no `unsafe-eval`, broad network access, or generic localhost
@@ -269,8 +271,8 @@ Any state → Stopping → Exited
 Any state → Failed → Restarting/Recovery
 ```
 
-- **Installing**: the platform installer or first application initialization is
-  completing.
+- **Installing**: first-time local AI components are being prepared. User-facing
+  copy calls this automatic phase “Preparing Panoptikon,” not “setup.”
 - **Starting**: sidecar launched; gateway or UI not yet ready.
 - **Setting up**: resource extraction or managed Python environment convergence
   is in progress.
@@ -336,7 +338,7 @@ Conceptual layout:
 
 ```text
 <app-config>/
-├── desktop.toml               # Desktop, autostart, onboarding preferences
+├── desktop.toml               # Desktop, autostart, and update preferences
 └── relay.toml                 # Relay instances and mappings
 
 <app-local-data>/
@@ -362,10 +364,6 @@ start_at_login = false
 
 [updates]
 check_automatically = true
-
-[onboarding]
-server_instance_id = "" # filled after local Server initialization
-state = "not_started"
 ```
 
 Relay settings remain in `relay.toml` so Relay-only use does not require Server
@@ -459,12 +457,32 @@ The Open action is state-aware:
 1. If the local Server is disabled, show the bundled Desktop Settings/Relay
    window.
 2. If Server is not ready, show the bundled Startup/Recovery window.
-3. If Desktop onboarding is incomplete, show the onboarding webview.
+3. If the configured default index database is not ready, show the
+   first-database setup webview.
 4. Otherwise open `http://localhost:<port>/search` in the default browser.
 
-Login startup never invokes Open automatically. An explicit first launch MAY
-show bootstrap progress immediately and MUST show onboarding once the UI is
-ready.
+Login startup never invokes Open automatically. A normal/manual launch MUST
+show the bundled launch-progress webview immediately when the Server is not
+ready; it cannot wait for the Next.js UI. The view uses the animated Panoptikon
+logo, coarse current activity, a safe-to-close/background explanation, and
+redacted copyable diagnostics. Login/autostart does not open a window on its
+own.
+
+If the progress window remains open, readiness navigates that same
+privilege-free webview to `/desktop/setup?mode=onboarding` when the configured
+default database is not ready. If it is ready, Desktop closes the progress
+webview and opens `/search` in the default browser. Closing the setup or
+progress window only defers the UI; it never changes readiness or cancels
+background work. The next Open action applies the same state-aware routing.
+
+Automatic environment preparation emits a clickable native notification when
+it starts and another when it completes. Any terminal preparation or startup
+failure emits a clickable failure notification. Clicking any of these runs the
+state-aware Open action: progress/recovery while starting or failed,
+first-database setup when ready but incomplete, and `/search` when ready and
+configured.
+Transient sidecar exits that are still inside the bounded restart policy are
+not reported as terminal failures.
 
 ### 11.1 Two control-UI layers
 
@@ -479,9 +497,13 @@ The bundled Tauri frontend MUST handle states where Server cannot serve pages:
 - Relay management and pairing confirmation.
 
 Once the gateway and UI are ready, Tauri opens a dedicated main-frontend route,
-`/desktop/setup`, for guided Panoptikon onboarding. This route reuses the UI's
-database, folder, scan, model, and job components. It is wizard-oriented and is
-not a copy of the current `/` guide.
+`/desktop/setup`, with explicit onboarding and new-database modes. Onboarding
+configures the policy-resolved default index database and does not ask the user
+to select or name a database. Its copy displays that database's actual name.
+Once the default database is ready, every explicit Desktop setup-wizard launch
+surface becomes a New Database action. That mode explains the database
+isolation model, validates a unique staged name against existing databases,
+and creates the database only at the final confirmation.
 
 `/desktop/setup` SHOULD be included in the normal UI bundle and activated at
 runtime, rather than requiring a second UI compile. The same Panoptikon Server
@@ -490,34 +512,43 @@ Desktop sidecar. Outside Desktop mode, the route MAY redirect to `/`, explain
 that Desktop is required, or function as a normal setup wizard; the route name
 is not a security boundary.
 
-### 11.2 Onboarding state
+### 11.2 First-database readiness
 
-Desktop onboarding is explicit state, not inferred solely from database file
-existence: the Server automatically creates/migrates default databases, and an
-empty database may be intentional.
+“Onboarding” is the internal lifecycle/state term. User-facing copy describes
+the concrete task: setting up the first/default index database. This is distinct
+from the automatic “Preparing Panoptikon” phase that installs local components
+and from the New Database wizard available after first setup.
 
-Desktop stores an onboarding record keyed by a stable Server-root instance ID:
+Desktop derives first-database readiness from the effective default index
+database selected by Server policy. It does not store an onboarding marker or
+inspect any other database. The default database is ready when at least one
+currently included folder has a matching `file_scans` row, which establishes
+that a file scan for that folder has started at some point. Merely creating or
+migrating a database, adding a folder without starting its scan, or scanning a
+folder that is no longer included is insufficient. Model selection and
+extraction completion are deliberately not readiness requirements.
 
-```toml
-[onboarding]
-server_instance_id = "<uuid>"
-state = "not_started" # not_started | in_progress | complete | skipped
-```
-
-The instance ID is created atomically under the Server root. Replacing or
-resetting that root re-arms onboarding. The wizard marks `complete` only after
-its required save operations succeed; it MAY offer an explicit Skip action.
-Completed and skipped states both send normal Open actions to `/search`.
+There is no skipped state and no Skip action. Closing the wizard defers setup,
+but normal Desktop Open actions continue to return to it and do not open Search
+until the configured default database is ready. A user who manually navigates
+the Server UI is outside this launcher policy. Once the default database is
+ready, normal Open actions launch Search and explicit setup-wizard actions mean
+New Database.
 
 The initial wizard MUST support:
 
-1. explaining the local data root and browser/desktop relationship;
-2. selecting or confirming the index/user-data database;
-3. selecting at least one included folder, or explicitly choosing to defer;
-4. saving the scan configuration and optionally enqueueing the initial scan;
-5. explaining extraction/model setup without requiring a long extraction job
+1. explaining Panoptikon and the separate-database model, including the actual
+   name of the configured default database;
+2. selecting at least one included folder;
+3. saving the scan configuration and starting the initial scan;
+4. explaining extraction/model setup without requiring a long extraction job
    to finish before onboarding completes; and
-6. opening `/search` in the browser at completion.
+5. opening `/search` only after first-database readiness is satisfied.
+
+The wizard fills its webview as three independent vertical regions: a fixed
+step indicator, a `min-height: 0` internally scrolling step-content region,
+and fixed Back/Continue controls. Resizing the window may reduce the
+middle region but MUST never move the navigation controls below the viewport.
 
 ### 11.3 Webview security
 
@@ -528,10 +559,10 @@ surfaces.
   capabilities.
 - A webview loading `http://localhost:<port>/desktop/setup` receives no generic
   Tauri capability.
-- If native folder selection or completion signaling is needed, expose only
-  purpose-built commands such as `choose_scan_folder` and
-  `complete_onboarding`, scoped to the setup window label and exact loopback
-  origin.
+- If native folder selection is needed, expose only a purpose-built command
+  such as `choose_scan_folder`, scoped to the setup window label and exact
+  loopback origin. Readiness itself comes from the Server's narrow Desktop
+  status endpoint and requires no privileged Tauri completion signal.
 - Generic shell execution, sidecar spawning, unrestricted filesystem access,
   updater installation, and Relay secret access MUST remain Rust-only.
 - Tauri commands MUST validate the calling window and all arguments even when
@@ -890,7 +921,8 @@ control UI must state which feature is unavailable.
 - platform path/root selection tests;
 - command construction with spaces and non-ASCII paths;
 - parent-control shutdown protocol tests;
-- onboarding state keyed to Server instance ID;
+- default-database readiness transitions, including included-only, scan-only,
+  matching scan, and removed-folder cases;
 - Relay component-aware longest-prefix mapping on Windows and Unix paths;
 - Relay traversal, drive, UNC, separator, and quoting adversarial tests;
 - Relay pairing expiry, origin binding, rate limit, revocation, and CORS tests;
@@ -905,7 +937,8 @@ For Windows, Linux, and macOS release candidates:
 2. verify no terminal appears;
 3. verify platform application-data root creation;
 4. wait through first resource/environment setup and reach Ready;
-5. complete or skip onboarding;
+5. configure an included folder, start its scan, and complete first-database
+   setup;
 6. verify Open launches `/search` in the default browser;
 7. launch Desktop again and verify the existing process handles activation;
 8. verify only one gateway and one tray exist;
@@ -967,10 +1000,11 @@ The first Desktop release is complete only when:
 
 ### Phase 2 — onboarding and desktop control
 
-1. Implement stable app paths, settings, autostart, instance ID, and onboarding
-   state.
+1. Implement stable app paths, settings, autostart, and default-database
+   readiness routing.
 2. Add bundled Startup/Recovery/Diagnostics/Settings views.
-3. Add `/desktop/setup` to `panoptikon-ui`, reusing scan/database components.
+3. Add `/desktop/setup` to `panoptikon-ui` with first-database onboarding and
+   staged new-database modes.
 4. Add minimal, origin/window-scoped native commands needed by that wizard.
 5. Implement the state-aware browser Open action.
 

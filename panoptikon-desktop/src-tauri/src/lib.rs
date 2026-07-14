@@ -8,10 +8,10 @@ use crate::{
     lifecycle::{ActivationIntent, LifecycleState, activation_intent},
     paths::DesktopPaths,
     relay::{PathMapping, RelayAction, RelayHandle, RelayState},
-    settings::{OnboardingState, SettingsDocument, sync_onboarding_marker},
+    settings::SettingsDocument,
     supervisor::{StatusSnapshot, Supervisor},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     panic::AssertUnwindSafe,
     sync::{
@@ -42,6 +42,13 @@ struct RuntimeState {
     tray: Mutex<Option<TrayUi>>,
     startup_warnings: Vec<String>,
     pending_open: AtomicBool,
+    interactive_startup_seen: AtomicBool,
+    automated_setup_seen: AtomicBool,
+    automated_setup_failed: AtomicBool,
+    setup_start_notified: AtomicBool,
+    setup_completion_notified: AtomicBool,
+    startup_activity: Mutex<Option<String>>,
+    setup_failure: Mutex<Option<String>>,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -77,7 +84,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
-            set_start_at_login, open_known_folder, log_tail, complete_onboarding,
+            set_start_at_login, open_known_folder, log_tail,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
             relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
         ])
@@ -134,6 +141,13 @@ pub fn run() {
                 tray: Mutex::new(None),
                 startup_warnings,
                 pending_open: AtomicBool::new(false),
+                interactive_startup_seen: AtomicBool::new(false),
+                automated_setup_seen: AtomicBool::new(false),
+                automated_setup_failed: AtomicBool::new(false),
+                setup_start_notified: AtomicBool::new(false),
+                setup_completion_notified: AtomicBool::new(false),
+                startup_activity: Mutex::new(None),
+                setup_failure: Mutex::new(None),
                 _log_guard: log_guard,
             });
             let restart_app = app.handle().clone();
@@ -142,7 +156,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) = Supervisor::start(restart_app.clone()).await {
                         restart_app.state::<Arc<Supervisor>>().set_state(&restart_app, LifecycleState::Failed(error.to_string())).await;
-                        let _ = show_control_window(&restart_app, true);
+                        notify_startup_result(&restart_app, false).await;
+                        if restart_app.state::<RuntimeState>().pending_open.load(Ordering::Acquire) {
+                            let _ = show_launch_window(&restart_app, true);
+                        }
                     }
                 });
             });
@@ -182,7 +199,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = Supervisor::start(start_app.clone()).await {
                     start_app.state::<Arc<Supervisor>>().set_state(&start_app, LifecycleState::Failed(error.to_string())).await;
-                    let _ = show_control_window(&start_app, true);
+                    notify_startup_result(&start_app, false).await;
+                    if start_app.state::<RuntimeState>().pending_open.load(Ordering::Acquire) {
+                        let _ = show_launch_window(&start_app, true);
+                    }
                 }
             });
             let update_app = app.handle().clone();
@@ -286,7 +306,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
                     app.state::<Arc<Supervisor>>()
                         .set_state(&app, LifecycleState::Failed(error.to_string()))
                         .await;
-                    let _ = show_control_window(&app, true);
+                    notify_startup_result(&app, false).await;
                 }
             });
         }
@@ -383,30 +403,173 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
                 | LifecycleState::SettingUp
                 | LifecycleState::Restarting
         ) {
-            // A normal activation during startup stays tray-only and is
-            // fulfilled once readiness succeeds. Recovery remains explicit.
             app.state::<RuntimeState>()
                 .pending_open
                 .store(true, Ordering::Release);
-            return Ok(());
+            return show_launch_window(app, true).map_err(|e| e.to_string());
+        }
+        if matches!(
+            snapshot.state,
+            LifecycleState::Degraded(_) | LifecycleState::Failed(_)
+        ) {
+            return show_launch_window(app, true).map_err(|e| e.to_string());
         }
         return show_control_window(app, true).map_err(|e| e.to_string());
     }
-    let onboarding = {
-        let mut settings = supervisor.settings.lock().await;
-        sync_onboarding_marker(&supervisor.paths, &mut settings)
-            .map_err(|error| error.to_string())?;
-        settings.typed.onboarding.state
-    };
-    if matches!(
-        onboarding,
-        OnboardingState::Complete | OnboardingState::Skipped
-    ) {
+    if fetch_setup_status(snapshot.port).await?.ready {
+        close_launch_window(app);
         app.opener()
             .open_url(local_browser_url(snapshot.port, "/search"), None::<&str>)
             .map_err(|e| e.to_string())
     } else {
-        show_setup_window(app, snapshot.port).map_err(|e| e.to_string())
+        show_setup_window(app, snapshot.port, SetupMode::Onboarding).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Serialize)]
+struct LaunchView {
+    kind: &'static str,
+    activity: Option<String>,
+    error: Option<String>,
+    diagnostics: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesktopSetupStatus {
+    ready: bool,
+}
+
+async fn fetch_setup_status(port: u16) -> Result<DesktopSetupStatus, String> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(local_browser_url(port, "/api/desktop/setup-status"))
+        .send()
+        .await
+        .map_err(|error| format!("failed to read Desktop setup status: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Desktop setup status returned HTTP {}",
+            response.status()
+        ));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("invalid Desktop setup status: {error}"))
+}
+
+fn lifecycle_kind(state: &LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Installing => "installing",
+        LifecycleState::Starting => "starting",
+        LifecycleState::SettingUp => "setting_up",
+        LifecycleState::Ready => "ready",
+        LifecycleState::Degraded(_) => "degraded",
+        LifecycleState::LocalServerDisabled => "local_server_disabled",
+        LifecycleState::Stopping => "stopping",
+        LifecycleState::Failed(_) => "failed",
+        LifecycleState::Restarting => "restarting",
+        LifecycleState::Exited => "exited",
+    }
+}
+
+pub(crate) async fn refresh_launch_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("launch") else {
+        return;
+    };
+    if !window
+        .url()
+        .is_ok_and(|url| url.path().ends_with("/launch.html"))
+    {
+        return;
+    }
+    let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
+    let snapshot = supervisor.snapshot().await;
+    let runtime = app.state::<RuntimeState>();
+    let error = match &snapshot.state {
+        LifecycleState::Failed(detail) | LifecycleState::Degraded(detail) => Some(detail.clone()),
+        _ => runtime.setup_failure.lock().await.clone(),
+    };
+    let activity = if matches!(snapshot.state, LifecycleState::Installing) {
+        runtime.startup_activity.lock().await.clone()
+    } else {
+        None
+    };
+    let logs = supervisor.tail(150).await;
+    let diagnostics = format!(
+        "Panoptikon Desktop {}\nOS: {} {}\nState: {}\nPort: {}\nServer root: {}\n\nRecent output:\n{}",
+        app.package_info().version,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        snapshot.state_label,
+        snapshot.port,
+        snapshot.server_root,
+        if logs.is_empty() {
+            "No output yet.".into()
+        } else {
+            logs.join("\n")
+        },
+    );
+    let view = LaunchView {
+        kind: lifecycle_kind(&snapshot.state),
+        activity,
+        error,
+        diagnostics,
+    };
+    if let Ok(json) = serde_json::to_string(&view) {
+        let _ = window.eval(format!("window.updateLaunchState?.({json})"));
+    }
+}
+
+pub(crate) fn show_launch_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {
+    app.state::<RuntimeState>()
+        .interactive_startup_seen
+        .store(true, Ordering::Release);
+    let window = if let Some(window) = app.get_webview_window("launch") {
+        if !window.url()?.path().ends_with("/launch.html") {
+            window.destroy()?;
+            return show_launch_window(app, focus);
+        }
+        window
+    } else {
+        WebviewWindowBuilder::new(app, "launch", WebviewUrl::App("launch.html".into()))
+            .title("Starting Panoptikon")
+            .inner_size(720.0, 720.0)
+            .min_inner_size(540.0, 540.0)
+            .on_page_load(|window, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished
+                    && payload.url().path().ends_with("/launch.html")
+                {
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move { refresh_launch_window(&app).await });
+                }
+            })
+            .build()?
+    };
+    let close_app = app.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            close_app
+                .state::<RuntimeState>()
+                .pending_open
+                .store(false, Ordering::Release);
+        }
+    });
+    window.show()?;
+    if focus {
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    let refresh_app = app.clone();
+    tauri::async_runtime::spawn(async move { refresh_launch_window(&refresh_app).await });
+    Ok(())
+}
+
+fn close_launch_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("launch") {
+        let _ = window.destroy();
     }
 }
 
@@ -450,20 +613,184 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
     Ok(())
 }
 
-fn show_setup_window(app: &AppHandle, port: u16) -> tauri::Result<()> {
-    let url = local_browser_url(port, "/desktop/setup")
+#[derive(Clone, Copy)]
+enum SetupMode {
+    Onboarding,
+    NewDatabase,
+}
+
+impl SetupMode {
+    fn query(self) -> &'static str {
+        match self {
+            Self::Onboarding => "onboarding",
+            Self::NewDatabase => "new-database",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Onboarding => "Set up Panoptikon",
+            Self::NewDatabase => "New Panoptikon database",
+        }
+    }
+}
+
+fn show_setup_window(app: &AppHandle, port: u16, mode: SetupMode) -> tauri::Result<()> {
+    let url = local_browser_url(port, &format!("/desktop/setup?mode={}", mode.query()))
         .parse()
         .map_err(|error| tauri::Error::InvalidUrl(error))?;
-    let window = if let Some(window) = app.get_webview_window("setup") {
+    let window = if let Some(window) = app.get_webview_window("launch") {
+        window.navigate(url)?;
+        window.set_title(mode.title())?;
+        window.set_size(tauri::LogicalSize::new(1000.0, 760.0))?;
         window
     } else {
-        WebviewWindowBuilder::new(app, "setup", WebviewUrl::External(url))
-            .title("Set up Panoptikon")
+        WebviewWindowBuilder::new(app, "launch", WebviewUrl::External(url))
+            .title(mode.title())
             .inner_size(1000.0, 760.0)
             .build()?
     };
     window.show()?;
     window.set_focus()
+}
+
+fn send_clickable_notification(app: &AppHandle, title: &str, body: &str) {
+    let app_handle = app.clone();
+    let title = title.to_owned();
+    let body = body.to_owned();
+    let identifier = app.config().identifier.clone();
+    let product_name = app.package_info().name.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .appname(&product_name)
+            .app_id(&identifier)
+            .summary(&title)
+            .body(&body)
+            .auto_icon()
+            .action("open", "Open Panoptikon");
+        match notification.show() {
+            Ok(handle) => {
+                let clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let clicked_response = clicked.clone();
+                if let Err(error) =
+                    handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+                        clicked_response.store(
+                            matches!(
+                                response,
+                                notify_rust::NotificationResponse::Default
+                                    | notify_rust::NotificationResponse::Action(_)
+                            ),
+                            Ordering::Release,
+                        );
+                    })
+                {
+                    tracing::warn!(%error, "failed to wait for Desktop notification response");
+                }
+                if clicked.load(Ordering::Acquire) {
+                    route_activation(app_handle, ActivationIntent::Open);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to show Desktop notification"),
+        }
+    });
+}
+
+pub(crate) async fn observe_server_progress(app: &AppHandle, line: &str) {
+    let runtime = app.state::<RuntimeState>();
+    let lower = line.to_ascii_lowercase();
+    let activity = if lower.contains("running setup automatically") {
+        runtime.automated_setup_seen.store(true, Ordering::Release);
+        if !runtime.setup_start_notified.swap(true, Ordering::AcqRel) {
+            send_clickable_notification(
+                app,
+                "Panoptikon preparation has started",
+                "First-time preparation is running in the background and may take a while. Click to view progress.",
+            );
+        }
+        Some("Checking the local AI environment…")
+    } else if lower.contains("accelerator selected") {
+        Some("Selecting the best AI runtime for this computer…")
+    } else if lower.contains("creating the managed venv") {
+        Some("Creating the local AI environment…")
+    } else if lower.contains("syncing the locked environment") {
+        Some("Downloading and installing local AI components…")
+    } else if lower.contains("python inference environment is ready") {
+        Some("Local AI components are ready. Starting Panoptikon…")
+    } else {
+        None
+    };
+    if let Some(activity) = activity {
+        *runtime.startup_activity.lock().await = Some(activity.into());
+        if runtime.automated_setup_seen.load(Ordering::Acquire) {
+            app.state::<Arc<Supervisor>>()
+                .set_state(app, LifecycleState::Installing)
+                .await;
+        } else {
+            refresh_launch_window(app).await;
+        }
+    }
+    if lower.contains("automatic python environment setup failed") {
+        runtime
+            .automated_setup_failed
+            .store(true, Ordering::Release);
+        let detail = "The local AI environment could not be prepared. Panoptikon can start, but AI features will be unavailable until this is fixed.".to_owned();
+        *runtime.setup_failure.lock().await = Some(detail.clone());
+        app.state::<Arc<Supervisor>>()
+            .set_state(app, LifecycleState::Degraded(detail))
+            .await;
+        notify_startup_result(app, false).await;
+    }
+}
+
+pub(crate) async fn notify_startup_result(app: &AppHandle, ready: bool) {
+    let runtime = app.state::<RuntimeState>();
+    let automated_setup = runtime.automated_setup_seen.load(Ordering::Acquire);
+    let interactive_startup = runtime.interactive_startup_seen.load(Ordering::Acquire);
+    if (ready && !automated_setup && !interactive_startup)
+        || runtime
+            .setup_completion_notified
+            .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    if ready && !runtime.automated_setup_failed.load(Ordering::Acquire) {
+        let default_database_ready =
+            match fetch_setup_status(app.state::<Arc<Supervisor>>().snapshot().await.port).await {
+                Ok(status) => status.ready,
+                Err(error) => {
+                    tracing::warn!(%error, "could not determine default database readiness");
+                    false
+                }
+            };
+        send_clickable_notification(
+            app,
+            if automated_setup {
+                "Panoptikon preparation is complete"
+            } else {
+                "Panoptikon is ready"
+            },
+            if default_database_ready {
+                "Panoptikon is ready. Click to open Search."
+            } else {
+                "Panoptikon is ready. Click to set up your first database."
+            },
+        );
+    } else {
+        send_clickable_notification(
+            app,
+            if automated_setup {
+                "Panoptikon preparation needs attention"
+            } else {
+                "Panoptikon could not start"
+            },
+            if automated_setup {
+                "Automatic preparation did not complete. Click to view the error and diagnostics."
+            } else {
+                "Startup did not complete. Click to view the error and diagnostics."
+            },
+        );
+    }
 }
 
 fn local_browser_url(port: u16, path: &str) -> String {
@@ -477,7 +804,12 @@ async fn open_setup_command(window: WebviewWindow, app: AppHandle) -> Result<(),
     if !snapshot.local_server_enabled || snapshot.state != LifecycleState::Ready {
         return Err("the local Server must be ready before setup can open".into());
     }
-    show_setup_window(&app, snapshot.port).map_err(|error| error.to_string())
+    let mode = if fetch_setup_status(snapshot.port).await?.ready {
+        SetupMode::NewDatabase
+    } else {
+        SetupMode::Onboarding
+    };
+    show_setup_window(&app, snapshot.port, mode).map_err(|error| error.to_string())
 }
 
 fn validate_control(window: &WebviewWindow) -> Result<(), String> {
@@ -491,7 +823,16 @@ fn validate_control(window: &WebviewWindow) -> Result<(), String> {
 #[tauri::command]
 async fn get_status(window: WebviewWindow, app: AppHandle) -> Result<StatusSnapshot, String> {
     validate_control(&window)?;
-    Ok(app.state::<Arc<Supervisor>>().snapshot().await)
+    let mut snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
+    if snapshot.local_server_enabled && snapshot.state == LifecycleState::Ready {
+        match fetch_setup_status(snapshot.port).await {
+            Ok(status) => snapshot.default_database_ready = Some(status.ready),
+            Err(error) => {
+                tracing::warn!(%error, "could not refresh default database readiness");
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -509,7 +850,15 @@ async fn open_action_command(window: WebviewWindow, app: AppHandle) -> Result<()
 #[tauri::command]
 async fn restart_server(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     validate_control(&window)?;
-    Supervisor::restart(app).await.map_err(|e| e.to_string())
+    if let Err(error) = Supervisor::restart(app.clone()).await {
+        let detail = error.to_string();
+        app.state::<Arc<Supervisor>>()
+            .set_state(&app, LifecycleState::Failed(detail.clone()))
+            .await;
+        notify_startup_result(&app, false).await;
+        return Err(detail);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -542,7 +891,15 @@ async fn set_local_enabled_inner(
         let _ = tray.local.set_checked(enabled);
     }
     if enabled && !was_enabled {
-        Supervisor::start(app).await.map_err(|e| e.to_string())
+        if let Err(error) = Supervisor::start(app.clone()).await {
+            let detail = error.to_string();
+            app.state::<Arc<Supervisor>>()
+                .set_state(&app, LifecycleState::Failed(detail.clone()))
+                .await;
+            notify_startup_result(&app, false).await;
+            return Err(detail);
+        }
+        Ok(())
     } else if !enabled && was_enabled {
         Supervisor::stop(&app, false)
             .await
@@ -615,23 +972,6 @@ async fn log_tail(
 ) -> Result<Vec<String>, String> {
     validate_control(&window)?;
     Ok(app.state::<Arc<Supervisor>>().tail(lines).await)
-}
-
-#[tauri::command]
-async fn complete_onboarding(
-    window: WebviewWindow,
-    app: AppHandle,
-    skipped: bool,
-) -> Result<(), String> {
-    validate_control(&window)?;
-    let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
-    let mut settings = supervisor.settings.lock().await;
-    settings.typed.onboarding.state = if skipped {
-        OnboardingState::Skipped
-    } else {
-        OnboardingState::Complete
-    };
-    settings.save().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -933,6 +1273,11 @@ mod tests {
             capability["permissions"],
             serde_json::json!(["core:default"])
         );
+        let launch_html = include_str!("../../dist/launch.html");
+        let launch_js = include_str!("../../dist/launch.js");
+        assert!(launch_html.contains("spinner_text.svg"));
+        assert!(!launch_js.contains("__TAURI__"));
+        assert!(!launch_js.contains("invoke("));
     }
 
     #[test]

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Starting Panoptikon</title>
+    <link rel="stylesheet" href="launch.css" />
+  </head>
+  <body>
+    <main>
+      <img src="spinner_text.svg" alt="Panoptikon" />
+      <section aria-live="polite">
+        <h1 id="title">Starting Panoptikon</h1>
+        <p id="explanation">Panoptikon is getting its local services ready.</p>
+        <div class="current"><span class="pulse" aria-hidden="true"></span><span id="current">Preparing to start…</span></div>
+        <p id="background-note" class="background-note">You can safely close this window. Panoptikon will continue in the background and notify you when it is ready.</p>
+      </section>
+      <section id="error" class="error" role="alert" hidden>
+        <h2>Panoptikon could not finish starting</h2>
+        <p id="error-detail"></p>
+        <p>The diagnostics below are safe to copy into a GitHub issue. Known credentials and secrets are redacted.</p>
+      </section>
+      <details id="diagnostics-panel">
+        <summary>Technical details</summary>
+        <textarea id="diagnostics" readonly aria-label="Startup diagnostics"></textarea>
+        <button id="copy" type="button">Copy diagnostics</button>
+        <span id="copy-result" role="status"></span>
+      </details>
+    </main>
+    <script src="launch.js"></script>
+  </body>
+</html>

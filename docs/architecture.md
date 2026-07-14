@@ -164,8 +164,12 @@ launch working directory.
 The supervisor has explicit lifecycle states, captures and redacts Server
 output, waits for both client-config and UI readiness, performs bounded
 1/2/4-second crash restarts, and stops through the Server's stdin control
-channel before escalating. The Server independently prevents two processes
-from owning one root with `runtime/server.lock`.
+channel before escalating. Manual activation before readiness opens an
+immediately available bundled progress/recovery webview; login activation does
+not. Clickable native preparation, readiness, and terminal-failure
+notifications route through the same state-aware Open action. The Server
+independently prevents two processes from owning one root with
+`runtime/server.lock`.
 
 Desktop settings live in the platform config directory. Server data, managed
 Python/Node runtimes, and materialized resources live below platform local

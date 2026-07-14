@@ -1,7 +1,7 @@
 use crate::{
     lifecycle::{LifecycleState, RestartBudget},
     paths::DesktopPaths,
-    settings::{SettingsDocument, ensure_instance_id},
+    settings::SettingsDocument,
 };
 use anyhow::{Context as _, bail};
 use serde::Serialize;
@@ -51,6 +51,7 @@ pub struct StatusSnapshot {
     pub config_dir: String,
     pub log_dir: String,
     pub sidecar_pid: Option<u32>,
+    pub default_database_ready: Option<bool>,
 }
 
 impl Supervisor {
@@ -98,6 +99,7 @@ impl Supervisor {
             config_dir: self.paths.config_dir.display().to_string(),
             log_dir: self.paths.log_dir.display().to_string(),
             sidecar_pid: pid,
+            default_database_ready: None,
         }
     }
 
@@ -105,6 +107,7 @@ impl Supervisor {
         *self.state.write().await = state.clone();
         crate::update_tray(app, &state).await;
         let _ = app.emit("desktop-state", &state);
+        crate::refresh_launch_window(app).await;
     }
 
     pub async fn start(app: AppHandle) -> anyhow::Result<()> {
@@ -119,19 +122,27 @@ impl Supervisor {
         if supervisor.child.lock().await.is_some() {
             return Ok(());
         }
+        {
+            let runtime = app.state::<crate::RuntimeState>();
+            runtime.automated_setup_seen.store(false, Ordering::Release);
+            runtime
+                .automated_setup_failed
+                .store(false, Ordering::Release);
+            runtime.setup_start_notified.store(false, Ordering::Release);
+            runtime
+                .setup_completion_notified
+                .store(false, Ordering::Release);
+            runtime.interactive_startup_seen.store(
+                app.get_webview_window("launch").is_some(),
+                Ordering::Release,
+            );
+            *runtime.startup_activity.lock().await = None;
+            *runtime.setup_failure.lock().await = None;
+        }
         supervisor
             .paths
             .materialize_server_root()
             .context("failed to materialize the Desktop Server root")?;
-        let instance_id = ensure_instance_id(&supervisor.paths)?;
-        {
-            let mut settings = supervisor.settings.lock().await;
-            if settings.typed.onboarding.server_instance_id != instance_id {
-                settings.typed.onboarding.server_instance_id = instance_id;
-                settings.typed.onboarding.state = crate::settings::OnboardingState::NotStarted;
-                settings.save()?;
-            }
-        }
         let port = effective_port(
             &supervisor.paths,
             supervisor.server_config,
@@ -171,6 +182,7 @@ impl Supervisor {
                                 .state::<Arc<Supervisor>>()
                                 .record(format!("server: {line}"))
                                 .await;
+                            crate::observe_server_progress(&event_app, &line).await;
                         }
                     }
                     CommandEvent::Stderr(bytes) => {
@@ -180,6 +192,7 @@ impl Supervisor {
                                 .state::<Arc<Supervisor>>()
                                 .record(format!("server stderr: {line}"))
                                 .await;
+                            crate::observe_server_progress(&event_app, &line).await;
                         }
                     }
                     CommandEvent::Error(error) => {
@@ -201,18 +214,42 @@ impl Supervisor {
             if let Err(error) = wait_for_readiness(&ready_app, generation, port).await {
                 let supervisor = ready_app.state::<Arc<Supervisor>>().inner().clone();
                 if supervisor.generation.load(Ordering::Acquire) == generation {
+                    if matches!(*supervisor.state.read().await, LifecycleState::Restarting) {
+                        return;
+                    }
                     supervisor
                         .set_state(&ready_app, LifecycleState::Failed(error.to_string()))
                         .await;
-                    let _ = crate::show_control_window(&ready_app, true);
+                    crate::notify_startup_result(&ready_app, false).await;
+                    let pending = ready_app
+                        .state::<crate::RuntimeState>()
+                        .pending_open
+                        .load(Ordering::Acquire);
+                    if pending {
+                        let _ = crate::show_launch_window(&ready_app, true);
+                    }
                 }
             } else {
                 let supervisor = ready_app.state::<Arc<Supervisor>>().inner().clone();
                 if supervisor.generation.load(Ordering::Acquire) == generation {
-                    supervisor
-                        .set_state(&ready_app, LifecycleState::Ready)
-                        .await;
-                    crate::open_pending_action(&ready_app).await;
+                    let setup_failure = ready_app
+                        .state::<crate::RuntimeState>()
+                        .setup_failure
+                        .lock()
+                        .await
+                        .clone();
+                    if let Some(error) = setup_failure {
+                        supervisor
+                            .set_state(&ready_app, LifecycleState::Degraded(error))
+                            .await;
+                        crate::notify_startup_result(&ready_app, false).await;
+                    } else {
+                        supervisor
+                            .set_state(&ready_app, LifecycleState::Ready)
+                            .await;
+                        crate::notify_startup_result(&ready_app, true).await;
+                        crate::open_pending_action(&ready_app).await;
+                    }
                 }
             }
         });
@@ -336,7 +373,14 @@ async fn handle_exit(app: AppHandle, generation: u64, code: Option<i32>) {
                     ),
                 )
                 .await;
-            let _ = crate::show_control_window(&app, true);
+            crate::notify_startup_result(&app, false).await;
+            if app
+                .state::<crate::RuntimeState>()
+                .pending_open
+                .load(Ordering::Acquire)
+            {
+                let _ = crate::show_launch_window(&app, true);
+            }
         }
     }
 }
@@ -408,7 +452,9 @@ async fn wait_for_readiness(app: &AppHandle, generation: u64, port: u16) -> anyh
             if !gateway_seen {
                 gateway_seen = true;
                 let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
-                if supervisor.generation.load(Ordering::Acquire) == generation {
+                if supervisor.generation.load(Ordering::Acquire) == generation
+                    && !matches!(*supervisor.state.read().await, LifecycleState::Degraded(_))
+                {
                     supervisor.set_state(app, LifecycleState::SettingUp).await;
                 }
             }

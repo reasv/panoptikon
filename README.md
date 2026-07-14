@@ -32,7 +32,11 @@ Panoptikon will build an index inside its own SQLite database, referencing the o
 
 Desktop installs the complete application, runs without a terminal, keeps the
 local Server healthy from a tray icon, opens search in your normal browser,
-and updates Desktop, Relay, the control UI, and Server as one signed unit.
+and updates Desktop, Relay, the control UI, and Server as one signed unit. A
+manual first launch immediately shows preparation progress and copyable failure
+diagnostics; preparation/readiness notifications can be clicked to continue
+into guided library setup or Search. Start-at-login never opens a window on its
+own.
 
 | Platform | Download |
 | --- | --- |

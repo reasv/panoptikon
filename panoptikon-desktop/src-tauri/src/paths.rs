@@ -48,10 +48,6 @@ impl DesktopPaths {
         Ok(())
     }
 
-    pub fn instance_id_path(&self) -> PathBuf {
-        self.server_root.join("runtime/desktop-instance-id")
-    }
-
     pub fn path_is_within_shell_roots(&self, path: &Path) -> bool {
         path.starts_with(&self.config_dir)
             || path.starts_with(&self.local_data_dir)
