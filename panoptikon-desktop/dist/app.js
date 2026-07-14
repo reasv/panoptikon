@@ -55,6 +55,7 @@ document.addEventListener('click', async (event) => {
   try {
     if (button.dataset.folder) await invoke('open_known_folder', { kind: button.dataset.folder });
     if (button.dataset.action === 'open') await invoke('open_action_command');
+    if (button.dataset.action === 'setup') await invoke('open_setup_command');
     if (button.dataset.action === 'restart') await invoke('restart_server');
     if (button.dataset.action === 'skip') await invoke('complete_onboarding', { skipped: true });
     if (button.dataset.action === 'updates') { const update = await invoke('check_for_updates'); if (update) showUpdate(update); else alert('No update is available.'); }

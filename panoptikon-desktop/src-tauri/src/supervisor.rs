@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -35,6 +35,7 @@ pub struct Supervisor {
     restart_budget: Mutex<RestartBudget>,
     intentional_stop: AtomicBool,
     generation: AtomicU64,
+    active_port: AtomicU16,
     log_tail: Mutex<VecDeque<String>>,
 }
 
@@ -52,6 +53,7 @@ pub struct StatusSnapshot {
 
 impl Supervisor {
     pub fn new(paths: DesktopPaths, settings: SettingsDocument) -> Self {
+        let initial_port = settings.typed.local_server.port;
         let initial = if settings.typed.local_server.enabled {
             LifecycleState::Installing
         } else {
@@ -65,6 +67,7 @@ impl Supervisor {
             restart_budget: Mutex::new(RestartBudget::default()),
             intentional_stop: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            active_port: AtomicU16::new(initial_port),
             log_tail: Mutex::new(VecDeque::with_capacity(500)),
         }
     }
@@ -82,7 +85,7 @@ impl Supervisor {
             state_label: state.label().to_owned(),
             state,
             local_server_enabled: settings.typed.local_server.enabled,
-            port: settings.typed.local_server.port,
+            port: self.active_port.load(Ordering::Acquire),
             server_root: self.paths.server_root.display().to_string(),
             config_dir: self.paths.config_dir.display().to_string(),
             log_dir: self.paths.log_dir.display().to_string(),
@@ -125,6 +128,7 @@ impl Supervisor {
             &supervisor.paths,
             supervisor.settings.lock().await.typed.local_server.port,
         )?;
+        supervisor.active_port.store(port, Ordering::Release);
         supervisor.intentional_stop.store(false, Ordering::Release);
         supervisor.set_state(&app, LifecycleState::Starting).await;
         let generation = supervisor.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -195,6 +199,7 @@ impl Supervisor {
                     supervisor
                         .set_state(&ready_app, LifecycleState::Ready)
                         .await;
+                    crate::open_pending_action(&ready_app).await;
                 }
             }
         });
@@ -368,11 +373,24 @@ async fn wait_for_readiness(app: &AppHandle, generation: u64, port: u16) -> anyh
         if Instant::now() >= deadline {
             bail!("Server readiness timed out on port {port}");
         }
-        let gateway_ok = client
-            .get(&gateway)
-            .send()
+        let child_is_running = app
+            .state::<Arc<Supervisor>>()
+            .child
+            .lock()
             .await
-            .is_ok_and(|response| response.status().is_success());
+            .as_ref()
+            .is_some_and(|running| running.generation == generation);
+        if !child_is_running {
+            bail!("Server sidecar exited before readiness");
+        }
+        let gateway_ok = match client.get(&gateway).send().await {
+            Ok(response) if response.status().is_success() => response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .is_some_and(|value| client_config_is_desktop_managed(&value)),
+            _ => false,
+        };
         if gateway_ok {
             if !gateway_seen {
                 gateway_seen = true;
@@ -389,13 +407,27 @@ async fn wait_for_readiness(app: &AppHandle, generation: u64, port: u16) -> anyh
                         .and_then(|v| v.to_str().ok())
                         .is_some_and(|value| value.contains("text/html"))
                 {
-                    return Ok(());
+                    let child_is_still_running = app
+                        .state::<Arc<Supervisor>>()
+                        .child
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|running| running.generation == generation);
+                    if child_is_still_running {
+                        return Ok(());
+                    }
+                    bail!("Server sidecar exited during readiness checks");
                 }
             }
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(2));
     }
+}
+
+fn client_config_is_desktop_managed(value: &serde_json::Value) -> bool {
+    value.get("desktop_managed").and_then(|v| v.as_bool()) == Some(true)
 }
 
 fn redact(line: &str) -> String {
@@ -443,5 +475,30 @@ mod tests {
             "[redacted sensitive diagnostic line]"
         );
         assert_eq!(redact("gateway ready"), "gateway ready");
+    }
+
+    #[test]
+    fn effective_port_comes_from_the_user_owned_server_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DesktopPaths::new(
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("logs"),
+        );
+        paths.materialize_server_root().unwrap();
+        let config = paths.server_root.join("config/server/desktop.toml");
+        std::fs::write(&config, "[server]\nport = 7123\n").unwrap();
+        assert_eq!(effective_port(&paths, 6342).unwrap(), 7123);
+    }
+
+    #[test]
+    fn readiness_rejects_an_ordinary_server_client_config() {
+        assert!(client_config_is_desktop_managed(
+            &serde_json::json!({"desktop_managed": true})
+        ));
+        assert!(!client_config_is_desktop_managed(
+            &serde_json::json!({"desktop_managed": false})
+        ));
+        assert!(!client_config_is_desktop_managed(&serde_json::json!({})));
     }
 }

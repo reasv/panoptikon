@@ -565,7 +565,7 @@ second process for that root fails clearly.
 Desktop-managed mode adds `desktop_managed = true` to `/api/client-config` and
 enables `POST /api/desktop/onboarding` with body
 `{"state":"complete"}` or `{"state":"skipped"}`. The endpoint atomically
-writes `<root>/runtime/desktop-onboarding.toml`. Ordinary Server processes
+writes `<root>/runtime/desktop-onboarding-state`. Ordinary Server processes
 reject this Desktop-only endpoint. Bare `panoptikon`, explicit `--root`,
 Docker, signals, and foreground behavior are otherwise unchanged.
 

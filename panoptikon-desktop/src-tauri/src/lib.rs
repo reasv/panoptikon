@@ -12,7 +12,13 @@ use crate::{
     supervisor::{StatusSnapshot, Supervisor},
 };
 use serde::Serialize;
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tauri::{
     AppHandle, Emitter as _, Listener as _, Manager as _, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
@@ -29,6 +35,7 @@ struct RuntimeState {
     relay_handle: Mutex<Option<RelayHandle>>,
     tray: Mutex<Option<TrayUi>>,
     startup_warnings: Vec<String>,
+    pending_open: AtomicBool,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -63,7 +70,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            get_status, get_startup_warnings, open_action_command, restart_server, set_local_server_enabled,
+            get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, complete_onboarding,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
             relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
@@ -105,7 +112,13 @@ pub fn run() {
             app.manage(supervisor.clone());
             app.manage(relay_state.clone());
             let has_startup_warnings = !startup_warnings.is_empty();
-            app.manage(RuntimeState { relay_handle: Mutex::new(None), tray: Mutex::new(None), startup_warnings, _log_guard: log_guard });
+            app.manage(RuntimeState {
+                relay_handle: Mutex::new(None),
+                tray: Mutex::new(None),
+                startup_warnings,
+                pending_open: AtomicBool::new(false),
+                _log_guard: log_guard,
+            });
             let restart_app = app.handle().clone();
             app.listen("desktop-internal-restart", move |_| {
                 let restart_app = restart_app.clone();
@@ -252,7 +265,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         "local" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let enabled = !app
+                let was_enabled = app
                     .state::<Arc<Supervisor>>()
                     .settings
                     .lock()
@@ -260,7 +273,17 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
                     .typed
                     .local_server
                     .enabled;
-                let _ = set_local_enabled_inner(app, enabled, true).await;
+                if was_enabled {
+                    // The tray cannot present the same explicit confirmation
+                    // as the bundled control UI. Restore its checkmark and
+                    // route the user to the confirmed disable action there.
+                    if let Some(tray) = app.state::<RuntimeState>().tray.lock().await.as_ref() {
+                        let _ = tray.local.set_checked(true);
+                    }
+                    let _ = show_control_window(&app, true);
+                } else {
+                    let _ = set_local_enabled_inner(app, true, true).await;
+                }
             });
         }
         "relay" | "settings" => {
@@ -325,6 +348,9 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
         return show_control_window(app, true).map_err(|e| e.to_string());
     }
     if snapshot.state != LifecycleState::Ready {
+        app.state::<RuntimeState>()
+            .pending_open
+            .store(true, Ordering::Release);
         return show_control_window(app, true).map_err(|e| e.to_string());
     }
     let onboarding = {
@@ -345,6 +371,19 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())
     } else {
         show_setup_window(app, snapshot.port).map_err(|e| e.to_string())
+    }
+}
+
+pub(crate) async fn open_pending_action(app: &AppHandle) {
+    if app
+        .state::<RuntimeState>()
+        .pending_open
+        .swap(false, Ordering::AcqRel)
+    {
+        if let Err(error) = open_action_inner(app).await {
+            tracing::warn!(%error, "failed to fulfill pending Desktop open action");
+            let _ = show_control_window(app, true);
+        }
     }
 }
 
@@ -380,6 +419,16 @@ fn show_setup_window(app: &AppHandle, port: u16) -> tauri::Result<()> {
     };
     window.show()?;
     window.set_focus()
+}
+
+#[tauri::command]
+async fn open_setup_command(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    validate_control(&window)?;
+    let snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
+    if !snapshot.local_server_enabled || snapshot.state != LifecycleState::Ready {
+        return Err("the local Server must be ready before setup can open".into());
+    }
+    show_setup_window(&app, snapshot.port).map_err(|error| error.to_string())
 }
 
 fn validate_control(window: &WebviewWindow) -> Result<(), String> {
@@ -730,12 +779,17 @@ async fn install_update(window: WebviewWindow, app: AppHandle) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?
         .ok_or("no update available")?;
+    let restart_server_on_failure = app
+        .state::<Arc<Supervisor>>()
+        .snapshot()
+        .await
+        .local_server_enabled;
     Supervisor::stop(&app, false)
         .await
         .map_err(|e| e.to_string())?;
     let progress_app = app.clone();
     let finished_app = app.clone();
-    update
+    let install_result = update
         .download_and_install(
             move |chunk, total| {
                 let _ = progress_app.emit(
@@ -750,8 +804,20 @@ async fn install_update(window: WebviewWindow, app: AppHandle) -> Result<(), Str
                 );
             },
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+    if let Err(error) = install_result {
+        if restart_server_on_failure {
+            if let Err(restart_error) = Supervisor::start(app.clone()).await {
+                return Err(format!(
+                    "update failed: {error}; the local Server also failed to restart: {restart_error}"
+                ));
+            }
+            return Err(format!(
+                "update failed: {error}; the local Server was restarted"
+            ));
+        }
+        return Err(format!("update failed: {error}"));
+    }
     app.restart();
 }
 

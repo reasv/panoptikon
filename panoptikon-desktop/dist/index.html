@@ -17,7 +17,7 @@
       </section>
       <section id="update" hidden><h2>Update available</h2><p id="update-message"></p><progress id="update-progress" hidden></progress><button id="install-update">Install and restart</button></section>
       <section><h2>Local Server</h2><label class="toggle"><input id="local" type="checkbox" /> Run Local Panoptikon</label><dl><dt>Server root</dt><dd id="root"></dd><dt>Port</dt><dd id="port"></dd></dl><div class="actions"><button data-folder="server_root">Open Data Folder</button><button data-folder="config">Open Configuration</button><button data-folder="logs">Open Logs</button></div></section>
-      <section><h2>Onboarding</h2><p>Use the guided setup to choose databases and folders. You can also explicitly skip it.</p><div class="actions"><button data-action="open">Open Setup</button><button data-action="skip">Skip Onboarding</button></div></section>
+      <section><h2>Onboarding</h2><p>Use the guided setup to choose databases and folders. You can also explicitly skip it.</p><div class="actions"><button data-action="setup">Open Setup</button><button data-action="skip">Skip Onboarding</button></div></section>
       <section><h2>Relay</h2><p>Relay listens only on loopback. Pairing always requires approval here and credentials are bound to one browser origin.</p><label class="toggle"><input id="relay-enabled" type="checkbox" /> Enable Relay</label><h3>Pairing requests</h3><div id="relay"></div><h3>Paired instances</h3><div id="relay-instances"></div></section>
       <section><h2>Diagnostics</h2><pre id="logs">No log entries yet.</pre><button data-action="refresh">Refresh</button></section>
       <footer><button data-action="quit" class="danger">Quit Panoptikon</button></footer>
