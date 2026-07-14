@@ -563,10 +563,12 @@ Server holds an exclusive advisory lock at `<root>/runtime/server.lock`; a
 second process for that root fails clearly.
 
 Desktop-managed mode adds `desktop_managed = true` to `/api/client-config` and
-enables `POST /api/desktop/onboarding` with body
-`{"state":"complete"}` or `{"state":"skipped"}`. The endpoint atomically
-writes `<root>/runtime/desktop-onboarding-state`. Ordinary Server processes
-reject this Desktop-only endpoint. Bare `panoptikon`, explicit `--root`,
+enables `GET /api/desktop/setup-status`. The endpoint evaluates the
+policy-resolved default index database and reports it ready once at least one
+currently included folder has a matching `file_scans` row, meaning a scan for
+that folder has started at some point. It does not inspect other databases or
+store a separate onboarding-completion marker. Ordinary Server processes do
+not mount this Desktop-only endpoint. Bare `panoptikon`, explicit `--root`,
 Docker, signals, and foreground behavior are otherwise unchanged.
 
 ## Configuration

@@ -340,10 +340,7 @@ async fn async_main() -> anyhow::Result<()> {
             // capabilities and [policies.client] settings here.
             .route("/api/client-config", get(api::client_config::client_config));
         if desktop::is_managed() {
-            app = app.route(
-                "/api/desktop/onboarding",
-                post(api::desktop::complete_onboarding),
-            );
+            app = app.route("/api/desktop/setup-status", get(api::desktop::setup_status));
         }
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app

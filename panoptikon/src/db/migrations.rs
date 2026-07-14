@@ -431,7 +431,10 @@ async fn has_user_tables(conn: &mut SqliteConnection) -> Result<bool> {
 }
 
 #[cfg(test)]
-async fn migrate_in_memory(index_db: String, user_data_db: String) -> Result<InMemoryDatabases> {
+pub(crate) async fn migrate_in_memory(
+    index_db: String,
+    user_data_db: String,
+) -> Result<InMemoryDatabases> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -595,7 +598,10 @@ mod tests {
             .await
             .expect("baseline at head should succeed");
 
-        assert_eq!(sqlx_migration_count(&path).await, user_data_migration_total());
+        assert_eq!(
+            sqlx_migration_count(&path).await,
+            user_data_migration_total()
+        );
         let mut conn = connect(&path).await;
         let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
             sqlx::query_as("SELECT * FROM pragma_table_info('bookmarks')")
@@ -770,7 +776,10 @@ mod tests {
             .await
             .expect("fresh database creation should succeed");
 
-        assert_eq!(sqlx_migration_count(&path).await, user_data_migration_total());
+        assert_eq!(
+            sqlx_migration_count(&path).await,
+            user_data_migration_total()
+        );
         let mut conn = connect(&path).await;
         let version: (String,) = sqlx::query_as("SELECT version_num FROM alembic_version")
             .fetch_one(&mut conn)

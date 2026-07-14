@@ -74,7 +74,8 @@ impl Modify for JsonValueSchema {
         crate::api::pinboards::pinboard_version_preview,
         crate::api::db::db_info,
         crate::api::db::db_create,
-        crate::api::client_config::client_config
+        crate::api::client_config::client_config,
+        crate::api::desktop::setup_status
     ),
     components(
         schemas(
@@ -140,6 +141,7 @@ impl Modify for JsonValueSchema {
             crate::api::db::DbCreateResponse,
             crate::api::client_config::ClientConfigResponse,
             crate::api::client_config::ClientCapabilities,
+            crate::api::desktop::DesktopSetupStatus,
             crate::pql::EmbeddingCacheEntry,
             crate::pql::EmbeddingCacheStats,
             crate::pql::model::PqlQuery,
@@ -307,9 +309,9 @@ mod tests {
                 .find(|param| param["name"] == wanted)
                 .unwrap_or_else(|| panic!("{wanted} param missing"));
             assert_eq!(param["required"], Value::Bool(false), "{wanted} required");
-            let types = param["schema"]["type"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{wanted} should have a type array, got {}", param["schema"]));
+            let types = param["schema"]["type"].as_array().unwrap_or_else(|| {
+                panic!("{wanted} should have a type array, got {}", param["schema"])
+            });
             assert!(
                 types.contains(&Value::String("null".into())),
                 "{wanted} not nullable: {types:?}"
@@ -332,7 +334,10 @@ mod tests {
             "/api/inference/metadata",
             "/api/inference/health",
         ] {
-            assert!(paths.contains_key(wanted), "missing inference path {wanted}");
+            assert!(
+                paths.contains_key(wanted),
+                "missing inference path {wanted}"
+            );
         }
     }
 
@@ -342,8 +347,7 @@ mod tests {
     /// openapi`, commit the new fixture, and regenerate the UI types.
     #[test]
     fn spec_matches_committed_fixture() {
-        let rendered =
-            serde_json::to_string_pretty(&spec()).expect("spec serializes") + "\n";
+        let rendered = serde_json::to_string_pretty(&spec()).expect("spec serializes") + "\n";
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
         if std::env::var_os("UPDATE_OPENAPI_FIXTURE").is_some() {
             std::fs::write(&path, &rendered).expect("write fixture");

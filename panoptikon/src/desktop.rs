@@ -16,26 +16,6 @@ pub(crate) fn is_managed() -> bool {
     DESKTOP_MANAGED.load(Ordering::Acquire)
 }
 
-pub(crate) fn write_onboarding_state(state: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        matches!(state, "complete" | "skipped"),
-        "invalid onboarding state"
-    );
-    let runtime = PathBuf::from("runtime");
-    std::fs::create_dir_all(&runtime)?;
-    let target = runtime.join("desktop-onboarding-state");
-    let temp = runtime.join(format!(
-        ".desktop-onboarding-state-{}.tmp",
-        std::process::id()
-    ));
-    std::fs::write(&temp, format!("{state}\n"))?;
-    if target.exists() {
-        std::fs::remove_file(&target)?;
-    }
-    std::fs::rename(&temp, &target)?;
-    Ok(())
-}
-
 /// Held for the lifetime of a serving process. File locking is advisory and
 /// automatically released by the OS on crash or normal process exit.
 pub(crate) struct RootLock {

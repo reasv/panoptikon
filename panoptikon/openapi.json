@@ -766,6 +766,52 @@
         }
       }
     },
+    "/api/desktop/setup-status": {
+      "get": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_setup_status",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopSetupStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/inference/cache": {
       "get": {
         "tags": [
@@ -4031,7 +4077,8 @@
         "required": [
           "policy",
           "capabilities",
-          "client"
+          "client",
+          "desktop_managed"
         ],
         "properties": {
           "capabilities": {
@@ -4040,6 +4087,10 @@
           },
           "client": {
             "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms` and `disable_backend_open`."
+          },
+          "desktop_managed": {
+            "type": "boolean",
+            "description": "True only when this Server process is the bundled sidecar owned by\nPanoptikon Desktop. API semantics are otherwise identical."
           },
           "policy": {
             "type": "string",
@@ -4321,6 +4372,23 @@
           "setter_name": {
             "type": "string",
             "description": "Name of the setter that would produce the derived data"
+          }
+        }
+      },
+      "DesktopSetupStatus": {
+        "type": "object",
+        "required": [
+          "index_db",
+          "ready"
+        ],
+        "properties": {
+          "index_db": {
+            "type": "string",
+            "description": "The policy-resolved default index database used for this request."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "True once a current included folder has a corresponding filescan row."
           }
         }
       },

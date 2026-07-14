@@ -28,7 +28,10 @@ Behavior (important)
 - Desktop supervision: the hidden `--desktop-managed` flag enables parent
   control over stdin (`shutdown` or EOF use the normal graceful path), exposes
   `desktop_managed` in client config, and admits the local-only
-  `POST /api/desktop/onboarding` marker route. Serving processes take an
+  `GET /api/desktop/setup-status` route. That route evaluates only the
+  policy-resolved default index database and reports it ready when a currently
+  included folder has a matching `file_scans` row; no separate onboarding
+  marker is stored. Serving processes take an
   advisory `<root>/runtime/server.lock`; lock contention is a clear startup
   error. Ordinary foreground/Server behavior is unchanged.
   Managed bundled invocation materializes missing embedded Desktop configs
