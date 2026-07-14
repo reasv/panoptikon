@@ -8,7 +8,7 @@ enforcement, and structured logging.
 
 ## Where it fits
 
-In the standard local setup (`config/server/local.toml`) the binary serves
+In the standard local setup (`config/server/default.toml`) the binary serves
 everything itself:
 
 - Every `/api` route is handled in-process (`upstreams.api.local = true`).
@@ -50,9 +50,9 @@ determined by the TCP listener, so unlike `Host` matching it cannot be
 influenced by request headers and works with plain local ports. A typical
 use is a second loopback port whose policy defaults to (and is locked to) a
 dedicated test DB — anything pointed at that port operates on the test DB
-with no manual selection (`config/server/local.toml` ships this setup on
-port 6343). All listeners are bound before serving starts; if any bind
-fails, startup fails.
+with no manual selection (`config/server/default.toml` ships this setup on
+port 6343). All listeners are bound before serving starts; if any bind fails,
+startup fails.
 
 ## Policy enforcement
 
@@ -388,7 +388,7 @@ for it and the lock excludes it) — setup fails fast there.
 A machine that only lends its GPU can run the standalone service:
 
 ```bash
-cargo run -p panoptikon -- inferio --config config\server\default.toml
+cargo run -p panoptikon -- inferio
 ```
 
 This starts only `/api/inference/*` plus `GET /health` — no proxy, local API,
@@ -470,9 +470,9 @@ UI first — it is stateless.
   `Scripts/node.exe` / `bin/node` launcher stub), then `node` from PATH.
 - `build` (default `"auto"`): `"auto"` | `"always"` | `"never"`.
 
-`config/server/local.toml` is a ready-made local rust-only production
-config (local API + local inference + local UI); `start.bat` / `start.sh` at
-the repo root runs the release binary with it.
+`config/server/default.toml` is the canonical local production config (local
+API + local inference + local UI); `start.bat` / `start.sh` run the release
+binary with this automatically selected config.
 
 In a `bundled-ui` build, a missing checkout at `dir` falls back to the
 embedded UI bundle instead of failing: it is extracted to
@@ -662,8 +662,8 @@ level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 # folder_command = "explorer {folder}" # (was: show in file manager)
 
 [server]
-host = "0.0.0.0"
-port = 8080
+host = "127.0.0.1"
+port = 6342
 trust_forwarded_headers = false
 # Extra named listeners (the primary above is always endpoint "default");
 # policies can match on them via [policies.match] endpoints = [...]:
@@ -674,28 +674,28 @@ trust_forwarded_headers = false
 
 [upstreams.ui]
 base_url = "http://127.0.0.1:6340"
-# Run the production UI from a checkout (see "Production UI" above):
-# local = true
-# dir = "ui"                  # the ui/ git submodule is the standard spot
+# Run the production UI from a checkout or the embedded release bundle:
+local = true
+dir = "ui"                    # the ui/ git submodule is the standard spot
 # node = "C:/path/to/node.exe"  # default: repo venv's node, then PATH
 # build = "auto"                # "auto" | "always" | "never"
 
 [upstreams.api]
 base_url = "http://127.0.0.1:6342"
-local = false
+local = true
 
 # Inference upstreams (first entry is used for search + metadata + /api/inference proxy).
 # Omit entirely when [inference_local] is enabled: a loopback self entry is
 # synthesized automatically.
-[[upstreams.inference]]
-base_url = "http://127.0.0.1:6342"
-weight = 1.0
-use_for_jobs = true
+# [[upstreams.inference]]
+# base_url = "http://gpu-host:6342"
+# weight = 1.0
+# use_for_jobs = true
 
 # Serve /api/inference/* in-process instead of proxying (Rust inferio
 # orchestrator; see "Local inference" above).
 [inference_local]
-enabled = false
+enabled = true
 
 [search]
 embedding_cache_size = 16
@@ -800,8 +800,8 @@ threads are still configured with 8MB stacks in code.
 
 Then visit:
 
-- `http://localhost:8080` for the UI
-- `http://localhost:8080/api/...` for the API
+- `http://localhost:6342` for the UI
+- `http://localhost:6342/api/...` for the API
 
 The gateway logs method, path, chosen upstream, policy, DB rewrite action, and
 response status via `tracing`.

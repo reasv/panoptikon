@@ -36,7 +36,7 @@ panoptikon/
 ├── ui/                   # git submodule → panoptikon-ui
 ├── panoptikon-desktop/   # Tauri v2 shell, control UI, Relay, sidecar bundle
 ├── config/
-│   ├── gateway/          # server TOML config (default.toml, local.toml)
+│   ├── server/           # server TOMLs (default plus deployment profiles)
 │   └── inference/        # user model-registry TOMLs (merged with built-ins)
 ├── inferio_custom/       # user impl classes (merged with built-ins)
 ├── data/                 # runtime data (databases, logs) — DATA_FOLDER

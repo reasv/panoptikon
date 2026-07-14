@@ -6,7 +6,7 @@ license = "AGPL-3.0-or-later"
 
 [features]
 # Self-contained releases (docs/architecture.md): embed the default configs
-# (config/server/default.toml, config/inference/example.toml) and the
+# (the canonical config/server/default.toml, config/inference/example.toml) and the
 # Python source set (python/inferio_worker, python/inferio, pyproject.toml,
 # uv.lock — no tests, no .venv) into the binary; first run materializes
 # them (config dump if absent, extraction to runtime/pysrc/<version>).

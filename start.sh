@@ -7,4 +7,4 @@ if [ ! -x target/release/panoptikon ]; then
     exit 1
 fi
 
-exec target/release/panoptikon --config config/server/local.toml "$@"
+exec target/release/panoptikon "$@"

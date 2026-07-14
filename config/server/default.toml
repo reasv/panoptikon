@@ -1,8 +1,5 @@
-# Panoptikon Gateway local rust-only production configuration:
-# the gateway serves the API locally, runs the inferio orchestrator
-# in-process, and builds + runs the production Next.js UI itself from the
-# ui/ submodule checkout.
-# Run with: panoptikon --config config/server/local.toml
+# Panoptikon's canonical local configuration. The server loads this file by
+# default and owns the API, inference orchestrator, databases, jobs, and UI.
 
 [logging]
 # The .env file keeps auto-loading; LOGLEVEL set there (e.g. DEBUG) feeds
@@ -11,7 +8,7 @@
 level = "${LOGLEVEL:-INFO}"
 
 [server]
-# Bind address for the gateway listener.
+# Bind address for the primary server listener.
 host = "127.0.0.1"
 # Port for the gateway listener. 6342 is the port the legacy Python server
 # used, so existing links and clients keep working.
@@ -63,12 +60,17 @@ local = true
 [inference_local]
 enabled = true
 
+[inference_local.python_env]
+# The release smoke test sets this templated value to false so it can exercise
+# first-run UI startup without downloading the multi-GB inference environment.
+auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
 [search]
 # Size of the in-process embedding cache used by search preprocessing.
 embedding_cache_size = 16
 
-# Host-resource limits and external tools for scan/extraction jobs (see
-# default.toml for the full key list).
+# Host-resource limits and external tools for scan/extraction jobs. See the
+# configuration reference in panoptikon/README.md for the full key list.
 [jobs]
 # Explicit paths to bundled native dependencies. Empty means "unset": the
 # built-in search order applies. The ${VAR:-} templates keep .env-based

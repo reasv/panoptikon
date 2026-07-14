@@ -823,8 +823,8 @@ impl Settings {
             None => default_config_path()?,
         };
         let mut builder = config::Config::builder()
-            .set_default("server.host", "0.0.0.0")?
-            .set_default("server.port", 8080)?
+            .set_default("server.host", "127.0.0.1")?
+            .set_default("server.port", 6342)?
             .set_default("server.trust_forwarded_headers", false)?
             .set_default("upstreams.ui.base_url", "http://127.0.0.1:6340")?
             .set_default("upstreams.api.base_url", "http://127.0.0.1:6342")?
@@ -2322,13 +2322,21 @@ file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
             .join("config")
             .join("server");
 
-        for file in ["default.toml", "local.toml"] {
+        for file in ["default.toml"] {
             unsafe { env::remove_var("LOGLEVEL") };
-            let settings =
-                Settings::load(Some(config_dir.join(file))).unwrap_or_else(|err| {
-                    panic!("shipped {file} must load: {err:#}");
-                });
+            let settings = Settings::load(Some(config_dir.join(file))).unwrap_or_else(|err| {
+                panic!("shipped {file} must load: {err:#}");
+            });
             assert_eq!(settings.logging.level, "INFO", "{file}: LOGLEVEL unset");
+            assert_eq!(settings.server.host, "127.0.0.1");
+            assert_eq!(settings.server.port, 6342);
+            assert!(settings.upstreams.api.local);
+            assert!(settings.upstreams.ui.local);
+            assert_eq!(
+                settings.upstreams.ui.dir.as_deref(),
+                Some(std::path::Path::new("ui"))
+            );
+            assert!(settings.inference_local.enabled);
 
             // `.env` empty assignment (`LOGLEVEL=`): set-but-empty must also
             // fall back to INFO under the shell `:-` convention.

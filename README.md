@@ -195,8 +195,8 @@ For Windows, run:
 .\start.bat
 ```
 
-Both run the release binary with the all-in-one configuration at
-`config/server/local.toml`: the server owns the databases, jobs, cron, and
+Both run the release binary with the canonical configuration at
+`config/server/default.toml`: the server owns the databases, jobs, cron, and
 inference, and serves everything — UI included — on
 **http://127.0.0.1:6342**.
 
@@ -227,7 +227,7 @@ Then open http://127.0.0.1:6342.
 A machine that only lends its GPU can run the standalone inference service:
 
 ```bash
-target/release/panoptikon inferio --config config/server/local.toml
+target/release/panoptikon inferio
 ```
 
 This serves only the inference API (`/api/inference/*`). Point other
@@ -253,10 +253,9 @@ See `config/inference/example.toml` for examples on how to add custom models fro
 
 ## Configuration
 
-All global configuration is TOML: the server reads
+All global configuration is TOML: the server reads the all-in-one
 `config/server/default.toml` (override with `--config` or
-`PANOPTIKON_CONFIG_PATH`; `config/server/local.toml` is the all-in-one config
-the start scripts use). Environment variables are no longer a parallel
+`PANOPTIKON_CONFIG_PATH`). Environment variables are no longer a parallel
 configuration mechanism: string values in the TOML (and in every inference
 registry TOML) can reference environment variables with `${VAR}` /
 `${VAR:-default}` templating, and a `.env` file in the repo root is still
