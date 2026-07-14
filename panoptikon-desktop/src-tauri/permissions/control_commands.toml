@@ -1,0 +1,24 @@
+[[permission]]
+identifier = "allow-control-commands"
+description = "Allows the bundled control window to invoke Panoptikon Desktop management commands."
+commands.allow = [
+  "get_status",
+  "get_startup_warnings",
+  "open_action_command",
+  "open_setup_command",
+  "restart_server",
+  "set_local_server_enabled",
+  "set_start_at_login",
+  "open_known_folder",
+  "log_tail",
+  "relay_status",
+  "relay_pending",
+  "relay_approve",
+  "relay_reject",
+  "relay_revoke",
+  "relay_set_mappings",
+  "set_relay_enabled",
+  "check_for_updates",
+  "install_update",
+  "quit_desktop",
+]
