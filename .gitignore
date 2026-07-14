@@ -164,6 +164,7 @@ cython_debug/
 /scripts/*
 !/scripts/build-desktop-dev.ps1
 !/scripts/reset-desktop-dev.ps1
+!/scripts/run-desktop-dev.ps1
 .vscode/
 
 .DS_Store

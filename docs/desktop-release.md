@@ -30,6 +30,16 @@ not describe these packages as Authenticode- or Developer-ID-signed.
 
 ## Windows development installer and clean-state testing
 
+For normal source development, run `scripts/run-desktop-dev.ps1`. It builds the
+current standalone UI, embeds it in a debug Server sidecar, stages that sidecar,
+and launches the unpackaged Tauri application with the isolated
+`app.panoptikon.desktop.dev` profile. It does not build or install an NSIS
+package. Pass `-SkipUiBuild` for Desktop-shell-only iterations after a current
+standalone UI has already been built.
+
+Quit the dev application before rerunning the script if Server/UI sources have
+changed, because Windows cannot replace a running sidecar executable.
+
 Run `scripts/build-desktop-dev.ps1` from the repository to build the standalone
 UI, bundled Server sidecar, and an unsigned NSIS installer using the mandatory
 `app.panoptikon.desktop.dev` Tauri overlay. The development profile uses gateway
@@ -38,5 +48,6 @@ port 16342, UI port 16340, and Relay port 17601; browser-facing URLs use
 
 After quitting Desktop Dev, run `scripts/reset-desktop-dev.ps1` to remove only
 its roaming and local application-data roots. The already-installed app will
-repeat extraction, environment setup, and onboarding on its next launch. Use
+repeat extraction, environment preparation, and first-database setup on its
+next launch. Use
 `-WhatIf` to print the guarded targets and `-Force` to skip the RESET prompt.
