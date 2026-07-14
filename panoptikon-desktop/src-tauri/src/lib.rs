@@ -37,6 +37,8 @@ const PROD_SERVER_CONFIG: &str = "config/server/desktop.toml";
 const DEV_SERVER_CONFIG: &str = "config/server/desktop-dev.toml";
 const PROD_SERVER_PORT: u16 = 6342;
 const DEV_SERVER_PORT: u16 = 16342;
+const SETUP_WINDOW_WIDTH: f64 = 1000.0;
+const SETUP_WINDOW_HEIGHT: f64 = 1140.0;
 
 struct RuntimeState {
     relay_handle: Mutex<Option<RelayHandle>>,
@@ -643,12 +645,15 @@ fn show_setup_window(app: &AppHandle, port: u16, mode: SetupMode) -> tauri::Resu
     let window = if let Some(window) = app.get_webview_window("launch") {
         window.navigate(url)?;
         window.set_title(mode.title())?;
-        window.set_size(tauri::LogicalSize::new(1000.0, 760.0))?;
+        window.set_size(tauri::LogicalSize::new(
+            SETUP_WINDOW_WIDTH,
+            SETUP_WINDOW_HEIGHT,
+        ))?;
         window
     } else {
         WebviewWindowBuilder::new(app, "launch", WebviewUrl::External(url))
             .title(mode.title())
-            .inner_size(1000.0, 760.0)
+            .inner_size(SETUP_WINDOW_WIDTH, SETUP_WINDOW_HEIGHT)
             .build()?
     };
     window.show()?;
