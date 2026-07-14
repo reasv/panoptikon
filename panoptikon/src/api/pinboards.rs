@@ -575,9 +575,7 @@ pub async fn delete_pinboard_version(
     commit_transaction(&mut db.conn).await?;
 
     match outcome {
-        pinboards::DeleteVersionOutcome::NotFound => {
-            Err(ApiError::not_found("Version not found"))
-        }
+        pinboards::DeleteVersionOutcome::NotFound => Err(ApiError::not_found("Version not found")),
         pinboards::DeleteVersionOutcome::Deleted {
             new_head_version_id,
         } => Ok(Json(PinboardDeleteResponse {
@@ -648,17 +646,20 @@ async fn downscale_preview(bytes: Vec<u8>, maxw: u32) -> ApiResult<(Vec<u8>, &'s
             let media_type = sniff_image_media_type(&bytes);
             return Ok((bytes, media_type));
         }
-        let height = ((u64::from(maxw) * u64::from(img.height())) / u64::from(img.width()))
-            .max(1) as u32;
+        let height =
+            ((u64::from(maxw) * u64::from(img.height())) / u64::from(img.width())).max(1) as u32;
         let scaled = img.resize_exact(maxw, height, image::imageops::FilterType::Lanczos3);
 
         let mut out = Vec::new();
         let mut cursor = std::io::Cursor::new(&mut out);
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
-        scaled.into_rgb8().write_with_encoder(encoder).map_err(|err| {
-            tracing::error!(error = %err, "failed to encode downscaled pinboard preview");
-            ApiError::internal("Failed to encode preview")
-        })?;
+        scaled
+            .into_rgb8()
+            .write_with_encoder(encoder)
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to encode downscaled pinboard preview");
+                ApiError::internal("Failed to encode preview")
+            })?;
         Ok((out, "image/jpeg"))
     })
     .await
@@ -752,7 +753,9 @@ mod tests {
         records: &[&str],
         items: &[&str],
     ) -> (i64, i64) {
-        let pinboard_id = pinboards::create_pinboard(conn, "user", name).await.unwrap();
+        let pinboard_id = pinboards::create_pinboard(conn, "user", name)
+            .await
+            .unwrap();
         let request = save_request(records, items);
         let version_id = pinboards::append_version(
             conn,
@@ -776,12 +779,19 @@ mod tests {
         let (board_a, head_a) = create_board(
             &mut dbs.index_conn,
             Some("poses"),
-            &["v2", "aaaa", "0", "0", "10", "10", "bbbb", "10", "0", "10", "10"],
+            &[
+                "v2", "aaaa", "0", "0", "10", "10", "bbbb", "10", "0", "10", "10",
+            ],
             &["a1", "b2"],
         )
         .await;
-        create_board(&mut dbs.index_conn, None, &["v2", "cccc", "0", "0", "5", "5"], &["c3"])
-            .await;
+        create_board(
+            &mut dbs.index_conn,
+            None,
+            &["v2", "cccc", "0", "0", "5", "5"],
+            &["c3"],
+        )
+        .await;
 
         let boards = pinboards::list_pinboards(&mut dbs.index_conn, "user", None)
             .await

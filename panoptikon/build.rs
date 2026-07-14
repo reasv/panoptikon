@@ -73,8 +73,8 @@ fn collect_python_files(dir: &Path, rel: &str, entries: &mut Vec<(String, PathBu
     let read = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("bundled: failed to read '{}': {err}", dir.display()));
     for entry in read {
-        let entry =
-            entry.unwrap_or_else(|err| panic!("bundled: failed to list '{}': {err}", dir.display()));
+        let entry = entry
+            .unwrap_or_else(|err| panic!("bundled: failed to list '{}': {err}", dir.display()));
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         // fs::metadata follows symlinks, so a linked file ships by content.
@@ -152,9 +152,8 @@ fn collect_all_files(dir: &Path, rel: &str, entries: &mut Vec<(String, PathBuf)>
             format!("{rel}/{name}")
         };
         let path = entry.path();
-        let meta = fs::metadata(&path).unwrap_or_else(|err| {
-            panic!("bundled-ui: failed to stat '{}': {err}", path.display())
-        });
+        let meta = fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("bundled-ui: failed to stat '{}': {err}", path.display()));
         if meta.is_dir() {
             collect_all_files(&path, &child_rel, entries);
         } else if meta.is_file() {
@@ -181,7 +180,9 @@ fn write_tar_gz(target: &Path, entries: &[(String, PathBuf)]) {
         header.set_uid(0);
         header.set_gid(0);
         tar.append_data(&mut header, name, data.as_slice())
-            .unwrap_or_else(|err| panic!("failed to append '{name}' to '{}': {err}", target.display()));
+            .unwrap_or_else(|err| {
+                panic!("failed to append '{name}' to '{}': {err}", target.display())
+            });
     }
     let gz = tar
         .into_inner()

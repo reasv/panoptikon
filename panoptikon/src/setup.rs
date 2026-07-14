@@ -227,7 +227,14 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
 
     if !venv.join(python_relpath()).is_file() {
         tracing::info!(venv = %venv.display(), python = PYTHON_VERSION, "creating the managed venv (uv venv)");
-        run_uv_logged(&uv.path, &uv_venv_args(&venv), &python_dir, &venv, "uv venv").await?;
+        run_uv_logged(
+            &uv.path,
+            &uv_venv_args(&venv),
+            &python_dir,
+            &venv,
+            "uv venv",
+        )
+        .await?;
     }
 
     tracing::info!(
@@ -353,8 +360,8 @@ fn sentinel_status_from(content: Option<&str>, current_lock_hash: Option<&str>) 
 pub(crate) fn auto_setup_needed() -> Option<String> {
     let managed = ManagedPython::active();
     let managed_interpreter = managed.venv.join(python_relpath()).is_file();
-    let legacy_interpreter = managed.legacy_suppresses
-        && Path::new(LEGACY_VENV).join(python_relpath()).is_file();
+    let legacy_interpreter =
+        managed.legacy_suppresses && Path::new(LEGACY_VENV).join(python_relpath()).is_file();
     let sentinel = sentinel_status_from(
         std::fs::read_to_string(managed.venv.join(SETUP_SENTINEL))
             .ok()
@@ -382,9 +389,7 @@ fn auto_setup_decision(
                  (interrupted sync?)"
                     .into(),
             ),
-            SentinelStatus::Stale => {
-                Some("uv.lock changed since setup last completed".into())
-            }
+            SentinelStatus::Stale => Some("uv.lock changed since setup last completed".into()),
         };
     }
     if legacy_interpreter {
@@ -465,7 +470,9 @@ fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> 
     match requested {
         Accelerator::Auto => Ok(decide_accelerator(&DetectionProbes::gather())),
         Accelerator::Rocm if !cfg!(target_os = "linux") => {
-            bail!("accelerator 'rocm' is only supported on Linux (PyTorch publishes no ROCm wheels elsewhere)")
+            bail!(
+                "accelerator 'rocm' is only supported on Linux (PyTorch publishes no ROCm wheels elsewhere)"
+            )
         }
         Accelerator::Cuda if cfg!(target_os = "macos") => {
             tracing::warn!(
@@ -544,10 +551,7 @@ fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
             return (Accelerator::Rocm, (*evidence).into());
         }
     }
-    (
-        Accelerator::Cpu,
-        "no NVIDIA or ROCm evidence found".into(),
-    )
+    (Accelerator::Cpu, "no NVIDIA or ROCm evidence found".into())
 }
 
 /// Exclusive advisory file lock (`runtime/setup.lock`) serializing
@@ -612,8 +616,7 @@ fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     use windows_sys::Win32::Storage::FileSystem::{
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
-    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
-        unsafe { std::mem::zeroed() };
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         LockFileEx(
             file.as_raw_handle(),
@@ -704,11 +707,16 @@ async fn locate_uv() -> Result<UvBinary> {
         }
     }
 
-    let managed = std::path::absolute(managed_uv_path())
-        .context("failed to resolve the managed uv path")?;
+    let managed =
+        std::path::absolute(managed_uv_path()).context("failed to resolve the managed uv path")?;
     if managed.is_file() {
         match validate_uv(&managed).await {
-            Ok(version) => return Ok(UvBinary { path: managed, version }),
+            Ok(version) => {
+                return Ok(UvBinary {
+                    path: managed,
+                    version,
+                });
+            }
             Err(err) => tracing::warn!(
                 uv = %managed.display(),
                 error = format!("{err:#}"),
@@ -744,11 +752,7 @@ async fn validate_uv(uv: &Path) -> Result<String> {
         .await
         .with_context(|| format!("failed to run '{} --version'", uv.display()))?;
     if !output.status.success() {
-        bail!(
-            "'{} --version' failed with {}",
-            uv.display(),
-            output.status
-        );
+        bail!("'{} --version' failed with {}", uv.display(), output.status);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_uv_version(&stdout)
@@ -757,7 +761,11 @@ async fn validate_uv(uv: &Path) -> Result<String> {
 
 /// Parse "uv X.Y.Z (…)" into "X.Y.Z".
 fn parse_uv_version(output: &str) -> Option<String> {
-    let version = output.trim().strip_prefix("uv ")?.split_whitespace().next()?;
+    let version = output
+        .trim()
+        .strip_prefix("uv ")?
+        .split_whitespace()
+        .next()?;
     version_triple(version).map(|_| version.to_string())
 }
 
@@ -767,7 +775,10 @@ fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
     let minor = parts.next()?.parse().ok()?;
     // Allow suffixes like "1rc1" by taking leading digits of the patch.
     let patch_part = parts.next()?;
-    let digits: String = patch_part.chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = patch_part
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     let patch = digits.parse().ok()?;
     Some((major, minor, patch))
 }
@@ -796,8 +807,7 @@ fn uv_asset_name() -> Result<&'static str> {
 async fn download_uv(target: &Path) -> Result<()> {
     let asset = uv_asset_name()?;
     let expected_sha256 = uv_asset_sha256(asset)?;
-    let url =
-        format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}");
+    let url = format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{asset}");
     let dir = target
         .parent()
         .context("managed uv path has no parent directory")?;
@@ -843,10 +853,7 @@ async fn download_uv(target: &Path) -> Result<()> {
                     downloaded / (1024 * 1024),
                     total / (1024 * 1024)
                 ),
-                None => tracing::info!(
-                    "downloading uv: {} MiB",
-                    downloaded / (1024 * 1024)
-                ),
+                None => tracing::info!("downloading uv: {} MiB", downloaded / (1024 * 1024)),
             }
         }
     }
@@ -1314,8 +1321,7 @@ mod tests {
     #[test]
     fn write_sentinel_is_guarded() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            write_sentinel(dir.path(), "cpu", Path::new("python/uv.lock")).unwrap_err();
+        let err = write_sentinel(dir.path(), "cpu", Path::new("python/uv.lock")).unwrap_err();
         assert!(err.to_string().contains("refusing to operate"), "{err}");
     }
 }

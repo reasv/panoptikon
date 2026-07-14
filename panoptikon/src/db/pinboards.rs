@@ -39,7 +39,9 @@ pub(crate) enum DeleteVersionOutcome {
     NotFound,
     /// The version was removed; if it was the head, the head has been moved
     /// to the newest remaining version.
-    Deleted { new_head_version_id: i64 },
+    Deleted {
+        new_head_version_id: i64,
+    },
     /// The last remaining version was removed, so the board itself is gone.
     DeletedBoard,
 }

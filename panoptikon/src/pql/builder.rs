@@ -1481,7 +1481,10 @@ mod tests {
             sql.contains("(1.0) / ((10)"),
             "RRF terms must use float division, got: {sql}"
         );
-        assert!(!sql.contains("(1) / ((10)"), "integer division in RRF: {sql}");
+        assert!(
+            !sql.contains("(1) / ((10)"),
+            "integer division in RRF: {sql}"
+        );
     }
 
     #[test]

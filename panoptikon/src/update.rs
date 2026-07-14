@@ -293,7 +293,10 @@ pub async fn run_update_command(current: &str, assume_yes: bool) -> anyhow::Resu
             backups.display()
         )
     })?;
-    let backup_path = backups.join(format!("panoptikon-{current}{}", std::env::consts::EXE_SUFFIX));
+    let backup_path = backups.join(format!(
+        "panoptikon-{current}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     // A leftover backup from a previous run would block the rename below.
     std::fs::remove_file(&backup_path).ok();
 
@@ -384,7 +387,10 @@ mod tests {
 
     #[test]
     fn platform_key_maps_supported_hosts() {
-        assert_eq!(platform_key_for("windows", "x86_64"), Some("windows-x86_64"));
+        assert_eq!(
+            platform_key_for("windows", "x86_64"),
+            Some("windows-x86_64")
+        );
         assert_eq!(platform_key_for("linux", "x86_64"), Some("linux-x86_64"));
         assert_eq!(platform_key_for("macos", "aarch64"), Some("macos-aarch64"));
         assert_eq!(platform_key_for("plan9", "sparc"), None);
@@ -406,7 +412,10 @@ mod tests {
         let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.version, "0.2.0");
         let entry = manifest.platforms.get("windows-x86_64").unwrap();
-        assert_eq!(entry.url, "https://example.com/panoptikon-windows-x86_64.zip");
+        assert_eq!(
+            entry.url,
+            "https://example.com/panoptikon-windows-x86_64.zip"
+        );
         assert_eq!(entry.sha256, "abc123");
     }
 

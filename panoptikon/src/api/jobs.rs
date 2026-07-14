@@ -648,7 +648,10 @@ mod tests {
         let Query(q) = Query::<InferenceQuery>::try_from_uri(&uri).unwrap();
         assert_eq!(
             q.inference_ids,
-            vec!["tags/wd-swinv2-tagger-v3", "clip/ViT-H-14-378-quickgelu_dfn5b"]
+            vec![
+                "tags/wd-swinv2-tagger-v3",
+                "clip/ViT-H-14-378-quickgelu_dfn5b"
+            ]
         );
         assert_eq!(q.batch_size, Some(64));
         assert_eq!(q.threshold, None);

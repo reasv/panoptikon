@@ -894,9 +894,7 @@ mod tests {
         // against a Windows checkout, whose .venv is a Windows venv.
         let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
             Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => {
-                test_venv_python(&root, "Scripts/python.exe")
-            }
+            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
             None => test_venv_python(&root, "bin/python"),
         };
         if !python.is_file() {
@@ -1413,9 +1411,7 @@ config.impl_class = "echo_test"
     /// where `python/inferio/config` does not exist.
     #[tokio::test]
     async fn from_settings_degrades_when_builtin_config_dir_is_missing() {
-        use crate::config::{
-            InferenceLocalConfig, Settings, UpstreamConfig, UpstreamsConfig,
-        };
+        use crate::config::{InferenceLocalConfig, Settings, UpstreamConfig, UpstreamsConfig};
 
         // Force the default-dirs error path deterministically: no
         // python/inferio/config relative to the test CWD.
@@ -1468,7 +1464,12 @@ config.impl_class = "echo_test"
             .expect("missing built-in config dir degrades instead of failing boot");
         // The degraded registry is empty but serviceable: /metadata-style
         // reads succeed with no groups.
-        let registry = state.registry.lock().unwrap().get().expect("empty registry loads");
+        let registry = state
+            .registry
+            .lock()
+            .unwrap()
+            .get()
+            .expect("empty registry loads");
         assert!(registry.groups.is_empty());
         state.manager.shutdown().await;
     }

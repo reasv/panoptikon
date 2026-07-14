@@ -262,9 +262,8 @@ fn apply_policy(
     // defeat its purpose. Local API only: the endpoint exists solely as a
     // local route, and in proxied-API mode the exemption would forward the
     // path to the upstream past a restrictive ruleset.
-    let is_client_config = settings.upstreams.api.local
-        && method == Method::GET
-        && is_client_config_path(&path);
+    let is_client_config =
+        settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
 
     if is_api && !is_client_config {
         if !ruleset_allows(settings, &policy, &method, &path) {
@@ -1249,10 +1248,10 @@ allow = "*"
         // Fallback cases: all select "localhost" via listener/host.
         let other_key = TokenKey::random();
         for bad in [
-            other_key.mint("both"),        // forged: wrong key
-            key.sign("both", 42),          // expired long ago
-            key.mint("no-such-policy"),    // unknown policy name
-            "total.garbage".to_string(),   // malformed
+            other_key.mint("both"),      // forged: wrong key
+            key.sign("both", 42),        // expired long ago
+            key.mint("no-such-policy"),  // unknown policy name
+            "total.garbage".to_string(), // malformed
         ] {
             let mut req = request_with_token(&bad);
             let decision = apply_policy(&mut req, &settings, &key).unwrap();

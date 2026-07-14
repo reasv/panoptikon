@@ -64,7 +64,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::dispatch::{DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher};
+use super::dispatch::{
+    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher,
+};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
 use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput, WorkerSpawnConfig};
@@ -152,8 +154,7 @@ impl Expiration {
         if ttl_seconds < 0 {
             return Expiration::Never;
         }
-        match chrono::Duration::try_seconds(ttl_seconds)
-            .and_then(|ttl| now.checked_add_signed(ttl))
+        match chrono::Duration::try_seconds(ttl_seconds).and_then(|ttl| now.checked_add_signed(ttl))
         {
             Some(at) => Expiration::At(at),
             None => Expiration::Never,
@@ -465,7 +466,11 @@ impl PinGuard {
     /// pin stays atomic with the loaded-check). Does not lock.
     fn adopt(manager: &ModelManager, inference_id: &str, restore: Option<(String, i64)>) -> Self {
         Self {
-            manager: manager.weak.get().cloned().expect("weak self is set in new()"),
+            manager: manager
+                .weak
+                .get()
+                .cloned()
+                .expect("weak self is set in new()"),
             inference_id: inference_id.to_owned(),
             restore,
         }
@@ -950,8 +955,11 @@ impl ModelManager {
         let task = tokio::spawn(run_dispatcher(context, workers, rx));
         let sender = if pin_for_predict {
             state.cache.pin(inference_id);
-            let guard =
-                PinGuard::adopt(self, inference_id, Some((cache_key.to_owned(), ttl_seconds)));
+            let guard = PinGuard::adopt(
+                self,
+                inference_id,
+                Some((cache_key.to_owned(), ttl_seconds)),
+            );
             Some((tx.clone(), guard))
         } else {
             None
@@ -1402,9 +1410,7 @@ config.impl_class = "cls"
         // against a Windows checkout, whose .venv is a Windows venv.
         let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
             Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => {
-                test_venv_python(&root, "Scripts/python.exe")
-            }
+            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
             None => test_venv_python(&root, "bin/python"),
         };
         if !python.is_file() {
@@ -1483,7 +1489,11 @@ config.replicas = 2
     }
 
     fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
-        test_manager_with_deadlines(sweep_interval, default_max_batch, WorkerDeadlines::default())
+        test_manager_with_deadlines(
+            sweep_interval,
+            default_max_batch,
+            WorkerDeadlines::default(),
+        )
     }
 
     fn test_manager_with_deadlines(
@@ -1563,7 +1573,15 @@ config.replicas = 2
         );
 
         let outputs = manager
-            .predict("echo/test", "key", 10, 60, None, None, vec![data_input(json!(2))])
+            .predict(
+                "echo/test",
+                "key",
+                10,
+                60,
+                None,
+                None,
+                vec![data_input(json!(2))],
+            )
             .await
             .expect("second predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 2}))]);
@@ -1602,7 +1620,15 @@ config.replicas = 2
             "still referenced by b"
         );
         let outputs = manager
-            .predict("echo/test", "b", 10, -1, None, None, vec![data_input(json!("x"))])
+            .predict(
+                "echo/test",
+                "b",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!("x"))],
+            )
             .await
             .expect("still serves");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "x"}))]);
@@ -1618,7 +1644,15 @@ config.replicas = 2
         assert!(!manager.unload_model("b", "echo/test").await.unwrap());
 
         let outputs = manager
-            .predict("echo/test", "b", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "echo/test",
+                "b",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect("respawns after unload");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 1}))]);
@@ -1704,7 +1738,15 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("slow/test", "k", 10, 1, None, None, vec![data_input(json!(null))])
+            .predict(
+                "slow/test",
+                "k",
+                10,
+                1,
+                None,
+                None,
+                vec![data_input(json!(null))],
+            )
             .await
             .expect("predict outlives its ttl thanks to the pin");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"slow": true}))]);
@@ -1748,7 +1790,15 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("batch/test", "k", 10, -1, None, None, vec![data_input(json!(0))])
+                    .predict(
+                        "batch/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        None,
+                        vec![data_input(json!(0))],
+                    )
                     .await
             })
         };
@@ -1760,7 +1810,15 @@ config.replicas = 2
             let manager = manager.clone();
             rest.push(tokio::spawn(async move {
                 manager
-                    .predict("batch/test", "k", 10, -1, None, None, vec![data_input(json!(i))])
+                    .predict(
+                        "batch/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        None,
+                        vec![data_input(json!(i))],
+                    )
                     .await
             }));
         }
@@ -1895,7 +1953,15 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let err = manager
-            .predict("dying/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "dying/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect_err("worker exits mid-predict");
         assert!(
@@ -1916,7 +1982,15 @@ config.replicas = 2
         // fatal error proves a new process served it rather than a closed
         // queue or a poisoned handle).
         let err = manager
-            .predict("dying/test", "k", 10, -1, None, None, vec![data_input(json!(2))])
+            .predict(
+                "dying/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(2))],
+            )
             .await
             .expect_err("fresh worker also dies");
         assert!(
@@ -1973,7 +2047,15 @@ config.replicas = 2
             .expect_err("loads refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
         let err = manager
-            .predict("echo/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect_err("predicts refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
@@ -1990,14 +2072,30 @@ config.replicas = 2
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("ok"))])
+            .predict(
+                "nan/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!("ok"))],
+            )
             .await
             .expect("normal predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
         let generation = manager.loaded_generation("nan/test").expect("loaded");
 
         let err = manager
-            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("nan"))])
+            .predict(
+                "nan/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!("nan"))],
+            )
             .await
             .expect_err("NaN output has no JSON form");
         assert!(
@@ -2015,7 +2113,15 @@ config.replicas = 2
         );
 
         let outputs = manager
-            .predict("nan/test", "k", 10, -1, None, None, vec![data_input(json!("ok"))])
+            .predict(
+                "nan/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!("ok"))],
+            )
             .await
             .expect("worker still serves after the failed request");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
@@ -2043,7 +2149,15 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("slow/test", "k", 10, 1, None, None, vec![data_input(json!(null))])
+                    .predict(
+                        "slow/test",
+                        "k",
+                        10,
+                        1,
+                        None,
+                        None,
+                        vec![data_input(json!(null))],
+                    )
                     .await
             })
         };
@@ -2096,7 +2210,15 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("hang/test", "k", 10, 60, None, None, vec![data_input(json!(null))])
+                    .predict(
+                        "hang/test",
+                        "k",
+                        10,
+                        60,
+                        None,
+                        None,
+                        vec![data_input(json!(null))],
+                    )
                     .await
             })
         };
@@ -2500,7 +2622,15 @@ config.replicas = 2
             let manager = manager.clone();
             tokio::spawn(async move {
                 manager
-                    .predict("slow/test", "k", 10, -1, None, None, vec![data_input(json!(null))])
+                    .predict(
+                        "slow/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        None,
+                        vec![data_input(json!(null))],
+                    )
                     .await
             })
         };

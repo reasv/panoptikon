@@ -262,9 +262,9 @@ fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option
         None => None,
         Some(value) => match value.as_i64() {
             Some(n) if n >= 1 && (n as u64) <= MAX_REPLICAS as u64 => Some(n as usize),
-            Some(n) if n >= 1 => bail!(
-                "'replicas' ({n}) exceeds the maximum of {MAX_REPLICAS} worker processes"
-            ),
+            Some(n) if n >= 1 => {
+                bail!("'replicas' ({n}) exceeds the maximum of {MAX_REPLICAS} worker processes")
+            }
             _ => bail!("'replicas' must be an integer >= 1, got {value}"),
         },
     };
@@ -277,9 +277,9 @@ fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option
             let devices: Vec<String> = items
                 .iter()
                 .map(|item| {
-                    item.as_str().map(str::to_owned).with_context(|| {
-                        format!("'devices' entries must be strings, got {item}")
-                    })
+                    item.as_str()
+                        .map(str::to_owned)
+                        .with_context(|| format!("'devices' entries must be strings, got {item}"))
                 })
                 .collect::<Result<_>>()?;
             if devices.is_empty() {
@@ -505,7 +505,9 @@ fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<(
             // merged config is what spawn_spec will resolve, so validating
             // it here covers group-level inheritance too.
             resolve_device_pins(&merged_config).with_context(|| {
-                format!("invalid replicas/devices config for inference id '{group_name}/{inference_id}'")
+                format!(
+                    "invalid replicas/devices config for inference id '{group_name}/{inference_id}'"
+                )
             })?;
             let metadata = match inf_data.get("metadata") {
                 Some(metadata) => {

@@ -366,11 +366,7 @@ impl Worker {
     /// (bad kwargs, failing `__init__`, double configure) is a per-request
     /// [`WorkerError`]: the worker stays alive and is NOT poisoned. On
     /// success the worker's log/error label becomes the inference_id.
-    pub async fn configure(
-        &mut self,
-        inference_id: &str,
-        config_kwargs: &JsonValue,
-    ) -> Result<()> {
+    pub async fn configure(&mut self, inference_id: &str, config_kwargs: &JsonValue) -> Result<()> {
         let deadline = self.deadlines.handshake;
         let fields = vec![
             (Value::from("inference_id"), Value::from(inference_id)),
@@ -801,7 +797,10 @@ async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mut
                 break;
             }
         }
-        while buf.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+        while buf
+            .last()
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
             buf.pop();
         }
         if buf.is_empty() {
@@ -987,9 +986,7 @@ mod tests {
         // against a Windows checkout, whose .venv is a Windows venv.
         let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
             Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => {
-                test_venv_python(&root, "Scripts/python.exe")
-            }
+            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
             None => test_venv_python(&root, "bin/python"),
         };
         if !python.is_file() {
@@ -1065,10 +1062,13 @@ mod tests {
     #[tokio::test]
     async fn spawn_unknown_impl_class_surfaces_worker_traceback() {
         let cfg = test_spawn_config();
-        let err = match Worker::spawn_configured(&cfg, "test/missing", &spec("does_not_exist"), None).await {
-            Ok(_) => panic!("handshake with an unknown impl_class must fail"),
-            Err(err) => err,
-        };
+        let err =
+            match Worker::spawn_configured(&cfg, "test/missing", &spec("does_not_exist"), None)
+                .await
+            {
+                Ok(_) => panic!("handshake with an unknown impl_class must fail"),
+                Err(err) => err,
+            };
         let text = format!("{err:#}");
         assert!(
             text.contains("does_not_exist"),
@@ -1163,9 +1163,10 @@ mod tests {
     #[tokio::test]
     async fn stdout_hygiene_survives_printing_impl() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/printer", &spec("printing_test"), None)
-            .await
-            .expect("spawn + handshake");
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/printer", &spec("printing_test"), None)
+                .await
+                .expect("spawn + handshake");
         worker.load().await.expect("load ok despite print()");
 
         let inputs = [
@@ -1215,9 +1216,10 @@ mod tests {
     #[tokio::test]
     async fn stderr_forwarder_survives_invalid_utf8_and_cr_only_runs() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/badbytes", &spec("badbytes_test"), None)
-            .await
-            .expect("spawn + handshake");
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/badbytes", &spec("badbytes_test"), None)
+                .await
+                .expect("spawn + handshake");
         worker.load().await.expect("load ok");
 
         let input = [WorkerInput {
@@ -1370,7 +1372,10 @@ mod tests {
             .await
             .expect("spawn + identity handshake");
         worker.prewarm().await.expect("prewarm (no prepare) is ok");
-        let status = worker.shutdown().await.expect("graceful shutdown while parked");
+        let status = worker
+            .shutdown()
+            .await
+            .expect("graceful shutdown while parked");
         assert_eq!(status.code(), Some(0), "parked worker exits 0 on unload");
     }
 

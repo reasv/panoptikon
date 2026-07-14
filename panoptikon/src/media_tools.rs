@@ -108,7 +108,10 @@ fn venv_static_ffmpeg(python: &Path) -> Option<(PathBuf, PathBuf)> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
     let ffmpeg = PathBuf::from(lines.next()?);
     let ffprobe = PathBuf::from(lines.next()?);
     if !ffmpeg.is_file() || !ffprobe.is_file() {
@@ -138,13 +141,11 @@ mod tests {
     #[test]
     fn explicit_overrides_win_per_tool() {
         let missing = Path::new("does-not-exist/python");
-        let (ffmpeg, ffprobe) =
-            resolve(Some(Path::new("C:/tools/ffmpeg.exe")), None, missing);
+        let (ffmpeg, ffprobe) = resolve(Some(Path::new("C:/tools/ffmpeg.exe")), None, missing);
         assert_eq!(ffmpeg, PathBuf::from("C:/tools/ffmpeg.exe"));
         assert_eq!(ffprobe, PathBuf::from("ffprobe"));
 
-        let (ffmpeg, ffprobe) =
-            resolve(None, Some(Path::new("/opt/ffprobe")), missing);
+        let (ffmpeg, ffprobe) = resolve(None, Some(Path::new("/opt/ffprobe")), missing);
         assert_eq!(ffmpeg, PathBuf::from("ffmpeg"));
         assert_eq!(ffprobe, PathBuf::from("/opt/ffprobe"));
     }

@@ -457,9 +457,7 @@ impl Default for RuntimeConfig {
             html_renderer: None,
             html_renderer_args: Vec::new(),
             thumbnail_font: None,
-            venv_python: crate::resources::default_worker_python(
-                crate::resources::py_source_mode(),
-            ),
+            venv_python: crate::resources::default_worker_python(crate::resources::py_source_mode()),
         }
     }
 }
@@ -878,7 +876,10 @@ impl Settings {
             &mut self.jobs.html_renderer,
             &mut self.jobs.thumbnail_font,
         ] {
-            if slot.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+            if slot
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
                 *slot = None;
             }
         }
@@ -1128,7 +1129,11 @@ impl Settings {
                 "/api/inference/load/group/id",
                 "PUT /api/inference/load/*",
             ),
-            (Method::GET, "/api/inference/metadata", "GET /api/inference/metadata"),
+            (
+                Method::GET,
+                "/api/inference/metadata",
+                "GET /api/inference/metadata",
+            ),
         ] {
             if !crate::policy::ruleset_allows(self, policy, &method, path) {
                 anyhow::bail!(
@@ -1240,7 +1245,9 @@ fn default_config_path() -> Result<PathBuf> {
 /// Read the settings file, run env templating over its parsed string values
 /// (see `env_template`), and hand the substituted document to the config
 /// crate. Returns `None` when the file does not exist.
-fn templated_file_source(path: &PathBuf) -> Result<Option<config::File<config::FileSourceString, config::FileFormat>>> {
+fn templated_file_source(
+    path: &PathBuf,
+) -> Result<Option<config::File<config::FileSourceString, config::FileFormat>>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1751,8 +1758,14 @@ base_url = "http://127.0.0.1:6342"
         let settings = Settings::load(Some(path.clone())).unwrap();
         let ui = &settings.upstreams.ui;
         assert!(ui.local);
-        assert_eq!(ui.dir.as_deref(), Some(std::path::Path::new("../panoptikon-ui")));
-        assert_eq!(ui.node.as_deref(), Some(std::path::Path::new("custom/node.exe")));
+        assert_eq!(
+            ui.dir.as_deref(),
+            Some(std::path::Path::new("../panoptikon-ui"))
+        );
+        assert_eq!(
+            ui.node.as_deref(),
+            Some(std::path::Path::new("custom/node.exe"))
+        );
         assert_eq!(ui.build, UiBuildPolicy::Always);
         assert_eq!(
             ui.local_bind_addr().unwrap(),
@@ -1810,8 +1823,10 @@ base_url = "http://127.0.0.1:6342"
             .unwrap();
         };
 
-        write(r#"base_url = "http://127.0.0.1:6339"
-local = true"#);
+        write(
+            r#"base_url = "http://127.0.0.1:6339"
+local = true"#,
+        );
         let err = Settings::load(Some(path.clone())).expect_err("dir is required");
         assert!(format!("{err:#}").contains("upstreams.ui.dir"), "{err:#}");
 
@@ -1832,18 +1847,22 @@ local = true"#);
         write(r#"base_url = "http://192.168.1.5:6339/ui""#);
         Settings::load(Some(path.clone())).expect("proxy-only ui is unrestricted");
 
-        write(r#"base_url = "http://[::1]:6339"
+        write(
+            r#"base_url = "http://[::1]:6339"
 local = true
-dir = "ui""#);
+dir = "ui""#,
+        );
         let settings = Settings::load(Some(path.clone())).unwrap();
         assert_eq!(
             settings.upstreams.ui.local_bind_addr().unwrap(),
             ("::1".to_string(), 6339)
         );
 
-        write(r#"base_url = "http://localhost"
+        write(
+            r#"base_url = "http://localhost"
 local = true
-dir = "ui""#);
+dir = "ui""#,
+        );
         let settings = Settings::load(Some(path)).unwrap();
         assert_eq!(
             settings.upstreams.ui.local_bind_addr().unwrap(),

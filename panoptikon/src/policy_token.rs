@@ -99,8 +99,7 @@ impl TokenKey {
     /// Sign with an explicit expiry (mint's core; separate for tests).
     pub(crate) fn sign(&self, policy_name: &str, expiry_unix: u64) -> String {
         let message = format!("{policy_name}.{expiry_unix}");
-        let mut mac =
-            HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
         mac.update(message.as_bytes());
         let tag = mac.finalize().into_bytes();
         format!("{message}.{}", hex::encode(tag))
@@ -132,8 +131,7 @@ impl TokenKey {
         let expiry: u64 = expiry_str.parse().map_err(|_| TokenError::Malformed)?;
         let tag = hex::decode(tag_hex).map_err(|_| TokenError::Malformed)?;
 
-        let mut mac =
-            HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
         // The signed message is everything before the tag separator.
         mac.update(token[..token.len() - tag_hex.len() - 1].as_bytes());
         // Constant-time comparison: verify_slice goes through subtle's
@@ -214,7 +212,11 @@ mod tests {
         // Tampered name and tampered expiry both break the HMAC.
         let tampered_name = token.replacen("demo", "root", 1);
         assert_eq!(key.verify_at(&tampered_name, now), Err(TokenError::BadHmac));
-        let tampered_expiry = token.replacen(&format!(".{}", now + 100), &format!(".{}", now + 9_999_999), 1);
+        let tampered_expiry = token.replacen(
+            &format!(".{}", now + 100),
+            &format!(".{}", now + 9_999_999),
+            1,
+        );
         assert_eq!(
             key.verify_at(&tampered_expiry, now),
             Err(TokenError::BadHmac)

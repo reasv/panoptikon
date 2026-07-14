@@ -31,11 +31,10 @@ use crate::jobs::dir_poller::{
 };
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
-    ScanTimers, THUMBNAIL_PROCESS_VERSION,
-    build_extension_set, build_file_scan_data, check_folder_validity, current_iso_timestamp,
-    deduplicate_paths, get_last_modified_time_and_size, has_allowed_extension, is_excluded,
-    is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
-    run_post_job_maintenance,
+    ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
+    check_folder_validity, current_iso_timestamp, deduplicate_paths,
+    get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
+    normalize_path, parse_filescan_filter, process_file, run_post_job_maintenance,
 };
 use crate::pql::model::Match;
 
@@ -2128,7 +2127,9 @@ mod tests {
         let cfg = std::path::Path::new("data/index/mydb/config.toml").to_path_buf();
 
         // The scanner's own DB writes must not trigger a resync.
-        assert!(!event_is_relevant(&Event::new(EventKind::Any).add_path(db.clone())));
+        assert!(!event_is_relevant(
+            &Event::new(EventKind::Any).add_path(db.clone())
+        ));
         // A config.toml change must.
         assert!(event_is_relevant(
             &Event::new(EventKind::Any).add_path(cfg.clone())

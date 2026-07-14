@@ -556,7 +556,10 @@ base_url = "http://127.0.0.1:6342"
         let response = reqwest::get(format!("http://{addr}/api/no-such-route"))
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), StatusCode::LOOP_DETECTED.as_u16());
+        assert_eq!(
+            response.status().as_u16(),
+            StatusCode::LOOP_DETECTED.as_u16()
+        );
     }
 
     /// UI-bound proxied requests carry a freshly minted policy token naming
@@ -569,15 +572,13 @@ base_url = "http://127.0.0.1:6342"
         // "absent") in the response body.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let echo = axum::Router::new().fallback(any(
-            |req: Request<Body>| async move {
-                req.headers()
-                    .get(POLICY_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("absent")
-                    .to_string()
-            },
-        ));
+        let echo = axum::Router::new().fallback(any(|req: Request<Body>| async move {
+            req.headers()
+                .get(POLICY_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("absent")
+                .to_string()
+        }));
         tokio::spawn(async move {
             axum::serve(listener, echo).await.unwrap();
         });
@@ -597,8 +598,7 @@ base_url = "http://127.0.0.1:6342"
             db_action: crate::policy::DbAction::Skipped,
             selected_by: crate::policy::PolicySelection::ListenerHost,
         });
-        let response =
-            proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
+        let response = proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
@@ -610,8 +610,7 @@ base_url = "http://127.0.0.1:6342"
             .uri("http://gateway/some/page")
             .body(Body::empty())
             .unwrap();
-        let response =
-            proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
+        let response = proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
@@ -640,7 +639,10 @@ base_url = "http://127.0.0.1:6342"
     #[test]
     fn strips_hop_by_hop_headers_table() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONNECTION, "keep-alive, x-custom-hop".parse().unwrap());
+        headers.insert(
+            header::CONNECTION,
+            "keep-alive, x-custom-hop".parse().unwrap(),
+        );
         headers.insert("keep-alive", "timeout=5".parse().unwrap());
         headers.insert("proxy-connection", "keep-alive".parse().unwrap());
         headers.insert(header::PROXY_AUTHENTICATE, "Basic".parse().unwrap());
@@ -705,7 +707,10 @@ base_url = "http://127.0.0.1:6342"
         headers.insert(header::CONNECTION, "keep-alive, Upgrade".parse().unwrap());
         headers.insert(header::UPGRADE, "websocket".parse().unwrap());
         headers.insert("keep-alive", "timeout=5".parse().unwrap());
-        headers.insert("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap());
+        headers.insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
         headers.insert("sec-websocket-version", "13".parse().unwrap());
 
         let protocol = requested_upgrade(&headers).expect("handshake detected");
@@ -985,11 +990,9 @@ allow = "*"
         let settings = policy_settings();
         let token_key = Arc::new(TokenKey::random());
         let upstream = Upstream::parse("ui", &format!("http://{upstream_addr}")).unwrap();
-        let inference_client = InferenceApiClient::new_with_metadata_cache(
-            format!("http://{upstream_addr}"),
-            false,
-        )
-        .unwrap();
+        let inference_client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{upstream_addr}"), false)
+                .unwrap();
         let state = Arc::new(ProxyState::new(
             upstream.clone(),
             upstream.clone(),

@@ -169,11 +169,7 @@ impl PrewarmPool {
         }
         state.tasks.retain(|task| !task.is_finished());
         state.slots.insert(impl_class.to_owned(), Slot::Spawning);
-        let weak = self
-            .weak
-            .get()
-            .cloned()
-            .expect("weak self is set in new()");
+        let weak = self.weak.get().cloned().expect("weak self is set in new()");
         let task = tokio::spawn(warm_worker_task(
             weak,
             self.spawn.clone(),
@@ -456,7 +452,10 @@ pub(crate) async fn eager_prewarm_tick(manager: &ModelManager) {
         let config = match store.load(&index_db) {
             Ok(config) => config,
             Err(err) => {
-                tracing::warn!(index_db, "eager prewarm: failed to load config, skipping: {err:?}");
+                tracing::warn!(
+                    index_db,
+                    "eager prewarm: failed to load config, skipping: {err:?}"
+                );
                 continue;
             }
         };
@@ -466,14 +465,20 @@ pub(crate) async fn eager_prewarm_tick(manager: &ModelManager) {
         let mut conn = match open_index_db_read(&index_db, &user_data_db).await {
             Ok(conn) => conn,
             Err(err) => {
-                tracing::warn!(index_db, "eager prewarm: failed to open index DB, skipping: {err:?}");
+                tracing::warn!(
+                    index_db,
+                    "eager prewarm: failed to open index DB, skipping: {err:?}"
+                );
                 continue;
             }
         };
         let setters = match get_search_embedding_setters(&mut conn).await {
             Ok(setters) => setters,
             Err(err) => {
-                tracing::warn!(index_db, "eager prewarm: failed to list setters, skipping: {err:?}");
+                tracing::warn!(
+                    index_db,
+                    "eager prewarm: failed to list setters, skipping: {err:?}"
+                );
                 continue;
             }
         };
@@ -530,9 +535,7 @@ mod tests {
         // against a Windows checkout, whose .venv is a Windows venv.
         let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
             Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => {
-                test_venv_python(&root, "Scripts/python.exe")
-            }
+            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
             None => test_venv_python(&root, "bin/python"),
         };
         if !python.is_file() {
@@ -661,7 +664,15 @@ config.impl_class = "echo_test"
         wait_for_pool_state(manager, "prepare_test", "warm").await;
 
         let outputs = manager
-            .predict("prep/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect("predict auto-loads via the claimed worker");
         assert!(
@@ -692,7 +703,15 @@ config.impl_class = "echo_test"
         let manager = &setup.manager;
 
         let outputs = manager
-            .predict("prep/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect("predict via fresh spawn");
         assert!(
@@ -736,7 +755,15 @@ config.impl_class = "echo_test"
             .await
             .expect("second load (claim)");
         let outputs = manager
-            .predict("prep/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect("predict on the claimed worker");
         assert!(
@@ -808,7 +835,15 @@ config.impl_class = "echo_test"
             .await
             .expect("load succeeds via fresh spawn despite the dead parked worker");
         let outputs = manager
-            .predict("prep/test", "k", 10, -1, None, None, vec![data_input(json!(1))])
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
             .await
             .expect("predict");
         assert!(
@@ -955,7 +990,9 @@ config.impl_class = "echo_test"
             "the flag defaults to true"
         );
         cold_config.prewarm_embedding_models = false;
-        store.save(&cold_db, &cold_config).expect("save cold config");
+        store
+            .save(&cold_db, &cold_config)
+            .expect("save cold config");
 
         let setup = test_manager(enabled(false, &[]));
         let manager = &setup.manager;
