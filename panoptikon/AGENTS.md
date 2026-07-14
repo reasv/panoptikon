@@ -28,10 +28,14 @@ Behavior (important)
 - Desktop supervision: the hidden `--desktop-managed` flag enables parent
   control over stdin (`shutdown` or EOF use the normal graceful path), exposes
   `desktop_managed` in client config, and admits the local-only
-  `GET /api/desktop/setup-status` route. That route evaluates only the
+  `GET /api/desktop/setup-status`, folder/continuous-validation, and setup-completion
+  routes. Readiness evaluates only the
   policy-resolved default index database and reports it ready when a currently
   included folder has a matching `file_scans` row; no separate onboarding
-  marker is stored. Serving processes take an
+  marker is stored. Folder validation normalizes staged paths without saving
+  them; continuous whitelist validation also enforces the staged full-scan
+  include/exclude scope. Completion saves both folder lists and the staged
+  continuous-scan configuration before queueing the first folder update. Serving processes take an
   advisory `<root>/runtime/server.lock`; lock contention is a clear startup
   error. Ordinary foreground/Server behavior is unchanged.
   Managed bundled invocation materializes missing embedded Desktop configs
@@ -68,6 +72,7 @@ Behavior (important)
   - Job completion flows through a watcher task: it observes the job task ending (return, error, panic, or abort) and sends `JobCompleted` to the runner, which clears its busy state before forwarding `RunnerFinished` to the queue. This ordering means the queue's next `RunJob` can never hit a stale busy state, and a panicking job cannot wedge the queue.
   - Cancellation aborts the job task; extraction item tasks live in a `JoinSet` owned by that task, so they are aborted with it instead of continuing to run and write. Continuous-scan pause/resume uses `JobPauseGuard` (Drop-based), so a cancelled or panicking job cannot leave a DB's continuous scan paused.
   - File scan jobs (`folder_rescan`, `folder_update`) run through `FileScanService` and the index writer actor for writes.
+  - Empty included folders are accepted only when the selected index DB has no indexed file rows beneath them. If rows exist, full scans and continuous-watch startup reject the empty root to protect against a temporarily unavailable drive or network share.
   - Data extraction jobs stream items concurrently and serialize all DB writes through the index writer actor. Job `batch_size` caps both the number of items in flight and the total number of work units inside in-flight inference requests (shared unit semaphore); items with more work units than `batch_size` (e.g. many-page PDFs) are split into multiple sequential requests and their outputs concatenated in order.
   - `POST /api/jobs/data/extraction` validates models and resolves effective `batch_size`/`threshold` at enqueue time (mirrors Python): a bad inference ID fails the request, and queue status shows the resolved values.
   - Threshold semantics mirror Python: a zero threshold anywhere in the chain (request, job settings) means "unset" and falls back to the model default; a still-unset/zero final value is omitted from inference payloads so the server-side fallback (e.g. mcut for taggers) applies.
@@ -217,7 +222,7 @@ Continuous File Scanning (Implemented)
   - If a move appears as delete+create (no rename event), process it directly as delete+create.
 - Cross-platform file watching:
   - Use `notify` with native backends (Windows/macOS/Linux).
-- Optional polling mode when `[continuous_filescan].poll_interval_secs` is set (uses `notify::PollWatcher`).
+- Optional polling mode when `[continuous_filescan].poll_interval_secs` is set uses the hierarchical directory-mtime poller: idle passes stat directories and enumerate only changed directories, rather than rescanning or hashing every file. It detects entry changes but may miss in-place content edits until the next full scan.
 - Watcher overflow logs a warning (index_db + watched roots); no automatic recovery action.
 - For unreliable shares (SMB/NFS), add an explicit config opt-in to use `notify::PollWatcher` with a configurable interval (e.g., `[continuous_filescan].poll_interval_secs`); default remains native watchers.
 - When `[continuous_filescan].included_folders` is non-empty, watcher roots are limited to those paths; they must be within the global `included_folders` and not under `excluded_folders`, otherwise continuous scanning is disabled for that DB until fixed.

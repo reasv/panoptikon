@@ -361,13 +361,25 @@ async fn execute_folder_scan(
     excluded_folders: &[String],
     options: ScanOptions,
 ) -> ApiResult<Vec<i64>> {
-    let mut all_included = included_folders.to_vec();
-    all_included.retain(|folder| check_folder_validity(folder));
+    let mut conn = open_index_db_read(index_db, user_data_db).await?;
+    let mut all_included = Vec::new();
+    for folder in included_folders {
+        if check_folder_validity(folder)
+            || (folder_is_empty(folder)
+                && !crate::db::setup::has_indexed_files_under(&mut conn, folder).await?)
+        {
+            all_included.push(folder.clone());
+        } else if folder_is_empty(folder) {
+            tracing::warn!(
+                folder,
+                "empty folder still has indexed files; skipping to protect indexed entries"
+            );
+        }
+    }
     let starting_points = deduplicate_paths(&all_included);
 
     // Scans interrupted before completion leave rows with a NULL end_time;
     // close them so they are not reported as still running.
-    let mut conn = open_index_db_read(index_db, user_data_db).await?;
     for folder in &starting_points {
         while let Some(stale_scan_id) = get_open_file_scan_id(&mut conn, folder).await? {
             call_index_db_writer(index_db, |reply| IndexDbWriterMessage::CloseFileScan {
@@ -2824,6 +2836,14 @@ pub(crate) fn check_folder_validity(folder: &str) -> bool {
     }
 }
 
+pub(crate) fn folder_is_empty(folder: &str) -> bool {
+    let path = Path::new(folder);
+    path.is_dir()
+        && fs::read_dir(path)
+            .ok()
+            .is_some_and(|mut entries| entries.next().is_none())
+}
+
 pub(crate) fn deduplicate_paths(paths: &[String]) -> Vec<String> {
     let mut normalized = paths
         .iter()
@@ -3299,6 +3319,41 @@ LIMIT 1
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let folders_after = get_folders_from_database(&mut conn, true).await.unwrap();
         assert_eq!(folders_after, folders);
+    }
+
+    #[tokio::test]
+    async fn folder_update_starts_a_scan_for_a_safe_empty_folder() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let empty_dir = root.join("empty-watch-target");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![empty_dir.to_string_lossy().into_owned()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 1 },
+        );
+        let result = service.run_folder_update().await.unwrap();
+        assert_eq!(result.scan_ids.len(), 1);
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let scans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM file_scans WHERE path != '<continuous>'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(scans, 1);
     }
 
     // A folder registered by an update that failed before its scan completed

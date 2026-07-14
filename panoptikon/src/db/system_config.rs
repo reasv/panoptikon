@@ -202,18 +202,19 @@ impl SystemConfigStore {
 
 fn normalize_folder_lists(config: &mut SystemConfig) {
     if !config.included_folders.is_empty() {
-        config.included_folders = clean_folder_list(&config.included_folders);
+        config.included_folders = normalize_folder_list(&config.included_folders);
     }
     if !config.excluded_folders.is_empty() {
-        config.excluded_folders = clean_folder_list(&config.excluded_folders);
+        config.excluded_folders = normalize_folder_list(&config.excluded_folders);
     }
     if !config.continuous_filescan.included_folders.is_empty() {
         config.continuous_filescan.included_folders =
-            clean_folder_list(&config.continuous_filescan.included_folders);
+            normalize_folder_list(&config.continuous_filescan.included_folders);
     }
 }
 
-fn clean_folder_list(folder_list: &[String]) -> Vec<String> {
+/// Applies the same path cleanup used when a scan configuration is saved.
+pub(crate) fn normalize_folder_list(folder_list: &[String]) -> Vec<String> {
     folder_list
         .iter()
         .filter_map(|entry| {

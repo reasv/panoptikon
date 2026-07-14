@@ -75,7 +75,10 @@ impl Modify for JsonValueSchema {
         crate::api::db::db_info,
         crate::api::db::db_create,
         crate::api::client_config::client_config,
-        crate::api::desktop::setup_status
+        crate::api::desktop::setup_status,
+        crate::api::desktop::validate_setup_folders,
+        crate::api::desktop::validate_setup_continuous_folders,
+        crate::api::desktop::complete_setup
     ),
     components(
         schemas(
@@ -142,6 +145,12 @@ impl Modify for JsonValueSchema {
             crate::api::client_config::ClientConfigResponse,
             crate::api::client_config::ClientCapabilities,
             crate::api::desktop::DesktopSetupStatus,
+            crate::api::desktop::DesktopFolderSelection,
+            crate::api::desktop::DesktopContinuousScanSelection,
+            crate::api::desktop::DesktopSetupCompleteRequest,
+            crate::api::desktop::DesktopSetupCompleteResponse,
+            crate::db::setup::FolderValidation,
+            crate::db::setup::FolderValidationIssue,
             crate::pql::EmbeddingCacheEntry,
             crate::pql::EmbeddingCacheStats,
             crate::pql::model::PqlQuery,

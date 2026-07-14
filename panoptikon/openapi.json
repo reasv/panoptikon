@@ -766,6 +766,118 @@
         }
       }
     },
+    "/api/desktop/setup-continuous/validate": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_validate_setup_continuous_folders",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopContinuousScanSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FolderValidation"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/desktop/setup-folders/validate": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_validate_setup_folders",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopFolderSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FolderValidation"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/desktop/setup-status": {
       "get": {
         "tags": [
@@ -805,6 +917,62 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DesktopSetupStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/desktop/setup/complete": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "complete_desktop_setup",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopSetupCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopSetupCompleteResponse"
                 }
               }
             }
@@ -4375,6 +4543,119 @@
           }
         }
       },
+      "DesktopContinuousScanSelection": {
+        "type": "object",
+        "required": [
+          "included_folders"
+        ],
+        "properties": {
+          "continuous_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "excluded_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "included_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "new_database": {
+            "type": "boolean",
+            "description": "A new database has no indexed rows, so empty folders are safe."
+          }
+        }
+      },
+      "DesktopFolderSelection": {
+        "type": "object",
+        "required": [
+          "included_folders"
+        ],
+        "properties": {
+          "excluded_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "included_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "new_database": {
+            "type": "boolean",
+            "description": "A new database has no indexed rows, so empty folders are safe."
+          }
+        }
+      },
+      "DesktopSetupCompleteRequest": {
+        "type": "object",
+        "required": [
+          "included_folders"
+        ],
+        "properties": {
+          "continuous_filescan_enabled": {
+            "type": "boolean"
+          },
+          "continuous_filescan_included_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "continuous_filescan_poll_interval_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "excluded_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "included_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "new_index_db": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When present, create and configure this index instead of the default."
+          }
+        }
+      },
+      "DesktopSetupCompleteResponse": {
+        "type": "object",
+        "required": [
+          "index_db",
+          "job"
+        ],
+        "properties": {
+          "index_db": {
+            "type": "string"
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobModel"
+          }
+        }
+      },
       "DesktopSetupStatus": {
         "type": "object",
         "required": [
@@ -4776,6 +5057,49 @@
           "unique": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "FolderValidation": {
+        "type": "object",
+        "required": [
+          "included_folders",
+          "excluded_folders",
+          "errors"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FolderValidationIssue"
+            }
+          },
+          "excluded_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "included_folders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "FolderValidationIssue": {
+        "type": "object",
+        "required": [
+          "path",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
           }
         }
       },

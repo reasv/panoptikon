@@ -233,6 +233,13 @@ jobs API.
 File scan jobs honor the `filescan_filter` (PQL `Match`) during stage-1/2
 filtering, and apply `job_filters` entries that include `file_scan` after
 scans to delete files that violate those rules.
+
+An empty included directory is accepted when the selected index database has
+no indexed files beneath it, allowing a new database to begin with a future
+watch target. If indexed rows already exist beneath an empty directory, full
+and continuous scans reject that root: the apparent emptiness may be a
+temporarily unavailable external drive or network share, and accepting it
+could delete valid indexed entries.
 The system config now parses `job_filters`/`filescan_filter` as PQL objects;
 invalid PQL in config will fail to load (matching Python behavior).
 
@@ -248,8 +255,12 @@ those paths; they must be under the DB’s global `included_folders` and not und
 `excluded_folders`, otherwise continuous scanning is disabled for that DB until
 fixed. To force polling (e.g., for unreliable shares), set
 `[continuous_filescan].poll_interval_secs` to a number of seconds (uses
-`notify::PollWatcher` instead of native watchers). There is no native watcher
-exclude support, so continuous-scan excludes are not implemented.
+the hierarchical directory-mtime poller instead of native events). An idle
+poll pass stats each directory and enumerates only directories whose mtime
+changed; it does not rescan or hash every file. Polling detects entry changes
+but not necessarily in-place file edits, so scheduled full scans remain the
+ground truth. There is no separate continuous-scan exclude list; the database's
+global `excluded_folders` still apply.
 
 ## Local inference (inferio orchestrator)
 
@@ -563,7 +574,14 @@ Server holds an exclusive advisory lock at `<root>/runtime/server.lock`; a
 second process for that root fails clearly.
 
 Desktop-managed mode adds `desktop_managed = true` to `/api/client-config` and
-enables `GET /api/desktop/setup-status`. The endpoint evaluates the
+enables narrow `/api/desktop/setup-*` lifecycle endpoints. Folder validation
+normalizes and checks staged included/excluded paths without changing
+configuration. Continuous-folder validation additionally requires each
+optional watch root to be inside a staged include and outside every exclusion.
+Setup completion revalidates them, optionally creates a named index database,
+saves the folder and continuous-scan settings, and queues its first
+folder-update job.
+`GET /api/desktop/setup-status` evaluates the
 policy-resolved default index database and reports it ready once at least one
 currently included folder has a matching `file_scans` row, meaning a scan for
 that folder has started at some point. It does not inspect other databases or

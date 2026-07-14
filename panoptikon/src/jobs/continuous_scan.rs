@@ -32,7 +32,7 @@ use crate::jobs::dir_poller::{
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
     ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
-    check_folder_validity, current_iso_timestamp, deduplicate_paths,
+    check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
     get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
     normalize_path, parse_filescan_filter, process_file, run_post_job_maintenance,
 };
@@ -250,8 +250,15 @@ impl ScanStats {
 }
 
 pub(crate) fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
+    compute_watch_roots_with_safe_empty(config, &HashSet::new())
+}
+
+fn compute_watch_roots_with_safe_empty(
+    config: &SystemConfig,
+    safe_empty: &HashSet<String>,
+) -> WatchRootsOutcome {
     let mut included = config.included_folders.clone();
-    included.retain(|folder| check_folder_validity(folder));
+    included.retain(|folder| check_folder_validity(folder) || safe_empty.contains(folder));
     let global_included = deduplicate_paths(&included);
     let global_included_roots: Vec<PathBuf> = global_included
         .iter()
@@ -271,7 +278,7 @@ pub(crate) fn compute_watch_roots(config: &SystemConfig) -> WatchRootsOutcome {
         watch_roots = global_included_roots.clone();
     } else {
         let mut continuous = continuous_includes.clone();
-        continuous.retain(|folder| check_folder_validity(folder));
+        continuous.retain(|folder| check_folder_validity(folder) || safe_empty.contains(folder));
         let deduped = deduplicate_paths(&continuous);
         for folder in &deduped {
             let path = PathBuf::from(folder);
@@ -395,8 +402,25 @@ impl ContinuousScanState {
         .await;
     }
 
-    fn refresh_roots(&mut self) -> bool {
-        let outcome = compute_watch_roots(&self.config);
+    async fn refresh_roots(&mut self) -> bool {
+        let mut safe_empty = HashSet::new();
+        if let Ok(mut conn) = open_index_db_read(&self.index_db, &self.user_data_db).await {
+            for folder in self
+                .config
+                .included_folders
+                .iter()
+                .chain(self.config.continuous_filescan.included_folders.iter())
+            {
+                if folder_is_empty(folder)
+                    && crate::db::setup::has_indexed_files_under(&mut conn, folder)
+                        .await
+                        .is_ok_and(|indexed| !indexed)
+                {
+                    safe_empty.insert(folder.clone());
+                }
+            }
+        }
+        let outcome = compute_watch_roots_with_safe_empty(&self.config, &safe_empty);
         self.watch_roots = outcome.watch_roots;
         self.excluded_roots = outcome.excluded_roots;
         self.invalid_includes = outcome.invalid_includes;
@@ -800,7 +824,7 @@ impl Actor for ContinuousScanActor {
             deletions_since_maintenance: 0,
         };
 
-        let roots_ok = state.refresh_roots();
+        let roots_ok = state.refresh_roots().await;
         let _ = state.close_stale_scan().await;
         if state.config.continuous_filescan.enabled && roots_ok {
             let _ = state.start_scan().await;
@@ -840,7 +864,7 @@ impl Actor for ContinuousScanActor {
                         return Ok(());
                     }
                 };
-                let roots_ok = state.refresh_roots();
+                let roots_ok = state.refresh_roots().await;
                 if !state.config.continuous_filescan.enabled || !roots_ok {
                     state.paused = true;
                     state.watcher = None;
@@ -866,7 +890,7 @@ impl Actor for ContinuousScanActor {
                 let prev_interval = state.config.continuous_filescan.poll_interval_secs;
 
                 state.config = config;
-                let roots_ok = state.refresh_roots();
+                let roots_ok = state.refresh_roots().await;
                 let now_enabled = state.config.continuous_filescan.enabled;
                 if !now_enabled || !roots_ok {
                     state.paused = true;
