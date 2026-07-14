@@ -227,9 +227,10 @@ at all) against the same data folder, or extraction jobs will be scheduled
 twice. A global job-queue actor holds the in-memory queue and running job
 state, and a job-runner actor executes one job at a time. File scan jobs
 (`folder_rescan`, `folder_update`) run through `FileScanService`, which writes
-via the index DB writer actor. Queue status mirrors Python semantics (running
-job first, then queued jobs), and queued/running jobs can be cancelled via the
-jobs API.
+via the index DB writer actor. Queue status returns the running job first, then
+queued jobs, plus a bounded process-local outcome list for the 256 most recent
+completed, failed, or cancelled jobs. Queued/running jobs can be cancelled via
+the jobs API.
 File scan jobs honor the `filescan_filter` (PQL `Match`) during stage-1/2
 filtering, and apply `job_filters` entries that include `file_scan` after
 scans to delete files that violate those rules.
@@ -579,8 +580,10 @@ normalizes and checks staged included/excluded paths without changing
 configuration. Continuous-folder validation additionally requires each
 optional watch root to be inside a staged include and outside every exclusion.
 Setup completion revalidates them, optionally creates a named index database,
-saves the folder and continuous-scan settings, and queues its first
-folder-update job.
+saves file-type, folder, continuous-scan, model-plan, and schedule settings,
+then atomically queues an initial folder update followed by every selected
+model. `POST /api/desktop/setup-schedule/preview` validates a staged cron string
+and returns its next local-time occurrence without saving it.
 `GET /api/desktop/setup-status` evaluates the
 policy-resolved default index database and reports it ready once at least one
 currently included folder has a matching `file_scans` row, meaning a scan for

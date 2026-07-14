@@ -543,14 +543,24 @@ The initial wizard MUST support:
    two-tab editor, with no configuration writes while moving between steps;
 3. normalizing and validating reachability on Continue, with path-specific
    failures displayed inside the scrolling content region;
-4. staging optional continuous scanning, including a local/native versus
+4. selecting at least one supported file category (images, video, audio, PDF,
+   or HTML) before configuring change detection;
+5. staging optional continuous scanning, including a local/native versus
    network/polling choice, polling interval, and an optional watched-folder
    whitelist constrained by the previously selected full-scan folders;
-5. saving the staged scan configuration and starting the initial scan only at
-   final completion;
-6. explaining extraction/model setup without requiring a long extraction job
-   to finish before onboarding completes; and
-7. opening `/search` only after first-database readiness is satisfied.
+6. freely selecting zero or more models in registry declaration order, with
+   optional batch-size and confidence-threshold overrides and no implicit
+   model selection;
+7. configuring the standing routine as daily-at-time, every N hours, weekly,
+   or a custom five-field cron expression, with non-mutating validation and an
+   exact next-run preview in local time;
+8. presenting a structured review of every staged choice before any write or
+   job action, with an explicit Start Scan commit action;
+9. saving the staged configuration and atomically starting the initial folder
+   update followed by the selected models only from that review; and
+10. advancing irreversibly to a dedicated landing page that polls the exact
+    returned queue IDs, shows scan/model progress, explains background work,
+    and offers database-scoped Search and Scan actions in the system browser.
 
 The folder editor keeps textareas for pasted one-path-per-line input and, in
 Desktop, offers a native multi-folder picker that appends selections to the
@@ -569,10 +579,21 @@ full scan. Its optional whitelist and nested reminder of the staged full-scan
 folders are collapsed by default. An empty whitelist watches every included
 folder. All controls remain staged until final completion.
 
+The Schedule step defaults automatic routine processing to enabled with the
+existing daily 03:00 schedule. Every automatic or later manual routine run
+performs a full rescan followed by the persisted model list. The first run is
+always queued when the wizard finishes, even if later automatic runs are
+disabled; it uses the folder-update scan path so a new database is not scanned
+twice while its folder rows are first synchronized.
+
 The wizard fills its webview as three independent vertical regions: a fixed
 step indicator, a `min-height: 0` internally scrolling step-content region,
 and fixed Back/Continue controls. Resizing the window may reduce the
 middle region but MUST never move the navigation controls below the viewport.
+After Start Scan, Back is removed: the final Scan step owns its actions
+inside the scrolling body and remains useful while jobs continue. Search may
+be opened before completion so already indexed items can be explored; Scan
+opens the same database for full queue details, management, and cancellation.
 
 ### 11.3 Webview security
 
@@ -581,6 +602,10 @@ surfaces.
 
 - The bundled control frontend receives only narrow, window-labelled Tauri
   capabilities.
+- The server-hosted setup page may invoke only the URL-validated multi-folder
+  picker and a native opener restricted to `/search` or `/scan`; the latter
+  constructs the localhost URL and database query itself before opening the
+  system browser.
 - The `launch` webview on an `http://localhost:<port>` origin receives only core
   IPC access and the purpose-built `choose_scan_folders` command. Tauri applies
   remote capabilities to an IPC caller's origin rather than its current path,

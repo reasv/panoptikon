@@ -34,8 +34,11 @@ Behavior (important)
   included folder has a matching `file_scans` row; no separate onboarding
   marker is stored. Folder validation normalizes staged paths without saving
   them; continuous whitelist validation also enforces the staged full-scan
-  include/exclude scope. Completion saves both folder lists and the staged
-  continuous-scan configuration before queueing the first folder update. Serving processes take an
+  include/exclude scope. Completion saves file types, both folder lists, the
+  staged continuous-scan configuration, the cron model list, and its routine
+  schedule. It atomically queues an initial folder update followed by the
+  selected models; later cron/manual runs use a full rescan instead. Schedule
+  preview parses staged cron strings without saving them. Serving processes take an
   advisory `<root>/runtime/server.lock`; lock contention is a clear startup
   error. Ordinary foreground/Server behavior is unchanged.
   Managed bundled invocation materializes missing embedded Desktop configs
@@ -82,7 +85,7 @@ Behavior (important)
   - Tag output text entries keep Python's ordering: namespaces in first-appearance order, tags confidence-sorted within each namespace. Empty `metadata` objects produce no metadata text entry.
   - `data_log` start and end times use the same local-time format (`db::extraction_write::current_iso_timestamp`), and incomplete-job cleanup runs before the remaining count so `[jobs].atomic_extraction_jobs` cleanup is reflected in it.
   - File scan jobs honor `filescan_filter` (PQL `Match`) during stage-1/2 file filtering and apply `job_filters` entries that include `file_scan` after scans to delete files that violate the rules.
-  - Queue status mirrors Python: running job is listed first with `running=true`, followed by queued jobs.
+  - Queue status lists the running job first with `running=true`, followed by queued jobs, and includes a bounded process-local `outcomes` list for the 256 most recent completed, failed, or cancelled jobs. Desktop setup uses those outcomes to distinguish successful completion from failure instead of inferring it from queue disappearance.
   - Queue cancel can target queued jobs and the running job (best-effort cancellation).
   - Cron jobs are fully ported (`jobs/cron.rs`): a scheduler actor ticks every minute over all index DBs, evaluating each DB's `cron_schedule` (croner, croniter-compatible 5-field patterns, local time) with Python's semantics — config re-read every tick, a changed string recomputes the next fire from now, no catch-up for missed runs (deliberate: startup must never kick off a GPU-heavy run on its own). The scheduler starts whenever `upstreams.api.local = true`.
   - `run_cronjob` (shared by the scheduler and the manual trigger, which deliberately ignores `enable_cron_job`) enqueues a folder rescan first, then extraction jobs ordered items/files-targeting models before derived-data models; all tagged `cronjob`. The batch is enqueued atomically and skipped while a previous cronjob for that DB is queued/running (dedup lives inside the queue actor to avoid check-then-enqueue races). A model unknown to the inference server is skipped; if the metadata fetch itself fails, jobs are enqueued unordered instead of consuming the slot (deliberate improvement over Python).
