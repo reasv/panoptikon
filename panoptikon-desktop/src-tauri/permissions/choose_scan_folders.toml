@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-choose-scan-folders"
+description = "Allows the setup window to open Panoptikon's native scan-folder picker."
+commands.allow = ["choose_scan_folders"]

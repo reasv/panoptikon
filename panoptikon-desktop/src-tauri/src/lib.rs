@@ -26,6 +26,7 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt as _;
 use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::Mutex;
@@ -84,7 +85,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
-            set_start_at_login, open_known_folder, log_tail,
+            set_start_at_login, open_known_folder, log_tail, choose_scan_folders,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
             relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
         ])
@@ -820,6 +821,44 @@ fn validate_control(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 
+fn validate_setup_window(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() != "launch" {
+        return Err("command is restricted to the setup window".into());
+    }
+    let url = window.url().map_err(|error| error.to_string())?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("localhost")
+        || url.path() != "/desktop/setup"
+    {
+        return Err("command is restricted to the local setup page".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn choose_scan_folders(window: WebviewWindow) -> Result<Vec<String>, String> {
+    validate_setup_window(&window)?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window
+        .app_handle()
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose folders for Panoptikon")
+        .pick_folders(move |folders| {
+            let _ = send.send(folders);
+        });
+    let folders = receive
+        .await
+        .map_err(|_| "the folder picker closed unexpectedly".to_string())?
+        .unwrap_or_default();
+    Ok(folders
+        .into_iter()
+        .filter_map(|folder| folder.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
 #[tauri::command]
 async fn get_status(window: WebviewWindow, app: AppHandle) -> Result<StatusSnapshot, String> {
     validate_control(&window)?;
@@ -1262,8 +1301,8 @@ mod tests {
         );
     }
 
-    /// Only the bundled control window receives Tauri core capabilities; the
-    /// external onboarding window receives none and no plugin grants exist.
+    /// The bundled control window remains core-only. The external setup page
+    /// receives one app command, whose implementation validates its URL again.
     #[test]
     fn control_capability_is_window_scoped_and_core_only() {
         let capability: serde_json::Value =
@@ -1278,6 +1317,21 @@ mod tests {
         assert!(launch_html.contains("spinner_text.svg"));
         assert!(!launch_js.contains("__TAURI__"));
         assert!(!launch_js.contains("invoke("));
+
+        let setup: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/setup.json")).unwrap();
+        assert_eq!(setup["windows"], serde_json::json!(["launch"]));
+        assert_eq!(
+            setup["remote"]["urls"],
+            serde_json::json!(["http://localhost:*"])
+        );
+        assert_eq!(
+            setup["permissions"],
+            serde_json::json!(["core:default", "allow-choose-scan-folders"])
+        );
+        assert_eq!(setup["local"], false);
+        let picker_permission = include_str!("../permissions/choose_scan_folders.toml");
+        assert!(picker_permission.contains("commands.allow = [\"choose_scan_folders\"]"));
     }
 
     #[test]
