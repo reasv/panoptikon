@@ -878,6 +878,36 @@
         }
       }
     },
+    "/api/desktop/setup-schedule/preview": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_preview_setup_schedule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopSchedulePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopSchedulePreviewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/desktop/setup-status": {
       "get": {
         "tags": [
@@ -4597,6 +4627,40 @@
           }
         }
       },
+      "DesktopSchedulePreviewRequest": {
+        "type": "object",
+        "required": [
+          "cron_schedule"
+        ],
+        "properties": {
+          "cron_schedule": {
+            "type": "string"
+          }
+        }
+      },
+      "DesktopSchedulePreviewResponse": {
+        "type": "object",
+        "required": [
+          "valid"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        }
+      },
       "DesktopSetupCompleteRequest": {
         "type": "object",
         "required": [
@@ -4620,6 +4684,18 @@
             "format": "int64",
             "minimum": 0
           },
+          "cron_jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CronJob"
+            }
+          },
+          "cron_schedule": {
+            "type": "string"
+          },
+          "enable_cron_job": {
+            "type": "boolean"
+          },
           "excluded_folders": {
             "type": "array",
             "items": {
@@ -4638,6 +4714,21 @@
               "null"
             ],
             "description": "When present, create and configure this index instead of the default."
+          },
+          "scan_audio": {
+            "type": "boolean"
+          },
+          "scan_html": {
+            "type": "boolean"
+          },
+          "scan_images": {
+            "type": "boolean"
+          },
+          "scan_pdf": {
+            "type": "boolean"
+          },
+          "scan_video": {
+            "type": "boolean"
           }
         }
       },
@@ -4645,14 +4736,18 @@
         "type": "object",
         "required": [
           "index_db",
-          "job"
+          "jobs"
         ],
         "properties": {
           "index_db": {
             "type": "string"
           },
-          "job": {
-            "$ref": "#/components/schemas/JobModel"
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobModel"
+            },
+            "description": "The immediate first run: full rescan followed by configured models.\nEmpty only when an earlier cron-style run for this DB is still active."
           }
         }
       },
@@ -5483,6 +5578,36 @@
             "format": "double"
           }
         }
+      },
+      "JobOutcomeModel": {
+        "type": "object",
+        "required": [
+          "queue_id",
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queue_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobOutcomeStatus"
+          }
+        }
+      },
+      "JobOutcomeStatus": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "failed",
+          "cancelled"
+        ]
       },
       "JobSettings": {
         "type": "object",
@@ -7192,9 +7317,17 @@
       "QueueStatusModel": {
         "type": "object",
         "required": [
-          "queue"
+          "queue",
+          "outcomes"
         ],
         "properties": {
+          "outcomes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobOutcomeModel"
+            },
+            "description": "Bounded, process-local outcomes for jobs that recently left the queue."
+          },
           "queue": {
             "type": "array",
             "items": {

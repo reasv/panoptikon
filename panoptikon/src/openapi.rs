@@ -78,6 +78,7 @@ impl Modify for JsonValueSchema {
         crate::api::desktop::setup_status,
         crate::api::desktop::validate_setup_folders,
         crate::api::desktop::validate_setup_continuous_folders,
+        crate::api::desktop::preview_setup_schedule,
         crate::api::desktop::complete_setup
     ),
     components(
@@ -108,6 +109,8 @@ impl Modify for JsonValueSchema {
             crate::api::jobs::ContinuousScanMode,
             crate::api::jobs::ContinuousScanStatusResponse,
             crate::jobs::queue::JobModel,
+            crate::jobs::queue::JobOutcomeModel,
+            crate::jobs::queue::JobOutcomeStatus,
             crate::jobs::queue::QueueStatusModel,
             crate::jobs::queue::JobType,
             crate::db::file_scans::FileScanRecord,
@@ -147,6 +150,8 @@ impl Modify for JsonValueSchema {
             crate::api::desktop::DesktopSetupStatus,
             crate::api::desktop::DesktopFolderSelection,
             crate::api::desktop::DesktopContinuousScanSelection,
+            crate::api::desktop::DesktopSchedulePreviewRequest,
+            crate::api::desktop::DesktopSchedulePreviewResponse,
             crate::api::desktop::DesktopSetupCompleteRequest,
             crate::api::desktop::DesktopSetupCompleteResponse,
             crate::db::setup::FolderValidation,

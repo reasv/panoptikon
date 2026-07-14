@@ -59,6 +59,23 @@ pub(crate) struct JobModel {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct QueueStatusModel {
     pub queue: Vec<JobModel>,
+    /// Bounded, process-local outcomes for jobs that recently left the queue.
+    pub outcomes: Vec<JobOutcomeModel>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JobOutcomeStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct JobOutcomeModel {
+    pub queue_id: i64,
+    pub status: JobOutcomeStatus,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +167,7 @@ pub(crate) struct JobQueueState {
     queue: VecDeque<Job>,
     queued_jobs: HashMap<i64, Job>,
     running_job: Option<Job>,
+    outcomes: VecDeque<JobOutcomeModel>,
     job_counter: i64,
     runner: ActorRef<JobRunnerMessage>,
     shutting_down: bool,
@@ -213,6 +231,7 @@ impl Actor for JobQueueActor {
             queue: VecDeque::new(),
             queued_jobs: HashMap::new(),
             running_job: None,
+            outcomes: VecDeque::new(),
             job_counter: 0,
             runner,
             shutting_down: false,
@@ -277,7 +296,10 @@ impl Actor for JobQueueActor {
                 for job in state.queue.iter() {
                     queue.push(JobModel::from_job(job, false));
                 }
-                let _ = reply.send(Ok(QueueStatusModel { queue }));
+                let _ = reply.send(Ok(QueueStatusModel {
+                    queue,
+                    outcomes: state.outcomes.iter().cloned().collect(),
+                }));
             }
             JobQueueMessage::CancelQueued { queue_ids, reply } => {
                 let mut cancelled = Vec::new();
@@ -294,6 +316,7 @@ impl Actor for JobQueueActor {
                     }
                     if let Some(job) = state.queued_jobs.remove(&queue_id) {
                         state.queue.retain(|entry| entry.queue_id != queue_id);
+                        record_outcome(state, job.queue_id, JobOutcomeStatus::Cancelled, None);
                         cancelled.push(job.queue_id);
                     }
                 }
@@ -306,9 +329,20 @@ impl Actor for JobQueueActor {
             JobQueueMessage::RunnerFinished { queue_id, result } => {
                 if let Some(running) = state.running_job.as_ref() {
                     if running.queue_id == queue_id {
+                        let error = result.error.clone();
+                        record_outcome(
+                            state,
+                            queue_id,
+                            if result.success {
+                                JobOutcomeStatus::Completed
+                            } else {
+                                JobOutcomeStatus::Failed
+                            },
+                            error.clone(),
+                        );
                         if !result.success {
                             tracing::error!(
-                                error = %result.error.unwrap_or_else(|| "unknown job error".to_string()),
+                                error = %error.unwrap_or_else(|| "unknown job error".to_string()),
                                 queue_id,
                                 "job failed"
                             );
@@ -353,6 +387,23 @@ fn push_job(state: &mut JobQueueState, request: JobRequest) -> JobModel {
     model
 }
 
+fn record_outcome(
+    state: &mut JobQueueState,
+    queue_id: i64,
+    status: JobOutcomeStatus,
+    error: Option<String>,
+) {
+    const MAX_RECENT_OUTCOMES: usize = 256;
+    state.outcomes.push_back(JobOutcomeModel {
+        queue_id,
+        status,
+        error,
+    });
+    while state.outcomes.len() > MAX_RECENT_OUTCOMES {
+        state.outcomes.pop_front();
+    }
+}
+
 async fn start_next_job(state: &mut JobQueueState) {
     if state.shutting_down || state.running_job.is_some() {
         return;
@@ -372,6 +423,12 @@ async fn start_next_job(state: &mut JobQueueState) {
         .is_err()
     {
         tracing::error!(queue_id = job.queue_id, "job runner unavailable");
+        record_outcome(
+            state,
+            job.queue_id,
+            JobOutcomeStatus::Failed,
+            Some("job runner unavailable".into()),
+        );
         return;
     }
     match rx.await {
@@ -380,9 +437,21 @@ async fn start_next_job(state: &mut JobQueueState) {
         }
         Ok(Err(err)) => {
             tracing::error!(error = ?err, queue_id = job.queue_id, "job runner rejected job");
+            record_outcome(
+                state,
+                job.queue_id,
+                JobOutcomeStatus::Failed,
+                Some(format!("{err:?}")),
+            );
         }
         Err(_) => {
             tracing::error!(queue_id = job.queue_id, "job runner dropped response");
+            record_outcome(
+                state,
+                job.queue_id,
+                JobOutcomeStatus::Failed,
+                Some("job runner dropped its response".into()),
+            );
         }
     }
 }
@@ -401,6 +470,7 @@ async fn cancel_running_job_inner(state: &mut JobQueueState) -> Option<i64> {
         Ok(Ok(Some(queue_id))) => {
             if running.queue_id == queue_id {
                 state.running_job = None;
+                record_outcome(state, queue_id, JobOutcomeStatus::Cancelled, None);
                 start_next_job(state).await;
                 Some(queue_id)
             } else {
@@ -773,7 +843,7 @@ mod tests {
             tag: Some("400".to_string()),
             ..job.clone()
         };
-        let _first = enqueue_on(&queue, job).await;
+        let first = enqueue_on(&queue, job).await;
         let second = enqueue_on(&queue, job2).await;
 
         // At t=300ms the first job (200ms) has finished and the second
@@ -787,6 +857,9 @@ mod tests {
         );
         assert_eq!(status.queue[0].queue_id, second.queue_id);
         assert!(status.queue[0].running);
+        assert!(status.outcomes.iter().any(|outcome| {
+            outcome.queue_id == first.queue_id && outcome.status == JobOutcomeStatus::Completed
+        }));
 
         queue.stop(None);
         handle.await.unwrap();

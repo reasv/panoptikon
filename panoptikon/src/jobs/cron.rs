@@ -45,6 +45,14 @@ pub(crate) fn validate_cron_schedule(schedule: &str) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// Returns the first occurrence strictly after now, using the same local-time
+/// parser and semantics as the scheduler.
+pub(crate) fn next_cron_occurrence(schedule: &str) -> Result<DateTime<Local>, String> {
+    let cron = Cron::from_str(schedule).map_err(|err| err.to_string())?;
+    cron.find_next_occurrence(&Local::now(), false)
+        .map_err(|err| err.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Pure scheduling core (port of schedule.py)
 // ---------------------------------------------------------------------------
@@ -128,16 +136,29 @@ fn order_cron_jobs(jobs: Vec<(CronJob, Option<Vec<String>>)>) -> Vec<CronJob> {
 /// or running. Runs regardless of `enable_cron_job` — the manual trigger uses
 /// the cron set as "the jobs to run now".
 pub(crate) async fn run_cronjob(index_db: &str, user_data_db: &str) -> ApiResult<CronRunOutcome> {
+    run_cronjob_with_scan(index_db, user_data_db, JobType::FolderRescan).await
+}
+
+/// Enqueues the wizard's first processing run. FolderUpdate both registers and
+/// scans a new configuration; using FolderRescan here would call that update
+/// and then immediately scan the same new roots a second time.
+pub(crate) async fn run_initial_cronjob(
+    index_db: &str,
+    user_data_db: &str,
+) -> ApiResult<CronRunOutcome> {
+    run_cronjob_with_scan(index_db, user_data_db, JobType::FolderUpdate).await
+}
+
+async fn run_cronjob_with_scan(
+    index_db: &str,
+    user_data_db: &str,
+    scan_job_type: JobType,
+) -> ApiResult<CronRunOutcome> {
     tracing::info!(index_db, "running cronjob");
     let store = SystemConfigStore::from_env();
     let config = store.load(index_db)?;
 
-    let mut requests = vec![cron_request(
-        JobType::FolderRescan,
-        index_db,
-        user_data_db,
-        None,
-    )];
+    let mut requests = vec![cron_request(scan_job_type, index_db, user_data_db, None)];
 
     let ordered = match job_inference_context().primary.get_metadata().await {
         Ok(metadata) => {
@@ -653,6 +674,8 @@ mod tests {
         assert!(validate_cron_schedule("61 3 * * *").is_err());
         assert!(validate_cron_schedule("").is_err());
         assert!(validate_cron_schedule("not a cron string").is_err());
+        assert!(next_cron_occurrence("0 3 * * *").is_ok());
+        assert!(next_cron_occurrence("not a cron string").is_err());
     }
 
     // Source-data models (items/files) run before derived-data models;

@@ -1,6 +1,8 @@
 //! Desktop-only lifecycle status. This route is mounted only for a
 //! `--desktop-managed` sidecar and carries no general host privilege.
 
+use std::collections::HashSet;
+
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -14,11 +16,11 @@ use crate::{
         setup::{
             FolderValidation, is_ready_for_desktop, validate_continuous_folders, validate_folders,
         },
-        system_config::SystemConfigStore,
+        system_config::{CronJob, SystemConfigStore},
     },
     jobs::{
-        continuous_scan,
-        queue::{JobModel, JobRequest, JobType, enqueue_job},
+        continuous_scan, cron, extraction::resolve_model_metadata,
+        inference_pool::job_inference_context, queue::JobModel,
     },
 };
 
@@ -51,6 +53,22 @@ pub(crate) struct DesktopSetupCompleteRequest {
     pub continuous_filescan_poll_interval_secs: Option<u64>,
     #[serde(default)]
     pub continuous_filescan_included_folders: Vec<String>,
+    #[serde(default = "default_true")]
+    pub scan_images: bool,
+    #[serde(default = "default_true")]
+    pub scan_video: bool,
+    #[serde(default)]
+    pub scan_audio: bool,
+    #[serde(default)]
+    pub scan_pdf: bool,
+    #[serde(default)]
+    pub scan_html: bool,
+    #[serde(default)]
+    pub cron_jobs: Vec<CronJob>,
+    #[serde(default)]
+    pub enable_cron_job: bool,
+    #[serde(default = "default_cron_schedule")]
+    pub cron_schedule: String,
     /// When present, create and configure this index instead of the default.
     pub new_index_db: Option<String>,
 }
@@ -70,7 +88,29 @@ pub(crate) struct DesktopContinuousScanSelection {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct DesktopSetupCompleteResponse {
     pub index_db: String,
-    pub job: JobModel,
+    /// The immediate first run: full rescan followed by configured models.
+    /// Empty only when an earlier cron-style run for this DB is still active.
+    pub jobs: Vec<JobModel>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DesktopSchedulePreviewRequest {
+    pub cron_schedule: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DesktopSchedulePreviewResponse {
+    pub valid: bool,
+    pub next_run: Option<String>,
+    pub error: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_cron_schedule() -> String {
+    "0 3 * * *".into()
 }
 
 fn ensure_desktop_managed() -> Result<(), ApiError> {
@@ -151,6 +191,74 @@ pub(crate) async fn validate_setup_continuous_folders(
     ))
 }
 
+#[utoipa::path(
+    post,
+    operation_id = "desktop_preview_setup_schedule",
+    path = "/api/desktop/setup-schedule/preview",
+    tag = "desktop",
+    request_body = DesktopSchedulePreviewRequest,
+    responses((status = 200, body = DesktopSchedulePreviewResponse))
+)]
+pub(crate) async fn preview_setup_schedule(
+    Json(request): Json<DesktopSchedulePreviewRequest>,
+) -> Result<Json<DesktopSchedulePreviewResponse>, ApiError> {
+    ensure_desktop_managed()?;
+    Ok(Json(
+        match cron::next_cron_occurrence(&request.cron_schedule) {
+            Ok(next) => DesktopSchedulePreviewResponse {
+                valid: true,
+                next_run: Some(next.to_rfc3339()),
+                error: None,
+            },
+            Err(error) => DesktopSchedulePreviewResponse {
+                valid: false,
+                next_run: None,
+                error: Some(error),
+            },
+        },
+    ))
+}
+
+async fn validate_cron_jobs(jobs: &[CronJob]) -> Result<(), ApiError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let metadata = job_inference_context()
+        .primary
+        .get_metadata()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to load model metadata for Desktop setup");
+            ApiError::internal("Failed to validate the selected models")
+        })?;
+    let mut seen = HashSet::new();
+    for job in jobs {
+        if !seen.insert(job.inference_id.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "Model {} was selected more than once",
+                job.inference_id
+            )));
+        }
+        resolve_model_metadata(&metadata, &job.inference_id)?;
+        if job.batch_size.is_some_and(|value| value < 1) {
+            return Err(ApiError::bad_request(format!(
+                "Model {} has an invalid batch size",
+                job.inference_id
+            )));
+        }
+        if job
+            .threshold
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(ApiError::bad_request(format!(
+                "Model {} has an invalid confidence threshold",
+                job.inference_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_new_database_name(name: &str) -> Result<(), ApiError> {
     if !(3..=32).contains(&name.len())
         || !name
@@ -206,6 +314,9 @@ pub(crate) async fn complete_setup(
             "The continuous-scan polling interval must be at least one second",
         ));
     }
+    cron::validate_cron_schedule(&request.cron_schedule)
+        .map_err(|error| ApiError::bad_request(format!("Invalid routine schedule: {error}")))?;
+    validate_cron_jobs(&request.cron_jobs).await?;
 
     let database = request.new_index_db.is_none().then_some(&mut conn.conn);
     let validation = validate_folders(
@@ -297,19 +408,21 @@ pub(crate) async fn complete_setup(
     config.continuous_filescan.enabled = request.continuous_filescan_enabled;
     config.continuous_filescan.poll_interval_secs = request.continuous_filescan_poll_interval_secs;
     config.continuous_filescan.included_folders = continuous_validation.included_folders;
+    config.scan_images = request.scan_images;
+    config.scan_video = request.scan_video;
+    config.scan_audio = request.scan_audio;
+    config.scan_pdf = request.scan_pdf;
+    config.scan_html = request.scan_html;
+    config.cron_jobs = request.cron_jobs;
+    config.enable_cron_job = request.enable_cron_job;
+    config.cron_schedule = request.cron_schedule;
     store.save(&index_db, &config)?;
     let _ = continuous_scan::notify_config_change(&index_db).await;
-    let job = enqueue_job(JobRequest {
-        job_type: JobType::FolderUpdate,
-        index_db: index_db.clone(),
-        user_data_db,
-        metadata: None,
-        batch_size: None,
-        threshold: None,
-        log_id: None,
-        tag: None,
-    })
-    .await?;
+    let _ = cron::notify_config_change(&index_db).await;
+    let jobs = match cron::run_initial_cronjob(&index_db, &user_data_db).await? {
+        cron::CronRunOutcome::Enqueued(jobs) => jobs,
+        cron::CronRunOutcome::Skipped => Vec::new(),
+    };
 
-    Ok(Json(DesktopSetupCompleteResponse { index_db, job }))
+    Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
 }

@@ -351,6 +351,10 @@ async fn async_main() -> anyhow::Result<()> {
                     post(api::desktop::validate_setup_continuous_folders),
                 )
                 .route(
+                    "/api/desktop/setup-schedule/preview",
+                    post(api::desktop::preview_setup_schedule),
+                )
+                .route(
                     "/api/desktop/setup/complete",
                     post(api::desktop::complete_setup),
                 );
