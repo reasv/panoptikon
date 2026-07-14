@@ -37,8 +37,8 @@ const PROD_SERVER_CONFIG: &str = "config/server/desktop.toml";
 const DEV_SERVER_CONFIG: &str = "config/server/desktop-dev.toml";
 const PROD_SERVER_PORT: u16 = 6342;
 const DEV_SERVER_PORT: u16 = 16342;
-const SETUP_WINDOW_WIDTH: f64 = 1000.0;
-const SETUP_WINDOW_HEIGHT: f64 = 1140.0;
+const SETUP_WINDOW_WIDTH: f64 = 1200.0;
+const SETUP_WINDOW_HEIGHT: f64 = 800.0;
 
 struct RuntimeState {
     relay_handle: Mutex<Option<RelayHandle>>,
@@ -1331,17 +1331,63 @@ mod tests {
         );
     }
 
-    /// The bundled control window remains core-only. The external setup page
-    /// receives only the setup commands whose implementations validate its URL again.
+    /// The bundled control and external setup windows receive separate,
+    /// explicitly enumerated application commands.
     #[test]
-    fn control_capability_is_window_scoped_and_core_only() {
+    fn desktop_capabilities_are_window_scoped_and_command_limited() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/control.json")).unwrap();
         assert_eq!(capability["windows"], serde_json::json!(["control"]));
         assert_eq!(
             capability["permissions"],
-            serde_json::json!(["core:default"])
+            serde_json::json!(["core:default", "allow-control-commands"])
         );
+        let control_permission: toml::Value =
+            toml::from_str(include_str!("../permissions/control_commands.toml")).unwrap();
+        let allowed_commands = control_permission["permission"][0]["commands"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_commands = [
+            "get_status",
+            "get_startup_warnings",
+            "open_action_command",
+            "open_setup_command",
+            "restart_server",
+            "set_local_server_enabled",
+            "set_start_at_login",
+            "open_known_folder",
+            "log_tail",
+            "relay_status",
+            "relay_pending",
+            "relay_approve",
+            "relay_reject",
+            "relay_revoke",
+            "relay_set_mappings",
+            "set_relay_enabled",
+            "check_for_updates",
+            "install_update",
+            "quit_desktop",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(allowed_commands, expected_commands);
+        let control_js = include_str!("../../dist/app.js");
+        let invoked_commands = control_js
+            .split("invoke('")
+            .skip(1)
+            .filter_map(|suffix| suffix.split('\'').next())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            invoked_commands.is_subset(&allowed_commands),
+            "control frontend invokes commands absent from its capability: {:?}",
+            invoked_commands
+                .difference(&allowed_commands)
+                .collect::<Vec<_>>()
+        );
+
         let launch_html = include_str!("../../dist/launch.html");
         let launch_js = include_str!("../../dist/launch.js");
         assert!(launch_html.contains("spinner_text.svg"));
