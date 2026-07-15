@@ -9,7 +9,7 @@ const previewState = {
   current_version: '0.1.4', available: true, target_version: '0.3.0',
   published_at: '2026-08-01', checking: false, fresh: true, can_install: true,
   check_automatically: true, ribbon_visible: true, updates_disabled: false,
-  active_work: true, last_success_unix: Math.floor(Date.now() / 1000) - 420,
+  active_work: true, active_work_unknown: false, last_success_unix: Math.floor(Date.now() / 1000) - 420,
   releases: [
     { version: '0.3.0', date: '2026-08-01', notes_markdown: '### Highlights\n\nA much better Desktop update experience.\n\n### Added\n\n- A dedicated update window with release notes.\n- Gentle reminders and persistent update awareness.\n\n### Fixed\n\n- Update checks no longer delay startup.' },
     { version: '0.2.0', date: '2026-07-10', notes_markdown: '### Added\n\n- Faster local search startup.\n- Improved first-run guidance.' }
@@ -26,8 +26,9 @@ function renderInline(container, source) {
   while ((match = pattern.exec(source))) {
     container.append(document.createTextNode(source.slice(offset, match.index)));
     if (match[2]) {
-      const link = document.createElement('a'); link.href = match[3]; link.textContent = match[2];
-      link.addEventListener('click', (event) => { event.preventDefault(); invoke?.('open_update_link', { url: match[3] }); });
+      const url = match[3];
+      const link = document.createElement('a'); link.href = url; link.textContent = match[2];
+      link.addEventListener('click', (event) => { event.preventDefault(); invoke?.('open_update_link', { url }); });
       container.append(link);
     } else if (match[4]) {
       const code = document.createElement('code'); code.textContent = match[4]; container.append(code);
@@ -57,6 +58,14 @@ function renderMarkdown(markdown) {
 }
 
 function render(next) {
+  const workMayBeActive = Boolean(next.active_work || next.active_work_unknown);
+  const nextWorkState = next.active_work_unknown ? 'unknown' : (next.active_work ? 'active' : 'idle');
+  const previousWorkState = state
+    ? (state.active_work_unknown ? 'unknown' : (state.active_work ? 'active' : 'idle'))
+    : null;
+  if (state && (state.target_version !== next.target_version || previousWorkState !== nextWorkState)) {
+    byId('confirm-active-work').checked = false;
+  }
   state = next;
   const available = Boolean(next.available && next.target_version);
   text('title', available ? 'Update available' : (next.checking ? 'Checking for updates' : 'Panoptikon is up to date'));
@@ -64,7 +73,14 @@ function render(next) {
     ? `Installed ${next.current_version}  →  Available ${next.target_version}`
     : `Panoptikon Desktop ${next.current_version}`);
   setHidden('checking', !next.checking);
-  setHidden('active-work', !(available && next.active_work && !installing));
+  setHidden('active-work', !(available && workMayBeActive && !installing));
+  text('active-work-title', next.active_work_unknown ? 'Panoptikon activity could not be verified' : 'Panoptikon is processing files');
+  text('active-work-description', next.active_work_unknown
+    ? 'Desktop could not confirm whether Panoptikon is processing files. It will not stop Panoptikon unless a final safety check succeeds.'
+    : 'Installing now will stop the current task. Incomplete work can be retried after Panoptikon restarts.');
+  text('confirm-active-work-label', next.active_work_unknown
+    ? 'Retry the safety check before installing'
+    : 'I understand and want to install now');
   setHidden('notes', !available || installing);
   setHidden('empty', available || next.checking || installing);
   setHidden('error', !next.last_error || next.checking || installing);
@@ -81,7 +97,7 @@ function render(next) {
     if (index === 0) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = 'Latest'; heading.append(badge); }
     section.append(heading, renderMarkdown(release.notes_markdown)); notes.append(section);
   });
-  byId('install').disabled = !next.can_install || installing || (next.active_work && !byId('confirm-active-work').checked);
+  byId('install').disabled = !next.can_install || installing || (workMayBeActive && !byId('confirm-active-work').checked);
   byId('reminder').disabled = !available || installing;
   byId('later').disabled = installing;
 }
@@ -90,7 +106,7 @@ async function refresh({ checkIfStale = false } = {}) {
   if (!invoke) { render(previewState); return; }
   try {
     let next = await invoke('get_update_state'); render(next);
-    if (checkIfStale && next.available && !next.fresh && !next.checking) {
+    if (checkIfStale && next.available && (!next.fresh || !next.can_install) && !next.checking) {
       next = await invoke('check_for_updates'); render(next);
     }
   } catch (error) {
@@ -115,12 +131,18 @@ byId('install').addEventListener('click', async () => {
   try {
     await invoke('install_update', {
       expectedVersion: state.target_version,
-      confirmActiveWork: !state.active_work || byId('confirm-active-work').checked,
+      confirmedWorkState: byId('confirm-active-work').checked
+        ? (state.active_work_unknown ? 'unknown' : (state.active_work ? 'active' : null))
+        : null,
     });
   } catch (error) {
     installing = false;
     if (String(error).includes('TARGET_CHANGED')) {
       await refresh(); text('message', 'A newer update was found. Review its notes before installing.'); setHidden('message', false);
+    } else if (String(error).includes('ACTIVE_WORK_UNKNOWN')) {
+      await refresh(); text('message', 'Desktop could not confirm that Panoptikon is idle. Panoptikon was left running; try again.'); setHidden('message', false);
+    } else if (String(error).includes('ACTIVE_WORK')) {
+      await refresh(); text('message', 'Panoptikon started processing files. Review the warning before installing.'); setHidden('message', false);
     } else {
       await refresh(); text('error-text', String(error)); setHidden('error', false);
     }

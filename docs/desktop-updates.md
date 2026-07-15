@@ -158,7 +158,10 @@ cache miss and MUST NOT prevent the signed update check itself.
 
 At most one updater check may be in flight. If a startup, runtime, manual, or
 dialog-freshness request arrives during a check, it joins the existing request
-and receives its result.
+and receives its result. A joiner is bound to that exact check generation;
+completion and a subsequently started check cannot redirect it to the newer
+result. Cancellation completes the generation with an error and releases the
+next caller.
 
 A manual caller joining an automatic check still receives explicit checking
 and result feedback. It MUST NOT start a second request merely to be considered
@@ -167,7 +170,9 @@ manual.
 The coordinator classifies each request by its strongest reason. A dialog or
 install freshness request has stronger presentation requirements than a
 background request, but all callers may reuse the same authoritative network
-result.
+result. A suppressed request that made no updater attempt is not authoritative:
+a concurrently waiting stronger manual or freshness request becomes the owner
+of a new generation and performs its required check.
 
 ### 5.2 Startup checks
 
@@ -224,7 +229,9 @@ The result is always explicit:
 ### 5.5 Dialog and install freshness
 
 Opening the update dialog conditionally checks again when the last successful
-check is older than ten minutes. It does not request again when state is fresh.
+check is older than ten minutes. Fresh persisted state normally avoids another
+request, but a restarted Desktop checks again to reacquire the in-memory
+pending update object before it advertises installation as available.
 
 The Install action repeats the same test. This matters when the user has left
 the notes open for more than ten minutes. If the fresh target differs from the
@@ -513,14 +520,29 @@ POST /api/desktop/update-ribbon/dismiss
 ```
 
 Names may follow the repository's final API conventions, but scope and
-semantics are fixed. The sidecar forwards these operations over a private,
+semantics are fixed. Snooze and dismissal send JSON `{ "version": "<the
+displayed target>" }`; Desktop returns `409 Conflict` if that version is no
+longer current. A settings persistence failure returns `500 Internal Server
+Error` and leaves the live ribbon state unchanged. The sidecar forwards these
+operations over a private,
 authenticated parent/child control channel. Desktop creates a per-run secret,
 passes it directly to the managed sidecar, and never returns it through client
-config or browser responses.
+config or browser responses. The sidecar accepts the bridge base only as a
+literal loopback HTTP address with an explicit port, and its bridge HTTP client
+disables system proxies so the bearer secret cannot be sent to one.
+
+All three browser `POST` routes require a loopback-literal or `localhost`
+request `Host` and an HTTP `Origin` whose origin exactly matches it. Requiring
+the browser authority itself to be local also blocks DNS rebinding through an
+attacker-controlled hostname. If the browser supplies Fetch Metadata,
+`Sec-Fetch-Site` must be `same-origin` as well. Missing, opaque, cross-origin,
+non-local-host, or contradictory requests are rejected before the bridge
+credential is attached. The status `GET` remains a non-mutating same-origin
+read and does not require these headers.
 
 The browser API cannot request a network check or installation. Open-window is
 safe and idempotent; snooze and dismissal validate the known target version so
-a stale browser tab cannot dismiss a newly discovered release.
+a stale browser tab cannot suppress a newly discovered release.
 
 The routes remain subject to the local Desktop policy and MUST NOT be enabled
 merely because the process was started with `--desktop-managed`.
@@ -537,12 +559,36 @@ If Desktop restarts or loses the in-memory object, it performs a fresh check
 and obtains a new one. Persisted metadata alone is never treated as an
 installable payload.
 
+Checks and installation share an exclusive updater-operation gate. Once an
+installation has validated its target, no external check may replace or clear
+the pending object during download or installation. Desktop revalidates both
+the persisted target and pending object immediately before disruption.
+
 ### 13.2 Active work
 
 Before disruption, Desktop queries whether the local sidecar has an active
 scan, extraction, or other job. If active work exists, the dialog explains
 that installing now will stop it and that incomplete work will be retried by
-Panoptikon where applicable.
+Panoptikon where applicable. Consent is explicit: an idle observation never
+stands in for confirmation. Desktop queries again after download, immediately
+before stopping the sidecar, so work that began during the download is not
+interrupted without that confirmation.
+
+For this consent gate, active work is the non-empty `/api/jobs/queue`: it
+contains running and queued full rescans, folder updates, extractions, and
+deletions. The continuous scanner is deliberately not inferred from
+`/api/jobs/continuous/status`, whose `active` flag means that its watcher is
+enabled rather than that a file is currently being processed. Its transient
+per-file activity is therefore not shown as an active-job warning; the normal
+sidecar shutdown path stops that scanner separately.
+
+Timeouts, non-success HTTP responses, invalid JSON, and missing queue data are
+shown as unknown activity rather than idle. Installation never treats explicit
+active-work consent as consent to an unknown probe: if the final pre-stop query
+cannot verify the state, it aborts and leaves the sidecar running.
+Likewise, consent to retry an unknown probe is not consent to stop work if the
+retry discovers an active job; the dialog resets confirmation when the
+classification changes.
 
 The initial implementation may offer `Install now` and Later. A later
 `Install when processing finishes` action may wait for an idle transition, but
@@ -690,18 +736,27 @@ phase and MUST land before the new Desktop UI depends on it.
 
 For a canonical `vX.Y.Z` tag, release CI:
 
-1. checks out the tagged repository in the release job;
+1. runs the same canonical-tag and product-version validator immediately after
+   checkout in every native-build, Docker-image, and GitHub-release job, before
+   any artifact or image can be published; the tag must exactly match the
+   Server Cargo package, Desktop Cargo package, Tauri configuration, and UI
+   package versions;
 2. validates the entire changelog structure;
-3. requires one non-empty section matching `vX.Y.Z` and the release date;
+3. requires one section matching the canonical `vX.Y.Z` tag and release date,
+   with at least one substantive visible line; headings, HTML comments, and
+   empty list/task markers do not qualify (SemVer components with leading
+   zeroes are rejected);
 4. extracts that section without its release H2 for the GitHub release body;
 5. publishes the extracted Markdown instead of generated commit-history notes;
-6. puts the same current-release Markdown in
+6. puts the same current-release Markdown, including its final newline, in
    `latest-desktop.json.notes`;
 7. compiles all structured release sections into `changelog.json`;
 8. attaches `changelog.json`, `latest.json`, and `latest-desktop.json` with the
    other release artifacts; and
 9. fails before publishing if extraction, semantic-version parsing, JSON
-   generation, or artifact validation fails.
+   generation, exact public-JSON contract validation, note equivalence,
+   cryptographic signature verification, or exact platform artifact validation
+   fails.
 
 `latest.json` retains the Server CLI's release-notes URL contract until the
 Server updater schema and banner are deliberately migrated. Desktop may carry
@@ -739,8 +794,19 @@ https://github.com/reasv/panoptikon/releases/latest/download/changelog.json
 
 The parser/validator lives in a repository script with unit fixtures covering
 valid extraction, missing/duplicate tags, malformed headings and dates,
-ordering, empty sections, unknown categories, Markdown content, and JSON
-escaping. CI invokes the same script used by local release preparation.
+ordering, heading/comment/empty-list-only sections, noncanonical versions,
+unknown categories, fenced and indented code, empty Markdown constructs,
+Markdown content, and JSON escaping. Code blocks and HTML comments are tracked
+as Markdown contexts, so literal changelog headings in examples cannot create
+document sections. A second validator compares the generated manifests with
+every exact platform filename, checksum, and signature input, rejects missing
+or extra JSON keys, validates canonical versions/dates and RFC 3339 timestamps,
+and verifies that the release body, decoded Desktop-manifest notes, and matching
+feed entry preserve the same UTF-8 note bytes. It invokes a pinned, locked Rust
+helper to cryptographically verify every updater signature against the public
+key in `tauri.conf.json`, and requires the Windows/Linux direct installers to
+equal their updater payloads byte-for-byte. CI invokes the same scripts used by
+local release preparation.
 
 ## 17. Accessibility and interaction requirements
 
@@ -809,6 +875,10 @@ No analytics or remote telemetry is introduced by this feature.
 - A selected reminder fires once and stale reminders are discarded.
 - Ribbon X hides it for 24 hours; version dismissal survives restart; both
   reset for a newer release.
+- A tab showing an older target cannot snooze or dismiss a newly discovered
+  target; both stale actions receive `409 Conflict`.
+- Cross-origin form/fetch requests cannot open the dialog, snooze, or dismiss,
+  and configured system proxies never receive the private bridge credential.
 - Remote/non-bridge browser clients never see the Desktop ribbon.
 
 ### 19.3 Dialog and notes
@@ -818,8 +888,8 @@ No analytics or remote telemetry is introduced by this feature.
   section newest first.
 - Missing/corrupt feed data has an explicit fallback/error state.
 - Raw HTML, scripts, remote images, and unsafe links in notes cannot execute.
-- Opening fresh state causes no request; opening state older than ten minutes
-  causes one request.
+- Opening fresh state with a live pending update causes no request; opening
+  state older than ten minutes or restored after restart causes one request.
 - If a newer target appears while the dialog is open, Install requires renewed
   consent for the newly displayed target.
 - A failed required freshness check prevents installation.
@@ -830,6 +900,9 @@ No analytics or remote telemetry is introduced by this feature.
 - Signature failure cannot be bypassed.
 - The displayed progress resets correctly on retry and handles unknown totals.
 - Active processing is disclosed before disruption.
+- Unknown processing state is disclosed and a failed final probe never stops
+  the sidecar.
+- Checks cannot replace the exact pending target while installation owns it.
 - The sidecar is stopped gracefully as late as supported.
 - Installation failure restarts the sidecar where Desktop still owns process
   control and reports restart failure separately.
@@ -846,6 +919,9 @@ No analytics or remote telemetry is introduced by this feature.
   are byte-equivalent after the defined heading normalization.
 - The stable latest manifest and changelog URLs resolve after publication.
 - Every platform entry references the correct signed Desktop updater payload.
+- Every updater signature verifies against its exact payload and the public key
+  compiled into Desktop.
+- Windows and Linux direct installers equal their same-format updater payloads.
 - Server `latest.json` retains its independent URL/checksum behavior.
 
 ## 20. Delivery sequence

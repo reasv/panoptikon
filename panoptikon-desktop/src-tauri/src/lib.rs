@@ -271,14 +271,13 @@ fn init_logging(
 fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
     let status = MenuItem::with_id(app, "status", "Status: Installing", false, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "Restart Panoptikon", true, None::<&str>)?;
-    let local_enabled = tauri::async_runtime::block_on(async {
-        app.state::<Arc<Supervisor>>()
-            .settings
-            .lock()
-            .await
-            .typed
-            .local_server
-            .enabled
+    let (local_enabled, update_target) = tauri::async_runtime::block_on(async {
+        let supervisor = app.state::<Arc<Supervisor>>();
+        let settings = supervisor.settings.lock().await;
+        (
+            settings.typed.local_server.enabled,
+            settings.typed.updates.latest_version.clone(),
+        )
     });
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
     let local = CheckMenuItem::with_id(
@@ -297,7 +296,13 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         autostart_enabled,
         None::<&str>,
     )?;
-    let updates = MenuItem::with_id(app, "updates", "Check for Updates…", true, None::<&str>)?;
+    let updates = MenuItem::with_id(
+        app,
+        "updates",
+        update_menu_label(update_target.as_deref()),
+        true,
+        None::<&str>,
+    )?;
     let menu = MenuBuilder::new(app)
         .text("open", "Open Panoptikon")
         .item(&status)
@@ -416,11 +421,14 @@ pub(crate) async fn update_update_tray(app: &AppHandle) {
             .clone()
     };
     if let Some(tray) = app.state::<RuntimeState>().tray.lock().await.as_ref() {
-        let label = target
-            .map(|version| format!("Update to {version}…"))
-            .unwrap_or_else(|| "Check for Updates…".into());
-        let _ = tray.updates.set_text(label);
+        let _ = tray.updates.set_text(update_menu_label(target.as_deref()));
     }
+}
+
+fn update_menu_label(target: Option<&str>) -> String {
+    target
+        .map(|version| format!("Update to {version}…"))
+        .unwrap_or_else(|| "Check for Updates…".into())
 }
 
 pub(crate) async fn update_tray(app: &AppHandle, state: &LifecycleState) {
@@ -1373,7 +1381,7 @@ async fn quit_inner(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::local_browser_url;
+    use super::{local_browser_url, update_menu_label};
 
     /// Production and development manifests stay product-separated, updater
     /// signing metadata is present only in production, and the Server is an
@@ -1529,6 +1537,29 @@ mod tests {
         assert_eq!(
             local_browser_url(16342, "/desktop/setup"),
             "http://localhost:16342/desktop/setup"
+        );
+    }
+
+    #[test]
+    fn update_tray_label_reflects_persisted_availability() {
+        assert_eq!(update_menu_label(None), "Check for Updates…");
+        assert_eq!(update_menu_label(Some("0.3.0")), "Update to 0.3.0…");
+    }
+
+    #[test]
+    fn update_window_preserves_link_targets_and_requires_explicit_confirmation() {
+        let update_js = include_str!("../../dist/update.js");
+        assert!(update_js.contains("const url = match[3]"));
+        assert!(update_js.contains("invoke?.('open_update_link', { url })"));
+        assert!(!update_js.contains("url: match[3]"));
+        assert!(update_js.contains("confirmedWorkState: byId('confirm-active-work').checked"));
+        assert!(!update_js.contains("!state.active_work ||"));
+        assert!(update_js.contains("next.active_work || next.active_work_unknown"));
+        assert!(update_js.contains("previousWorkState !== nextWorkState"));
+        assert!(update_js.contains("ACTIVE_WORK_UNKNOWN"));
+        assert!(
+            update_js
+                .contains("next.available && (!next.fresh || !next.can_install) && !next.checking")
         );
     }
 }

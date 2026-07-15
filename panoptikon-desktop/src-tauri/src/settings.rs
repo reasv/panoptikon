@@ -193,6 +193,15 @@ fn merge_known(raw: &mut toml::Table, settings: &DesktopSettings) -> anyhow::Res
     for (section, value) in known {
         match (raw.get_mut(&section), value) {
             (Some(toml::Value::Table(existing)), toml::Value::Table(update)) => {
+                // TOML has no null value, so serde omits `None` fields. Remove
+                // the optional keys owned by the current schema before merging
+                // the serialized values; otherwise an old `Some` value in the
+                // raw document would survive after the typed value was cleared.
+                if section == "updates" {
+                    for key in OPTIONAL_UPDATE_KEYS {
+                        existing.remove(*key);
+                    }
+                }
                 for (key, value) in update {
                     existing.insert(key, value);
                 }
@@ -204,6 +213,23 @@ fn merge_known(raw: &mut toml::Table, settings: &DesktopSettings) -> anyhow::Res
     }
     Ok(())
 }
+
+const OPTIONAL_UPDATE_KEYS: &[&str] = &[
+    "last_checked_unix",
+    "last_attempt_unix",
+    "last_error",
+    "last_error_unix",
+    "latest_version",
+    "latest_published_at",
+    "latest_notes_markdown",
+    "latest_release_url",
+    "discovered_unix",
+    "native_notified_version",
+    "ribbon_snoozed_until_unix",
+    "ribbon_dismissed_version",
+    "reminder_version",
+    "reminder_at_unix",
+];
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().context("settings path has no parent")?;
@@ -291,5 +317,88 @@ mod tests {
             Some("0.2.0")
         );
         assert_eq!(restored.typed.updates.automatic_attempts_unix, [80, 100]);
+    }
+
+    /// Clearing typed optional values removes their old TOML keys without
+    /// discarding settings written by a newer Desktop version.
+    #[test]
+    fn save_removes_cleared_known_values_and_preserves_unknown_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("desktop.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "[updates]\n",
+                "latest_version = '0.2.0'\n",
+                "last_error = 'offline'\n",
+                "ribbon_snoozed_until_unix = 1234\n",
+                "reminder_version = '0.2.0'\n",
+                "future_update_setting = 'keep'\n",
+                "[future_section]\n",
+                "flag = true\n",
+            ),
+        )
+        .unwrap();
+
+        let mut document = SettingsDocument::load_path(&path).unwrap();
+        document.typed.updates.latest_version = None;
+        document.typed.updates.last_error = None;
+        document.typed.updates.ribbon_snoozed_until_unix = None;
+        document.typed.updates.reminder_version = None;
+        document.save().unwrap();
+
+        let raw: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let updates = raw["updates"].as_table().unwrap();
+        assert!(!updates.contains_key("latest_version"));
+        assert!(!updates.contains_key("last_error"));
+        assert!(!updates.contains_key("ribbon_snoozed_until_unix"));
+        assert!(!updates.contains_key("reminder_version"));
+        assert_eq!(updates["future_update_setting"].as_str(), Some("keep"));
+        assert_eq!(raw["future_section"]["flag"].as_bool(), Some(true));
+
+        let restored = SettingsDocument::load_path(&path).unwrap();
+        assert_eq!(restored.typed.updates.latest_version, None);
+        assert_eq!(restored.typed.updates.last_error, None);
+        assert_eq!(restored.typed.updates.ribbon_snoozed_until_unix, None);
+        assert_eq!(restored.typed.updates.reminder_version, None);
+    }
+
+    /// Keep the removal list exhaustive when the persisted update schema
+    /// gains another optional field.
+    #[test]
+    fn optional_update_key_list_matches_the_serialized_schema() {
+        let populated = UpdateSettings {
+            check_automatically: true,
+            last_checked_unix: Some(1),
+            last_attempt_unix: Some(2),
+            last_error: Some("offline".into()),
+            last_error_unix: Some(3),
+            consecutive_failures: 1,
+            automatic_attempts_unix: vec![2],
+            latest_version: Some("0.2.0".into()),
+            latest_published_at: Some("2026-01-01".into()),
+            latest_notes_markdown: Some("notes".into()),
+            latest_release_url: Some("https://example.invalid/release".into()),
+            discovered_unix: Some(4),
+            native_notified_version: Some("0.2.0".into()),
+            ribbon_snoozed_until_unix: Some(5),
+            ribbon_dismissed_version: Some("0.2.0".into()),
+            reminder_version: Some("0.2.0".into()),
+            reminder_at_unix: Some(6),
+        };
+        let populated = toml::Value::try_from(&populated).unwrap();
+        let defaults = toml::Value::try_from(UpdateSettings::default()).unwrap();
+        let populated = populated.as_table().unwrap();
+        let defaults = defaults.as_table().unwrap();
+        let serialized_optional = populated
+            .keys()
+            .filter(|key| !defaults.contains_key(*key))
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let declared_optional = OPTIONAL_UPDATE_KEYS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(serialized_optional, declared_optional);
     }
 }

@@ -5,6 +5,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../dist/launch.html");
     println!("cargo:rerun-if-changed=../dist/launch.js");
     println!("cargo:rerun-if-changed=../dist/launch.css");
+    println!("cargo:rerun-if-changed=../dist/update.html");
+    println!("cargo:rerun-if-changed=../dist/update.js");
+    println!("cargo:rerun-if-changed=../dist/update.css");
     println!("cargo:rerun-if-changed=../dist/spinner_text.svg");
     tauri_build::build()
 }

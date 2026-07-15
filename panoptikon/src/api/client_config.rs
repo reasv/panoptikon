@@ -99,8 +99,7 @@ pub(crate) fn build_client_config(
         desktop_shell_available: desktop_shell_available(
             policy,
             crate::desktop::is_managed(),
-            std::env::var_os("PANOPTIKON_DESKTOP_BRIDGE_URL").is_some()
-                && std::env::var_os("PANOPTIKON_DESKTOP_BRIDGE_TOKEN").is_some(),
+            crate::api::desktop::desktop_bridge_is_configured(),
         ),
     }
 }

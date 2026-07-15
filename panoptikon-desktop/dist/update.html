@@ -28,9 +28,9 @@
           <button id="retry" type="button">Try again</button>
         </div>
         <div id="active-work" class="warning" hidden>
-          <strong>Panoptikon is processing files</strong>
-          <p>Installing now will stop the current task. Incomplete work can be retried after Panoptikon restarts.</p>
-          <label><input id="confirm-active-work" type="checkbox" /> I understand and want to install now</label>
+          <strong id="active-work-title">Panoptikon is processing files</strong>
+          <p id="active-work-description">Installing now will stop the current task. Incomplete work can be retried after Panoptikon restarts.</p>
+          <label><input id="confirm-active-work" type="checkbox" /> <span id="confirm-active-work-label">I understand and want to install now</span></label>
         </div>
         <div id="notes" class="notes" aria-label="Release notes"></div>
         <div id="empty" class="empty" hidden>

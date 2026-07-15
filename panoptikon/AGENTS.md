@@ -49,7 +49,15 @@ Behavior (important)
   `PANOPTIKON_DESKTOP_BRIDGE_TOKEN`. Only policies with
   `[policies.client].desktop = true` receive `desktop_shell_available` and may
   use the narrow update status/open/snooze/dismiss routes; the browser never
-  receives the bridge token or raw updater capabilities.
+  receives the bridge token or raw updater capabilities. The bridge URL is
+  accepted only as a literal loopback HTTP address with an explicit port;
+  bridge requests bypass system proxies and refuse redirects so the bearer
+  token cannot leave the process-local channel. Browser mutations require a loopback/`localhost`
+  request `Host`, an HTTP `Origin` matching that host, and
+  `Sec-Fetch-Site: same-origin` when Fetch Metadata is present; the host
+  restriction also blocks DNS rebinding. Snooze and dismissal both carry the
+  version the tab displayed; Desktop rejects stale actions after the available
+  version changes.
 - The supervised production UI receives `PANOPTIKON_API_URL` at build/start
   from the effective gateway listener, so server-rendered UI routes follow
   non-default ports (including the isolated Desktop Dev profile).
