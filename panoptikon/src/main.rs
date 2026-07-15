@@ -353,7 +353,7 @@ async fn async_main() -> anyhow::Result<()> {
             axum::routing::put(api::relay::commit_pairing_operation),
         );
         app = app.route(
-            "/api/relay/pairing-operations/{operation_id}",
+            "/api/relay/pairing-operations/{operation_id}/cancel",
             axum::routing::delete(api::relay::cancel_pairing_operation),
         );
         if desktop::is_managed() {
@@ -592,6 +592,32 @@ async fn async_main() -> anyhow::Result<()> {
 /// proxy target would be this gateway itself (see router setup above).
 async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
     api_error::ApiError::not_found(format!("Unknown API endpoint: {}", uri.path()))
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn relay_pairing_route_shapes_do_not_conflict() {
+        let _: Router<Arc<proxy::ProxyState>> = Router::new()
+            .route(
+                "/api/relay/pairings/{relay_id}",
+                get(api::relay::get_pairing).delete(api::relay::delete_pairing),
+            )
+            .route(
+                "/api/relay/pairing-operations/{relay_id}",
+                get(api::relay::get_pairing_operation).post(api::relay::begin_pairing_operation),
+            )
+            .route(
+                "/api/relay/pairing-operations/{operation_id}/commit",
+                axum::routing::put(api::relay::commit_pairing_operation),
+            )
+            .route(
+                "/api/relay/pairing-operations/{operation_id}/cancel",
+                axum::routing::delete(api::relay::cancel_pairing_operation),
+            );
+    }
 }
 
 /// `panoptikon inferio`: the standalone inference service (design
