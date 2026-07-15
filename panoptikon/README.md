@@ -213,8 +213,12 @@ The existing `file_command` and `folder_command` keys remain available as
 explicit shell-command templates. All forms support `{path}`, `{folder}`, and
 `{filename}`. Panoptikon Desktop exposes one shared **File opening on this
 computer** editor for its local Server and Relay actions, including native
-application and test-file pickers, structured arguments, expanded previews,
-test results, explicit shell warnings, and per-action reset.
+application and test-file pickers, command-line-style argument entry backed by
+structured direct arguments, a copyable placeholder reference, expanded
+previews, test results, explicit shell warnings, and per-action reset. The
+"Choose an application" mode requires an existing executable path; "Executable
+from PATH" launches a named executable directly; and the advanced shell mode is
+reserved for pipes, redirects, variables, and other shell features.
 
 `capabilities` are derived, not configured: each is one representative
 probe from the real route list — `search` → `POST /api/search/pql`,

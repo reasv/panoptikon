@@ -48,16 +48,55 @@ function showUpdate(update) {
   byId('view-update').hidden = !update.available || update.updates_disabled;
 }
 const samplePath = navigator.userAgent.includes('Windows') ? 'C:\\Media\\example.jpg' : '/home/user/Media/example.jpg';
-function insertPlaceholder(field, value) {
-  const start = field.selectionStart ?? field.value.length; const end = field.selectionEnd ?? start;
-  field.value = field.value.slice(0, start) + value + field.value.slice(end); field.focus(); field.setSelectionRange(start + value.length, start + value.length);
-  field.dispatchEvent(new Event('input', { bubbles: true }));
+function formatArguments(args) {
+  return args.map(value => value && !/[\s"']/.test(value) ? value : JSON.stringify(value)).join(' ');
 }
-function addArgument(list, value = '') {
-  const row = document.createElement('div'); row.className = 'argument-row';
-  const input = document.createElement('input'); input.value = value; input.placeholder = 'Argument';
-  const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove'; remove.onclick = () => { row.remove(); list.closest('fieldset').dispatchEvent(new Event('input', { bubbles: true })); };
-  row.append(input, remove); list.append(row); return input;
+function parseArguments(value) {
+  const args = []; let argument = ''; let quote = ''; let started = false;
+  const push = () => { if (started) args.push(argument); argument = ''; started = false; };
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      if (character === quote) { quote = ''; continue; }
+      if (character === '\\' && quote === '"' && ['"', '\\'].includes(value[index + 1])) { argument += value[index + 1]; index += 1; continue; }
+      argument += character; started = true; continue;
+    }
+    if (/\s/.test(character)) { push(); continue; }
+    if (character === '"' || character === "'") { quote = character; started = true; continue; }
+    if (character === '\\' && value[index + 1] && /[\s"']/.test(value[index + 1])) { argument += value[index + 1]; index += 1; started = true; continue; }
+    argument += character; started = true;
+  }
+  if (quote) throw new Error('Close the quoted argument.');
+  push(); return args;
+}
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* Use the selection fallback below. */ }
+  }
+  const input = document.createElement('textarea'); input.value = value; input.style.position = 'fixed'; input.style.opacity = '0'; document.body.append(input); input.select();
+  const copied = document.execCommand('copy'); input.remove(); if (!copied) throw new Error('Copy failed.');
+}
+function placeholderReference() {
+  const section = document.createElement('section'); section.dataset.panel = 'placeholders'; section.className = 'placeholder-reference';
+  const heading = document.createElement('strong'); heading.textContent = 'Available placeholders';
+  const help = document.createElement('p'); help.className = 'muted'; help.textContent = 'Panoptikon replaces these values when the action runs. Copy one, then paste it into the arguments or command field.';
+  const list = document.createElement('div'); list.className = 'placeholder-list';
+  for (const [value, description] of [['{path}', 'Full path to the file'], ['{folder}', 'Parent folder'], ['{filename}', 'File name and extension']]) {
+    const item = document.createElement('div'); item.className = 'placeholder-item';
+    const token = document.createElement('code'); token.textContent = value;
+    const detail = document.createElement('span'); detail.textContent = description;
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'copy-placeholder'; button.title = `Copy ${value}`; button.setAttribute('aria-label', `Copy ${value} placeholder`);
+    button.innerHTML = '<svg class="copy-source-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"></path></svg><svg class="copy-success-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>';
+    let resetCopyState;
+    button.onclick = async () => {
+      try {
+        await copyText(value); clearTimeout(resetCopyState); button.classList.remove('copied'); void button.offsetWidth; button.classList.add('copied'); button.title = `Copied ${value}`; button.setAttribute('aria-label', `Copied ${value}`);
+        resetCopyState = setTimeout(() => { button.classList.remove('copied'); button.title = `Copy ${value}`; button.setAttribute('aria-label', `Copy ${value} placeholder`); }, 1600);
+      } catch (error) { fail(error); }
+    };
+    item.append(token, detail, button); list.append(item);
+  }
+  section.append(heading, help, list); return section;
 }
 function commandPreview(box) {
   const mode = box.querySelector('[data-field=mode]').value;
@@ -67,14 +106,33 @@ function commandPreview(box) {
   const expand = value => value.replaceAll('{path}', path).replaceAll('{folder}', folder).replaceAll('{filename}', filename);
   if (mode === 'custom_shell') return expand(box.querySelector('[data-field=shell_command]').value);
   const program = expand(box.querySelector('[data-field=program]').value);
-  const args = [...box.querySelectorAll('.argument-row input')].map(input => `"${expand(input.value)}"`);
+  let args;
+  try { args = parseArguments(box.querySelector('[data-field=args]').value).map(value => `"${expand(value)}"`); }
+  catch (error) { return `Invalid arguments: ${error.message}`; }
   return [`"${program}"`, ...args].join(' ');
 }
 function updateCommandCard(box) {
   const mode = box.querySelector('[data-field=mode]').value;
-  if (mode === 'specific_application' && !box.querySelector('.argument-row')) addArgument(box.querySelector('[data-field=args]'), '{path}');
   box.querySelector('[data-panel=direct]').hidden = !['specific_application', 'custom_direct'].includes(mode);
   box.querySelector('[data-panel=shell]').hidden = mode !== 'custom_shell';
+  box.querySelector('[data-panel=placeholders]').hidden = mode === 'system_default';
+  const help = box.querySelector('[data-role=method-help]');
+  const programLabel = box.querySelector('[data-role=program-label]');
+  const program = box.querySelector('[data-field=program]');
+  const chooseProgram = box.querySelector('[data-role=choose-program]');
+  const descriptions = {
+    system_default: 'Uses the application associated with this file type by your operating system. No placeholders are needed.',
+    specific_application: 'Always opens with an application you choose. It is launched directly, without a shell.',
+    custom_direct: 'Runs an executable by name or path, directly and without a shell. Use this for tools available on PATH.',
+    custom_shell: 'Runs a complete command through the system shell. Use only when pipes, redirects, variables, or other shell features are required.',
+  };
+  help.textContent = descriptions[mode];
+  if (['specific_application', 'custom_direct'].includes(mode)) {
+    const specific = mode === 'specific_application';
+    programLabel.firstChild.textContent = specific ? 'Application' : 'Executable name or path';
+    program.placeholder = specific ? 'Choose or enter an application path' : 'For example: mpv';
+    chooseProgram.hidden = !specific;
+  }
   box.querySelector('[data-role=preview]').textContent = commandPreview(box);
 }
 function commandEditor(container, commands) {
@@ -83,27 +141,29 @@ function commandEditor(container, commands) {
     const spec = commands[key] || { mode: 'system_default', program: '', args: [], shell_command: '' };
     const box = document.createElement('fieldset'); box.dataset.command = key; box.className = 'command-card';
     const legend = document.createElement('legend'); legend.textContent = label;
-    const methodLabel = document.createElement('label'); methodLabel.textContent = 'Method';
+    const methodLabel = document.createElement('label'); methodLabel.className = 'method-field'; methodLabel.textContent = 'Method';
     const mode = document.createElement('select'); mode.dataset.field = 'mode';
-    for (const [value, text] of [['system_default','System default'], ['specific_application','Specific application'], ['custom_direct','Custom direct command'], ['custom_shell','Custom shell command']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
+    for (const [value, text] of [['system_default','System default'], ['specific_application','Choose an application'], ['custom_direct','Executable from PATH'], ['custom_shell','Shell command (advanced)']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
     mode.value = spec.mode || (spec.shell_command ? 'custom_shell' : spec.program ? 'custom_direct' : 'system_default'); methodLabel.append(mode);
+    const methodHelp = document.createElement('p'); methodHelp.dataset.role = 'method-help'; methodHelp.className = 'method-help muted';
 
     const direct = document.createElement('div'); direct.dataset.panel = 'direct'; direct.className = 'command-panel';
-    const programLabel = document.createElement('label'); programLabel.textContent = 'Application or executable';
+    const programLabel = document.createElement('label'); programLabel.dataset.role = 'program-label'; programLabel.append('Application or executable');
     const programRow = document.createElement('div'); programRow.className = 'picker-row';
     const program = document.createElement('input'); program.dataset.field = 'program'; program.value = spec.program || ''; program.placeholder = 'Choose or enter an executable';
-    const chooseProgram = document.createElement('button'); chooseProgram.type = 'button'; chooseProgram.textContent = 'Choose application…'; chooseProgram.onclick = async () => { const value = await invoke('choose_file_action_application'); if (value) { program.value = value; updateCommandCard(box); } };
+    const chooseProgram = document.createElement('button'); chooseProgram.type = 'button'; chooseProgram.dataset.role = 'choose-program'; chooseProgram.textContent = 'Choose application…'; chooseProgram.onclick = async () => { const value = await invoke('choose_file_action_application'); if (value) { program.value = value; updateCommandCard(box); } };
     programRow.append(program, chooseProgram); programLabel.append(programRow); direct.append(programLabel);
-    const argsTitle = document.createElement('span'); argsTitle.textContent = 'Arguments'; direct.append(argsTitle);
-    const args = document.createElement('div'); args.dataset.field = 'args'; for (const arg of spec.args || []) addArgument(args, arg); direct.append(args);
-    const addArg = document.createElement('button'); addArg.type = 'button'; addArg.textContent = '+ Add argument'; addArg.onclick = () => addArgument(args).focus(); direct.append(addArg);
+    const argsLabel = document.createElement('label'); argsLabel.append('Arguments');
+    const args = document.createElement('input'); args.dataset.field = 'args'; args.value = formatArguments(spec.args || []); args.placeholder = '{path}';
+    if (mode.value === 'specific_application' && !args.value.trim()) args.value = '{path}';
+    const argsHelp = document.createElement('small'); argsHelp.className = 'muted'; argsHelp.textContent = 'Enter arguments on one line. Put quotes around text that must remain one argument.';
+    argsLabel.append(args, argsHelp); direct.append(argsLabel);
 
     const shellPanel = document.createElement('div'); shellPanel.dataset.panel = 'shell'; shellPanel.className = 'command-panel';
     const warning = document.createElement('p'); warning.className = 'warning'; warning.textContent = 'Shell commands can execute arbitrary programs and scripts. Paths are inserted exactly where placeholders appear.';
     const shell = document.createElement('textarea'); shell.rows = 4; shell.dataset.field = 'shell_command'; shell.value = spec.shell_command || ''; shell.placeholder = 'Shell command'; shellPanel.append(warning, shell);
 
-    const placeholders = document.createElement('div'); placeholders.className = 'placeholder-row'; placeholders.append('Insert placeholder: ');
-    for (const value of ['{path}', '{folder}', '{filename}']) { const button = document.createElement('button'); button.type = 'button'; button.textContent = value; button.onclick = () => { const focused = box.querySelector('input:focus, textarea:focus') || (mode.value === 'custom_shell' ? shell : addArgument(args)); insertPlaceholder(focused, value); }; placeholders.append(button); }
+    const placeholders = placeholderReference();
     const previewLabel = document.createElement('strong'); previewLabel.textContent = 'Expanded preview';
     const preview = document.createElement('code'); preview.dataset.role = 'preview'; preview.className = 'command-preview';
     const testRow = document.createElement('div'); testRow.className = 'test-row';
@@ -111,17 +171,20 @@ function commandEditor(container, commands) {
     const chooseTest = document.createElement('button'); chooseTest.type = 'button'; chooseTest.textContent = 'Choose test file…'; chooseTest.onclick = async () => { const value = await invoke('choose_file_action_test_file'); if (value) { testPath.value = value; updateCommandCard(box); } };
     const runTest = document.createElement('button'); runTest.type = 'button'; runTest.textContent = 'Test action'; runTest.onclick = async () => { try { if (!testPath.value) throw new Error('Choose a test file first.'); const result = await invoke('test_file_action', { command: readCommand(box), path: testPath.value }); status.textContent = `${result.message}. Preview: ${result.preview}`; status.className = result.exit_code && result.exit_code !== 0 ? 'inline-error' : 'success'; } catch (error) { status.textContent = String(error); status.className = 'inline-error'; } };
     testRow.append(testPath, chooseTest, runTest);
-    const status = document.createElement('p'); status.setAttribute('aria-live', 'polite'); status.className = 'muted';
-    const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset this action to system default'; reset.onclick = () => { mode.value = 'system_default'; program.value = ''; args.replaceChildren(); shell.value = ''; updateCommandCard(box); };
-    box.append(legend, methodLabel, direct, shellPanel, placeholders, previewLabel, preview, testRow, status, reset);
-    box.addEventListener('input', () => updateCommandCard(box)); mode.addEventListener('change', () => updateCommandCard(box)); updateCommandCard(box); container.append(box);
+    const status = document.createElement('p'); status.setAttribute('aria-live', 'polite'); status.className = 'command-status muted';
+    const reset = document.createElement('button'); reset.type = 'button'; reset.className = 'reset-action'; reset.textContent = 'Reset to Default'; reset.onclick = () => { mode.value = 'system_default'; program.value = ''; args.value = ''; shell.value = ''; updateCommandCard(box); };
+    const methodRow = document.createElement('div'); methodRow.className = 'method-row'; methodRow.append(methodLabel, reset);
+    box.append(legend, methodRow, methodHelp, direct, shellPanel, placeholders, previewLabel, preview, testRow, status);
+    box.addEventListener('input', () => updateCommandCard(box));
+    mode.addEventListener('change', () => { if (mode.value === 'specific_application' && !args.value.trim()) args.value = '{path}'; updateCommandCard(box); });
+    updateCommandCard(box); container.append(box);
   }
 }
 function readCommand(box) {
   const mode = box.querySelector('[data-field=mode]').value;
   const program = ['specific_application', 'custom_direct'].includes(mode) ? box.querySelector('[data-field=program]').value.trim() : '';
   const shell_command = mode === 'custom_shell' ? box.querySelector('[data-field=shell_command]').value.trim() : '';
-  const args = ['specific_application', 'custom_direct'].includes(mode) ? [...box.querySelectorAll('.argument-row input')].map(input => input.value) : [];
+  const args = ['specific_application', 'custom_direct'].includes(mode) ? parseArguments(box.querySelector('[data-field=args]').value) : [];
   if (mode !== 'system_default' && !program && !shell_command) throw new Error('Choose an application or enter a command.');
   if (mode !== 'system_default' && ![program, shell_command, ...args].some(value => /\{(?:path|folder|filename)\}/.test(value))) throw new Error('Each custom action must use at least one path placeholder.');
   return { mode, program, shell_command, args };
