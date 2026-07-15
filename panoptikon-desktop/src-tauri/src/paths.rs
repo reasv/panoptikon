@@ -7,6 +7,7 @@ pub struct DesktopPaths {
     pub local_data_dir: PathBuf,
     pub log_dir: PathBuf,
     pub desktop_settings: PathBuf,
+    pub update_changelog: PathBuf,
     pub relay_settings: PathBuf,
     pub relay_secrets: PathBuf,
     pub server_root: PathBuf,
@@ -18,6 +19,7 @@ impl DesktopPaths {
     pub fn new(config_dir: PathBuf, local_data_dir: PathBuf, log_dir: PathBuf) -> Self {
         Self {
             desktop_settings: config_dir.join("desktop.toml"),
+            update_changelog: local_data_dir.join("update-changelog.json"),
             relay_settings: config_dir.join("relay.toml"),
             relay_secrets: config_dir.join("relay-secrets.toml"),
             server_root: local_data_dir.join("server"),

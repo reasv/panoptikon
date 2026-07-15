@@ -466,11 +466,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
+
+      - name: Validate and extract curated release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/changelog.py validate
+          python scripts/changelog.py extract \
+            --tag "${GITHUB_REF_NAME}" \
+            --output dist/release-notes.md
+          python scripts/changelog.py feed \
+            --repository "${GITHUB_REPOSITORY}" \
+            --output dist/changelog.json
 
       # Build latest.json: the Panoptikon Server updater manifest. The Desktop
       # updater uses the separate Tauri-signature manifest below.
@@ -506,9 +520,10 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          notes=$(cat dist/release-notes.md)
           jq -n \
             --arg version "${TAG#v}" \
-            --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg notes "$notes" \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg win_url "$base/panoptikon-desktop-updater-windows-x86_64.exe" \
             --arg win_sig "$(cat dist/panoptikon-desktop-updater-windows-x86_64.exe.sig)" \
@@ -536,5 +551,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          body_path: dist/release-notes.md
+          generate_release_notes: false
           files: dist/*

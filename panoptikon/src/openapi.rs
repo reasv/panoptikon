@@ -82,7 +82,11 @@ impl Modify for JsonValueSchema {
         crate::api::desktop::complete_setup,
         crate::api::desktop::external_inputs,
         crate::api::desktop::update_external_inputs,
-        crate::api::desktop::reveal_external_input
+        crate::api::desktop::reveal_external_input,
+        crate::api::desktop::update_status,
+        crate::api::desktop::open_update_window,
+        crate::api::desktop::snooze_update_ribbon,
+        crate::api::desktop::dismiss_update_ribbon
     ),
     components(
         schemas(
@@ -158,6 +162,7 @@ impl Modify for JsonValueSchema {
             crate::api::desktop::DesktopSetupCompleteRequest,
             crate::api::desktop::DesktopSetupCompleteResponse,
             crate::api::desktop::DesktopExternalInputUpdate,
+            crate::api::desktop::DesktopUpdateDismissRequest,
             crate::db::setup::FolderValidation,
             crate::db::setup::FolderValidationIssue,
             crate::pql::EmbeddingCacheEntry,

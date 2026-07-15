@@ -1,0 +1,11 @@
+[[permission]]
+identifier = "allow-update-window-commands"
+description = "Allows the bundled update window to review and install a signed Panoptikon Desktop update."
+commands.allow = [
+  "get_update_state",
+  "check_for_updates",
+  "close_update_window",
+  "open_update_link",
+  "schedule_update_reminder",
+  "install_update",
+]

@@ -31,8 +31,40 @@ pub struct StartupSettings {
 pub struct UpdateSettings {
     #[serde(default = "yes")]
     pub check_automatically: bool,
+    /// Last authoritative successful check. The serialized name is retained
+    /// for compatibility with the initial Desktop updater.
     #[serde(default)]
     pub last_checked_unix: Option<i64>,
+    #[serde(default)]
+    pub last_attempt_unix: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_unix: Option<i64>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub automatic_attempts_unix: Vec<i64>,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub latest_published_at: Option<String>,
+    #[serde(default)]
+    pub latest_notes_markdown: Option<String>,
+    #[serde(default)]
+    pub latest_release_url: Option<String>,
+    #[serde(default)]
+    pub discovered_unix: Option<i64>,
+    #[serde(default)]
+    pub native_notified_version: Option<String>,
+    #[serde(default)]
+    pub ribbon_snoozed_until_unix: Option<i64>,
+    #[serde(default)]
+    pub ribbon_dismissed_version: Option<String>,
+    #[serde(default)]
+    pub reminder_version: Option<String>,
+    #[serde(default)]
+    pub reminder_at_unix: Option<i64>,
 }
 
 fn yes() -> bool {
@@ -55,6 +87,21 @@ impl Default for UpdateSettings {
         Self {
             check_automatically: true,
             last_checked_unix: None,
+            last_attempt_unix: None,
+            last_error: None,
+            last_error_unix: None,
+            consecutive_failures: 0,
+            automatic_attempts_unix: Vec::new(),
+            latest_version: None,
+            latest_published_at: None,
+            latest_notes_markdown: None,
+            latest_release_url: None,
+            discovered_unix: None,
+            native_notified_version: None,
+            ribbon_snoozed_until_unix: None,
+            ribbon_dismissed_version: None,
+            reminder_version: None,
+            reminder_at_unix: None,
         }
     }
 }
@@ -219,5 +266,30 @@ mod tests {
         assert!(error.contains("quarantined"), "{error}");
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn update_awareness_state_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("desktop.toml");
+        let mut document = SettingsDocument::defaults(path.clone()).unwrap();
+        document.typed.updates.last_attempt_unix = Some(100);
+        document.typed.updates.last_checked_unix = Some(90);
+        document.typed.updates.latest_version = Some("0.2.0".into());
+        document.typed.updates.ribbon_dismissed_version = Some("0.2.0".into());
+        document.typed.updates.automatic_attempts_unix = vec![80, 100];
+        document.save().unwrap();
+
+        let restored = SettingsDocument::load_path(&path).unwrap();
+        assert_eq!(restored.typed.updates.last_attempt_unix, Some(100));
+        assert_eq!(
+            restored.typed.updates.latest_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            restored.typed.updates.ribbon_dismissed_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(restored.typed.updates.automatic_attempts_unix, [80, 100]);
     }
 }

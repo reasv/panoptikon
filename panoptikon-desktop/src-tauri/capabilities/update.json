@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "update-window",
+  "description": "Narrow capability for the bundled Panoptikon Desktop update view.",
+  "windows": ["update"],
+  "permissions": ["core:default", "allow-update-window-commands"]
+}

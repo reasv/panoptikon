@@ -13,9 +13,8 @@
       <section class="actions">
         <button data-action="open" class="primary">Open Panoptikon</button>
         <button data-action="restart">Restart Server</button>
-        <button data-action="updates">Check for Updates</button>
       </section>
-      <section id="update" hidden><h2>Update available</h2><p id="update-message"></p><progress id="update-progress" hidden></progress><button id="install-update">Install and restart</button></section>
+      <section id="updates"><h2>Updates</h2><p id="update-version">Loading update status…</p><p id="update-last-check" class="muted"></p><p id="update-error" class="inline-error" hidden></p><label class="toggle"><input id="automatic-updates" type="checkbox" /> Check for updates automatically</label><div class="actions"><button data-action="updates">Check now</button><button id="view-update" class="primary" hidden>View update</button></div></section>
       <section><h2>Local Server</h2><label class="toggle"><input id="local" type="checkbox" /> Run Local Panoptikon</label><dl><dt>Server root</dt><dd id="root"></dd><dt>Port</dt><dd id="port"></dd></dl><div class="actions"><button data-folder="server_root">Open Data Folder</button><button data-folder="config">Open Configuration</button><button data-folder="logs">Open Logs</button></div></section>
       <section><h2 id="setup-title">Set Up Panoptikon</h2><p id="setup-description">Choose the folders and indexing options for your first database.</p><div class="actions"><button id="setup-button" data-action="setup">Continue Setup</button></div></section>
       <section><h2>Relay</h2><p>Relay listens only on loopback. Pairing always requires approval here and credentials are bound to one browser origin.</p><label class="toggle"><input id="relay-enabled" type="checkbox" /> Enable Relay</label><h3>Pairing requests</h3><div id="relay"></div><h3>Paired instances</h3><div id="relay-instances"></div></section>

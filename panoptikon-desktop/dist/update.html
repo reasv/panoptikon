@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Update Panoptikon</title>
+    <link rel="stylesheet" href="update.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand" aria-hidden="true">P</div>
+        <div class="heading">
+          <p class="eyebrow">PANOPTIKON DESKTOP</p>
+          <h1 id="title">Update available</h1>
+          <p id="versions" class="versions">Loading update information…</p>
+        </div>
+        <div id="checking" class="checking" role="status" hidden>
+          <span class="spinner" aria-hidden="true"></span> Checking…
+        </div>
+      </header>
+
+      <section id="content" class="content" tabindex="-1">
+        <div id="message" class="message" role="status" hidden></div>
+        <div id="error" class="error" role="alert" hidden>
+          <strong>Update check failed</strong>
+          <p id="error-text"></p>
+          <button id="retry" type="button">Try again</button>
+        </div>
+        <div id="active-work" class="warning" hidden>
+          <strong>Panoptikon is processing files</strong>
+          <p>Installing now will stop the current task. Incomplete work can be retried after Panoptikon restarts.</p>
+          <label><input id="confirm-active-work" type="checkbox" /> I understand and want to install now</label>
+        </div>
+        <div id="notes" class="notes" aria-label="Release notes"></div>
+        <div id="empty" class="empty" hidden>
+          <h2 id="empty-title">Panoptikon is up to date</h2>
+          <p id="empty-description"></p>
+        </div>
+        <div id="progress" class="progress-card" aria-live="polite" hidden>
+          <div class="progress-heading">
+            <strong id="progress-stage">Preparing update…</strong>
+            <span id="progress-size"></span>
+          </div>
+          <progress id="progress-bar"></progress>
+          <p id="progress-detail">Panoptikon will remain available until installation is ready.</p>
+        </div>
+      </section>
+
+      <footer>
+        <button id="later" class="ghost" type="button">Later</button>
+        <div class="footer-actions">
+          <label class="reminder-label" for="reminder">Remind me</label>
+          <select id="reminder" aria-label="Choose when to be reminded">
+            <option value="">Choose…</option>
+            <option value="tomorrow">Tomorrow</option>
+            <option value="three-days">In 3 days</option>
+            <option value="next-week">Next week</option>
+          </select>
+          <button id="install" class="primary" type="button" disabled>Install and restart</button>
+        </div>
+      </footer>
+    </main>
+    <script src="update.js"></script>
+  </body>
+</html>

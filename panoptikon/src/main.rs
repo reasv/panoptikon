@@ -367,6 +367,22 @@ async fn async_main() -> anyhow::Result<()> {
                     "/api/desktop/external-inputs/{variable}",
                     get(api::desktop::reveal_external_input),
                 )
+                .route(
+                    "/api/desktop/update-status",
+                    get(api::desktop::update_status),
+                )
+                .route(
+                    "/api/desktop/update-window/open",
+                    post(api::desktop::open_update_window),
+                )
+                .route(
+                    "/api/desktop/update-ribbon/snooze",
+                    post(api::desktop::snooze_update_ribbon),
+                )
+                .route(
+                    "/api/desktop/update-ribbon/dismiss",
+                    post(api::desktop::dismiss_update_ribbon),
+                )
                 .layer(axum::Extension(api::desktop::DesktopInferenceState(
                     inferio_state.clone(),
                 )));

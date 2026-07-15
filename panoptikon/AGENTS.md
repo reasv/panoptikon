@@ -44,6 +44,12 @@ Behavior (important)
   Managed bundled invocation materializes missing embedded Desktop configs
   even though `--config` is explicit; files remain create-once/user-owned.
   Its captured console stream is emitted without ANSI styling.
+  Desktop also supplies a per-run authenticated loopback shell bridge through
+  inherited `PANOPTIKON_DESKTOP_BRIDGE_URL` and
+  `PANOPTIKON_DESKTOP_BRIDGE_TOKEN`. Only policies with
+  `[policies.client].desktop = true` receive `desktop_shell_available` and may
+  use the narrow update status/open/snooze/dismiss routes; the browser never
+  receives the bridge token or raw updater capabilities.
 - The supervised production UI receives `PANOPTIKON_API_URL` at build/start
   from the effective gateway listener, so server-rendered UI routes follow
   non-default ports (including the isolated Desktop Dev profile).

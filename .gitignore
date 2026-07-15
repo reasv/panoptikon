@@ -162,6 +162,8 @@ cython_debug/
 #.idea/
 
 /scripts/*
+!/scripts/changelog.py
+!/scripts/test_changelog.py
 !/scripts/build-desktop-dev.ps1
 !/scripts/reset-desktop-dev.ps1
 !/scripts/run-desktop-dev.ps1

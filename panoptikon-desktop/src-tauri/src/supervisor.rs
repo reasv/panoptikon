@@ -153,11 +153,16 @@ impl Supervisor {
         supervisor.set_state(&app, LifecycleState::Starting).await;
         let generation = supervisor.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let args = sidecar_arguments(&supervisor.paths, supervisor.server_config);
-        let command = app
+        let mut command = app
             .shell()
             .sidecar("panoptikon")
             .context("bundled Panoptikon Server sidecar is missing")?
             .args(args);
+        if let Some((bridge_url, bridge_token)) = crate::updates::bridge_environment(&app) {
+            command = command
+                .env("PANOPTIKON_DESKTOP_BRIDGE_URL", bridge_url)
+                .env("PANOPTIKON_DESKTOP_BRIDGE_TOKEN", bridge_token);
+        }
         let (mut events, child) = command
             .spawn()
             .context("failed to start bundled Panoptikon Server sidecar")?;
@@ -545,6 +550,7 @@ fn redact(line: &str) -> String {
         "api_key",
         "password",
         "policy_token_key",
+        "desktop_bridge_token",
         "tauri_signing_private_key",
     ]
     .iter()
@@ -580,6 +586,10 @@ mod tests {
     fn diagnostic_redaction_covers_secrets() {
         assert_eq!(
             redact("Authorization: Bearer abc"),
+            "[redacted sensitive diagnostic line]"
+        );
+        assert_eq!(
+            redact("PANOPTIKON_DESKTOP_BRIDGE_TOKEN=abc"),
             "[redacted sensitive diagnostic line]"
         );
         assert_eq!(redact("gateway ready"), "gateway ready");

@@ -1,5 +1,9 @@
 # Panoptikon Desktop release operations
 
+The product behavior, changelog format, and release-CI contract for updates are
+defined in the [Desktop update system](desktop-updates.md). This document covers
+the operational signing, packaging, and clean-state release procedure.
+
 Desktop versions must match the release tag, the Server and Desktop Cargo
 package versions, `tauri.conf.json`, and the UI package version. The release
 workflow rejects any mismatch or missing platform artifact.

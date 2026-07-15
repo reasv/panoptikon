@@ -3,6 +3,7 @@ mod paths;
 mod relay;
 mod settings;
 mod supervisor;
+mod updates;
 
 use crate::{
     lifecycle::{ActivationIntent, LifecycleState, activation_intent},
@@ -20,15 +21,13 @@ use std::{
     },
 };
 use tauri::{
-    AppHandle, Emitter as _, Listener as _, Manager as _, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    AppHandle, Listener as _, Manager as _, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     menu::{CheckMenuItem, MenuBuilder, MenuItem},
     tray::TrayIconBuilder,
 };
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt as _;
-use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -60,14 +59,7 @@ struct TrayUi {
     restart: MenuItem<tauri::Wry>,
     local: CheckMenuItem<tauri::Wry>,
     autostart: CheckMenuItem<tauri::Wry>,
-}
-
-#[derive(Debug, Serialize)]
-struct UpdateInfo {
-    version: String,
-    current_version: String,
-    notes: Option<String>,
-    date: Option<String>,
+    updates: MenuItem<tauri::Wry>,
 }
 
 pub fn run() {
@@ -89,7 +81,13 @@ pub fn run() {
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
-            relay_set_mappings, set_relay_enabled, check_for_updates, install_update, quit_desktop
+            relay_set_mappings, set_relay_enabled,
+            updates::get_update_state, updates::check_for_updates,
+            updates::open_update_window, updates::close_update_window,
+            updates::open_update_link, updates::set_automatic_update_checks,
+            updates::schedule_update_reminder, updates::snooze_update_ribbon,
+            updates::dismiss_update_ribbon, updates::install_update,
+            quit_desktop
         ])
         .setup(|app| {
             let development = app.config().identifier == DEV_IDENTIFIER;
@@ -138,6 +136,17 @@ pub fn run() {
             let relay_state = Arc::new(RelayState::new(relay_config, paths.relay_settings.clone(), action_handler));
             app.manage(supervisor.clone());
             app.manage(relay_state.clone());
+            app.manage(Arc::new(updates::UpdateCoordinator::new()));
+            updates::initialize_bridge(app)?;
+            if let Err(error) = tauri::async_runtime::block_on(async {
+                app.state::<Arc<updates::UpdateCoordinator>>()
+                    .normalize_installed_version(app.handle())
+                    .await
+            }) {
+                // Updater bookkeeping must never prevent the application from
+                // starting. A later check can repair the persisted state.
+                tracing::warn!(%error, "failed to normalize Desktop update state");
+            }
             let has_startup_warnings = !startup_warnings.is_empty();
             app.manage(RuntimeState {
                 relay_handle: Mutex::new(None),
@@ -208,8 +217,7 @@ pub fn run() {
                     }
                 }
             });
-            let update_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move { automatic_update_check(update_app).await; });
+            updates::start(app.handle().clone());
             let intent = activation_intent(&std::env::args().collect::<Vec<_>>());
             if intent == ActivationIntent::Open { route_activation(app.handle().clone(), intent); }
             Ok(())
@@ -279,6 +287,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         autostart_enabled,
         None::<&str>,
     )?;
+    let updates = MenuItem::with_id(app, "updates", "Check for Updates…", true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
         .text("open", "Open Panoptikon")
         .item(&status)
@@ -289,7 +298,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         .text("settings", "Desktop Settings…")
         .text("logs", "View Logs")
         .text("data", "Open Data Folder")
-        .text("updates", "Check for Updates…")
+        .item(&updates)
         .separator()
         .item(&autostart)
         .text("quit", "Quit Panoptikon")
@@ -347,7 +356,17 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
             let _ = open_folder(app, "server_root");
         }
         "updates" => {
-            let _ = show_control_window(app, true);
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let coordinator = app
+                    .state::<Arc<updates::UpdateCoordinator>>()
+                    .inner()
+                    .clone();
+                let known = coordinator.view(&app).await.available;
+                if updates::show_update_window(&app, true).is_ok() && !known {
+                    let _ = coordinator.check(&app, updates::CheckReason::Manual).await;
+                }
+            });
         }
         "autostart" => {
             let app = app.clone();
@@ -370,7 +389,28 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         restart,
         local,
         autostart,
+        updates,
     })
+}
+
+pub(crate) async fn update_update_tray(app: &AppHandle) {
+    let target = {
+        let supervisor = app.state::<Arc<Supervisor>>();
+        supervisor
+            .settings
+            .lock()
+            .await
+            .typed
+            .updates
+            .latest_version
+            .clone()
+    };
+    if let Some(tray) = app.state::<RuntimeState>().tray.lock().await.as_ref() {
+        let label = target
+            .map(|version| format!("Update to {version}…"))
+            .unwrap_or_else(|| "Check for Updates…".into());
+        let _ = tray.updates.set_text(label);
+    }
 }
 
 pub(crate) async fn update_tray(app: &AppHandle, state: &LifecycleState) {
@@ -1138,148 +1178,6 @@ async fn relay_set_mappings(
 }
 
 #[tauri::command]
-async fn check_for_updates(
-    window: WebviewWindow,
-    app: AppHandle,
-) -> Result<Option<UpdateInfo>, String> {
-    validate_control(&window)?;
-    if cfg!(debug_assertions) {
-        return Ok(None);
-    }
-    record_update_check(&app).await?;
-    fetch_update_info(&app).await
-}
-
-async fn fetch_update_info(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let update = app
-        .updater()
-        .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(update.map(|update| UpdateInfo {
-        version: update.version,
-        current_version: update.current_version,
-        notes: update.body,
-        date: update.date.map(|value| value.to_string()),
-    }))
-}
-
-async fn record_update_check(app: &AppHandle) -> Result<(), String> {
-    let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
-    let mut settings = supervisor.settings.lock().await;
-    settings.typed.updates.last_checked_unix = Some(unix_timestamp());
-    settings.save().map_err(|error| error.to_string())
-}
-
-async fn automatic_update_check(app: AppHandle) {
-    if cfg!(debug_assertions) {
-        return;
-    }
-    // Do not contend with initial sidecar setup. Check once the application is
-    // usable (or Relay-only), and never more than once per 24 hours.
-    for _ in 0..120 {
-        let snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
-        if matches!(
-            snapshot.state_label.as_str(),
-            "Ready" | "Local Server Disabled"
-        ) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    let due = {
-        let supervisor = app.state::<Arc<Supervisor>>();
-        let settings = supervisor.settings.lock().await;
-        settings.typed.updates.check_automatically
-            && settings
-                .typed
-                .updates
-                .last_checked_unix
-                .is_none_or(|last| unix_timestamp().saturating_sub(last) >= 86_400)
-    };
-    if !due {
-        return;
-    }
-    if let Err(error) = record_update_check(&app).await {
-        tracing::warn!(%error, "failed to persist automatic update-check time");
-        return;
-    }
-    match fetch_update_info(&app).await {
-        Ok(Some(update)) => {
-            let _ = app.emit("desktop-update-available", &update);
-            let _ = show_control_window(&app, false);
-        }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(%error, "automatic update check failed"),
-    }
-}
-
-fn unix_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
-
-#[tauri::command]
-async fn install_update(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
-    validate_control(&window)?;
-    if cfg!(debug_assertions) {
-        return Err("updates are disabled in development builds".into());
-    }
-    let update = app
-        .updater()
-        .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("no update available")?;
-    let restart_server_on_failure = app
-        .state::<Arc<Supervisor>>()
-        .snapshot()
-        .await
-        .local_server_enabled;
-    Supervisor::stop(&app, false)
-        .await
-        .map_err(|e| e.to_string())?;
-    let progress_app = app.clone();
-    let finished_app = app.clone();
-    let install_result = update
-        .download_and_install(
-            move |chunk, total| {
-                let _ = progress_app.emit(
-                    "desktop-update-progress",
-                    serde_json::json!({ "chunk": chunk, "total": total }),
-                );
-            },
-            move || {
-                let _ = finished_app.emit(
-                    "desktop-update-progress",
-                    serde_json::json!({ "finished": true }),
-                );
-            },
-        )
-        .await;
-    if let Err(error) = install_result {
-        if restart_server_on_failure {
-            if let Err(restart_error) = Supervisor::start(app.clone()).await {
-                return Err(format!(
-                    "update failed: {error}; the local Server also failed to restart: {restart_error}"
-                ));
-            }
-            return Err(format!(
-                "update failed: {error}; the local Server was restarted"
-            ));
-        }
-        return Err(format!("update failed: {error}"));
-    }
-    app.restart();
-}
-
-#[tauri::command]
 async fn quit_desktop(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     validate_control(&window)?;
     quit_inner(app).await;
@@ -1367,8 +1265,10 @@ mod tests {
             "relay_revoke",
             "relay_set_mappings",
             "set_relay_enabled",
+            "get_update_state",
             "check_for_updates",
-            "install_update",
+            "open_update_window",
+            "set_automatic_update_checks",
             "quit_desktop",
         ]
         .into_iter()
@@ -1385,6 +1285,35 @@ mod tests {
             "control frontend invokes commands absent from its capability: {:?}",
             invoked_commands
                 .difference(&allowed_commands)
+                .collect::<Vec<_>>()
+        );
+
+        let update: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/update.json")).unwrap();
+        assert_eq!(update["windows"], serde_json::json!(["update"]));
+        assert_eq!(
+            update["permissions"],
+            serde_json::json!(["core:default", "allow-update-window-commands"])
+        );
+        let update_permission: toml::Value =
+            toml::from_str(include_str!("../permissions/update_commands.toml")).unwrap();
+        let update_allowed = update_permission["permission"][0]["commands"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let update_js = include_str!("../../dist/update.js");
+        let update_invoked = update_js
+            .split("invoke('")
+            .skip(1)
+            .filter_map(|suffix| suffix.split('\'').next())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            update_invoked.is_subset(&update_allowed),
+            "update frontend invokes commands absent from its capability: {:?}",
+            update_invoked
+                .difference(&update_allowed)
                 .collect::<Vec<_>>()
         );
 

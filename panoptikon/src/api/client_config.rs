@@ -53,6 +53,9 @@ pub(crate) struct ClientConfigResponse {
     /// True only when this Server process is the bundled sidecar owned by
     /// Panoptikon Desktop. API semantics are otherwise identical.
     pub desktop_managed: bool,
+    /// True only for a policy explicitly marked as the local Desktop client
+    /// while the private parent-shell bridge is configured.
+    pub desktop_shell_available: bool,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -73,6 +76,16 @@ fn derive_capabilities(settings: &Settings, policy: &PolicyConfig) -> ClientCapa
     }
 }
 
+fn desktop_shell_available(policy: &PolicyConfig, managed: bool, bridge_configured: bool) -> bool {
+    managed
+        && bridge_configured
+        && policy
+            .client
+            .get("desktop")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
 pub(crate) fn build_client_config(
     settings: &Settings,
     policy: &PolicyConfig,
@@ -82,6 +95,12 @@ pub(crate) fn build_client_config(
         capabilities: derive_capabilities(settings, policy),
         client: policy.client.clone(),
         desktop_managed: crate::desktop::is_managed(),
+        desktop_shell_available: desktop_shell_available(
+            policy,
+            crate::desktop::is_managed(),
+            std::env::var_os("PANOPTIKON_DESKTOP_BRIDGE_URL").is_some()
+                && std::env::var_os("PANOPTIKON_DESKTOP_BRIDGE_TOKEN").is_some(),
+        ),
     }
 }
 
@@ -311,5 +330,16 @@ disable_backend_open = true
         policy.ruleset = None;
         let caps = derive_capabilities(&settings, &policy);
         assert!(caps.search && caps.scan_jobs && caps.db_create && caps.inference);
+    }
+
+    #[test]
+    fn desktop_bridge_requires_management_configuration_and_policy_opt_in() {
+        let settings = two_policy_settings();
+        let mut desktop = settings.policies[0].clone();
+        desktop.client["desktop"] = serde_json::Value::Bool(true);
+        assert!(desktop_shell_available(&desktop, true, true));
+        assert!(!desktop_shell_available(&desktop, false, true));
+        assert!(!desktop_shell_available(&desktop, true, false));
+        assert!(!desktop_shell_available(&settings.policies[1], true, true));
     }
 }

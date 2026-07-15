@@ -1,9 +1,25 @@
 const invoke = window.__TAURI__.core.invoke;
 const byId = (id) => document.getElementById(id);
 function fail(error) { const box = byId('error'); box.hidden = false; box.textContent = String(error); }
+function relativeTime(unix) {
+  if (!unix) return 'Never';
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+  const relative = seconds < 60 ? 'just now' : seconds < 3600 ? `${Math.floor(seconds / 60)} minutes ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)} hours ago` : `${Math.floor(seconds / 86400)} days ago`;
+  return `${relative} (${new Date(unix * 1000).toLocaleString()})`;
+}
 function showUpdate(update) {
-  byId('update').hidden = false;
-  byId('update-message').textContent = `Panoptikon Desktop ${update.version} is available (installed: ${update.current_version}).`;
+  byId('update-version').textContent = update.available
+    ? `Panoptikon Desktop ${update.target_version} is available. You have ${update.current_version}.`
+    : `Panoptikon Desktop ${update.current_version} is up to date.`;
+  byId('update-last-check').textContent = update.last_success_unix
+    ? `Last checked successfully ${relativeTime(update.last_success_unix)}.`
+    : 'Panoptikon has not completed an update check yet.';
+  if (update.last_error && (!update.last_success_unix || update.last_error_unix > update.last_success_unix)) {
+    byId('update-error').hidden = false;
+    byId('update-error').textContent = `Last attempt failed ${relativeTime(update.last_error_unix)}: ${update.last_error}.`;
+  } else byId('update-error').hidden = true;
+  byId('automatic-updates').checked = update.check_automatically;
+  byId('view-update').hidden = !update.available;
 }
 async function refresh() {
   try {
@@ -17,6 +33,7 @@ async function refresh() {
     byId('root').textContent = status.server_root;
     byId('port').textContent = status.port;
     byId('local').checked = status.local_server_enabled;
+    showUpdate(await invoke('get_update_state'));
     const databaseReady = status.default_database_ready === true;
     byId('setup-title').textContent = databaseReady ? 'New Database' : 'Set Up Panoptikon';
     byId('setup-description').textContent = databaseReady
@@ -63,14 +80,19 @@ document.addEventListener('click', async (event) => {
     if (button.dataset.action === 'open') await invoke('open_action_command');
     if (button.dataset.action === 'setup') await invoke('open_setup_command');
     if (button.dataset.action === 'restart') await invoke('restart_server');
-    if (button.dataset.action === 'updates') { const update = await invoke('check_for_updates'); if (update) showUpdate(update); else alert('No update is available.'); }
+    if (button.dataset.action === 'updates') {
+      button.disabled = true; const original = button.textContent; button.textContent = 'Checking…';
+      try { const update = await invoke('check_for_updates'); showUpdate(update); if (update.available) await invoke('open_update_window'); else alert(`Panoptikon Desktop ${update.current_version} is up to date.`); }
+      finally { button.disabled = false; button.textContent = original; }
+    }
     if (button.dataset.action === 'refresh') await refresh();
     if (button.dataset.action === 'quit' && confirm('Quit Panoptikon Desktop and stop the local Server?')) await invoke('quit_desktop');
   } catch (error) { fail(error); }
 });
-byId('install-update').addEventListener('click', async () => {
-  if (!confirm('Download the signed update, stop the local Server, and restart Panoptikon Desktop?')) return;
-  try { byId('update-progress').hidden = false; await invoke('install_update'); } catch (error) { fail(error); }
+byId('view-update').addEventListener('click', () => invoke('open_update_window').catch(fail));
+byId('automatic-updates').addEventListener('change', async (event) => {
+  try { showUpdate(await invoke('set_automatic_update_checks', { enabled: event.target.checked })); }
+  catch (error) { event.target.checked = !event.target.checked; fail(error); }
 });
 byId('local').addEventListener('change', async (event) => {
   const enabled = event.target.checked;
@@ -81,10 +103,6 @@ byId('relay-enabled').addEventListener('change', async (event) => {
   try { await invoke('set_relay_enabled', { enabled: event.target.checked }); await refresh(); } catch (error) { event.target.checked = !event.target.checked; fail(error); }
 });
 window.__TAURI__.event.listen('desktop-state', refresh);
-window.__TAURI__.event.listen('desktop-update-available', (event) => showUpdate(event.payload));
-window.__TAURI__.event.listen('desktop-update-progress', (event) => {
-  const progress = byId('update-progress'); progress.hidden = false;
-  if (event.payload.total) { progress.max = event.payload.total; progress.value += event.payload.chunk || 0; }
-});
+window.__TAURI__.event.listen('desktop-update-state', (event) => showUpdate(event.payload));
 refresh();
 setInterval(refresh, 3000);

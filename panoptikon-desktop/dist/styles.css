@@ -6,5 +6,6 @@ section { background: #1b1e21; border: 1px solid #30343a; border-radius: 12px; p
 dl { display: grid; grid-template-columns: 110px 1fr; gap: 5px 12px; } dt { color: #aaa; } dd { margin: 0; overflow-wrap: anywhere; }
 pre { max-height: 220px; overflow: auto; white-space: pre-wrap; background: #0d0f10; padding: 12px; border-radius: 8px; }
 #error { background: #4b1f1f; border: 1px solid #a84545; padding: 12px; border-radius: 8px; margin: 12px 0; }
+.muted { color: #aaa; }
+.inline-error { color: #ffaca0; }
 footer { display: flex; justify-content: flex-end; margin-top: 22px; }
-

@@ -165,6 +165,12 @@ bundled as a Tauri sidecar and spawned with an explicit platform-data root and
 the materialized `config/server/desktop.toml`; Desktop never relies on its
 launch working directory.
 
+Update behavior is defined in `docs/desktop-updates.md`. Desktop owns durable
+availability state and the signed Tauri updater. A random per-run authenticated
+loopback bridge lets only the local Desktop policy expose update awareness and
+open/snooze/dismiss actions to the browser UI; raw update checks and
+installation remain confined to bundled Desktop webviews and Rust.
+
 The supervisor has explicit lifecycle states, captures and redacts Server
 output, waits for both client-config and UI readiness, performs bounded
 1/2/4-second crash restarts, and stops through the Server's stdin control

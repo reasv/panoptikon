@@ -9,7 +9,11 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use axum::{Extension, Json, extract::Path as AxumPath};
+use axum::{
+    Extension, Json,
+    extract::{Path as AxumPath, State},
+    http::{Method, StatusCode},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::Mutex;
@@ -30,6 +34,8 @@ use crate::{
         continuous_scan, cron, extraction::resolve_model_metadata,
         inference_pool::job_inference_context, queue::JobModel,
     },
+    policy::PolicyContext,
+    proxy::ProxyState,
 };
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -143,6 +149,133 @@ fn ensure_desktop_managed() -> Result<(), ApiError> {
     } else {
         Err(ApiError::not_found("Desktop lifecycle endpoint not found"))
     }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DesktopUpdateDismissRequest {
+    pub version: String,
+}
+
+fn ensure_desktop_shell_policy(
+    state: &ProxyState,
+    context: &PolicyContext,
+) -> Result<(String, String), ApiError> {
+    ensure_desktop_managed()?;
+    let allowed = state
+        .settings
+        .policies
+        .iter()
+        .find(|policy| policy.name == context.policy_name)
+        .and_then(|policy| policy.client.get("desktop"))
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    if !allowed {
+        return Err(ApiError::not_found("Desktop shell endpoint not found"));
+    }
+    let url = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_URL")
+        .map_err(|_| ApiError::not_found("Desktop shell endpoint not found"))?;
+    let token = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_TOKEN")
+        .map_err(|_| ApiError::not_found("Desktop shell endpoint not found"))?;
+    Ok((url, token))
+}
+
+async fn desktop_bridge_request(
+    state: &ProxyState,
+    context: &PolicyContext,
+    method: Method,
+    path: &str,
+    body: Option<JsonValue>,
+) -> Result<reqwest::Response, ApiError> {
+    let (base, token) = ensure_desktop_shell_policy(state, context)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|error| {
+            tracing::error!(%error, "failed to build Desktop shell bridge client");
+            ApiError::internal("Desktop shell is unavailable")
+        })?;
+    let mut request = client
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request.send().await.map_err(|error| {
+        tracing::warn!(%error, "Desktop shell bridge request failed");
+        ApiError::internal("Desktop shell is unavailable")
+    })
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "desktop_update_status",
+    path = "/api/desktop/update-status",
+    tag = "desktop",
+    responses((status = 200, description = "Desktop update awareness state", body = JsonValue))
+)]
+pub(crate) async fn update_status(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let response = desktop_bridge_request(&state, &context, Method::GET, "/status", None).await?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            response.status(),
+            "Desktop shell rejected the request",
+        ));
+    }
+    response.json().await.map(Json).map_err(|error| {
+        tracing::warn!(%error, "Desktop shell returned invalid update status");
+        ApiError::internal("Desktop shell returned invalid update status")
+    })
+}
+
+async fn desktop_bridge_action(
+    state: Arc<ProxyState>,
+    context: PolicyContext,
+    path: &'static str,
+    body: Option<JsonValue>,
+) -> Result<StatusCode, ApiError> {
+    let response = desktop_bridge_request(&state, &context, Method::POST, path, body).await?;
+    if response.status().is_success() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::new(
+            response.status(),
+            "Desktop shell rejected the request",
+        ))
+    }
+}
+
+#[utoipa::path(post, operation_id = "open_desktop_update_window", path = "/api/desktop/update-window/open", tag = "desktop", responses((status = 204, description = "Update window opened")))]
+pub(crate) async fn open_update_window(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(state, context, "/open", None).await
+}
+
+#[utoipa::path(post, operation_id = "snooze_desktop_update_ribbon", path = "/api/desktop/update-ribbon/snooze", tag = "desktop", responses((status = 204, description = "Ribbon snoozed for 24 hours")))]
+pub(crate) async fn snooze_update_ribbon(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(state, context, "/snooze", None).await
+}
+
+#[utoipa::path(post, operation_id = "dismiss_desktop_update_ribbon", path = "/api/desktop/update-ribbon/dismiss", tag = "desktop", request_body = DesktopUpdateDismissRequest, responses((status = 204, description = "Ribbon dismissed for the selected version")))]
+pub(crate) async fn dismiss_update_ribbon(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+    Json(request): Json<DesktopUpdateDismissRequest>,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(
+        state,
+        context,
+        "/dismiss",
+        Some(json!({ "version": request.version })),
+    )
+    .await
 }
 
 #[utoipa::path(

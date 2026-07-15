@@ -592,6 +592,16 @@ store a separate onboarding-completion marker. Ordinary Server processes do
 not mount this Desktop-only endpoint. Bare `panoptikon`, explicit `--root`,
 Docker, signals, and foreground behavior are otherwise unchanged.
 
+Desktop additionally passes a random per-run loopback bridge address and
+bearer secret directly to the managed sidecar. A matched policy with
+`[policies.client].desktop = true` receives
+`desktop_shell_available = true` in `/api/client-config` and may use the narrow
+`/api/desktop/update-status`, `/api/desktop/update-window/open`, and update
+ribbon snooze/dismiss routes. These routes proxy only to the parent Desktop
+shell; they do not expose checking, downloading, installation, the bridge
+secret, or general Tauri IPC to browser pages. Other policies receive no shell
+capability and the routes respond as unavailable.
+
 ## Configuration
 
 All global configuration is TOML. The gateway reads

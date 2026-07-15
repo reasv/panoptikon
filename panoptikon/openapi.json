@@ -1089,6 +1089,75 @@
         }
       }
     },
+    "/api/desktop/update-ribbon/dismiss": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "dismiss_desktop_update_ribbon",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopUpdateDismissRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Ribbon dismissed for the selected version"
+          }
+        }
+      }
+    },
+    "/api/desktop/update-ribbon/snooze": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "snooze_desktop_update_ribbon",
+        "responses": {
+          "204": {
+            "description": "Ribbon snoozed for 24 hours"
+          }
+        }
+      }
+    },
+    "/api/desktop/update-status": {
+      "get": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_update_status",
+        "responses": {
+          "200": {
+            "description": "Desktop update awareness state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Value"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/desktop/update-window/open": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "open_desktop_update_window",
+        "responses": {
+          "204": {
+            "description": "Update window opened"
+          }
+        }
+      }
+    },
     "/api/inference/cache": {
       "get": {
         "tags": [
@@ -4386,7 +4455,8 @@
           "policy",
           "capabilities",
           "client",
-          "desktop_managed"
+          "desktop_managed",
+          "desktop_shell_available"
         ],
         "properties": {
           "capabilities": {
@@ -4399,6 +4469,10 @@
           "desktop_managed": {
             "type": "boolean",
             "description": "True only when this Server process is the bundled sidecar owned by\nPanoptikon Desktop. API semantics are otherwise identical."
+          },
+          "desktop_shell_available": {
+            "type": "boolean",
+            "description": "True only for a policy explicitly marked as the local Desktop client\nwhile the private parent-shell bridge is configured."
           },
           "policy": {
             "type": "string",
@@ -4895,6 +4969,17 @@
           "ready": {
             "type": "boolean",
             "description": "True once a current included folder has a corresponding filescan row."
+          }
+        }
+      },
+      "DesktopUpdateDismissRequest": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
           }
         }
       },

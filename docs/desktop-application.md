@@ -791,24 +791,21 @@ secrets and the public key is compiled into Desktop.
 
 ### 14.1 Desktop update policy
 
-- Check in the background after Desktop initialization (and, when enabled,
-  after the local Server reaches Ready) and at most once per 24 hours.
-- Also provide an explicit Check for Updates action that bypasses the throttle.
-- Never install without user confirmation unless a future explicit setting
-  opts into automatic installation.
-- Display version, notes link, download progress, and restart requirement in a
-  bundled control window.
-- Stop the sidecar gracefully before installation when it is running.
-- Install/restart using Tauri's platform updater bundle.
-- On Windows, allow the updater/NSIS process to complete replacement and
-  relaunch rather than also calling an in-process restart. On Linux and macOS,
-  use Tauri's documented post-install restart path.
-- On restart, the new sidecar performs existing version-keyed embedded-resource
-  extraction, venv lock-hash reconciliation, and migrations.
-- Keep enough previous runtime state for recovery; do not eagerly delete old
-  `runtime/pysrc/<version>` or `runtime/ui/<version>` directories.
-- If post-update startup fails, show Recovery with the Tauri/platform rollback
-  option available. Do not enter an automatic update/restart loop.
+The complete update checking, persistence, notification, reminder, ribbon,
+release-notes, dialog, installation, recovery, and CI contract is specified in
+the [Desktop update system](desktop-updates.md). That document is normative
+where the original high-level Desktop design did not fully define updater
+behavior.
+
+In summary, Desktop checks asynchronously at startup and while running, keeps
+known availability as durable state, uses passive awareness surfaces rather
+than automatically opening a dialog, and requires explicit consent in a
+dedicated bundled update webview. The exact approved target is downloaded and
+verified before the sidecar is stopped where supported, then installed and
+relaunched through Tauri's platform updater lifecycle. Post-update startup
+continues to use version-keyed embedded-resource extraction, environment
+reconciliation, migrations, retained prior runtime resources, and the Recovery
+surface without automatic update loops.
 
 The update operation replaces the Desktop shell, control assets, Relay, and
 bundled sidecar together. Mixed Desktop/sidecar versions are unsupported.

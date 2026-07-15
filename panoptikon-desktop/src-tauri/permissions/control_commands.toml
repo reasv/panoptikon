@@ -18,7 +18,9 @@ commands.allow = [
   "relay_revoke",
   "relay_set_mappings",
   "set_relay_enabled",
+  "get_update_state",
   "check_for_updates",
-  "install_update",
+  "open_update_window",
+  "set_automatic_update_checks",
   "quit_desktop",
 ]
