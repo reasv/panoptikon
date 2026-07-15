@@ -1,6 +1,6 @@
 # File opening and Panoptikon Relay specification
 
-Status: **normative design; implementation pending**
+Status: **normative, implemented design**
 
 Audience: Panoptikon Server, Panoptikon UI, and Panoptikon Desktop implementers
 
@@ -219,14 +219,11 @@ A completed pairing has matching records on both sides:
   authenticate to that Relay.
 
 The server-side credential MUST be stored reversibly because a later browser
-profile must be able to retrieve it. It MUST be encrypted at rest with
-server-owned key material and MUST never be returned in logs, diagnostics, or
-ordinary API responses.
-
-Server-side pairing records MUST be scoped to the effective Panoptikon
-identity when one exists. In an un-tenanted, single-user configuration they
-are server-wide. The exact persistence schema is an implementation detail,
-but it MUST NOT depend on browser local storage.
+profile must be able to retrieve it. Panoptikon has no user-identity principal
+for this feature: the pairing protects the browser device's loopback Relay and
+is server-wide within the matched policy. The credential store MUST use
+permission-restricted Server-owned storage and credentials MUST never be
+returned in logs, diagnostics, URLs, or ordinary API responses.
 
 ### 7.1 Pairing lookup
 
@@ -251,7 +248,8 @@ server-stored Relay credential as well as an allowed Origin.
 
 ### 7.3 Initial pairing exchange
 
-When the user selects the pairing entry:
+Pairing uses a durable, random operation ID shared by Server, browser, and
+Relay. When the user selects the pairing entry:
 
 1. The browser starts a pairing operation with its same-origin Panoptikon
    server for the discovered Relay ID.
@@ -275,12 +273,30 @@ The browser MUST poll or subscribe to the pending operation automatically.
 There is no manual "Check approval" action.
 
 Relay MUST keep the approved credential claimable until server persistence is
-acknowledged or the pairing operation expires. A lost response, page reload,
-or transient network failure MUST NOT create a permanently paired Relay record
-whose only credential was lost.
+acknowledged, explicitly cancelled, or replaced by a newly approved pairing
+for the same origin. A lost response, page reload, or transient network
+failure MUST NOT create a permanently paired Relay record whose only
+credential was lost.
 
 Repeated approval, completion, and acknowledgement messages MUST be
 idempotent. Concurrent approval clicks MUST NOT create duplicate instances.
+
+Unfinished Server operations expire after ten minutes and are garbage
+collected whenever the pairing store is accessed. The Server MUST impose
+finite global and per-policy limits on unfinished operations and reject excess
+requests with `429 Too Many Requests`, so a default-enabled public endpoint
+cannot accumulate unbounded pairing state. The completed pairing registry is
+also hard-bounded. The implementation limits unfinished operations to 256
+globally and 64 per policy, and completed pairings to 4,096 globally and 2,048
+per policy. Relay retains an approved but unacknowledged credential until
+acknowledgement, explicit cancellation, or replacement so a browser or
+process restart cannot lose the only recoverable copy.
+
+On initialization, a browser resumes the Server's unfinished operation, if
+one exists. A committed credential is checked through an authenticated,
+side-effect-free Relay endpoint. If Relay reports that it was revoked or is
+invalid, the browser forgets the stale Server record and returns to the
+repairable unpaired state.
 
 ### 7.4 Subsequent browser profiles
 
@@ -342,8 +358,12 @@ security properties:
 - longest matching remote prefix wins;
 - deliberate Windows drive, UNC, Unix-root, case, and separator handling;
 - normalization of `.` and `..` before matching;
-- rejection of traversal outside the selected local root; and
+- rejection of lexical traversal above the remote mapping prefix; and
 - rejection of nonexistent or inaccessible resolved paths.
+
+Mappings are translations, not filesystem sandboxes. Symlinks and Windows
+junctions beneath the selected local folder follow normal operating-system
+semantics and MAY resolve outside that folder.
 
 Desktop MUST replace the raw `remote => local` textarea with structured
 mapping rows. Each row contains:
@@ -376,8 +396,9 @@ An authenticated Relay action with no matching mapping returns a structured
 `mapping_required` result containing the action context and unmatched server
 path. It MUST NOT collapse this into a generic bad-request message.
 
-Relay simultaneously asks Desktop to foreground the mapping flow and retains
-the pending action. Desktop then:
+Relay assigns an idempotency ID, asks Desktop to foreground the mapping flow,
+and durably retains the pending action. The browser polls that action ID; it
+does not repeatedly submit a new side-effecting action. Desktop then:
 
 1. shows the exact unmatched server path;
 2. highlights a supplied server root that contains it, if any;
@@ -487,9 +508,9 @@ Behavior on failure:
 Panoptikon server persists:
 
 - Relay ID;
-- encrypted Relay credential;
-- effective identity/tenant scope; and
-- creation, last-use, and revocation metadata.
+- reversibly stored Relay credential in permission-restricted storage;
+- matched policy scope and creation metadata; and
+- bounded, expiring unfinished pairing operations.
 
 Relay/Desktop persists:
 
@@ -516,8 +537,8 @@ pairing record.
 - Pairing always requires explicit approval in the trusted Desktop UI.
 - Pairing approval identifies the requesting Panoptikon origin and the two
   local capabilities being granted.
-- Server-side credentials are encrypted at rest and returned only through
-  policy-authorized, `Cache-Control: no-store` APIs.
+- Server-side credentials use permission-restricted Server-owned storage and
+  are returned only through policy-authorized, `Cache-Control: no-store` APIs.
 - Credential responses and browser session state MUST NOT enter SSR caches,
   shared intermediary caches, logs, diagnostics, URLs, or analytics.
 - Browser code never supplies executable commands or local paths.
@@ -526,6 +547,8 @@ pairing record.
   or the standalone Server's local configuration file.
 - Pairing, lookup, and action endpoints require rate limits appropriate to
   their cost and attack surface.
+- Unfinished Server pairing operations have a finite TTL and hard global and
+  per-policy count limits.
 - Relay action and mapping outcomes are audit-logged using instance IDs and
   redacted path information; credentials are never logged.
 
@@ -585,7 +608,7 @@ The implementation is not complete until automated and manual tests cover:
 
 This specification deliberately does not prescribe:
 
-- the exact server database table or secret-encryption library;
+- the exact server database table or on-disk pairing-store format;
 - the visual component used for the adjacent selector;
 - the polling interval used for live Relay discovery;
 - whether ready-state updates across tabs use `BroadcastChannel`, storage

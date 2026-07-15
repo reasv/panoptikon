@@ -81,8 +81,10 @@ pub fn run() {
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
-            relay_set_mappings, relay_set_commands, choose_relay_folder, local_file_commands,
-            set_local_file_commands, set_relay_enabled,
+            relay_set_mappings, relay_resolve_mapping, relay_mapping_preview,
+            choose_relay_folder, file_action_commands, set_file_action_commands,
+            choose_file_action_application, choose_file_action_test_file, test_file_action,
+            set_relay_enabled,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
             updates::open_update_link, updates::set_automatic_update_checks,
@@ -1196,19 +1198,35 @@ async fn relay_set_mappings(
 }
 
 #[tauri::command]
-async fn relay_set_commands(
+async fn relay_mapping_preview(
     window: WebviewWindow,
     app: AppHandle,
-    commands: relay::FileActionCommands,
-) -> Result<(), String> {
+    action_id: Uuid,
+    remote: String,
+    local: String,
+) -> Result<relay::MappingPreview, String> {
     validate_control(&window)?;
     app.state::<Arc<RelayState>>()
-        .set_commands(commands)
+        .mapping_preview(action_id, remote, local)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
+async fn relay_resolve_mapping(
+    window: WebviewWindow,
+    app: AppHandle,
+    action_id: Uuid,
+    remote: String,
+    local: String,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    app.state::<Arc<RelayState>>()
+        .resolve_mapping(action_id, remote, local)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn local_file_commands(
     window: WebviewWindow,
     app: AppHandle,
@@ -1219,6 +1237,21 @@ async fn local_file_commands(
     let value: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
     let open = value.get("open");
     let parse = |prefix: &str| relay::CommandSpec {
+        mode: if open
+            .and_then(|v| v.get(format!("{prefix}_command")))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            relay::CommandMode::CustomShell
+        } else if open
+            .and_then(|v| v.get(format!("{prefix}_program")))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            relay::CommandMode::CustomDirect
+        } else {
+            relay::CommandMode::SystemDefault
+        },
         program: open
             .and_then(|v| v.get(format!("{prefix}_program")))
             .and_then(toml::Value::as_str)
@@ -1247,7 +1280,6 @@ async fn local_file_commands(
     })
 }
 
-#[tauri::command]
 async fn set_local_file_commands(
     window: WebviewWindow,
     app: AppHandle,
@@ -1313,6 +1345,140 @@ async fn set_local_file_commands(
     Supervisor::restart(app).await.map_err(|e| e.to_string())
 }
 
+fn command_configured(command: &relay::CommandSpec) -> bool {
+    !command.program.trim().is_empty()
+        || !command.shell_command.trim().is_empty()
+        || !command.args.is_empty()
+}
+
+#[tauri::command]
+async fn file_action_commands(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<relay::FileActionCommands, String> {
+    validate_control(&window)?;
+    let relay_commands = app.state::<Arc<RelayState>>().config().await.commands;
+    if command_configured(&relay_commands.open_file)
+        || command_configured(&relay_commands.reveal_in_folder)
+    {
+        return Ok(relay_commands);
+    }
+    local_file_commands(window, app).await
+}
+
+#[tauri::command]
+async fn set_file_action_commands(
+    window: WebviewWindow,
+    app: AppHandle,
+    commands: relay::FileActionCommands,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    let relay = app.state::<Arc<RelayState>>();
+    let previous = relay.config().await.commands;
+    relay
+        .set_commands(commands.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = set_local_file_commands(window, app.clone(), commands).await {
+        if let Err(rollback_error) = relay.set_commands(previous).await {
+            return Err(format!(
+                "{error}; additionally failed to roll back Relay command settings: {rollback_error}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn choose_one_file(window: &WebviewWindow, title: &str) -> Result<Option<String>, String> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window
+        .app_handle()
+        .dialog()
+        .file()
+        .set_parent(window)
+        .set_title(title)
+        .pick_file(move |file| {
+            let _ = send.send(file);
+        });
+    Ok(receive
+        .await
+        .map_err(|_| "the file picker closed unexpectedly".to_string())?
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn choose_file_action_application(window: WebviewWindow) -> Result<Option<String>, String> {
+    validate_control(&window)?;
+    choose_one_file(&window, "Choose an application or executable").await
+}
+
+#[tauri::command]
+async fn choose_file_action_test_file(window: WebviewWindow) -> Result<Option<String>, String> {
+    validate_control(&window)?;
+    choose_one_file(&window, "Choose a file for testing").await
+}
+
+#[derive(Debug, Serialize)]
+struct FileActionTestResult {
+    status: &'static str,
+    exit_code: Option<i32>,
+    message: String,
+    preview: String,
+}
+
+#[tauri::command]
+async fn test_file_action(
+    window: WebviewWindow,
+    app: AppHandle,
+    command: relay::CommandSpec,
+    path: String,
+) -> Result<FileActionTestResult, String> {
+    validate_control(&window)?;
+    let path = std::path::PathBuf::from(path);
+    if !path.exists() {
+        return Err("the selected test file does not exist".into());
+    }
+    if !command_configured(&command) {
+        app.opener()
+            .open_path(path.display().to_string(), None::<&str>)
+            .map_err(|error| error.to_string())?;
+        return Ok(FileActionTestResult {
+            status: "started",
+            exit_code: None,
+            message: "Opened with the system default application".into(),
+            preview: "System default".into(),
+        });
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let preview = expanded_file_action_preview(&command, &path);
+        let mut child = spawn_file_action_command(&command, &path).map_err(|e| e.to_string())?;
+        for _ in 0..10 {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                return Ok(FileActionTestResult {
+                    status: "exited",
+                    exit_code: status.code(),
+                    message: match status.code() {
+                        Some(code) => format!("Command exited with status {code}"),
+                        None => "Command exited without a numeric status".into(),
+                    },
+                    preview,
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(FileActionTestResult {
+            status: "started",
+            exit_code: None,
+            message: "Command started successfully and is still running".into(),
+            preview,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 async fn choose_relay_folder(window: WebviewWindow) -> Result<Option<String>, String> {
     validate_control(&window)?;
@@ -1337,6 +1503,11 @@ fn execute_file_action_command(
     command: &relay::CommandSpec,
     path: &std::path::Path,
 ) -> anyhow::Result<()> {
+    spawn_file_action_command(command, path)?;
+    Ok(())
+}
+
+fn expanded_file_action_preview(command: &relay::CommandSpec, path: &std::path::Path) -> String {
     let folder = path.parent().unwrap_or(path).to_string_lossy();
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
     let replace = |value: &str| {
@@ -1346,22 +1517,45 @@ fn execute_file_action_command(
             .replace("{filename}", &filename)
     };
     if !command.program.trim().is_empty() {
-        std::process::Command::new(replace(&command.program))
+        let mut parts = vec![format!("\"{}\"", replace(&command.program))];
+        parts.extend(
+            command
+                .args
+                .iter()
+                .map(|arg| format!("\"{}\"", replace(arg))),
+        );
+        return parts.join(" ");
+    }
+    replace(&command.shell_command)
+}
+
+fn spawn_file_action_command(
+    command: &relay::CommandSpec,
+    path: &std::path::Path,
+) -> anyhow::Result<std::process::Child> {
+    let folder = path.parent().unwrap_or(path).to_string_lossy();
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let replace = |value: &str| {
+        value
+            .replace("{path}", &path.to_string_lossy())
+            .replace("{folder}", &folder)
+            .replace("{filename}", &filename)
+    };
+    if !command.program.trim().is_empty() {
+        return Ok(std::process::Command::new(replace(&command.program))
             .args(command.args.iter().map(|arg| replace(arg)))
-            .spawn()?;
-        return Ok(());
+            .spawn()?);
     }
     let shell = replace(&command.shell_command);
     if cfg!(windows) {
-        std::process::Command::new("cmd")
+        Ok(std::process::Command::new("cmd")
             .args(["/C", &shell])
-            .spawn()?;
+            .spawn()?)
     } else {
-        std::process::Command::new("sh")
+        Ok(std::process::Command::new("sh")
             .args(["-c", &shell])
-            .spawn()?;
+            .spawn()?)
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1451,10 +1645,14 @@ mod tests {
             "relay_reject",
             "relay_revoke",
             "relay_set_mappings",
-            "relay_set_commands",
+            "relay_resolve_mapping",
+            "relay_mapping_preview",
             "choose_relay_folder",
-            "local_file_commands",
-            "set_local_file_commands",
+            "file_action_commands",
+            "set_file_action_commands",
+            "choose_file_action_application",
+            "choose_file_action_test_file",
+            "test_file_action",
             "set_relay_enabled",
             "get_update_state",
             "check_for_updates",

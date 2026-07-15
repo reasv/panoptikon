@@ -184,10 +184,14 @@ audience's capabilities to another. Response:
 `[policies.client] relay_enabled` defaults to `true`. Setting it to `false`
 is a hard frontend opt-out: the UI does not load its Relay module, probe
 loopback, or render Relay controls. Pairing bootstrap endpoints at
-`/api/relay/pairings/{relay_id}` are policy-scoped, return `no-store`, and
-also reject a policy that disables Relay. They persist the credential needed
-for another browser profile to authenticate directly to the same local Relay;
-file actions themselves never transit the Panoptikon server.
+`/api/relay/pairings/{relay_id}` and `/api/relay/pairing-operations/*` are
+policy-scoped, return `no-store`, and also reject a policy that disables
+Relay. They persist the credential needed for another browser profile and a
+durable operation ID used to resume interrupted pairing; file actions
+themselves never transit the Panoptikon server. Unfinished operations expire
+after ten minutes, are pruned on store access, and are capped at 256 globally
+and 64 per policy. Completed pairings are capped at 4,096 globally and 2,048
+per policy to bound all registry state on public default-configured endpoints.
 
 ## File-opening commands
 
@@ -205,8 +209,10 @@ folder_args = ["--select", "{path}"]
 
 The existing `file_command` and `folder_command` keys remain available as
 explicit shell-command templates. All forms support `{path}`, `{folder}`, and
-`{filename}`. Panoptikon Desktop exposes the same model for its local server
-and for Relay actions.
+`{filename}`. Panoptikon Desktop exposes one shared **File opening on this
+computer** editor for its local Server and Relay actions, including native
+application and test-file pickers, structured arguments, expanded previews,
+test results, explicit shell warnings, and per-action reset.
 
 `capabilities` are derived, not configured: each is one representative
 probe from the real route list — `search` → `POST /api/search/pql`,

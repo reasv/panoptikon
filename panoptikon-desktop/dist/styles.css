@@ -11,6 +11,16 @@ pre { max-height: 220px; overflow: auto; white-space: pre-wrap; background: #0d0
 footer { display: flex; justify-content: flex-end; margin-top: 22px; }
 fieldset { display: grid; gap: 8px; border: 1px solid #30343a; border-radius: 8px; margin: 10px 0; padding: 12px; }
 input, textarea { box-sizing: border-box; width: 100%; border: 1px solid #4b5159; border-radius: 6px; padding: 8px; background: #111315; color: inherit; }
-.mapping-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) auto; gap: 8px; align-items: center; margin: 10px 0; }
+.mapping-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) auto auto; gap: 8px; align-items: center; margin: 10px 0; }
 .mapping-row code { overflow-wrap: anywhere; }
 article { border-top: 1px solid #30343a; margin-top: 12px; padding-top: 12px; }
+.command-card { gap: 12px; }
+.command-card label, .command-panel { display: grid; gap: 6px; }
+.picker-row, .argument-row, .test-row, .placeholder-row { display: flex; gap: 8px; align-items: center; }
+.picker-row input, .argument-row input, .test-row input { flex: 1; }
+.command-preview, .unmatched-path { display: block; padding: 10px; background: #0d0f11; border-radius: 6px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.warning { color: #ffd18b; border-left: 3px solid #e69a2d; padding-left: 10px; }
+.success { color: #8ee6a2; }
+.pending-mapping { display: grid; gap: 10px; border: 1px solid #805f25; border-radius: 8px; padding: 12px; }
+select { border: 1px solid #4b5159; border-radius: 6px; padding: 8px; background: #111315; color: inherit; }
+@media (max-width: 720px) { .mapping-row, .picker-row, .test-row { display: grid; grid-template-columns: 1fr; } }

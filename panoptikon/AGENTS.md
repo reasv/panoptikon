@@ -66,9 +66,15 @@ Behavior (important)
   templates remain supported. The Desktop control edits this configuration
   for its managed server. Policy client key `relay_enabled` defaults true;
   false means the UI must not load or run Relay discovery at all. Pairing
-  credentials live in `<data_folder>/relay-pairings.json` (owner-only mode on
-  Unix), keyed by policy and stable Relay ID. Browsers retrieve them during
-  discovery; `/api/relay/pairings/*` never executes a file action.
+  credentials and bounded operations live in
+  `<data_folder>/relay-pairings.json` (owner-only mode on Unix), keyed by
+  policy and stable Relay ID. Unfinished operations expire after ten minutes
+  and are capped at 256 globally/64 per policy; completed pairings are capped
+  at 4,096 globally/2,048 per policy. Browsers retrieve credentials and resume
+  operations through one application-wide discovery query;
+  `/api/relay/pairings/*` never executes a file action. Relay retains approved
+  operations until browser acknowledgement and mapping-blocked actions by
+  action ID so Desktop can save a new root and resume them automatically.
 - Logging (`logging.rs`): console plus append-mode file, default `<data_folder>/panoptikon.log`; `[logging].file` overrides (empty string disables), `[logging].level` sets the level, `RUST_LOG` wins when set. Config-file string values support env templating (`${VAR}` / `${VAR:-default}`, see `env_template.rs`); global keys reach settings-less code via `config::runtime()` (installed once in main; tests default it to a shared temp root).
 - Inference upstreams are configured as an array; the first entry is the proxy + metadata target and may be marked `use_for_jobs = false` to keep it search-only. Extraction jobs only use endpoints with `use_for_jobs = true`. With `[inference_local].enabled = true` the `/api/inference/*` routes are served in-process instead of proxied (see the inferio orchestrator section), and an empty `upstreams.inference` synthesizes a loopback self entry so the gateway's own clients keep working.
 - DB param enforcement:

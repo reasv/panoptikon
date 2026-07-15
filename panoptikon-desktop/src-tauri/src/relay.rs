@@ -20,7 +20,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use url::Url;
@@ -30,6 +30,8 @@ const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT: usize = 5;
 const MAX_PENDING: usize = 10;
+const MAX_ACTION_RECORDS: usize = 1024;
+const ACTION_TTL_SECS: i64 = 10 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -43,6 +45,10 @@ pub struct RelayConfig {
     pub instances: Vec<RelayInstance>,
     #[serde(default)]
     pub commands: FileActionCommands,
+    #[serde(default)]
+    pairing_operations: Vec<PairingOperation>,
+    #[serde(default)]
+    actions: Vec<ActionRecord>,
 }
 
 impl Default for RelayConfig {
@@ -53,6 +59,8 @@ impl Default for RelayConfig {
             bind: default_bind(),
             instances: Vec::new(),
             commands: FileActionCommands::default(),
+            pairing_operations: Vec::new(),
+            actions: Vec::new(),
         }
     }
 }
@@ -68,11 +76,23 @@ pub struct FileActionCommands {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommandSpec {
     #[serde(default)]
+    pub mode: CommandMode,
+    #[serde(default)]
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub shell_command: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMode {
+    #[default]
+    SystemDefault,
+    SpecificApplication,
+    CustomDirect,
+    CustomShell,
 }
 
 impl RelayConfig {
@@ -100,10 +120,26 @@ pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig
         .with_context(|| format!("failed to read Relay settings '{}'", path.display()))?;
     match toml::from_str(&text) {
         Ok(config) => {
-            let config: RelayConfig = config;
-            if !text
-                .lines()
-                .any(|line| line.trim_start().starts_with("relay_id"))
+            let mut config: RelayConfig = config;
+            let mut migrated = false;
+            for command in [
+                &mut config.commands.open_file,
+                &mut config.commands.reveal_in_folder,
+            ] {
+                if command.mode == CommandMode::SystemDefault {
+                    if !command.shell_command.trim().is_empty() {
+                        command.mode = CommandMode::CustomShell;
+                        migrated = true;
+                    } else if !command.program.trim().is_empty() {
+                        command.mode = CommandMode::CustomDirect;
+                        migrated = true;
+                    }
+                }
+            }
+            if migrated
+                || !text
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("relay_id"))
             {
                 save_config(path, &config)?;
             }
@@ -148,6 +184,7 @@ pub struct RelayStatusView {
     pub bind: String,
     pub instances: Vec<RelayInstanceView>,
     pub commands: FileActionCommands,
+    pub pending_actions: Vec<PendingActionView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,22 +206,49 @@ pub struct PendingPairingView {
     pub expires_in_secs: u64,
 }
 
-#[derive(Debug)]
-struct PendingPairing {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingOperation {
     id: Uuid,
     name: String,
     origin: String,
     server_url: String,
     roots: Vec<String>,
-    created: Instant,
-    approved: Option<ApprovedCredential>,
-    rejected: bool,
+    created_unix: i64,
+    state: PairingOperationState,
 }
 
-#[derive(Debug)]
-struct ApprovedCredential {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PairingOperationState {
+    Pending,
+    Rejected,
+    ApprovedUnconfirmed {
+        instance_id: Uuid,
+        credential: String,
+    },
+    Complete {
+        instance_id: Uuid,
+        completed_unix: i64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActionRecord {
+    id: Uuid,
     instance_id: Uuid,
-    credential: String,
+    action: RelayAction,
+    remote_path: String,
+    created_unix: i64,
+    state: ActionRecordState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ActionRecordState {
+    PendingMapping,
+    Executing,
+    Complete,
+    Failed { code: String, message: String },
 }
 
 type ActionHandler =
@@ -194,13 +258,12 @@ type AttentionHandler = Arc<dyn Fn() + Send + Sync>;
 pub struct RelayState {
     config: RwLock<RelayConfig>,
     config_path: PathBuf,
-    pending: Mutex<HashMap<Uuid, PendingPairing>>,
     attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
     action_handler: ActionHandler,
     attention_handler: AttentionHandler,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayAction {
     OpenFile,
@@ -209,6 +272,7 @@ pub enum RelayAction {
 
 #[derive(Debug, Deserialize)]
 struct PairingRequest {
+    operation_id: Uuid,
     name: String,
     origin: String,
     server_url: String,
@@ -216,27 +280,20 @@ struct PairingRequest {
     roots: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct PairingRequested {
-    request_id: Uuid,
-    expires_in_secs: u64,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum PairingStatus {
-    Pending,
-    Rejected,
-    Approved {
-        instance_id: Uuid,
-        credential: String,
-    },
-}
-
 #[derive(Debug, Deserialize)]
 struct ActionRequest {
+    action_id: Uuid,
     action: RelayAction,
     path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingActionView {
+    pub id: Uuid,
+    pub instance_id: Uuid,
+    pub action: RelayAction,
+    pub remote_path: String,
+    pub suggested_remote_root: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,7 +314,6 @@ impl RelayState {
         Self {
             config: RwLock::new(config),
             config_path,
-            pending: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             action_handler,
             attention_handler,
@@ -271,7 +327,12 @@ impl RelayState {
     /// Return only fields safe to expose to the bundled control UI. In
     /// particular, credential hashes never cross the Rust command boundary.
     pub async fn status(&self) -> RelayStatusView {
-        let config = self.config.read().await;
+        let mut config = self.config.write().await;
+        if prune_config(&mut config) {
+            if let Err(error) = save_config(&self.config_path, &config) {
+                tracing::warn!(%error, "failed to persist Relay state garbage collection");
+            }
+        }
         RelayStatusView {
             enabled: config.enabled,
             bind: config.bind.clone(),
@@ -287,6 +348,26 @@ impl RelayState {
                 })
                 .collect(),
             commands: config.commands.clone(),
+            pending_actions: config
+                .actions
+                .iter()
+                .filter(|item| matches!(item.state, ActionRecordState::PendingMapping))
+                .map(|item| PendingActionView {
+                    id: item.id,
+                    instance_id: item.instance_id,
+                    action: item.action,
+                    remote_path: item.remote_path.clone(),
+                    suggested_remote_root: suggested_remote_root(
+                        &item.remote_path,
+                        &config
+                            .instances
+                            .iter()
+                            .find(|instance| instance.id == item.instance_id)
+                            .map(|instance| instance.mappings.as_slice())
+                            .unwrap_or_default(),
+                    ),
+                })
+                .collect(),
         }
     }
 
@@ -298,8 +379,47 @@ impl RelayState {
 
     pub async fn set_commands(&self, commands: FileActionCommands) -> anyhow::Result<()> {
         for command in [&commands.open_file, &commands.reveal_in_folder] {
-            if !command.program.trim().is_empty() && !command.shell_command.trim().is_empty() {
-                bail!("choose either a direct executable or shell mode, not both");
+            let contains_placeholder = command
+                .args
+                .iter()
+                .chain([&command.program, &command.shell_command])
+                .any(|value| {
+                    ["{path}", "{folder}", "{filename}"]
+                        .iter()
+                        .any(|placeholder| value.contains(placeholder))
+                });
+            match command.mode {
+                CommandMode::SystemDefault => {
+                    if !command.program.is_empty()
+                        || !command.shell_command.is_empty()
+                        || !command.args.is_empty()
+                    {
+                        bail!("system-default actions cannot include a command");
+                    }
+                }
+                CommandMode::SpecificApplication | CommandMode::CustomDirect => {
+                    if command.program.trim().is_empty() || !command.shell_command.trim().is_empty()
+                    {
+                        bail!("direct actions require one executable and no shell command");
+                    }
+                    if !contains_placeholder {
+                        bail!("custom actions must include a path placeholder");
+                    }
+                    if command.mode == CommandMode::SpecificApplication
+                        && !Path::new(&command.program).exists()
+                    {
+                        bail!("the selected application does not exist");
+                    }
+                }
+                CommandMode::CustomShell => {
+                    if command.shell_command.trim().is_empty() || !command.program.trim().is_empty()
+                    {
+                        bail!("shell actions require one shell command and no direct executable");
+                    }
+                    if !contains_placeholder {
+                        bail!("custom actions must include a path placeholder");
+                    }
+                }
             }
         }
         let mut config = self.config.write().await;
@@ -308,41 +428,47 @@ impl RelayState {
     }
 
     pub async fn pending(&self) -> Vec<PendingPairingView> {
-        let now = Instant::now();
-        let mut pending = self.pending.lock().await;
-        pending.retain(|_, item| now.duration_since(item.created) <= PAIRING_TTL && !item.rejected);
-        pending
-            .values()
-            .filter(|item| item.approved.is_none())
+        let mut config = self.config.write().await;
+        if prune_config(&mut config) {
+            let _ = save_config(&self.config_path, &config);
+        }
+        let now = unix_now();
+        config
+            .pairing_operations
+            .iter()
+            .filter(|item| matches!(item.state, PairingOperationState::Pending))
             .map(|item| PendingPairingView {
                 id: item.id,
                 name: item.name.clone(),
                 origin: item.origin.clone(),
                 server_url: item.server_url.clone(),
                 roots: item.roots.clone(),
-                expires_in_secs: PAIRING_TTL
-                    .saturating_sub(now.duration_since(item.created))
-                    .as_secs(),
+                expires_in_secs: (item.created_unix + PAIRING_TTL.as_secs() as i64 - now).max(0)
+                    as u64,
             })
             .collect()
     }
 
     pub async fn approve(&self, request_id: Uuid) -> anyhow::Result<()> {
-        let (name, origin, server_url, roots) = {
-            let pending = self.pending.lock().await;
-            let item = pending
-                .get(&request_id)
-                .context("pairing request not found or expired")?;
-            if item.rejected || item.approved.is_some() || item.created.elapsed() > PAIRING_TTL {
-                bail!("pairing request is no longer approvable");
-            }
-            (
-                item.name.clone(),
-                item.origin.clone(),
-                item.server_url.clone(),
-                item.roots.clone(),
-            )
+        let mut config = self.config.write().await;
+        prune_config(&mut config);
+        let Some(index) = config
+            .pairing_operations
+            .iter()
+            .position(|item| item.id == request_id)
+        else {
+            bail!("pairing request not found or expired");
         };
+        match config.pairing_operations[index].state {
+            PairingOperationState::ApprovedUnconfirmed { .. }
+            | PairingOperationState::Complete { .. } => return Ok(()),
+            PairingOperationState::Rejected => bail!("pairing request was rejected"),
+            PairingOperationState::Pending => {}
+        }
+        let name = config.pairing_operations[index].name.clone();
+        let origin = config.pairing_operations[index].origin.clone();
+        let server_url = config.pairing_operations[index].server_url.clone();
+        let roots = config.pairing_operations[index].roots.clone();
         let mut secret = [0u8; 32];
         rand::rng().fill_bytes(&mut secret);
         let credential = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
@@ -353,51 +479,71 @@ impl RelayState {
             .map_err(|error| anyhow::anyhow!("failed to hash Relay credential: {error}"))?
             .to_string();
         let instance_id = Uuid::new_v4();
-        {
-            let mut config = self.config.write().await;
-            config.instances.push(RelayInstance {
-                id: instance_id,
-                name,
-                server_url,
-                origins: vec![origin],
-                credential_hash,
-                mappings: roots
-                    .into_iter()
-                    .map(|remote| PathMapping {
-                        remote,
-                        local: String::new(),
-                    })
-                    .collect(),
-            });
-            save_config(&self.config_path, &config)?;
-        }
-        let mut pending = self.pending.lock().await;
-        let item = pending
-            .get_mut(&request_id)
+        // Explicit approval of a replacement rotates any earlier instance for
+        // this origin, including an abandoned provisional pairing.
+        config
+            .instances
+            .retain(|item| !item.origins.iter().any(|item| item == &origin));
+        config
+            .pairing_operations
+            .retain(|item| item.id == request_id || item.origin != origin);
+        let index = config
+            .pairing_operations
+            .iter()
+            .position(|item| item.id == request_id)
             .context("pairing request disappeared")?;
-        item.approved = Some(ApprovedCredential {
+        config.instances.push(RelayInstance {
+            id: instance_id,
+            name,
+            server_url,
+            origins: vec![origin],
+            credential_hash,
+            mappings: roots
+                .into_iter()
+                .map(|remote| PathMapping {
+                    remote,
+                    local: String::new(),
+                })
+                .collect(),
+        });
+        config.pairing_operations[index].state = PairingOperationState::ApprovedUnconfirmed {
             instance_id,
             credential,
-        });
-        Ok(())
+        };
+        save_config(&self.config_path, &config)
     }
 
     pub async fn reject(&self, request_id: Uuid) -> anyhow::Result<()> {
-        let mut pending = self.pending.lock().await;
-        let item = pending
-            .get_mut(&request_id)
+        let mut config = self.config.write().await;
+        let item = config
+            .pairing_operations
+            .iter_mut()
+            .find(|item| item.id == request_id)
             .context("pairing request not found")?;
-        if item.approved.is_some() || item.rejected {
-            bail!("pairing request is already resolved");
+        match item.state {
+            PairingOperationState::Pending => item.state = PairingOperationState::Rejected,
+            PairingOperationState::Rejected => return Ok(()),
+            _ => bail!("pairing request is already approved"),
         }
-        item.rejected = true;
-        Ok(())
+        save_config(&self.config_path, &config)
     }
 
     pub async fn revoke(&self, instance_id: Uuid) -> anyhow::Result<()> {
         let mut config = self.config.write().await;
         let old_len = config.instances.len();
         config.instances.retain(|item| item.id != instance_id);
+        config.pairing_operations.retain(|item| match item.state {
+            PairingOperationState::ApprovedUnconfirmed {
+                instance_id: id, ..
+            }
+            | PairingOperationState::Complete {
+                instance_id: id, ..
+            } => id != instance_id,
+            _ => true,
+        });
+        config
+            .actions
+            .retain(|item| item.instance_id != instance_id);
         if config.instances.len() == old_len {
             bail!("Relay instance not found");
         }
@@ -422,8 +568,134 @@ impl RelayState {
             .find(|item| item.id == instance_id)
             .context("Relay instance not found")?;
         instance.mappings = mappings;
-        save_config(&self.config_path, &config)
+        save_config(&self.config_path, &config)?;
+        drop(config);
+        self.retry_pending_actions(instance_id).await
     }
+
+    pub async fn resolve_mapping(
+        &self,
+        action_id: Uuid,
+        remote: String,
+        local: String,
+    ) -> anyhow::Result<()> {
+        normalize_path(&remote)?;
+        normalize_path(&local)?;
+        let mut config = self.config.write().await;
+        let action = config
+            .actions
+            .iter()
+            .find(|item| {
+                item.id == action_id && matches!(item.state, ActionRecordState::PendingMapping)
+            })
+            .context("pending Relay action not found")?;
+        let instance_id = action.instance_id;
+        let translated = map_path(
+            &action.remote_path,
+            &[PathMapping {
+                remote: remote.clone(),
+                local: local.clone(),
+            }],
+        )?;
+        if !translated.exists() {
+            bail!("the translated path does not exist");
+        }
+        let instance = config
+            .instances
+            .iter_mut()
+            .find(|item| item.id == instance_id)
+            .context("Relay instance not found")?;
+        instance.mappings.retain(|item| item.remote != remote);
+        instance.mappings.push(PathMapping { remote, local });
+        save_config(&self.config_path, &config)?;
+        drop(config);
+        self.retry_pending_actions(instance_id).await
+    }
+
+    pub async fn mapping_preview(
+        &self,
+        action_id: Uuid,
+        remote: String,
+        local: String,
+    ) -> anyhow::Result<MappingPreview> {
+        let config = self.config.read().await;
+        let action = config
+            .actions
+            .iter()
+            .find(|item| item.id == action_id)
+            .context("pending Relay action not found")?;
+        let translated = map_path(&action.remote_path, &[PathMapping { remote, local }])?;
+        Ok(MappingPreview {
+            translated_path: translated.to_string_lossy().into_owned(),
+            exists: translated.exists(),
+        })
+    }
+
+    async fn retry_pending_actions(&self, instance_id: Uuid) -> anyhow::Result<()> {
+        let ids = {
+            let config = self.config.read().await;
+            config
+                .actions
+                .iter()
+                .filter(|item| {
+                    item.instance_id == instance_id
+                        && matches!(item.state, ActionRecordState::PendingMapping)
+                })
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        };
+        for id in ids {
+            let _ = self.execute_recorded_action(id).await;
+        }
+        Ok(())
+    }
+
+    async fn execute_recorded_action(&self, action_id: Uuid) -> anyhow::Result<()> {
+        let (action, path, command) = {
+            let mut config = self.config.write().await;
+            let index = config
+                .actions
+                .iter()
+                .position(|item| item.id == action_id)
+                .context("Relay action not found")?;
+            let record = config.actions[index].clone();
+            let instance = config
+                .instances
+                .iter()
+                .find(|item| item.id == record.instance_id)
+                .context("Relay instance not found")?;
+            let path = map_path(&record.remote_path, &instance.mappings)?;
+            if !path.exists() {
+                bail!("mapped path is unavailable");
+            }
+            config.actions[index].state = ActionRecordState::Executing;
+            let command = match record.action {
+                RelayAction::OpenFile => config.commands.open_file.clone(),
+                RelayAction::RevealInFolder => config.commands.reveal_in_folder.clone(),
+            };
+            save_config(&self.config_path, &config)?;
+            (record.action, path, command)
+        };
+        let result = (self.action_handler)(action, path, command);
+        let mut config = self.config.write().await;
+        if let Some(record) = config.actions.iter_mut().find(|item| item.id == action_id) {
+            record.state = match &result {
+                Ok(()) => ActionRecordState::Complete,
+                Err(error) => ActionRecordState::Failed {
+                    code: "command_failed".into(),
+                    message: error.to_string(),
+                },
+            };
+            save_config(&self.config_path, &config)?;
+        }
+        result
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MappingPreview {
+    pub translated_path: String,
+    pub exists: bool,
 }
 
 pub struct RelayHandle {
@@ -480,9 +752,20 @@ pub fn router(state: Arc<RelayState>) -> Router {
         )
         .route(
             "/v1/pairing/{id}",
-            get(pairing_status).options(pairing_options),
+            get(pairing_status)
+                .delete(cancel_pairing)
+                .options(pairing_options),
         )
+        .route(
+            "/v1/pairing/{id}/ack",
+            post(ack_pairing).options(pairing_options),
+        )
+        .route("/v1/auth/check", post(auth_check).options(action_options))
         .route("/v1/actions", post(action).options(action_options))
+        .route(
+            "/v1/actions/{id}",
+            get(action_status).options(action_options),
+        )
         .with_state(state)
 }
 
@@ -512,7 +795,7 @@ async fn pairing_options(headers: HeaderMap) -> Response {
         Ok(origin) => origin,
         Err(response) => return response,
     };
-    preflight(&origin, "GET, POST, OPTIONS")
+    preflight(&origin, "GET, POST, DELETE, OPTIONS")
 }
 
 async fn action_options(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
@@ -530,7 +813,7 @@ async fn action_options(State(state): State<Arc<RelayState>>, headers: HeaderMap
     if !allowed {
         return error(StatusCode::FORBIDDEN, "origin is not paired", Some(&origin));
     }
-    preflight(&origin, "POST, OPTIONS")
+    preflight(&origin, "GET, POST, OPTIONS")
 }
 
 async fn request_pairing(
@@ -560,6 +843,50 @@ async fn request_pairing(
             Some(&origin),
         );
     }
+    if request.roots.len() > 128 || request.roots.iter().any(|root| root.len() > 4096) {
+        return error(StatusCode::BAD_REQUEST, "invalid root hints", Some(&origin));
+    }
+
+    // Retries of the same durable operation are reads, not new pairing
+    // attempts. Check before rate limiting so a lost response can always be
+    // recovered without eventually throttling its own idempotent retries.
+    {
+        let mut config = state.config.write().await;
+        if prune_config(&mut config) {
+            if let Err(save_error) = save_config(&state.config_path, &config) {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to garbage collect pairing requests: {save_error}"),
+                    Some(&origin),
+                );
+            }
+        }
+        if let Some(existing) = config
+            .pairing_operations
+            .iter()
+            .find(|item| item.id == request.operation_id)
+        {
+            if existing.origin != origin || existing.server_url != server_url.to_string() {
+                return error(
+                    StatusCode::CONFLICT,
+                    "pairing operation conflicts with an existing request",
+                    Some(&origin),
+                );
+            }
+            return with_cors(
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "operation_id": existing.id,
+                        "expires_in_secs": PAIRING_TTL.as_secs()
+                    })),
+                )
+                    .into_response(),
+                &origin,
+            );
+        }
+    }
+
     let now = Instant::now();
     {
         let mut attempts = state.attempts.lock().await;
@@ -579,41 +906,73 @@ async fn request_pairing(
         }
         values.push_back(now);
     }
-    let mut pending = state.pending.lock().await;
-    pending.retain(|_, item| now.duration_since(item.created) <= PAIRING_TTL);
-    if pending.len() >= MAX_PENDING {
+    let mut config = state.config.write().await;
+    prune_config(&mut config);
+    if let Some(existing) = config
+        .pairing_operations
+        .iter()
+        .find(|item| item.id == request.operation_id)
+    {
+        if existing.origin != origin || existing.server_url != server_url.to_string() {
+            return error(
+                StatusCode::CONFLICT,
+                "pairing operation conflicts with an existing request",
+                Some(&origin),
+            );
+        }
+        return with_cors(
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "operation_id": existing.id,
+                    "expires_in_secs": PAIRING_TTL.as_secs()
+                })),
+            )
+                .into_response(),
+            &origin,
+        );
+    }
+    let pending_count = config
+        .pairing_operations
+        .iter()
+        .filter(|item| matches!(item.state, PairingOperationState::Pending))
+        .count();
+    if pending_count >= MAX_PENDING {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many pending pairing requests",
             Some(&origin),
         );
     }
-    let id = Uuid::new_v4();
-    pending.insert(
-        id,
-        PendingPairing {
-            id,
-            name: request.name.trim().to_owned(),
-            origin: origin.clone(),
-            server_url: server_url.to_string(),
-            roots: request
-                .roots
-                .into_iter()
-                .filter(|root| !root.trim().is_empty())
-                .collect(),
-            created: now,
-            approved: None,
-            rejected: false,
-        },
-    );
+    config.pairing_operations.push(PairingOperation {
+        id: request.operation_id,
+        name: request.name.trim().to_owned(),
+        origin: origin.clone(),
+        server_url: server_url.to_string(),
+        roots: request
+            .roots
+            .into_iter()
+            .filter(|root| !root.trim().is_empty())
+            .collect(),
+        created_unix: unix_now(),
+        state: PairingOperationState::Pending,
+    });
+    if let Err(save_error) = save_config(&state.config_path, &config) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to save pairing request: {save_error}"),
+            Some(&origin),
+        );
+    }
+    drop(config);
     (state.attention_handler)();
     with_cors(
         (
             StatusCode::ACCEPTED,
-            Json(PairingRequested {
-                request_id: id,
-                expires_in_secs: PAIRING_TTL.as_secs(),
-            }),
+            Json(serde_json::json!({
+                "operation_id": request.operation_id,
+                "expires_in_secs": PAIRING_TTL.as_secs(),
+            })),
         )
             .into_response(),
         &origin,
@@ -629,8 +988,11 @@ async fn pairing_status(
         Ok(origin) => origin,
         Err(response) => return response,
     };
-    let mut pending = state.pending.lock().await;
-    let Some(item) = pending.get_mut(&id) else {
+    let mut config = state.config.write().await;
+    if prune_config(&mut config) {
+        let _ = save_config(&state.config_path, &config);
+    }
+    let Some(item) = config.pairing_operations.iter().find(|item| item.id == id) else {
         return error(
             StatusCode::NOT_FOUND,
             "pairing request not found",
@@ -644,20 +1006,158 @@ async fn pairing_status(
             Some(&origin),
         );
     }
-    if item.created.elapsed() > PAIRING_TTL {
-        return error(StatusCode::GONE, "pairing request expired", Some(&origin));
-    }
-    let status = if item.rejected {
-        PairingStatus::Rejected
-    } else if let Some(approved) = &item.approved {
-        PairingStatus::Approved {
-            instance_id: approved.instance_id,
-            credential: approved.credential.clone(),
+    let status = match &item.state {
+        PairingOperationState::Pending => serde_json::json!({"status":"pending"}),
+        PairingOperationState::Rejected => serde_json::json!({"status":"rejected"}),
+        PairingOperationState::ApprovedUnconfirmed {
+            instance_id,
+            credential,
+        } => {
+            serde_json::json!({"status":"approved_unconfirmed", "instance_id":instance_id, "credential":credential})
         }
-    } else {
-        PairingStatus::Pending
+        PairingOperationState::Complete { instance_id, .. } => {
+            serde_json::json!({"status":"complete", "instance_id":instance_id})
+        }
     };
     with_cors(Json(status).into_response(), &origin)
+}
+
+async fn ack_pairing(
+    State(state): State<Arc<RelayState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let credential = match bearer_credential(&headers) {
+        Some(value) => value,
+        None => {
+            return structured_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credential",
+                "Relay credential is required",
+                Some(&origin),
+                serde_json::json!({}),
+            );
+        }
+    };
+    let mut config = state.config.write().await;
+    let Some(index) = config
+        .pairing_operations
+        .iter()
+        .position(|item| item.id == id && item.origin == origin)
+    else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "pairing operation not found",
+            Some(&origin),
+        );
+    };
+    let instance_id = match config.pairing_operations[index].state.clone() {
+        PairingOperationState::ApprovedUnconfirmed { instance_id, .. }
+        | PairingOperationState::Complete { instance_id, .. } => instance_id,
+        _ => {
+            return error(
+                StatusCode::CONFLICT,
+                "pairing operation is not approved",
+                Some(&origin),
+            );
+        }
+    };
+    let valid = config
+        .instances
+        .iter()
+        .find(|item| item.id == instance_id)
+        .is_some_and(|item| verify_credential(&item.credential_hash, credential));
+    if !valid {
+        return structured_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credential",
+            "Relay credential is invalid",
+            Some(&origin),
+            serde_json::json!({}),
+        );
+    }
+    config.pairing_operations[index].state = PairingOperationState::Complete {
+        instance_id,
+        completed_unix: unix_now(),
+    };
+    if let Err(error_value) = save_config(&state.config_path, &config) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error_value.to_string(),
+            Some(&origin),
+        );
+    }
+    with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
+}
+
+async fn cancel_pairing(
+    State(state): State<Arc<RelayState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mut config = state.config.write().await;
+    if let Some(operation) = config
+        .pairing_operations
+        .iter()
+        .find(|item| item.id == id && item.origin == origin)
+    {
+        if let PairingOperationState::ApprovedUnconfirmed { instance_id, .. } = operation.state {
+            config.instances.retain(|item| item.id != instance_id);
+        }
+    }
+    config
+        .pairing_operations
+        .retain(|item| !(item.id == id && item.origin == origin));
+    if let Err(error_value) = save_config(&state.config_path, &config) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error_value.to_string(),
+            Some(&origin),
+        );
+    }
+    with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
+}
+
+async fn auth_check(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let credential = match bearer_credential(&headers) {
+        Some(value) => value,
+        None => {
+            return structured_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credential",
+                "Relay credential is required",
+                Some(&origin),
+                serde_json::json!({}),
+            );
+        }
+    };
+    let valid = state.config.read().await.instances.iter().any(|item| {
+        item.origins.iter().any(|allowed| allowed == &origin)
+            && verify_credential(&item.credential_hash, credential)
+    });
+    if valid {
+        with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
+    } else {
+        structured_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credential",
+            "Relay credential is invalid or revoked",
+            Some(&origin),
+            serde_json::json!({}),
+        )
+    }
 }
 
 async fn action(
@@ -669,69 +1169,286 @@ async fn action(
         Ok(origin) => origin,
         Err(response) => return response,
     };
-    let credential = match headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        Some(value) if !value.is_empty() => value,
+    if request.path.is_empty() || request.path.len() > 32 * 1024 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid server path",
+            Some(&origin),
+        );
+    }
+    let credential = match bearer_credential(&headers) {
+        Some(value) => value,
         _ => {
-            return error(
+            return structured_error(
                 StatusCode::UNAUTHORIZED,
-                "missing Relay credential",
+                "invalid_credential",
+                "Relay credential is required",
                 Some(&origin),
+                serde_json::json!({}),
             );
         }
     };
-    let config = state.config.read().await;
+    let mut config = state.config.write().await;
+    prune_config(&mut config);
     let instance = config.instances.iter().find(|item| {
         item.origins.iter().any(|allowed| allowed == &origin)
             && verify_credential(&item.credential_hash, credential)
     });
     let Some(instance) = instance else {
-        return error(
+        return structured_error(
             StatusCode::UNAUTHORIZED,
-            "invalid Relay credential or origin",
+            "invalid_credential",
+            "Relay credential is invalid or revoked",
             Some(&origin),
+            serde_json::json!({}),
         );
     };
-    let mapped = match map_path(&request.path, &instance.mappings) {
+    let instance_id = instance.id;
+    let mappings = instance.mappings.clone();
+    if let Some(existing) = config
+        .actions
+        .iter()
+        .find(|item| item.id == request.action_id)
+    {
+        if existing.instance_id != instance_id
+            || existing.action != request.action
+            || existing.remote_path != request.path
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "action ID conflicts with an existing action",
+                Some(&origin),
+            );
+        }
+        return action_record_response(existing, &origin);
+    }
+    if config.actions.len() >= MAX_ACTION_RECORDS {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many retained Relay actions",
+            Some(&origin),
+        );
+    }
+    let mapped = match map_path(&request.path, &mappings) {
         Ok(path) => path,
         Err(_) => {
+            config.actions.push(ActionRecord {
+                id: request.action_id,
+                instance_id,
+                action: request.action,
+                remote_path: request.path.clone(),
+                created_unix: unix_now(),
+                state: ActionRecordState::PendingMapping,
+            });
+            if let Err(error_value) = save_config(&state.config_path, &config) {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error_value.to_string(),
+                    Some(&origin),
+                );
+            }
+            drop(config);
             (state.attention_handler)();
             return structured_error(
                 StatusCode::CONFLICT,
                 "mapping_required",
                 "Choose the local folder corresponding to this server path",
                 Some(&origin),
-                serde_json::json!({"path": request.path, "instance_id": instance.id}),
+                serde_json::json!({"path": request.path, "instance_id": instance_id, "action_id": request.action_id}),
             );
         }
     };
     if !mapped.exists() {
-        return error(
+        return structured_error(
             StatusCode::NOT_FOUND,
+            "mapped_path_unavailable",
             "mapped path is unavailable",
             Some(&origin),
+            serde_json::json!({"path":request.path}),
         );
     }
-    let instance_id = instance.id;
     let command = match request.action {
         RelayAction::OpenFile => config.commands.open_file.clone(),
         RelayAction::RevealInFolder => config.commands.reveal_in_folder.clone(),
     };
+    config.actions.push(ActionRecord {
+        id: request.action_id,
+        instance_id,
+        action: request.action,
+        remote_path: request.path,
+        created_unix: unix_now(),
+        state: ActionRecordState::Executing,
+    });
+    if let Err(error_value) = save_config(&state.config_path, &config) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error_value.to_string(),
+            Some(&origin),
+        );
+    }
     drop(config);
     tracing::info!(%instance_id, action = ?request.action, "Relay action authorized");
     match (state.action_handler)(request.action, mapped, command) {
-        Ok(()) => with_cors(StatusCode::NO_CONTENT.into_response(), &origin),
+        Ok(()) => {
+            let mut config = state.config.write().await;
+            if let Some(record) = config
+                .actions
+                .iter_mut()
+                .find(|item| item.id == request.action_id)
+            {
+                record.state = ActionRecordState::Complete;
+            }
+            let _ = save_config(&state.config_path, &config);
+            with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
+        }
         Err(error_value) => {
             tracing::warn!(%instance_id, error = %error_value, "Relay action failed");
-            error(
+            let mut config = state.config.write().await;
+            if let Some(record) = config
+                .actions
+                .iter_mut()
+                .find(|item| item.id == request.action_id)
+            {
+                record.state = ActionRecordState::Failed {
+                    code: "command_failed".into(),
+                    message: error_value.to_string(),
+                };
+            }
+            let _ = save_config(&state.config_path, &config);
+            structured_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "command_failed",
                 "local action failed",
                 Some(&origin),
+                serde_json::json!({}),
             )
         }
+    }
+}
+
+async fn action_status(
+    State(state): State<Arc<RelayState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let credential = match bearer_credential(&headers) {
+        Some(value) => value,
+        None => {
+            return structured_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credential",
+                "Relay credential is required",
+                Some(&origin),
+                serde_json::json!({}),
+            );
+        }
+    };
+    let config = state.config.read().await;
+    let Some(record) = config.actions.iter().find(|item| item.id == id) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "Relay action not found",
+            Some(&origin),
+        );
+    };
+    let valid = config
+        .instances
+        .iter()
+        .find(|item| item.id == record.instance_id)
+        .is_some_and(|item| {
+            item.origins.iter().any(|allowed| allowed == &origin)
+                && verify_credential(&item.credential_hash, credential)
+        });
+    if !valid {
+        return structured_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credential",
+            "Relay credential is invalid or revoked",
+            Some(&origin),
+            serde_json::json!({}),
+        );
+    }
+    action_record_response(record, &origin)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn prune_config(config: &mut RelayConfig) -> bool {
+    let now = unix_now();
+    let old_operations = config.pairing_operations.len();
+    config.pairing_operations.retain(|item| match item.state {
+        PairingOperationState::Pending | PairingOperationState::Rejected => {
+            item.created_unix + PAIRING_TTL.as_secs() as i64 > now
+        }
+        PairingOperationState::Complete { .. } => true,
+        // An approved operation remains recoverable until Server persistence
+        // is acknowledged or the user explicitly cancels/replaces it.
+        PairingOperationState::ApprovedUnconfirmed { .. } => true,
+    });
+    let old_actions = config.actions.len();
+    config
+        .actions
+        .retain(|item| item.created_unix + ACTION_TTL_SECS > now);
+    old_operations != config.pairing_operations.len() || old_actions != config.actions.len()
+}
+
+fn suggested_remote_root(path: &str, mappings: &[PathMapping]) -> String {
+    let input = match normalize_path(path) {
+        Ok(value) => value,
+        Err(_) => return path.to_owned(),
+    };
+    for mapping in mappings {
+        if let Ok(remote) = normalize_path(&mapping.remote)
+            && remote.windows == input.windows
+            && component_eq(&remote.prefix, &input.prefix, input.windows)
+            && remote.components.len() <= input.components.len()
+            && remote
+                .components
+                .iter()
+                .zip(&input.components)
+                .all(|(a, b)| component_eq(a, b, input.windows))
+        {
+            return mapping.remote.clone();
+        }
+    }
+    let mut parent = PathBuf::from(path.replace('\\', "/"));
+    parent.pop();
+    let value = parent.to_string_lossy().replace('\\', "/");
+    if value.is_empty() {
+        path.to_owned()
+    } else {
+        value
+    }
+}
+
+fn bearer_credential(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+}
+
+fn action_record_response(record: &ActionRecord, origin: &str) -> Response {
+    match &record.state {
+        ActionRecordState::PendingMapping => with_cors((StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": { "code": "mapping_required", "message": "Choose the local folder corresponding to this server path", "details": { "path": record.remote_path, "instance_id": record.instance_id, "action_id": record.id } }
+        }))).into_response(), origin),
+        ActionRecordState::Executing => with_cors(
+            (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"executing"}))).into_response(),
+            origin,
+        ),
+        ActionRecordState::Complete => with_cors(StatusCode::NO_CONTENT.into_response(), origin),
+        ActionRecordState::Failed { code, message } => structured_error(StatusCode::INTERNAL_SERVER_ERROR, code, message, Some(origin), serde_json::json!({"action_id":record.id})),
     }
 }
 
@@ -959,6 +1676,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({
+                    "operation_id": Uuid::new_v4(),
                     "name": name,
                     "origin": origin,
                     "server_url": format!("{origin}/search")
@@ -988,8 +1706,8 @@ mod tests {
         assert!(map_path("/srv-media/a.jpg", &mappings).is_err());
     }
 
-    /// Dot components normalize before matching while traversal above an
-    /// authorized root is rejected.
+    /// Dot components normalize before matching while lexical traversal above
+    /// the remote mapping prefix is rejected; mappings are not symlink sandboxes.
     #[test]
     fn traversal_cannot_escape_mapping() {
         let mappings = [PathMapping {
@@ -1073,6 +1791,7 @@ mod tests {
         let mut mismatched = pairing_request("https://other.example", "wrong");
         *mismatched.body_mut() = Body::from(
             serde_json::json!({
+                "operation_id": Uuid::new_v4(),
                 "name": "wrong",
                 "origin": "https://remote.example",
                 "server_url": "https://remote.example/search"
@@ -1095,8 +1814,11 @@ mod tests {
             .unwrap();
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let requested: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let request_id = Uuid::parse_str(requested["request_id"].as_str().unwrap()).unwrap();
-        state.approve(request_id).await.unwrap();
+        let request_id = Uuid::parse_str(requested["operation_id"].as_str().unwrap()).unwrap();
+        let (first, second) = tokio::join!(state.approve(request_id), state.approve(request_id));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(state.status().await.instances.len(), 1);
 
         let wrong_origin = Request::builder()
             .uri(format!("/v1/pairing/{request_id}"))
@@ -1122,7 +1844,7 @@ mod tests {
         let approved = router(state.clone()).oneshot(poll()).await.unwrap();
         let body = to_bytes(approved.into_body(), 16 * 1024).await.unwrap();
         let approved: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(approved["status"], "approved");
+        assert_eq!(approved["status"], "approved_unconfirmed");
         assert!(approved["credential"].as_str().unwrap().len() >= 40);
         let repeated = router(state.clone()).oneshot(poll()).await.unwrap();
         assert_eq!(repeated.status(), StatusCode::OK);
@@ -1131,30 +1853,54 @@ mod tests {
         assert_eq!(repeated["credential"], approved["credential"]);
 
         let instance_id = Uuid::parse_str(approved["instance_id"].as_str().unwrap()).unwrap();
+        let credential = approved["credential"].as_str().unwrap();
+        let acknowledge = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/pairing/{request_id}/ack"))
+                .header(header::ORIGIN, "https://remote.example")
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            router(state.clone())
+                .oneshot(acknowledge())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            router(state.clone())
+                .oneshot(acknowledge())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
         state.revoke(instance_id).await.unwrap();
         assert!(state.status().await.instances.is_empty());
     }
 
-    /// Expired requests return Gone even when the caller presents the exact
-    /// origin that created the request.
+    /// Expired requests are garbage collected and no longer claimable.
     #[tokio::test]
     async fn expired_pairing_is_not_claimable() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
         let id = Uuid::new_v4();
-        state.pending.lock().await.insert(
-            id,
-            PendingPairing {
+        {
+            let mut config = state.config.write().await;
+            config.pairing_operations.push(PairingOperation {
                 id,
                 name: "expired".into(),
                 origin: "https://remote.example".into(),
                 server_url: "https://remote.example/search".into(),
                 roots: Vec::new(),
-                created: Instant::now() - PAIRING_TTL - Duration::from_secs(1),
-                approved: None,
-                rejected: false,
-            },
-        );
+                created_unix: unix_now() - PAIRING_TTL.as_secs() as i64 - 1,
+                state: PairingOperationState::Pending,
+            });
+        }
         let request = Request::builder()
             .uri(format!("/v1/pairing/{id}"))
             .header(header::ORIGIN, "https://remote.example")
@@ -1162,7 +1908,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             router(state).oneshot(request).await.unwrap().status(),
-            StatusCode::GONE
+            StatusCode::NOT_FOUND
         );
     }
 
@@ -1199,6 +1945,8 @@ mod tests {
                     }],
                 }],
                 commands: FileActionCommands::default(),
+                pairing_operations: Vec::new(),
+                actions: Vec::new(),
             },
             temp.path().join("relay.toml"),
             Arc::new(move |_, _, _| {
@@ -1207,6 +1955,7 @@ mod tests {
             }),
             Arc::new(|| {}),
         ));
+        let action_id = Uuid::new_v4();
         let action = || {
             Request::builder()
                 .method("POST")
@@ -1215,7 +1964,7 @@ mod tests {
                 .header(header::AUTHORIZATION, format!("Bearer {credential}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({"action":"open_file","path":"/remote/fixture.txt"})
+                    serde_json::json!({"action_id":action_id,"action":"open_file","path":"/remote/fixture.txt"})
                         .to_string(),
                 ))
                 .unwrap()
@@ -1232,5 +1981,86 @@ mod tests {
             router(state).oneshot(action()).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// An action outside all root hints is retained, accepts a newly entered
+    /// remote root, previews the translated file, and executes automatically
+    /// after Desktop saves the mapping.
+    #[tokio::test]
+    async fn unknown_root_mapping_resumes_the_pending_action() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("fixture.txt"), "fixture").unwrap();
+        let credential = "test-credential";
+        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+        let hash = Argon2::default()
+            .hash_password(credential.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        let instance_id = Uuid::new_v4();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_for_action = invoked.clone();
+        let state = Arc::new(RelayState::new(
+            RelayConfig {
+                relay_id: Uuid::new_v4(),
+                enabled: true,
+                bind: default_bind(),
+                instances: vec![RelayInstance {
+                    id: instance_id,
+                    name: "remote".into(),
+                    server_url: "https://remote.example".into(),
+                    origins: vec!["https://remote.example".into()],
+                    credential_hash: hash,
+                    mappings: Vec::new(),
+                }],
+                commands: FileActionCommands::default(),
+                pairing_operations: Vec::new(),
+                actions: Vec::new(),
+            },
+            temp.path().join("relay.toml"),
+            Arc::new(move |_, _, _| {
+                invoked_for_action.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Arc::new(|| {}),
+        ));
+        let action_id = Uuid::new_v4();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/actions")
+            .header(header::ORIGIN, "https://remote.example")
+            .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"action_id":action_id,"action":"open_file","path":"/unknown/fixture.txt"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.status().await.pending_actions.len(), 1);
+        let preview = state
+            .mapping_preview(
+                action_id,
+                "/unknown".into(),
+                temp.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(preview.exists);
+        state
+            .resolve_mapping(
+                action_id,
+                "/unknown".into(),
+                temp.path().display().to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(invoked.load(Ordering::Acquire));
+        assert!(state.status().await.pending_actions.is_empty());
     }
 }

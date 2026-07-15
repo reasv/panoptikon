@@ -4489,7 +4489,7 @@
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."
           },
           "client": {
-            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms` and `disable_backend_open`."
+            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, and `relay_enabled`\n(Relay is enabled when the key is absent)."
           },
           "desktop_managed": {
             "type": "boolean",

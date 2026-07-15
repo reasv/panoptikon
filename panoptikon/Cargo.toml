@@ -74,7 +74,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 rand = "0.9"
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 tower = "0.5"
 tokio-util = { version = "0.7", features = ["io"] }
 httpdate = "1"

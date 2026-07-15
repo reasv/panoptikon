@@ -627,8 +627,8 @@ Relay is a Desktop feature that lets a Panoptikon UI connected to a remote
 Panoptikon instance request explicitly authorized actions on the local computer,
 initially opening a mapped file or revealing it in the file manager.
 
-The local Desktop-hosted Panoptikon does not use Relay. Its backend `/api/open`
-implementation already operates on the same filesystem.
+The normative routing, pairing, mapping-recovery, and command behavior is in
+`file-opening-and-relay.md`, which supersedes this overview where they differ.
 
 ### 12.1 Runtime and Relay-only mode
 
@@ -675,9 +675,9 @@ local = "//workstation/archive"
 ```
 
 Secrets MUST not be written into ordinary logs or returned by diagnostics.
-Desktop SHOULD use the OS credential store when practical; otherwise a
-permission-restricted secret file separate from `relay.toml` is acceptable.
-Only credential hashes are stored when bearer verification permits it.
+Relay stores credential verifiers after pairing completes. An approved but
+unacknowledged operation temporarily retains its recoverable credential in
+permission-restricted Desktop settings so interrupted pairing can resume.
 
 ### 12.3 Pairing and authorization
 
@@ -691,14 +691,18 @@ The v1 protocol MUST provide:
   server URL;
 - a pending pairing state visible in Desktop;
 - explicit local approval or rejection in a Tauri control window;
-- issuance of a unique credential after approval;
+- durable, idempotent Server and Relay operation records;
+- issuance of a unique, recoverable-until-acknowledged credential after approval;
+- explicit idempotent acknowledgement after Server persistence;
 - authenticated action requests; and
 - local revocation of one instance without rotating every other instance.
 
 An unpaired web origin may request pairing but cannot execute any action. Pairing
 approval MUST display the requesting origin and explain the local capabilities
-being granted. Requests expire, cannot be approved twice, and are bounded to
-prevent a website from flooding the user with dialogs.
+being granted. Pending requests expire, concurrent approval returns the same
+credential, and requests are bounded to prevent a website from flooding the
+user with dialogs. Approved provisional operations survive Desktop restart
+until acknowledged, cancelled, or replaced by a newly approved repair.
 
 CORS MUST reflect only the requesting origin for pairing responses and only
 stored allowed origins for authenticated endpoints. Wildcard CORS is forbidden.
@@ -721,12 +725,13 @@ Mapping requirements:
 - the longest valid remote prefix wins;
 - separators and Windows drive/UNC semantics are normalized deliberately;
 - `.` and `..` components are normalized before matching;
-- traversal outside the selected local mapping root is rejected;
+- lexical `..` traversal above the remote mapping prefix is rejected;
+- mappings are translations rather than sandboxes, so local symlinks and
+  junctions follow normal operating-system semantics;
 - nonexistent or inaccessible mapped paths produce a non-sensitive error;
-- command execution uses an executable plus an argument vector, not a
-  shell-interpolated string; and
-- custom commands, if retained at all, are an advanced local-only setting with
-  explicit argument templates and no remote-controlled shell fragments.
+- direct command execution uses an executable plus an argument vector;
+- explicit shell mode remains a trusted local-only option with a warning; and
+- browser and Server requests never provide command templates.
 
 All action requests and outcomes are audit-logged with instance ID, action, and
 redacted/mapped path information. Credentials are never logged.

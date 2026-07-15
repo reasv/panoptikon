@@ -266,8 +266,9 @@ fn apply_policy(
         settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
     // Relay pairing bootstrap is capability-discovery state, not an action.
     // Its handlers still enforce the matched policy's relay_enabled switch.
-    let is_relay_bootstrap =
-        settings.upstreams.api.local && path.starts_with("/api/relay/pairings/");
+    let is_relay_bootstrap = settings.upstreams.api.local
+        && (path.starts_with("/api/relay/pairings/")
+            || path.starts_with("/api/relay/pairing-operations/"));
 
     if is_api && !is_client_config && !is_relay_bootstrap {
         if !ruleset_allows(settings, &policy, &method, &path) {

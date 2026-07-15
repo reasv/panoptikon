@@ -342,9 +342,19 @@ async fn async_main() -> anyhow::Result<()> {
             .route("/api/client-config", get(api::client_config::client_config));
         app = app.route(
             "/api/relay/pairings/{relay_id}",
-            get(api::relay::get_pairing)
-                .put(api::relay::put_pairing)
-                .delete(api::relay::delete_pairing),
+            get(api::relay::get_pairing).delete(api::relay::delete_pairing),
+        );
+        app = app.route(
+            "/api/relay/pairing-operations/{relay_id}",
+            get(api::relay::get_pairing_operation).post(api::relay::begin_pairing_operation),
+        );
+        app = app.route(
+            "/api/relay/pairing-operations/{operation_id}/commit",
+            axum::routing::put(api::relay::commit_pairing_operation),
+        );
+        app = app.route(
+            "/api/relay/pairing-operations/{operation_id}",
+            axum::routing::delete(api::relay::cancel_pairing_operation),
         );
         if desktop::is_managed() {
             let desktop_routes = Router::new()
