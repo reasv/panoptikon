@@ -672,7 +672,12 @@ requiredness and secret presentation. `GET /api/inference/external-inputs`
 reports definitions, model usages, and presence without values. Desktop-only
 `GET|PUT /api/desktop/external-inputs` manages declared environment-backed
 values in `<Desktop Server root>/.env`; an explicit per-variable Desktop GET is
-used only when the user chooses to reveal a configured secret. See
+used only when the user chooses to reveal a configured secret. Desktop always
+uses the in-process local registry for these management routes, even when an
+explicit remote inference upstream is primary; without local inference the
+remote declarations are informational and management is disabled. Empty PUT
+values preserve existing entries, while removal uses the explicit `remove`
+list. See
 [Inferio external inputs](../docs/inferio-external-inputs.md).
 
 ### Settings

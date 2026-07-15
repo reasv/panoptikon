@@ -6,10 +6,10 @@ use std::{
     fs,
     io::Write as _,
     path::Path,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
-use axum::{Json, extract::Path as AxumPath};
+use axum::{Extension, Json, extract::Path as AxumPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::Mutex;
@@ -123,6 +123,12 @@ pub(crate) struct DesktopExternalInputUpdate {
 
 static ENV_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// The in-process Inferio instance owned by this Desktop server, if enabled.
+/// This is deliberately independent of the primary job/search upstream,
+/// which may be remote in a supported mixed deployment.
+#[derive(Clone)]
+pub(crate) struct DesktopInferenceState(pub(crate) Option<Arc<crate::inferio::http::InferioState>>);
+
 fn default_true() -> bool {
     true
 }
@@ -146,17 +152,12 @@ fn ensure_desktop_managed() -> Result<(), ApiError> {
     tag = "desktop",
     responses((status = 200, description = "Declared external inputs, presence, and editable non-secret values", body = JsonValue))
 )]
-pub(crate) async fn external_inputs() -> Result<Json<JsonValue>, ApiError> {
+pub(crate) async fn external_inputs(
+    Extension(inference): Extension<DesktopInferenceState>,
+) -> Result<Json<JsonValue>, ApiError> {
     ensure_desktop_managed()?;
-    let value = job_inference_context()
-        .primary
-        .get_external_inputs()
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to read inference external inputs");
-            ApiError::internal("Failed to read inference external inputs")
-        })?;
-    let values = if crate::config::runtime().inference_local_enabled {
+    let value = desktop_external_input_registry(&inference).await?;
+    let values = if inference.0.is_some() {
         let snapshot =
             crate::env_template::EnvironmentSnapshot::current(true).map_err(|error| {
                 tracing::error!(%error, "failed to resolve Desktop managed .env");
@@ -181,10 +182,29 @@ pub(crate) async fn external_inputs() -> Result<Json<JsonValue>, ApiError> {
         HashMap::new()
     };
     Ok(Json(json!({
-        "managed": crate::config::runtime().inference_local_enabled,
+        "managed": inference.0.is_some(),
         "registry": value,
         "values": values
     })))
+}
+
+async fn desktop_external_input_registry(
+    inference: &DesktopInferenceState,
+) -> Result<JsonValue, ApiError> {
+    if let Some(local) = &inference.0 {
+        return local.external_inputs_json().map_err(|error| {
+            tracing::error!(%error, "failed to read local inference external inputs");
+            ApiError::internal("Failed to read inference external inputs")
+        });
+    }
+    job_inference_context()
+        .primary
+        .get_external_inputs()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read remote inference external inputs");
+            ApiError::internal("Failed to read inference external inputs")
+        })
 }
 
 #[utoipa::path(
@@ -196,22 +216,16 @@ pub(crate) async fn external_inputs() -> Result<Json<JsonValue>, ApiError> {
     responses((status = 200, description = "Current value after an explicit reveal action", body = JsonValue))
 )]
 pub(crate) async fn reveal_external_input(
+    Extension(inference): Extension<DesktopInferenceState>,
     AxumPath(variable): AxumPath<String>,
 ) -> Result<Json<JsonValue>, ApiError> {
     ensure_desktop_managed()?;
-    if !crate::config::runtime().inference_local_enabled {
+    if inference.0.is_none() {
         return Err(ApiError::bad_request(
             "External inputs are managed on the configured remote Inferio host",
         ));
     }
-    let declared = job_inference_context()
-        .primary
-        .get_external_inputs()
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to validate external-input reveal");
-            ApiError::internal("Failed to validate inference external inputs")
-        })?;
+    let declared = desktop_external_input_registry(&inference).await?;
     let allowed = declared
         .get("definitions")
         .and_then(JsonValue::as_object)
@@ -242,22 +256,16 @@ pub(crate) async fn reveal_external_input(
     responses((status = 200, description = "Updated external-input status", body = JsonValue))
 )]
 pub(crate) async fn update_external_inputs(
-    Json(request): Json<DesktopExternalInputUpdate>,
+    Extension(inference): Extension<DesktopInferenceState>,
+    Json(mut request): Json<DesktopExternalInputUpdate>,
 ) -> Result<Json<JsonValue>, ApiError> {
     ensure_desktop_managed()?;
-    if !crate::config::runtime().inference_local_enabled {
+    if inference.0.is_none() {
         return Err(ApiError::bad_request(
             "External inputs are managed on the configured remote Inferio host",
         ));
     }
-    let declared = job_inference_context()
-        .primary
-        .get_external_inputs()
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to validate inference external inputs");
-            ApiError::internal("Failed to validate inference external inputs")
-        })?;
+    let declared = desktop_external_input_registry(&inference).await?;
     let allowed = declared
         .get("definitions")
         .and_then(JsonValue::as_object)
@@ -278,12 +286,20 @@ pub(crate) async fn update_external_inputs(
         }
     }
 
+    // Empty edits mean "keep the current value". Removal is represented
+    // exclusively by the explicit `remove` list.
+    discard_empty_updates(&mut request.values);
+
     let _guard = ENV_WRITE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     update_dotenv(Path::new(".env"), &request.values, &request.remove).map_err(|error| {
         tracing::error!(%error, "failed to update Desktop managed .env");
         ApiError::internal("Failed to update Desktop inference configuration")
     })?;
-    external_inputs().await
+    external_inputs(Extension(inference)).await
+}
+
+fn discard_empty_updates(values: &mut HashMap<String, String>) {
+    values.retain(|_, value| !value.is_empty());
 }
 
 fn update_dotenv(
@@ -703,6 +719,8 @@ pub(crate) async fn complete_setup(
 mod external_input_tests {
     use super::*;
 
+    /// Updating one declaration preserves unrelated content, while an
+    /// explicit removal deletes only the requested declaration.
     #[test]
     fn dotenv_update_preserves_unrelated_lines_and_removes_explicitly() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,6 +742,20 @@ mod external_input_tests {
         assert!(text.contains("OTHER=value"));
     }
 
+    /// Empty API edits are discarded, so they cannot replace an existing
+    /// declaration; non-empty edits remain available to the dotenv writer.
+    #[test]
+    fn dotenv_empty_edit_keeps_existing_value() {
+        let mut values = HashMap::from([
+            ("API_KEY".into(), String::new()),
+            ("TIMEOUT".into(), "30".into()),
+        ]);
+        discard_empty_updates(&mut values);
+        assert_eq!(values, HashMap::from([("TIMEOUT".into(), "30".into())]));
+    }
+
+    /// Dotenv assignment parsing ignores comments and invalid identifiers,
+    /// while accepting the standard optional `export` prefix.
     #[test]
     fn dotenv_key_parser_ignores_comments_and_accepts_export() {
         assert_eq!(dotenv_line_key(" export TOKEN = value"), Some("TOKEN"));

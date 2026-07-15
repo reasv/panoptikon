@@ -141,6 +141,17 @@ impl InferioState {
         );
         Ok(Arc::new(Self { manager, registry }))
     }
+
+    /// Resolve external-input declarations from this local Inferio registry.
+    /// Desktop management uses this directly so an explicitly configured
+    /// remote primary upstream cannot be mistaken for the local instance.
+    pub fn external_inputs_json(&self) -> Result<JsonValue> {
+        self.registry
+            .lock()
+            .unwrap()
+            .get()
+            .and_then(|registry| registry.external_inputs_json())
+    }
 }
 
 /// The inference routes, path-relative so they can be nested under
@@ -556,8 +567,7 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
 async fn get_external_inputs(
     State(state): State<Arc<InferioState>>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let snapshot = state.registry.lock().unwrap().get();
-    match snapshot.and_then(|registry| registry.external_inputs_json()) {
+    match state.external_inputs_json() {
         Ok(status) => Ok(Json(status)),
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "failed to resolve external inputs");

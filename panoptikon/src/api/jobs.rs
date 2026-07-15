@@ -431,12 +431,23 @@ pub(crate) async fn update_config(
 }
 
 /// Validate declarations when the upstream supports the additive endpoint.
-/// Older remote Python Inferio servers do not have it, so discovery failure
-/// preserves their previous behavior; load-time Inferio validation remains
-/// authoritative for current servers.
+/// Older remote Python Inferio servers do not have it, so a 404 preserves
+/// their previous behavior; every other discovery failure is surfaced.
+/// Load-time Inferio validation remains authoritative for current servers.
 async fn validate_external_inputs(inference_ids: &[String]) -> Result<(), ApiError> {
-    let Ok(status) = job_inference_context().primary.get_external_inputs().await else {
-        return Ok(());
+    let status = match job_inference_context()
+        .primary
+        .get_external_inputs_optional()
+        .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::error!(%error, "failed to validate inference external inputs");
+            return Err(ApiError::internal(
+                "Failed to validate inference external inputs",
+            ));
+        }
     };
     for inference_id in inference_ids {
         let Some(usages) = status

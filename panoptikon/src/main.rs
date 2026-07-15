@@ -341,7 +341,7 @@ async fn async_main() -> anyhow::Result<()> {
             // capabilities and [policies.client] settings here.
             .route("/api/client-config", get(api::client_config::client_config));
         if desktop::is_managed() {
-            app = app
+            let desktop_routes = Router::new()
                 .route("/api/desktop/setup-status", get(api::desktop::setup_status))
                 .route(
                     "/api/desktop/setup-folders/validate",
@@ -366,7 +366,11 @@ async fn async_main() -> anyhow::Result<()> {
                 .route(
                     "/api/desktop/external-inputs/{variable}",
                     get(api::desktop::reveal_external_input),
-                );
+                )
+                .layer(axum::Extension(api::desktop::DesktopInferenceState(
+                    inferio_state.clone(),
+                )));
+            app = app.merge(desktop_routes);
         }
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;
         app = app

@@ -435,7 +435,6 @@ pub struct RuntimeConfig {
     pub html_renderer: Option<PathBuf>,
     pub html_renderer_args: Vec<String>,
     pub thumbnail_font: Option<PathBuf>,
-    pub inference_local_enabled: bool,
     /// The venv interpreter `media_tools` probes for static-ffmpeg —
     /// the same one that runs inference workers.
     pub venv_python: PathBuf,
@@ -458,7 +457,6 @@ impl Default for RuntimeConfig {
             html_renderer: None,
             html_renderer_args: Vec::new(),
             thumbnail_font: None,
-            inference_local_enabled: false,
             venv_python: crate::resources::default_worker_python(crate::resources::py_source_mode()),
         }
     }
@@ -525,7 +523,6 @@ impl Settings {
             html_renderer: self.jobs.html_renderer.clone(),
             html_renderer_args: self.jobs.html_renderer_args.clone(),
             thumbnail_font: self.jobs.thumbnail_font.clone(),
-            inference_local_enabled: self.inference_local.enabled,
             venv_python: self.inference_local.resolved_python(),
         }
     }

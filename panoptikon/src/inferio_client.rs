@@ -283,6 +283,23 @@ impl InferenceApiClient {
             .context("inference external-input request failed")?;
         parse_json_response(response).await
     }
+
+    /// Fetch external inputs when the upstream implements the additive
+    /// endpoint. Only a genuine 404 means an older unsupported server;
+    /// availability, authorization, and decoding failures remain errors.
+    pub async fn get_external_inputs_optional(&self) -> Result<Option<Value>> {
+        let url = format!("{}/external-inputs", self.base_url);
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("inference external-input request failed")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        parse_json_response(response).await.map(Some)
+    }
 }
 
 async fn file_to_part(idx: usize, file: &InferenceFile) -> Result<Part> {
@@ -482,9 +499,40 @@ fn file_input_from_path(path: impl AsRef<Path>) -> InferenceFile {
 mod tests {
     use super::*;
     use axum::extract::RawQuery;
-    use axum::routing::post;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Optional external-input discovery treats only a 404 as an older
+    /// unsupported server; other HTTP failures remain visible to callers.
+    #[tokio::test]
+    async fn optional_external_inputs_only_ignores_not_found() {
+        let app = Router::new()
+            .route(
+                "/missing/api/inference/external-inputs",
+                get(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/broken/api/inference/external-inputs",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let missing =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}/missing"), false)
+                .unwrap();
+        assert_eq!(missing.get_external_inputs_optional().await.unwrap(), None);
+
+        let broken =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}/broken"), false)
+                .unwrap();
+        assert!(broken.get_external_inputs_optional().await.is_err());
+    }
 
     /// The predict request must carry `max_batch` (design §6) and `prewarm`
     /// (design §8) as query params exactly when the caller passes Some, and
