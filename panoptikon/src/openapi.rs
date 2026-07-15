@@ -163,6 +163,7 @@ impl Modify for JsonValueSchema {
             crate::api::desktop::DesktopSetupCompleteResponse,
             crate::api::desktop::DesktopExternalInputUpdate,
             crate::api::desktop::DesktopUpdateDismissRequest,
+            crate::api::desktop::DesktopUpdateSnoozeRequest,
             crate::db::setup::FolderValidation,
             crate::db::setup::FolderValidationIssue,
             crate::pql::EmbeddingCacheEntry,

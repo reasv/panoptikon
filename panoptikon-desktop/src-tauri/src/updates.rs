@@ -1,5 +1,5 @@
 use crate::{
-    settings::{UpdateSettings, atomic_write},
+    settings::{SettingsDocument, UpdateSettings, atomic_write},
     supervisor::Supervisor,
 };
 use axum::{
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -25,7 +25,7 @@ use tauri::{
 };
 use tauri_plugin_opener::OpenerExt as _;
 use tauri_plugin_updater::{Update, UpdaterExt as _};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 const CHANGELOG_URL: &str =
     "https://github.com/reasv/panoptikon/releases/latest/download/changelog.json";
@@ -58,6 +58,169 @@ impl CheckReason {
             Self::Manual => "manual",
             Self::Freshness => "freshness",
         }
+    }
+
+    fn strength(self) -> u8 {
+        match self {
+            Self::Startup | Self::Runtime => 0,
+            Self::Manual => 1,
+            Self::Freshness => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckFlightOutcome {
+    Attempted(Result<(), String>),
+    NotAttempted {
+        owner_reason: CheckReason,
+        result: Result<(), String>,
+    },
+    Cancelled(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CheckOutcomeDisposition {
+    Retry,
+    Complete(Result<(), String>),
+}
+
+fn check_outcome_disposition(
+    requested_reason: CheckReason,
+    outcome: CheckFlightOutcome,
+) -> CheckOutcomeDisposition {
+    match outcome {
+        CheckFlightOutcome::Attempted(result) => CheckOutcomeDisposition::Complete(result),
+        CheckFlightOutcome::NotAttempted {
+            owner_reason,
+            result,
+        } if requested_reason.strength() > owner_reason.strength() => {
+            CheckOutcomeDisposition::Retry
+        }
+        CheckFlightOutcome::NotAttempted { result, .. } => {
+            CheckOutcomeDisposition::Complete(result)
+        }
+        CheckFlightOutcome::Cancelled(error) => CheckOutcomeDisposition::Complete(Err(error)),
+    }
+}
+
+struct CheckSingleFlight {
+    registry: StdMutex<CheckFlightRegistry>,
+}
+
+struct CheckFlightRegistry {
+    next_id: u64,
+    active: Option<ActiveCheckFlight>,
+}
+
+struct ActiveCheckFlight {
+    id: u64,
+    result: watch::Sender<Option<CheckFlightOutcome>>,
+}
+
+enum CheckFlightEntry<'a> {
+    Owner(CheckFlightOwner<'a>),
+    Joiner(watch::Receiver<Option<CheckFlightOutcome>>),
+}
+
+struct CheckFlightOwner<'a> {
+    single_flight: &'a CheckSingleFlight,
+    id: u64,
+    completed: bool,
+}
+
+impl CheckSingleFlight {
+    fn new() -> Self {
+        Self {
+            registry: StdMutex::new(CheckFlightRegistry {
+                next_id: 0,
+                active: None,
+            }),
+        }
+    }
+
+    fn enter(&self) -> CheckFlightEntry<'_> {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = &registry.active {
+            return CheckFlightEntry::Joiner(active.result.subscribe());
+        }
+        registry.next_id = registry.next_id.wrapping_add(1).max(1);
+        let id = registry.next_id;
+        let (sender, _receiver) = watch::channel(None);
+        registry.active = Some(ActiveCheckFlight { id, result: sender });
+        CheckFlightEntry::Owner(CheckFlightOwner {
+            single_flight: self,
+            id,
+            completed: false,
+        })
+    }
+
+    fn complete(&self, id: u64, outcome: CheckFlightOutcome) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == id)
+        {
+            let active = registry
+                .active
+                .take()
+                .expect("active check flight disappeared");
+            active.result.send_replace(Some(outcome));
+        }
+    }
+}
+
+impl CheckFlightOwner<'_> {
+    fn finish(mut self, outcome: CheckFlightOutcome) {
+        self.single_flight.complete(self.id, outcome);
+        self.completed = true;
+    }
+}
+
+impl Drop for CheckFlightOwner<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.single_flight.complete(
+                self.id,
+                CheckFlightOutcome::Cancelled("the update check was cancelled".into()),
+            );
+        }
+    }
+}
+
+async fn wait_for_check_flight(
+    mut result: watch::Receiver<Option<CheckFlightOutcome>>,
+) -> CheckFlightOutcome {
+    loop {
+        let outcome = result.borrow().clone();
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+        if result.changed().await.is_err() {
+            return CheckFlightOutcome::Cancelled("the update check ended without a result".into());
+        }
+    }
+}
+
+struct AtomicBoolReset<'a>(&'a AtomicBool);
+
+impl AtomicBoolReset<'_> {
+    fn set(flag: &AtomicBool) -> AtomicBoolReset<'_> {
+        flag.store(true, Ordering::Release);
+        AtomicBoolReset(flag)
+    }
+}
+
+impl Drop for AtomicBoolReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -98,10 +261,12 @@ pub struct UpdateView {
     pub reminder_at_unix: Option<i64>,
     pub updates_disabled: bool,
     pub active_work: bool,
+    pub active_work_unknown: bool,
 }
 
 pub struct UpdateCoordinator {
-    check_gate: Mutex<()>,
+    operation_gate: Mutex<()>,
+    check_single_flight: CheckSingleFlight,
     pending: Mutex<Option<Update>>,
     manual_attempts: Mutex<VecDeque<i64>>,
     checking: AtomicBool,
@@ -120,8 +285,25 @@ struct BridgeServerState {
 }
 
 #[derive(Debug, Deserialize)]
-struct BridgeDismissRequest {
+struct BridgeVersionRequest {
     version: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RibbonActionError {
+    #[error("the available update changed; refresh and try again")]
+    TargetChanged,
+    #[error("failed to save Desktop update settings: {0}")]
+    Persistence(#[source] anyhow::Error),
+}
+
+impl RibbonActionError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::TargetChanged => StatusCode::CONFLICT,
+            Self::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -211,34 +393,36 @@ async fn bridge_open(
 async fn bridge_snooze(
     State(state): State<BridgeServerState>,
     headers: HeaderMap,
+    Json(request): Json<BridgeVersionRequest>,
 ) -> Result<StatusCode, StatusCode> {
     if !bridge_authorized(&headers, &state) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    set_ribbon_snooze(&state.app)
+    set_ribbon_snooze(&state.app, request.version)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| error.status_code())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn bridge_dismiss(
     State(state): State<BridgeServerState>,
     headers: HeaderMap,
-    Json(request): Json<BridgeDismissRequest>,
+    Json(request): Json<BridgeVersionRequest>,
 ) -> Result<StatusCode, StatusCode> {
     if !bridge_authorized(&headers, &state) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     set_ribbon_dismissal(&state.app, request.version)
         .await
-        .map_err(|_| StatusCode::CONFLICT)?;
+        .map_err(|error| error.status_code())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 impl UpdateCoordinator {
     pub fn new() -> Self {
         Self {
-            check_gate: Mutex::new(()),
+            operation_gate: Mutex::new(()),
+            check_single_flight: CheckSingleFlight::new(),
             pending: Mutex::new(None),
             manual_attempts: Mutex::new(VecDeque::new()),
             checking: AtomicBool::new(false),
@@ -265,7 +449,7 @@ impl UpdateCoordinator {
     }
 
     pub async fn view(&self, app: &AppHandle) -> UpdateView {
-        let (settings, cache_path, port, local_enabled) = {
+        let (settings, cache_path, port, local_enabled, sidecar_running) = {
             let supervisor = app.state::<Arc<Supervisor>>();
             let settings = supervisor.settings.lock().await.typed.updates.clone();
             let snapshot = supervisor.snapshot().await;
@@ -274,6 +458,7 @@ impl UpdateCoordinator {
                 supervisor.paths.update_changelog.clone(),
                 snapshot.port,
                 snapshot.local_server_enabled,
+                snapshot.sidecar_pid.is_some(),
             )
         };
         let current_version = app.package_info().version.to_string();
@@ -300,6 +485,23 @@ impl UpdateCoordinator {
             && settings
                 .ribbon_snoozed_until_unix
                 .is_none_or(|until| until <= now);
+        let checking = self.checking.load(Ordering::Acquire);
+        let installing = self.installing.load(Ordering::Acquire);
+        let pending_matches = self.pending.lock().await.as_ref().is_some_and(|update| {
+            settings.latest_version.as_deref() == Some(update.version.as_str())
+        });
+        let active_work = if local_enabled && sidecar_running {
+            match probe_sidecar_active_work(port).await {
+                Ok(true) => ActiveWorkState::Active,
+                Ok(false) => ActiveWorkState::Idle,
+                Err(error) => {
+                    tracing::debug!(%error, "could not determine whether the sidecar has active work");
+                    ActiveWorkState::Unknown
+                }
+            }
+        } else {
+            ActiveWorkState::Idle
+        };
         UpdateView {
             current_version,
             available,
@@ -311,16 +513,23 @@ impl UpdateCoordinator {
             last_success_unix: settings.last_checked_unix,
             last_error: settings.last_error,
             last_error_unix: settings.last_error_unix,
-            checking: self.checking.load(Ordering::Acquire),
+            checking,
             fresh,
-            can_install: available && fresh && !self.installing.load(Ordering::Acquire),
+            can_install: can_advertise_install(
+                available,
+                fresh,
+                pending_matches,
+                checking,
+                installing,
+            ),
             check_automatically: settings.check_automatically,
             ribbon_visible,
             ribbon_snoozed_until_unix: settings.ribbon_snoozed_until_unix,
             ribbon_dismissed_version: settings.ribbon_dismissed_version,
             reminder_at_unix: settings.reminder_at_unix,
             updates_disabled: cfg!(debug_assertions),
-            active_work: local_enabled && sidecar_has_active_work(port).await,
+            active_work: active_work == ActiveWorkState::Active,
+            active_work_unknown: active_work == ActiveWorkState::Unknown,
         }
     }
 
@@ -329,26 +538,77 @@ impl UpdateCoordinator {
             return Ok(self.view(app).await);
         }
 
-        let guard = match self.check_gate.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                let guard = self.check_gate.lock().await;
-                drop(guard);
-                return Ok(self.view(app).await);
+        loop {
+            if self.installing.load(Ordering::Acquire) {
+                if reason.automatic() {
+                    return Ok(self.view(app).await);
+                }
+                return Err("an update installation is in progress".into());
             }
-        };
+            let outcome = match self.check_single_flight.enter() {
+                CheckFlightEntry::Owner(owner) => {
+                    let outcome = self.run_external_check_flight(app, reason).await;
+                    owner.finish(outcome.clone());
+                    outcome
+                }
+                CheckFlightEntry::Joiner(result) => wait_for_check_flight(result).await,
+            };
+            match check_outcome_disposition(reason, outcome) {
+                CheckOutcomeDisposition::Retry => continue,
+                CheckOutcomeDisposition::Complete(result) => {
+                    result?;
+                    return Ok(self.view(app).await);
+                }
+            }
+        }
+    }
+
+    async fn run_external_check_flight(
+        &self,
+        app: &AppHandle,
+        reason: CheckReason,
+    ) -> CheckFlightOutcome {
+        let _operation_guard = self.operation_gate.lock().await;
+        if self.installing.load(Ordering::Acquire) {
+            let result = if reason.automatic() {
+                Ok(())
+            } else {
+                Err("an update installation is in progress".into())
+            };
+            return CheckFlightOutcome::NotAttempted {
+                owner_reason: reason,
+                result,
+            };
+        }
+        self.run_check_locked(app, reason).await
+    }
+
+    async fn run_check_locked(&self, app: &AppHandle, reason: CheckReason) -> CheckFlightOutcome {
         let now = unix_timestamp();
-        if !self.allow_attempt(app, reason, now).await? {
-            drop(guard);
-            return Ok(self.view(app).await);
+        match self.allow_attempt(app, reason, now).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return CheckFlightOutcome::NotAttempted {
+                    owner_reason: reason,
+                    result: Ok(()),
+                };
+            }
+            Err(error) => {
+                return CheckFlightOutcome::NotAttempted {
+                    owner_reason: reason,
+                    result: Err(error),
+                };
+            }
         }
 
-        self.checking.store(true, Ordering::Release);
+        let checking_guard = AtomicBoolReset::set(&self.checking);
         if let Err(error) = self.record_attempt(app, reason, now).await {
-            self.checking.store(false, Ordering::Release);
-            drop(guard);
+            drop(checking_guard);
             emit_state(app, self).await;
-            return Err(error);
+            return CheckFlightOutcome::NotAttempted {
+                owner_reason: reason,
+                result: Err(error),
+            };
         }
         emit_state(app, self).await;
         tracing::info!(source = reason.label(), "Desktop update check started");
@@ -361,18 +621,18 @@ impl UpdateCoordinator {
             Ok(update) => self.record_success(app, reason, update, now).await,
             Err(error) => {
                 tracing::warn!(source = reason.label(), %error, "Desktop update check failed");
-                self.record_failure(app, now).await?;
-                Err(
-                    "Unable to reach the update service. Check your connection and try again."
-                        .into(),
-                )
+                match self.record_failure(app, now).await {
+                    Ok(()) => Err(
+                        "Unable to reach the update service. Check your connection and try again."
+                            .into(),
+                    ),
+                    Err(error) => Err(error),
+                }
             }
         };
-        self.checking.store(false, Ordering::Release);
-        drop(guard);
+        drop(checking_guard);
         emit_state(app, self).await;
-        outcome?;
-        Ok(self.view(app).await)
+        CheckFlightOutcome::Attempted(outcome)
     }
 
     async fn allow_attempt(
@@ -519,11 +779,11 @@ impl UpdateCoordinator {
         document.save().map_err(|error| error.to_string())
     }
 
-    pub async fn install(
+    async fn install(
         &self,
         app: &AppHandle,
         expected_version: &str,
-        confirm_active_work: bool,
+        active_work_confirmation: Option<ActiveWorkConfirmation>,
     ) -> Result<(), String> {
         if cfg!(debug_assertions) {
             return Err("updates are disabled in development builds".into());
@@ -531,33 +791,45 @@ impl UpdateCoordinator {
         if self.installing.swap(true, Ordering::AcqRel) {
             return Err("an update installation is already in progress".into());
         }
-        let result = self
-            .install_inner(app, expected_version, confirm_active_work)
-            .await;
-        self.installing.store(false, Ordering::Release);
+        let installing_guard = AtomicBoolReset(&self.installing);
+        let result = {
+            let _operation_guard = self.operation_gate.lock().await;
+            self.install_inner_locked(app, expected_version, active_work_confirmation)
+                .await
+        };
+        drop(installing_guard);
         emit_state(app, self).await;
         result
     }
 
-    async fn install_inner(
+    async fn install_inner_locked(
         &self,
         app: &AppHandle,
         expected_version: &str,
-        confirm_active_work: bool,
+        active_work_confirmation: Option<ActiveWorkConfirmation>,
     ) -> Result<(), String> {
-        let fresh = self.view(app).await.fresh;
-        if !fresh {
-            self.check(app, CheckReason::Freshness).await?;
+        let initial_view = self.view(app).await;
+        if initial_view.target_version.as_deref() != Some(expected_version) {
+            return Err("TARGET_CHANGED".into());
+        }
+        let pending_matches = self
+            .pending
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|update| update.version == expected_version);
+        if !initial_view.fresh || !pending_matches || initial_view.checking {
+            let outcome = self.run_check_locked(app, CheckReason::Freshness).await;
+            match check_outcome_disposition(CheckReason::Freshness, outcome) {
+                CheckOutcomeDisposition::Complete(result) => result?,
+                CheckOutcomeDisposition::Retry => {
+                    return Err("the required update check did not run".into());
+                }
+            }
         }
         let view = self.view(app).await;
         if view.target_version.as_deref() != Some(expected_version) {
             return Err("TARGET_CHANGED".into());
-        }
-        if !view.can_install {
-            return Err("A fresh update check is required before installation.".into());
-        }
-        if view.active_work && !confirm_active_work {
-            return Err("ACTIVE_WORK".into());
         }
         let update = self
             .pending
@@ -568,6 +840,15 @@ impl UpdateCoordinator {
         if update.version != expected_version {
             return Err("TARGET_CHANGED".into());
         }
+        if !install_target_ready(view.available, view.fresh, true, view.checking) {
+            return Err("A fresh update check is required before installation.".into());
+        }
+        let initial_work_state = if view.active_work_unknown {
+            ActiveWorkState::Unknown
+        } else {
+            ActiveWorkState::from_active(view.active_work)
+        };
+        validate_active_work_state(initial_work_state, active_work_confirmation)?;
 
         emit_progress(app, "downloading", 0, None, false);
         let progress_app = app.clone();
@@ -584,11 +865,27 @@ impl UpdateCoordinator {
                 format!("Update download or signature verification failed: {error}")
             })?;
 
-        let restart_server_on_failure = app
-            .state::<Arc<Supervisor>>()
-            .snapshot()
-            .await
-            .local_server_enabled;
+        // Work can begin while a large update is downloading. Query again as
+        // the final operation before stopping the sidecar, and only accept an
+        // explicit confirmation from the update dialog.
+        self.validate_exact_install_target(app, expected_version)
+            .await?;
+        let restart_snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
+        let final_work_state = if restart_snapshot.local_server_enabled
+            && restart_snapshot.sidecar_pid.is_some()
+        {
+            match probe_sidecar_active_work(restart_snapshot.port).await {
+                Ok(active) => ActiveWorkState::from_active(active),
+                Err(error) => {
+                    tracing::warn!(%error, "aborting update because sidecar work state is unknown");
+                    ActiveWorkState::Unknown
+                }
+            }
+        } else {
+            ActiveWorkState::Idle
+        };
+        validate_active_work_state(final_work_state, active_work_confirmation)?;
+        let restart_server_on_failure = restart_snapshot.local_server_enabled;
         emit_progress(app, "stopping", 0, None, true);
         Supervisor::stop(app, false)
             .await
@@ -611,6 +908,95 @@ impl UpdateCoordinator {
         #[cfg(not(windows))]
         app.restart();
         Ok(())
+    }
+
+    async fn validate_exact_install_target(
+        &self,
+        app: &AppHandle,
+        expected_version: &str,
+    ) -> Result<(), String> {
+        let supervisor = app.state::<Arc<Supervisor>>();
+        let latest_version = supervisor
+            .settings
+            .lock()
+            .await
+            .typed
+            .updates
+            .latest_version
+            .clone();
+        let pending_matches = self
+            .pending
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|update| update.version == expected_version);
+        if latest_version.as_deref() == Some(expected_version) && pending_matches {
+            Ok(())
+        } else {
+            Err("TARGET_CHANGED".into())
+        }
+    }
+}
+
+fn install_target_ready(
+    available: bool,
+    fresh: bool,
+    pending_matches: bool,
+    checking: bool,
+) -> bool {
+    available && fresh && pending_matches && !checking
+}
+
+fn can_advertise_install(
+    available: bool,
+    fresh: bool,
+    pending_matches: bool,
+    checking: bool,
+    installing: bool,
+) -> bool {
+    install_target_ready(available, fresh, pending_matches, checking) && !installing
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveWorkState {
+    Idle,
+    Active,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveWorkConfirmation {
+    Active,
+    Unknown,
+}
+
+impl ActiveWorkState {
+    fn from_active(active: bool) -> Self {
+        if active { Self::Active } else { Self::Idle }
+    }
+}
+
+fn validate_active_work_state(
+    active_work: ActiveWorkState,
+    confirmation: Option<ActiveWorkConfirmation>,
+) -> Result<(), String> {
+    match active_work {
+        ActiveWorkState::Unknown => Err("ACTIVE_WORK_UNKNOWN".into()),
+        ActiveWorkState::Active if confirmation != Some(ActiveWorkConfirmation::Active) => {
+            Err("ACTIVE_WORK".into())
+        }
+        ActiveWorkState::Idle | ActiveWorkState::Active => Ok(()),
+    }
+}
+
+fn parse_active_work_confirmation(
+    value: Option<&str>,
+) -> Result<Option<ActiveWorkConfirmation>, String> {
+    match value {
+        None => Ok(None),
+        Some("active") => Ok(Some(ActiveWorkConfirmation::Active)),
+        Some("unknown") => Ok(Some(ActiveWorkConfirmation::Unknown)),
+        Some(_) => Err("invalid active-work confirmation state".into()),
     }
 }
 
@@ -711,11 +1097,8 @@ async fn fetch_changelog(current: &str, update: &Update) -> Result<Vec<ReleaseNo
             feed.schema_version
         ));
     }
-    let releases = filter_releases(feed.releases, current, &update.version);
-    if releases.is_empty() {
-        return Err("structured changelog has no notes for this update".into());
-    }
-    Ok(releases)
+    releases_through_target(feed.releases, current, &update.version)
+        .ok_or_else(|| "structured changelog has no notes for the target update".into())
 }
 
 fn read_releases(
@@ -726,8 +1109,7 @@ fn read_releases(
     let target = target?;
     let bytes = std::fs::read(path).ok()?;
     let releases: Vec<ReleaseNote> = serde_json::from_slice(&bytes).ok()?;
-    let filtered = filter_releases(releases, current, target);
-    (!filtered.is_empty()).then_some(filtered)
+    releases_through_target(releases, current, target)
 }
 
 fn fallback_release(settings: &UpdateSettings) -> Vec<ReleaseNote> {
@@ -765,24 +1147,51 @@ fn filter_releases(
     releases
 }
 
-async fn sidecar_has_active_work(port: u16) -> bool {
+fn releases_through_target(
+    releases: Vec<ReleaseNote>,
+    current: &str,
+    target: &str,
+) -> Option<Vec<ReleaseNote>> {
+    let target_version = Version::parse(target).ok()?;
+    let releases = filter_releases(releases, current, target);
+    releases
+        .iter()
+        .any(|release| Version::parse(&release.version).ok().as_ref() == Some(&target_version))
+        .then_some(releases)
+}
+
+async fn probe_sidecar_active_work(port: u16) -> Result<bool, String> {
     let url = format!("http://127.0.0.1:{port}/api/jobs/queue");
-    let Ok(client) = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(700))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-    else {
-        return false;
-    };
-    let Ok(response) = client.get(url).send().await else {
-        return false;
-    };
-    let Ok(value) = response.json::<serde_json::Value>().await else {
-        return false;
-    };
+        .map_err(|error| format!("failed to create sidecar status client: {error}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("sidecar work-state request failed: {error}"))?;
+    if response.status() != StatusCode::OK {
+        return Err(format!(
+            "sidecar work-state request returned HTTP {}",
+            response.status()
+        ));
+    }
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("sidecar work-state response was not valid JSON: {error}"))?;
+    parse_active_work_response(&value)
+}
+
+fn parse_active_work_response(value: &serde_json::Value) -> Result<bool, String> {
     value
         .get("queue")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|queue| !queue.is_empty())
+        .map(|queue| !queue.is_empty())
+        .ok_or_else(|| "sidecar work-state response did not contain a queue array".into())
 }
 
 async fn notify_update(app: AppHandle, version: String) {
@@ -978,16 +1387,24 @@ pub async fn schedule_update_reminder(
 }
 
 #[tauri::command]
-pub async fn snooze_update_ribbon(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub async fn snooze_update_ribbon(
+    window: WebviewWindow,
+    app: AppHandle,
+    version: String,
+) -> Result<(), String> {
     validate_update_client(&window)?;
-    set_ribbon_snooze(&app).await
+    set_ribbon_snooze(&app, version)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-async fn set_ribbon_snooze(app: &AppHandle) -> Result<(), String> {
+async fn set_ribbon_snooze(app: &AppHandle, version: String) -> Result<(), RibbonActionError> {
     let supervisor = app.state::<Arc<Supervisor>>();
     let mut document = supervisor.settings.lock().await;
-    document.typed.updates.ribbon_snoozed_until_unix = Some(unix_timestamp() + RIBBON_SNOOZE_SECS);
-    document.save().map_err(|error| error.to_string())
+    validate_known_target(&document.typed.updates, &version)?;
+    persist_update_settings(&mut document, |settings| {
+        settings.ribbon_snoozed_until_unix = Some(unix_timestamp() + RIBBON_SNOOZE_SECS);
+    })
 }
 
 #[tauri::command]
@@ -997,17 +1414,53 @@ pub async fn dismiss_update_ribbon(
     version: String,
 ) -> Result<(), String> {
     validate_update_client(&window)?;
-    set_ribbon_dismissal(&app, version).await
+    set_ribbon_dismissal(&app, version)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-async fn set_ribbon_dismissal(app: &AppHandle, version: String) -> Result<(), String> {
+async fn set_ribbon_dismissal(app: &AppHandle, version: String) -> Result<(), RibbonActionError> {
     let supervisor = app.state::<Arc<Supervisor>>();
     let mut document = supervisor.settings.lock().await;
-    if document.typed.updates.latest_version.as_deref() != Some(version.as_str()) {
-        return Err("the available update changed; refresh and try again".into());
+    validate_known_target(&document.typed.updates, &version)?;
+    persist_update_settings(&mut document, move |settings| {
+        settings.ribbon_dismissed_version = Some(version);
+    })
+}
+
+fn persist_update_settings(
+    document: &mut SettingsDocument,
+    mutate: impl FnOnce(&mut UpdateSettings),
+) -> Result<(), RibbonActionError> {
+    persist_update_settings_with(document, mutate, SettingsDocument::save)
+}
+
+fn persist_update_settings_with(
+    document: &mut SettingsDocument,
+    mutate: impl FnOnce(&mut UpdateSettings),
+    save: impl FnOnce(&mut SettingsDocument) -> anyhow::Result<()>,
+) -> Result<(), RibbonActionError> {
+    // SettingsDocument::save merges typed values into its raw TOML before the
+    // filesystem write. Restore the whole document so a failed write changes
+    // neither the live view nor a later save of an unrelated setting.
+    let previous = document.clone();
+    mutate(&mut document.typed.updates);
+    if let Err(error) = save(document) {
+        *document = previous;
+        return Err(RibbonActionError::Persistence(error));
     }
-    document.typed.updates.ribbon_dismissed_version = Some(version);
-    document.save().map_err(|error| error.to_string())
+    Ok(())
+}
+
+fn validate_known_target(
+    settings: &UpdateSettings,
+    expected_version: &str,
+) -> Result<(), RibbonActionError> {
+    if settings.latest_version.as_deref() == Some(expected_version) {
+        Ok(())
+    } else {
+        Err(RibbonActionError::TargetChanged)
+    }
 }
 
 #[tauri::command]
@@ -1015,11 +1468,12 @@ pub async fn install_update(
     window: WebviewWindow,
     app: AppHandle,
     expected_version: String,
-    confirm_active_work: bool,
+    confirmed_work_state: Option<String>,
 ) -> Result<(), String> {
     validate_update_window(&window)?;
+    let active_work_confirmation = parse_active_work_confirmation(confirmed_work_state.as_deref())?;
     app.state::<Arc<UpdateCoordinator>>()
-        .install(&app, &expected_version, confirm_active_work)
+        .install(&app, &expected_version, active_work_confirmation)
         .await
 }
 
@@ -1074,6 +1528,59 @@ fn automatic_attempts_in_window(attempts: &[i64], now: i64) -> usize {
 mod tests {
     use super::*;
 
+    async fn serve_queue_response(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new().route(
+            "/api/jobs/queue",
+            axum::routing::get(move || async move { (status, body) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (port, server)
+    }
+
+    async fn serve_redirecting_queue_response() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new()
+            .route(
+                "/api/jobs/queue",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/redirected")],
+                    )
+                }),
+            )
+            .route(
+                "/redirected",
+                axum::routing::get(|| async { (StatusCode::OK, r#"{"queue":[]}"#) }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (port, server)
+    }
+
+    fn release(version: &str) -> ReleaseNote {
+        ReleaseNote {
+            version: version.into(),
+            tag: format!("v{version}"),
+            date: String::new(),
+            notes_markdown: version.into(),
+            release_url: None,
+        }
+    }
+
     #[test]
     fn semantic_version_comparison_handles_prereleases() {
         assert!(version_is_newer("0.2.0", "0.1.9"));
@@ -1098,13 +1605,7 @@ mod tests {
     fn release_filter_selects_missed_versions_newest_first() {
         let releases = ["0.2.0", "0.4.0", "0.3.0", "0.1.0"]
             .into_iter()
-            .map(|version| ReleaseNote {
-                version: version.into(),
-                tag: format!("v{version}"),
-                date: String::new(),
-                notes_markdown: version.into(),
-                release_url: None,
-            })
+            .map(release)
             .collect();
         assert_eq!(
             filter_releases(releases, "0.1.5", "0.3.0")
@@ -1113,6 +1614,259 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["0.3.0", "0.2.0"]
         );
+    }
+
+    #[test]
+    fn structured_notes_must_include_the_exact_target_release() {
+        assert!(
+            releases_through_target(vec![release("0.2.0"), release("0.3.0")], "0.1.0", "0.3.0",)
+                .is_some()
+        );
+        assert!(releases_through_target(vec![release("0.2.0")], "0.1.0", "0.3.0").is_none());
+    }
+
+    #[test]
+    fn installability_requires_live_idle_coordinator_state() {
+        assert!(can_advertise_install(true, true, true, false, false));
+        assert!(!can_advertise_install(true, true, false, false, false));
+        assert!(!can_advertise_install(true, true, true, true, false));
+        assert!(!can_advertise_install(true, true, true, false, true));
+
+        // The installation owns the `installing` flag, so its internal target
+        // validation deliberately excludes that public presentation flag.
+        assert!(install_target_ready(true, true, true, false));
+    }
+
+    #[test]
+    fn active_work_validation_fails_closed() {
+        assert_eq!(
+            validate_active_work_state(ActiveWorkState::Active, None),
+            Err("ACTIVE_WORK".into())
+        );
+        assert_eq!(
+            validate_active_work_state(
+                ActiveWorkState::Active,
+                Some(ActiveWorkConfirmation::Active)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_active_work_state(
+                ActiveWorkState::Unknown,
+                Some(ActiveWorkConfirmation::Unknown)
+            ),
+            Err("ACTIVE_WORK_UNKNOWN".into())
+        );
+        assert_eq!(
+            validate_active_work_state(ActiveWorkState::Idle, None),
+            Ok(())
+        );
+        assert_eq!(
+            validate_active_work_state(
+                ActiveWorkState::Active,
+                Some(ActiveWorkConfirmation::Unknown)
+            ),
+            Err("ACTIVE_WORK".into())
+        );
+        assert_eq!(
+            parse_active_work_confirmation(Some("active")),
+            Ok(Some(ActiveWorkConfirmation::Active))
+        );
+        assert!(parse_active_work_confirmation(Some("forged")).is_err());
+    }
+
+    #[test]
+    fn active_work_response_requires_a_queue_array() {
+        assert_eq!(
+            parse_active_work_response(&serde_json::json!({ "queue": [] })),
+            Ok(false)
+        );
+        assert_eq!(
+            parse_active_work_response(&serde_json::json!({ "queue": [{}] })),
+            Ok(true)
+        );
+        assert!(parse_active_work_response(&serde_json::json!({})).is_err());
+        assert!(parse_active_work_response(&serde_json::json!({ "queue": null })).is_err());
+    }
+
+    #[tokio::test]
+    async fn active_work_probe_rejects_http_and_json_failures() {
+        let (error_port, error_server) =
+            serve_queue_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"queue":[]}"#).await;
+        assert!(probe_sidecar_active_work(error_port).await.is_err());
+        error_server.abort();
+
+        let (json_port, json_server) = serve_queue_response(StatusCode::OK, "not json").await;
+        assert!(probe_sidecar_active_work(json_port).await.is_err());
+        json_server.abort();
+
+        let (schema_port, schema_server) = serve_queue_response(StatusCode::OK, "{}").await;
+        assert!(probe_sidecar_active_work(schema_port).await.is_err());
+        schema_server.abort();
+
+        let (redirect_port, redirect_server) = serve_redirecting_queue_response().await;
+        assert!(probe_sidecar_active_work(redirect_port).await.is_err());
+        redirect_server.abort();
+    }
+
+    #[tokio::test]
+    async fn active_work_probe_accepts_only_valid_queue_state() {
+        let (idle_port, idle_server) =
+            serve_queue_response(StatusCode::OK, r#"{"queue":[]}"#).await;
+        assert_eq!(probe_sidecar_active_work(idle_port).await, Ok(false));
+        idle_server.abort();
+
+        let (active_port, active_server) =
+            serve_queue_response(StatusCode::OK, r#"{"queue":[{}]}"#).await;
+        assert_eq!(probe_sidecar_active_work(active_port).await, Ok(true));
+        active_server.abort();
+    }
+
+    #[test]
+    fn ribbon_actions_reject_a_stale_target() {
+        let mut settings = UpdateSettings {
+            latest_version: Some("0.3.0".into()),
+            ..UpdateSettings::default()
+        };
+        assert!(validate_known_target(&settings, "0.3.0").is_ok());
+        assert!(matches!(
+            validate_known_target(&settings, "0.2.0"),
+            Err(RibbonActionError::TargetChanged)
+        ));
+        settings.latest_version = None;
+        assert!(validate_known_target(&settings, "0.3.0").is_err());
+    }
+
+    #[test]
+    fn ribbon_action_status_distinguishes_conflict_from_persistence_failure() {
+        assert_eq!(
+            RibbonActionError::TargetChanged.status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            RibbonActionError::Persistence(anyhow::anyhow!("disk full")).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn ribbon_persistence_failure_restores_live_settings() {
+        let path = std::path::PathBuf::from("unused-settings.toml");
+        let mut document = SettingsDocument::defaults(path).unwrap();
+        document.typed.updates.latest_version = Some("0.3.0".into());
+        document.typed.updates.ribbon_snoozed_until_unix = Some(123);
+        let previous = document.clone();
+
+        let result = persist_update_settings_with(
+            &mut document,
+            |settings| settings.ribbon_snoozed_until_unix = Some(456),
+            |_| Err(anyhow::anyhow!("disk full")),
+        );
+
+        assert!(matches!(result, Err(RibbonActionError::Persistence(_))));
+        assert_eq!(document.typed, previous.typed);
+    }
+
+    #[tokio::test]
+    async fn single_flight_joiners_remain_bound_to_their_generation() {
+        let single_flight = CheckSingleFlight::new();
+        let first_owner = match single_flight.enter() {
+            CheckFlightEntry::Owner(owner) => owner,
+            CheckFlightEntry::Joiner(_) => panic!("first caller did not own the flight"),
+        };
+        let first_joiner = match single_flight.enter() {
+            CheckFlightEntry::Joiner(result) => result,
+            CheckFlightEntry::Owner(_) => panic!("second caller did not join the flight"),
+        };
+        let first_outcome = CheckFlightOutcome::Attempted(Err("first failed".into()));
+        first_owner.finish(first_outcome.clone());
+
+        let second_owner = match single_flight.enter() {
+            CheckFlightEntry::Owner(owner) => owner,
+            CheckFlightEntry::Joiner(_) => panic!("new generation did not get a new owner"),
+        };
+        let second_joiner = match single_flight.enter() {
+            CheckFlightEntry::Joiner(result) => result,
+            CheckFlightEntry::Owner(_) => panic!("second generation was not joined"),
+        };
+        let second_outcome = CheckFlightOutcome::Attempted(Ok(()));
+        second_owner.finish(second_outcome.clone());
+
+        assert_eq!(wait_for_check_flight(first_joiner).await, first_outcome);
+        assert_eq!(wait_for_check_flight(second_joiner).await, second_outcome);
+    }
+
+    #[tokio::test]
+    async fn cancelled_check_flight_wakes_joiners_and_allows_a_new_owner() {
+        let single_flight = CheckSingleFlight::new();
+        let owner = match single_flight.enter() {
+            CheckFlightEntry::Owner(owner) => owner,
+            CheckFlightEntry::Joiner(_) => panic!("first caller did not own the flight"),
+        };
+        let joiner = match single_flight.enter() {
+            CheckFlightEntry::Joiner(result) => result,
+            CheckFlightEntry::Owner(_) => panic!("second caller did not join the flight"),
+        };
+        drop(owner);
+        assert!(matches!(
+            wait_for_check_flight(joiner).await,
+            CheckFlightOutcome::Cancelled(_)
+        ));
+        assert!(matches!(single_flight.enter(), CheckFlightEntry::Owner(_)));
+    }
+
+    #[test]
+    fn stronger_caller_retries_a_suppressed_weaker_flight() {
+        let skipped = CheckFlightOutcome::NotAttempted {
+            owner_reason: CheckReason::Startup,
+            result: Ok(()),
+        };
+        assert_eq!(
+            check_outcome_disposition(CheckReason::Manual, skipped.clone()),
+            CheckOutcomeDisposition::Retry
+        );
+        assert_eq!(
+            check_outcome_disposition(CheckReason::Freshness, skipped.clone()),
+            CheckOutcomeDisposition::Retry
+        );
+        assert_eq!(
+            check_outcome_disposition(CheckReason::Runtime, skipped),
+            CheckOutcomeDisposition::Complete(Ok(()))
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_gate_excludes_checks_during_installation() {
+        let coordinator = Arc::new(UpdateCoordinator::new());
+        let installation_guard = coordinator.operation_gate.lock().await;
+        let waiting_coordinator = coordinator.clone();
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let waiting_check = tokio::spawn(async move {
+            let _check_guard = waiting_coordinator.operation_gate.lock().await;
+            let _ = acquired_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut acquired_rx)
+                .await
+                .is_err()
+        );
+        drop(installation_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), acquired_rx)
+            .await
+            .expect("waiting check never acquired the operation gate")
+            .expect("waiting check dropped its completion signal");
+        waiting_check.await.unwrap();
+    }
+
+    #[test]
+    fn operation_flag_guard_resets_on_early_drop() {
+        let installing = AtomicBool::new(true);
+        {
+            let _guard = AtomicBoolReset(&installing);
+            assert!(installing.load(Ordering::Acquire));
+        }
+        assert!(!installing.load(Ordering::Acquire));
     }
 
     #[test]

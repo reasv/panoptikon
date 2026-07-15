@@ -212,8 +212,9 @@ tray and supervisor are created from Rust during application setup. Webview
 windows are created programmatically only when needed. If a platform limitation
 requires a window to exist, it MUST be a minimal hidden bundled-assets window;
 that fallback does not change any user-facing behavior. The build script MUST
-explicitly watch the control frontend's generated entry point or asset manifest
-so an in-place frontend rebuild cannot leave stale assets embedded in Desktop.
+explicitly watch every directly embedded control, setup, and update frontend
+asset (or their generated asset manifests) so an in-place frontend rebuild
+cannot leave stale assets embedded in Desktop.
 
 ### 6.1 Server sidecar invocation
 
@@ -873,8 +874,9 @@ sidecars. Each platform job SHOULD:
 
 This produces six product artifacts but does not require six independent
 dependency builds or six matrix runners. The Desktop build reuses the platform
-job and its already built Server binary. Docker remains a separate parallel job
-and continues to use the Server build model.
+job and its already built Server binary. Docker remains a separate downstream
+job, waits for release validation before publishing images, never gates the
+binary release, and continues to use the Server build model.
 
 The release job MUST:
 
@@ -1026,8 +1028,8 @@ The first Desktop release is complete only when:
   carry valid Tauri signatures;
 - Desktop installs from one user-facing artifact per platform;
 - the complete first-run/onboarding/search path works without a terminal;
-- the existing Panoptikon Server and Docker workflows remain unchanged in
-  behavior;
+- the existing Panoptikon Server and Docker deliverables retain their runtime
+  behavior, and Docker publication cannot bypass release validation;
 - single-instance and graceful lifecycle tests pass;
 - signed Desktop update and tamper-rejection tests pass;
 - Relay v1 pairing, mapping, revocation, and security tests pass;

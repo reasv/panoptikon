@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Write as _,
+    net::IpAddr,
     path::Path,
     sync::{Arc, OnceLock},
 };
@@ -12,7 +13,7 @@ use std::{
 use axum::{
     Extension, Json,
     extract::{Path as AxumPath, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -156,10 +157,52 @@ pub(crate) struct DesktopUpdateDismissRequest {
     pub version: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DesktopUpdateSnoozeRequest {
+    pub version: String,
+}
+
+struct DesktopBridge {
+    base: reqwest::Url,
+    token: String,
+}
+
+fn parse_desktop_bridge_base(raw: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    let address = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .ok()?;
+    (url.scheme() == "http"
+        && address.is_loopback()
+        && url.port().is_some_and(|port| port != 0)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+fn desktop_bridge_from_environment() -> Option<DesktopBridge> {
+    let base = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_URL")
+        .ok()
+        .and_then(|raw| parse_desktop_bridge_base(&raw))?;
+    let token = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_TOKEN").ok()?;
+    (!token.is_empty()).then_some(DesktopBridge { base, token })
+}
+
+pub(crate) fn desktop_bridge_is_configured() -> bool {
+    desktop_bridge_from_environment().is_some()
+}
+
 fn ensure_desktop_shell_policy(
     state: &ProxyState,
     context: &PolicyContext,
-) -> Result<(String, String), ApiError> {
+) -> Result<DesktopBridge, ApiError> {
     ensure_desktop_managed()?;
     let allowed = state
         .settings
@@ -172,31 +215,38 @@ fn ensure_desktop_shell_policy(
     if !allowed {
         return Err(ApiError::not_found("Desktop shell endpoint not found"));
     }
-    let url = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_URL")
-        .map_err(|_| ApiError::not_found("Desktop shell endpoint not found"))?;
-    let token = std::env::var("PANOPTIKON_DESKTOP_BRIDGE_TOKEN")
-        .map_err(|_| ApiError::not_found("Desktop shell endpoint not found"))?;
-    Ok((url, token))
+    desktop_bridge_from_environment()
+        .ok_or_else(|| ApiError::not_found("Desktop shell endpoint not found"))
 }
 
 async fn desktop_bridge_request(
-    state: &ProxyState,
-    context: &PolicyContext,
+    bridge: &DesktopBridge,
     method: Method,
     path: &str,
     body: Option<JsonValue>,
 ) -> Result<reqwest::Response, ApiError> {
-    let (base, token) = ensure_desktop_shell_policy(state, context)?;
+    let url = bridge
+        .base
+        .join(path.strip_prefix('/').unwrap_or(path))
+        .map_err(|error| {
+            tracing::error!(%error, "failed to construct Desktop shell bridge URL");
+            ApiError::internal("Desktop shell is unavailable")
+        })?;
     let client = reqwest::Client::builder()
+        // The bridge is an authenticated process-local channel. Never send
+        // its bearer credential to a proxy selected from the environment.
+        .no_proxy()
+        // A bridge response is authoritative only for the exact loopback
+        // endpoint Desktop created. Do not carry the request (or its bearer
+        // credential) through an HTTP redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|error| {
             tracing::error!(%error, "failed to build Desktop shell bridge client");
             ApiError::internal("Desktop shell is unavailable")
         })?;
-    let mut request = client
-        .request(method, format!("{base}{path}"))
-        .bearer_auth(token);
+    let mut request = client.request(method, url).bearer_auth(&bridge.token);
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -217,7 +267,8 @@ pub(crate) async fn update_status(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let response = desktop_bridge_request(&state, &context, Method::GET, "/status", None).await?;
+    let bridge = ensure_desktop_shell_policy(&state, &context)?;
+    let response = desktop_bridge_request(&bridge, Method::GET, "/status", None).await?;
     if !response.status().is_success() {
         return Err(ApiError::new(
             response.status(),
@@ -233,10 +284,15 @@ pub(crate) async fn update_status(
 async fn desktop_bridge_action(
     state: Arc<ProxyState>,
     context: PolicyContext,
+    headers: HeaderMap,
     path: &'static str,
     body: Option<JsonValue>,
 ) -> Result<StatusCode, ApiError> {
-    let response = desktop_bridge_request(&state, &context, Method::POST, path, body).await?;
+    // Preserve the policy boundary first: callers without the Desktop client
+    // opt-in still see this route as unavailable, independent of headers.
+    let bridge = ensure_desktop_shell_policy(&state, &context)?;
+    ensure_same_origin_desktop_action(&headers)?;
+    let response = desktop_bridge_request(&bridge, Method::POST, path, body).await?;
     if response.status().is_success() {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -247,31 +303,107 @@ async fn desktop_bridge_action(
     }
 }
 
-#[utoipa::path(post, operation_id = "open_desktop_update_window", path = "/api/desktop/update-window/open", tag = "desktop", responses((status = 204, description = "Update window opened")))]
+fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError> {
+    fn forbidden() -> ApiError {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Desktop shell actions require a same-origin browser request",
+        )
+    }
+
+    let mut origin_values = headers.get_all(header::ORIGIN).iter();
+    let origin = origin_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .ok_or_else(forbidden)?;
+    if origin_values.next().is_some()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(forbidden());
+    }
+
+    let mut host_values = headers.get_all(header::HOST).iter();
+    let expected = host_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|host| reqwest::Url::parse(&format!("http://{host}/")).ok())
+        .ok_or_else(forbidden)?;
+    let expected_is_loopback = match expected.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if host_values.next().is_some()
+        || !expected.username().is_empty()
+        || expected.password().is_some()
+        || expected.path() != "/"
+        || expected.query().is_some()
+        || expected.fragment().is_some()
+        // Origin/Host equality alone is vulnerable to DNS rebinding: an
+        // attacker-owned hostname can remain same-origin while resolving to
+        // this listener. Desktop opens only localhost, so require the browser
+        // authority itself to name a loopback host.
+        || !expected_is_loopback
+        || origin.origin() != expected.origin()
+    {
+        return Err(forbidden());
+    }
+
+    let mut fetch_site_values = headers.get_all("sec-fetch-site").iter();
+    if let Some(fetch_site) = fetch_site_values.next()
+        && (fetch_site_values.next().is_some()
+            || !fetch_site
+                .to_str()
+                .is_ok_and(|value| value.eq_ignore_ascii_case("same-origin")))
+    {
+        return Err(forbidden());
+    }
+    Ok(())
+}
+
+#[utoipa::path(post, operation_id = "open_desktop_update_window", path = "/api/desktop/update-window/open", tag = "desktop", responses((status = 204, description = "Update window opened"), (status = 403, description = "Same-origin browser request required")))]
 pub(crate) async fn open_update_window(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    desktop_bridge_action(state, context, "/open", None).await
+    desktop_bridge_action(state, context, headers, "/open", None).await
 }
 
-#[utoipa::path(post, operation_id = "snooze_desktop_update_ribbon", path = "/api/desktop/update-ribbon/snooze", tag = "desktop", responses((status = 204, description = "Ribbon snoozed for 24 hours")))]
+#[utoipa::path(post, operation_id = "snooze_desktop_update_ribbon", path = "/api/desktop/update-ribbon/snooze", tag = "desktop", request_body = DesktopUpdateSnoozeRequest, responses((status = 204, description = "Ribbon snoozed for 24 hours"), (status = 403, description = "Same-origin browser request required"), (status = 409, description = "Available update version changed")))]
 pub(crate) async fn snooze_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    headers: HeaderMap,
+    Json(request): Json<DesktopUpdateSnoozeRequest>,
 ) -> Result<StatusCode, ApiError> {
-    desktop_bridge_action(state, context, "/snooze", None).await
+    desktop_bridge_action(
+        state,
+        context,
+        headers,
+        "/snooze",
+        Some(json!({ "version": request.version })),
+    )
+    .await
 }
 
-#[utoipa::path(post, operation_id = "dismiss_desktop_update_ribbon", path = "/api/desktop/update-ribbon/dismiss", tag = "desktop", request_body = DesktopUpdateDismissRequest, responses((status = 204, description = "Ribbon dismissed for the selected version")))]
+#[utoipa::path(post, operation_id = "dismiss_desktop_update_ribbon", path = "/api/desktop/update-ribbon/dismiss", tag = "desktop", request_body = DesktopUpdateDismissRequest, responses((status = 204, description = "Ribbon dismissed for the selected version"), (status = 403, description = "Same-origin browser request required"), (status = 409, description = "Available update version changed")))]
 pub(crate) async fn dismiss_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    headers: HeaderMap,
     Json(request): Json<DesktopUpdateDismissRequest>,
 ) -> Result<StatusCode, ApiError> {
     desktop_bridge_action(
         state,
         context,
+        headers,
         "/dismiss",
         Some(json!({ "version": request.version })),
     )
@@ -507,6 +639,196 @@ fn encode_dotenv_value(value: &str) -> String {
             .replace('\n', "\\n")
             .replace('\r', "\\r")
     )
+}
+
+#[cfg(test)]
+mod desktop_bridge_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use axum::response::Redirect;
+    use axum::routing::post;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn browser_headers(origin: &str, host: &str, fetch_site: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        if let Some(fetch_site) = fetch_site {
+            headers.insert("sec-fetch-site", HeaderValue::from_str(fetch_site).unwrap());
+        }
+        headers
+    }
+
+    /// The private shell hop accepts only the literal IPv4/IPv6 loopback
+    /// HTTP addresses Desktop creates, with an explicit nonzero port and no
+    /// URL components that could redirect a supposedly local credential.
+    #[test]
+    fn desktop_bridge_base_is_strictly_loopback() {
+        assert!(parse_desktop_bridge_base("http://127.0.0.1:49152").is_some());
+        assert!(parse_desktop_bridge_base("http://[::1]:49152/").is_some());
+
+        for invalid in [
+            "http://localhost:49152",
+            "http://192.0.2.1:49152",
+            "https://127.0.0.1:49152",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://user@127.0.0.1:49152",
+            "http://127.0.0.1:49152/status",
+            "http://127.0.0.1:49152/?target=elsewhere",
+            "http://127.0.0.1:49152/#fragment",
+        ] {
+            assert!(
+                parse_desktop_bridge_base(invalid).is_none(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
+    }
+
+    /// The real reqwest bridge path reaches the loopback listener with the
+    /// bearer credential and exact version JSON that the Desktop snooze
+    /// handler validates, rather than dropping the browser's target.
+    #[tokio::test]
+    async fn desktop_bridge_request_forwards_authenticated_version_body() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/snooze",
+            post(
+                |headers: HeaderMap, Json(body): Json<JsonValue>| async move {
+                    assert_eq!(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer bridge-secret")
+                    );
+                    assert_eq!(body, json!({ "version": "1.2.3" }));
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let bridge = DesktopBridge {
+            base: parse_desktop_bridge_base(&format!("http://{address}")).unwrap(),
+            token: "bridge-secret".into(),
+        };
+
+        let response = desktop_bridge_request(
+            &bridge,
+            Method::POST,
+            "/snooze",
+            Some(json!({ "version": "1.2.3" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// The bearer-authenticated private hop must never follow a response to a
+    /// second URL, even when the redirect remains on the loopback listener.
+    #[tokio::test]
+    async fn desktop_bridge_request_does_not_follow_redirects() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let followed = Arc::new(AtomicUsize::new(0));
+        let capture_count = followed.clone();
+        let router = axum::Router::new()
+            .route(
+                "/redirect",
+                post(|| async { Redirect::temporary("/capture") }),
+            )
+            .route(
+                "/capture",
+                post(move || {
+                    let capture_count = capture_count.clone();
+                    async move {
+                        capture_count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let bridge = DesktopBridge {
+            base: parse_desktop_bridge_base(&format!("http://{address}")).unwrap(),
+            token: "bridge-secret".into(),
+        };
+
+        let response = desktop_bridge_request(&bridge, Method::POST, "/redirect", None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(followed.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// A normal same-origin fetch is admitted, including URL normalization
+    /// and absent optional Fetch Metadata, so supported browsers can invoke
+    /// the Desktop action without an application-specific CSRF token.
+    #[test]
+    fn desktop_action_accepts_same_origin_browser_request() {
+        let headers = browser_headers(
+            "http://LOCALHOST:6342",
+            "localhost:6342",
+            Some("same-origin"),
+        );
+        ensure_same_origin_desktop_action(&headers).unwrap();
+
+        let headers = browser_headers("http://localhost", "localhost:80", None);
+        ensure_same_origin_desktop_action(&headers).unwrap();
+
+        let headers = browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None);
+        ensure_same_origin_desktop_action(&headers).unwrap();
+
+        let headers = browser_headers("http://[::1]:6342", "[::1]:6342", None);
+        ensure_same_origin_desktop_action(&headers).unwrap();
+    }
+
+    /// Cross-origin forms/fetches, scheme mismatches, opaque or missing
+    /// origins, and contradictory Fetch Metadata are all rejected before a
+    /// request can receive the private bridge credential.
+    #[test]
+    fn desktop_action_rejects_cross_origin_browser_request() {
+        for headers in [
+            browser_headers("https://attacker.example", "127.0.0.1:6342", None),
+            // Matching Origin and Host is insufficient when an attacker can
+            // rebind its own hostname to this loopback listener.
+            browser_headers(
+                "http://attacker.example:6342",
+                "attacker.example:6342",
+                Some("same-origin"),
+            ),
+            browser_headers("https://localhost:6342", "localhost:6342", None),
+            browser_headers("http://127.0.0.1:6342", "user@127.0.0.1:6342", None),
+            browser_headers(
+                "http://127.0.0.1:6342",
+                "127.0.0.1:6342",
+                Some("cross-site"),
+            ),
+            browser_headers("null", "127.0.0.1:6342", None),
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:6342"));
+                headers
+            },
+            {
+                let mut headers = browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None);
+                headers.append(
+                    header::ORIGIN,
+                    HeaderValue::from_static("http://127.0.0.1:6342"),
+                );
+                headers
+            },
+        ] {
+            assert!(ensure_same_origin_desktop_action(&headers).is_err());
+        }
+    }
 }
 
 #[utoipa::path(

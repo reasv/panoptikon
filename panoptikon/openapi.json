@@ -1108,6 +1108,12 @@
         "responses": {
           "204": {
             "description": "Ribbon dismissed for the selected version"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          },
+          "409": {
+            "description": "Available update version changed"
           }
         }
       }
@@ -1118,9 +1124,25 @@
           "desktop"
         ],
         "operationId": "snooze_desktop_update_ribbon",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopUpdateSnoozeRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "204": {
             "description": "Ribbon snoozed for 24 hours"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          },
+          "409": {
+            "description": "Available update version changed"
           }
         }
       }
@@ -1154,6 +1176,9 @@
         "responses": {
           "204": {
             "description": "Update window opened"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
           }
         }
       }
@@ -4973,6 +4998,17 @@
         }
       },
       "DesktopUpdateDismissRequest": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "DesktopUpdateSnoozeRequest": {
         "type": "object",
         "required": [
           "version"

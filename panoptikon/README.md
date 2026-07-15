@@ -600,7 +600,14 @@ bearer secret directly to the managed sidecar. A matched policy with
 ribbon snooze/dismiss routes. These routes proxy only to the parent Desktop
 shell; they do not expose checking, downloading, installation, the bridge
 secret, or general Tauri IPC to browser pages. Other policies receive no shell
-capability and the routes respond as unavailable.
+capability and the routes respond as unavailable. The sidecar accepts only a
+literal loopback HTTP bridge URL with an explicit port, disables environment
+proxies, and refuses redirects for this authenticated hop. Mutating browser requests
+must use a loopback or `localhost` request `Host` and have an HTTP `Origin`
+equal to it; this also blocks DNS rebinding, and contradictory Fetch Metadata
+is rejected. Snooze and dismissal include the version shown by the tab, so
+Desktop returns a conflict instead of applying a stale action to a newer
+release.
 
 ## Configuration
 
