@@ -27,6 +27,7 @@ panoptikon/
 ├── panoptikon/           # the server crate (binary: panoptikon)
 │   ├── migrations/       # sqlx migrations (index/storage/user_data), compiled in
 │   └── src/
+├── panoptikon-config/    # lossless TOML/.env patching + atomic commits
 ├── python/               # ALL Python, self-contained
 │   ├── pyproject.toml    # worker + inference deps, accelerator extras
 │   ├── uv.lock           # universal lock, all platforms/accelerators
@@ -64,6 +65,12 @@ the documented exceptions.
 
 Desktop manages external inputs in its Server root `.env`; remote Inferio owns
 its own values. See `docs/inferio-external-inputs.md`.
+
+All programmatic configuration writes use the shared lossless editor. Typed
+before/after values are diffed into the concrete editable TOML document so
+comments, ordering, unknown keys, and absent defaults survive. Whole-value env
+references remain in TOML and redirect edits to Desktop's managed `.env`. See
+`docs/desktop-configuration.md`.
 
 ### Policy-scoped SSR
 

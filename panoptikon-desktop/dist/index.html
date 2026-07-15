@@ -4,24 +4,87 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Panoptikon Desktop</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=7" />
   </head>
   <body>
-    <main>
-      <header><div><h1>Panoptikon Desktop</h1><p id="state">Loading status…</p></div></header>
+    <main class="app-shell">
+      <header class="app-header">
+        <div class="app-identity"><h1>Panoptikon Desktop</h1><p id="state" class="status-line">Loading status…</p></div>
+        <div class="app-actions" aria-label="Application actions"><button data-action="open" class="primary">Open Panoptikon</button><button data-action="restart">Restart Server</button><button data-action="quit" class="danger">Quit Desktop</button></div>
+      </header>
       <div id="error" role="alert" hidden></div>
-      <section class="actions">
-        <button data-action="open" class="primary">Open Panoptikon</button>
-        <button data-action="restart">Restart Server</button>
-      </section>
-      <section id="updates"><h2>Updates</h2><p id="update-version">Loading update status…</p><p id="update-last-check" class="muted"></p><p id="update-error" class="inline-error" hidden></p><label class="toggle"><input id="automatic-updates" type="checkbox" /> Check for updates automatically</label><div class="actions"><button id="check-updates" data-action="updates">Check now</button><button id="view-update" class="primary" hidden>View update</button></div></section>
-      <section><h2>Local Server</h2><label class="toggle"><input id="local" type="checkbox" /> Run Local Panoptikon</label><dl><dt>Server root</dt><dd id="root"></dd><dt>Port</dt><dd id="port"></dd></dl><div class="actions"><button data-folder="server_root">Open Data Folder</button><button data-folder="config">Open Configuration</button><button data-folder="logs">Open Logs</button></div></section>
-      <section><h2 id="setup-title">Set Up Panoptikon</h2><p id="setup-description">Choose the folders and indexing options for your first database.</p><div class="actions"><button id="setup-button" data-action="setup">Continue Setup</button></div></section>
-      <section><h2>File opening on this computer</h2><p>These settings apply to both Relay and the Desktop-managed local Server. Choose the system default, a specific application, a direct command, or an explicit shell command for each action.</p><div id="file-commands"></div><div class="actions"><button id="save-file-commands" class="primary">Save file-opening settings</button><span id="file-command-status" class="success" aria-live="polite"></span></div></section>
-      <section><h2>Relay</h2><p>Relay lets a Panoptikon page open indexed files on this computer—for example when Panoptikon runs on a NAS and the same folders are mounted here. It only listens on loopback; each Panoptikon endpoint requires approval below.</p><label class="toggle"><input id="relay-enabled" type="checkbox" /> Enable Relay</label><h3>Pairing requests</h3><div id="relay"></div><h3>Actions waiting for a folder mapping</h3><div id="pending-mappings"></div><h3>Paired Panoptikon endpoints and folder mappings</h3><div id="relay-instances"></div></section>
-      <section><h2>Diagnostics</h2><pre id="logs">No log entries yet.</pre><button data-action="refresh">Refresh</button></section>
-      <footer><button data-action="quit" class="danger">Quit Panoptikon</button></footer>
+      <nav class="section-tabs" role="tablist" aria-label="Desktop settings">
+        <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">Overview</button>
+        <button id="tab-server" type="button" role="tab" aria-selected="false" aria-controls="panel-server" data-tab="server">Server</button>
+        <button id="tab-integration" type="button" role="tab" aria-selected="false" aria-controls="panel-integration" data-tab="integration">Integration</button>
+        <button id="tab-diagnostics" type="button" role="tab" aria-selected="false" aria-controls="panel-diagnostics" data-tab="diagnostics">Diagnostics</button>
+      </nav>
+
+      <div class="tab-panels">
+        <div id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
+          <div class="page-heading"><div><h2>Overview</h2><p>Control the local Panoptikon service, create databases, and manage Desktop updates.</p></div></div>
+          <section class="card" aria-labelledby="local-server-title">
+            <div class="card-heading"><div><h3 id="local-server-title">Local Server</h3><p>Runs Panoptikon on this computer and keeps it available to the Desktop app.</p></div><label class="switch"><span class="switch-label">Run locally</span><input id="local" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <dl class="server-details"><dt>Server root</dt><dd id="root"></dd><dt>Active port</dt><dd id="port"></dd></dl>
+            <div class="button-row secondary-actions"><button data-folder="server_root">Open Data Folder</button><button data-folder="config">Open Config Files</button><button data-folder="logs">Open Logs</button></div>
+          </section>
+          <section class="card" aria-labelledby="setup-title">
+            <div class="card-heading"><div><h3 id="setup-title">Set Up Panoptikon</h3><p id="setup-description">Choose the folders and indexing options for your first database.</p></div></div>
+            <div class="button-row"><button id="setup-button" data-action="setup" class="primary">Continue Setup</button></div>
+          </section>
+          <section id="updates" class="card" aria-labelledby="updates-title">
+            <div class="card-heading"><div><h3 id="updates-title">Desktop updates</h3><p id="update-version">Loading update status…</p><p id="update-last-check" class="muted"></p><p id="update-error" class="inline-error" hidden></p></div></div>
+            <div class="setting-row compact"><div class="setting-copy"><strong>Automatic update checks</strong><small>Check periodically and notify you when a Desktop update is available.</small></div><label class="switch icon-only"><input id="automatic-updates" type="checkbox" aria-label="Check for updates automatically" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div class="button-row"><button id="check-updates" data-action="updates">Check now</button><button id="view-update" class="primary" hidden>View update</button></div>
+          </section>
+        </div>
+
+        <div id="panel-server" class="tab-panel" role="tabpanel" aria-labelledby="tab-server" data-panel="server" hidden>
+          <div class="page-heading"><div><h2>Server settings</h2><p>Settings for the local Panoptikon service. Saving validates the ports and restarts the Server.</p></div><button data-folder="config">Open Config Files</button></div>
+          <section id="network-settings" class="card" aria-labelledby="connection-title">
+            <div class="card-heading"><div><h3 id="connection-title">Connection</h3><p>Choose how this computer and, optionally, trusted devices reach Panoptikon.</p></div></div>
+            <div class="setting-row"><div class="setting-copy"><label for="local-port">Local port</label><small>Used by the Desktop app and browsers on this computer. It is never exposed to the network.</small><small id="local-port-source" class="source-label" hidden></small></div><div class="control-stack"><input id="local-port" class="number-control" type="number" min="1" max="65535" aria-describedby="local-port-error" /><small id="local-port-error" class="field-error" hidden></small></div></div>
+            <div class="setting-row"><div class="setting-copy"><label for="lan-enabled">Local network access</label><small>Creates a separate listener for other devices. Desktop-management commands remain available only on this computer.</small></div><label class="switch icon-only"><input id="lan-enabled" type="checkbox" aria-label="Allow devices on the local network" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div id="lan-custom" class="callout warning" hidden></div>
+            <div id="lan-fields" class="subsection" hidden>
+              <div class="callout warning"><strong>Trusted networks only</strong><span>Panoptikon does not add authentication. Anyone who can reach this port can use the normal API for the databases you select.</span></div>
+              <div class="setting-row"><div class="setting-copy"><label for="lan-port">LAN port</label><small>A separate port for devices on your network. Your firewall may ask for permission.</small><small id="lan-port-source" class="source-label" hidden></small></div><div class="control-stack"><input id="lan-port" class="number-control" type="number" min="1" max="65535" aria-describedby="lan-port-error" /><small id="lan-port-error" class="field-error" hidden></small></div></div>
+              <div class="setting-row"><div class="setting-copy"><label for="lan-default-database">Default database</label><small>Opened when a LAN URL does not specify a database.</small></div><select id="lan-default-database" class="select-control"></select></div>
+              <div class="setting-row"><div class="setting-copy"><label for="lan-all-databases">Database access</label><small>Automatically expose new databases, or select an explicit safe subset below.</small></div><label class="switch labeled"><span class="switch-label">All databases</span><input id="lan-all-databases" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></label></div>
+              <fieldset id="lan-databases" class="check-list"><legend>Databases available on the LAN</legend></fieldset>
+            </div>
+          </section>
+
+          <section id="performance-settings" class="card" aria-labelledby="performance-title">
+            <div class="card-heading"><div><h3 id="performance-title">Performance and memory</h3><p>Installation-wide limits shared by every database. Model-specific preload choices remain in each database’s Scan settings.</p></div></div>
+            <h4>Inference startup</h4>
+            <div class="setting-row"><div class="setting-copy"><label for="prewarm-enabled">Prepared worker pool</label><small>Keep Python inference workers ready to reduce first-use delay. Prepared workers use additional memory.</small><small id="prewarm-enabled-source" class="source-label" hidden></small></div><label class="switch icon-only"><input id="prewarm-enabled" type="checkbox" aria-label="Keep a pool of prepared inference workers" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div class="setting-row"><div class="setting-copy"><label for="prewarm-lazy">Prepare workers on demand</label><small>After a model is used for the first time, prepare a replacement worker in the background.</small><small id="prewarm-lazy-source" class="source-label" hidden></small></div><label class="switch icon-only"><input id="prewarm-lazy" type="checkbox" aria-label="Prepare another worker after a model is first used" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <h4>Processing limits</h4>
+            <div class="setting-row"><div class="setting-copy"><label for="loader-concurrency">Concurrent file loaders</label><small>More loaders can improve indexing throughput, but increase CPU and memory pressure.</small><small id="loader-concurrency-source" class="source-label" hidden></small></div><input id="loader-concurrency" class="number-control" type="number" min="1" max="256" /></div>
+            <div class="setting-row"><div class="setting-copy"><label for="intermediate-budget">Intermediate-data memory</label><small>Maximum memory for decoded inputs waiting to be processed, measured in MiB.</small><small id="intermediate-budget-source" class="source-label" hidden></small></div><div class="input-with-unit"><input id="intermediate-budget" type="number" min="64" max="1048576" /><span>MiB</span></div></div>
+            <div class="setting-row"><div class="setting-copy"><label for="embedding-cache-size">Semantic-query embedding cache</label><small>Generated search vectors kept in the Panoptikon Server process. Each entry is usually a few KiB; 1,024 entries typically use only a few MiB and avoid repeated inference for recent queries. Cleared on restart.</small><small id="embedding-cache-source" class="source-label" hidden></small></div><div class="input-with-unit"><input id="embedding-cache-size" type="number" min="0" max="65536" /><span>entries</span></div></div>
+          </section>
+          <div class="save-bar"><span id="server-configuration-status" class="success" aria-live="polite"></span><button id="save-server-configuration" class="primary">Save and restart Server</button></div>
+        </div>
+
+        <div id="panel-integration" class="tab-panel" role="tabpanel" aria-labelledby="tab-integration" data-panel="integration" hidden>
+          <div class="page-heading"><div><h2>Desktop integration</h2><p>Control how Panoptikon opens local files and connects remote Panoptikon pages to this computer.</p></div></div>
+          <section class="card" aria-labelledby="file-opening-title"><div class="card-heading"><div><h3 id="file-opening-title">File opening</h3><p>Choose the application or command used when Panoptikon opens a file, its folder, or a terminal.</p></div></div><div id="file-commands"></div><div class="button-row form-actions"><button id="save-file-commands" class="primary">Save file-opening settings</button><span id="file-command-status" class="success" aria-live="polite"></span></div></section>
+          <section class="card" aria-labelledby="relay-title">
+            <div class="card-heading"><div><h3 id="relay-title">Relay</h3><p>Allow an approved Panoptikon website—such as one running on a NAS—to open indexed files that are mounted on this computer. Relay listens only on loopback.</p></div><label class="switch"><span class="switch-label">Enable Relay</span><input id="relay-enabled" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div class="relay-group"><h4>Pairing requests</h4><p class="section-help">Approve only endpoints you recognize.</p><div id="relay"></div></div>
+            <div class="relay-group"><h4>Waiting for folder mapping</h4><p class="section-help">Match a remote indexed path to its location on this computer.</p><div id="pending-mappings"></div></div>
+            <div class="relay-group"><h4>Paired endpoints and mappings</h4><div id="relay-instances"></div></div>
+          </section>
+        </div>
+
+        <div id="panel-diagnostics" class="tab-panel" role="tabpanel" aria-labelledby="tab-diagnostics" data-panel="diagnostics" hidden>
+          <div class="page-heading"><div><h2>Diagnostics</h2><p>Recent Desktop and Server activity for troubleshooting startup or configuration problems.</p></div></div>
+          <section class="card" aria-labelledby="logs-title"><div class="card-heading"><div><h3 id="logs-title">Recent logs</h3><p>The latest 150 log lines. Full log files are available from the Overview page.</p></div><button data-action="refresh">Refresh</button></div><pre id="logs">No log entries yet.</pre></section>
+        </div>
+      </div>
     </main>
-    <script src="app.js"></script>
+    <script src="app.js?v=4"></script>
   </body>
 </html>

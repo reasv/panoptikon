@@ -130,18 +130,21 @@ impl Default for DesktopSettings {
 #[derive(Debug, Clone)]
 pub struct SettingsDocument {
     pub typed: DesktopSettings,
-    raw: toml::Table,
+    persisted: DesktopSettings,
+    raw: panoptikon_config::TomlDocument,
     path: PathBuf,
 }
 
 impl SettingsDocument {
     pub fn defaults(path: PathBuf) -> anyhow::Result<Self> {
         let typed = DesktopSettings::default();
-        let raw = toml::Value::try_from(&typed)?
-            .as_table()
-            .cloned()
-            .unwrap_or_default();
-        Ok(Self { typed, raw, path })
+        let raw = panoptikon_config::TomlDocument::from_serializable(&typed)?;
+        Ok(Self {
+            persisted: typed.clone(),
+            typed,
+            raw,
+            path,
+        })
     }
 
     pub fn load(paths: &DesktopPaths) -> anyhow::Result<Self> {
@@ -154,8 +157,8 @@ impl SettingsDocument {
         }
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        let raw: toml::Table = match toml::from_str(&content) {
-            Ok(raw) => raw,
+        let typed: DesktopSettings = match toml::from_str(&content) {
+            Ok(typed) => typed,
             Err(error) => {
                 let quarantine = quarantine_path(path);
                 std::fs::rename(path, &quarantine).with_context(|| {
@@ -171,8 +174,8 @@ impl SettingsDocument {
                 );
             }
         };
-        let typed = match toml::Value::Table(raw.clone()).try_into() {
-            Ok(typed) => typed,
+        let raw = match panoptikon_config::TomlDocument::parse(&content) {
+            Ok(raw) => raw,
             Err(error) => {
                 let quarantine = quarantine_path(path);
                 std::fs::rename(path, &quarantine)?;
@@ -184,6 +187,7 @@ impl SettingsDocument {
             }
         };
         Ok(Self {
+            persisted: typed.clone(),
             typed,
             raw,
             path: path.to_path_buf(),
@@ -191,41 +195,14 @@ impl SettingsDocument {
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
-        merge_known(&mut self.raw, &self.typed)?;
-        let body = toml::to_string_pretty(&self.raw)?;
-        atomic_write(&self.path, body.as_bytes())
+        self.raw.patch_serialized(&self.persisted, &self.typed)?;
+        self.raw.write_private_atomic(&self.path)?;
+        self.persisted = self.typed.clone();
+        Ok(())
     }
 }
 
-fn merge_known(raw: &mut toml::Table, settings: &DesktopSettings) -> anyhow::Result<()> {
-    let known = toml::Value::try_from(settings)?
-        .as_table()
-        .cloned()
-        .unwrap_or_default();
-    for (section, value) in known {
-        match (raw.get_mut(&section), value) {
-            (Some(toml::Value::Table(existing)), toml::Value::Table(update)) => {
-                // TOML has no null value, so serde omits `None` fields. Remove
-                // the optional keys owned by the current schema before merging
-                // the serialized values; otherwise an old `Some` value in the
-                // raw document would survive after the typed value was cleared.
-                if section == "updates" {
-                    for key in OPTIONAL_UPDATE_KEYS {
-                        existing.remove(*key);
-                    }
-                }
-                for (key, value) in update {
-                    existing.insert(key, value);
-                }
-            }
-            (_, value) => {
-                raw.insert(section, value);
-            }
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 const OPTIONAL_UPDATE_KEYS: &[&str] = &[
     "last_checked_unix",
     "last_attempt_unix",
@@ -247,25 +224,7 @@ const OPTIONAL_UPDATE_KEYS: &[&str] = &[
 ];
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("settings path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, bytes)
-        .with_context(|| format!("failed to write temporary settings '{}'", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to commit settings '{}'", path.display()))
+    panoptikon_config::atomic_write_private(path, bytes)
 }
 
 fn quarantine_path(path: &Path) -> PathBuf {
@@ -294,6 +253,28 @@ mod tests {
         assert_eq!(raw["local_server"]["future"].as_integer(), Some(42));
         assert_eq!(raw["future_section"]["flag"].as_str(), Some("keep"));
         assert!(!raw["local_server"]["enabled"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn save_preserves_comments_and_existing_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("desktop.toml");
+        let source = concat!(
+            "# Desktop preferences\n",
+            "future = 'first'\n\n",
+            "[local_server]\n",
+            "# local switch\n",
+            "enabled = true # keep this note\n",
+            "port = 6342\n",
+        );
+        std::fs::write(&path, source).unwrap();
+        let mut document = SettingsDocument::load_path(&path).unwrap();
+        document.typed.local_server.enabled = false;
+        document.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            source.replace("enabled = true", "enabled = false")
+        );
     }
 
     /// Corrupt settings are retained under a quarantine name and never

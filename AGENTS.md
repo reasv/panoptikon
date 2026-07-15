@@ -9,6 +9,9 @@ Overview
   Python environment management, and the release roadmap.
 
 Components
+- panoptikon-config (shared configuration editing crate): `panoptikon-config/`
+  - Comment/order-preserving TOML diffs, environment-binding detection,
+    line-preserving `.env` edits, and atomic file replacement.
 - panoptikon (Rust server crate): `panoptikon/`
   - The single entrypoint: HTTP server, policy layer, full API, PQL search,
     job system, cron, file scanning, database migrations, the inference

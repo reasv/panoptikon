@@ -256,6 +256,23 @@ fn apply_policy(
     let is_api = is_api_surface(&path);
     let is_db_info = is_db_info_path(&path);
     let is_db_create = is_db_create_path(&path);
+    // Desktop-managed routes include secret reveal and installation-wide
+    // mutations. They are mounted only in managed mode, and additionally
+    // require the matched policy to opt into the Desktop client. Endpoint
+    // matching therefore keeps a future LAN listener from inheriting local
+    // Desktop authority even if its ruleset otherwise allows every route.
+    if path.starts_with("/api/desktop/")
+        && policy
+            .client
+            .get("desktop")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(EnforcementError {
+            status: StatusCode::FORBIDDEN,
+            reason: "desktop_policy_required",
+        });
+    }
     // GET /api/client-config is exempt from ruleset enforcement: a client
     // must always be able to ask what it may do — it is how restricted UIs
     // learn which controls to hide, so gating it behind the ruleset would
@@ -1217,6 +1234,42 @@ allow = "*"
         let decision = apply_policy(&mut req, &settings, &key).unwrap();
         assert_eq!(decision.policy.name, "localhost");
         assert_eq!(decision.endpoint, None);
+    }
+
+    #[test]
+    fn desktop_routes_require_an_explicit_desktop_policy() {
+        let mut settings = endpoint_settings();
+        settings
+            .policies
+            .iter_mut()
+            .find(|policy| policy.name == "localhost")
+            .unwrap()
+            .client = serde_json::json!({"desktop": true});
+        let key = TokenKey::random();
+
+        let mut lan_request = Request::builder()
+            .uri("http://localhost/api/desktop/external-inputs")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        lan_request
+            .extensions_mut()
+            .insert(ListenerEndpoint(Arc::from("test")));
+        let error = match apply_policy(&mut lan_request, &settings, &key) {
+            Ok(_) => panic!("LAN policy unexpectedly received Desktop authority"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason, "desktop_policy_required");
+
+        let mut local_request = Request::builder()
+            .uri("http://localhost/api/desktop/external-inputs")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        local_request
+            .extensions_mut()
+            .insert(ListenerEndpoint(Arc::from("default")));
+        assert!(apply_policy(&mut local_request, &settings, &key).is_ok());
     }
 
     /// A valid policy token overrides listener/host selection: the same

@@ -4493,7 +4493,7 @@
           },
           "desktop_managed": {
             "type": "boolean",
-            "description": "True only when this Server process is the bundled sidecar owned by\nPanoptikon Desktop. API semantics are otherwise identical."
+            "description": "True only when this Server process is the bundled sidecar owned by\nPanoptikon Desktop and the matched policy opts into Desktop authority."
           },
           "desktop_shell_available": {
             "type": "boolean",

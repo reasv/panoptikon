@@ -67,7 +67,7 @@ auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.
-embedding_cache_size = 16
+embedding_cache_size = 1024
 
 # Host-resource limits and external tools for scan/extraction jobs. See the
 # configuration reference in panoptikon/README.md for the full key list.

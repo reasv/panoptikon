@@ -62,6 +62,7 @@ sqlx = { version = "0.8", features = [
     "macros",
 ] }
 anyhow = "1"
+panoptikon-config = { path = "../panoptikon-config" }
 config = "0.14"
 url = "2"
 clap = { version = "4", features = ["derive"] }

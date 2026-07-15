@@ -705,7 +705,7 @@ pub struct SearchConfig {
 }
 
 fn default_embedding_cache_size() -> usize {
-    16
+    1024
 }
 
 fn default_inference_weight() -> f64 {

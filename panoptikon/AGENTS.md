@@ -13,10 +13,12 @@ Architecture (current)
 - Listeners: the primary `server.host`/`server.port` is always the endpoint named "default"; extra `[[server.endpoints]]` entries (`name`, `port`, optional `host` defaulting to `server.host`) each get their own TCP listener serving the identical router. The endpoint name is attached per listener as a `ListenerEndpoint` request extension (an `axum::Extension` layer outside the policy layer) so policies can match on it. All listeners bind before any serves; a failed bind fails startup. The `inferio` subcommand ignores extra endpoints (single listener, tagged "default").
 - Local API: `panoptikon/src/api/*.rs` implements `/api/db`, `/api/db/create`, `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, `/api/search/stats`, and `/api/jobs/*` locally when `upstreams.api.local = true`. `/openapi.json`, `/docs`, and `/redoc` are served locally when `upstreams.api.local = true`.
 - Config: `panoptikon/src/config.rs` loads TOML + env and validates policies/rulesets. `config/server/default.toml` is the single canonical local configuration: primary loopback port 6342 with the API, inference, and supervised UI enabled.
+- Config writes: `panoptikon-config` owns lossless TOML/`.env` patching and atomic replacement. Per-index `SystemConfigStore::save` diffs the typed current/requested values into the original document; unchanged comments, order, unknown keys, literal spelling, and absent defaults survive. Desktop uses the same layer for its preferences, Server TOML, file actions, and managed `.env`.
 
 Behavior (important)
 
 - Policy selection: `[policies.match]` takes `hosts` (effective host: `Host`, optionally forwarded headers) and/or `endpoints` (listener endpoint names — physical, header-independent). Empty list = matches anything; both non-empty = AND; at least one must be non-empty. Policies are checked in config order, first match wins, so endpoint-scoped policies belong before broad host policies. The synthesized loopback inference self-call is validated against the primary ("default") endpoint.
+- Desktop authority is policy-scoped in addition to managed-mode route mounting: every `/api/desktop/*` request requires the matched policy's `[policies.client] desktop = true`. A separate LAN endpoint can therefore use `allow_all` without inheriting secret reveal or Desktop configuration authority.
 - Ruleset allowlisting applies to all API surface paths (`/api/*`, `/docs`, `/redoc`, `/openapi.json`).
 - `.env` is loaded at startup for server settings. Inferio additionally reads it just in time before every worker spawn: ordinary Server/Inferio lets inherited env win, while Desktop-managed local inference lets its explicit managed `.env` win. Declared external inputs are validated and explicitly set/removed on the child, so inference changes never require a Panoptikon restart. Desktop external-input management reads the in-process local registry directly (never the possibly remote primary upstream); empty edits keep existing values and only the explicit remove operation deletes them. Remote additive endpoint compatibility ignores only a 404—other discovery failures remain errors.
 - On Windows, the gateway sets the executable stack size via linker flags
@@ -27,7 +29,8 @@ Behavior (important)
 - Graceful shutdown (`shutdown.rs`): first SIGINT/SIGTERM drains HTTP, stops cron + continuous-scan actors, cancels the running job (queued jobs dropped, new enqueues refused), and flushes index DB writers; 10s cleanup grace, 20s hard exit deadline, second signal exits immediately.
 - Desktop supervision: the hidden `--desktop-managed` flag enables parent
   control over stdin (`shutdown` or EOF use the normal graceful path), exposes
-  `desktop_managed` in client config, and admits the local-only
+  policy-scoped `desktop_managed` in client config (only when that policy's
+  client table opts into `desktop = true`), and admits the local-only
   `GET /api/desktop/setup-status`, folder/continuous-validation, and setup-completion
   routes. Readiness evaluates only the
   policy-resolved default index database and reports it ready when a currently
@@ -196,7 +199,7 @@ PQL Rewrite (Rust, Planned)
   - `preprocess_query_async` embeds queries via the inference upstream and loads model metadata for distance-function overrides; the sync preprocessor accepts base64 embeddings or prefilled `_embedding` fields.
   - Inference metadata is cached per inference base URL (5-minute TTL) to avoid repeated `/metadata` calls during preprocessing.
     - Callers that need fresh metadata can construct the client with caching disabled (`InferenceApiClient::from_settings_with_metadata_cache(..., false)`).
-- Search-time embeddings are cached in-process with a global LRU keyed by `(model, kind, query)`; cache size is controlled by `search.embedding_cache_size` in gateway config.
+- Search-time embeddings are cached in-process with a global LRU keyed by `(model, kind, query)`; cache size is controlled by `search.embedding_cache_size` in gateway config and defaults to 1,024 entries.
   - `/api/search/embeddings/cache` provides cache stats and allows clearing the embedding cache.
   - Embedding decoding accepts `f16/f32/f64`, integer/boolean dtypes, and both C/Fortran order; non-float inputs are coerced to `f32` and 2-D arrays use the first row.
   - Inference predict calls (multipart uploads) bypass the retry middleware and use a raw reqwest client with manual retry logic because multipart bodies are not clonable.

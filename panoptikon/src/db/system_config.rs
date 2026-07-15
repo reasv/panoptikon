@@ -188,12 +188,33 @@ impl SystemConfigStore {
         let mut normalized = config.clone();
         normalize_folder_lists(&mut normalized);
 
-        let serialized = toml::to_string(&normalized).map_err(|err| {
-            tracing::error!(error = %err, "failed to serialize system config");
-            ApiError::internal("Failed to serialize system configuration")
-        })?;
-        fs::write(&config_path, serialized).map_err(|err| {
-            tracing::error!(error = %err, path = %config_path.display(), "failed to write system config");
+        let document = if config_path.exists() {
+            let source = fs::read_to_string(&config_path).map_err(|err| {
+                tracing::error!(error = %err, path = %config_path.display(), "failed to read system config before update");
+                ApiError::internal("Failed to read system configuration")
+            })?;
+            let mut before: SystemConfig = toml::from_str(&source).map_err(|err| {
+                tracing::error!(error = %err, path = %config_path.display(), "failed to parse system config before update");
+                ApiError::internal("Failed to parse system configuration")
+            })?;
+            normalize_folder_lists(&mut before);
+            let mut document = panoptikon_config::TomlDocument::parse(&source).map_err(|err| {
+                tracing::error!(error = %err, path = %config_path.display(), "failed to open editable system config");
+                ApiError::internal("Failed to edit system configuration")
+            })?;
+            document.patch_serialized(&before, &normalized).map_err(|err| {
+                tracing::error!(error = %err, path = %config_path.display(), "failed to patch system config");
+                ApiError::internal("Failed to edit system configuration")
+            })?;
+            document
+        } else {
+            panoptikon_config::TomlDocument::from_serializable(&normalized).map_err(|err| {
+                tracing::error!(error = %err, "failed to serialize system config");
+                ApiError::internal("Failed to serialize system configuration")
+            })?
+        };
+        document.write_atomic(&config_path).map_err(|err| {
+            tracing::error!(error = %err, path = %config_path.display(), "failed to atomically write system config");
             ApiError::internal("Failed to write system configuration")
         })?;
         Ok(())
@@ -320,5 +341,28 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         assert_eq!(reloaded.job_filters.len(), loaded.job_filters.len());
         assert!(reloaded.filescan_filter.is_some());
         assert!(reloaded.extra.contains_key("some_future_key"));
+    }
+
+    #[test]
+    fn save_patches_only_changed_fields_and_preserves_toml_layout() {
+        let tmp = TempDir::new().unwrap();
+        let store = SystemConfigStore::new(tmp.path().to_path_buf());
+        let path = store.config_path("default");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = concat!(
+            "# hand-written database settings\n",
+            "future_key = 'leave me first'\n",
+            "scan_images = true # image note\n",
+            "# video note\n",
+            "scan_video = true\n",
+        );
+        fs::write(&path, raw).unwrap();
+        let mut config = store.load("default").unwrap();
+        config.scan_video = false;
+        store.save("default", &config).unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            raw.replace("scan_video = true", "scan_video = false")
+        );
     }
 }

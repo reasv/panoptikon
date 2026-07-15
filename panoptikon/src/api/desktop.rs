@@ -2,9 +2,7 @@
 //! `--desktop-managed` sidecar and carries no general host privilege.
 
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::Write as _,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::IpAddr,
     path::Path,
     sync::{Arc, OnceLock},
@@ -572,73 +570,14 @@ fn update_dotenv(
     values: &HashMap<String, String>,
     remove: &[String],
 ) -> anyhow::Result<()> {
-    let existing = match fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let remove = remove.iter().cloned().collect::<HashSet<_>>();
-    let mut written = HashSet::new();
-    let mut output = Vec::new();
-    for line in existing.lines() {
-        let Some(key) = dotenv_line_key(line) else {
-            output.push(line.to_owned());
-            continue;
-        };
-        if remove.contains(key) {
-            continue;
-        }
-        if let Some(value) = values.get(key) {
-            if written.insert(key.to_owned()) {
-                output.push(format!("{key}={}", encode_dotenv_value(value)));
-            }
-        } else {
-            output.push(line.to_owned());
-        }
-    }
-    for (key, value) in values {
-        if !written.contains(key) && !remove.contains(key) {
-            output.push(format!("{key}={}", encode_dotenv_value(value)));
-        }
-    }
-    let mut rendered = output.join("\n");
-    if !rendered.is_empty() {
-        rendered.push('\n');
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(rendered.as_bytes())?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-fn dotenv_line_key(line: &str) -> Option<&str> {
-    let line = line.trim_start();
-    let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-    let (key, _) = line.split_once('=')?;
-    let key = key.trim();
-    let mut chars = key.chars();
-    let first = chars.next()?;
-    ((first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(key)
-}
-
-fn encode_dotenv_value(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    )
+    let values = values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let remove = remove.iter().cloned().collect::<BTreeSet<_>>();
+    let mut document = panoptikon_config::DotenvDocument::load(path)?;
+    document.apply(&values, &remove);
+    document.write_private_atomic(path)
 }
 
 #[cfg(test)]
@@ -1180,19 +1119,19 @@ mod external_input_tests {
     fn dotenv_update_preserves_unrelated_lines_and_removes_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
-        fs::write(&path, "# keep me\nOTHER=value\nAPI_KEY=old\n").unwrap();
+        std::fs::write(&path, "# keep me\nOTHER=value\nAPI_KEY=old\n").unwrap();
         update_dotenv(
             &path,
             &HashMap::from([("API_KEY".into(), "new value=with symbols".into())]),
             &[],
         )
         .unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"));
         assert!(text.contains("OTHER=value"));
         assert!(text.contains("API_KEY=\"new value=with symbols\""));
         update_dotenv(&path, &HashMap::new(), &["API_KEY".into()]).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("API_KEY="));
         assert!(text.contains("OTHER=value"));
     }
@@ -1207,14 +1146,5 @@ mod external_input_tests {
         ]);
         discard_empty_updates(&mut values);
         assert_eq!(values, HashMap::from([("TIMEOUT".into(), "30".into())]));
-    }
-
-    /// Dotenv assignment parsing ignores comments and invalid identifiers,
-    /// while accepting the standard optional `export` prefix.
-    #[test]
-    fn dotenv_key_parser_ignores_comments_and_accepts_export() {
-        assert_eq!(dotenv_line_key(" export TOKEN = value"), Some("TOKEN"));
-        assert_eq!(dotenv_line_key("# TOKEN=value"), None);
-        assert_eq!(dotenv_line_key("BAD-NAME=value"), None);
     }
 }

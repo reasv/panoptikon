@@ -102,7 +102,9 @@ Special handling:
   logic because multipart bodies are not clonable. Inference errors are sanitized
   in client responses while detailed error context is logged. Search-time embeddings are cached
   in-process with a global LRU keyed by `(model, kind, query)`
-  using `search.embedding_cache_size` from the gateway config. It tracks joined base tables to
+  using `search.embedding_cache_size` from the gateway config. The cache lives in the
+  Panoptikon Server process, is cleared on restart, and defaults to 1,024 entries; common
+  embedding vectors are only a few KiB each. It tracks joined base tables to
   avoid duplicate joins when the root CTE is unwrapped. When `check_path` is
   enabled for `entity = file` with no `partition_by`, missing paths are dropped
   instead of substituting a different file (matching Python behavior).
@@ -607,8 +609,11 @@ parent-pipe EOF, initiates the same graceful cleanup path as an OS signal. The
 Server holds an exclusive advisory lock at `<root>/runtime/server.lock`; a
 second process for that root fails clearly.
 
-Desktop-managed mode adds `desktop_managed = true` to `/api/client-config` and
-enables narrow `/api/desktop/setup-*` lifecycle endpoints. Folder validation
+Desktop-managed mode adds `desktop_managed = true` to `/api/client-config`
+only for a matched policy with `[policies.client] desktop = true`, and enables
+narrow `/api/desktop/setup-*` lifecycle endpoints. Every `/api/desktop/*`
+request requires that same policy opt-in, so a separate LAN listener never
+inherits Desktop authority. Folder validation
 normalizes and checks staged included/excluded paths without changing
 configuration. Continuous-folder validation additionally requires each
 optional watch root to be inside a staged include and outside every exclusion.
@@ -660,6 +665,16 @@ profile. It uses gateway/UI ports 16342/16340, while production Desktop uses
 through `PANOPTIKON_API_URL`, so server-rendered routes use the selected profile.
 In managed mode these embedded configs are materialized when missing despite
 the explicit `--config` argument; existing files are never overwritten.
+
+Panoptikon Desktop's native control window edits the supported installation-wide
+subset: the private port, a separate LAN listener with database scoping, and
+the principal memory/prewarm limits. It remains usable when the Server cannot
+bind, preflights changed ports, and restarts the Server after a successful
+save. Programmatic TOML writes are lossless patches rather than object dumps:
+comments, ordering, unknown keys, unchanged literal spelling, and absent
+defaults survive. Advanced hand-written LAN policies are detected and left
+read-only by the simplified controls. See
+[Desktop configuration architecture](../docs/desktop-configuration.md).
 
 ### Env templating
 
@@ -789,7 +804,7 @@ local = true
 enabled = true
 
 [search]
-embedding_cache_size = 16
+embedding_cache_size = 1024
 
 [jobs]
 # loader_concurrency = 8

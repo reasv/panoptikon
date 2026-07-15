@@ -18,9 +18,11 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 anyhow = "1"
+panoptikon-config = { path = "../../panoptikon-config" }
 argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"
+dotenvy = "0.15"
 http = "1"
 notify-rust = "4.11"
 rand = "0.9"

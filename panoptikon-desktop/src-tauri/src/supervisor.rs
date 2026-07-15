@@ -30,6 +30,8 @@ pub struct RunningSidecar {
 pub struct Supervisor {
     pub paths: DesktopPaths,
     pub settings: Mutex<SettingsDocument>,
+    /// Serializes every in-process edit of the user-owned Server TOML.
+    pub config_write: Mutex<()>,
     pub state: RwLock<LifecycleState>,
     server_config: &'static str,
     default_port: u16,
@@ -72,6 +74,7 @@ impl Supervisor {
         Self {
             paths,
             settings: Mutex::new(settings),
+            config_write: Mutex::new(()),
             state: RwLock::new(initial),
             server_config,
             default_port,
@@ -395,23 +398,14 @@ async fn handle_exit(app: AppHandle, generation: u64, code: Option<i32>) {
 
 fn effective_port(paths: &DesktopPaths, server_config: &str, fallback: u16) -> anyhow::Result<u16> {
     let config = paths.server_root.join(server_config);
-    if !config.exists() {
-        return Ok(fallback);
-    }
-    let text = std::fs::read_to_string(&config).with_context(|| {
-        format!(
-            "failed to read Desktop Server config '{}'",
-            config.display()
-        )
-    })?;
-    let value: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("invalid Desktop Server config '{}'", config.display()))?;
-    let port = value
-        .get("server")
-        .and_then(|v| v.get("port"))
-        .and_then(toml::Value::as_integer)
-        .context("Desktop Server config has no valid [server].port")?;
-    u16::try_from(port).context("Desktop Server port is outside 1..65535")
+    crate::server_config::effective_local_port(&paths.server_root, &config, fallback).with_context(
+        || {
+            format!(
+                "failed to resolve Desktop Server port from '{}'",
+                config.display()
+            )
+        },
+    )
 }
 
 pub fn sidecar_arguments(paths: &DesktopPaths, server_config: &str) -> Vec<OsString> {
@@ -620,6 +614,24 @@ mod tests {
         assert_eq!(
             effective_port(&paths, "config/server/desktop.toml", 6342).unwrap(),
             7123
+        );
+    }
+
+    #[test]
+    fn effective_port_resolves_the_managed_dotenv_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DesktopPaths::new(
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("logs"),
+        );
+        paths.materialize_server_root().unwrap();
+        let config = paths.server_root.join("config/server/desktop.toml");
+        std::fs::write(&config, "[server]\nport = \"${PORT:-6342}\"\n").unwrap();
+        std::fs::write(paths.server_root.join(".env"), "PORT=7124\n").unwrap();
+        assert_eq!(
+            effective_port(&paths, "config/server/desktop.toml", 6342).unwrap(),
+            7124
         );
     }
 

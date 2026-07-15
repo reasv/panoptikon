@@ -52,7 +52,7 @@ pub(crate) struct ClientConfigResponse {
     /// (Relay is enabled when the key is absent).
     pub client: serde_json::Value,
     /// True only when this Server process is the bundled sidecar owned by
-    /// Panoptikon Desktop. API semantics are otherwise identical.
+    /// Panoptikon Desktop and the matched policy opts into Desktop authority.
     pub desktop_managed: bool,
     /// True only for a policy explicitly marked as the local Desktop client
     /// while the private parent-shell bridge is configured.
@@ -78,8 +78,11 @@ fn derive_capabilities(settings: &Settings, policy: &PolicyConfig) -> ClientCapa
 }
 
 fn desktop_shell_available(policy: &PolicyConfig, managed: bool, bridge_configured: bool) -> bool {
+    desktop_managed_for_policy(policy, managed) && bridge_configured
+}
+
+fn desktop_managed_for_policy(policy: &PolicyConfig, managed: bool) -> bool {
     managed
-        && bridge_configured
         && policy
             .client
             .get("desktop")
@@ -95,7 +98,7 @@ pub(crate) fn build_client_config(
         policy: policy.name.clone(),
         capabilities: derive_capabilities(settings, policy),
         client: policy.client.clone(),
-        desktop_managed: crate::desktop::is_managed(),
+        desktop_managed: desktop_managed_for_policy(policy, crate::desktop::is_managed()),
         desktop_shell_available: desktop_shell_available(
             policy,
             crate::desktop::is_managed(),
@@ -341,5 +344,8 @@ disable_backend_open = true
         assert!(!desktop_shell_available(&desktop, false, true));
         assert!(!desktop_shell_available(&desktop, true, false));
         assert!(!desktop_shell_available(&settings.policies[1], true, true));
+        assert!(desktop_managed_for_policy(&desktop, true));
+        assert!(!desktop_managed_for_policy(&desktop, false));
+        assert!(!desktop_managed_for_policy(&settings.policies[1], true));
     }
 }

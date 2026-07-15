@@ -1,6 +1,7 @@
 mod lifecycle;
 mod paths;
 mod relay;
+mod server_config;
 mod settings;
 mod supervisor;
 mod updates;
@@ -88,6 +89,7 @@ pub fn run() {
             relay_set_mappings, relay_resolve_mapping, relay_mapping_preview,
             choose_relay_folder, file_action_commands, set_file_action_commands,
             choose_file_action_application, choose_file_action_test_file, test_file_action,
+            get_server_configuration, set_server_configuration,
             set_relay_enabled,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
@@ -1304,10 +1306,12 @@ async fn set_local_file_commands(
         }
     }
     let supervisor = app.state::<Arc<Supervisor>>();
+    let _config_guard = supervisor.config_write.lock().await;
     let path = supervisor.server_config_path();
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut value: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let root = value
+    let before: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let mut after = before.clone();
+    let root = after
         .as_table_mut()
         .ok_or("server config is not a TOML table")?;
     let open = root
@@ -1347,14 +1351,52 @@ async fn set_local_file_commands(
     };
     write("file", &commands.open_file);
     write("folder", &commands.reveal_in_folder);
-    crate::settings::atomic_write(
-        &path,
-        toml::to_string_pretty(&value)
-            .map_err(|e| e.to_string())?
-            .as_bytes(),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut document = panoptikon_config::TomlDocument::parse(&text).map_err(|e| e.to_string())?;
+    document
+        .patch_values(&before, &after)
+        .map_err(|e| e.to_string())?;
+    document.write_atomic(&path).map_err(|e| e.to_string())?;
+    drop(_config_guard);
     Supervisor::restart(app).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_server_configuration(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<server_config::ServerConfigurationView, String> {
+    validate_control(&window)?;
+    let supervisor = app.state::<Arc<Supervisor>>();
+    server_config::load(
+        &supervisor.paths.server_root,
+        &supervisor.server_config_path(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_server_configuration(
+    window: WebviewWindow,
+    app: AppHandle,
+    configuration: server_config::ServerConfigurationUpdate,
+) -> Result<server_config::ServerConfigurationView, String> {
+    validate_control(&window)?;
+    let supervisor = app.state::<Arc<Supervisor>>();
+    let _guard = supervisor.config_write.lock().await;
+    let snapshot = supervisor.snapshot().await;
+    let current_port = snapshot.sidecar_pid.map(|_| snapshot.port);
+    let saved = server_config::save(
+        &supervisor.paths.server_root,
+        &supervisor.server_config_path(),
+        current_port,
+        &configuration,
+    )
+    .map_err(|error| error.to_string())?;
+    drop(_guard);
+    Supervisor::restart(app)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(saved)
 }
 
 fn command_configured(command: &relay::CommandSpec) -> bool {
@@ -1665,6 +1707,8 @@ mod tests {
             "choose_file_action_application",
             "choose_file_action_test_file",
             "test_file_action",
+            "get_server_configuration",
+            "set_server_configuration",
             "set_relay_enabled",
             "get_update_state",
             "check_for_updates",
