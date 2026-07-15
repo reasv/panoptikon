@@ -340,6 +340,12 @@ async fn async_main() -> anyhow::Result<()> {
             // exempts GET on this path): clients discover their policy's
             // capabilities and [policies.client] settings here.
             .route("/api/client-config", get(api::client_config::client_config));
+        app = app.route(
+            "/api/relay/pairings/{relay_id}",
+            get(api::relay::get_pairing)
+                .put(api::relay::put_pairing)
+                .delete(api::relay::delete_pairing),
+        );
         if desktop::is_managed() {
             let desktop_routes = Router::new()
                 .route("/api/desktop/setup-status", get(api::desktop::setup_status))

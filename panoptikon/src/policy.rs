@@ -264,8 +264,12 @@ fn apply_policy(
     // path to the upstream past a restrictive ruleset.
     let is_client_config =
         settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
+    // Relay pairing bootstrap is capability-discovery state, not an action.
+    // Its handlers still enforce the matched policy's relay_enabled switch.
+    let is_relay_bootstrap =
+        settings.upstreams.api.local && path.starts_with("/api/relay/pairings/");
 
-    if is_api && !is_client_config {
+    if is_api && !is_client_config && !is_relay_bootstrap {
         if !ruleset_allows(settings, &policy, &method, &path) {
             return Err(EnforcementError {
                 status: StatusCode::FORBIDDEN,
@@ -288,7 +292,7 @@ fn apply_policy(
         false
     } else if is_db_info || is_db_create {
         false
-    } else if is_client_config {
+    } else if is_client_config || is_relay_bootstrap {
         // Local-mode client-config takes no DB params (same gate as its
         // ruleset exemption above; in proxied-API mode the path is treated
         // like any other upstream API route).

@@ -177,9 +177,36 @@ audience's capabilities to another. Response:
     "scan_jobs": false, "open_files": false, "db_create": false,
     "inference": false, "pinboards": false
   },
-  "client": { "search_throttle_ms": 1500, "disable_backend_open": true }
+  "client": { "search_throttle_ms": 1500, "disable_backend_open": true, "relay_enabled": false }
 }
 ```
+
+`[policies.client] relay_enabled` defaults to `true`. Setting it to `false`
+is a hard frontend opt-out: the UI does not load its Relay module, probe
+loopback, or render Relay controls. Pairing bootstrap endpoints at
+`/api/relay/pairings/{relay_id}` are policy-scoped, return `no-store`, and
+also reject a policy that disables Relay. They persist the credential needed
+for another browser profile to authenticate directly to the same local Relay;
+file actions themselves never transit the Panoptikon server.
+
+## File-opening commands
+
+`[open]` controls actions executed on the Panoptikon server host. The default
+uses the operating system association. A direct executable is the preferred
+custom form:
+
+```toml
+[open]
+file_program = "mpv"
+file_args = ["{path}"]
+folder_program = "my-file-manager"
+folder_args = ["--select", "{path}"]
+```
+
+The existing `file_command` and `folder_command` keys remain available as
+explicit shell-command templates. All forms support `{path}`, `{folder}`, and
+`{filename}`. Panoptikon Desktop exposes the same model for its local server
+and for Relay actions.
 
 `capabilities` are derived, not configured: each is one representative
 probe from the real route list — `search` → `POST /api/search/pql`,
@@ -194,9 +221,9 @@ the same rule-matching code enforcement uses. Under the shipped
 everything host-side false.
 
 `client` is the policy's `[policies.client]` TOML table passed through
-verbatim (default: empty object). The gateway attaches no semantics to it;
-recognized-by-convention keys are `search_throttle_ms`,
-`disable_backend_open`, and `home_redirect` (a string path the UI's root
+verbatim (default: empty object). Most keys are UI conventions;
+recognized keys are `search_throttle_ms`, `disable_backend_open`,
+`relay_enabled`, and `home_redirect` (a string path the UI's root
 page redirects to, e.g. `"/search"`; unset = no redirect). Env templating
 applies inside it like everywhere else in the config file.
 

@@ -21,6 +21,47 @@ function showUpdate(update) {
   byId('automatic-updates').checked = update.check_automatically;
   byId('view-update').hidden = !update.available;
 }
+function commandEditor(container, commands) {
+  container.replaceChildren();
+  for (const [key, label] of [['open_file', 'Open file'], ['reveal_in_folder', 'Show in folder']]) {
+    const spec = commands[key] || { program: '', args: [], shell_command: '' };
+    const box = document.createElement('fieldset'); box.dataset.command = key;
+    const legend = document.createElement('legend'); legend.textContent = label;
+    const program = document.createElement('input'); program.placeholder = 'Executable (direct mode)'; program.value = spec.program; program.dataset.field = 'program';
+    const args = document.createElement('textarea'); args.rows = 2; args.placeholder = 'One argument per line'; args.value = (spec.args || []).join('\n'); args.dataset.field = 'args';
+    const shell = document.createElement('input'); shell.placeholder = 'Shell command (explicit shell mode)'; shell.value = spec.shell_command; shell.dataset.field = 'shell_command';
+    box.append(legend, program, args, shell); container.append(box);
+  }
+}
+function readCommands(container) {
+  const result = {};
+  for (const box of container.querySelectorAll('[data-command]')) {
+    const program = box.querySelector('[data-field=program]').value.trim();
+    const shell_command = box.querySelector('[data-field=shell_command]').value.trim();
+    if (program && shell_command) throw new Error('Choose direct executable or shell command for each action, not both.');
+    result[box.dataset.command] = { program, shell_command, args: box.querySelector('[data-field=args]').value.split('\n').map(v => v.trim()).filter(Boolean) };
+  }
+  return result;
+}
+function mappingEditor(item) {
+  const card = document.createElement('article'); card.dataset.instance = item.id;
+  const title = document.createElement('strong'); title.textContent = item.name;
+  const detail = document.createElement('p'); detail.textContent = `${item.server_url} — ${item.origins.join(', ')}`;
+  card.append(title, detail);
+  for (const mapping of item.mappings) {
+    const row = document.createElement('div'); row.className = 'mapping-row'; row.dataset.remote = mapping.remote;
+    const remote = document.createElement('code'); remote.textContent = mapping.remote;
+    const local = document.createElement('input'); local.value = mapping.local; local.placeholder = 'Choose the matching folder, or leave blank to skip';
+    const browse = document.createElement('button'); browse.textContent = 'Choose folder…'; browse.onclick = async () => { const folder = await invoke('choose_relay_folder'); if (folder) local.value = folder; };
+    row.append(remote, local, browse); card.append(row);
+  }
+  const save = document.createElement('button'); save.textContent = 'Save mappings'; save.onclick = async () => {
+    const mappings = [...card.querySelectorAll('.mapping-row')].map(row => ({ remote: row.dataset.remote, local: row.querySelector('input').value.trim() }));
+    await invoke('relay_set_mappings', { instanceId: item.id, mappings }); await refresh();
+  };
+  const revoke = document.createElement('button'); revoke.textContent = 'Revoke'; revoke.onclick = async () => { if (confirm(`Revoke Relay access for ${item.name}?`)) { await invoke('relay_revoke', { instanceId: item.id }); await refresh(); } };
+  card.append(save, revoke); return card;
+}
 async function refresh() {
   try {
     const status = await invoke('get_status');
@@ -44,33 +85,16 @@ async function refresh() {
     const pending = await invoke('relay_pending');
     const relayStatus = await invoke('relay_status');
     byId('relay-enabled').checked = relayStatus.enabled;
+    if (!byId('relay-commands').children.length) commandEditor(byId('relay-commands'), relayStatus.commands);
+    if (!byId('local-commands').children.length) commandEditor(byId('local-commands'), await invoke('local_file_commands'));
     byId('relay').replaceChildren(...pending.map((item) => {
       const row = document.createElement('p');
-      row.textContent = `${item.name} — ${item.origin} `;
+      row.textContent = `${item.name} — ${item.origin}. Suggested roots: ${item.roots.length ? item.roots.join(', ') : 'none'} `;
       const approve = document.createElement('button'); approve.textContent = 'Approve'; approve.onclick = () => invoke('relay_approve', { requestId: item.id }).then(refresh).catch(fail);
       const reject = document.createElement('button'); reject.textContent = 'Reject'; reject.onclick = () => invoke('relay_reject', { requestId: item.id }).then(refresh).catch(fail);
       row.append(approve, reject); return row;
     }));
-    byId('relay-instances').replaceChildren(...relayStatus.instances.map((item) => {
-      const card = document.createElement('article');
-      const title = document.createElement('strong'); title.textContent = item.name;
-      const detail = document.createElement('p'); detail.textContent = `${item.server_url} — ${item.origins.join(', ')}`;
-      const mappings = document.createElement('textarea'); mappings.rows = 4;
-      mappings.setAttribute('aria-label', `Path mappings for ${item.name}`);
-      mappings.value = item.mappings.map((mapping) => `${mapping.remote} => ${mapping.local}`).join('\n');
-      const save = document.createElement('button'); save.textContent = 'Save mappings';
-      save.onclick = async () => {
-        const parsed = mappings.value.split('\n').filter((line) => line.trim()).map((line) => {
-          const separator = line.indexOf('=>');
-          if (separator < 1) throw new Error('Each mapping must use: remote path => local path');
-          return { remote: line.slice(0, separator).trim(), local: line.slice(separator + 2).trim() };
-        });
-        await invoke('relay_set_mappings', { instanceId: item.id, mappings: parsed }); await refresh();
-      };
-      const revoke = document.createElement('button'); revoke.textContent = 'Revoke';
-      revoke.onclick = async () => { if (confirm(`Revoke Relay access for ${item.name}?`)) { await invoke('relay_revoke', { instanceId: item.id }); await refresh(); } };
-      card.append(title, detail, mappings, save, revoke); return card;
-    }));
+    if (!byId('relay-instances').contains(document.activeElement)) byId('relay-instances').replaceChildren(...relayStatus.instances.map(mappingEditor));
   } catch (error) { fail(error); }
 }
 document.addEventListener('click', async (event) => {
@@ -102,6 +126,8 @@ byId('local').addEventListener('change', async (event) => {
 byId('relay-enabled').addEventListener('change', async (event) => {
   try { await invoke('set_relay_enabled', { enabled: event.target.checked }); await refresh(); } catch (error) { event.target.checked = !event.target.checked; fail(error); }
 });
+byId('save-relay-commands').addEventListener('click', async () => { try { await invoke('relay_set_commands', { commands: readCommands(byId('relay-commands')) }); } catch (error) { fail(error); } });
+byId('save-local-commands').addEventListener('click', async () => { try { await invoke('set_local_file_commands', { commands: readCommands(byId('local-commands')) }); } catch (error) { fail(error); } });
 window.__TAURI__.event.listen('desktop-state', refresh);
 window.__TAURI__.event.listen('desktop-update-state', (event) => showUpdate(event.payload));
 refresh();

@@ -55,6 +55,9 @@ pub struct StatusSnapshot {
 }
 
 impl Supervisor {
+    pub fn server_config_path(&self) -> std::path::PathBuf {
+        self.paths.server_root.join(self.server_config)
+    }
     pub fn new(
         paths: DesktopPaths,
         settings: SettingsDocument,

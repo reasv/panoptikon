@@ -97,12 +97,24 @@ impl Default for LoggingConfig {
 /// An explicit empty string makes the endpoint a no-op.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenConfig {
+    /// Executable for direct (non-shell) "open file" customization.
+    #[serde(default)]
+    pub file_program: Option<String>,
+    /// Arguments passed directly to `file_program`.
+    #[serde(default)]
+    pub file_args: Vec<String>,
     /// Command template for "open file" (was the OPEN_FILE_COMMAND env var).
     #[serde(default)]
     pub file_command: Option<String>,
     /// Command template for "show in file manager" (was SHOW_IN_FM_COMMAND).
     #[serde(default)]
     pub folder_command: Option<String>,
+    /// Executable for direct (non-shell) "show in folder" customization.
+    #[serde(default)]
+    pub folder_program: Option<String>,
+    /// Arguments passed directly to `folder_program`.
+    #[serde(default)]
+    pub folder_args: Vec<String>,
 }
 
 /// `[inference_local]`: the in-process inferio orchestrator (design doc §3).
@@ -738,10 +750,12 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub identity: Option<IdentityConfig>,
     /// `[policies.client]`: free-form table returned verbatim as the
-    /// `client` object of `GET /api/client-config`. The gateway attaches no
-    /// semantics to it — it is per-policy configuration for UI clients.
+    /// `client` object of `GET /api/client-config`. It is primarily
+    /// per-policy UI configuration; `relay_enabled` is also enforced by the
+    /// gateway's pairing bootstrap endpoints.
     /// Recognized-by-convention keys (documented, not enforced):
-    /// `search_throttle_ms`, `disable_backend_open`. Default: empty object.
+    /// `search_throttle_ms`, `disable_backend_open`, `relay_enabled`.
+    /// Default: empty object (`relay_enabled` therefore defaults true).
     #[serde(default = "default_client_table")]
     pub client: serde_json::Value,
 }

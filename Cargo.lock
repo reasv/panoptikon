@@ -4380,6 +4380,7 @@ dependencies = [
  "utoipa",
  "utoipa-redoc",
  "utoipa-swagger-ui",
+ "uuid",
  "walkdir",
  "windows-sys 0.60.2",
  "zip 2.4.2",

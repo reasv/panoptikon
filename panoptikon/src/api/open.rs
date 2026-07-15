@@ -98,10 +98,37 @@ async fn execute_custom_command(
     Ok(())
 }
 
+async fn execute_direct_command(program: &str, args: &[String], path: &FsPath) -> ApiResult<()> {
+    let folder = path.parent().unwrap_or(path).to_string_lossy();
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let expand = |value: &str| {
+        value
+            .replace("{path}", &path.to_string_lossy())
+            .replace("{folder}", &folder)
+            .replace("{filename}", &filename)
+    };
+    Command::new(expand(program))
+        .args(args.iter().map(|arg| expand(arg)))
+        .spawn()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to start custom file action: {error}"))
+        })?;
+    Ok(())
+}
+
 /// Open the specified file using the default application.
 ///
 /// `path`: The path to the file to be opened.
 async fn open_file(path: &FsPath) -> ApiResult<()> {
+    if let Some(program) = crate::config::runtime()
+        .open
+        .file_program
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        execute_direct_command(&program, &crate::config::runtime().open.file_args, path).await?;
+        return Ok(());
+    }
     if let Some(custom_cmd) = crate::config::runtime().open.file_command.clone() {
         execute_custom_command("open.file_command", &custom_cmd, path).await?;
         return Ok(());
@@ -165,6 +192,15 @@ async fn show_in_fm(path: &FsPath) -> ApiResult<()> {
         )));
     }
 
+    if let Some(program) = crate::config::runtime()
+        .open
+        .folder_program
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        execute_direct_command(&program, &crate::config::runtime().open.folder_args, path).await?;
+        return Ok(());
+    }
     if let Some(custom_cmd) = crate::config::runtime().open.folder_command.clone() {
         execute_custom_command("open.folder_command", &custom_cmd, path).await?;
         return Ok(());

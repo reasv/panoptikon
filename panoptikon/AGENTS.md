@@ -53,6 +53,14 @@ Behavior (important)
 - The supervised production UI receives `PANOPTIKON_API_URL` at build/start
   from the effective gateway listener, so server-rendered UI routes follow
   non-default ports (including the isolated Desktop Dev profile).
+- File actions and Relay: `[open]` supports direct `file_program`/
+  `folder_program` plus argument arrays, while the older `*_command` shell
+  templates remain supported. The Desktop control edits this configuration
+  for its managed server. Policy client key `relay_enabled` defaults true;
+  false means the UI must not load or run Relay discovery at all. Pairing
+  credentials live in `<data_folder>/relay-pairings.json` (owner-only mode on
+  Unix), keyed by policy and stable Relay ID. Browsers retrieve them during
+  discovery; `/api/relay/pairings/*` never executes a file action.
 - Logging (`logging.rs`): console plus append-mode file, default `<data_folder>/panoptikon.log`; `[logging].file` overrides (empty string disables), `[logging].level` sets the level, `RUST_LOG` wins when set. Config-file string values support env templating (`${VAR}` / `${VAR:-default}`, see `env_template.rs`); global keys reach settings-less code via `config::runtime()` (installed once in main; tests default it to a shared temp root).
 - Inference upstreams are configured as an array; the first entry is the proxy + metadata target and may be marked `use_for_jobs = false` to keep it search-only. Extraction jobs only use endpoints with `use_for_jobs = true`. With `[inference_local].enabled = true` the `/api/inference/*` routes are served in-process instead of proxied (see the inferio orchestrator section), and an empty `upstreams.inference` synthesizes a loopback self entry so the gateway's own clients keep working.
 - DB param enforcement:

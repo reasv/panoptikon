@@ -9,3 +9,8 @@ pre { max-height: 220px; overflow: auto; white-space: pre-wrap; background: #0d0
 .muted { color: #aaa; }
 .inline-error { color: #ffaca0; }
 footer { display: flex; justify-content: flex-end; margin-top: 22px; }
+fieldset { display: grid; gap: 8px; border: 1px solid #30343a; border-radius: 8px; margin: 10px 0; padding: 12px; }
+input, textarea { box-sizing: border-box; width: 100%; border: 1px solid #4b5159; border-radius: 6px; padding: 8px; background: #111315; color: inherit; }
+.mapping-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) auto; gap: 8px; align-items: center; margin: 10px 0; }
+.mapping-row code { overflow-wrap: anywhere; }
+article { border-top: 1px solid #30343a; margin-top: 12px; padding-top: 12px; }

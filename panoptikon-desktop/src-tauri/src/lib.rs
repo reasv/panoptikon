@@ -81,7 +81,8 @@ pub fn run() {
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
             relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
-            relay_set_mappings, set_relay_enabled,
+            relay_set_mappings, relay_set_commands, choose_relay_folder, local_file_commands,
+            set_local_file_commands, set_relay_enabled,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
             updates::open_update_link, updates::set_automatic_update_checks,
@@ -126,14 +127,23 @@ pub fn run() {
                 default_port,
             ));
             let opener = app.handle().clone();
-            let action_handler = Arc::new(move |action: RelayAction, path: std::path::PathBuf| {
+            let action_handler = Arc::new(move |action: RelayAction, path: std::path::PathBuf, command: relay::CommandSpec| {
+                if !command.program.trim().is_empty() || !command.shell_command.trim().is_empty() {
+                    return execute_file_action_command(&command, &path);
+                }
                 match action {
                     RelayAction::OpenFile => opener.opener().open_path(path.display().to_string(), None::<&str>)?,
                     RelayAction::RevealInFolder => opener.opener().reveal_item_in_dir(path)?,
                 }
                 Ok(())
             });
-            let relay_state = Arc::new(RelayState::new(relay_config, paths.relay_settings.clone(), action_handler));
+            let attention_app = app.handle().clone();
+            let attention_handler = Arc::new(move || {
+                if let Err(error) = show_control_window(&attention_app, true) {
+                    tracing::warn!(%error, "failed to show Relay setup window");
+                }
+            });
+            let relay_state = Arc::new(RelayState::new(relay_config, paths.relay_settings.clone(), action_handler, attention_handler));
             app.manage(supervisor.clone());
             app.manage(relay_state.clone());
             app.manage(Arc::new(updates::UpdateCoordinator::new()));
@@ -1175,6 +1185,175 @@ async fn relay_set_mappings(
         .replace_mappings(instance_id, mappings)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn relay_set_commands(
+    window: WebviewWindow,
+    app: AppHandle,
+    commands: relay::FileActionCommands,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    app.state::<Arc<RelayState>>()
+        .set_commands(commands)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_file_commands(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<relay::FileActionCommands, String> {
+    validate_control(&window)?;
+    let path = app.state::<Arc<Supervisor>>().server_config_path();
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let open = value.get("open");
+    let parse = |prefix: &str| relay::CommandSpec {
+        program: open
+            .and_then(|v| v.get(format!("{prefix}_program")))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        args: open
+            .and_then(|v| v.get(format!("{prefix}_args")))
+            .and_then(toml::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        shell_command: open
+            .and_then(|v| v.get(format!("{prefix}_command")))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    };
+    Ok(relay::FileActionCommands {
+        open_file: parse("file"),
+        reveal_in_folder: parse("folder"),
+    })
+}
+
+#[tauri::command]
+async fn set_local_file_commands(
+    window: WebviewWindow,
+    app: AppHandle,
+    commands: relay::FileActionCommands,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    for command in [&commands.open_file, &commands.reveal_in_folder] {
+        if !command.program.trim().is_empty() && !command.shell_command.trim().is_empty() {
+            return Err("choose either a direct executable or shell mode, not both".into());
+        }
+    }
+    let supervisor = app.state::<Arc<Supervisor>>();
+    let path = supervisor.server_config_path();
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut value: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let root = value
+        .as_table_mut()
+        .ok_or("server config is not a TOML table")?;
+    let open = root
+        .entry("open")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("[open] is not a table")?;
+    let mut write = |prefix: &str, command: &relay::CommandSpec| {
+        let program_key = format!("{prefix}_program");
+        let args_key = format!("{prefix}_args");
+        let command_key = format!("{prefix}_command");
+        if command.program.trim().is_empty() {
+            open.remove(&program_key);
+            open.remove(&args_key);
+        } else {
+            open.insert(program_key, toml::Value::String(command.program.clone()));
+            open.insert(
+                args_key,
+                toml::Value::Array(
+                    command
+                        .args
+                        .iter()
+                        .cloned()
+                        .map(toml::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if command.shell_command.trim().is_empty() {
+            open.remove(&command_key);
+        } else {
+            open.insert(
+                command_key,
+                toml::Value::String(command.shell_command.clone()),
+            );
+        }
+    };
+    write("file", &commands.open_file);
+    write("folder", &commands.reveal_in_folder);
+    crate::settings::atomic_write(
+        &path,
+        toml::to_string_pretty(&value)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    Supervisor::restart(app).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn choose_relay_folder(window: WebviewWindow) -> Result<Option<String>, String> {
+    validate_control(&window)?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    window
+        .app_handle()
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose the matching local folder")
+        .pick_folder(move |folder| {
+            let _ = send.send(folder);
+        });
+    Ok(receive
+        .await
+        .map_err(|_| "the folder picker closed unexpectedly".to_string())?
+        .and_then(|folder| folder.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+fn execute_file_action_command(
+    command: &relay::CommandSpec,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let folder = path.parent().unwrap_or(path).to_string_lossy();
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let replace = |value: &str| {
+        value
+            .replace("{path}", &path.to_string_lossy())
+            .replace("{folder}", &folder)
+            .replace("{filename}", &filename)
+    };
+    if !command.program.trim().is_empty() {
+        std::process::Command::new(replace(&command.program))
+            .args(command.args.iter().map(|arg| replace(arg)))
+            .spawn()?;
+        return Ok(());
+    }
+    let shell = replace(&command.shell_command);
+    if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/C", &shell])
+            .spawn()?;
+    } else {
+        std::process::Command::new("sh")
+            .args(["-c", &shell])
+            .spawn()?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
