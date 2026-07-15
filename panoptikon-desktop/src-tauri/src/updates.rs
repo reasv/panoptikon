@@ -37,6 +37,7 @@ const MANUAL_WINDOW_SECS: i64 = 60;
 const MANUAL_MAX_ATTEMPTS: usize = 10;
 const MANUAL_MIN_GAP_SECS: i64 = 2;
 const RIBBON_SNOOZE_SECS: i64 = 24 * 60 * 60;
+const NATIVE_NOTIFICATION_RETRY_SECS: i64 = 4 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckReason {
@@ -233,6 +234,17 @@ pub struct ReleaseNote {
     pub release_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePresentationState {
+    Available,
+    Checking,
+    Failed,
+    Current,
+    Unchecked,
+    Disabled,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChangelogFeed {
     schema_version: u32,
@@ -241,6 +253,7 @@ struct ChangelogFeed {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateView {
+    pub presentation_state: UpdatePresentationState,
     pub current_version: String,
     pub available: bool,
     pub target_version: Option<String>,
@@ -480,13 +493,23 @@ impl UpdateCoordinator {
         let fresh = settings
             .last_checked_unix
             .is_some_and(|last| timestamp_age(now, last).is_some_and(|age| age <= FRESH_SECS));
-        let ribbon_visible = available
+        let updates_disabled = crate::updates_disabled(app);
+        let ribbon_visible = !updates_disabled
+            && available
             && settings.ribbon_dismissed_version.as_deref() != settings.latest_version.as_deref()
             && settings
                 .ribbon_snoozed_until_unix
                 .is_none_or(|until| until <= now);
         let checking = self.checking.load(Ordering::Acquire);
         let installing = self.installing.load(Ordering::Acquire);
+        let presentation_state = update_presentation_state(
+            updates_disabled,
+            available,
+            checking,
+            settings.last_checked_unix,
+            settings.last_error.as_deref(),
+            settings.last_error_unix,
+        );
         let pending_matches = self.pending.lock().await.as_ref().is_some_and(|update| {
             settings.latest_version.as_deref() == Some(update.version.as_str())
         });
@@ -503,6 +526,7 @@ impl UpdateCoordinator {
             ActiveWorkState::Idle
         };
         UpdateView {
+            presentation_state,
             current_version,
             available,
             target_version: settings.latest_version,
@@ -527,14 +551,14 @@ impl UpdateCoordinator {
             ribbon_snoozed_until_unix: settings.ribbon_snoozed_until_unix,
             ribbon_dismissed_version: settings.ribbon_dismissed_version,
             reminder_at_unix: settings.reminder_at_unix,
-            updates_disabled: cfg!(debug_assertions),
+            updates_disabled,
             active_work: active_work == ActiveWorkState::Active,
             active_work_unknown: active_work == ActiveWorkState::Unknown,
         }
     }
 
     pub async fn check(&self, app: &AppHandle, reason: CheckReason) -> Result<UpdateView, String> {
-        if cfg!(debug_assertions) {
+        if crate::updates_disabled(app) {
             return Ok(self.view(app).await);
         }
 
@@ -709,6 +733,10 @@ impl UpdateCoordinator {
                     document.typed.updates.latest_version.clone()
                 };
                 let newly_discovered = previous.as_deref() != Some(update.version.as_str());
+                let update_visible = app
+                    .get_webview_window("update")
+                    .and_then(|window| window.is_visible().ok())
+                    .unwrap_or(false);
                 let releases = fetch_changelog(&current, &update).await;
                 if let Ok(releases) = &releases {
                     if let Ok(bytes) = serde_json::to_vec_pretty(releases)
@@ -723,7 +751,7 @@ impl UpdateCoordinator {
                 let settings = &mut document.typed.updates;
                 record_success_fields(settings, now);
                 settings.latest_version = Some(update.version.clone());
-                settings.latest_published_at = update.date.map(|date| date.to_string());
+                settings.latest_published_at = update.date.and_then(format_published_at);
                 settings.latest_notes_markdown = update.body.clone();
                 settings.latest_release_url = Some(format!(
                     "https://github.com/reasv/panoptikon/releases/tag/v{}",
@@ -735,12 +763,17 @@ impl UpdateCoordinator {
                     settings.ribbon_dismissed_version = None;
                     settings.reminder_version = None;
                     settings.reminder_at_unix = None;
-                    if reason.automatic()
-                        && settings.native_notified_version.as_deref()
-                            != Some(update.version.as_str())
-                    {
-                        notify_version = Some(update.version.clone());
-                    }
+                }
+                // Manual/freshness results are presented directly, and an
+                // already-visible update window has likewise informed the
+                // user. Treat both as surfaced so a later automatic check
+                // does not add a redundant native interruption.
+                if !reason.automatic() || update_visible {
+                    settings.native_surfaced_version = Some(update.version.clone());
+                } else if native_notification_retry_due(settings, &update.version, now) {
+                    settings.native_notification_attempt_version = Some(update.version.clone());
+                    settings.native_notification_last_attempt_unix = Some(now);
+                    notify_version = Some(update.version.clone());
                 }
                 document.save().map_err(|error| error.to_string())?;
                 *self.pending.lock().await = Some(update);
@@ -758,13 +791,7 @@ impl UpdateCoordinator {
         }
         crate::update_update_tray(app).await;
         if let Some(version) = notify_version {
-            let update_visible = app
-                .get_webview_window("update")
-                .and_then(|window| window.is_visible().ok())
-                .unwrap_or(false);
-            if !update_visible {
-                notify_update(app.clone(), version).await;
-            }
+            notify_update(app.clone(), version).await;
         }
         Ok(())
     }
@@ -785,7 +812,7 @@ impl UpdateCoordinator {
         expected_version: &str,
         active_work_confirmation: Option<ActiveWorkConfirmation>,
     ) -> Result<(), String> {
-        if cfg!(debug_assertions) {
+        if crate::updates_disabled(app) {
             return Err("updates are disabled in development builds".into());
         }
         if self.installing.swap(true, Ordering::AcqRel) {
@@ -1000,6 +1027,53 @@ fn parse_active_work_confirmation(
     }
 }
 
+fn update_presentation_state(
+    updates_disabled: bool,
+    available: bool,
+    checking: bool,
+    last_success_unix: Option<i64>,
+    last_error: Option<&str>,
+    last_error_unix: Option<i64>,
+) -> UpdatePresentationState {
+    if updates_disabled {
+        return UpdatePresentationState::Disabled;
+    }
+    if available {
+        return UpdatePresentationState::Available;
+    }
+    if checking {
+        return UpdatePresentationState::Checking;
+    }
+    let latest_attempt_failed = last_error.is_some()
+        && match (last_error_unix, last_success_unix) {
+            (Some(error), Some(success)) => error > success,
+            (_, None) => true,
+            (None, Some(_)) => true,
+        };
+    if latest_attempt_failed {
+        UpdatePresentationState::Failed
+    } else if last_success_unix.is_some() {
+        UpdatePresentationState::Current
+    } else {
+        UpdatePresentationState::Unchecked
+    }
+}
+
+fn native_notification_retry_due(settings: &UpdateSettings, version: &str, now: i64) -> bool {
+    if settings.native_surfaced_version.as_deref() == Some(version)
+        || settings.native_notified_version.as_deref() == Some(version)
+    {
+        return false;
+    }
+    if settings.native_notification_attempt_version.as_deref() != Some(version) {
+        return true;
+    }
+    settings
+        .native_notification_last_attempt_unix
+        .and_then(|attempt| timestamp_age(now, attempt))
+        .is_none_or(|age| age >= NATIVE_NOTIFICATION_RETRY_SECS)
+}
+
 fn record_success_fields(settings: &mut UpdateSettings, now: i64) {
     settings.last_checked_unix = Some(now);
     settings.last_error = None;
@@ -1039,6 +1113,9 @@ pub fn start(app: AppHandle) {
 }
 
 async fn runtime_check_due(app: &AppHandle, jitter_secs: i64) -> bool {
+    if crate::updates_disabled(app) {
+        return false;
+    }
     let now = unix_timestamp();
     let supervisor = app.state::<Arc<Supervisor>>();
     let settings = supervisor.settings.lock().await.typed.updates.clone();
@@ -1126,6 +1203,11 @@ fn fallback_release(settings: &UpdateSettings) -> Vec<ReleaseNote> {
             .unwrap_or_else(|| "Release notes are temporarily unavailable.".into()),
         release_url: settings.latest_release_url.clone(),
     }]
+}
+
+fn format_published_at(date: time::OffsetDateTime) -> Option<String> {
+    date.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 fn filter_releases(
@@ -1239,7 +1321,8 @@ async fn notify_update(app: AppHandle, version: String) {
     if accepted_rx.await.unwrap_or(false) {
         let supervisor = app.state::<Arc<Supervisor>>();
         let mut document = supervisor.settings.lock().await;
-        document.typed.updates.native_notified_version = Some(version);
+        document.typed.updates.native_notified_version = Some(version.clone());
+        document.typed.updates.native_surfaced_version = Some(version);
         if let Err(error) = document.save() {
             tracing::warn!(%error, "failed to persist update notification state");
         }
@@ -1352,6 +1435,9 @@ pub async fn set_automatic_update_checks(
     enabled: bool,
 ) -> Result<UpdateView, String> {
     validate_update_client(&window)?;
+    if crate::updates_disabled(&app) {
+        return Err("updates are disabled in development builds".into());
+    }
     let supervisor = app.state::<Arc<Supervisor>>();
     let mut document = supervisor.settings.lock().await;
     document.typed.updates.check_automatically = enabled;
@@ -1589,6 +1675,61 @@ mod tests {
     }
 
     #[test]
+    fn presentation_state_never_calls_a_failed_or_missing_check_current() {
+        assert_eq!(
+            update_presentation_state(false, false, false, None, None, None),
+            UpdatePresentationState::Unchecked
+        );
+        assert_eq!(
+            update_presentation_state(false, false, false, None, Some("offline"), Some(10)),
+            UpdatePresentationState::Failed
+        );
+        assert_eq!(
+            update_presentation_state(false, false, false, Some(10), Some("offline"), Some(20)),
+            UpdatePresentationState::Failed
+        );
+        assert_eq!(
+            update_presentation_state(false, false, false, Some(20), None, None),
+            UpdatePresentationState::Current
+        );
+        assert_eq!(
+            update_presentation_state(true, true, true, Some(20), None, None),
+            UpdatePresentationState::Disabled
+        );
+    }
+
+    #[test]
+    fn native_notification_failures_retry_after_a_version_scoped_cooldown() {
+        let now = 100_000;
+        let mut settings = UpdateSettings::default();
+        assert!(native_notification_retry_due(&settings, "0.3.0", now));
+
+        settings.native_notification_attempt_version = Some("0.3.0".into());
+        settings.native_notification_last_attempt_unix = Some(now);
+        assert!(!native_notification_retry_due(&settings, "0.3.0", now));
+        assert!(native_notification_retry_due(
+            &settings,
+            "0.3.0",
+            now + NATIVE_NOTIFICATION_RETRY_SECS
+        ));
+        assert!(native_notification_retry_due(&settings, "0.4.0", now));
+
+        settings.native_surfaced_version = Some("0.3.0".into());
+        assert!(!native_notification_retry_due(
+            &settings,
+            "0.3.0",
+            now + NATIVE_NOTIFICATION_RETRY_SECS
+        ));
+        settings.native_surfaced_version = None;
+        settings.native_notified_version = Some("0.3.0".into());
+        assert!(!native_notification_retry_due(
+            &settings,
+            "0.3.0",
+            now + NATIVE_NOTIFICATION_RETRY_SECS
+        ));
+    }
+
+    #[test]
     fn rolling_automatic_limit_ignores_old_and_future_timestamps() {
         let now = 100_000;
         let attempts = vec![
@@ -1613,6 +1754,15 @@ mod tests {
                 .map(|release| release.version)
                 .collect::<Vec<_>>(),
             ["0.3.0", "0.2.0"]
+        );
+    }
+
+    #[test]
+    fn publication_dates_are_exposed_as_browser_parseable_rfc3339() {
+        let epoch = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
+        assert_eq!(
+            format_published_at(epoch).as_deref(),
+            Some("1970-01-01T00:00:00Z")
         );
     }
 

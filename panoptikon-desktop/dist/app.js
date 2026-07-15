@@ -8,18 +8,26 @@ function relativeTime(unix) {
   return `${relative} (${new Date(unix * 1000).toLocaleString()})`;
 }
 function showUpdate(update) {
-  byId('update-version').textContent = update.available
-    ? `Panoptikon Desktop ${update.target_version} is available. You have ${update.current_version}.`
-    : `Panoptikon Desktop ${update.current_version} is up to date.`;
+  const messages = {
+    available: `Panoptikon Desktop ${update.target_version} is available. You have ${update.current_version}.`,
+    checking: 'Checking for updates…',
+    failed: 'Unable to check for updates.',
+    current: `Panoptikon Desktop ${update.current_version} is up to date.`,
+    unchecked: 'Panoptikon has not checked for updates yet.',
+    disabled: 'Update checks are disabled in development builds.',
+  };
+  byId('update-version').textContent = messages[update.presentation_state] || messages.unchecked;
   byId('update-last-check').textContent = update.last_success_unix
     ? `Last checked successfully ${relativeTime(update.last_success_unix)}.`
     : 'Panoptikon has not completed an update check yet.';
-  if (update.last_error && (!update.last_success_unix || update.last_error_unix > update.last_success_unix)) {
+  if (update.last_error && (update.presentation_state === 'failed' || !update.last_success_unix || update.last_error_unix > update.last_success_unix)) {
     byId('update-error').hidden = false;
     byId('update-error').textContent = `Last attempt failed ${relativeTime(update.last_error_unix)}: ${update.last_error}.`;
   } else byId('update-error').hidden = true;
   byId('automatic-updates').checked = update.check_automatically;
-  byId('view-update').hidden = !update.available;
+  byId('automatic-updates').disabled = update.updates_disabled;
+  byId('check-updates').disabled = update.updates_disabled;
+  byId('view-update').hidden = !update.available || update.updates_disabled;
 }
 const samplePath = navigator.userAgent.includes('Windows') ? 'C:\\Media\\example.jpg' : '/home/user/Media/example.jpg';
 function insertPlaceholder(field, value) {
@@ -177,8 +185,17 @@ document.addEventListener('click', async (event) => {
     if (button.dataset.action === 'setup') await invoke('open_setup_command');
     if (button.dataset.action === 'restart') await invoke('restart_server');
     if (button.dataset.action === 'updates') {
+      if (button.disabled) return;
       button.disabled = true; const original = button.textContent; button.textContent = 'Checking…';
-      try { const update = await invoke('check_for_updates'); showUpdate(update); if (update.available) await invoke('open_update_window'); else alert(`Panoptikon Desktop ${update.current_version} is up to date.`); }
+      try {
+        const update = await invoke('check_for_updates'); showUpdate(update);
+        if (update.available) await invoke('open_update_window');
+        else if (update.presentation_state === 'current') alert(`Panoptikon Desktop ${update.current_version} is up to date.`);
+      }
+      catch (error) {
+        const update = await invoke('get_update_state'); showUpdate(update);
+        if (update.presentation_state !== 'failed') throw error;
+      }
       finally { button.disabled = false; button.textContent = original; }
     }
     if (button.dataset.action === 'refresh') await refresh();

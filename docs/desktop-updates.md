@@ -89,6 +89,9 @@ but it cannot check, download, install, restart, or access a pending Tauri
 
 Development builds use their separate application identifier and MUST keep
 production updater endpoints disabled.
+Their tray item and bundled controls identify updates as disabled; they MUST
+NOT describe the build as up to date or expose enabled automatic/manual check
+controls.
 
 ## 4. Authoritative update state
 
@@ -115,6 +118,9 @@ latest_release_url
 discovered_at
 
 native_notified_version
+native_surfaced_version
+native_notification_attempt_version
+native_notification_last_attempt_at
 ribbon_snoozed_until
 ribbon_dismissed_version
 reminder_version
@@ -138,6 +144,12 @@ normative:
 - Discovering a version newer than the previously known version resets ribbon
   snooze/dismissal state and makes that version eligible for one native
   notification.
+- A manual/freshness result, or discovery while the update dialog is already
+  visible, marks that version as surfaced without posting another native
+  notification.
+- A native-notification API failure leaves the version eligible for another
+  attempt after a four-hour, version-scoped cooldown. An accepted notification
+  or directly surfaced version is never retried automatically.
 - Discovering the same version again does not reset dismissal, schedule a new
   notification, or change `discovered_at`.
 - Persisted state is committed before tray updates or events are emitted.
@@ -351,6 +363,10 @@ A check failure shows the cached target, the last successful check time, an
 offline/service explanation, and Retry. Install remains disabled because the
 target is not fresh.
 
+When no cached target exists, the failure state is mutually exclusive with
+the up-to-date state. Only a successful authoritative response may say the
+installed version is up to date; never-checked state is reported separately.
+
 The dialog also has explicit states for downloading, preparing, waiting for
 work, stopping the Server, installing, restarting, installation failure, and
 post-update recovery. It never reuses a generic alert box as the primary
@@ -406,7 +422,11 @@ therefore needs an update-specific activation intent.
 
 `native_notified_version` is stored only after the notification API accepts
 the notification. Closing or ignoring it does not make that version eligible
-for another automatic notification.
+for another automatic notification. Failed notification creation is retried
+no sooner than four hours later; the cooldown is scoped to the target version
+so a newer release is immediately eligible. A manual/freshness result or an
+already-visible update dialog records the release as surfaced and suppresses
+future automatic notification for that release.
 
 ## 10. Tray behavior
 

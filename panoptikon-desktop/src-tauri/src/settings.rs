@@ -57,6 +57,15 @@ pub struct UpdateSettings {
     pub discovered_unix: Option<i64>,
     #[serde(default)]
     pub native_notified_version: Option<String>,
+    /// Version already surfaced either through an accepted native
+    /// notification or through an intentional foreground update flow.
+    #[serde(default)]
+    pub native_surfaced_version: Option<String>,
+    /// Target associated with the most recent native-notification attempt.
+    #[serde(default)]
+    pub native_notification_attempt_version: Option<String>,
+    #[serde(default)]
+    pub native_notification_last_attempt_unix: Option<i64>,
     #[serde(default)]
     pub ribbon_snoozed_until_unix: Option<i64>,
     #[serde(default)]
@@ -98,6 +107,9 @@ impl Default for UpdateSettings {
             latest_release_url: None,
             discovered_unix: None,
             native_notified_version: None,
+            native_surfaced_version: None,
+            native_notification_attempt_version: None,
+            native_notification_last_attempt_unix: None,
             ribbon_snoozed_until_unix: None,
             ribbon_dismissed_version: None,
             reminder_version: None,
@@ -225,6 +237,9 @@ const OPTIONAL_UPDATE_KEYS: &[&str] = &[
     "latest_release_url",
     "discovered_unix",
     "native_notified_version",
+    "native_surfaced_version",
+    "native_notification_attempt_version",
+    "native_notification_last_attempt_unix",
     "ribbon_snoozed_until_unix",
     "ribbon_dismissed_version",
     "reminder_version",
@@ -303,6 +318,9 @@ mod tests {
         document.typed.updates.last_checked_unix = Some(90);
         document.typed.updates.latest_version = Some("0.2.0".into());
         document.typed.updates.ribbon_dismissed_version = Some("0.2.0".into());
+        document.typed.updates.native_surfaced_version = Some("0.2.0".into());
+        document.typed.updates.native_notification_attempt_version = Some("0.2.0".into());
+        document.typed.updates.native_notification_last_attempt_unix = Some(100);
         document.typed.updates.automatic_attempts_unix = vec![80, 100];
         document.save().unwrap();
 
@@ -317,6 +335,14 @@ mod tests {
             Some("0.2.0")
         );
         assert_eq!(restored.typed.updates.automatic_attempts_unix, [80, 100]);
+        assert_eq!(
+            restored.typed.updates.native_surfaced_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            restored.typed.updates.native_notification_last_attempt_unix,
+            Some(100)
+        );
     }
 
     /// Clearing typed optional values removes their old TOML keys without
@@ -381,6 +407,9 @@ mod tests {
             latest_release_url: Some("https://example.invalid/release".into()),
             discovered_unix: Some(4),
             native_notified_version: Some("0.2.0".into()),
+            native_surfaced_version: Some("0.2.0".into()),
+            native_notification_attempt_version: Some("0.2.0".into()),
+            native_notification_last_attempt_unix: Some(4),
             ribbon_snoozed_until_unix: Some(5),
             ribbon_dismissed_version: Some("0.2.0".into()),
             reminder_version: Some("0.2.0".into()),

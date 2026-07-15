@@ -6,6 +6,7 @@ let downloaded = 0;
 let installing = false;
 
 const previewState = {
+  presentation_state: 'available',
   current_version: '0.1.4', available: true, target_version: '0.3.0',
   published_at: '2026-08-01', checking: false, fresh: true, can_install: true,
   check_automatically: true, ribbon_visible: true, updates_disabled: false,
@@ -19,6 +20,15 @@ const previewState = {
 function setHidden(id, hidden) { byId(id).hidden = hidden; }
 function text(id, value) { byId(id).textContent = value ?? ''; }
 function formatVersion(value) { return value ? `Version ${value}` : 'Unknown version'; }
+function formatPublishedAt(value) {
+  if (!value) return '';
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const date = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `Published ${new Intl.DateTimeFormat(undefined, { dateStyle: 'long' }).format(date)}`;
+}
 
 function renderInline(container, source) {
   const pattern = /(\[([^\]]+)\]\((https:\/\/[^)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*)/g;
@@ -68,12 +78,25 @@ function render(next) {
   }
   state = next;
   const available = Boolean(next.available && next.target_version);
-  text('title', available ? 'Update available' : (next.checking ? 'Checking for updates' : 'Panoptikon is up to date'));
-  text('versions', available
+  const presentation = next.presentation_state || (available ? 'available' : 'unchecked');
+  const surfaceAvailable = available && presentation !== 'disabled';
+  const titles = {
+    available: 'Panoptikon update available',
+    checking: 'Checking for updates',
+    failed: 'Unable to check for updates',
+    current: 'Panoptikon is up to date',
+    unchecked: 'Update status not checked',
+    disabled: 'Updates disabled',
+  };
+  text('title', titles[presentation] || titles.unchecked);
+  text('versions', surfaceAvailable
     ? `Installed ${next.current_version}  →  Available ${next.target_version}`
     : `Panoptikon Desktop ${next.current_version}`);
+  const published = surfaceAvailable ? formatPublishedAt(next.published_at) : '';
+  text('published', published);
+  setHidden('published', !published);
   setHidden('checking', !next.checking);
-  setHidden('active-work', !(available && workMayBeActive && !installing));
+  setHidden('active-work', !(surfaceAvailable && workMayBeActive && !installing));
   text('active-work-title', next.active_work_unknown ? 'Panoptikon activity could not be verified' : 'Panoptikon is processing files');
   text('active-work-description', next.active_work_unknown
     ? 'Desktop could not confirm whether Panoptikon is processing files. It will not stop Panoptikon unless a final safety check succeeds.'
@@ -81,13 +104,25 @@ function render(next) {
   text('confirm-active-work-label', next.active_work_unknown
     ? 'Retry the safety check before installing'
     : 'I understand and want to install now');
-  setHidden('notes', !available || installing);
-  setHidden('empty', available || next.checking || installing);
-  setHidden('error', !next.last_error || next.checking || installing);
-  text('error-text', next.last_error ? `${next.last_error}. Cached update information is still shown when available.` : '');
-  text('empty-description', next.updates_disabled
-    ? 'Update checks are disabled in development builds.'
-    : 'You already have the newest available version.');
+  setHidden('notes', !surfaceAvailable || installing);
+  const showEmpty = ['current', 'unchecked', 'disabled'].includes(presentation) && !installing;
+  setHidden('empty', !showEmpty);
+  const showError = (presentation === 'failed' || (surfaceAvailable && next.last_error)) && !next.checking && !installing;
+  setHidden('error', !showError);
+  const successfulCheck = next.last_success_unix
+    ? ` Last successful check: ${new Date(next.last_success_unix * 1000).toLocaleString()}.`
+    : '';
+  text('error-text', next.last_error
+    ? `${next.last_error}.${surfaceAvailable ? ' Cached update information is still shown.' : successfulCheck}`
+    : 'The update service could not be reached.');
+  const emptyCopy = {
+    current: ['Panoptikon is up to date', 'You already have the newest available version.'],
+    unchecked: ['Update status not checked', 'Check for updates to see whether a newer version is available.'],
+    disabled: ['Updates disabled', 'Update checks are disabled in development builds.'],
+  };
+  const [emptyTitle, emptyDescription] = emptyCopy[presentation] || emptyCopy.unchecked;
+  text('empty-title', emptyTitle);
+  text('empty-description', emptyDescription);
   const notes = byId('notes'); notes.replaceChildren();
   (next.releases || []).forEach((release, index) => {
     const section = document.createElement('section'); section.className = 'release';
@@ -97,8 +132,8 @@ function render(next) {
     if (index === 0) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = 'Latest'; heading.append(badge); }
     section.append(heading, renderMarkdown(release.notes_markdown)); notes.append(section);
   });
-  byId('install').disabled = !next.can_install || installing || (workMayBeActive && !byId('confirm-active-work').checked);
-  byId('reminder').disabled = !available || installing;
+  byId('install').disabled = !surfaceAvailable || !next.can_install || installing || (workMayBeActive && !byId('confirm-active-work').checked);
+  byId('reminder').disabled = !surfaceAvailable || installing;
   byId('later').disabled = installing;
 }
 
@@ -106,7 +141,7 @@ async function refresh({ checkIfStale = false } = {}) {
   if (!invoke) { render(previewState); return; }
   try {
     let next = await invoke('get_update_state'); render(next);
-    if (checkIfStale && next.available && (!next.fresh || !next.can_install) && !next.checking) {
+    if (checkIfStale && !next.updates_disabled && next.available && (!next.fresh || !next.can_install) && !next.checking) {
       next = await invoke('check_for_updates'); render(next);
     }
   } catch (error) {
@@ -115,7 +150,7 @@ async function refresh({ checkIfStale = false } = {}) {
 }
 
 byId('retry').addEventListener('click', async () => {
-  try { render({ ...state, checking: true }); render(await invoke('check_for_updates')); }
+  try { render({ ...state, checking: true, presentation_state: state?.available ? 'available' : 'checking' }); render(await invoke('check_for_updates')); }
   catch (error) { await refresh(); text('error-text', String(error)); setHidden('error', false); }
 });
 byId('confirm-active-work').addEventListener('change', () => render(state));

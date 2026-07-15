@@ -26,6 +26,7 @@ header { flex: 0 0 auto; min-height: 126px; padding: 24px 30px 20px; display: fl
 .eyebrow { margin: 0 0 3px; color: #d87859; font-size: 11px; font-weight: 700; letter-spacing: .18em; }
 h1 { margin: 0; font-size: clamp(23px, 4vw, 31px); line-height: 1.15; }
 .versions { margin: 7px 0 0; color: var(--muted); }
+.published { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
 .checking { margin-left: auto; white-space: nowrap; color: var(--muted); }
 .spinner { width: 15px; height: 15px; display: inline-block; margin-right: 6px; vertical-align: -2px; border: 2px solid #555; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 .content { min-height: 0; flex: 1 1 auto; overflow-y: auto; padding: 26px 30px 42px; scroll-behavior: smooth; }

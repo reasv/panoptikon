@@ -39,6 +39,10 @@ const DEV_SERVER_PORT: u16 = 16342;
 const SETUP_WINDOW_WIDTH: f64 = 1200.0;
 const SETUP_WINDOW_HEIGHT: f64 = 800.0;
 
+pub(crate) fn updates_disabled(app: &AppHandle) -> bool {
+    cfg!(debug_assertions) || app.config().identifier == DEV_IDENTIFIER
+}
+
 struct RuntimeState {
     relay_handle: Mutex<Option<RelayHandle>>,
     tray: Mutex<Option<TrayUi>>,
@@ -282,6 +286,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         )
     });
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    let updates_disabled = updates_disabled(app);
     let local = CheckMenuItem::with_id(
         app,
         "local",
@@ -301,8 +306,8 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
     let updates = MenuItem::with_id(
         app,
         "updates",
-        update_menu_label(update_target.as_deref()),
-        true,
+        update_menu_label(update_target.as_deref(), updates_disabled),
+        !updates_disabled,
         None::<&str>,
     )?;
     let menu = MenuBuilder::new(app)
@@ -423,11 +428,18 @@ pub(crate) async fn update_update_tray(app: &AppHandle) {
             .clone()
     };
     if let Some(tray) = app.state::<RuntimeState>().tray.lock().await.as_ref() {
-        let _ = tray.updates.set_text(update_menu_label(target.as_deref()));
+        let disabled = updates_disabled(app);
+        let _ = tray
+            .updates
+            .set_text(update_menu_label(target.as_deref(), disabled));
+        let _ = tray.updates.set_enabled(!disabled);
     }
 }
 
-fn update_menu_label(target: Option<&str>) -> String {
+fn update_menu_label(target: Option<&str>, updates_disabled: bool) -> String {
+    if updates_disabled {
+        return "Updates disabled (development build)".into();
+    }
     target
         .map(|version| format!("Update to {version}…"))
         .unwrap_or_else(|| "Check for Updates…".into())
@@ -1744,8 +1756,12 @@ mod tests {
 
     #[test]
     fn update_tray_label_reflects_persisted_availability() {
-        assert_eq!(update_menu_label(None), "Check for Updates…");
-        assert_eq!(update_menu_label(Some("0.3.0")), "Update to 0.3.0…");
+        assert_eq!(update_menu_label(None, false), "Check for Updates…");
+        assert_eq!(update_menu_label(Some("0.3.0"), false), "Update to 0.3.0…");
+        assert_eq!(
+            update_menu_label(Some("0.3.0"), true),
+            "Updates disabled (development build)"
+        );
     }
 
     #[test]
@@ -1763,5 +1779,19 @@ mod tests {
             update_js
                 .contains("next.available && (!next.fresh || !next.can_install) && !next.checking")
         );
+    }
+
+    #[test]
+    fn update_frontends_use_authoritative_presentation_state() {
+        let control_js = include_str!("../../dist/app.js");
+        assert!(control_js.contains("messages[update.presentation_state]"));
+        assert!(control_js.contains("update.presentation_state === 'current'"));
+        assert!(control_js.contains("byId('check-updates').disabled = update.updates_disabled"));
+
+        let update_js = include_str!("../../dist/update.js");
+        assert!(update_js.contains("const presentation = next.presentation_state"));
+        assert!(update_js.contains("presentation === 'failed'"));
+        assert!(update_js.contains("formatPublishedAt(next.published_at)"));
+        assert!(include_str!("../../dist/update.html").contains("id=\"published\""));
     }
 }
