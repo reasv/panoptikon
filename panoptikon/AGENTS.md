@@ -67,7 +67,9 @@ Behavior (important)
 - File actions and Relay: `[open]` supports direct `file_program`/
   `folder_program` plus argument arrays, while the older `*_command` shell
   templates remain supported. The Desktop control edits this configuration
-  for its managed server. Policy client key `relay_enabled` defaults true;
+  for its managed server. Desktop's loopback Relay service is enabled by
+  default; an explicit `enabled = false` in its Relay settings remains an
+  opt-out. Policy client key `relay_enabled` defaults true;
   false means the UI must not load or run Relay discovery at all. Pairing
   credentials and bounded operations live in
   `<data_folder>/relay-pairings.json` (owner-only mode on Unix), keyed by

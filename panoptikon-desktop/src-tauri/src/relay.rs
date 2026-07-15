@@ -37,7 +37,7 @@ const ACTION_TTL_SECS: i64 = 10 * 60;
 pub struct RelayConfig {
     #[serde(default = "Uuid::new_v4")]
     pub relay_id: Uuid,
-    #[serde(default)]
+    #[serde(default = "relay_enabled_by_default")]
     pub enabled: bool,
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -55,7 +55,7 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             relay_id: Uuid::new_v4(),
-            enabled: false,
+            enabled: relay_enabled_by_default(),
             bind: default_bind(),
             instances: Vec::new(),
             commands: FileActionCommands::default(),
@@ -63,6 +63,10 @@ impl Default for RelayConfig {
             actions: Vec::new(),
         }
     }
+}
+
+fn relay_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1684,6 +1688,23 @@ mod tests {
                 .to_string(),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn relay_is_enabled_by_default() {
+        assert!(RelayConfig::default().enabled);
+        assert!(RelayConfig::desktop_default(false).enabled);
+        assert!(RelayConfig::desktop_default(true).enabled);
+    }
+
+    #[test]
+    fn missing_enabled_key_defaults_on_but_explicit_false_is_preserved() {
+        let missing: RelayConfig = toml::from_str("bind = '127.0.0.1:17600'").unwrap();
+        assert!(missing.enabled);
+
+        let disabled: RelayConfig =
+            toml::from_str("enabled = false\nbind = '127.0.0.1:17600'").unwrap();
+        assert!(!disabled.enabled);
     }
 
     /// Mapping is component-aware and the longest valid prefix wins.

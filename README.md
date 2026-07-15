@@ -97,9 +97,9 @@ Although large parts of the API are disabled in the public instance, you can sti
 
 ## Relay for remote Panoptikon instances
 
-Relay is built into Panoptikon Desktop. It lets a remote or containerized
-Panoptikon ask your computer to open a locally mounted copy of an indexed file.
-Enable Relay in Desktop, start pairing from the remote web UI, approve the
+Relay is built into Panoptikon Desktop and enabled by default. It lets a remote
+or containerized Panoptikon ask your computer to open a locally mounted copy of
+an indexed file. Start pairing from the remote web UI, approve the
 origin-bound request locally, then configure component-aware path mappings.
 Credentials are generated once, stored only as salted hashes by Desktop, and
 can be revoked at any time. Relay listens on loopback only and does not execute
