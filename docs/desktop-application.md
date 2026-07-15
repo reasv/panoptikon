@@ -742,6 +742,11 @@ Desktop's Relay-only mode after the replacement ships.
 
 ## 13. Logging and diagnostics
 
+Desktop-managed inference external inputs are specified in
+`docs/inferio-external-inputs.md`. Desktop owns the local Server root `.env`,
+offers the conditional onboarding step and later management page, and never
+returns configured secret values from status endpoints.
+
 Desktop MUST initialize rotating file logging before launching the sidecar.
 Diagnostics combine:
 

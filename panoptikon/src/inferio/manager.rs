@@ -1019,7 +1019,12 @@ impl ModelManager {
             (spec, registry_default_batch(&snapshot, inference_id))
         };
         let replica_count = spec.device_pins.len();
-        let claim_replica = spec.device_pins.iter().position(Option::is_none);
+        // A prewarmed process was spawned before this model's just-in-time
+        // external inputs were resolved. Models with explicit worker env
+        // must therefore use a fresh process.
+        let claim_replica = (spec.env.is_empty() && spec.env_remove.is_empty())
+            .then(|| spec.device_pins.iter().position(Option::is_none))
+            .flatten();
         let mut claimed = match claim_replica {
             Some(_) => self.prewarm.claim(&spec.impl_class).await,
             // Every replica is device-pinned; a pooled worker (spawned
@@ -1424,6 +1429,7 @@ config.impl_class = "cls"
             impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
             pythonpath: vec![root.join("python")],
             env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
+            env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
         }
@@ -1432,6 +1438,13 @@ config.impl_class = "cls"
     /// Synthetic registry covering every fixture impl, so the manager path
     /// exercises RegistryCache -> spawn_spec for real.
     const TEST_REGISTRY_TOML: &str = r#"
+[external_inputs.manager_test_value]
+label = "Manager test value"
+required = true
+[external_inputs.manager_test_value.source]
+type = "environment"
+variable = "INFERIO_MANAGER_EXTERNAL_INPUT_XYZ"
+
 [group.echo]
 config.impl_class = "echo_test"
 [group.echo.inference_ids.test]
@@ -1460,6 +1473,10 @@ config.impl_class = "dying_test"
 [group.nan]
 config.impl_class = "nan_test"
 [group.nan.inference_ids.test]
+
+[group.externalenv]
+config.impl_class = "external_env_test"
+[group.externalenv.inference_ids.test.external_inputs.manager_test_value]
 
 [group.missing]
 config.impl_class = "does_not_exist"
@@ -1591,6 +1608,40 @@ config.replicas = 2
             "same worker: no respawn between predicts"
         );
 
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn declared_external_input_is_resolved_and_passed_at_worker_spawn() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+        assert!(
+            manager
+                .load_model("externalenv/test", "key", 10, 60, None)
+                .await
+                .is_err(),
+            "missing required input prevents worker creation"
+        );
+
+        unsafe { std::env::set_var("INFERIO_MANAGER_EXTERNAL_INPUT_XYZ", "latest-value") };
+        let output = manager
+            .predict(
+                "externalenv/test",
+                "key",
+                10,
+                60,
+                None,
+                None,
+                vec![data_input(json!(null))],
+            )
+            .await;
+        unsafe { std::env::remove_var("INFERIO_MANAGER_EXTERNAL_INPUT_XYZ") };
+        assert_eq!(
+            output.expect("worker receives current input"),
+            vec![WorkerOutput::Json(
+                json!({"external_input": "latest-value"})
+            )]
+        );
         manager.shutdown().await;
     }
 

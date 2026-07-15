@@ -122,6 +122,7 @@ async fn async_main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
     }
     desktop::set_managed(args.desktop_managed);
+    env_template::capture_inherited_environment();
     // `.env` still auto-loads: it is how users populate the env vars that
     // config templating (`${VAR}` in TOML values) references, and children
     // (inference workers, the UI server) inherit it.
@@ -357,6 +358,14 @@ async fn async_main() -> anyhow::Result<()> {
                 .route(
                     "/api/desktop/setup/complete",
                     post(api::desktop::complete_setup),
+                )
+                .route(
+                    "/api/desktop/external-inputs",
+                    get(api::desktop::external_inputs).put(api::desktop::update_external_inputs),
+                )
+                .route(
+                    "/api/desktop/external-inputs/{variable}",
+                    get(api::desktop::reveal_external_input),
                 );
         }
         let _ = jobs::continuous_scan::ensure_continuous_supervisor().await;

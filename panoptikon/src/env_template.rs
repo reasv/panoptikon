@@ -31,7 +31,62 @@
 //! round-tripped through a number).
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::{collections::HashMap, path::Path, sync::OnceLock};
+
+static INHERITED_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Capture the launch environment before `.env` is loaded into the process.
+/// The just-in-time Inferio resolver needs this distinction so removing a
+/// Desktop-managed value cannot fall back to a stale startup copy.
+pub fn capture_inherited_environment() {
+    let _ = INHERITED_ENVIRONMENT.set(std::env::vars().collect());
+}
+
+/// A just-in-time environment snapshot used for inference worker creation.
+#[derive(Debug, Clone)]
+pub struct EnvironmentSnapshot {
+    values: HashMap<String, String>,
+}
+
+impl EnvironmentSnapshot {
+    /// Read the root `.env` now. Ordinary server mode lets the inherited
+    /// launch environment win; Desktop-managed mode treats its managed file
+    /// as the explicit configuration surface and lets the file win.
+    pub fn current(desktop_managed: bool) -> Result<Self> {
+        let inherited = INHERITED_ENVIRONMENT
+            .get()
+            .cloned()
+            .unwrap_or_else(|| std::env::vars().collect());
+        let mut dotenv = HashMap::new();
+        let path = Path::new(".env");
+        if path.is_file() {
+            for item in dotenvy::from_path_iter(path)
+                .with_context(|| format!("failed to read {}", path.display()))?
+            {
+                let (key, value) =
+                    item.with_context(|| format!("failed to parse {}", path.display()))?;
+                dotenv.insert(key, value);
+            }
+        }
+        let mut values;
+        if desktop_managed {
+            values = inherited;
+            values.extend(dotenv);
+        } else {
+            values = dotenv;
+            values.extend(inherited);
+        }
+        Ok(Self { values })
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    pub fn substitute_json_value(&self, value: &mut serde_json::Value) -> Result<()> {
+        walk_json(value, &|name| Ok(self.values.get(name).cloned()))
+    }
+}
 
 /// Recursively substitute every string value in `value` (arrays and nested
 /// tables included). Errors name `source` (the file the value came from) and
@@ -67,6 +122,13 @@ fn walk(value: &mut toml::Value) -> Result<()> {
 /// Substitute placeholders in one string. Exposed for tests; config code goes
 /// through [`substitute_toml_value`].
 pub fn substitute_str(input: &str) -> Result<String> {
+    substitute_str_with(input, &lookup)
+}
+
+fn substitute_str_with(
+    input: &str,
+    lookup: &impl Fn(&str) -> Result<Option<String>>,
+) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(pos) = rest.find('$') {
@@ -135,6 +197,31 @@ pub fn substitute_str(input: &str) -> Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+fn walk_json(
+    value: &mut serde_json::Value,
+    lookup: &impl Fn(&str) -> Result<Option<String>>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains('$') {
+                *text = substitute_str_with(text, lookup)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_json(item, lookup)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                walk_json(item, lookup)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Length of the leading `[A-Za-z_][A-Za-z0-9_]*` run in `s`.

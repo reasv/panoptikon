@@ -114,6 +114,8 @@ pub struct WorkerSpawnConfig {
     pub pythonpath: Vec<PathBuf>,
     /// Extra environment applied last (wins over the computed entries).
     pub env: Vec<(String, String)>,
+    /// Variables explicitly removed after inheritance.
+    pub env_remove: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub deadlines: WorkerDeadlines,
 }
@@ -255,6 +257,9 @@ impl Worker {
         for (key, value) in &cfg.env {
             command.env(key, value);
         }
+        for key in &cfg.env_remove {
+            command.env_remove(key);
+        }
         if let Some(cwd) = &cfg.cwd {
             command.current_dir(cwd);
         }
@@ -349,7 +354,10 @@ impl Worker {
         spec: &SpawnSpec,
         device: Option<String>,
     ) -> Result<Worker> {
-        let mut worker = Self::spawn(cfg, &spec.impl_class, device)
+        let mut spawn_cfg = cfg.clone();
+        spawn_cfg.env.extend(spec.env.clone());
+        spawn_cfg.env_remove.extend(spec.env_remove.clone());
+        let mut worker = Self::spawn(&spawn_cfg, &spec.impl_class, device)
             .await
             .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
         if let Err(err) = worker.configure(inference_id, &spec.config_kwargs).await {
@@ -1000,6 +1008,7 @@ mod tests {
             impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
             pythonpath: vec![root.join("python")],
             env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
+            env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
         }
@@ -1010,6 +1019,8 @@ mod tests {
             impl_class: impl_class.to_owned(),
             config_kwargs: json!({}),
             device_pins: vec![None],
+            env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 

@@ -4,6 +4,7 @@ use axum::{Json, http::StatusCode};
 // FastAPI's List[str] query parameter behavior.
 use axum_extra::extract::Query;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
@@ -16,6 +17,7 @@ use crate::db::{DbConnection, ReadOnly};
 use crate::jobs::continuous_scan;
 use crate::jobs::cron::{self, CronRunOutcome};
 use crate::jobs::files::is_resync_needed;
+use crate::jobs::inference_pool::job_inference_context;
 use crate::jobs::queue::{
     JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs, cancel_running_job,
     enqueue_job, get_queue_status,
@@ -121,6 +123,7 @@ pub(crate) async fn enqueue_data_extraction(
     // the job will actually run with.
     let store = SystemConfigStore::from_env();
     let config = store.load(&conn.index_db)?;
+    validate_external_inputs(&query.inference_ids).await?;
     let mut jobs = Vec::new();
     for inference_id in query.inference_ids {
         let model = crate::jobs::extraction::load_model_metadata(&inference_id).await?;
@@ -397,6 +400,14 @@ pub(crate) async fn update_config(
             config.cron_schedule
         )));
     }
+    validate_external_inputs(
+        &config
+            .cron_jobs
+            .iter()
+            .map(|job| job.inference_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
     let config = store.load(&conn.index_db)?;
@@ -417,6 +428,44 @@ pub(crate) async fn update_config(
         .await?;
     }
     Ok(Json(config))
+}
+
+/// Validate declarations when the upstream supports the additive endpoint.
+/// Older remote Python Inferio servers do not have it, so discovery failure
+/// preserves their previous behavior; load-time Inferio validation remains
+/// authoritative for current servers.
+async fn validate_external_inputs(inference_ids: &[String]) -> Result<(), ApiError> {
+    let Ok(status) = job_inference_context().primary.get_external_inputs().await else {
+        return Ok(());
+    };
+    for inference_id in inference_ids {
+        let Some(usages) = status
+            .get("models")
+            .and_then(|models| models.get(inference_id))
+            .and_then(JsonValue::as_array)
+        else {
+            continue;
+        };
+        for usage in usages {
+            if usage.get("required").and_then(JsonValue::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(id) = usage.get("id").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let definition = &status["definitions"][id];
+            if definition.get("configured").and_then(JsonValue::as_bool) != Some(true) {
+                let label = definition
+                    .get("label")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(id);
+                return Err(ApiError::bad_request(format!(
+                    "Model {inference_id} requires additional configuration: {label}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[utoipa::path(

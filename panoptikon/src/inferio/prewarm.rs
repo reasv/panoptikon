@@ -549,6 +549,7 @@ mod tests {
             impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
             pythonpath: vec![root.join("python")],
             env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
+            env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
         }

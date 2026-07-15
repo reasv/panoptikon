@@ -113,6 +113,22 @@ pub struct InferenceIdEntry {
     /// [`Registry::spawn_spec`] for the kwargs actually passed to workers.
     pub config: JsonMap<String, JsonValue>,
     pub metadata: JsonMap<String, JsonValue>,
+    pub external_inputs: IndexMap<String, ExternalInputReference>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalInputDefinition {
+    pub label: String,
+    pub description: String,
+    pub secret: bool,
+    pub required: bool,
+    pub variable: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExternalInputReference {
+    pub required: Option<bool>,
+    pub description: Option<String>,
 }
 
 /// A model group: accumulated group-level config/metadata plus its ids.
@@ -120,12 +136,14 @@ pub struct InferenceIdEntry {
 pub struct GroupEntry {
     pub group_config: JsonMap<String, JsonValue>,
     pub group_metadata: JsonMap<String, JsonValue>,
+    pub group_external_inputs: IndexMap<String, ExternalInputReference>,
     pub inference_ids: IndexMap<String, InferenceIdEntry>,
 }
 
 /// Immutable loaded snapshot of the whole registry.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
+    pub external_inputs: IndexMap<String, ExternalInputDefinition>,
     pub groups: IndexMap<String, GroupEntry>,
 }
 
@@ -142,17 +160,39 @@ pub struct SpawnSpec {
     /// replica to spawn, `None` = no pin (inherit the parent env). Always
     /// non-empty; `vec![None]` is the single-replica default.
     pub device_pins: Vec<Option<String>>,
+    /// Declared environment-backed external inputs, resolved immediately
+    /// before this worker is spawned and applied explicitly to the child.
+    pub env: Vec<(String, String)>,
+    /// Declared variables absent from the just-in-time snapshot. Workers
+    /// inherit the gateway process by default, so these must be removed to
+    /// avoid a stale value loaded from `.env` at gateway startup.
+    pub env_remove: Vec<String>,
 }
 
 impl Registry {
     /// Load a fresh snapshot from the configured directories, in order.
     /// Any file error fails the whole load (Python re-raises, config.py:79).
     pub fn load(config: &RegistryConfig) -> Result<Self> {
+        let mut external_inputs = IndexMap::new();
         let mut groups: IndexMap<String, GroupEntry> = IndexMap::new();
         for dir in &config.config_dirs {
-            load_folder(dir, &mut groups)?;
+            load_folder(dir, &mut external_inputs, &mut groups)?;
         }
-        Ok(Self { groups })
+        for (group_name, group) in &groups {
+            for (inference_id, entry) in &group.inference_ids {
+                for input_id in entry.external_inputs.keys() {
+                    if !external_inputs.contains_key(input_id) {
+                        bail!(
+                            "inference id '{group_name}/{inference_id}' references unknown external input '{input_id}'"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            external_inputs,
+            groups,
+        })
     }
 
     /// Build the `/metadata` response body, matching Python's
@@ -218,7 +258,38 @@ impl Registry {
             format!("Inference ID '{inference_id}' not found in group '{group_name}'")
         })?;
 
-        let mut kwargs = entry.config.clone();
+        let snapshot =
+            crate::env_template::EnvironmentSnapshot::current(crate::desktop::is_managed())?;
+        let mut env = Vec::new();
+        let mut env_remove = Vec::new();
+        for (input_id, reference) in &entry.external_inputs {
+            let definition = self
+                .external_inputs
+                .get(input_id)
+                .with_context(|| format!("external input definition '{input_id}' not found"))?;
+            let value = snapshot.get(&definition.variable);
+            let required = reference.required.unwrap_or(definition.required);
+            if required && value.is_none_or(str::is_empty) {
+                bail!(
+                    "inference id '{full_inference_id}' requires {} (environment variable {})",
+                    definition.label,
+                    definition.variable
+                );
+            }
+            if let Some(value) = value {
+                env.push((definition.variable.clone(), value.to_owned()));
+            } else {
+                env_remove.push(definition.variable.clone());
+            }
+        }
+
+        let mut kwargs = JsonValue::Object(entry.config.clone());
+        snapshot
+            .substitute_json_value(&mut kwargs)
+            .with_context(|| {
+                format!("failed to resolve config for inference id '{full_inference_id}'")
+            })?;
+        let mut kwargs = kwargs.as_object().cloned().unwrap_or_default();
         let impl_class = kwargs.remove("impl_class");
         // ray_config rode along in the merged config for the dropped Ray
         // mode; Python strips it before instantiation (process_model.py:211)
@@ -245,7 +316,48 @@ impl Registry {
             impl_class,
             config_kwargs: JsonValue::Object(kwargs),
             device_pins,
+            env,
+            env_remove,
         })
+    }
+
+    /// Client-facing declarations and presence. Values are never returned.
+    pub fn external_inputs_json(&self) -> Result<JsonValue> {
+        let snapshot =
+            crate::env_template::EnvironmentSnapshot::current(crate::desktop::is_managed())?;
+        let mut definitions = JsonMap::new();
+        for (id, definition) in &self.external_inputs {
+            definitions.insert(id.clone(), serde_json::json!({
+                "label": definition.label,
+                "description": definition.description,
+                "secret": definition.secret,
+                "required": definition.required,
+                "source": {"type": "environment", "variable": definition.variable},
+                "configured": snapshot.get(&definition.variable).is_some_and(|value| !value.is_empty()),
+            }));
+        }
+        let mut models = JsonMap::new();
+        for (group_name, group) in &self.groups {
+            for (inference_id, entry) in &group.inference_ids {
+                let usages = entry
+                    .external_inputs
+                    .iter()
+                    .map(|(id, reference)| {
+                        let definition = &self.external_inputs[id];
+                        serde_json::json!({
+                            "id": id,
+                            "required": reference.required.unwrap_or(definition.required),
+                            "description": reference.description,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                models.insert(
+                    format!("{group_name}/{inference_id}"),
+                    JsonValue::Array(usages),
+                );
+            }
+        }
+        Ok(serde_json::json!({"definitions": definitions, "models": models}))
     }
 }
 
@@ -407,7 +519,11 @@ fn latest_config_mtime(dirs: &[PathBuf]) -> Result<Option<SystemTime>> {
 /// Load every TOML file in `folder` into `groups`, mirroring
 /// `load_config_folder` (config.py:24-80). A missing folder logs a warning
 /// and is skipped; any file error aborts the whole load.
-fn load_folder(folder: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<()> {
+fn load_folder(
+    folder: &Path,
+    external_inputs: &mut IndexMap<String, ExternalInputDefinition>,
+    groups: &mut IndexMap<String, GroupEntry>,
+) -> Result<()> {
     if !folder.is_dir() {
         tracing::warn!(
             folder = %folder.display(),
@@ -416,27 +532,42 @@ fn load_folder(folder: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Resu
         return Ok(());
     }
     for file in toml_files(folder)? {
-        load_file(&file, groups)
+        load_file(&file, external_inputs, groups)
             .with_context(|| format!("Error loading TOML file {}", file.display()))?;
     }
     Ok(())
 }
 
-fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<()> {
+fn load_file(
+    file: &Path,
+    external_inputs: &mut IndexMap<String, ExternalInputDefinition>,
+    groups: &mut IndexMap<String, GroupEntry>,
+) -> Result<()> {
     let text = fs::read_to_string(file).context("failed to read file")?;
-    let mut doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
-    // Env templating (`${VAR}` / `${VAR:-default}` in string values): this is
-    // how secrets and URLs reach inference impls — a registry file can set
-    // `config.api_key = "${SOME_API_KEY}"` and the substituted value flows
-    // into the impl constructor kwargs. Applied on every (re)load, so the
-    // mtime-gated reload path re-substitutes too. A substitution error fails
-    // the whole load like any other file error.
-    crate::env_template::substitute_toml_value(&mut doc, file)?;
+    let doc: toml::Value = toml::from_str(&text).context("failed to parse TOML")?;
 
     // Python evaluates the flag's *truthiness* (`data.get("allow_override",
     // False)` used in a boolean context, config.py:39,59), so non-bool
     // values follow Python truthiness rules.
     let allow_inference_id_overrides = toml_truthy(doc.get("allow_override"));
+
+    if let Some(definitions) = doc.get("external_inputs") {
+        let definitions = definitions
+            .as_table()
+            .context("'external_inputs' must be a table")?;
+        for (id, value) in definitions {
+            if external_inputs.contains_key(id) && !allow_inference_id_overrides {
+                bail!(
+                    "Duplicate external input '{id}' found in {}",
+                    file.display()
+                );
+            }
+            let table = value
+                .as_table()
+                .with_context(|| format!("external input '{id}' must be a table"))?;
+            external_inputs.insert(id.clone(), parse_external_input_definition(id, table)?);
+        }
+    }
 
     let Some(groups_value) = doc.get("group") else {
         // No [group.*] tables: nothing to merge (data.get("group", {})).
@@ -465,6 +596,14 @@ fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<(
                 .as_table()
                 .with_context(|| format!("group '{group_name}' metadata must be a table"))?;
             merge_table_into(&mut entry.group_metadata, table);
+        }
+        if let Some(inputs) = group_data.get("external_inputs") {
+            for (id, reference) in parse_external_input_references(
+                inputs,
+                &format!("group '{group_name}' external_inputs"),
+            )? {
+                entry.group_external_inputs.insert(id, reference);
+            }
         }
 
         let Some(ids_value) = group_data.get("inference_ids") else {
@@ -499,16 +638,21 @@ fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<(
                 })?;
                 merge_table_into(&mut merged_config, table);
             }
-            // Validate the WorkerSet shape now so a bad replicas/devices
-            // combination is a *registry load* error naming the id, not a
-            // spawn-time surprise (design §8; explicit beats silent). The
-            // merged config is what spawn_spec will resolve, so validating
-            // it here covers group-level inheritance too.
-            resolve_device_pins(&merged_config).with_context(|| {
-                format!(
-                    "invalid replicas/devices config for inference id '{group_name}/{inference_id}'"
-                )
-            })?;
+            // Validate static WorkerSet directives now. Templated directives
+            // are intentionally deferred until spawn_spec resolves the
+            // current environment.
+            if !merged_config
+                .get("replicas")
+                .into_iter()
+                .chain(merged_config.get("devices"))
+                .any(json_contains_template)
+            {
+                resolve_device_pins(&merged_config).with_context(|| {
+                    format!(
+                        "invalid replicas/devices config for inference id '{group_name}/{inference_id}'"
+                    )
+                })?;
+            }
             let metadata = match inf_data.get("metadata") {
                 Some(metadata) => {
                     let table = metadata.as_table().with_context(|| {
@@ -520,6 +664,15 @@ fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<(
                 }
                 None => JsonMap::new(),
             };
+            let mut model_external_inputs = entry.group_external_inputs.clone();
+            if let Some(inputs) = inf_data.get("external_inputs") {
+                for (id, reference) in parse_external_input_references(
+                    inputs,
+                    &format!("inference id '{group_name}/{inference_id}' external_inputs"),
+                )? {
+                    model_external_inputs.insert(id, reference);
+                }
+            }
             // Redefinition (when allowed) fully replaces the entry
             // (config.py:71-76): config re-merged, metadata replaced.
             entry.inference_ids.insert(
@@ -527,11 +680,117 @@ fn load_file(file: &Path, groups: &mut IndexMap<String, GroupEntry>) -> Result<(
                 InferenceIdEntry {
                     config: merged_config,
                     metadata,
+                    external_inputs: model_external_inputs,
                 },
             );
         }
     }
     Ok(())
+}
+
+fn parse_external_input_definition(
+    id: &str,
+    table: &toml::Table,
+) -> Result<ExternalInputDefinition> {
+    let label = table
+        .get("label")
+        .and_then(toml::Value::as_str)
+        .with_context(|| format!("external input '{id}' requires string 'label'"))?
+        .to_owned();
+    let description = table
+        .get("description")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let secret = table
+        .get("secret")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let required = table
+        .get("required")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let source = table
+        .get("source")
+        .and_then(toml::Value::as_table)
+        .with_context(|| format!("external input '{id}' requires a 'source' table"))?;
+    let source_type = source
+        .get("type")
+        .and_then(toml::Value::as_str)
+        .with_context(|| format!("external input '{id}' source requires string 'type'"))?;
+    if source_type != "environment" {
+        bail!("external input '{id}' has unsupported source type '{source_type}'");
+    }
+    let variable = source
+        .get("variable")
+        .and_then(toml::Value::as_str)
+        .filter(|value| is_valid_env_name(value))
+        .with_context(|| {
+            format!("external input '{id}' source requires a valid environment 'variable'")
+        })?
+        .to_owned();
+    Ok(ExternalInputDefinition {
+        label,
+        description,
+        secret,
+        required,
+        variable,
+    })
+}
+
+fn parse_external_input_references(
+    value: &toml::Value,
+    context: &str,
+) -> Result<IndexMap<String, ExternalInputReference>> {
+    let table = value
+        .as_table()
+        .with_context(|| format!("{context} must be a table"))?;
+    let mut references = IndexMap::new();
+    for (id, value) in table {
+        let table = value
+            .as_table()
+            .with_context(|| format!("{context}.{id} must be a table"))?;
+        let required = match table.get("required") {
+            Some(value) => Some(
+                value
+                    .as_bool()
+                    .with_context(|| format!("{context}.{id}.required must be a boolean"))?,
+            ),
+            None => None,
+        };
+        let description = match table.get("description") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .with_context(|| format!("{context}.{id}.description must be a string"))?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        references.insert(
+            id.clone(),
+            ExternalInputReference {
+                required,
+                description,
+            },
+        );
+    }
+    Ok(references)
+}
+
+fn is_valid_env_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn json_contains_template(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::String(value) => value.contains("${"),
+        JsonValue::Array(values) => values.iter().any(json_contains_template),
+        JsonValue::Object(values) => values.values().any(json_contains_template),
+        _ => false,
+    }
 }
 
 /// Shallow merge of a TOML table into a JSON map (`dict.update` semantics:
@@ -638,6 +897,17 @@ mod tests {
             spec.device_pins,
             vec![None],
             "no replicas/devices in the shipped registry -> single unpinned replica"
+        );
+        assert!(registry.external_inputs.contains_key("jina_api_key"));
+        assert!(
+            registry.groups["clip"].inference_ids["jina-clip-v2-api"]
+                .external_inputs
+                .contains_key("jina_api_key")
+        );
+        assert!(
+            registry.groups["tagmatch"].inference_ids["danbooru-saucenao"]
+                .external_inputs
+                .contains_key("saucenao_api_key")
         );
     }
 
@@ -1255,10 +1525,8 @@ config.impl_class = "cls"
     }
 
     /// Env templating applies to registry files: `${VAR}` in `config.*`
-    /// values reaches the merged config and the spawn kwargs (the mechanism
-    /// for feeding secrets/URLs to impl constructors), `${VAR:-default}`
-    /// falls back when unset, and an unset `${VAR}` without a default fails
-    /// the whole load naming the file and the variable.
+    /// values is resolved just in time by spawn_spec. Registry loading never
+    /// depends on the environment.
     #[test]
     fn registry_values_are_env_templated() {
         let dir = tempfile::tempdir().unwrap();
@@ -1275,18 +1543,14 @@ config.endpoint = "${REGISTRY_TEST_ENDPOINT:-https://default.example}"
 "#,
         );
 
-        // Unset required var: the load fails, naming file and variable.
-        let err = registry_for(&[dir.path()]).expect_err("unset ${VAR} fails the load");
-        let text = format!("{err:#}");
-        assert!(text.contains("REGISTRY_TEST_KEY"), "{text}");
-        assert!(text.contains("a.toml"), "{text}");
-
+        let registry = registry_for(&[dir.path()]).expect("load is environment independent");
+        assert!(
+            registry.spawn_spec("g/x").is_err(),
+            "unset bare template fails at spawn"
+        );
         unsafe { std::env::set_var("REGISTRY_TEST_KEY", "sekrit") };
-        let registry = registry_for(&[dir.path()]);
-        unsafe { std::env::remove_var("REGISTRY_TEST_KEY") };
-        let registry = registry.expect("loads once the variable is set");
-
         let spec = registry.spawn_spec("g/x").expect("resolves");
+        unsafe { std::env::remove_var("REGISTRY_TEST_KEY") };
         assert_eq!(
             spec.config_kwargs,
             json!({"api_key": "sekrit", "endpoint": "https://default.example"}),
@@ -1294,12 +1558,62 @@ config.endpoint = "${REGISTRY_TEST_ENDPOINT:-https://default.example}"
         );
     }
 
-    /// The mtime-gated reload re-substitutes: after the env value changes,
-    /// a reload (triggered by an mtime bump) reflects the new value.
+    #[test]
+    fn external_input_definition_is_reused_with_per_model_requiredness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "a.toml",
+            r#"
+[external_inputs.provider_key]
+label = "Provider API key"
+description = "Shared credential"
+secret = true
+required = true
+[external_inputs.provider_key.source]
+type = "environment"
+variable = "REGISTRY_SHARED_PROVIDER_KEY_XYZ"
+
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.paid.external_inputs.provider_key]
+[group.g.inference_ids.free.external_inputs.provider_key]
+required = false
+description = "Optional for the free model"
+"#,
+        );
+        let registry = registry_for(&[dir.path()]).expect("fixture loads");
+        let status = registry.external_inputs_json().unwrap();
+        assert_eq!(status["models"]["g/paid"][0]["required"], json!(true));
+        assert_eq!(status["models"]["g/free"][0]["required"], json!(false));
+        assert_eq!(
+            status["models"]["g/free"][0]["description"],
+            json!("Optional for the free model")
+        );
+        assert!(registry.spawn_spec("g/paid").is_err());
+        assert!(registry.spawn_spec("g/free").is_ok());
+
+        unsafe { std::env::set_var("REGISTRY_SHARED_PROVIDER_KEY_XYZ", "secret-value") };
+        let spec = registry
+            .spawn_spec("g/paid")
+            .expect("current value resolves");
+        unsafe { std::env::remove_var("REGISTRY_SHARED_PROVIDER_KEY_XYZ") };
+        assert_eq!(
+            spec.env,
+            vec![(
+                "REGISTRY_SHARED_PROVIDER_KEY_XYZ".into(),
+                "secret-value".into()
+            )]
+        );
+        assert!(!status.to_string().contains("secret-value"));
+    }
+
+    /// A cached registry resolves templates against the latest environment
+    /// for each spawn without requiring a TOML mtime change.
     #[test]
     fn cache_reload_resubstitutes_env() {
         let dir = tempfile::tempdir().unwrap();
-        let file = write_file(
+        write_file(
             dir.path(),
             "a.toml",
             r#"
@@ -1320,15 +1634,13 @@ config.token = "${REGISTRY_RELOAD_TOKEN:-none}"
         );
 
         unsafe { std::env::set_var("REGISTRY_RELOAD_TOKEN", "fresh") };
-        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-        set_mtime(&file, mtime + Duration::from_secs(2));
-        let reloaded = cache.get();
+        let reloaded = cache.get().expect("cached registry succeeds");
+        let resolved = reloaded.spawn_spec("g/x").unwrap().config_kwargs;
         unsafe { std::env::remove_var("REGISTRY_RELOAD_TOKEN") };
-        let reloaded = reloaded.expect("reload succeeds");
         assert_eq!(
-            reloaded.spawn_spec("g/x").unwrap().config_kwargs,
+            resolved,
             json!({"token": "fresh"}),
-            "reload re-runs substitution with the current environment"
+            "spawn resolution uses the current environment"
         );
     }
 

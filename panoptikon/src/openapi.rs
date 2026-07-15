@@ -79,7 +79,10 @@ impl Modify for JsonValueSchema {
         crate::api::desktop::validate_setup_folders,
         crate::api::desktop::validate_setup_continuous_folders,
         crate::api::desktop::preview_setup_schedule,
-        crate::api::desktop::complete_setup
+        crate::api::desktop::complete_setup,
+        crate::api::desktop::external_inputs,
+        crate::api::desktop::update_external_inputs,
+        crate::api::desktop::reveal_external_input
     ),
     components(
         schemas(
@@ -154,6 +157,7 @@ impl Modify for JsonValueSchema {
             crate::api::desktop::DesktopSchedulePreviewResponse,
             crate::api::desktop::DesktopSetupCompleteRequest,
             crate::api::desktop::DesktopSetupCompleteResponse,
+            crate::api::desktop::DesktopExternalInputUpdate,
             crate::db::setup::FolderValidation,
             crate::db::setup::FolderValidationIssue,
             crate::pql::EmbeddingCacheEntry,
@@ -346,6 +350,7 @@ mod tests {
             "/api/inference/cache/{cache_key}",
             "/api/inference/cache",
             "/api/inference/metadata",
+            "/api/inference/external-inputs",
             "/api/inference/health",
         ] {
             assert!(

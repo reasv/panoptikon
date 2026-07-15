@@ -272,6 +272,17 @@ impl InferenceApiClient {
             .context("inference metadata request failed")?;
         parse_json_response(response).await
     }
+
+    pub async fn get_external_inputs(&self) -> Result<Value> {
+        let url = format!("{}/external-inputs", self.base_url);
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("inference external-input request failed")?;
+        parse_json_response(response).await
+    }
 }
 
 async fn file_to_part(idx: usize, file: &InferenceFile) -> Result<Part> {

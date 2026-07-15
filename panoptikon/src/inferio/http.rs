@@ -122,6 +122,7 @@ impl InferioState {
             impl_dirs: local.resolved_impl_dirs(),
             pythonpath: local.resolved_pythonpath(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             cwd: None,
             deadlines,
         };
@@ -160,6 +161,7 @@ pub fn router(state: Arc<InferioState>) -> Router {
         )
         .route("/cache", get(get_cached_models))
         .route("/metadata", get(get_metadata))
+        .route("/external-inputs", get(get_external_inputs))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
@@ -539,6 +541,33 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
     }
 }
 
+/// Declared model external inputs and presence. Values are never exposed.
+#[utoipa::path(
+    get,
+    operation_id = "get_external_inputs",
+    path = "/external-inputs",
+    tag = "inference",
+    summary = "Get model external-input requirements",
+    responses(
+        (status = 200, description = "Reusable definitions, model usages, and configured presence", body = JsonValue),
+        (status = 500, description = "Registry or environment resolution failed", body = crate::api_error::ErrorBody)
+    )
+)]
+async fn get_external_inputs(
+    State(state): State<Arc<InferioState>>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let snapshot = state.registry.lock().unwrap().get();
+    match snapshot.and_then(|registry| registry.external_inputs_json()) {
+        Ok(status) => Ok(Json(status)),
+        Err(err) => {
+            tracing::error!(error = %format!("{err:#}"), "failed to resolve external inputs");
+            Err(ApiError::internal(
+                "Failed to resolve inference external inputs",
+            ))
+        }
+    }
+}
+
 /// `GET /health` (additive, design §7; no Python counterpart): orchestrator
 /// + per-model liveness, loaded models, queue depths, and batch caps — the
 /// serde shape is [`HealthReport`], assembled by [`ModelManager::health`].
@@ -681,6 +710,7 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
         clear_cache,
         get_cached_models,
         get_metadata,
+        get_external_inputs,
         health
     ),
     components(schemas(
@@ -908,6 +938,7 @@ mod tests {
             impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
             pythonpath: vec![root.join("python")],
             env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
+            env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
         }
@@ -917,10 +948,20 @@ mod tests {
     async fn spawn_test_server() -> (Arc<InferioState>, String, tempfile::TempDir) {
         spawn_test_server_with_registry(
             r#"
+[external_inputs.test_token]
+label = "Test token"
+description = "HTTP fixture input"
+secret = true
+required = false
+[external_inputs.test_token.source]
+type = "environment"
+variable = "INFERIO_HTTP_TEST_TOKEN_XYZ"
+
 [group.echo]
 config.impl_class = "echo_test"
 [group.echo.inference_ids.test]
 metadata.description = "echo fixture"
+[group.echo.inference_ids.test.external_inputs.test_token]
 "#,
         )
         .await
@@ -993,6 +1034,15 @@ metadata.description = "echo fixture"
         assert_eq!(
             metadata["echo"]["inference_ids"]["test"]["description"],
             json!("echo fixture")
+        );
+        let external_inputs = client.get_external_inputs().await.expect("external inputs");
+        assert_eq!(
+            external_inputs["definitions"]["test_token"]["configured"],
+            json!(false)
+        );
+        assert_eq!(
+            external_inputs["models"]["echo/test"][0]["required"],
+            json!(false)
         );
 
         // PUT /load: Python's exact status body.

@@ -766,6 +766,85 @@
         }
       }
     },
+    "/api/desktop/external-inputs": {
+      "get": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "desktop_external_inputs",
+        "responses": {
+          "200": {
+            "description": "Declared external inputs, presence, and editable non-secret values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Value"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "update_desktop_external_inputs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesktopExternalInputUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated external-input status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Value"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/desktop/external-inputs/{variable}": {
+      "get": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "reveal_desktop_external_input",
+        "parameters": [
+          {
+            "name": "variable",
+            "in": "path",
+            "description": "Declared environment-variable binding",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current value after an explicit reveal action",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Value"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/desktop/setup-continuous/validate": {
       "post": {
         "tags": [
@@ -1152,6 +1231,37 @@
           },
           "500": {
             "description": "Unload failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/inference/external-inputs": {
+      "get": {
+        "tags": [
+          "inference"
+        ],
+        "summary": "Get model external-input requirements",
+        "operationId": "get_external_inputs",
+        "responses": {
+          "200": {
+            "description": "Reusable definitions, model usages, and configured presence",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Value"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Registry or environment resolution failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -4600,6 +4710,26 @@
           "new_database": {
             "type": "boolean",
             "description": "A new database has no indexed rows, so empty folders are safe."
+          }
+        }
+      },
+      "DesktopExternalInputUpdate": {
+        "type": "object",
+        "properties": {
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },

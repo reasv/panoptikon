@@ -1,3 +1,39 @@
+[external_inputs.saucenao_api_key]
+label = "SauceNAO API key"
+description = "Authenticates image lookup requests to SauceNAO."
+secret = true
+required = true
+[external_inputs.saucenao_api_key.source]
+type = "environment"
+variable = "SAUCENAO_API_KEY"
+
+[external_inputs.jina_api_key]
+label = "Jina API key"
+description = "Authenticates requests to Jina-hosted inference models."
+secret = true
+required = true
+[external_inputs.jina_api_key.source]
+type = "environment"
+variable = "JINA_API_KEY"
+
+[external_inputs.jina_max_retries]
+label = "Jina maximum retries"
+description = "Maximum number of retries for failed Jina API requests."
+secret = false
+required = false
+[external_inputs.jina_max_retries.source]
+type = "environment"
+variable = "JINA_MAX_RETRIES"
+
+[external_inputs.jina_timeout]
+label = "Jina request timeout"
+description = "Timeout in seconds for Jina API requests; zero uses the client default."
+secret = false
+required = false
+[external_inputs.jina_timeout.source]
+type = "environment"
+variable = "JINA_TIMEOUT"
+
 # ===================================================================
 #  Tagger Group: Danbooru style and VLM-based general taggers
 # ===================================================================
@@ -113,6 +149,8 @@ metadata.description = """Requires a SauceNAO API key, provided through the \
   Falls back to SauceNAO if it can't find your exact image on Danbooru. \
   Finds your images and videos on Danbooru and downloads the tags. \
   Applies the confidence threshold to the SauceNAO similarity level."""
+
+[group.tagmatch.inference_ids.danbooru-saucenao.external_inputs.saucenao_api_key]
 
 # ===================================================================
 #  OCR Group: Text extraction from images and documents
@@ -459,6 +497,10 @@ metadata.description = """Not local (API-based). You must set the JINA_API_KEY \
   jina-embeddings-v3 is a multilingual multi-task text embedding model \
   designed for a variety of NLP applications."""
 
+[group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_api_key]
+[group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_max_retries]
+[group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_timeout]
+
 
 # ===================================================================
 #  Whisper Group: Speech-to-Text
@@ -636,6 +678,10 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   env var (or the api_key config option) before using this model. \
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
+
+[group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
+[group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
+[group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_timeout]
 
 [group.clip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
 config.model_name = "ViT-SO400M-14-SigLIP-384"
@@ -856,6 +902,10 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   env var (or the api_key config option) before using this model. \
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
+
+[group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
+[group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
+[group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_timeout]
 
 [group.tclip.inference_ids.ViT-SO400M-14-SigLIP-384_webli]
 config.model_name = "ViT-SO400M-14-SigLIP-384"

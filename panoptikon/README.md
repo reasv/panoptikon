@@ -653,14 +653,27 @@ whole value as a quoted template — `port = "${PORT:-6342}"`, `readonly =
 to the target key's type at load (garbage in a numeric key fails the load
 loudly). String-typed keys always keep the substituted string verbatim, so
 numeric-looking values like a DB name `"0123"` are never mangled. There is
-no separate env override layer. Registry TOMLs are
-re-substituted on every mtime-gated reload. Per-DB system configs
+no separate env override layer for server settings. Inference registry
+`config` values remain raw in the cached registry and are substituted just
+before the selected model's Python worker is spawned. Per-DB system configs
 (`data/index/<name>/config.toml`) are **not** templated: the gateway writes
 them back, which would destroy the templates.
 
-The gateway auto-loads `.env` from the working directory at startup — that is
-the intended way to populate the variables templating references, and child
-processes (inference workers, the UI server) inherit them.
+The gateway auto-loads `.env` from the working directory at startup for server
+settings. Inferio also reads it immediately before every worker spawn. Ordinary
+Server/standalone Inferio lets the inherited launch environment win; Desktop
+managed local inference treats its managed `.env` as explicit UI configuration
+and lets the file win. Declared values are explicitly set or removed on the
+child, so edits never require restarting Panoptikon.
+
+Inference registries may declare reusable external inputs and reference them
+from inference IDs. These declarations—not `${...}` template discovery—define
+requiredness and secret presentation. `GET /api/inference/external-inputs`
+reports definitions, model usages, and presence without values. Desktop-only
+`GET|PUT /api/desktop/external-inputs` manages declared environment-backed
+values in `<Desktop Server root>/.env`; an explicit per-variable Desktop GET is
+used only when the user chooses to reveal a configured secret. See
+[Inferio external inputs](../docs/inferio-external-inputs.md).
 
 ### Settings
 
@@ -770,8 +783,9 @@ These are deliberately *not* TOML keys:
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
   `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
-  inheritance — workers and the UI server see the gateway's env (and thus
-  `.env`), unfiltered.
+  inheritance. Declared Inferio external inputs are then explicitly set or
+  removed from each new worker using the current just-in-time snapshot; the UI
+  server retains ordinary startup inheritance.
 - `PANOPTIKON_TEST_PYTHON` — test-only (points the inferio worker tests at
   an interpreter).
 

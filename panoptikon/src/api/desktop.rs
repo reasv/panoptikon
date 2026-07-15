@@ -1,10 +1,18 @@
 //! Desktop-only lifecycle status. This route is mounted only for a
 //! `--desktop-managed` sidecar and carries no general host privilege.
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Write as _,
+    path::Path,
+    sync::OnceLock,
+};
 
-use axum::Json;
+use axum::{Json, extract::Path as AxumPath};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
 use crate::{
@@ -105,6 +113,16 @@ pub(crate) struct DesktopSchedulePreviewResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DesktopExternalInputUpdate {
+    #[serde(default)]
+    pub values: HashMap<String, String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+static ENV_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 fn default_true() -> bool {
     true
 }
@@ -119,6 +137,227 @@ fn ensure_desktop_managed() -> Result<(), ApiError> {
     } else {
         Err(ApiError::not_found("Desktop lifecycle endpoint not found"))
     }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "desktop_external_inputs",
+    path = "/api/desktop/external-inputs",
+    tag = "desktop",
+    responses((status = 200, description = "Declared external inputs, presence, and editable non-secret values", body = JsonValue))
+)]
+pub(crate) async fn external_inputs() -> Result<Json<JsonValue>, ApiError> {
+    ensure_desktop_managed()?;
+    let value = job_inference_context()
+        .primary
+        .get_external_inputs()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to read inference external inputs");
+            ApiError::internal("Failed to read inference external inputs")
+        })?;
+    let values = if crate::config::runtime().inference_local_enabled {
+        let snapshot =
+            crate::env_template::EnvironmentSnapshot::current(true).map_err(|error| {
+                tracing::error!(%error, "failed to resolve Desktop managed .env");
+                ApiError::internal("Failed to resolve Desktop inference configuration")
+            })?;
+        value
+            .get("definitions")
+            .and_then(JsonValue::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, definition)| {
+                if definition.get("secret").and_then(JsonValue::as_bool) == Some(true) {
+                    return None;
+                }
+                let variable = definition.pointer("/source/variable")?.as_str()?;
+                snapshot
+                    .get(variable)
+                    .map(|current| (variable.to_owned(), current.to_owned()))
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    Ok(Json(json!({
+        "managed": crate::config::runtime().inference_local_enabled,
+        "registry": value,
+        "values": values
+    })))
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "reveal_desktop_external_input",
+    path = "/api/desktop/external-inputs/{variable}",
+    tag = "desktop",
+    params(("variable" = String, Path, description = "Declared environment-variable binding")),
+    responses((status = 200, description = "Current value after an explicit reveal action", body = JsonValue))
+)]
+pub(crate) async fn reveal_external_input(
+    AxumPath(variable): AxumPath<String>,
+) -> Result<Json<JsonValue>, ApiError> {
+    ensure_desktop_managed()?;
+    if !crate::config::runtime().inference_local_enabled {
+        return Err(ApiError::bad_request(
+            "External inputs are managed on the configured remote Inferio host",
+        ));
+    }
+    let declared = job_inference_context()
+        .primary
+        .get_external_inputs()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to validate external-input reveal");
+            ApiError::internal("Failed to validate inference external inputs")
+        })?;
+    let allowed = declared
+        .get("definitions")
+        .and_then(JsonValue::as_object)
+        .into_iter()
+        .flatten()
+        .any(|(_, definition)| {
+            definition
+                .pointer("/source/variable")
+                .and_then(JsonValue::as_str)
+                == Some(variable.as_str())
+        });
+    if !allowed {
+        return Err(ApiError::not_found("External input is not declared"));
+    }
+    let snapshot = crate::env_template::EnvironmentSnapshot::current(true).map_err(|error| {
+        tracing::error!(%error, "failed to reveal Desktop managed external input");
+        ApiError::internal("Failed to resolve Desktop inference configuration")
+    })?;
+    Ok(Json(json!({"value": snapshot.get(&variable)})))
+}
+
+#[utoipa::path(
+    put,
+    operation_id = "update_desktop_external_inputs",
+    path = "/api/desktop/external-inputs",
+    tag = "desktop",
+    request_body = DesktopExternalInputUpdate,
+    responses((status = 200, description = "Updated external-input status", body = JsonValue))
+)]
+pub(crate) async fn update_external_inputs(
+    Json(request): Json<DesktopExternalInputUpdate>,
+) -> Result<Json<JsonValue>, ApiError> {
+    ensure_desktop_managed()?;
+    if !crate::config::runtime().inference_local_enabled {
+        return Err(ApiError::bad_request(
+            "External inputs are managed on the configured remote Inferio host",
+        ));
+    }
+    let declared = job_inference_context()
+        .primary
+        .get_external_inputs()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to validate inference external inputs");
+            ApiError::internal("Failed to validate inference external inputs")
+        })?;
+    let allowed = declared
+        .get("definitions")
+        .and_then(JsonValue::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, definition)| {
+            definition
+                .pointer("/source/variable")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    for variable in request.values.keys().chain(request.remove.iter()) {
+        if !allowed.contains(variable) {
+            return Err(ApiError::bad_request(format!(
+                "Environment variable {variable} is not declared by the inference registry"
+            )));
+        }
+    }
+
+    let _guard = ENV_WRITE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    update_dotenv(Path::new(".env"), &request.values, &request.remove).map_err(|error| {
+        tracing::error!(%error, "failed to update Desktop managed .env");
+        ApiError::internal("Failed to update Desktop inference configuration")
+    })?;
+    external_inputs().await
+}
+
+fn update_dotenv(
+    path: &Path,
+    values: &HashMap<String, String>,
+    remove: &[String],
+) -> anyhow::Result<()> {
+    let existing = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let remove = remove.iter().cloned().collect::<HashSet<_>>();
+    let mut written = HashSet::new();
+    let mut output = Vec::new();
+    for line in existing.lines() {
+        let Some(key) = dotenv_line_key(line) else {
+            output.push(line.to_owned());
+            continue;
+        };
+        if remove.contains(key) {
+            continue;
+        }
+        if let Some(value) = values.get(key) {
+            if written.insert(key.to_owned()) {
+                output.push(format!("{key}={}", encode_dotenv_value(value)));
+            }
+        } else {
+            output.push(line.to_owned());
+        }
+    }
+    for (key, value) in values {
+        if !written.contains(key) && !remove.contains(key) {
+            output.push(format!("{key}={}", encode_dotenv_value(value)));
+        }
+    }
+    let mut rendered = output.join("\n");
+    if !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(rendered.as_bytes())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn dotenv_line_key(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+    let (key, _) = line.split_once('=')?;
+    let key = key.trim();
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    ((first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    .then_some(key)
+}
+
+fn encode_dotenv_value(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
 }
 
 #[utoipa::path(
@@ -231,6 +470,14 @@ async fn validate_cron_jobs(jobs: &[CronJob]) -> Result<(), ApiError> {
             tracing::error!(%error, "failed to load model metadata for Desktop setup");
             ApiError::internal("Failed to validate the selected models")
         })?;
+    let external_inputs = job_inference_context()
+        .primary
+        .get_external_inputs()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to validate model external inputs for Desktop setup");
+            ApiError::internal("Failed to validate additional model configuration")
+        })?;
     let mut seen = HashSet::new();
     for job in jobs {
         if !seen.insert(job.inference_id.as_str()) {
@@ -240,6 +487,31 @@ async fn validate_cron_jobs(jobs: &[CronJob]) -> Result<(), ApiError> {
             )));
         }
         resolve_model_metadata(&metadata, &job.inference_id)?;
+        if let Some(usages) = external_inputs
+            .get("models")
+            .and_then(|models| models.get(&job.inference_id))
+            .and_then(JsonValue::as_array)
+        {
+            for usage in usages {
+                if usage.get("required").and_then(JsonValue::as_bool) != Some(true) {
+                    continue;
+                }
+                let Some(id) = usage.get("id").and_then(JsonValue::as_str) else {
+                    continue;
+                };
+                let definition = &external_inputs["definitions"][id];
+                if definition.get("configured").and_then(JsonValue::as_bool) != Some(true) {
+                    let label = definition
+                        .get("label")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(id);
+                    return Err(ApiError::bad_request(format!(
+                        "Model {} requires additional configuration: {label}",
+                        job.inference_id
+                    )));
+                }
+            }
+        }
         if job.batch_size.is_some_and(|value| value < 1) {
             return Err(ApiError::bad_request(format!(
                 "Model {} has an invalid batch size",
@@ -425,4 +697,37 @@ pub(crate) async fn complete_setup(
     };
 
     Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+}
+
+#[cfg(test)]
+mod external_input_tests {
+    use super::*;
+
+    #[test]
+    fn dotenv_update_preserves_unrelated_lines_and_removes_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "# keep me\nOTHER=value\nAPI_KEY=old\n").unwrap();
+        update_dotenv(
+            &path,
+            &HashMap::from([("API_KEY".into(), "new value=with symbols".into())]),
+            &[],
+        )
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"));
+        assert!(text.contains("OTHER=value"));
+        assert!(text.contains("API_KEY=\"new value=with symbols\""));
+        update_dotenv(&path, &HashMap::new(), &["API_KEY".into()]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("API_KEY="));
+        assert!(text.contains("OTHER=value"));
+    }
+
+    #[test]
+    fn dotenv_key_parser_ignores_comments_and_accepts_export() {
+        assert_eq!(dotenv_line_key(" export TOKEN = value"), Some("TOKEN"));
+        assert_eq!(dotenv_line_key("# TOKEN=value"), None);
+        assert_eq!(dotenv_line_key("BAD-NAME=value"), None);
+    }
 }

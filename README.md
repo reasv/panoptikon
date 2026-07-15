@@ -264,6 +264,10 @@ configuration mechanism: string values in the TOML (and in every inference
 registry TOML) can reference environment variables with `${VAR}` /
 `${VAR:-default}` templating, and a `.env` file in the repo root is still
 auto-loaded as a convenient source for those variables (see `.env.example`).
+Inference registry templates and declared worker external inputs are resolved
+again before each new Python worker is spawned, so edits do not require a
+Panoptikon restart. Desktop provides an Additional configuration UI backed by
+its managed Server root `.env`.
 Numeric and boolean keys can be templated too, as quoted whole-value
 templates (e.g. `port = "${PORT:-6342}"` — coerced to the key's type at
 load). The remaining real environment variables are bootstrap/diagnostic:

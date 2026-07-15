@@ -53,13 +53,17 @@ mounted as a permanent gitignored worktree at `python-legacy/` (see Roadmap).
 TOML with env templating is THE configuration mechanism (see
 `panoptikon/README.md` for the reference). `${VAR}` errors on unset,
 `${VAR:-default}` covers unset-or-empty, `${VAR-default}` unset only, `$${`
-escapes. Applied to the server config and every inference registry TOML —
-secrets reach inference impls via inference-ID `config.*` kwargs, never via a
-special env-passing channel. `.env` is auto-loaded as a convenience source for
-template variables; numeric/boolean keys are templated as quoted
+escapes. Server config is resolved at startup. Inference registry `config`
+templates are retained raw and resolved immediately before worker spawn.
+Reusable external-input declarations can also pass current values directly to
+workers for libraries which read their environment. `.env` is the backing
+source; numeric/boolean server keys are templated as quoted
 whole-value templates (`port = "${PORT:-6342}"`), coerced at load.
 Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
 the documented exceptions.
+
+Desktop manages external inputs in its Server root `.env`; remote Inferio owns
+its own values. See `docs/inferio-external-inputs.md`.
 
 ### Policy-scoped SSR
 

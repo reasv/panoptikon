@@ -82,6 +82,7 @@ sqlite-vec = "0.1.7-alpha.2"
 libsqlite3-sys = "0.28"
 base64 = "0.22"
 dotenvy = "0.15"
+tempfile = "3"
 ractor = "0.15"
 blurhash = "0.2.3"
 hashlink = "0.10"
@@ -153,7 +154,6 @@ windows-sys = { version = "0.60", features = [
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-tempfile = "3"
 
 [build-dependencies]
 # build.rs packages the embedded resource archives (`bundled`/`bundled-ui`);

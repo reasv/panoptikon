@@ -25,3 +25,19 @@ metadata.description = "ViT-bigG-14-CLIPA model pretrained on DataComp1B"
 #   $${              -> a literal "${"
 # For example, to pass an API key from the environment:
 # config.api_key = "${JINA_API_KEY:-}"
+
+# Explicit external-input declarations drive validation and UI. They are
+# reusable and independent of templates:
+# [external_inputs.jina_api_key]
+# label = "Jina API key"
+# description = "Authenticates requests to Jina-hosted inference models."
+# secret = true
+# required = true
+# [external_inputs.jina_api_key.source]
+# type = "environment"
+# variable = "JINA_API_KEY"
+#
+# Reference the reusable definition from an inference ID. The reference may
+# override requiredness or add a model-specific description:
+# [group.clip.inference_ids.ViT-bigG-14-CLIPA_datacomp1b.external_inputs.jina_api_key]
+# required = false
