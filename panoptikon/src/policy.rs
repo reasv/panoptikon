@@ -110,7 +110,7 @@ where
             };
 
             let status = response.status();
-            tracing::info!(
+            tracing::debug!(
                 method = %decision.method,
                 path = %decision.path,
                 policy = %decision.policy.name,

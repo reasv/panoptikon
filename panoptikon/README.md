@@ -887,6 +887,9 @@ Log output goes to the console and, by default, to
 `[logging].file` overrides the path; setting it to an empty string
 disables file logging. `[logging].level` sets the default level; `RUST_LOG`
 takes precedence when set and supports per-module directives.
+Routine policy and proxy request-completion events are logged at `DEBUG`, so
+the default `INFO` level does not act as an access log. Policy denials are
+`WARN`, while proxy preparation and transport failures are `ERROR`.
 
 On SIGINT/SIGTERM (Ctrl-C, `docker stop`, systemd) the gateway shuts down
 gracefully: it stops accepting connections, drains in-flight requests, stops

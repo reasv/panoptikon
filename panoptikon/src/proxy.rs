@@ -376,7 +376,7 @@ async fn proxy_request(
 
     let status = response.status();
     if let Some(context) = policy_context {
-        tracing::info!(
+        tracing::debug!(
             method = %method,
             path = %path_and_query,
             upstream = %upstream.name,
@@ -387,7 +387,7 @@ async fn proxy_request(
             "proxied request"
         );
     } else {
-        tracing::info!(
+        tracing::debug!(
             method = %method,
             path = %path_and_query,
             upstream = %upstream.name,
