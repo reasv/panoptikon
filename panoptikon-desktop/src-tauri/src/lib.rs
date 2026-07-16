@@ -85,9 +85,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
-            relay_status, relay_pending, relay_approve, relay_reject, relay_revoke,
-            relay_set_mappings, relay_resolve_mapping, relay_mapping_preview,
-            choose_relay_folder, file_action_commands, set_file_action_commands,
+            relay_status, relay_pending, relay_pairing_progress, close_relay_pairing_window,
+            relay_approve, relay_reject, choose_relay_pairing_folder, relay_revoke,
+            relay_set_mappings, relay_mapping_pending, relay_resolve_mapping, relay_mapping_preview,
+            choose_relay_folder, choose_relay_mapping_folder, close_relay_mapping_window,
+            file_action_commands, set_file_action_commands,
             choose_file_action_application, choose_file_action_test_file, test_file_action,
             get_server_configuration, set_server_configuration,
             set_relay_enabled,
@@ -145,13 +147,25 @@ pub fn run() {
                 }
                 Ok(())
             });
-            let attention_app = app.handle().clone();
-            let attention_handler = Arc::new(move || {
-                if let Err(error) = show_control_window(&attention_app, true) {
-                    tracing::warn!(%error, "failed to show Relay setup window");
+            let pairing_attention_app = app.handle().clone();
+            let pairing_attention_handler = Arc::new(move || {
+                if let Err(error) = show_relay_pairing_window(&pairing_attention_app, true) {
+                    tracing::warn!(%error, "failed to show Relay pairing window");
                 }
             });
-            let relay_state = Arc::new(RelayState::new(relay_config, paths.relay_settings.clone(), action_handler, attention_handler));
+            let mapping_attention_app = app.handle().clone();
+            let mapping_attention_handler = Arc::new(move || {
+                if let Err(error) = show_relay_mapping_window(&mapping_attention_app, true) {
+                    tracing::warn!(%error, "failed to show Relay mapping window");
+                }
+            });
+            let relay_state = Arc::new(RelayState::new(
+                relay_config,
+                paths.relay_settings.clone(),
+                action_handler,
+                pairing_attention_handler,
+                mapping_attention_handler,
+            ));
             app.manage(supervisor.clone());
             app.manage(relay_state.clone());
             app.manage(Arc::new(updates::UpdateCoordinator::new()));
@@ -669,7 +683,7 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
         let window =
             WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
                 .title("Panoptikon Desktop")
-                .inner_size(780.0, 680.0)
+                .inner_size(780.0, 1000.0)
                 .min_inner_size(560.0, 480.0)
                 .build()?;
         let close_window = window.clone();
@@ -677,6 +691,76 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = close_window.hide();
+            }
+        });
+        window
+    };
+    window.show()?;
+    if focus {
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
+fn show_relay_pairing_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window("relay-pairing") {
+        window
+    } else {
+        let window =
+            WebviewWindowBuilder::new(app, "relay-pairing", WebviewUrl::App("pairing.html".into()))
+                .title("Pair with Panoptikon Relay")
+                .inner_size(560.0, 620.0)
+                .min_inner_size(460.0, 500.0)
+                .build()?;
+        let close_app = app.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let close_app = close_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = close_app
+                        .state::<Arc<RelayState>>()
+                        .cancel_incomplete_pairings()
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to cancel closed Relay pairing window");
+                    }
+                });
+            }
+        });
+        window
+    };
+    window.show()?;
+    if focus {
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
+fn show_relay_mapping_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window("relay-mapping") {
+        window
+    } else {
+        let window =
+            WebviewWindowBuilder::new(app, "relay-mapping", WebviewUrl::App("mapping.html".into()))
+                .title("Add a Panoptikon Relay mapping")
+                .inner_size(620.0, 620.0)
+                .min_inner_size(480.0, 500.0)
+                .build()?;
+        let close_app = app.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let close_app = close_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = close_app
+                        .state::<Arc<RelayState>>()
+                        .cancel_pending_actions()
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to cancel closed Relay mapping window");
+                    }
+                });
             }
         });
         window
@@ -894,6 +978,22 @@ async fn open_setup_command(window: WebviewWindow, app: AppHandle) -> Result<(),
 fn validate_control(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "control" {
         Err("command is restricted to the bundled control window".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_relay_pairing_window(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() != "relay-pairing" {
+        Err("command is restricted to the Relay pairing window".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_relay_mapping_window(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() != "relay-mapping" {
+        Err("command is restricted to the Relay mapping window".into())
     } else {
         Ok(())
     }
@@ -1163,20 +1263,58 @@ async fn relay_pending(
     window: WebviewWindow,
     app: AppHandle,
 ) -> Result<Vec<relay::PendingPairingView>, String> {
-    validate_control(&window)?;
+    validate_relay_pairing_window(&window)?;
     Ok(app.state::<Arc<RelayState>>().pending().await)
+}
+
+#[tauri::command]
+async fn relay_pairing_progress(
+    window: WebviewWindow,
+    app: AppHandle,
+    request_id: Uuid,
+) -> Result<Option<relay::PairingProgressView>, String> {
+    validate_relay_pairing_window(&window)?;
+    Ok(app
+        .state::<Arc<RelayState>>()
+        .pairing_progress(request_id)
+        .await)
+}
+
+#[tauri::command]
+fn close_relay_pairing_window(window: WebviewWindow) -> Result<(), String> {
+    validate_relay_pairing_window(&window)?;
+    window.close().map_err(|error| error.to_string())
 }
 #[tauri::command]
 async fn relay_approve(
     window: WebviewWindow,
     app: AppHandle,
     request_id: Uuid,
+    mappings: Vec<PathMapping>,
 ) -> Result<(), String> {
-    validate_control(&window)?;
+    validate_relay_pairing_window(&window)?;
     app.state::<Arc<RelayState>>()
-        .approve(request_id)
+        .approve_with_mappings(request_id, mappings)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn choose_relay_pairing_folder(window: WebviewWindow) -> Result<Option<String>, String> {
+    validate_relay_pairing_window(&window)?;
+    choose_relay_folder_inner(window).await
+}
+
+#[tauri::command]
+async fn choose_relay_mapping_folder(window: WebviewWindow) -> Result<Option<String>, String> {
+    validate_relay_mapping_window(&window)?;
+    choose_relay_folder_inner(window).await
+}
+
+#[tauri::command]
+fn close_relay_mapping_window(window: WebviewWindow) -> Result<(), String> {
+    validate_relay_mapping_window(&window)?;
+    window.close().map_err(|error| error.to_string())
 }
 #[tauri::command]
 async fn relay_reject(
@@ -1184,7 +1322,7 @@ async fn relay_reject(
     app: AppHandle,
     request_id: Uuid,
 ) -> Result<(), String> {
-    validate_control(&window)?;
+    validate_relay_pairing_window(&window)?;
     app.state::<Arc<RelayState>>()
         .reject(request_id)
         .await
@@ -1217,6 +1355,15 @@ async fn relay_set_mappings(
 }
 
 #[tauri::command]
+async fn relay_mapping_pending(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<Vec<relay::PendingActionView>, String> {
+    validate_relay_mapping_window(&window)?;
+    Ok(app.state::<Arc<RelayState>>().pending_actions().await)
+}
+
+#[tauri::command]
 async fn relay_mapping_preview(
     window: WebviewWindow,
     app: AppHandle,
@@ -1224,7 +1371,7 @@ async fn relay_mapping_preview(
     remote: String,
     local: String,
 ) -> Result<relay::MappingPreview, String> {
-    validate_control(&window)?;
+    validate_relay_mapping_window(&window)?;
     app.state::<Arc<RelayState>>()
         .mapping_preview(action_id, remote, local)
         .await
@@ -1239,7 +1386,7 @@ async fn relay_resolve_mapping(
     remote: String,
     local: String,
 ) -> Result<(), String> {
-    validate_control(&window)?;
+    validate_relay_mapping_window(&window)?;
     app.state::<Arc<RelayState>>()
         .resolve_mapping(action_id, remote, local)
         .await
@@ -1541,6 +1688,10 @@ async fn test_file_action(
 #[tauri::command]
 async fn choose_relay_folder(window: WebviewWindow) -> Result<Option<String>, String> {
     validate_control(&window)?;
+    choose_relay_folder_inner(window).await
+}
+
+async fn choose_relay_folder_inner(window: WebviewWindow) -> Result<Option<String>, String> {
     let (send, receive) = tokio::sync::oneshot::channel();
     window
         .app_handle()
@@ -1699,13 +1850,8 @@ mod tests {
             "open_known_folder",
             "log_tail",
             "relay_status",
-            "relay_pending",
-            "relay_approve",
-            "relay_reject",
             "relay_revoke",
             "relay_set_mappings",
-            "relay_resolve_mapping",
-            "relay_mapping_preview",
             "choose_relay_folder",
             "file_action_commands",
             "set_file_action_commands",
@@ -1766,6 +1912,47 @@ mod tests {
                 .difference(&update_allowed)
                 .collect::<Vec<_>>()
         );
+
+        for (capability_source, permission_source, window, permission, frontend) in [
+            (
+                include_str!("../capabilities/relay_pairing.json"),
+                include_str!("../permissions/relay_pairing_commands.toml"),
+                "relay-pairing",
+                "allow-relay-pairing-commands",
+                include_str!("../../dist/pairing.js"),
+            ),
+            (
+                include_str!("../capabilities/relay_mapping.json"),
+                include_str!("../permissions/relay_mapping_commands.toml"),
+                "relay-mapping",
+                "allow-relay-mapping-commands",
+                include_str!("../../dist/mapping.js"),
+            ),
+        ] {
+            let capability: serde_json::Value = serde_json::from_str(capability_source).unwrap();
+            assert_eq!(capability["windows"], serde_json::json!([window]));
+            assert_eq!(
+                capability["permissions"],
+                serde_json::json!(["core:default", permission])
+            );
+            let commands: toml::Value = toml::from_str(permission_source).unwrap();
+            let allowed = commands["permission"][0]["commands"]["allow"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|command| command.as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            let invoked = frontend
+                .split("invoke('")
+                .skip(1)
+                .filter_map(|suffix| suffix.split('\'').next())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                invoked.is_subset(&allowed),
+                "{window} frontend invokes commands absent from its capability: {:?}",
+                invoked.difference(&allowed).collect::<Vec<_>>()
+            );
+        }
 
         let launch_html = include_str!("../../dist/launch.html");
         let launch_js = include_str!("../../dist/launch.js");

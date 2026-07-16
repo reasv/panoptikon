@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "relay-pairing-window",
+  "description": "Narrow capability for the bundled Relay pairing workflow.",
+  "windows": ["relay-pairing"],
+  "permissions": ["core:default", "allow-relay-pairing-commands"]
+}

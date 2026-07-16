@@ -1,0 +1,10 @@
+[[permission]]
+identifier = "allow-relay-mapping-commands"
+description = "Allows the dedicated Relay mapping window to resolve blocked file actions."
+commands.allow = [
+  "relay_mapping_pending",
+  "relay_mapping_preview",
+  "relay_resolve_mapping",
+  "choose_relay_mapping_folder",
+  "close_relay_mapping_window",
+]

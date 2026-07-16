@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "relay-mapping-window",
+  "description": "Narrow capability for resolving a Relay action that needs a folder mapping.",
+  "windows": ["relay-mapping"],
+  "permissions": ["core:default", "allow-relay-mapping-commands"]
+}

@@ -1,0 +1,33 @@
+.pairing-shell { max-width: 560px; margin: 0 auto; padding: 30px 32px 24px; }
+.pairing-shell header { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
+.pairing-mark { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid #6e4032; border-radius: 11px; background: #291b17; color: #ef8a68; }
+.pairing-mark svg { width: 23px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.eyebrow { margin: 0 0 1px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.pairing-shell h1 { margin: 0; font-size: 1.55rem; }
+.intro { margin-bottom: 20px; color: #d4d0ca; }
+.pairing-request { padding: 18px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.pairing-request + .pairing-request { margin-top: 12px; }
+.pairing-request h2 { margin-bottom: 14px; font-size: 1.05rem; }
+.request-details { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px 12px; margin: 0 0 16px; }
+.request-details dt { color: var(--muted); }
+.request-details dd { margin: 0; overflow-wrap: anywhere; }
+.pairing-mappings { display: grid; gap: 10px; max-height: 260px; overflow: auto; }
+.pairing-mapping { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 8px; padding: 10px; background: var(--surface-subtle); border-radius: 7px; }
+.mapping-label { grid-column: 1 / -1; color: var(--muted); font-size: .76rem; font-weight: 650; letter-spacing: .025em; }
+.mapping-label:not(:first-child) { margin-top: 3px; }
+.remote-controls { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.copy-root { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 84px; }
+.copy-icon { position: relative; width: 17px; height: 17px; }
+.copy-icon svg { position: absolute; inset: 0; width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: opacity .16s ease, transform .2s ease; }
+.check-glyph { opacity: 0; transform: scale(.45) rotate(-12deg); color: var(--success); }
+.copy-root.is-copied { border-color: #40765d; color: var(--success); animation: copied-pulse .32s ease; }
+.copy-root.is-copied .copy-glyph { opacity: 0; transform: scale(.55) rotate(10deg); }
+.copy-root.is-copied .check-glyph { opacity: 1; transform: scale(1) rotate(0); }
+.pairing-mapping input { min-width: 0; }
+.pairing-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.pairing-state { margin: 14px 0 0; color: var(--warning); }
+.pairing-state.success { color: var(--success); }
+.close-help { margin: 18px 2px 0; color: var(--muted); font-size: .82rem; text-align: center; }
+@keyframes copied-pulse { 50% { transform: scale(1.04); } }
+@media (prefers-reduced-motion: reduce) { .copy-icon svg { transition: none; } .copy-root.is-copied { animation: none; } }
+@media (max-width: 520px) { .pairing-shell { padding: 22px 18px; } .pairing-mapping { grid-template-columns: 1fr; } }

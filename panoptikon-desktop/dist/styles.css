@@ -124,6 +124,8 @@ article { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 14
 @keyframes copy-pulse { 50% { transform: scale(1.12); } }
 .command-preview, .unmatched-path { display: block; padding: 10px; background: #0d0f11; border-radius: 6px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .mapping-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(170px, 1fr) auto auto; gap: 8px; align-items: center; margin: 10px 0; }
+.mapping-actions { gap: 10px; margin-top: 12px; }
+.relay-group > .command-status { margin: 8px 0; }
 .mapping-row code { overflow-wrap: anywhere; }
 .pending-mapping { display: grid; gap: 10px; border: 1px solid #805f25; border-radius: 8px; padding: 12px; }
 .relay-group { margin-top: 22px; }

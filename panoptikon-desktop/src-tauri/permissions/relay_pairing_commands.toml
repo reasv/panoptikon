@@ -1,0 +1,11 @@
+[[permission]]
+identifier = "allow-relay-pairing-commands"
+description = "Allows the dedicated Relay pairing window to inspect and decide pending requests."
+commands.allow = [
+  "relay_pending",
+  "relay_pairing_progress",
+  "close_relay_pairing_window",
+  "relay_approve",
+  "relay_reject",
+  "choose_relay_pairing_folder",
+]

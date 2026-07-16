@@ -21,7 +21,7 @@ The file-action system MUST:
 - allow a browser to use either the existing action or a Relay on the
   browser's own device when both are available;
 - make a successfully paired Relay the default action while retaining an
-  explicit, persisted override to the existing action;
+  explicit, session-local override to the existing action;
 - pair a Panoptikon server and a Relay once, not once per browser profile;
 - let every browser on the paired device retrieve the existing credential
   automatically from the Panoptikon server;
@@ -109,7 +109,7 @@ When `relay_enabled` is false, the UI MUST:
 - not probe loopback Relay addresses;
 - not create Relay state, timers, or event listeners;
 - not call server-side Relay pairing APIs;
-- not render a Relay selector, pairing action, status, or error; and
+- not render a Relay pairing action, destination menu, status, or error; and
 - behave exactly as the UI behaved before Relay integration.
 
 The Relay integration SHOULD be a dynamically loaded client module. A static
@@ -118,7 +118,8 @@ browser never run Relay code for a disabled policy.
 
 When `relay_enabled` is true but no compatible Relay is detected, the same
 zero-visible-impact rule applies: file-action controls and their behavior MUST
-remain identical to the existing UI, and no Relay selector is rendered.
+remain identical to the existing UI, and no Relay pairing action or destination
+menu is rendered.
 
 Because client configuration is policy-scoped, one listener or audience MAY
 allow Relay while another disables it.
@@ -145,7 +146,7 @@ discovery state:
 
 - when the client application starts;
 - when the document becomes visible or regains focus;
-- when an existing Relay selector is opened;
+- when an existing Relay destination context menu is opened;
 - after pairing or revocation; and
 - after a Relay request fails because the service disappeared or changed.
 
@@ -155,49 +156,57 @@ MUST NOT be inserted as a sequential prerequisite for every file action.
 ## 6. File-action control behavior
 
 The primary Open File and Show in Folder controls always execute the currently
-selected action immediately. Opening a selector MUST NOT be required before
-ordinary execution.
+selected action immediately. Opening the destination context menu MUST NOT be
+required before ordinary execution.
 
-The Relay selector exists only while a compatible Relay is detected.
+Relay controls exist only while a compatible Relay is detected and the
+current Panoptikon endpoint is not the Server managed by that same Desktop
+installation. A Desktop-managed local Server already executes file actions on
+that computer, so pairing it to its own Relay is redundant and MUST NOT be
+offered.
 
 ### 6.1 Relay not detected
 
-No selector is shown. The controls execute the existing actions exactly as
-they do today.
+No Relay-specific control is shown. The controls execute the existing actions
+exactly as they do today.
 
 ### 6.2 Relay detected but not paired
 
-The controls continue to execute the existing actions. The selector contains:
-
-- a checked entry for the existing action; and
-- an entry that starts pairing with the detected Relay.
-
-The existing entry's user-facing label is derived from the current client
-mode. It is **Open on Panoptikon server host** when server-host opening is
-enabled. Otherwise it describes the browser/in-UI action already selected by
-the UI. The selector MUST NOT introduce an additional browser action.
+The controls continue to execute the existing actions. A direct action starts
+pairing with the detected Relay. This action is a small corner affordance
+attached to each primary file-action button and is revealed when that primary
+button is hovered or keyboard-focused; it is not a separate toolbar or image
+overlay button. It MUST NOT open a menu containing the already-active existing
+action, because there is no routing choice until the Relay is paired. While
+approval is pending, the action remains available and foregrounds the same
+idempotent pairing workflow instead of becoming stuck disabled across page
+reloads.
 
 ### 6.3 Relay paired
 
 Completing pairing selects Relay mode by default. The controls then perform
-their Relay actions with one click.
+their Relay actions with one click, and the small attached pairing affordance
+disappears.
 
-The selector contains exactly the available modes:
+Right-clicking either primary file-action button opens a destination context
+menu containing exactly the available modes:
 
 - **Use local Relay**; and
 - the existing action, labelled according to the current client mode.
 
+The existing entry's user-facing label is derived from the current client
+mode. It is **Open on Panoptikon server host** when server-host opening is
+enabled. Otherwise it describes the browser/in-UI action already selected by
+the UI. The context menu MUST NOT introduce an additional browser action.
+
 The selected mode is checkmarked. Changing it changes only routing preference;
 it does not execute the file action.
 
-The preference MUST be persisted for the Panoptikon client. An explicit user
-override to the existing action MUST survive page reloads and ordinary Relay
-rediscovery. Completing a new pairing selects Relay mode unless the product
-later provides an explicit "keep my previous override" choice.
+The override is session-local. Reloading, revoking, re-pairing, or losing the
+Relay resets the mode to Relay for the next time a valid pairing is available.
 
-If the Relay disappears, the selector disappears and controls immediately
-fall back to the existing action. The stored preference MAY remain so Relay
-mode can resume when the same paired Relay returns.
+If the Relay disappears, the destination context menu disappears and controls
+immediately fall back to the existing action.
 
 ### 6.4 Shared routing
 
@@ -255,11 +264,16 @@ Relay. When the user selects the pairing entry:
    server for the discovered Relay ID.
 2. The browser sends the server identity, pairing operation, and root hints to
    the loopback Relay.
-3. Desktop foregrounds or notifies the user about the pending request.
-4. Desktop displays the requesting Panoptikon origin and the capabilities to
-   be granted: submitting server paths covered by locally approved mappings to
-   the local Open File and Show in Folder commands.
-5. The user approves or rejects the request locally.
+3. Desktop opens a dedicated pairing window. Pairing approval MUST NOT be
+   embedded in the general Settings window.
+4. The pairing window displays the requesting Panoptikon origin, suggested
+   roots, and the capabilities to be granted: submitting server paths covered
+   by locally approved mappings to the local Open File and Show in Folder
+   commands. It also lets the user copy, replace, narrow, or broaden each
+   suggested root and choose initial local folders for any roots they want to
+   map now.
+5. The user approves or rejects the request locally, including any selected
+   initial mappings in the approval.
 6. On approval, Relay creates the per-server credential and makes it claimable
    by the pending browser operation.
 7. The browser stores it on the Panoptikon server through the same-origin
@@ -268,6 +282,12 @@ Relay. When the user selects the pairing entry:
    to Relay.
 9. The browser selects Relay mode and updates all open pages through the
    application's normal shared state mechanism.
+
+The dedicated window remains open through acknowledgement and closes when the
+operation completes. Closing it earlier is rejection: Relay marks every
+incomplete request shown there as rejected, removes any provisional
+credential, and leaves the browser able to cancel its durable Server operation
+and start again.
 
 The browser MUST poll or subscribe to the pending operation automatically.
 There is no manual "Check approval" action.
@@ -308,7 +328,10 @@ persistence.
 ### 7.5 Revocation
 
 Desktop MUST allow the user to revoke one Panoptikon pairing. Revocation
-immediately invalidates Relay actions for that credential.
+immediately invalidates Relay actions for that credential. The management UI
+MUST disable the affected controls and announce progress while revocation is
+running, then announce success or failure without waiting for an unrelated
+full Settings refresh.
 
 The Panoptikon server SHOULD provide an authenticated API to forget its side
 of a pairing. Either side may be removed first; subsequent discovery MUST
@@ -379,9 +402,14 @@ entry MAY remain available.
 
 ### 9.1 Initial mapping
 
-After pairing approval, Desktop SHOULD show the supplied server roots and let
-the user choose the corresponding local folder for each one. It MUST allow
-roots to be skipped.
+The dedicated pairing window MUST show the supplied server roots in editable
+fields, provide a copy-to-clipboard action for each one, and let the user choose
+the corresponding local folder before approval. Supplied roots are suggestions,
+not authorization boundaries: the user MAY replace, narrow, or broaden them,
+and the explicitly approved mapping prefix becomes the Relay boundary. The
+window MUST allow roots to be skipped; skipped roots remain unmapped so that
+first use opens the missing-mapping flow. Background request polling MUST
+preserve text selection, focus, and in-progress field edits.
 
 When an exact representative file is available, Desktop SHOULD allow the user
 to select its local copy and derive the mapping by comparing the common path
@@ -397,7 +425,9 @@ An authenticated Relay action with no matching mapping returns a structured
 path. It MUST NOT collapse this into a generic bad-request message.
 
 Relay assigns an idempotency ID, asks Desktop to foreground the mapping flow,
-and durably retains the pending action. The browser polls that action ID; it
+and durably retains the pending action. Desktop opens a dedicated mapping
+window instead of navigating to or foregrounding general Settings. Closing
+that window cancels the retained action. The browser polls that action ID; it
 does not repeatedly submit a new side-effecting action. Desktop then:
 
 1. shows the exact unmatched server path;
@@ -412,6 +442,10 @@ does not repeatedly submit a new side-effecting action. Desktop then:
 The browser MAY display that Desktop needs input, but mapping configuration is
 Desktop-only. The user MUST NOT have to click the original file action again
 after completing a successful mapping.
+
+General Desktop Settings remains the persistent management surface for
+reviewing and editing existing mappings and revoking paired endpoints outside
+the pairing and missing-mapping flows.
 
 ### 9.3 Unavailable mounts
 
@@ -491,8 +525,8 @@ Relay responses MUST use structured error codes so the UI can distinguish:
 
 Behavior on failure:
 
-- Discovery or connection failure removes the selector and restores existing
-  behavior without blocking the existing action.
+- Discovery or connection failure removes Relay-specific controls and restores
+  existing behavior without blocking the existing action.
 - Authentication failure refreshes pairing state; it does not repeatedly send
   the same bad credential.
 - Mapping-required and unavailable-root results invoke Desktop-local recovery.
@@ -501,7 +535,7 @@ Behavior on failure:
 - A failed Relay action MUST NOT silently fall through and execute the existing
   action on the Panoptikon server host. That could open a file on an unintended
   machine. The user may explicitly choose the existing action from the
-  selector.
+  destination context menu.
 
 ## 12. Persistence and state boundaries
 
@@ -520,10 +554,8 @@ Relay/Desktop persists:
 - per-server mappings and root hints; and
 - Desktop-owned command configuration.
 
-The browser persists only UX preference:
-
-- selected file-action mode for the Panoptikon client; and
-- optional session-scoped credential caching.
+The browser MAY keep optional session-scoped credential and destination-mode
+caches. It MUST NOT persist an override to the existing action across reloads.
 
 Deleting browser storage MUST NOT destroy the pairing. A new profile MUST be
 able to reconstruct ready state from local Relay discovery plus the server-side
@@ -556,12 +588,12 @@ pairing record.
 
 - The primary action has an accessible name that reflects its effective
   action while Relay mode is selected.
-- The selector has a distinct accessible label such as "Choose file action."
+- The destination context menu has a distinct accessible label.
 - The selected mode is conveyed semantically, not only by a visual checkmark.
 - Pairing, mapping, and command-test progress is announced through appropriate
   status or alert regions.
-- Keyboard users can execute the primary action without opening the selector
-  and can change modes entirely by keyboard.
+- Keyboard users can execute the primary action without opening the context
+  menu and can change modes entirely by keyboard.
 - Open File and Show in Folder expose consistent mode state and terminology.
 
 ## 15. Acceptance matrix
@@ -578,8 +610,8 @@ The implementation is not complete until automated and manual tests cover:
 6. A second browser profile automatically retrieves the stored credential and
    requires no approval.
 7. Relay becomes the default immediately after pairing.
-8. Explicit override to the existing action persists across reload and Relay
-   rediscovery.
+8. Explicit override to the existing action is available from the right-click
+   context menu and resets to Relay after reload, revocation, or re-pairing.
 9. Open File through Relay with identical, Windows-drive, UNC, Unix, and mixed
    separator mappings.
 10. Show in Folder through Relay for the same mapping cases.
@@ -609,7 +641,7 @@ The implementation is not complete until automated and manual tests cover:
 This specification deliberately does not prescribe:
 
 - the exact server database table or on-disk pairing-store format;
-- the visual component used for the adjacent selector;
+- the visual styling of the pairing affordance and destination context menu;
 - the polling interval used for live Relay discovery;
 - whether ready-state updates across tabs use `BroadcastChannel`, storage
   events, or another browser-local mechanism; or

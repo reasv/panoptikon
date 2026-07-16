@@ -1,0 +1,14 @@
+.mapping-shell { max-width: 620px; margin: 0 auto; padding: 30px 32px 24px; }
+.mapping-shell header { margin-bottom: 18px; }
+.mapping-shell h1 { margin: 0; font-size: 1.55rem; }
+.eyebrow { margin: 0 0 2px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.intro { color: #d4d0ca; }
+.mapping-request { display: grid; gap: 12px; padding: 18px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.mapping-request + .mapping-request { margin-top: 12px; }
+.mapping-request code { display: block; padding: 10px; overflow-wrap: anywhere; background: var(--surface-subtle); border-radius: 7px; }
+.mapping-fields { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.mapping-fields label { grid-column: 1 / -1; color: var(--muted); }
+.mapping-preview { min-height: 22px; margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.mapping-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.close-help { margin-top: 18px; color: var(--muted); font-size: .82rem; text-align: center; }
+@media (max-width: 520px) { .mapping-shell { padding: 22px 18px; } .mapping-fields { grid-template-columns: 1fr; } .mapping-fields label { grid-column: auto; } }

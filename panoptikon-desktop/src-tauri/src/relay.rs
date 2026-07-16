@@ -215,6 +215,12 @@ pub struct PendingPairingView {
     pub server_url: String,
     pub roots: Vec<String>,
     pub expires_in_secs: u64,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingProgressView {
+    pub status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,7 +277,8 @@ pub struct RelayState {
     config_path: PathBuf,
     attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
     action_handler: ActionHandler,
-    attention_handler: AttentionHandler,
+    pairing_attention_handler: AttentionHandler,
+    mapping_attention_handler: AttentionHandler,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -320,14 +327,16 @@ impl RelayState {
         config: RelayConfig,
         config_path: PathBuf,
         action_handler: ActionHandler,
-        attention_handler: AttentionHandler,
+        pairing_attention_handler: AttentionHandler,
+        mapping_attention_handler: AttentionHandler,
     ) -> Self {
         Self {
             config: RwLock::new(config),
             config_path,
             attempts: Mutex::new(HashMap::new()),
             action_handler,
-            attention_handler,
+            pairing_attention_handler,
+            mapping_attention_handler,
         }
     }
 
@@ -380,6 +389,23 @@ impl RelayState {
                 })
                 .collect(),
         }
+    }
+
+    pub async fn pending_actions(&self) -> Vec<PendingActionView> {
+        self.status().await.pending_actions
+    }
+
+    pub async fn cancel_pending_actions(&self) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        for action in &mut config.actions {
+            if matches!(action.state, ActionRecordState::PendingMapping) {
+                action.state = ActionRecordState::Failed {
+                    code: "mapping_cancelled".into(),
+                    message: "Folder mapping was cancelled in Panoptikon Desktop".into(),
+                };
+            }
+        }
+        save_config(&self.config_path, &config)
     }
 
     pub async fn set_enabled(&self, enabled: bool) -> anyhow::Result<()> {
@@ -447,7 +473,13 @@ impl RelayState {
         config
             .pairing_operations
             .iter()
-            .filter(|item| matches!(item.state, PairingOperationState::Pending))
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    PairingOperationState::Pending
+                        | PairingOperationState::ApprovedUnconfirmed { .. }
+                )
+            })
             .map(|item| PendingPairingView {
                 id: item.id,
                 name: item.name.clone(),
@@ -456,11 +488,69 @@ impl RelayState {
                 roots: item.roots.clone(),
                 expires_in_secs: (item.created_unix + PAIRING_TTL.as_secs() as i64 - now).max(0)
                     as u64,
+                status: match item.state {
+                    PairingOperationState::Pending => "pending",
+                    PairingOperationState::ApprovedUnconfirmed { .. } => "finishing",
+                    _ => unreachable!("filtered to incomplete pairing states"),
+                },
             })
             .collect()
     }
 
+    pub async fn pairing_progress(&self, request_id: Uuid) -> Option<PairingProgressView> {
+        let config = self.config.read().await;
+        config
+            .pairing_operations
+            .iter()
+            .find(|item| item.id == request_id)
+            .map(|item| {
+                let status = match item.state {
+                    PairingOperationState::Pending => "pending",
+                    PairingOperationState::Rejected => "rejected",
+                    PairingOperationState::ApprovedUnconfirmed { .. } => "finishing",
+                    PairingOperationState::Complete { .. } => "complete",
+                };
+                PairingProgressView { status }
+            })
+    }
+
+    /// Closing the dedicated pairing window is an explicit cancellation.
+    /// Keep rejected tombstones long enough for polling browsers to observe
+    /// them and cancel their matching durable Server operations.
+    pub async fn cancel_incomplete_pairings(&self) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        let provisional_instances = config
+            .pairing_operations
+            .iter()
+            .filter_map(|item| match item.state {
+                PairingOperationState::ApprovedUnconfirmed { instance_id, .. } => Some(instance_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        config
+            .instances
+            .retain(|item| !provisional_instances.contains(&item.id));
+        for operation in &mut config.pairing_operations {
+            if matches!(
+                operation.state,
+                PairingOperationState::Pending | PairingOperationState::ApprovedUnconfirmed { .. }
+            ) {
+                operation.state = PairingOperationState::Rejected;
+            }
+        }
+        save_config(&self.config_path, &config)
+    }
+
+    #[cfg(test)]
     pub async fn approve(&self, request_id: Uuid) -> anyhow::Result<()> {
+        self.approve_with_mappings(request_id, Vec::new()).await
+    }
+
+    pub async fn approve_with_mappings(
+        &self,
+        request_id: Uuid,
+        mappings: Vec<PathMapping>,
+    ) -> anyhow::Result<()> {
         let mut config = self.config.write().await;
         prune_config(&mut config);
         let Some(index) = config
@@ -479,7 +569,15 @@ impl RelayState {
         let name = config.pairing_operations[index].name.clone();
         let origin = config.pairing_operations[index].origin.clone();
         let server_url = config.pairing_operations[index].server_url.clone();
-        let roots = config.pairing_operations[index].roots.clone();
+        for mapping in &mappings {
+            // Supplied roots are usability hints, not authorization. The
+            // user-approved mapping prefix is the actual Relay boundary and
+            // may narrow, broaden, or replace the suggestion entirely.
+            normalize_path(&mapping.remote)?;
+            if !mapping.local.trim().is_empty() {
+                normalize_path(&mapping.local)?;
+            }
+        }
         let mut secret = [0u8; 32];
         rand::rng().fill_bytes(&mut secret);
         let credential = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
@@ -509,11 +607,16 @@ impl RelayState {
             server_url,
             origins: vec![origin],
             credential_hash,
-            mappings: roots
+            // A root left blank in the pairing window is intentionally
+            // unmapped. Do not persist an empty local prefix: that would make
+            // translation appear to succeed and bypass the first-use mapping
+            // flow.
+            mappings: mappings
                 .into_iter()
-                .map(|remote| PathMapping {
-                    remote,
-                    local: String::new(),
+                .filter_map(|mapping| {
+                    let remote = mapping.remote.trim().to_owned();
+                    let local = mapping.local.trim().to_owned();
+                    (!local.is_empty()).then_some(PathMapping { remote, local })
                 })
                 .collect(),
         });
@@ -771,7 +874,7 @@ pub fn router(state: Arc<RelayState>) -> Router {
             "/v1/pairing/{id}/ack",
             post(ack_pairing).options(pairing_options),
         )
-        .route("/v1/auth/check", post(auth_check).options(action_options))
+        .route("/v1/auth/check", post(auth_check).options(auth_options))
         .route("/v1/actions", post(action).options(action_options))
         .route(
             "/v1/actions/{id}",
@@ -807,6 +910,17 @@ async fn pairing_options(headers: HeaderMap) -> Response {
         Err(response) => return response,
     };
     preflight(&origin, "GET, POST, DELETE, OPTIONS")
+}
+
+// Credential validation is also how a browser discovers that its pairing was
+// revoked. Its preflight must remain reachable after the paired instance has
+// been removed; the POST itself still requires and verifies the credential.
+async fn auth_options(headers: HeaderMap) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    preflight(&origin, "POST, OPTIONS")
 }
 
 async fn action_options(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Response {
@@ -884,6 +998,9 @@ async fn request_pairing(
                     Some(&origin),
                 );
             }
+            if matches!(existing.state, PairingOperationState::Pending) {
+                (state.pairing_attention_handler)();
+            }
             return with_cors(
                 (
                     StatusCode::ACCEPTED,
@@ -931,6 +1048,9 @@ async fn request_pairing(
                 Some(&origin),
             );
         }
+        if matches!(existing.state, PairingOperationState::Pending) {
+            (state.pairing_attention_handler)();
+        }
         return with_cors(
             (
                 StatusCode::ACCEPTED,
@@ -976,7 +1096,7 @@ async fn request_pairing(
         );
     }
     drop(config);
-    (state.attention_handler)();
+    (state.pairing_attention_handler)();
     with_cors(
         (
             StatusCode::ACCEPTED,
@@ -1154,10 +1274,34 @@ async fn auth_check(State(state): State<Arc<RelayState>>, headers: HeaderMap) ->
             );
         }
     };
-    let valid = state.config.read().await.instances.iter().any(|item| {
-        item.origins.iter().any(|allowed| allowed == &origin)
-            && verify_credential(&item.credential_hash, credential)
-    });
+    // Argon2 verification is deliberately expensive. Never hold the Relay
+    // configuration lock while doing it: local revocation and mapping edits
+    // must remain immediately responsive while a browser validates its saved
+    // credential.
+    let credential_candidates = {
+        let config = state.config.read().await;
+        config
+            .instances
+            .iter()
+            .filter(|item| item.origins.iter().any(|allowed| allowed == &origin))
+            .map(|item| (item.id, item.credential_hash.clone()))
+            .collect::<Vec<_>>()
+    };
+    let verified = credential_candidates
+        .iter()
+        .find(|(_, hash)| verify_credential(hash, credential));
+    // Revocation may complete while Argon2 runs. Re-check the verified
+    // instance under a short read lock so a pre-revocation snapshot cannot
+    // authenticate after the revoke command has returned.
+    let valid = if let Some((instance_id, credential_hash)) = verified {
+        state.config.read().await.instances.iter().any(|item| {
+            item.id == *instance_id
+                && item.credential_hash == credential_hash.as_str()
+                && item.origins.iter().any(|allowed| allowed == &origin)
+        })
+    } else {
+        false
+    };
     if valid {
         with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
     } else {
@@ -1259,7 +1403,7 @@ async fn action(
                 );
             }
             drop(config);
-            (state.attention_handler)();
+            (state.mapping_attention_handler)();
             return structured_error(
                 StatusCode::CONFLICT,
                 "mapping_required",
@@ -1667,7 +1811,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt as _;
 
     fn test_state(temp: &tempfile::TempDir) -> Arc<RelayState> {
@@ -1676,10 +1820,24 @@ mod tests {
             temp.path().join("relay.toml"),
             Arc::new(|_, _, _| Ok(())),
             Arc::new(|| {}),
+            Arc::new(|| {}),
         ))
     }
 
     fn pairing_request(origin: &str, name: &str) -> Request<Body> {
+        pairing_request_with_id(origin, name, Uuid::new_v4())
+    }
+
+    fn pairing_request_with_id(origin: &str, name: &str, operation_id: Uuid) -> Request<Body> {
+        pairing_request_with_roots(origin, name, operation_id, &[])
+    }
+
+    fn pairing_request_with_roots(
+        origin: &str,
+        name: &str,
+        operation_id: Uuid,
+        roots: &[&str],
+    ) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri("/v1/pairing/request")
@@ -1687,14 +1845,139 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "operation_id": Uuid::new_v4(),
+                    "operation_id": operation_id,
                     "name": name,
                     "origin": origin,
-                    "server_url": format!("{origin}/search")
+                    "server_url": format!("{origin}/search"),
+                    "roots": roots,
                 })
                 .to_string(),
             ))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retry_foregrounds_pending_pairing_and_window_close_rejects_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let attention_count = Arc::new(AtomicUsize::new(0));
+        let attention = attention_count.clone();
+        let state = Arc::new(RelayState::new(
+            RelayConfig::desktop_default(false),
+            temp.path().join("relay.toml"),
+            Arc::new(|_, _, _| Ok(())),
+            Arc::new(move || {
+                attention.fetch_add(1, Ordering::Release);
+            }),
+            Arc::new(|| {}),
+        ));
+        let operation_id = Uuid::new_v4();
+        for _ in 0..2 {
+            let response = router(state.clone())
+                .oneshot(pairing_request_with_id(
+                    "https://remote.example",
+                    "remote",
+                    operation_id,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        assert_eq!(attention_count.load(Ordering::Acquire), 2);
+
+        state.approve(operation_id).await.unwrap();
+        assert_eq!(
+            state.pairing_progress(operation_id).await.unwrap().status,
+            "finishing"
+        );
+        assert_eq!(state.status().await.instances.len(), 1);
+
+        state.cancel_incomplete_pairings().await.unwrap();
+        assert_eq!(
+            state.pairing_progress(operation_id).await.unwrap().status,
+            "rejected"
+        );
+        assert!(state.status().await.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pairing_saves_edited_roots_and_leaves_skipped_roots_unmapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let operation_id = Uuid::new_v4();
+        let response = router(state.clone())
+            .oneshot(pairing_request_with_roots(
+                "https://remote.example",
+                "remote",
+                operation_id,
+                &["/mapped", "/map-later"],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        state
+            .approve_with_mappings(
+                operation_id,
+                vec![
+                    PathMapping {
+                        remote: "/".into(),
+                        local: temp.path().display().to_string(),
+                    },
+                    PathMapping {
+                        remote: "/map-later".into(),
+                        local: String::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let status = state.status().await;
+        assert_eq!(status.instances.len(), 1);
+        assert_eq!(status.instances[0].mappings.len(), 1);
+        assert_eq!(status.instances[0].mappings[0].remote, "/");
+    }
+
+    #[tokio::test]
+    async fn auth_preflight_remains_available_after_revocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/auth/check")
+            .header(header::ORIGIN, "https://remote.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://remote.example"
+        );
+        assert!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                .to_str()
+                .unwrap()
+                .contains("Authorization")
+        );
+
+        // Privileged action preflights remain restricted to paired origins.
+        let action_request = Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/actions")
+            .header(header::ORIGIN, "https://remote.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state)
+                .oneshot(action_request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
@@ -2006,6 +2289,7 @@ mod tests {
                 Ok(())
             }),
             Arc::new(|| {}),
+            Arc::new(|| {}),
         ));
         let action_id = Uuid::new_v4();
         let action = || {
@@ -2073,6 +2357,7 @@ mod tests {
                 invoked_for_action.store(true, Ordering::Release);
                 Ok(())
             }),
+            Arc::new(|| {}),
             Arc::new(|| {}),
         ));
         let action_id = Uuid::new_v4();

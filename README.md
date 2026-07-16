@@ -99,8 +99,13 @@ Although large parts of the API are disabled in the public instance, you can sti
 
 Relay is built into Panoptikon Desktop and enabled by default. It lets a remote
 or containerized Panoptikon ask your computer to open a locally mounted copy of
-an indexed file. Start pairing from the remote web UI, approve the
-origin-bound request locally, then configure component-aware path mappings.
+an indexed file. Start pairing from the remote web UI, then approve the
+origin-bound request and any initial path mappings in Desktop's dedicated
+pairing window. The window stays open until the secure exchange finishes;
+closing it cancels the unfinished request. If a later file has no mapping,
+Desktop opens a dedicated mapping window and resumes the blocked action after
+the mapping is saved. Existing mappings and revocation remain available in
+Desktop Settings.
 Credentials are generated once, stored only as salted hashes by Desktop, and
 can be revoked at any time. Relay listens on loopback only and does not execute
 user-configurable shell commands. Desktop can run in Relay-only mode with its

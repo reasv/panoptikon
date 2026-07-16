@@ -9,5 +9,11 @@ fn main() {
     println!("cargo:rerun-if-changed=../dist/update.js");
     println!("cargo:rerun-if-changed=../dist/update.css");
     println!("cargo:rerun-if-changed=../dist/spinner_text.svg");
+    println!("cargo:rerun-if-changed=../dist/pairing.html");
+    println!("cargo:rerun-if-changed=../dist/pairing.js");
+    println!("cargo:rerun-if-changed=../dist/pairing.css");
+    println!("cargo:rerun-if-changed=../dist/mapping.html");
+    println!("cargo:rerun-if-changed=../dist/mapping.js");
+    println!("cargo:rerun-if-changed=../dist/mapping.css");
     tauri_build::build()
 }

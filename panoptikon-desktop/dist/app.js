@@ -208,20 +208,18 @@ function mappingEditor(item) {
     const mappings = [...card.querySelectorAll('.mapping-row')].map(row => { const inputs = row.querySelectorAll('input'); return { remote: inputs[0].value.trim(), local: inputs[1].value.trim() }; }).filter(mapping => mapping.remote);
     await invoke('relay_set_mappings', { instanceId: item.id, mappings }); await refresh();
   };
-  const revoke = document.createElement('button'); revoke.textContent = 'Revoke'; revoke.onclick = async () => { if (confirm(`Revoke Relay access for ${item.name}?`)) { await invoke('relay_revoke', { instanceId: item.id }); await refresh(); } };
-  card.append(add, save, revoke); return card;
-}
-function pendingMappingEditor(action) {
-  const card = document.createElement('article'); card.className = 'pending-mapping';
-  const title = document.createElement('strong'); title.textContent = action.action === 'open_file' ? 'Open File needs a folder mapping' : 'Show in Folder needs a folder mapping';
-  const exact = document.createElement('code'); exact.className = 'unmatched-path'; exact.textContent = action.remote_path;
-  const remote = document.createElement('input'); remote.value = action.suggested_remote_root; remote.placeholder = 'Server folder prefix';
-  const localRow = document.createElement('div'); localRow.className = 'picker-row'; const local = document.createElement('input'); local.placeholder = 'Matching local folder';
-  const choose = document.createElement('button'); choose.textContent = 'Choose folder…'; choose.onclick = async () => { const value = await invoke('choose_relay_folder'); if (value) local.value = value; }; localRow.append(local, choose);
-  const preview = document.createElement('p'); preview.className = 'muted'; preview.setAttribute('aria-live', 'polite');
-  const check = document.createElement('button'); check.textContent = 'Preview translation'; check.onclick = async () => { try { const result = await invoke('relay_mapping_preview', { actionId: action.id, remote: remote.value.trim(), local: local.value.trim() }); preview.textContent = `${result.translated_path} — ${result.exists ? 'file exists' : 'file does not exist'}`; preview.className = result.exists ? 'success' : 'inline-error'; } catch (error) { preview.textContent = String(error); preview.className = 'inline-error'; } };
-  const save = document.createElement('button'); save.className = 'primary'; save.textContent = 'Save mapping and continue'; save.onclick = async () => { try { const result = await invoke('relay_mapping_preview', { actionId: action.id, remote: remote.value.trim(), local: local.value.trim() }); if (!result.exists) throw new Error('The translated file does not exist.'); await invoke('relay_resolve_mapping', { actionId: action.id, remote: remote.value.trim(), local: local.value.trim() }); await refresh(); } catch (error) { fail(error); } };
-  card.append(title, document.createTextNode('Panoptikon requested:'), exact, remote, localRow, preview, check, save); return card;
+  const revoke = document.createElement('button'); revoke.textContent = 'Revoke'; revoke.onclick = async () => {
+    if (!confirm(`Revoke Relay access for ${item.name}?`)) return;
+    const status = byId('relay-management-status'); const buttons = [...card.querySelectorAll('button')];
+    buttons.forEach(button => { button.disabled = true; }); revoke.textContent = 'Revoking…'; status.className = 'command-status muted'; status.textContent = `Revoking ${item.name}…`;
+    try {
+      await invoke('relay_revoke', { instanceId: item.id }); card.remove(); status.className = 'command-status success'; status.textContent = `${item.name} was revoked. Return to the Panoptikon page to pair again.`;
+    } catch (error) {
+      buttons.forEach(button => { button.disabled = false; }); revoke.textContent = 'Revoke'; status.className = 'command-status inline-error'; status.textContent = `Could not revoke ${item.name}.`; fail(error);
+    }
+  };
+  const actions = document.createElement('div'); actions.className = 'button-row mapping-actions'; actions.append(add, save, revoke);
+  card.append(actions); return card;
 }
 let serverConfiguration = null;
 let serverConfigurationDirty = false;
@@ -379,19 +377,10 @@ async function refresh() {
       : 'Choose the folders and indexing options for your first database.';
     byId('setup-button').textContent = databaseReady ? 'Create New Database' : 'Continue Setup';
     byId('logs').textContent = (await invoke('log_tail', { lines: 150 })).join('\n') || 'No log entries yet.';
-    const pending = await invoke('relay_pending');
     const relayStatus = await invoke('relay_status');
     byId('relay-enabled').checked = relayStatus.enabled;
     if (!byId('file-commands').children.length) commandEditor(byId('file-commands'), await invoke('file_action_commands'));
-    byId('relay').replaceChildren(...pending.map((item) => {
-      const row = document.createElement('p');
-      row.textContent = `${item.name} — ${item.origin}. Suggested roots: ${item.roots.length ? item.roots.join(', ') : 'none'} `;
-      const approve = document.createElement('button'); approve.textContent = 'Approve'; approve.onclick = () => invoke('relay_approve', { requestId: item.id }).then(refresh).catch(fail);
-      const reject = document.createElement('button'); reject.textContent = 'Reject'; reject.onclick = () => invoke('relay_reject', { requestId: item.id }).then(refresh).catch(fail);
-      row.append(approve, reject); return row;
-    }));
     if (!byId('relay-instances').contains(document.activeElement)) byId('relay-instances').replaceChildren(...relayStatus.instances.map(mappingEditor));
-    if (!byId('pending-mappings').contains(document.activeElement)) byId('pending-mappings').replaceChildren(...relayStatus.pending_actions.map(pendingMappingEditor));
   } catch (error) { fail(error); }
 }
 document.addEventListener('click', async (event) => {

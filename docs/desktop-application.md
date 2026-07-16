@@ -692,8 +692,9 @@ The v1 protocol MUST provide:
 - unauthenticated health/version discovery that exposes no paths or secrets;
 - a rate-limited pairing request carrying a proposed instance name, origin, and
   server URL;
-- a pending pairing state visible in Desktop;
-- explicit local approval or rejection in a Tauri control window;
+- a pending pairing state visible in a dedicated Desktop pairing window;
+- explicit local approval or rejection, with optional initial root mappings,
+  in that window;
 - durable, idempotent Server and Relay operation records;
 - issuance of a unique, recoverable-until-acknowledged credential after approval;
 - explicit idempotent acknowledgement after Server persistence;
@@ -743,8 +744,14 @@ redacted/mapped path information. Credentials are never logged.
 
 The existing browser-local `relayConfigState` (`enabled`, URL, API key) and
 direct `/open` request are replaced. The main UI gains a Relay pairing/status
-surface and uses the new protocol. No automatic migration from the old local
-storage values, `panoptikon-relay/config.toml`, or `token.txt` is required.
+surface and uses the new protocol. Approval runs in a dedicated Desktop window
+that stays open through acknowledgement; it is not part of Settings, and
+closing it cancels the unfinished pairing. The same window collects optional
+initial mappings. A missing mapping later opens a separate, dedicated mapping
+window which resumes the blocked file action after saving and cancels it when
+closed. General Settings continues to provide persistent mapping editing and
+pairing revocation. No automatic migration from the old local storage values,
+`panoptikon-relay/config.toml`, or `token.txt` is required.
 
 The old repository SHOULD be archived with a README pointing to Panoptikon
 Desktop's Relay-only mode after the replacement ships.

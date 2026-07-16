@@ -75,9 +75,7 @@
           <section class="card" aria-labelledby="file-opening-title"><div class="card-heading"><div><h3 id="file-opening-title">File opening</h3><p>Choose the application or command used when Panoptikon opens a file, its folder, or a terminal.</p></div></div><div id="file-commands"></div><div class="button-row form-actions"><button id="save-file-commands" class="primary">Save file-opening settings</button><span id="file-command-status" class="success" aria-live="polite"></span></div></section>
           <section class="card" aria-labelledby="relay-title">
             <div class="card-heading"><div><h3 id="relay-title">Relay</h3><p>Allow an approved Panoptikon website—such as one running on a NAS—to open indexed files that are mounted on this computer. Relay listens only on loopback.</p></div><label class="switch"><span class="switch-label">Enable Relay</span><input id="relay-enabled" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></label></div>
-            <div class="relay-group"><h4>Pairing requests</h4><p class="section-help">Approve only endpoints you recognize.</p><div id="relay"></div></div>
-            <div class="relay-group"><h4>Waiting for folder mapping</h4><p class="section-help">Match a remote indexed path to its location on this computer.</p><div id="pending-mappings"></div></div>
-            <div class="relay-group"><h4>Paired endpoints and mappings</h4><div id="relay-instances"></div></div>
+            <div class="relay-group"><h4>Paired endpoints and mappings</h4><p id="relay-management-status" class="command-status" aria-live="polite"></p><div id="relay-instances"></div></div>
           </section>
         </div>
 

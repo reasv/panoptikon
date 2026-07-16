@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pair with Panoptikon Relay</title>
+    <link rel="stylesheet" href="styles.css?v=8" />
+    <link rel="stylesheet" href="pairing.css?v=2" />
+  </head>
+  <body>
+    <main class="pairing-shell">
+      <header>
+        <div class="pairing-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M8 12h8M9 7H6a5 5 0 0 0 0 10h3M15 7h3a5 5 0 0 1 0 10h-3" /></svg>
+        </div>
+        <div><p class="eyebrow">Panoptikon Desktop</p><h1>Relay pairing</h1></div>
+      </header>
+      <p class="intro">A Panoptikon endpoint wants permission to open files and reveal folders on this computer. Approve only an endpoint you recognize.</p>
+      <div id="error" role="alert" hidden></div>
+      <section id="requests" aria-live="polite"><p class="muted">Loading pairing request…</p></section>
+      <p class="close-help">Closing this window cancels every unfinished request.</p>
+    </main>
+    <script src="pairing.js?v=2"></script>
+  </body>
+</html>
