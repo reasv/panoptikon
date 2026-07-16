@@ -40,9 +40,9 @@ own.
 
 | Platform | Download |
 | --- | --- |
-| **Windows** · x86-64 | (coming soon) |
-| **Linux** · x86-64 | (coming soon) |
-| **macOS** · Apple Silicon | (coming soon) |
+| **Windows** · x86-64 | [`Panoptikon-Desktop-windows-x86_64.exe`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-windows-x86_64.exe) |
+| **Linux** · x86-64 | [`Panoptikon-Desktop-linux-x86_64.AppImage`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-linux-x86_64.AppImage) |
+| **macOS** · Apple Silicon | [`Panoptikon-Desktop-macos-aarch64.dmg`](https://github.com/reasv/panoptikon/releases/latest/download/Panoptikon-Desktop-macos-aarch64.dmg) |
 
 Windows and macOS builds are intentionally not code-signed/notarized in this
 initial release, so the operating system may show an unknown-publisher warning.
