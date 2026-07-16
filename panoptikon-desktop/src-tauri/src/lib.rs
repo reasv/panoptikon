@@ -318,7 +318,6 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         .separator()
         .item(&restart)
         .item(&local)
-        .text("relay", "Relay…")
         .text("settings", "Desktop Settings…")
         .text("logs", "View Logs")
         .text("data", "Open Data Folder")
@@ -370,7 +369,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
                 }
             });
         }
-        "relay" | "settings" => {
+        "settings" => {
             let _ = show_control_window(app, true);
         }
         "logs" => {

@@ -410,7 +410,6 @@ Status: <state>                 (disabled informational item)
 
 Restart Panoptikon
 Run Local Panoptikon            (check item)
-Relay…
 Desktop Settings…
 View Logs
 Open Data Folder
