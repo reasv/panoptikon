@@ -31,7 +31,11 @@
 //! round-tripped through a number).
 
 use anyhow::{Context, Result, bail};
-use std::{collections::HashMap, path::Path, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 
 static INHERITED_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
 
@@ -40,6 +44,48 @@ static INHERITED_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new(
 /// Desktop-managed value cannot fall back to a stale startup copy.
 pub fn capture_inherited_environment() {
     let _ = INHERITED_ENVIRONMENT.set(std::env::vars().collect());
+}
+
+/// Load the root `.env` into the process environment (dotenv convention:
+/// variables already set in the inherited environment win). Malformed lines
+/// are skipped, not fatal — one stray line must not disable the file.
+/// Returns the diagnostics for the caller to log later: this runs before
+/// logging init because `.env` may configure logging itself.
+pub fn load_process_dotenv() -> Vec<String> {
+    let path = Path::new(".env");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => return vec![format!("failed to read {}: {error}", path.display())],
+    };
+    let parsed = panoptikon_config::parse_dotenv(&source);
+    for (key, value) in parsed.values {
+        if std::env::var_os(&key).is_none() {
+            // SAFETY: startup, at the call site the dotenvy loader used to
+            // occupy — nothing reads the environment concurrently yet.
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+    parsed
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| format!("{}: {diagnostic}", path.display()))
+        .collect()
+}
+
+/// Log each unique `.env` diagnostic once per process: the environment
+/// snapshot is re-read per worker spawn and per external-inputs poll, and
+/// repeating the same warning for every request would drown the log.
+pub fn warn_dotenv_diagnostics(messages: &[String]) {
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut reported = REPORTED.get_or_init(Default::default).lock().unwrap();
+    for message in messages {
+        if reported.insert(message.clone()) {
+            tracing::warn!("{message}");
+        }
+    }
 }
 
 /// A just-in-time environment snapshot used for inference worker creation.
@@ -60,13 +106,17 @@ impl EnvironmentSnapshot {
         let mut dotenv = HashMap::new();
         let path = Path::new(".env");
         if path.is_file() {
-            for item in dotenvy::from_path_iter(path)
-                .with_context(|| format!("failed to read {}", path.display()))?
-            {
-                let (key, value) =
-                    item.with_context(|| format!("failed to parse {}", path.display()))?;
-                dotenv.insert(key, value);
-            }
+            let source = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let parsed = panoptikon_config::parse_dotenv(&source);
+            warn_dotenv_diagnostics(
+                &parsed
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{}: {diagnostic}", path.display()))
+                    .collect::<Vec<_>>(),
+            );
+            dotenv.extend(parsed.values);
         }
         let mut values;
         if desktop_managed {

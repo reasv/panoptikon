@@ -125,8 +125,9 @@ async fn async_main() -> anyhow::Result<()> {
     env_template::capture_inherited_environment();
     // `.env` still auto-loads: it is how users populate the env vars that
     // config templating (`${VAR}` in TOML values) references, and children
-    // (inference workers, the UI server) inherit it.
-    dotenvy::dotenv().ok();
+    // (inference workers, the UI server) inherit it. Malformed lines are
+    // skipped and reported once logging is up, never fatal.
+    let dotenv_diagnostics = env_template::load_process_dotenv();
 
     let config_path = args
         .config
@@ -163,6 +164,7 @@ async fn async_main() -> anyhow::Result<()> {
     for message in &first_run_messages {
         tracing::info!("{message}");
     }
+    env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
     settings.log_warnings();
 
     // Policy-token HMAC key: random per boot unless [server]

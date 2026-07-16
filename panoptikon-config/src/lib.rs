@@ -479,6 +479,118 @@ fn encode_dotenv_value(value: &str) -> String {
     )
 }
 
+/// Parsed `.env` content: assignments in file order plus diagnostics for the
+/// lines that could not be parsed. Parsing never fails as a whole — a
+/// malformed line is skipped and reported, so it cannot take every other
+/// value in the file down with it.
+#[derive(Debug, Clone)]
+pub struct DotenvParse {
+    /// `(key, value)` in file order; collect into a map for last-wins.
+    pub values: Vec<(String, String)>,
+    /// One message per skipped line, naming the line number and reason but
+    /// never echoing the line's text (values may hold secrets).
+    pub diagnostics: Vec<String>,
+}
+
+/// Parse `.env` text with shell/docker-compose-style literal semantics:
+///
+/// - Unquoted values are literal — no escape processing, so Windows paths
+///   like `DIRS=C:\msys64\mingw64\bin` parse as written. An inline comment
+///   starts at a `#` preceded by whitespace; quote the value to keep ` #`.
+/// - `'single-quoted'` values are fully literal.
+/// - `"double-quoted"` values decode `\\`, `\"`, `\'`, `\$`, `\n`, `\r` and
+///   `\t`; an unrecognized escape is kept literally instead of rejected.
+/// - `export KEY=value`, whitespace around `=`, blank lines, `#` comments,
+///   and a leading UTF-8 BOM are accepted; later duplicate keys win.
+/// - No `$VAR` interpolation: values are always literal. Templating belongs
+///   to the TOML config layer (`${VAR}` placeholders), not the file itself.
+pub fn parse_dotenv(source: &str) -> DotenvParse {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut values = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let number = index + 1;
+        let Some(equals) = line.find('=') else {
+            diagnostics.push(format!(
+                "line {number}: not a KEY=value assignment (line skipped)"
+            ));
+            continue;
+        };
+        let mut key = line[..equals].trim_end();
+        if let Some(exported) = key.strip_prefix("export ") {
+            key = exported.trim_start();
+        }
+        if !is_env_name(key) {
+            diagnostics.push(format!(
+                "line {number}: invalid variable name before '=' (line skipped)"
+            ));
+            continue;
+        }
+        match parse_dotenv_value(line[equals + 1..].trim_start()) {
+            Ok(value) => values.push((key.to_owned(), value)),
+            Err(reason) => {
+                diagnostics.push(format!("line {number} ({key}): {reason} (line skipped)"));
+            }
+        }
+    }
+    DotenvParse {
+        values,
+        diagnostics,
+    }
+}
+
+fn parse_dotenv_value(text: &str) -> Result<String, String> {
+    let mut characters = text.char_indices();
+    let Some((_, quote @ ('\'' | '"'))) = characters.next() else {
+        // Unquoted: literal up to an inline comment (`#` after whitespace).
+        let mut end = text.len();
+        let mut after_whitespace = false;
+        for (index, character) in text.char_indices() {
+            if character == '#' && after_whitespace {
+                end = index;
+                break;
+            }
+            after_whitespace = character.is_whitespace();
+        }
+        return Ok(text[..end].trim_end().to_owned());
+    };
+    let mut output = String::new();
+    let mut escaped = false;
+    for (index, character) in characters {
+        if escaped {
+            escaped = false;
+            match character {
+                '\\' | '"' | '\'' | '$' => output.push(character),
+                'n' => output.push('\n'),
+                'r' => output.push('\r'),
+                't' => output.push('\t'),
+                // An unknown escape stays literal rather than rejecting the
+                // line: erroring on `\m` in a Windows path is exactly the
+                // trap this parser exists to remove.
+                other => {
+                    output.push('\\');
+                    output.push(other);
+                }
+            }
+        } else if quote == '"' && character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            let tail = text[index + 1..].trim_start();
+            if tail.is_empty() || tail.starts_with('#') {
+                return Ok(output);
+            }
+            return Err("unexpected text after the closing quote".into());
+        } else {
+            output.push(character);
+        }
+    }
+    Err("unterminated quoted value".into())
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_with_mode(path, bytes, None)
 }
@@ -701,5 +813,118 @@ mod tests {
         fs::write(&path, "old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "new");
+    }
+
+    /// The regression this parser exists for: an unquoted Windows path is
+    /// literal — dotenvy treated `\m` as an invalid escape and rejected the
+    /// whole file.
+    #[test]
+    fn dotenv_parse_keeps_unquoted_windows_paths_literal() {
+        let parsed = parse_dotenv("WEASYPRINT_DLL_DIRECTORIES=C:\\msys64\\mingw64\\bin\n");
+        assert_eq!(parsed.diagnostics, Vec::<String>::new());
+        assert_eq!(
+            parsed.values,
+            vec![(
+                "WEASYPRINT_DLL_DIRECTORIES".into(),
+                "C:\\msys64\\mingw64\\bin".into()
+            )]
+        );
+    }
+
+    /// Quoting forms: single quotes are fully literal, double quotes decode
+    /// the writer's escapes, and an unknown double-quote escape stays
+    /// literal instead of rejecting the line.
+    #[test]
+    fn dotenv_parse_quoting_forms() {
+        let parsed = parse_dotenv(concat!(
+            "SINGLE='C:\\msys64\\mingw64\\bin'\n",
+            "DOUBLE=\"a\\\\b \\\"q\\\" \\n\\r\\t\\$\"\n",
+            "UNKNOWN_ESCAPE=\"C:\\msys64\"\n",
+        ));
+        assert_eq!(parsed.diagnostics, Vec::<String>::new());
+        assert_eq!(
+            parsed.values,
+            vec![
+                ("SINGLE".into(), "C:\\msys64\\mingw64\\bin".into()),
+                ("DOUBLE".into(), "a\\b \"q\" \n\r\t$".into()),
+                ("UNKNOWN_ESCAPE".into(), "C:\\msys64".into()),
+            ]
+        );
+    }
+
+    /// Everything `encode_dotenv_value` can emit parses back to the original
+    /// value (the Desktop settings writer and the readers share the format).
+    #[test]
+    fn dotenv_parse_round_trips_writer_encoding() {
+        for value in [
+            "C:\\msys64\\mingw64\\bin",
+            "with \"quotes\" and 'single'",
+            "line\nbreak\rreturn",
+            "trailing backslash \\",
+            "",
+            "  spaced  ",
+            "hash # inside",
+        ] {
+            let line = format!("KEY={}", encode_dotenv_value(value));
+            let parsed = parse_dotenv(&line);
+            assert_eq!(parsed.diagnostics, Vec::<String>::new(), "{line}");
+            assert_eq!(parsed.values, vec![("KEY".into(), value.into())], "{line}");
+        }
+    }
+
+    /// Structure tolerance: BOM, blank lines, full-line and inline comments,
+    /// `export`, whitespace around `=`, empty values, `#` without preceding
+    /// whitespace staying part of the value, and later duplicates winning.
+    #[test]
+    fn dotenv_parse_structure_and_comments() {
+        let parsed = parse_dotenv(concat!(
+            "\u{feff}# full-line comment\n",
+            "\n",
+            "export EXPORTED = value # trailing comment\n",
+            "ANCHOR=a#not-a-comment\n",
+            "EMPTY=\n",
+            "DUP=first\n",
+            "DUP=second\n",
+        ));
+        assert_eq!(parsed.diagnostics, Vec::<String>::new());
+        assert_eq!(
+            parsed.values,
+            vec![
+                ("EXPORTED".into(), "value".into()),
+                ("ANCHOR".into(), "a#not-a-comment".into()),
+                ("EMPTY".into(), String::new()),
+                ("DUP".into(), "first".into()),
+                ("DUP".into(), "second".into()),
+            ]
+        );
+    }
+
+    /// Malformed lines are skipped with a diagnostic naming the line number
+    /// — never echoing the line's content — while every other line still
+    /// parses.
+    #[test]
+    fn dotenv_parse_skips_malformed_lines_without_echoing_values() {
+        let parsed = parse_dotenv(concat!(
+            "GOOD=one\n",
+            "C:\\msys64\\mingw64\\bin\n",
+            "9BAD=x\n",
+            "OPEN=\"secret-never-closed\n",
+            "ALSO_GOOD=two\n",
+        ));
+        assert_eq!(
+            parsed.values,
+            vec![
+                ("GOOD".into(), "one".into()),
+                ("ALSO_GOOD".into(), "two".into()),
+            ]
+        );
+        assert_eq!(parsed.diagnostics.len(), 3);
+        assert!(parsed.diagnostics[0].contains("line 2"), "{parsed:?}");
+        assert!(parsed.diagnostics[1].contains("line 3"), "{parsed:?}");
+        assert!(parsed.diagnostics[2].contains("line 4"), "{parsed:?}");
+        for diagnostic in &parsed.diagnostics {
+            assert!(!diagnostic.contains("msys64"), "{diagnostic}");
+            assert!(!diagnostic.contains("secret"), "{diagnostic}");
+        }
     }
 }

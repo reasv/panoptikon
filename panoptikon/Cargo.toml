@@ -83,7 +83,6 @@ axum-extra = { version = "0.12.5", features = ["query"] }
 sqlite-vec = "0.1.7-alpha.2"
 libsqlite3-sys = "0.28"
 base64 = "0.22"
-dotenvy = "0.15"
 tempfile = "3"
 ractor = "0.15"
 blurhash = "0.2.3"

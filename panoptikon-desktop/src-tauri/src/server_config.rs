@@ -743,15 +743,18 @@ fn resolved_string(
 
 fn environment_values(path: &Path) -> Result<BTreeMap<String, String>> {
     let mut values = std::env::vars().collect::<BTreeMap<_, _>>();
-    match dotenvy::from_path_iter(path) {
-        Ok(iter) => {
-            for item in iter {
-                let (key, value) = item?;
-                values.insert(key, value);
+    match fs::read_to_string(path) {
+        Ok(source) => {
+            let parsed = panoptikon_config::parse_dotenv(&source);
+            for diagnostic in &parsed.diagnostics {
+                tracing::warn!("{}: {diagnostic}", path.display());
             }
+            values.extend(parsed.values);
         }
-        Err(error) if error.not_found() => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
     }
     Ok(values)
 }
