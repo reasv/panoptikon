@@ -45,7 +45,9 @@ jobs:
             bin: target/release/panoptikon
             server_asset: panoptikon-server-macos-aarch64
             triple: aarch64-apple-darwin
-            desktop_bundle: dmg
+            # "app" is required alongside dmg: it is the updater-enabled
+            # target that produces the signed .app.tar.gz payload.
+            desktop_bundle: app,dmg
             desktop_asset: Panoptikon-Desktop-macos-aarch64.dmg
             updater_asset: panoptikon-desktop-updater-macos-aarch64.app.tar.gz
 
@@ -143,6 +145,9 @@ jobs:
           "$BIN" > gateway.log 2>&1 &
           GW_PID=$!
           trap 'kill $GW_PID 2>/dev/null || true' EXIT
+          # Any failed assertion below aborts via set -e; dump the gateway
+          # log so the failure is diagnosable from the CI log alone.
+          trap 'echo "--- gateway.log ---"; cat gateway.log || true' ERR
 
           echo "Waiting for the gateway..."
           for i in $(seq 1 60); do
