@@ -38,6 +38,10 @@ WORKDIR /src
 COPY .cargo/ .cargo/
 COPY Cargo.toml Cargo.lock ./
 COPY panoptikon/ panoptikon/
+# All workspace members must be present for cargo to load the workspace,
+# even though only -p panoptikon is built.
+COPY panoptikon-config/ panoptikon-config/
+COPY panoptikon-desktop/src-tauri/ panoptikon-desktop/src-tauri/
 COPY python/ python/
 COPY config/ config/
 COPY --from=ui-build /ui/.next/standalone /ui-bundle

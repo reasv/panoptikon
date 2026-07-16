@@ -821,17 +821,20 @@ fn send_clickable_notification(app: &AppHandle, title: &str, body: &str) {
     let app_handle = app.clone();
     let title = title.to_owned();
     let body = body.to_owned();
+    #[cfg(windows)]
     let identifier = app.config().identifier.clone();
     let product_name = app.package_info().name.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut notification = notify_rust::Notification::new();
         notification
             .appname(&product_name)
-            .app_id(&identifier)
             .summary(&title)
             .body(&body)
             .auto_icon()
             .action("open", "Open Panoptikon");
+        // app_id ties the toast to the installed shortcut; Windows-only API.
+        #[cfg(windows)]
+        notification.app_id(&identifier);
         match notification.show() {
             Ok(handle) => {
                 let clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -1284,11 +1284,13 @@ async fn notify_update(app: AppHandle, version: String) {
         let mut notification = notify_rust::Notification::new();
         notification
             .appname(&notification_app.package_info().name)
-            .app_id(&notification_app.config().identifier)
             .summary(&title)
             .body("Review what is new and install when you are ready.")
             .auto_icon()
             .action("update", "View update");
+        // app_id ties the toast to the installed shortcut; Windows-only API.
+        #[cfg(windows)]
+        notification.app_id(&notification_app.config().identifier);
         match notification.show() {
             Ok(handle) => {
                 let _ = accepted_tx.send(true);

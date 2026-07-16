@@ -16,6 +16,8 @@ scripts
 tools
 static
 panoptikon/data
+panoptikon-desktop/src-tauri/binaries
+panoptikon-desktop/src-tauri/gen
 python/.venv
 python/tests
 .venv
