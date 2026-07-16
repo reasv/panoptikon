@@ -332,7 +332,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         .separator()
         .item(&restart)
         .item(&local)
-        .text("settings", "Desktop Settings…")
+        .text("settings", "Settings…")
         .text("logs", "View Logs")
         .text("data", "Open Data Folder")
         .item(&updates)
