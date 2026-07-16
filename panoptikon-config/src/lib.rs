@@ -571,21 +571,33 @@ fn replace_file(temp: &Path, target: &Path) -> Result<()> {
     };
     let temp: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
     let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let succeeded = unsafe {
-        MoveFileExW(
-            temp.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if succeeded == 0 {
-        bail!(
-            "failed to commit configuration '{}': {}",
-            PathBuf::from(String::from_utf16_lossy(&target[..target.len() - 1])).display(),
-            std::io::Error::last_os_error()
-        );
+    // Antivirus and search indexers briefly hold freshly written files open
+    // without delete sharing, making the rename fail with ERROR_ACCESS_DENIED
+    // (5) or ERROR_SHARING_VIOLATION (32). Retry those for a bounded ~1.5s.
+    let mut delay = std::time::Duration::from_millis(10);
+    for attempt in 0..10 {
+        let succeeded = unsafe {
+            MoveFileExW(
+                temp.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if attempt == 9 || !matches!(error.raw_os_error(), Some(5) | Some(32)) {
+            bail!(
+                "failed to commit configuration '{}': {}",
+                PathBuf::from(String::from_utf16_lossy(&target[..target.len() - 1])).display(),
+                error
+            );
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_millis(250));
     }
-    Ok(())
+    unreachable!("the final rename attempt either returned or bailed")
 }
 
 #[cfg(unix)]
