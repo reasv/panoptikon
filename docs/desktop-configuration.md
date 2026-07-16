@@ -120,7 +120,9 @@ as interchangeable “preload/prewarm” switches.
 - Folder selection, file types, continuous scanning, schedules, job settings,
   filters, and model preload/prewarm remain per database.
 - Desktop enablement, start-at-login, Relay, updates, and diagnostics are shell
-  preferences, not Server TOML.
+  preferences, not Server TOML. “Start Panoptikon automatically” is available
+  on the control window's Overview tab as well as from the tray menu; both
+  surfaces reflect the operating system's current login-item state.
 
 ## Intentionally text-only global settings
 

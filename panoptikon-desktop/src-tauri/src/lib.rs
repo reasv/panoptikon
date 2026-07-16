@@ -300,7 +300,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
     let autostart = CheckMenuItem::with_id(
         app,
         "autostart",
-        "Start at Login",
+        "Start Panoptikon automatically",
         true,
         autostart_enabled,
         None::<&str>,
@@ -967,6 +967,12 @@ async fn open_panoptikon_page(
 async fn get_status(window: WebviewWindow, app: AppHandle) -> Result<StatusSnapshot, String> {
     validate_control(&window)?;
     let mut snapshot = app.state::<Arc<Supervisor>>().snapshot().await;
+    match app.autolaunch().is_enabled() {
+        Ok(enabled) => snapshot.start_at_login = enabled,
+        Err(error) => {
+            tracing::debug!(%error, "could not refresh Start at Login status");
+        }
+    }
     if snapshot.local_server_enabled && snapshot.state == LifecycleState::Ready {
         match fetch_setup_status(snapshot.port).await {
             Ok(status) => snapshot.default_database_ready = Some(status.ready),
@@ -1837,5 +1843,18 @@ mod tests {
         assert!(update_js.contains("presentation === 'failed'"));
         assert!(update_js.contains("formatPublishedAt(next.published_at)"));
         assert!(include_str!("../../dist/update.html").contains("id=\"published\""));
+    }
+
+    #[test]
+    fn overview_exposes_start_at_login_setting() {
+        let control_html = include_str!("../../dist/index.html");
+        let control_js = include_str!("../../dist/app.js");
+        assert!(control_html.contains("id=\"start-at-login\""));
+        assert!(control_html.contains(">Startup and updates</h3>"));
+        assert!(control_html.contains("Start Panoptikon automatically"));
+        assert!(control_html.contains("Run in the background when you sign in</small>"));
+        assert!(!control_html.contains("Desktop startup"));
+        assert!(control_js.contains("byId('start-at-login').checked = status.start_at_login"));
+        assert!(control_js.contains("invoke('set_start_at_login', { enabled })"));
     }
 }

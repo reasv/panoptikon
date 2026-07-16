@@ -369,6 +369,7 @@ async function refresh() {
     byId('root').textContent = status.server_root;
     byId('port').textContent = status.port;
     byId('local').checked = status.local_server_enabled;
+    byId('start-at-login').checked = status.start_at_login;
     if (!serverConfiguration) await loadServerConfiguration();
     showUpdate(await invoke('get_update_state'));
     const databaseReady = status.default_database_ready === true;
@@ -427,6 +428,11 @@ byId('local').addEventListener('change', async (event) => {
   const enabled = event.target.checked;
   if (!enabled && !confirm('Stop and disable the local Panoptikon Server? Relay and Desktop will remain available.')) { event.target.checked = true; return; }
   try { await invoke('set_local_server_enabled', { enabled, confirmed: true }); await refresh(); } catch (error) { fail(error); }
+});
+byId('start-at-login').addEventListener('change', async (event) => {
+  const enabled = event.target.checked;
+  try { await invoke('set_start_at_login', { enabled }); }
+  catch (error) { event.target.checked = !enabled; fail(error); }
 });
 byId('relay-enabled').addEventListener('change', async (event) => {
   try { await invoke('set_relay_enabled', { enabled: event.target.checked }); await refresh(); } catch (error) { event.target.checked = !event.target.checked; fail(error); }

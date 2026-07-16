@@ -32,9 +32,11 @@
             <div class="card-heading"><div><h3 id="setup-title">Set Up Panoptikon</h3><p id="setup-description">Choose the folders and indexing options for your first database.</p></div></div>
             <div class="button-row"><button id="setup-button" data-action="setup" class="primary">Continue Setup</button></div>
           </section>
-          <section id="updates" class="card" aria-labelledby="updates-title">
-            <div class="card-heading"><div><h3 id="updates-title">Desktop updates</h3><p id="update-version">Loading update status…</p><p id="update-last-check" class="muted"></p><p id="update-error" class="inline-error" hidden></p></div></div>
-            <div class="setting-row compact"><div class="setting-copy"><strong>Automatic update checks</strong><small>Check periodically and notify you when a Desktop update is available.</small></div><label class="switch icon-only"><input id="automatic-updates" type="checkbox" aria-label="Check for updates automatically" /><span class="switch-control" aria-hidden="true"></span></label></div>
+          <section id="updates" class="card" aria-labelledby="startup-updates-title">
+            <div class="card-heading"><div><h3 id="startup-updates-title">Startup and updates</h3></div></div>
+            <div class="setting-row compact"><div class="setting-copy"><label for="start-at-login">Start Panoptikon automatically</label><small>Run in the background when you sign in</small></div><label class="switch icon-only"><input id="start-at-login" type="checkbox" aria-label="Start Panoptikon automatically" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div class="setting-row compact"><div class="setting-copy"><strong>Automatic update checks</strong><small>Check periodically and notify you when a Desktop update is available</small></div><label class="switch icon-only"><input id="automatic-updates" type="checkbox" aria-label="Check for updates automatically" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <h4>Update status</h4><p id="update-version">Loading update status…</p><p id="update-last-check" class="muted"></p><p id="update-error" class="inline-error" hidden></p>
             <div class="button-row"><button id="check-updates" data-action="updates">Check now</button><button id="view-update" class="primary" hidden>View update</button></div>
           </section>
         </div>
@@ -85,6 +87,6 @@
         </div>
       </div>
     </main>
-    <script src="app.js?v=5"></script>
+    <script src="app.js?v=6"></script>
   </body>
 </html>

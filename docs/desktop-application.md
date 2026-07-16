@@ -416,7 +416,7 @@ View Logs
 Open Data Folder
 Check for Updates…
 
-Start at Login                 (check item)
+Start Panoptikon automatically  (check item)
 Quit Panoptikon
 ```
 
@@ -432,8 +432,9 @@ Requirements:
   Relay when enabled, flushes logs, and exits Tauri.
 - Closing a control window hides/destroys that window as appropriate but does
   not quit Desktop.
-- “Start at Login” is opt-in and user-scoped. It launches Desktop with a
-  background activation flag and never opens a browser at login.
+- “Start Panoptikon automatically” is opt-in and user-scoped. It launches
+  Desktop in the background and never opens a browser at login. The same
+  setting is exposed on the control window's Overview tab and in the tray menu.
 - Desktop startup MUST NOT request administrator privileges.
 
 Linux tray interaction has platform limitations; the context menu is the
