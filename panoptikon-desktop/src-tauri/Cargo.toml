@@ -1,6 +1,6 @@
 [package]
 name = "panoptikon-desktop"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Panoptikon Desktop tray, supervisor, updater, and Relay"
