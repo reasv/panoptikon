@@ -32,6 +32,9 @@ const RATE_LIMIT: usize = 5;
 const MAX_PENDING: usize = 10;
 const MAX_ACTION_RECORDS: usize = 1024;
 const ACTION_TTL_SECS: i64 = 10 * 60;
+const PRODUCTION_DEFAULT_BIND: &str = "127.0.0.1:16341";
+const DEVELOPMENT_DEFAULT_BIND: &str = "127.0.0.1:17601";
+const LEGACY_DEFAULT_BIND: &str = "127.0.0.1:17600";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -103,7 +106,7 @@ impl RelayConfig {
     pub fn desktop_default(development: bool) -> Self {
         Self {
             bind: if development {
-                "127.0.0.1:17601".into()
+                DEVELOPMENT_DEFAULT_BIND.into()
             } else {
                 default_bind()
             },
@@ -113,7 +116,7 @@ impl RelayConfig {
 }
 
 fn default_bind() -> String {
-    "127.0.0.1:17600".into()
+    PRODUCTION_DEFAULT_BIND.into()
 }
 
 pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig> {
@@ -126,6 +129,10 @@ pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig
         Ok(config) => {
             let mut config: RelayConfig = config;
             let mut migrated = false;
+            if config.bind == LEGACY_DEFAULT_BIND {
+                config.bind = RelayConfig::desktop_default(development).bind;
+                migrated = true;
+            }
             for command in [
                 &mut config.commands.open_file,
                 &mut config.commands.reveal_in_folder,
@@ -1692,19 +1699,43 @@ mod tests {
 
     #[test]
     fn relay_is_enabled_by_default() {
+        let production = RelayConfig::desktop_default(false);
+        let development = RelayConfig::desktop_default(true);
+
         assert!(RelayConfig::default().enabled);
-        assert!(RelayConfig::desktop_default(false).enabled);
-        assert!(RelayConfig::desktop_default(true).enabled);
+        assert!(production.enabled);
+        assert!(development.enabled);
+        assert_eq!(production.bind, "127.0.0.1:16341");
+        assert_eq!(development.bind, "127.0.0.1:17601");
     }
 
     #[test]
     fn missing_enabled_key_defaults_on_but_explicit_false_is_preserved() {
-        let missing: RelayConfig = toml::from_str("bind = '127.0.0.1:17600'").unwrap();
+        let missing: RelayConfig = toml::from_str("bind = '127.0.0.1:16341'").unwrap();
         assert!(missing.enabled);
 
         let disabled: RelayConfig =
-            toml::from_str("enabled = false\nbind = '127.0.0.1:17600'").unwrap();
+            toml::from_str("enabled = false\nbind = '127.0.0.1:16341'").unwrap();
         assert!(!disabled.enabled);
+    }
+
+    #[test]
+    fn legacy_default_bind_is_migrated_but_custom_bind_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        std::fs::write(&path, "bind = '127.0.0.1:17600'\n").unwrap();
+
+        let migrated = load_config(&path, false).unwrap();
+        assert_eq!(migrated.bind, PRODUCTION_DEFAULT_BIND);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(PRODUCTION_DEFAULT_BIND)
+        );
+
+        std::fs::write(&path, "bind = '127.0.0.1:18000'\n").unwrap();
+        let custom = load_config(&path, false).unwrap();
+        assert_eq!(custom.bind, "127.0.0.1:18000");
     }
 
     /// Mapping is component-aware and the longest valid prefix wins.

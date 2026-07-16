@@ -648,12 +648,15 @@ continue normally.
 
 Relay mappings are per remote instance; a single global mapping table is
 insufficient when a user connects to a NAS and other computers.
+The default listener is `127.0.0.1:16341`. On upgrade, Desktop migrates the
+former `127.0.0.1:17600` default to the new port while preserving custom bind
+values.
 
 Illustrative schema:
 
 ```toml
 enabled = true
-bind = "127.0.0.1:17600"
+bind = "127.0.0.1:16341"
 
 [[instances]]
 id = "<uuid>"
