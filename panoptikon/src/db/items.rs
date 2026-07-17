@@ -138,7 +138,7 @@ pub(crate) async fn get_item_metadata(
         }
     };
 
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(value)
         .fetch_all(conn)
         .await
@@ -322,14 +322,14 @@ pub(crate) async fn get_existing_files_for_sha256(
     } else {
         "WHERE sha256 = ?"
     };
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT id, sha256, path, last_modified, filename
         FROM files
         {where_clause}
         ORDER BY available DESC
         "#
-    ))
+    )))
     .bind(sha256)
     .fetch_all(conn)
     .await
@@ -492,7 +492,7 @@ pub(crate) async fn get_text_by_ids(
         "#
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for text_id in text_ids {
         query = query.bind(text_id);
     }
@@ -641,7 +641,7 @@ pub(crate) async fn get_all_tags_for_item(
 
     sql.push_str(" ORDER BY tags_items.rowid");
 
-    let mut query = sqlx::query(&sql).bind(item_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(item_id);
     for setter in setters {
         query = query.bind(setter);
     }

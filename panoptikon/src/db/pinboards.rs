@@ -253,7 +253,7 @@ pub(crate) async fn list_pinboards(
         "#
     );
 
-    let mut query = sqlx::query(&sql).bind(user);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(user);
     if !fts_filter.is_empty() {
         query = query.bind(fts_prefix_query(name_query.unwrap_or_default()));
     }

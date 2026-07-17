@@ -244,7 +244,7 @@ ORDER BY start_time DESC
         query.push_str(" LIMIT ? OFFSET ?");
     }
 
-    let mut sql = sqlx::query(&query);
+    let mut sql = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
     if let Some(page_size) = page_size {
         sql = sql.bind(page_size).bind(offset);
     }
@@ -387,7 +387,9 @@ WHERE scan_id != ?
 AND path LIKE ? || '%'{exclusion}
         "#
     );
-    let mut count_query = sqlx::query(&count_sql).bind(scan_id).bind(path_prefix);
+    let mut count_query = sqlx::query(sqlx::AssertSqlSafe(count_sql.as_str()))
+        .bind(scan_id)
+        .bind(path_prefix);
     for path in excluded_paths {
         count_query = count_query.bind(path);
     }
@@ -409,7 +411,9 @@ WHERE scan_id != ?
 AND path LIKE ? || '%'{exclusion}
         "#
     );
-    let mut update_query = sqlx::query(&update_sql).bind(scan_id).bind(path_prefix);
+    let mut update_query = sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
+        .bind(scan_id)
+        .bind(path_prefix);
     for path in excluded_paths {
         update_query = update_query.bind(path);
     }

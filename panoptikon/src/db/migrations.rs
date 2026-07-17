@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use sqlx::{
-    Connection, SqliteConnection,
+    AssertSqlSafe, Connection, SqlSafeStr, SqliteConnection,
     migrate::{Migrate, Migration, Migrator},
     sqlite::SqliteConnectOptions,
 };
@@ -30,13 +30,13 @@ fn normalize_line_endings(raw: Migrator) -> Migrator {
         .migrations
         .iter()
         .map(|migration| {
-            if migration.sql.contains('\r') {
+            if migration.sql.as_str().contains('\r') {
                 // Migration::new recomputes the checksum from the given SQL.
                 Migration::new(
                     migration.version,
                     migration.description.clone(),
                     migration.migration_type,
-                    migration.sql.replace("\r\n", "\n").into(),
+                    AssertSqlSafe(migration.sql.as_str().replace("\r\n", "\n")).into_sql_str(),
                     migration.no_tx,
                 )
             } else {
@@ -295,7 +295,7 @@ async fn ensure_baseline_if_needed(
         ),
     }
 
-    conn.ensure_migrations_table()
+    conn.ensure_migrations_table("_sqlx_migrations")
         .await
         .context("failed to ensure migrations table")?;
 
@@ -382,7 +382,7 @@ async fn reconcile_recorded_checksums(
             migration.version,
             migration.description.clone(),
             migration.migration_type,
-            migration.sql.replace('\n', "\r\n").into(),
+            AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
             migration.no_tx,
         );
         if recorded.as_slice() == crlf_variant.checksum.as_ref() {
@@ -649,7 +649,7 @@ mod tests {
         for migrator in [&*INDEX_MIGRATOR, &*STORAGE_MIGRATOR, &*USER_DATA_MIGRATOR] {
             for migration in migrator.iter() {
                 assert!(
-                    !migration.sql.contains('\r'),
+                    !migration.sql.as_str().contains('\r'),
                     "migration {} carries CR bytes into its checksum",
                     migration.version
                 );
@@ -664,7 +664,7 @@ mod tests {
             migration.version,
             migration.description.clone(),
             migration.migration_type,
-            migration.sql.replace('\n', "\r\n").into(),
+            AssertSqlSafe(migration.sql.as_str().replace('\n', "\r\n")).into_sql_str(),
             migration.no_tx,
         )
         .checksum

@@ -540,7 +540,7 @@ pub(crate) async fn delete_files_not_allowed(
         Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
         None => built.query.build_sqlx(SqliteQueryBuilder),
     };
-    let rows = sqlx::query_with(&sql, values)
+    let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
         .fetch_all(&mut *conn)
         .await
         .map_err(|err| {

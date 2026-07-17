@@ -11,7 +11,9 @@ pub(crate) async fn run_compiled_query(
     sql: &str,
     params: &[Value],
 ) -> ApiResult<Vec<sqlx::sqlite::SqliteRow>> {
-    let mut query = sqlx::query(sql);
+    // PQL SQL is emitted by our compiler from sea-query ASTs; user input only
+    // ever travels through the bind params below.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     query = bind_params(query, params)?;
     let rows = query.fetch_all(conn).await.map_err(|err| {
         tracing::error!(error = %err, "failed to run pql query");
@@ -25,7 +27,7 @@ pub(crate) async fn run_compiled_count(
     sql: &str,
     params: &[Value],
 ) -> ApiResult<i64> {
-    let mut query = sqlx::query(sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     query = bind_params(query, params)?;
     let row = query.fetch_one(conn).await.map_err(|err| {
         tracing::error!(error = %err, "failed to run pql count query");
@@ -39,9 +41,9 @@ pub(crate) async fn run_compiled_count(
 }
 
 fn bind_params<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>,
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>,
     params: &[Value],
-) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>> {
+) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>> {
     for param in params {
         query = bind_param(query, param)?;
     }
@@ -49,9 +51,9 @@ fn bind_params<'q>(
 }
 
 fn bind_param<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>,
     param: &Value,
-) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>> {
+) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>> {
     match param {
         Value::Null => Ok(query.bind(Option::<i64>::None)),
         Value::Bool(value) => Ok(query.bind(*value)),

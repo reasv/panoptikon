@@ -293,11 +293,11 @@ impl IndexDbWriterState {
 
     /// Runs maintenance statements directly on the connection, outside of
     /// `with_transaction`: VACUUM cannot execute inside a transaction.
-    async fn run_maintenance(&mut self, statements: &[&str]) -> ApiResult<()> {
+    async fn run_maintenance(&mut self, statements: &[&'static str]) -> ApiResult<()> {
         let result = async {
             let conn = self.ensure_conn().await?;
             for statement in statements {
-                sqlx::query(statement)
+                sqlx::query(*statement)
                     .execute(&mut *conn)
                     .await
                     .map_err(|err| {

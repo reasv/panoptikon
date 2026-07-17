@@ -145,13 +145,13 @@ pub(crate) async fn get_all_data_logs(
     }
 
     let rows = if let Some(page_size) = page_size {
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(page_size)
             .bind(offset)
             .fetch_all(&mut *conn)
             .await
     } else {
-        sqlx::query(&query).fetch_all(&mut *conn).await
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(&mut *conn).await
     }
     .map_err(|err| {
         tracing::error!(error = %err, "failed to read data logs");

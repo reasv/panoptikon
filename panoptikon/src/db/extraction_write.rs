@@ -683,7 +683,9 @@ pub(crate) fn current_iso_timestamp() -> String {
 fn iso_format() -> &'static [FormatItem<'static>] {
     static ISO_FORMAT: std::sync::OnceLock<Vec<FormatItem<'static>>> = std::sync::OnceLock::new();
     ISO_FORMAT.get_or_init(|| {
-        time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
-            .expect("invalid time format")
+        time::format_description::parse_borrowed::<2>(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]",
+        )
+        .expect("invalid time format")
     })
 }

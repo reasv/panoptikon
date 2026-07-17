@@ -129,7 +129,7 @@ pub(crate) mod test_support {
             None => built.query.build_sqlx(SqliteQueryBuilder),
         };
 
-        let _rows = sqlx::query_with(&sql, values)
+        let _rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
             .fetch_all(&mut dbs.index_conn)
             .await?;
         Ok(())

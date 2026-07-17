@@ -94,7 +94,7 @@ fn check_outcome_disposition(
         CheckFlightOutcome::Attempted(result) => CheckOutcomeDisposition::Complete(result),
         CheckFlightOutcome::NotAttempted {
             owner_reason,
-            result,
+            result: _,
         } if requested_reason.strength() > owner_reason.strength() => {
             CheckOutcomeDisposition::Retry
         }

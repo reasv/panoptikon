@@ -65,7 +65,7 @@ pub(crate) async fn find_tags(
         "#
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for tag_id in &ids {
         query = query.bind(tag_id);
     }
@@ -123,7 +123,7 @@ pub(crate) async fn get_most_common_tags_frequency(
         sql.push_str(&format!(" WHERE setters.name IN ({placeholders})"));
     }
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for setter in setters {
         query = query.bind(setter);
     }
@@ -256,7 +256,7 @@ async fn get_most_common_tags(
     sql.push_str(" ORDER BY count DESC");
     sql.push_str(" LIMIT ?");
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(namespace) = namespace {
         query = query.bind(namespace);
     }

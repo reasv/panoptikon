@@ -292,7 +292,7 @@ async fn run_extraction_job_inner(
     let mut tasks = tokio::task::JoinSet::new();
 
     let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
-    let mut query = sqlx::query(&compiled.sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(compiled.sql.as_str()));
     query = bind_params(query, &compiled.params)?;
     let mut rows = query.fetch(&mut conn);
     while let Some(row) = rows.try_next().await.map_err(|err| {
@@ -1166,9 +1166,9 @@ fn encode_value(value: SeaValue) -> ApiResult<Value> {
 }
 
 fn bind_params<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>,
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>,
     params: &[Value],
-) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>> {
+) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>> {
     for param in params {
         query = bind_param(query, param)?;
     }
@@ -1176,9 +1176,9 @@ fn bind_params<'q>(
 }
 
 fn bind_param<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>,
     param: &Value,
-) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments<'q>>> {
+) -> ApiResult<sqlx::query::Query<'q, sqlx::Sqlite, SqliteArguments>> {
     match param {
         Value::Null => Ok(query.bind(Option::<i64>::None)),
         Value::Bool(value) => Ok(query.bind(*value)),

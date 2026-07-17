@@ -227,7 +227,7 @@ pub(crate) async fn get_all_bookmark_namespaces(
         "#
     );
 
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(user)
         .fetch_all(conn)
         .await
@@ -312,7 +312,7 @@ pub(crate) async fn get_bookmarks(
         "#
     );
 
-    let mut count_query = sqlx::query(&count_sql);
+    let mut count_query = sqlx::query(sqlx::AssertSqlSafe(count_sql.as_str()));
     for value in &count_params {
         count_query = count_query.bind(value);
     }
@@ -355,7 +355,7 @@ pub(crate) async fn get_bookmarks(
         "#
     );
 
-    let mut data_query = sqlx::query(&data_sql);
+    let mut data_query = sqlx::query(sqlx::AssertSqlSafe(data_sql.as_str()));
     for value in count_params {
         data_query = data_query.bind(value);
     }
