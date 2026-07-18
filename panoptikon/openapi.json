@@ -3561,7 +3561,7 @@
           "pinboards"
         ],
         "summary": "Save a new version of a pinboard",
-        "description": "Appends a new version and moves the board's head to it. If the layout is byte-identical to the current head, no version is created and the response has `no_op: true`.\nThe version snapshots the board's current name as its name-at-save.",
+        "description": "Appends a new version and moves the board's head to it. If the layout is byte-identical to the current head, no version is created and the response has `no_op: true`.\nBoard-level `flags` are stored on the board itself in either case (never creating a version); `flags_updated` reports whether they changed, so a settings-only save is a flag update with `no_op: true`.\nThe version snapshots the board's current name as its name-at-save.",
         "operationId": "save_pinboard_version",
         "parameters": [
           {
@@ -7121,6 +7121,9 @@
           "version_count"
         ],
         "properties": {
+          "flags": {
+            "description": "The board's stored editing-behavior flags, verbatim as last saved.\nNull for boards saved before flags existed; the UI treats that as\nits codec defaults."
+          },
           "head": {
             "oneOf": [
               {
@@ -7661,9 +7664,14 @@
         "required": [
           "pinboard_id",
           "version_id",
-          "no_op"
+          "no_op",
+          "flags_updated"
         ],
         "properties": {
+          "flags_updated": {
+            "type": "boolean",
+            "description": "True when the board's stored flags changed as part of this save.\nWith `no_op: true` this distinguishes a settings-only save (\"Settings\nupdated\") from a save with nothing to do (\"No changes to save\")."
+          },
           "no_op": {
             "type": "boolean",
             "description": "True when the layout was byte-identical to the head version and no\nnew version was created; version_id is the existing head."
@@ -7685,6 +7693,9 @@
           "layout"
         ],
         "properties": {
+          "flags": {
+            "description": "Board-level editing-behavior flags (auto-layout & co.): an opaque\nJSON object owned by the UI, stored on the BOARD rather than the\nversion — flag changes never create versions and never make a board\n\"unsaved\". Omitted = leave the stored flags unchanged."
+          },
           "items": {
             "type": "array",
             "items": {

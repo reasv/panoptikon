@@ -21,6 +21,8 @@ const DEFAULT_USER: &str = "user";
 const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized layouts larger than this are rejected outright.
 const MAX_LAYOUT_BYTES: usize = 1024 * 1024;
+/// Serialized board flags larger than this are rejected outright.
+const MAX_FLAGS_BYTES: usize = 4096;
 
 fn default_user() -> String {
     DEFAULT_USER.to_string()
@@ -74,6 +76,12 @@ pub(crate) struct SaveVersionRequest {
     preview_h: Option<i64>,
     /// Height in preview-image pixels of one save-time viewport screenful.
     screenful_h: Option<i64>,
+    /// Board-level editing-behavior flags (auto-layout & co.): an opaque
+    /// JSON object owned by the UI, stored on the BOARD rather than the
+    /// version — flag changes never create versions and never make a board
+    /// "unsaved". Omitted = leave the stored flags unchanged.
+    #[serde(default)]
+    flags: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -101,6 +109,10 @@ pub(crate) struct SavePinboardResponse {
     /// True when the layout was byte-identical to the head version and no
     /// new version was created; version_id is the existing head.
     no_op: bool,
+    /// True when the board's stored flags changed as part of this save.
+    /// With `no_op: true` this distinguishes a settings-only save ("Settings
+    /// updated") from a save with nothing to do ("No changes to save").
+    flags_updated: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -139,6 +151,10 @@ pub(crate) struct PinboardListResponse {
 pub(crate) struct PinboardDetailResponse {
     id: i64,
     name: Option<String>,
+    /// The board's stored editing-behavior flags, verbatim as last saved.
+    /// Null for boards saved before flags existed; the UI treats that as
+    /// its codec defaults.
+    flags: Option<serde_json::Value>,
     time_added: String,
     time_updated: String,
     version_count: i64,
@@ -163,6 +179,36 @@ pub(crate) struct PinboardDeleteResponse {
 
 struct PreviewUpload {
     bytes: Option<Vec<u8>>,
+}
+
+/// Validates and canonicalizes the request's flags into the stored string
+/// form. Keys are sorted so byte comparison in set_flags is insensitive to
+/// the client's object key order. None when the request carries no flags.
+fn canonical_flags(request: &SaveVersionRequest) -> ApiResult<Option<String>> {
+    let Some(value) = &request.flags else {
+        return Ok(None);
+    };
+    let Some(map) = value.as_object() else {
+        return Err(ApiError::bad_request("Flags must be a JSON object"));
+    };
+    let sorted: std::collections::BTreeMap<&String, &serde_json::Value> = map.iter().collect();
+    let serialized = serde_json::to_string(&sorted)
+        .map_err(|_| ApiError::bad_request("Invalid flags"))?;
+    if serialized.len() > MAX_FLAGS_BYTES {
+        return Err(ApiError::bad_request("Flags too large"));
+    }
+    Ok(Some(serialized))
+}
+
+fn parse_stored_flags(raw: Option<String>) -> Option<serde_json::Value> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to parse stored pinboard flags");
+            None
+        }
+    }
 }
 
 fn validate_version_request(request: &SaveVersionRequest) -> ApiResult<PreviewUpload> {
@@ -267,11 +313,17 @@ pub async fn create_pinboard(
     Json(request): Json<CreatePinboardRequest>,
 ) -> ApiResult<Json<SavePinboardResponse>> {
     let preview = validate_version_request(&request.version)?;
+    let flags = canonical_flags(&request.version)?;
 
     begin_transaction(&mut db.conn).await?;
     let result: ApiResult<(i64, i64)> = async {
-        let pinboard_id =
-            pinboards::create_pinboard(&mut db.conn, &query.user, request.name.as_deref()).await?;
+        let pinboard_id = pinboards::create_pinboard(
+            &mut db.conn,
+            &query.user,
+            request.name.as_deref(),
+            flags.as_deref(),
+        )
+        .await?;
         let version_id = pinboards::append_version(
             &mut db.conn,
             pinboard_id,
@@ -294,6 +346,7 @@ pub async fn create_pinboard(
                 pinboard_id,
                 version_id,
                 no_op: false,
+                flags_updated: false,
             }))
         }
         Err(err) => {
@@ -332,6 +385,7 @@ pub async fn get_pinboard(
     Ok(Json(PinboardDetailResponse {
         id: summary.id,
         name: summary.name,
+        flags: parse_stored_flags(summary.flags),
         time_added: summary.time_added,
         time_updated: summary.time_updated,
         version_count: summary.version_count,
@@ -469,7 +523,7 @@ pub async fn list_pinboard_versions(
     path = "/api/pinboards/{pinboard_id}/versions",
     tag = "pinboards",
     summary = "Save a new version of a pinboard",
-    description = "Appends a new version and moves the board's head to it. If the layout is byte-identical to the current head, no version is created and the response has `no_op: true`.\nThe version snapshots the board's current name as its name-at-save.",
+    description = "Appends a new version and moves the board's head to it. If the layout is byte-identical to the current head, no version is created and the response has `no_op: true`.\nBoard-level `flags` are stored on the board itself in either case (never creating a version); `flags_updated` reports whether they changed, so a settings-only save is a flag update with `no_op: true`.\nThe version snapshots the board's current name as its name-at-save.",
     params(
         DbQueryParams,
         ("pinboard_id" = i64, Path, description = "The pinboard id"),
@@ -488,6 +542,7 @@ pub async fn save_pinboard_version(
     Json(request): Json<SaveVersionRequest>,
 ) -> ApiResult<Json<SavePinboardResponse>> {
     let preview = validate_version_request(&request)?;
+    let flags = canonical_flags(&request)?;
 
     begin_transaction(&mut db.conn).await?;
     let result: ApiResult<SavePinboardResponse> = async {
@@ -501,10 +556,19 @@ pub async fn save_pinboard_version(
             let incoming = serde_json::to_string(&request.layout)
                 .map_err(|_| ApiError::bad_request("Invalid layout"))?;
             if incoming == head_layout {
+                // Settings-only save: the layout no-ops but the board's
+                // flags still advance to what the client sent.
+                let flags_updated = match flags.as_deref() {
+                    Some(flags) => {
+                        pinboards::set_flags(&mut db.conn, pinboard_id, &query.user, flags).await?
+                    }
+                    None => false,
+                };
                 return Ok(SavePinboardResponse {
                     pinboard_id,
                     version_id: head_version_id,
                     no_op: true,
+                    flags_updated,
                 });
             }
         }
@@ -520,10 +584,17 @@ pub async fn save_pinboard_version(
             request.screenful_h,
         )
         .await?;
+        let flags_updated = match flags.as_deref() {
+            Some(flags) => {
+                pinboards::set_flags(&mut db.conn, pinboard_id, &query.user, flags).await?
+            }
+            None => false,
+        };
         Ok(SavePinboardResponse {
             pinboard_id,
             version_id,
             no_op: false,
+            flags_updated,
         })
     }
     .await;
@@ -744,6 +815,7 @@ mod tests {
             preview_w: None,
             preview_h: None,
             screenful_h: None,
+            flags: None,
         }
     }
 
@@ -753,7 +825,7 @@ mod tests {
         records: &[&str],
         items: &[&str],
     ) -> (i64, i64) {
-        let pinboard_id = pinboards::create_pinboard(conn, "user", name)
+        let pinboard_id = pinboards::create_pinboard(conn, "user", name, None)
             .await
             .unwrap();
         let request = save_request(records, items);
@@ -1019,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn preview_blob_round_trip() {
         let mut dbs = setup_test_databases().await;
-        let pinboard_id = pinboards::create_pinboard(&mut dbs.index_conn, "user", None)
+        let pinboard_id = pinboards::create_pinboard(&mut dbs.index_conn, "user", None, None)
             .await
             .unwrap();
         let version_id = pinboards::append_version(
@@ -1048,6 +1120,82 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // Ensures flags round-trip on the board, and set_flags detects change
+    // without bumping time_updated (a settings-only save must not reorder
+    // the library list or touch any version).
+    #[tokio::test]
+    async fn flags_round_trip_without_touching_versions() {
+        let mut dbs = setup_test_databases().await;
+        let flags = r#"{"pba":true,"pbc":true}"#;
+        let pinboard_id =
+            pinboards::create_pinboard(&mut dbs.index_conn, "user", None, Some(flags))
+                .await
+                .unwrap();
+        pinboards::append_version(
+            &mut dbs.index_conn,
+            pinboard_id,
+            &layout(&["v2", "a"]),
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (summary, _) = pinboards::get_pinboard(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.flags.as_deref(), Some(flags));
+        let time_updated = summary.time_updated;
+
+        // Identical flags: no change reported.
+        assert!(
+            !pinboards::set_flags(&mut dbs.index_conn, pinboard_id, "user", flags)
+                .await
+                .unwrap()
+        );
+        // Different flags: change reported, stored, user-scoped.
+        let changed = r#"{"pba":false,"pbc":true}"#;
+        assert!(
+            pinboards::set_flags(&mut dbs.index_conn, pinboard_id, "user", changed)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !pinboards::set_flags(&mut dbs.index_conn, pinboard_id, "other", flags)
+                .await
+                .unwrap()
+        );
+
+        let (summary, _) = pinboards::get_pinboard(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.flags.as_deref(), Some(changed));
+        assert_eq!(summary.time_updated, time_updated);
+        assert_eq!(summary.version_count, 1);
+    }
+
+    // Ensures flags canonicalization sorts keys, rejects non-objects, and
+    // passes through absent flags.
+    #[test]
+    fn canonical_flags_sorts_and_validates() {
+        let mut request = save_request(&["v2"], &[]);
+        assert_eq!(canonical_flags(&request).unwrap(), None);
+
+        request.flags = Some(serde_json::json!({"psc": true, "pba": false}));
+        assert_eq!(
+            canonical_flags(&request).unwrap().as_deref(),
+            Some(r#"{"pba":false,"psc":true}"#)
+        );
+
+        request.flags = Some(serde_json::json!([1, 2]));
+        assert!(canonical_flags(&request).is_err());
     }
 
     // Ensures request validation rejects bad layouts, items, and base64.

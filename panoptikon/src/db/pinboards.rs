@@ -8,6 +8,10 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 pub(crate) struct PinboardSummary {
     pub id: i64,
     pub name: Option<String>,
+    /// Board-level editing-behavior flags: an opaque JSON object owned by
+    /// the UI (same contract as layout). None = saved by a flags-unaware
+    /// client.
+    pub flags: Option<String>,
     pub head_version_id: Option<i64>,
     pub time_added: String,
     pub time_updated: String,
@@ -80,12 +84,13 @@ pub(crate) async fn create_pinboard(
     conn: &mut sqlx::SqliteConnection,
     user: &str,
     name: Option<&str>,
+    flags: Option<&str>,
 ) -> ApiResult<i64> {
     let row = sqlx::query(
         r#"
-        INSERT INTO user_data.pinboards (user, name, head_version_id, time_added, time_updated)
+        INSERT INTO user_data.pinboards (user, name, flags, head_version_id, time_added, time_updated)
         VALUES (
-            ?, ?, NULL,
+            ?, ?, ?, NULL,
             strftime('%Y-%m-%dT%H:%M:%f','now','localtime'),
             strftime('%Y-%m-%dT%H:%M:%f','now','localtime')
         )
@@ -94,12 +99,39 @@ pub(crate) async fn create_pinboard(
     )
     .bind(user)
     .bind(name)
+    .bind(flags)
     .fetch_one(conn)
     .await
     .map_err(internal("Failed to create pinboard"))?;
 
     row.try_get("id")
         .map_err(internal("Failed to create pinboard"))
+}
+
+/// Stores the board's flags, returning whether they actually changed.
+/// Deliberately does NOT bump time_updated: flags are editing convenience,
+/// not content — a settings-only save must not reorder the library list.
+pub(crate) async fn set_flags(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    user: &str,
+    flags: &str,
+) -> ApiResult<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE user_data.pinboards
+        SET flags = ?
+        WHERE id = ? AND user = ? AND flags IS NOT ?
+        "#,
+    )
+    .bind(flags)
+    .bind(pinboard_id)
+    .bind(user)
+    .bind(flags)
+    .execute(conn)
+    .await
+    .map_err(internal("Failed to update pinboard flags"))?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Returns the stored head layout string for the identical-save no-op check,
@@ -235,7 +267,7 @@ pub(crate) async fn list_pinboards(
     let sql = format!(
         r#"
         SELECT
-            p.id, p.name, p.head_version_id, p.time_added, p.time_updated,
+            p.id, p.name, p.flags, p.head_version_id, p.time_added, p.time_updated,
             v.preview_w, v.preview_h, v.screenful_h,
             (
                 SELECT COUNT(*) FROM user_data.pinboard_version_items i
@@ -271,6 +303,9 @@ pub(crate) async fn list_pinboards(
                 .map_err(internal("Failed to list pinboards"))?,
             name: row
                 .try_get("name")
+                .map_err(internal("Failed to list pinboards"))?,
+            flags: row
+                .try_get("flags")
                 .map_err(internal("Failed to list pinboards"))?,
             head_version_id: row
                 .try_get("head_version_id")
@@ -312,7 +347,7 @@ pub(crate) async fn get_pinboard(
         let row = sqlx::query(
             r#"
             SELECT
-                p.id, p.name, p.head_version_id, p.time_added, p.time_updated,
+                p.id, p.name, p.flags, p.head_version_id, p.time_added, p.time_updated,
                 v.layout, v.name_at_save, v.time_added AS head_time_added,
                 v.preview_w, v.preview_h, v.screenful_h,
                 (
@@ -353,6 +388,9 @@ pub(crate) async fn get_pinboard(
             .map_err(internal("Failed to get pinboard"))?,
         name: row
             .try_get("name")
+            .map_err(internal("Failed to get pinboard"))?,
+        flags: row
+            .try_get("flags")
             .map_err(internal("Failed to get pinboard"))?,
         head_version_id,
         time_added: row
