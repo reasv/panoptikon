@@ -857,7 +857,8 @@ These are deliberately *not* TOML keys:
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
   `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
-  inheritance. Declared Inferio external inputs are then explicitly set or
+  inheritance (except `PYTHONHOME`, which is removed — launcher-exported
+  values break venv interpreters). Declared Inferio external inputs are then explicitly set or
   removed from each new worker using the current just-in-time snapshot; the UI
   server retains ordinary startup inheritance.
 - `PANOPTIKON_TEST_PYTHON` — test-only (points the inferio worker tests at

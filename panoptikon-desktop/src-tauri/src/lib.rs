@@ -67,7 +67,65 @@ struct TrayUi {
     updates: MenuItem<tauri::Wry>,
 }
 
+/// PYTHONPATH with the entries under `appdir` dropped: `None` when the
+/// value has no such entries (leave it alone), `Some(None)` when nothing
+/// survives (remove the variable), `Some(Some(v))` otherwise. A poisoned
+/// value also sheds its empty segments — Python reads those as "add cwd to
+/// sys.path" and they come from the launcher's blind `:$PYTHONPATH`
+/// concatenation over an unset variable, not from the user.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pythonpath_without_appdir(path: &str, appdir: &std::path::Path) -> Option<Option<String>> {
+    let (dropped, kept): (Vec<&str>, Vec<&str>) = path
+        .split(':')
+        .partition(|entry| std::path::Path::new(entry).starts_with(appdir));
+    if dropped.is_empty() {
+        return None;
+    }
+    let kept: Vec<&str> = kept.into_iter().filter(|entry| !entry.is_empty()).collect();
+    if kept.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(kept.join(":")))
+    }
+}
+
+/// The AppImage AppRun script exports PYTHONHOME and PYTHONPATH pointing
+/// into the transient /tmp mount whether or not Python is bundled (it
+/// isn't). Every Python the sidecar later spawns — uv build backends, the
+/// managed venv, inferio workers — inherits them and dies before main with
+/// "init_fs_encoding: ... No module named 'encodings'". Strip the poisoned
+/// entries here, before anything else can spawn a child; values that do not
+/// point into the mount (user-set) are kept.
+#[cfg(target_os = "linux")]
+fn scrub_appimage_python_env() {
+    use std::path::Path;
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    let appdir = std::path::PathBuf::from(appdir);
+    if let Ok(home) = std::env::var("PYTHONHOME")
+        && Path::new(&home).starts_with(&appdir)
+    {
+        // SAFETY: called from `run()` before the Tauri builder starts any
+        // thread; the process is still single-threaded.
+        unsafe { std::env::remove_var("PYTHONHOME") };
+    }
+    if let Ok(path) = std::env::var("PYTHONPATH")
+        && let Some(scrubbed) = pythonpath_without_appdir(&path, &appdir)
+    {
+        // SAFETY: as above — still single-threaded.
+        unsafe {
+            match scrubbed {
+                None => std::env::remove_var("PYTHONPATH"),
+                Some(value) => std::env::set_var("PYTHONPATH", value),
+            }
+        }
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    scrub_appimage_python_env();
     let builder = tauri::Builder::default()
         // Normative ordering: a secondary instance must exit before any
         // path, logging, tray, Relay, updater, or sidecar state is created.
@@ -1788,7 +1846,36 @@ async fn quit_inner(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_browser_url, update_menu_label};
+    use super::{local_browser_url, pythonpath_without_appdir, update_menu_label};
+
+    /// The AppImage scrub drops exactly the mount-rooted PYTHONPATH entries
+    /// (plus launcher-introduced empty segments) and leaves clean values —
+    /// including their empty segments — untouched.
+    #[test]
+    fn appimage_pythonpath_scrub() {
+        let appdir = std::path::Path::new("/tmp/.mount_PanoptNPlAbN");
+        // The exact value AppRun exports over an unset PYTHONPATH.
+        assert_eq!(
+            pythonpath_without_appdir("/tmp/.mount_PanoptNPlAbN/usr/share/pyshared/:", appdir),
+            Some(None)
+        );
+        // A user entry behind the poison survives; the empty segment does not.
+        assert_eq!(
+            pythonpath_without_appdir(
+                "/tmp/.mount_PanoptNPlAbN/usr/share/pyshared/::/home/u/lib",
+                appdir
+            ),
+            Some(Some("/home/u/lib".to_string()))
+        );
+        // No mount entries: leave the value alone, empty segments included.
+        assert_eq!(pythonpath_without_appdir("/home/u/lib:", appdir), None);
+        assert_eq!(pythonpath_without_appdir("", appdir), None);
+        // Similar-prefix paths are not mount entries.
+        assert_eq!(
+            pythonpath_without_appdir("/tmp/.mount_PanoptNPlAbN-other/lib", appdir),
+            None
+        );
+    }
 
     /// Production and development manifests stay product-separated, updater
     /// signing metadata is present only in production, and the Server is an

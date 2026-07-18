@@ -216,7 +216,8 @@ pub struct Worker {
 impl Worker {
     /// Spawn `python -m inferio_worker` per the protocol's spawn contract
     /// (INFERIO_WORKER=1, PYTHONPATH prepend, CUDA_VISIBLE_DEVICES when a
-    /// device pin is given, inherited env otherwise) and perform the v2
+    /// device pin is given, PYTHONHOME removed, inherited env otherwise)
+    /// and perform the v2
     /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
     /// no instantiation — within the handshake deadline. On any failure the
     /// child is killed and reaped and the error carries the worker
@@ -241,7 +242,12 @@ impl Worker {
             // text streams UTF-8 regardless of the console code page
             // (cp1252 tracebacks on Windows). The Rust side still tolerates
             // arbitrary bytes — native libraries write to fd 2 directly.
-            .env("PYTHONIOENCODING", "utf-8");
+            .env("PYTHONIOENCODING", "utf-8")
+            // A set PYTHONHOME is never valid for a venv interpreter, and
+            // AppImage-style launchers export one pointing into their mount,
+            // which kills the child before main (missing 'encodings'). The
+            // PYTHONPATH inherit below stays: it is a deliberate dev hook.
+            .env_remove("PYTHONHOME");
         if !cfg.pythonpath.is_empty() {
             let mut entries = cfg.pythonpath.clone();
             if let Some(existing) = env::var_os("PYTHONPATH") {

@@ -270,6 +270,10 @@ async fn prefetch_static_ffmpeg(interpreter: &Path) {
     tracing::info!("fetching the ffmpeg/ffprobe binaries (static-ffmpeg)");
     match tokio::process::Command::new(interpreter)
         .args(["-c", crate::media_tools::STATIC_FFMPEG_PROBE])
+        // A launcher-exported PYTHONHOME (AppImage AppRun) breaks the venv
+        // interpreter outright; scrub as for the uv children above.
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
         .output()
         .await
     {
@@ -978,6 +982,13 @@ async fn run_uv_logged(
         // A different active venv (e.g. the repo root's) would make uv warn
         // or bail; the managed environment is explicit, so drop it.
         .env_remove("VIRTUAL_ENV")
+        // AppImage-style launchers (the Desktop AppRun script among them)
+        // export PYTHONHOME/PYTHONPATH pointing into their transient mount;
+        // uv's build-isolation interpreter inherits them and dies before
+        // main ("init_fs_encoding: ... No module named 'encodings'"). No uv
+        // operation here legitimately wants either.
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
