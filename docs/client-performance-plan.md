@@ -149,20 +149,73 @@ responses is always fresh; the cache key never involves the user_data DB.
 
 ### P5 — Transport & payload (contingent on P4)
 
-- [-] **5.1 HTTP/2 via locally-trusted TLS.** Deferred, likely never for local:
-  browsers require TLS for h2, which means installing a local CA (mkcert-style).
-  Cross-platform reliability is poor: Windows workable (`certutil` + admin
-  prompt); macOS needs admin + interactive keychain confirmation and breaks
-  across OS updates; Linux is fragmented (Chromium/Firefox read NSS profile DBs,
-  not the system store; Snap/Flatpak sandbox them; Firefox ignores OS stores
-  everywhere without enterprise policy). Plus the optics/AV-flag cost of
-  installing a root CA (name-constrained CA mitigates, doesn't erase).
-  **Remote deployments should get h2 from a TLS-terminating reverse proxy
-  instead — document this in deploy docs.**
+- [ ] **5.1 HTTP/2 for desktop users — opt-in self-signed TLS, triggered from
+  the desktop app.** UX and listener topology defined in
+  [desktop-https-ux-design.md](desktop-https-ux-design.md) (2026-07-20:
+  install action + separate Use-HTTPS switch; parallel listeners, TLS on
+  port 6343, HTTP never replaced; HSTS banned). Direction settled
+  2026-07-19: an *explicit user-triggered*
+  feature ("Enable HTTPS/HTTP2, advanced") rather than a silent default, which
+  dissolves the original reliability objection — friction and partial platform
+  coverage are acceptable when the user asked for it and plain
+  `http://localhost` remains the permanent fallback. Landscape facts
+  (verified 2026-07-19):
+  - **No escape hatches exist.** Browsers speak h2 only over TLS with ALPN;
+    h2c was never browser-supported and is dropped from RFC 9113. `localhost`
+    being a "secure context" does not grant h2. Chrome removed
+    `allow-insecure-localhost` in 119, and the desktop app opens the *default*
+    browser, so per-browser flags were never viable anyway.
+  - **Firefox now imports OS-store third-party roots by default on Windows
+    and macOS**, so one OS trust-store install covers Chrome/Edge/Safari/
+    Firefox on the two primary platforms. (Linux Firefox/Chromium still read
+    NSS profile DBs — best-effort tier there.)
+  - **Design:**
+    - *Cert material:* generated locally with `rcgen`. Plan A: single
+      self-signed **leaf** (CA:FALSE, EKU serverAuth, SAN =
+      `localhost`/`127.0.0.1`/`::1`) — a trust anchor that can vouch for
+      nothing but localhost, killing the root-CA optics/blast-radius problem.
+      Verify during implementation that Firefox's OS-store import accepts a
+      non-CA anchor; Plan B if not: minimal local CA with **critical
+      nameConstraints** (localhost + loopback IPs only, pathlen 0) + leaf.
+      Validity ≤825 days (Apple enforces this cap on *all* certs regardless
+      of issuer); desktop tracks expiry and re-runs generate+install.
+    - *Trust install (the user-triggered, elevated step):* Windows
+      `certutil -addstore Root` under UAC; macOS `security add-trusted-cert`
+      (admin + interactive dialog — fine, the user initiated it); Linux
+      best-effort: p11-kit/update-ca-certificates + `certutil` into
+      `~/.pki/nssdb` and Firefox profiles when libnss3-tools exists, with
+      per-step results shown in the UI and Snap/Flatpak caveats documented.
+    - *Graceful degradation:* if trust install fails, h2 still works after
+      the browser's one-time interstitial click-through (ALPN negotiates
+      regardless of trust) — ugly but functional; UI says so.
+    - *Gateway:* optional TLS listener (cert/key paths + https port in
+      config), rustls acceptor with ALPN `h2`/`http/1.1` (hyper `http2`
+      feature already enabled; `axum::serve` doesn't do TLS — manual accept
+      loop or axum-server-style adapter). Plain HTTP listener always kept.
+    - *Desktop flow:* toggle → generate → elevated trust install → write
+      gateway config → restart managed gateway → health-check `https://` →
+      switch launch URL. Disable reverses all of it (remove from stores,
+      revert config).
+    - *Origin consequences:* `https://localhost:{port}` is a new origin —
+      policy tokens/capabilities must accept it; browser cache splits, so
+      one one-time re-download re-warms the immutable cache.
+  - **Sequencing:** still worth running P4 first — if post-P1–P3 scrolling no
+    longer starves, this drops in priority (it stays desirable as a feature,
+    stops being a perf item).
+  - **Shelved alternative — Plex-style per-install WebPKI certs**
+    (`*.<hash>.local.panoptikon.dev` → 127.0.0.1, ACME DNS-01 issuance
+    service, CSR flow): the only *zero-friction* trusted path, but a standing
+    operational service with shrinking cert lifetimes (CA/B SC-081v3: 200d
+    max since 2026-03-15 → 100d 2027 → 47d 2029), router DNS-rebind failures,
+    and LE rate-limit management. Revisit only as a product feature.
+  **Remote deployments unchanged: h2 from a TLS-terminating reverse proxy —
+  document this in deploy docs.**
 - [-] **5.2 Second origin for images** (`127.0.0.1` + `localhost`, or a second
-  port) to double the connection budget. Held in reserve; splits the browser
-  cache by origin and complicates policy tokens. Only if 5.1 stays off the table
-  and P4 still shows starvation.
+  port) to double the connection budget. Rejected 2026-07-19: P3 folded
+  bookmark status into the search response, so no API traffic competes with
+  image fetches on the shared connections anymore; the residual benefit
+  (6→12 image lanes) doesn't justify splitting the browser cache by origin
+  and complicating policy tokens.
 - [ ] **5.3 JIT thumbnail system, policy-gated.** Wanted independently for
   internet-exposed instances (policy decides which endpoints serve thumbs vs
   originals). Generous quality/resolution — local UX must not degrade. For the
