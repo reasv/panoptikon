@@ -32,13 +32,22 @@ const PLACEHOLDER_PNG: &[u8] = include_bytes!("assets/placeholder.png");
 /// no timeout, tokio's blocking pool) indefinitely.
 const FILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Minimum sha256 prefix length (hex chars) still treated as
+/// content-addressed for caching. The pinboard stores 10-char prefixes as
+/// item identity, so it must be <= 10; at 40 bits the chance a given cached
+/// prefix ever gains a second match is ~n/2^40 (under one in a million even
+/// for multi-million-item libraries), and the pinboard already relies on
+/// prefix uniqueness for identity anyway.
+const MIN_IMMUTABLE_SHA256_PREFIX: usize = 10;
+
 /// Cache policy derived from how the item was addressed. Immutable responses
-/// are only claimed for full-sha256 addressing, where the URL is
-/// content-addressed and can never legitimately serve different bytes; any
-/// other identifier (path, file_id, ...) can be re-pointed, so those
-/// responses must revalidate (cheaply, via ETag/304).
+/// are only claimed for sha256 addressing with enough of the hash to make a
+/// collision negligible, where the URL is content-addressed and can never
+/// legitimately serve different bytes; any other identifier (path, file_id,
+/// short prefix, ...) can be re-pointed, so those responses must revalidate
+/// (cheaply, via ETag/304).
 fn cache_control_for(id_type: ItemIdentifierType, id: &str) -> &'static str {
-    if matches!(id_type, ItemIdentifierType::Sha256) && id.len() == 64 {
+    if matches!(id_type, ItemIdentifierType::Sha256) && id.len() >= MIN_IMMUTABLE_SHA256_PREFIX {
         "public, max-age=31536000, immutable"
     } else {
         "public, no-cache"
@@ -1143,14 +1152,19 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_is_immutable_only_for_full_sha256() {
+    fn cache_control_is_immutable_only_for_long_enough_sha256() {
         let full = "a".repeat(64);
         assert_eq!(
             cache_control_for(ItemIdentifierType::Sha256, &full),
             "public, max-age=31536000, immutable"
         );
+        // Pinboard-length (10 char) prefixes are content-addressed enough.
         assert_eq!(
-            cache_control_for(ItemIdentifierType::Sha256, "abc123"),
+            cache_control_for(ItemIdentifierType::Sha256, "abc123def4"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for(ItemIdentifierType::Sha256, "abc123def"),
             "public, no-cache"
         );
         assert_eq!(

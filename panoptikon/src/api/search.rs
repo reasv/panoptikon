@@ -1067,6 +1067,48 @@ mod tests {
         assert_eq!(results[2].bookmarked, Some(false));
     }
 
+    // Pages larger than BOOKMARK_LOOKUP_CHUNK split into multiple IN queries;
+    // this drives the real linked SQLite across a chunk boundary so a bind
+    // limit regression (SQLite's or sqlx's) fails here instead of in prod.
+    #[tokio::test]
+    async fn annotate_bookmark_status_chunks_large_pages() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added)
+            VALUES ('user', 'default', 'sha_first', '2024-01-01T00:00:00'),
+                   ('user', 'default', 'sha_last', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let total = BOOKMARK_LOOKUP_CHUNK * 2 + 3;
+        let mut results = Vec::with_capacity(total);
+        results.push(result_with_sha(Some("sha_first")));
+        for i in 0..total - 2 {
+            results.push(result_with_sha(Some(&format!("sha_filler_{i:07}"))));
+        }
+        results.push(result_with_sha(Some("sha_last")));
+
+        let params = BookmarkStatusParams {
+            include_bookmarks: true,
+            bookmarks_namespace: "default".to_string(),
+            bookmarks_user: "user".to_string(),
+        };
+        annotate_bookmark_status(&mut dbs.index_conn, &mut results, &params)
+            .await
+            .unwrap();
+        assert_eq!(results.first().unwrap().bookmarked, Some(true));
+        assert_eq!(results.last().unwrap().bookmarked, Some(true));
+        assert!(
+            results[1..total - 1]
+                .iter()
+                .all(|result| result.bookmarked == Some(false))
+        );
+    }
+
     async fn setup_tag_db() -> crate::db::migrations::InMemoryDatabases {
         let mut dbs = setup_test_databases().await;
         sqlx::query(
