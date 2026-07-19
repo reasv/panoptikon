@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "panoptikon"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "panoptikon-desktop"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "argon2",
