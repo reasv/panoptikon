@@ -18,7 +18,8 @@ Desktop release notes.
     pins stay put while the rest of the board reflows around them.
   - Hole targeting: carve a hole in the layout and send pins into it, with
     sticky carry and shift-drag placement.
-  - An auto-layout toggle directly on the Pinboard tab.
+  - An auto-layout toggle directly on the Pinboard tab, and the fullscreen
+    board view gained a hover-reveal toolbar.
   - Copy a pin's file path from its context menu.
 - **Pinboard tab in search results.** The grid view now has a Pinboard tab
   next to Results, so you can switch between a board and your search results
