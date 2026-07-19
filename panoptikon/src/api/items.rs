@@ -22,6 +22,7 @@ use crate::db::items::{
     get_thumbnail_bytes,
 };
 use crate::db::{DbConnection, ReadOnlyNoUserData};
+use crate::jobs::files::format_system_time;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -40,18 +41,22 @@ const FILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// prefix uniqueness for identity anyway.
 const MIN_IMMUTABLE_SHA256_PREFIX: usize = 10;
 
-/// Cache policy derived from how the item was addressed. Immutable responses
-/// are only claimed for sha256 addressing with enough of the hash to make a
-/// collision negligible, where the URL is content-addressed and can never
-/// legitimately serve different bytes; any other identifier (path, file_id,
-/// short prefix, ...) can be re-pointed, so those responses must revalidate
+/// Content-addressed URL bytes can never legitimately change.
+const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+/// Content-addressed URL, but the on-disk mtime no longer matches the one
+/// recorded at index time: the bytes may have drifted from the hash in the
+/// URL, so cap the cache and let the ETag revalidate after expiry.
+const CACHE_DRIFTED: &str = "public, max-age=3600";
+/// Re-pointable identifier (path, file_id, ...): revalidate every time
 /// (cheaply, via ETag/304).
-fn cache_control_for(id_type: ItemIdentifierType, id: &str) -> &'static str {
-    if matches!(id_type, ItemIdentifierType::Sha256) && id.len() >= MIN_IMMUTABLE_SHA256_PREFIX {
-        "public, max-age=31536000, immutable"
-    } else {
-        "public, no-cache"
-    }
+const CACHE_REVALIDATE: &str = "public, no-cache";
+
+/// Whether the request addressed the item by content: sha256 addressing with
+/// enough of the hash to make a collision negligible. Only such URLs may
+/// claim immutability; any other identifier (path, file_id, short prefix,
+/// ...) can be re-pointed, so those responses must always revalidate.
+fn is_content_addressed(id_type: ItemIdentifierType, id: &str) -> bool {
+    matches!(id_type, ItemIdentifierType::Sha256) && id.len() >= MIN_IMMUTABLE_SHA256_PREFIX
 }
 
 fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
@@ -229,13 +234,13 @@ pub async fn item_file(
         return Err(ApiError::not_found("No file found for item"));
     }
 
-    let cache_control = cache_control_for(query.id_type, &query.id);
+    let content_addressed = is_content_addressed(query.id_type, &query.id);
     file_response(
         &item,
         &item_data.files,
         "inline",
         &request_headers,
-        cache_control,
+        content_addressed,
     )
     .await
 }
@@ -395,14 +400,14 @@ pub async fn item_thumbnail(
         return Err(ApiError::not_found("No file found for item"));
     }
 
-    let cache_control = cache_control_for(query.id_type, &query.id);
+    let content_addressed = is_content_addressed(query.id_type, &query.id);
     match thumbnail_response(
         &mut db.conn,
         &item,
         &item_data.files,
         query.big,
         &request_headers,
-        cache_control,
+        content_addressed,
     )
     .await
     {
@@ -429,7 +434,7 @@ async fn thumbnail_response(
     files: &[FileRecord],
     big: bool,
     request_headers: &HeaderMap,
-    cache_control: &str,
+    content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
     let original_filename = display_filename(&files[0]);
     let original_filename_no_ext = Path::new(&original_filename)
@@ -439,7 +444,7 @@ async fn thumbnail_response(
 
     let mime = item.mime_type.as_str();
     if mime.is_empty() || mime.starts_with("image/gif") {
-        return file_response(item, files, "inline", request_headers, cache_control).await;
+        return file_response(item, files, "inline", request_headers, content_addressed).await;
     }
 
     let index = if mime.starts_with("video") {
@@ -450,11 +455,19 @@ async fn thumbnail_response(
 
     // Stored thumbnails are keyed by content hash; the ETag mirrors that. If
     // thumbnail generation ever changes quality/size for existing content,
-    // bust caches by versioning the URL, not by weakening this.
+    // bust caches by versioning the URL, not by weakening this. Unlike raw
+    // file serving there is no drift caveat: the stored thumbnail is derived
+    // from exactly the content the URL names, however the disk file has
+    // changed since, so content-addressed requests stay fully immutable.
     let sha256 = &item.sha256;
     if let Some(buffer) = get_thumbnail_bytes(conn, sha256, index).await? {
         let etag = format!("\"{sha256}-thumb{index}\"");
         let filename = format!("{original_filename_no_ext}.jpg");
+        let cache_control = if content_addressed {
+            CACHE_IMMUTABLE
+        } else {
+            CACHE_REVALIDATE
+        };
         return bytes_response(
             buffer,
             "image/jpeg",
@@ -466,7 +479,7 @@ async fn thumbnail_response(
     }
 
     if mime.starts_with("image") {
-        return file_response(item, files, "inline", request_headers, cache_control).await;
+        return file_response(item, files, "inline", request_headers, content_addressed).await;
     }
 
     // The placeholder may be replaced by a real thumbnail later (e.g. after
@@ -574,7 +587,7 @@ async fn file_response(
     files: &[FileRecord],
     content_disposition_type: &str,
     request_headers: &HeaderMap,
-    cache_control: &str,
+    content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
     let mut last_error = ApiError::not_found("No file found for item");
     for file in files {
@@ -583,7 +596,7 @@ async fn file_response(
             file,
             content_disposition_type,
             request_headers,
-            cache_control,
+            content_addressed,
         )
         .await
         {
@@ -616,7 +629,7 @@ async fn try_file_response(
     file: &FileRecord,
     content_disposition_type: &str,
     request_headers: &HeaderMap,
-    cache_control: &str,
+    content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
     let filename = display_filename(file);
     let mut file_handle = open_file_with_timeout(&file.path).await?;
@@ -638,13 +651,32 @@ async fn try_file_response(
     // Strong validator: the item's content hash plus the on-disk size/mtime.
     // The disk components catch the (path/file_id-addressed) case where the
     // file changed after indexing and the recorded hash no longer matches.
-    let mtime_secs = metadata
-        .modified()
-        .ok()
+    let modified = metadata.modified().ok();
+    let mtime_secs = modified
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let etag = format!("\"{}-{:x}-{:x}\"", item.sha256, size, mtime_secs);
+
+    // Immutability requires the served bytes to still be the content the URL
+    // names. The on-disk mtime matching the one recorded at index time is
+    // the same freshness check the scanner uses for unchanged files (via the
+    // shared `format_system_time` truncation, so the strings compare equal);
+    // on a mismatch the bytes may have drifted from the hash, so the cache
+    // gets a bounded lifetime instead. Costs nothing: the stat already
+    // happened for the ETag.
+    let cache_control = if content_addressed {
+        let mtime_matches = modified
+            .and_then(format_system_time)
+            .is_some_and(|disk_mtime| disk_mtime == file.last_modified);
+        if mtime_matches {
+            CACHE_IMMUTABLE
+        } else {
+            CACHE_DRIFTED
+        }
+    } else {
+        CACHE_REVALIDATE
+    };
 
     let last_modified = iso_to_system_time(&file.last_modified).map(httpdate::fmt_http_date);
 
@@ -901,7 +933,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &HeaderMap::new(),
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -931,7 +963,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -957,7 +989,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -975,7 +1007,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1000,7 +1032,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1030,7 +1062,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1052,7 +1084,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &HeaderMap::new(),
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1076,7 +1108,7 @@ mod tests {
             std::slice::from_ref(&file),
             "inline",
             &request_headers,
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1107,7 +1139,7 @@ mod tests {
             &[missing, file],
             "inline",
             &HeaderMap::new(),
-            "public, no-cache",
+            false,
         )
         .await
         .unwrap();
@@ -1152,24 +1184,67 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_is_immutable_only_for_long_enough_sha256() {
+    fn content_addressing_requires_long_enough_sha256() {
         let full = "a".repeat(64);
-        assert_eq!(
-            cache_control_for(ItemIdentifierType::Sha256, &full),
-            "public, max-age=31536000, immutable"
-        );
+        assert!(is_content_addressed(ItemIdentifierType::Sha256, &full));
         // Pinboard-length (10 char) prefixes are content-addressed enough.
+        assert!(is_content_addressed(
+            ItemIdentifierType::Sha256,
+            "abc123def4"
+        ));
+        assert!(!is_content_addressed(
+            ItemIdentifierType::Sha256,
+            "abc123def"
+        ));
+        assert!(!is_content_addressed(
+            ItemIdentifierType::Path,
+            "C:/img.png"
+        ));
+    }
+
+    // Content-addressed requests are only immutable while the on-disk mtime
+    // still matches the one recorded at index time; a drifted mtime means the
+    // bytes may no longer be the content the URL names, so the cache lifetime
+    // is bounded instead.
+    #[tokio::test]
+    async fn content_addressed_immutability_gated_on_recorded_mtime() {
+        let file_path = temp_path("file_mtime_gate");
+        std::fs::write(&file_path, b"test").unwrap();
+        let (item, mut file) = test_records(&file_path);
+
+        // Fixture's stale last_modified (2024-01-01) never matches the fresh
+        // temp file: drifted, bounded cache.
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            cache_control_for(ItemIdentifierType::Sha256, "abc123def4"),
-            "public, max-age=31536000, immutable"
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_DRIFTED
         );
+
+        // Record the actual on-disk mtime the way the scanner does: match,
+        // fully immutable.
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap())
+                .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            cache_control_for(ItemIdentifierType::Sha256, "abc123def"),
-            "public, no-cache"
-        );
-        assert_eq!(
-            cache_control_for(ItemIdentifierType::Path, "C:/img.png"),
-            "public, no-cache"
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_IMMUTABLE
         );
     }
 
