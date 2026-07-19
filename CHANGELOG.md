@@ -18,19 +18,16 @@ Desktop release notes.
     pins stay put while the rest of the board reflows around them.
   - Hole targeting: carve a hole in the layout and send pins into it, with
     sticky carry and shift-drag placement.
-  - A board section in the tab menu, an auto-layout toggle on the board tab,
-    and a fullscreen board view with a hover-reveal toolbar.
+  - An auto-layout toggle directly on the Pinboard tab.
   - Copy a pin's file path from its context menu.
-- **Pinboard tabs in search results.** The grid view now has Results and
-  Pinboard tabs, so you can flip between search results and a board without
-  leaving the page.
+- **Pinboard tab in search results.** The grid view now has a Pinboard tab
+  next to Results, so you can switch between a board and your search results
+  without opening the gallery view.
 - **Better new-board defaults.** New pinboards start with auto-layout and
   auto-crop enabled; manually dragging or resizing a pin switches auto-layout
   off for that board (a toast tells you when it happens). Board settings are
-  now stored per board, and changing them no longer creates a new board
+  now saved with the board, and saving them never creates a new board
   version.
-- The gallery filmstrip is now a single virtualized strip, keeping it smooth
-  for result sets of any size.
 - The page-size slider is now logarithmic and goes up to 10,000 results per
   page.
 
