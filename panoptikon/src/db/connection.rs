@@ -184,6 +184,33 @@ fn read_pools() -> &'static Mutex<HashMap<ReadPoolKey, SqlitePool>> {
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Closes and forgets every pooled read connection that touches `db_name`
+/// (as either the index or the user-data database). MUST be called before
+/// deleting, renaming, or replacing a database file: idle pooled connections
+/// hold open OS file handles for up to `READ_POOL_IDLE_TIMEOUT` (which block
+/// deletion/renaming outright on Windows), and connections opened against a
+/// since-replaced file would keep serving its old contents until then.
+/// In-flight requests finish normally — `close()` waits for checked-out
+/// connections to be returned; the next request transparently builds a fresh
+/// pool against whatever file is at the path.
+#[allow(dead_code)] // No in-process DB delete/rename/restore flow exists yet.
+pub(crate) async fn invalidate_read_pools(db_name: &str) {
+    let removed: Vec<SqlitePool> = {
+        let mut pools = read_pools().lock().expect("read pool registry poisoned");
+        let keys: Vec<ReadPoolKey> = pools
+            .keys()
+            .filter(|(index_db, user_data_db, _)| index_db == db_name || user_data_db == db_name)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| pools.remove(&key))
+            .collect()
+    };
+    for pool in removed {
+        pool.close().await;
+    }
+}
+
 async fn acquire_read_conn(
     query: &DbQuery,
     names: &DbNames,
