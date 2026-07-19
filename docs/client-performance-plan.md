@@ -39,16 +39,22 @@ Ordered by priority. Status: `[ ]` open, `[x]` done, `[-]` rejected/deferred.
 
 ### P1 — Immutable caching on image endpoints
 
-- [ ] **1.1 `Cache-Control: public, max-age=<large>, immutable` + `ETag` on thumbnail and file responses.**
+Implemented 2026-07-19 (verified against the CI fixture DB: immutable +
+ETag on content-addressed responses, empty-body 304 on If-None-Match,
+Range/If-Range still honored, ETag survives the dev proxy).
+
+- [x] **1.1 `Cache-Control: public, max-age=<large>, immutable` + `ETag` on thumbnail and file responses.**
   ETag = sha256 (+ thumbnail idx for the storage-blob path). Applies to
   `bytes_response` (`items.rs:586-602`) and `file_response` (`items.rs:484-584`).
   Content is addressed by hash in the URL, so `immutable` is correct, not a
   heuristic.
-- [ ] **1.2 Conditional GET → 304.** Honor `If-None-Match` (and
+- [x] **1.2 Conditional GET → 304.** Honor `If-None-Match` (and
   `If-Modified-Since` on the file path, which already emits `Last-Modified`).
   Today the server never returns 304; only `If-Range` is inspected
   (`items.rs:511-521`).
-- [ ] **1.3 URL versioning escape hatch.** If thumbnail regeneration at
+- [x] **1.3 URL versioning escape hatch.** (Policy in place: `immutable` is
+  claimed only for full-sha256 addressing; a `&v=` param is the designated
+  cache-buster if thumbnail generation ever changes for existing content.) If thumbnail regeneration at
   different quality/size ever lands, bust caches by versioning the URL (e.g.
   `&v=`) rather than weakening `immutable`.
 
@@ -58,20 +64,26 @@ the whole plan.
 
 ### P2 — Per-request backend cost on the image path
 
-- [ ] **2.1 Remove the blocking SMB stat from the thumbnail path.** Drop
+- [x] **2.1 Remove the blocking SMB stat from the thumbnail path.**
+  (Serving endpoints use `get_item_metadata_unchecked` + try-open-fallback
+  across file candidates; `item_meta` keeps its documented existence
+  filtering but runs the stats on a blocking thread.) Drop
   `Path::exists()` in `get_item_metadata` (`db/items.rs:241-249`) for image
   serving (a missing file fails at `open()` anyway, which must be handled
   regardless), or make it async + time-limited where existence filtering is
   genuinely needed (search `check_path` is a separate, opt-in concern).
-- [ ] **2.2 Async/timeout hygiene for file IO.** `file_response`'s blocking
+- [x] **2.2 Async/timeout hygiene for file IO.** (10s timeout on open/stat.) `file_response`'s blocking
   `metadata()` (`items.rs:492-499`) and unbounded reads over SMB should not be
   able to stall tokio workers; add `spawn_blocking` or async equivalents and a
   sane timeout.
-- [ ] **2.3 SQLite connection reuse.** Replace open-per-request with a reader
+- [x] **2.3 SQLite connection reuse.** (Read-only requests share pools keyed
+  by `(index_db, user_data_db, attach)`, max 16 conns, 5 min idle timeout;
+  DB-name validation and directory setup run once per pool, not per request.
+  Writes still open dedicated connections.) Replace open-per-request with a reader
   pool (or cached connections) keyed by `(index_db, user_data_db)`, eliminating
   the per-request open + double ATTACH + PRAGMA ceremony
   (`connection.rs:263-365`).
-- [ ] **2.4 Stop attaching `user_data` on paths that never read it** (the image
+- [x] **2.4 Stop attaching `user_data` on paths that never read it** (the image
   endpoints attach it unconditionally today via `from_request_parts`,
   `connection.rs:100`). Falls out naturally of 2.3's pool design if pools are
   per-purpose.
@@ -89,21 +101,27 @@ SQL, and NOT as a client-initiated second query (which cannot overlap with
 search, since the client lacks the sha256s until search returns; at 10 000-item
 pages the extra round trip is pure waste).
 
-- [ ] **3.1 Opt-in search request flag** (e.g. `include_bookmarks` with
+- [x] **3.1 Opt-in search request flag** (query params `include_bookmarks`,
+  `bookmarks_namespace`, `bookmarks_user` on `POST /api/search/pql`; results
+  gain an optional `bookmarked` field — absent for legacy clients) (e.g. `include_bookmarks` with
   namespace/user). After `run_compiled_query` returns rows
   (`search.rs:350-367`), run one
   `SELECT sha256 FROM user_data.bookmarks WHERE sha256 IN (...) AND user = ? AND namespace = ?`
   over the page's sha256s and stamp results — a `bookmarked` /
   `bookmark_namespaces` field on `SearchResult` (or the existing `extra` map,
   `search.rs:138-142`). `user_data` is already attached on search connections.
-- [ ] **3.2 Client: seed a sha256-keyed bookmark store from the search
-  response** and delete the per-cell `$api.useQuery` in `BookmarkBtn`
+- [x] **3.2 Client: seed a sha256-keyed bookmark store from the search
+  response** (`ui/lib/state/bookmarkStatus.ts`, keyed by
+  user_data_db + namespace + sha256; the per-item GET survives only as a
+  fallback for items with no entry — pinboards, or a just-switched
+  namespace) and delete the per-cell `$api.useQuery` in `BookmarkBtn`
   (`imageButtons.tsx:80-86`). Buttons read from the shared store.
-- [ ] **3.3 Mutations update the store locally** from the mutation result (the
+- [x] **3.3 Mutations update the store locally** from the mutation result (the
   response already tells you the new state — no refetch for the clicked item).
   Keep the existing per-item endpoint (`GET /api/bookmarks/item/{sha256}`) for
   spot reconciliation if a surface ever needs it.
-- [ ] **3.4 Ensure `user_data.db` is in WAL from creation**, not lazily on first
+- [x] **3.4 Ensure `user_data.db` is in WAL from creation** (set at
+  migration time for all three DB types — index, storage, user_data), not lazily on first
   write (`connection.rs:337-345`) — with every search reading the bookmarks
   table, a rollback-journal DB would reintroduce reader/writer contention.
 - [-] **3.5 Batch status endpoint** (POST sha256 list → statuses). Nice-to-have
@@ -180,7 +198,7 @@ reactivity/rendering pass over the search view.
   JS synchronously during render (`ui/lib/state/blurHashDataURL.ts`, memoized
   per hash). Consider a cheaper path (canvas decode, CSS-only approximation, or
   off-main-thread) if profiling shows it.
-- [ ] **7.2 `SearchResultImage` re-executes every scroll frame** — the
+- [x] **7.2 `SearchResultImage` re-executes every scroll frame** — the
   virtualized parent re-renders per frame (`"use no memo"`, inherent to
   tanstack-virtual v3) and passes non-referentially-stable props
   (`onImageClick`, `dbs`), defeating React Compiler memoization

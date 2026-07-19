@@ -8,6 +8,7 @@ use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::io::SeekFrom;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
@@ -17,13 +18,62 @@ use crate::api::utils::{content_disposition_value, iso_to_system_time, strip_non
 use crate::api_error::ApiError;
 use crate::db::items::{
     ExtractedTextRecord, FileRecord, ItemIdentifierType, ItemRecord, get_all_tags_for_item,
-    get_extracted_text_for_item, get_item_metadata, get_text_by_ids, get_thumbnail_bytes,
+    get_extracted_text_for_item, get_item_metadata, get_item_metadata_unchecked, get_text_by_ids,
+    get_thumbnail_bytes,
 };
-use crate::db::{DbConnection, ReadOnly};
+use crate::db::{DbConnection, ReadOnlyNoUserData};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const PLACEHOLDER_PNG: &[u8] = include_bytes!("assets/placeholder.png");
+
+/// Ceiling on opening/statting a file before giving up on it. Indexed files
+/// can live on network shares; a hung mount must not stall requests (or, with
+/// no timeout, tokio's blocking pool) indefinitely.
+const FILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cache policy derived from how the item was addressed. Immutable responses
+/// are only claimed for full-sha256 addressing, where the URL is
+/// content-addressed and can never legitimately serve different bytes; any
+/// other identifier (path, file_id, ...) can be re-pointed, so those
+/// responses must revalidate (cheaply, via ETag/304).
+fn cache_control_for(id_type: ItemIdentifierType, id: &str) -> &'static str {
+    if matches!(id_type, ItemIdentifierType::Sha256) && id.len() == 64 {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, no-cache"
+    }
+}
+
+fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
+    header_value.trim() == "*"
+        || header_value
+            .split(',')
+            .map(|candidate| candidate.trim().trim_start_matches("W/"))
+            .any(|candidate| candidate == etag)
+}
+
+fn not_modified_response(
+    etag: &str,
+    cache_control: &str,
+    last_modified: Option<&str>,
+) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    let headers = response.headers_mut();
+    if let Ok(value) = header::HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(cache_control) {
+        headers.insert(header::CACHE_CONTROL, value);
+    }
+    if let Some(last_modified) = last_modified {
+        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
+            headers.insert(header::LAST_MODIFIED, value);
+        }
+    }
+    response
+}
 
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -157,11 +207,11 @@ pub(crate) struct ThumbnailQuery {
     )
 )]
 pub async fn item_file(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<ItemQuery>,
     request_headers: HeaderMap,
 ) -> ApiResult<Response<Body>> {
-    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    let item_data = get_item_metadata_unchecked(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
         return Err(ApiError::not_found("Item not found"));
     };
@@ -170,13 +220,15 @@ pub async fn item_file(
         return Err(ApiError::not_found("No file found for item"));
     }
 
-    let file = &item_data.files[0];
-    let mut filename = strip_non_latin1_chars(&file.filename);
-    if filename.is_empty() {
-        filename = file.filename.clone();
-    }
-
-    file_response(&item, file, &filename, "inline", &request_headers).await
+    let cache_control = cache_control_for(query.id_type, &query.id);
+    file_response(
+        &item,
+        &item_data.files,
+        "inline",
+        &request_headers,
+        cache_control,
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -192,7 +244,7 @@ pub async fn item_file(
     )
 )]
 pub async fn item_meta(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<ItemQuery>,
 ) -> ApiResult<Json<ItemMetadataResponse>> {
     let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
@@ -221,10 +273,11 @@ pub async fn item_meta(
     )
 )]
 pub async fn item_text(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<ItemTextQuery>,
 ) -> ApiResult<Json<TextResponse>> {
-    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    // Unchecked: only the item id is needed, no reason to stat the files.
+    let item_data = get_item_metadata_unchecked(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
         return Err(ApiError::not_found("Item not found"));
     };
@@ -265,10 +318,11 @@ pub async fn item_text(
     )
 )]
 pub async fn item_tags(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<ItemTagsQuery>,
 ) -> ApiResult<Json<TagResponse>> {
-    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    // Unchecked: only the item id is needed, no reason to stat the files.
+    let item_data = get_item_metadata_unchecked(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
         return Err(ApiError::not_found("Item not found"));
     };
@@ -299,7 +353,7 @@ pub async fn item_tags(
     )
 )]
 pub async fn texts_any(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<TextAnyQuery>,
 ) -> ApiResult<Json<TextResponse>> {
     let text = get_text_by_ids(&mut db.conn, &query.text_ids).await?;
@@ -319,11 +373,11 @@ pub async fn texts_any(
     )
 )]
 pub async fn item_thumbnail(
-    mut db: DbConnection<ReadOnly>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
     Query(query): Query<ThumbnailQuery>,
     request_headers: HeaderMap,
 ) -> ApiResult<Response<Body>> {
-    let item_data = get_item_metadata(&mut db.conn, &query.id, query.id_type).await?;
+    let item_data = get_item_metadata_unchecked(&mut db.conn, &query.id, query.id_type).await?;
     let Some(item) = item_data.item else {
         return Err(ApiError::not_found("Item not found"));
     };
@@ -332,24 +386,14 @@ pub async fn item_thumbnail(
         return Err(ApiError::not_found("No file found for item"));
     }
 
-    let file = &item_data.files[0];
-    let mut original_filename = strip_non_latin1_chars(&file.filename);
-    if original_filename.is_empty() {
-        original_filename = file.filename.clone();
-    }
-    let original_filename_no_ext = Path::new(&original_filename)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(&original_filename);
-
+    let cache_control = cache_control_for(query.id_type, &query.id);
     match thumbnail_response(
         &mut db.conn,
         &item,
-        file,
-        &original_filename,
-        original_filename_no_ext,
+        &item_data.files,
         query.big,
         &request_headers,
+        cache_control,
     )
     .await
     {
@@ -361,18 +405,32 @@ pub async fn item_thumbnail(
     }
 }
 
+fn display_filename(file: &FileRecord) -> String {
+    let filename = strip_non_latin1_chars(&file.filename);
+    if filename.is_empty() {
+        file.filename.clone()
+    } else {
+        filename
+    }
+}
+
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
     item: &ItemRecord,
-    file: &FileRecord,
-    original_filename: &str,
-    original_filename_no_ext: &str,
+    files: &[FileRecord],
     big: bool,
     request_headers: &HeaderMap,
+    cache_control: &str,
 ) -> ApiResult<Response<Body>> {
+    let original_filename = display_filename(&files[0]);
+    let original_filename_no_ext = Path::new(&original_filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(&original_filename);
+
     let mime = item.mime_type.as_str();
     if mime.is_empty() || mime.starts_with("image/gif") {
-        return file_response(item, file, original_filename, "inline", request_headers).await;
+        return file_response(item, files, "inline", request_headers, cache_control).await;
     }
 
     let index = if mime.starts_with("video") {
@@ -381,17 +439,39 @@ async fn thumbnail_response(
         0
     };
 
-    if let Some(buffer) = get_thumbnail_bytes(conn, &file.sha256, index).await? {
+    // Stored thumbnails are keyed by content hash; the ETag mirrors that. If
+    // thumbnail generation ever changes quality/size for existing content,
+    // bust caches by versioning the URL, not by weakening this.
+    let sha256 = &item.sha256;
+    if let Some(buffer) = get_thumbnail_bytes(conn, sha256, index).await? {
+        let etag = format!("\"{sha256}-thumb{index}\"");
         let filename = format!("{original_filename_no_ext}.jpg");
-        return bytes_response(buffer, "image/jpeg", &filename);
+        return bytes_response(
+            buffer,
+            "image/jpeg",
+            &filename,
+            &etag,
+            cache_control,
+            request_headers,
+        );
     }
 
     if mime.starts_with("image") {
-        return file_response(item, file, original_filename, "inline", request_headers).await;
+        return file_response(item, files, "inline", request_headers, cache_control).await;
     }
 
+    // The placeholder may be replaced by a real thumbnail later (e.g. after
+    // the next scan), so it must not claim immutability.
+    let etag = format!("\"{sha256}-placeholder\"");
     let filename = format!("{original_filename_no_ext}.png");
-    bytes_response(PLACEHOLDER_PNG.to_vec(), "image/png", &filename)
+    bytes_response(
+        PLACEHOLDER_PNG.to_vec(),
+        "image/png",
+        &filename,
+        &etag,
+        "public, max-age=300",
+        request_headers,
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -476,29 +556,113 @@ fn parse_range_header(value: &str, size: u64) -> RangeOutcome {
     }
 }
 
+/// Serves the first candidate file that can actually be opened. Candidates
+/// are ordered by `available` DESC in the DB; a missing or hung file falls
+/// through to the next instead of failing the request (previously every
+/// candidate was pre-filtered with a blocking stat on the async worker).
 async fn file_response(
     item: &ItemRecord,
-    file: &FileRecord,
-    filename: &str,
+    files: &[FileRecord],
     content_disposition_type: &str,
     request_headers: &HeaderMap,
+    cache_control: &str,
 ) -> ApiResult<Response<Body>> {
-    let mut file_handle = tokio::fs::File::open(&file.path).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to open file");
-        ApiError::not_found("No file found for item")
-    })?;
+    let mut last_error = ApiError::not_found("No file found for item");
+    for file in files {
+        match try_file_response(
+            item,
+            file,
+            content_disposition_type,
+            request_headers,
+            cache_control,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                tracing::warn!(path = %file.path, "failed to serve file candidate");
+                last_error = err;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+async fn open_file_with_timeout(path: &str) -> ApiResult<tokio::fs::File> {
+    match tokio::time::timeout(FILE_IO_TIMEOUT, tokio::fs::File::open(path)).await {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "failed to open file");
+            Err(ApiError::not_found("No file found for item"))
+        }
+        Err(_) => {
+            tracing::error!(path = %path, "timed out opening file");
+            Err(ApiError::internal("Timed out opening file"))
+        }
+    }
+}
+
+async fn try_file_response(
+    item: &ItemRecord,
+    file: &FileRecord,
+    content_disposition_type: &str,
+    request_headers: &HeaderMap,
+    cache_control: &str,
+) -> ApiResult<Response<Body>> {
+    let filename = display_filename(file);
+    let mut file_handle = open_file_with_timeout(&file.path).await?;
     // The size on disk is authoritative for range math; the DB value can be
     // stale if the file changed since the last scan.
-    let size = file_handle
-        .metadata()
-        .await
-        .map_err(|err| {
+    let metadata = match tokio::time::timeout(FILE_IO_TIMEOUT, file_handle.metadata()).await {
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(err)) => {
             tracing::error!(error = %err, "failed to read file metadata");
-            ApiError::internal("Failed to read file metadata")
-        })?
-        .len();
+            return Err(ApiError::internal("Failed to read file metadata"));
+        }
+        Err(_) => {
+            tracing::error!(path = %file.path, "timed out reading file metadata");
+            return Err(ApiError::internal("Timed out reading file metadata"));
+        }
+    };
+    let size = metadata.len();
+
+    // Strong validator: the item's content hash plus the on-disk size/mtime.
+    // The disk components catch the (path/file_id-addressed) case where the
+    // file changed after indexing and the recorded hash no longer matches.
+    let mtime_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let etag = format!("\"{}-{:x}-{:x}\"", item.sha256, size, mtime_secs);
 
     let last_modified = iso_to_system_time(&file.last_modified).map(httpdate::fmt_http_date);
+
+    // Conditional GET: If-None-Match wins over If-Modified-Since (RFC 9110).
+    if let Some(if_none_match) = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        if if_none_match_matches(if_none_match, &etag) {
+            return Ok(not_modified_response(
+                &etag,
+                cache_control,
+                last_modified.as_deref(),
+            ));
+        }
+    } else if let Some(if_modified_since) = request_headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if last_modified.as_deref() == Some(if_modified_since.trim()) {
+            return Ok(not_modified_response(
+                &etag,
+                cache_control,
+                last_modified.as_deref(),
+            ));
+        }
+    }
 
     let mut range = request_headers
         .get(header::RANGE)
@@ -508,13 +672,19 @@ async fn file_response(
 
     // If-Range: only honor the range when the validator still matches;
     // otherwise the client's partial state is stale and it needs the full
-    // body. We emit no ETag, so Last-Modified is the only validator.
+    // body. The validator may be either our ETag or the Last-Modified date.
     if range != RangeOutcome::Full {
         if let Some(if_range) = request_headers
             .get(header::IF_RANGE)
             .and_then(|value| value.to_str().ok())
         {
-            if last_modified.as_deref() != Some(if_range.trim()) {
+            let if_range = if_range.trim();
+            let matches = if if_range.starts_with('"') || if_range.starts_with("W/") {
+                if_range == etag
+            } else {
+                last_modified.as_deref() == Some(if_range)
+            };
+            if !matches {
                 range = RangeOutcome::Full;
             }
         }
@@ -575,15 +745,37 @@ async fn file_response(
             headers.insert(header::LAST_MODIFIED, value);
         }
     }
+    if let Ok(value) = header::HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(cache_control) {
+        headers.insert(header::CACHE_CONTROL, value);
+    }
 
-    if let Some(value) = content_disposition_value(content_disposition_type, filename) {
+    if let Some(value) = content_disposition_value(content_disposition_type, &filename) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
 
     Ok(response)
 }
 
-fn bytes_response(bytes: Vec<u8>, media_type: &str, filename: &str) -> ApiResult<Response<Body>> {
+fn bytes_response(
+    bytes: Vec<u8>,
+    media_type: &str,
+    filename: &str,
+    etag: &str,
+    cache_control: &str,
+    request_headers: &HeaderMap,
+) -> ApiResult<Response<Body>> {
+    if let Some(if_none_match) = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        if if_none_match_matches(if_none_match, etag) {
+            return Ok(not_modified_response(etag, cache_control, None));
+        }
+    }
+
     let len = bytes.len();
     let mut response = Response::new(Body::from(bytes));
     let headers = response.headers_mut();
@@ -593,6 +785,12 @@ fn bytes_response(bytes: Vec<u8>, media_type: &str, filename: &str) -> ApiResult
     }
     if let Ok(value) = header::HeaderValue::from_str(&len.to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Ok(value) = header::HeaderValue::from_str(cache_control) {
+        headers.insert(header::CACHE_CONTROL, value);
     }
     if let Some(value) = content_disposition_value("inline", filename) {
         headers.insert(header::CONTENT_DISPOSITION, value);
@@ -689,9 +887,15 @@ mod tests {
         std::fs::write(&file_path, b"test").unwrap();
         let (item, file) = test_records(&file_path);
 
-        let response = file_response(&item, &file, "file.png", "inline", &HeaderMap::new())
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &HeaderMap::new(),
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
         let headers = response.headers();
 
         assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
@@ -713,9 +917,15 @@ mod tests {
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert(header::RANGE, "bytes=2-5".parse().unwrap());
-        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         let headers = response.headers();
@@ -733,9 +943,15 @@ mod tests {
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert(header::RANGE, "bytes=7-".parse().unwrap());
-        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             response.headers().get(header::CONTENT_RANGE).unwrap(),
@@ -745,9 +961,15 @@ mod tests {
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert(header::RANGE, "bytes=-3".parse().unwrap());
-        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             response.headers().get(header::CONTENT_RANGE).unwrap(),
@@ -764,9 +986,15 @@ mod tests {
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert(header::RANGE, "bytes=100-".parse().unwrap());
-        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(
@@ -788,12 +1016,156 @@ mod tests {
             header::IF_RANGE,
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
         );
-        let response = file_response(&item, &file, "file.png", "inline", &request_headers)
-            .await
-            .unwrap();
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_bytes(response).await, b"0123456789");
+    }
+
+    // Cache validators are emitted and a matching If-None-Match short-circuits
+    // to an empty 304 carrying the same validators.
+    #[tokio::test]
+    async fn file_response_supports_etag_and_304() {
+        let file_path = temp_path("file_etag");
+        std::fs::write(&file_path, b"test").unwrap();
+        let (item, file) = test_records(&file_path);
+
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &HeaderMap::new(),
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("ETag header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.starts_with("\"sha256-"), "{etag}");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, no-cache"
+        );
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let response = file_response(
+            &item,
+            std::slice::from_ref(&file),
+            "inline",
+            &request_headers,
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), &etag);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_some());
+        assert!(body_bytes(response).await.is_empty());
+    }
+
+    // A missing first candidate falls through to the next instead of 404ing.
+    #[tokio::test]
+    async fn file_response_falls_back_to_next_candidate() {
+        let file_path = temp_path("file_fallback");
+        std::fs::write(&file_path, b"test").unwrap();
+        let (item, file) = test_records(&file_path);
+        let missing = FileRecord {
+            id: 11,
+            sha256: file.sha256.clone(),
+            path: temp_path("file_fallback_missing")
+                .to_string_lossy()
+                .to_string(),
+            last_modified: file.last_modified.clone(),
+            filename: "gone.png".to_string(),
+        };
+
+        let response = file_response(
+            &item,
+            &[missing, file],
+            "inline",
+            &HeaderMap::new(),
+            "public, no-cache",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"test");
+    }
+
+    #[tokio::test]
+    async fn bytes_response_supports_etag_and_304() {
+        let response = bytes_response(
+            b"thumb".to_vec(),
+            "image/jpeg",
+            "file.jpg",
+            "\"sha-thumb0\"",
+            "public, max-age=31536000, immutable",
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            "\"sha-thumb0\""
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(header::IF_NONE_MATCH, "\"sha-thumb0\"".parse().unwrap());
+        let response = bytes_response(
+            b"thumb".to_vec(),
+            "image/jpeg",
+            "file.jpg",
+            "\"sha-thumb0\"",
+            "public, max-age=31536000, immutable",
+            &request_headers,
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_bytes(response).await.is_empty());
+    }
+
+    #[test]
+    fn cache_control_is_immutable_only_for_full_sha256() {
+        let full = "a".repeat(64);
+        assert_eq!(
+            cache_control_for(ItemIdentifierType::Sha256, &full),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for(ItemIdentifierType::Sha256, "abc123"),
+            "public, no-cache"
+        );
+        assert_eq!(
+            cache_control_for(ItemIdentifierType::Path, "C:/img.png"),
+            "public, no-cache"
+        );
+    }
+
+    #[test]
+    fn if_none_match_matching() {
+        assert!(if_none_match_matches("\"a\"", "\"a\""));
+        assert!(if_none_match_matches("\"x\", \"a\"", "\"a\""));
+        assert!(if_none_match_matches("W/\"a\"", "\"a\""));
+        assert!(if_none_match_matches("*", "\"a\""));
+        assert!(!if_none_match_matches("\"b\"", "\"a\""));
     }
 
     #[test]

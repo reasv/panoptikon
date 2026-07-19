@@ -151,7 +151,9 @@ pub(crate) async fn get_all_data_logs(
             .fetch_all(&mut *conn)
             .await
     } else {
-        sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(&mut *conn).await
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+            .fetch_all(&mut *conn)
+            .await
     }
     .map_err(|err| {
         tracing::error!(error = %err, "failed to read data logs");

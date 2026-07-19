@@ -803,7 +803,7 @@ pub(crate) async fn validate_setup_folders(
     Json(request): Json<DesktopFolderSelection>,
 ) -> Result<Json<FolderValidation>, ApiError> {
     ensure_desktop_managed()?;
-    let database = (!request.new_database).then_some(&mut conn.conn);
+    let database = (!request.new_database).then_some(&mut *conn.conn);
     Ok(Json(
         validate_folders(
             database,
@@ -828,7 +828,7 @@ pub(crate) async fn validate_setup_continuous_folders(
     Json(request): Json<DesktopContinuousScanSelection>,
 ) -> Result<Json<FolderValidation>, ApiError> {
     ensure_desktop_managed()?;
-    let database = (!request.new_database).then_some(&mut conn.conn);
+    let database = (!request.new_database).then_some(&mut *conn.conn);
     Ok(Json(
         validate_continuous_folders(
             database,
@@ -1000,7 +1000,7 @@ pub(crate) async fn complete_setup(
         .map_err(|error| ApiError::bad_request(format!("Invalid routine schedule: {error}")))?;
     validate_cron_jobs(&request.cron_jobs).await?;
 
-    let database = request.new_index_db.is_none().then_some(&mut conn.conn);
+    let database = request.new_index_db.is_none().then_some(&mut *conn.conn);
     let validation = validate_folders(
         database,
         &request.included_folders,
@@ -1013,7 +1013,7 @@ pub(crate) async fn complete_setup(
             issue.path, issue.error
         )));
     }
-    let database = request.new_index_db.is_none().then_some(&mut conn.conn);
+    let database = request.new_index_db.is_none().then_some(&mut *conn.conn);
     let continuous_validation = validate_continuous_folders(
         database,
         &validation.included_folders,

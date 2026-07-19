@@ -214,6 +214,16 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
             .await
             .with_context(|| format!("failed to stamp database {}", path.display()))?;
     }
+    // All three databases are read while other connections write them (index
+    // and storage by jobs, user_data directly by API handlers). WAL is a
+    // persistent property of the file, so setting it once here covers every
+    // later connection; without this a fresh database would sit in rollback
+    // journal until its first write connection happened to set WAL, giving
+    // readers and writers classic shared/exclusive lock contention.
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&mut conn)
+        .await
+        .with_context(|| format!("failed to enable WAL on {}", path.display()))?;
     Ok(())
 }
 

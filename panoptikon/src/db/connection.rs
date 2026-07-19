@@ -5,37 +5,85 @@ use axum::{
 use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
-use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+use sqlx::{
+    Connection, SqliteConnection, SqlitePool,
+    pool::PoolConnection,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use std::{
+    collections::HashMap,
     fs,
     marker::PhantomData,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
+    time::Duration,
 };
 use url::Url;
 
 use crate::api_error::ApiError;
 
 pub struct ReadOnly;
+/// Read-only mode that skips the user_data attach for endpoints that never
+/// touch bookmarks or pinboards (e.g. file/thumbnail serving).
+pub struct ReadOnlyNoUserData;
 pub struct UserDataWrite;
 
 pub(crate) trait DbMode {
     const WRITE_LOCK: bool;
     const USER_DATA_WL: bool;
+    const ATTACH_USER_DATA: bool;
 }
 
 impl DbMode for ReadOnly {
     const WRITE_LOCK: bool = false;
     const USER_DATA_WL: bool = false;
+    const ATTACH_USER_DATA: bool = true;
+}
+
+impl DbMode for ReadOnlyNoUserData {
+    const WRITE_LOCK: bool = false;
+    const USER_DATA_WL: bool = false;
+    const ATTACH_USER_DATA: bool = false;
 }
 
 impl DbMode for UserDataWrite {
     const WRITE_LOCK: bool = false;
     const USER_DATA_WL: bool = true;
+    const ATTACH_USER_DATA: bool = true;
+}
+
+/// A request-scoped database handle: read-only requests check a connection
+/// out of a shared per-(index_db, user_data_db) pool, write requests open a
+/// dedicated connection. Derefs to `SqliteConnection` so handlers can pass
+/// `&mut db.conn` to query helpers either way.
+pub enum DbConn {
+    Pooled(PoolConnection<sqlx::Sqlite>),
+    Direct(SqliteConnection),
+}
+
+impl Deref for DbConn {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &SqliteConnection {
+        match self {
+            DbConn::Pooled(conn) => conn,
+            DbConn::Direct(conn) => conn,
+        }
+    }
+}
+
+impl DerefMut for DbConn {
+    fn deref_mut(&mut self) -> &mut SqliteConnection {
+        match self {
+            DbConn::Pooled(conn) => conn,
+            DbConn::Direct(conn) => conn,
+        }
+    }
 }
 
 pub struct DbConnection<M: DbMode> {
-    pub conn: SqliteConnection,
+    pub conn: DbConn,
     pub index_db: String,
     pub user_data_db: String,
     _mode: PhantomData<M>,
@@ -95,12 +143,26 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let query = Query::<DbQuery>::try_from_uri(&parts.uri)
             .map_err(|_| ApiError::bad_request("Invalid query parameters"))?;
+
+        // Read-only requests share pooled connections; only writes still open
+        // (and tear down) a dedicated connection per request.
+        if !M::WRITE_LOCK && !M::USER_DATA_WL {
+            let names = resolve_db_names_unchecked(&query.0);
+            let conn = acquire_read_conn(&query.0, &names, M::ATTACH_USER_DATA).await?;
+            return Ok(Self {
+                conn: DbConn::Pooled(conn),
+                index_db: names.index_db,
+                user_data_db: names.user_data_db,
+                _mode: PhantomData,
+            });
+        }
+
         let names = resolve_db_names(query.0)?;
         let paths = db_paths(&names.index_db, &names.user_data_db)?;
-        let conn = connect_db(&paths, M::WRITE_LOCK, M::USER_DATA_WL, true).await?;
+        let conn = connect_db(&paths, M::WRITE_LOCK, M::USER_DATA_WL, M::ATTACH_USER_DATA).await?;
 
         Ok(Self {
-            conn,
+            conn: DbConn::Direct(conn),
             index_db: names.index_db,
             user_data_db: names.user_data_db,
             _mode: PhantomData,
@@ -108,13 +170,118 @@ where
     }
 }
 
+/// Max pooled read connections per (index_db, user_data_db) pair. Sized for a
+/// browser's worth of concurrent image/search requests plus SSR; SQLite read
+/// connections are cheap but each holds its own page cache.
+const READ_POOL_MAX_CONNECTIONS: u32 = 16;
+const READ_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Key: (index_db, user_data_db-or-empty, attach_user_data).
+type ReadPoolKey = (String, String, bool);
+
+fn read_pools() -> &'static Mutex<HashMap<ReadPoolKey, SqlitePool>> {
+    static POOLS: OnceLock<Mutex<HashMap<ReadPoolKey, SqlitePool>>> = OnceLock::new();
+    POOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn acquire_read_conn(
+    query: &DbQuery,
+    names: &DbNames,
+    attach_user_data: bool,
+) -> Result<PoolConnection<sqlx::Sqlite>, ApiError> {
+    let key = (
+        names.index_db.clone(),
+        if attach_user_data {
+            names.user_data_db.clone()
+        } else {
+            String::new()
+        },
+        attach_user_data,
+    );
+
+    let existing = {
+        let pools = read_pools().lock().expect("read pool registry poisoned");
+        pools.get(&key).cloned()
+    };
+    let pool = match existing {
+        Some(pool) => pool,
+        None => {
+            // First use of this DB pair: validate the client-supplied names
+            // (defaults are trusted, as before) and prepare directories once
+            // here instead of on every request.
+            check_dbs(
+                query.index_db.as_deref(),
+                if attach_user_data {
+                    query.user_data_db.as_deref()
+                } else {
+                    None
+                },
+            )?;
+            let paths = db_paths(&names.index_db, &names.user_data_db)?;
+            let pool = build_read_pool(&paths, attach_user_data)?;
+            let mut pools = read_pools().lock().expect("read pool registry poisoned");
+            // A concurrent request may have raced us here; keep the first pool.
+            pools.entry(key).or_insert(pool).clone()
+        }
+    };
+
+    pool.acquire().await.map_err(|err| {
+        tracing::error!(error = %err, "failed to acquire read connection");
+        ApiError::internal("Failed to open database")
+    })
+}
+
+fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
+    ensure_sqlite_vec_loaded()?;
+    let options = SqliteConnectOptions::new()
+        .filename(&paths.index_db_file)
+        .read_only(true);
+    let storage_path = paths.storage_db_file.to_string_lossy().to_string();
+    let user_data_path = attach_user_data.then(|| user_data_attach_path(&paths.user_db_file, true));
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(READ_POOL_MAX_CONNECTIONS)
+        .min_connections(0)
+        .idle_timeout(Some(READ_POOL_IDLE_TIMEOUT))
+        .test_before_acquire(false)
+        .after_connect(move |conn, _meta| {
+            let storage_path = storage_path.clone();
+            let user_data_path = user_data_path.clone();
+            Box::pin(async move {
+                sqlx::query("ATTACH DATABASE ? AS storage")
+                    .bind(storage_path)
+                    .execute(&mut *conn)
+                    .await?;
+                if let Some(user_data_path) = user_data_path {
+                    sqlx::query("ATTACH DATABASE ? AS user_data")
+                        .bind(user_data_path)
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA case_sensitive_like = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_lazy_with(options);
+    Ok(pool)
+}
+
 fn resolve_db_names(query: DbQuery) -> Result<DbNames, ApiError> {
     check_dbs(query.index_db.as_deref(), query.user_data_db.as_deref())?;
+    Ok(resolve_db_names_unchecked(&query))
+}
+
+fn resolve_db_names_unchecked(query: &DbQuery) -> DbNames {
     let (default_index, default_user) = db_default_names();
-    Ok(DbNames {
-        index_db: query.index_db.unwrap_or(default_index),
-        user_data_db: query.user_data_db.unwrap_or(default_user),
-    })
+    DbNames {
+        index_db: query.index_db.clone().unwrap_or(default_index),
+        user_data_db: query.user_data_db.clone().unwrap_or(default_user),
+    }
 }
 
 fn db_default_names() -> (String, String) {

@@ -192,8 +192,8 @@ fn canonical_flags(request: &SaveVersionRequest) -> ApiResult<Option<String>> {
         return Err(ApiError::bad_request("Flags must be a JSON object"));
     };
     let sorted: std::collections::BTreeMap<&String, &serde_json::Value> = map.iter().collect();
-    let serialized = serde_json::to_string(&sorted)
-        .map_err(|_| ApiError::bad_request("Invalid flags"))?;
+    let serialized =
+        serde_json::to_string(&sorted).map_err(|_| ApiError::bad_request("Invalid flags"))?;
     if serialized.len() > MAX_FLAGS_BYTES {
         return Err(ApiError::bad_request("Flags too large"));
     }

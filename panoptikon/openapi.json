@@ -3946,7 +3946,7 @@
           "search"
         ],
         "summary": "Search for files and items in the database",
-        "description": "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.",
+        "description": "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.\nWith `include_bookmarks`, each result additionally carries a `bookmarked` field\nresolved after the query runs (see the parameter description).",
         "operationId": "search_pql",
         "parameters": [
           {
@@ -3971,6 +3971,36 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "name": "include_bookmarks",
+            "in": "query",
+            "description": "Include Bookmark Status\n\nWhen true, each result carries a `bookmarked` field, resolved against\nthe selected user data database after the search query runs. This\navoids a separate round trip for per-item bookmark status without\ncoupling the search query itself to bookmark state.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "bookmarks_namespace",
+            "in": "query",
+            "description": "Bookmarks Namespace\n\nThe bookmark namespace to check against. `*` matches any namespace.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "*"
+            }
+          },
+          {
+            "name": "bookmarks_user",
+            "in": "query",
+            "description": "Bookmarks User\n\nThe bookmarks user to check against.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
             }
           }
         ],
@@ -7800,6 +7830,13 @@
               "string",
               "null"
             ]
+          },
+          "bookmarked": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Bookmarked\n\nWhether this item is bookmarked. Only present when the search was\nrequested with `include_bookmarks` and the result has a sha256.\nComputed after the query runs; never part of the compiled search SQL."
           },
           "confidence": {
             "type": [

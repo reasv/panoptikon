@@ -69,7 +69,35 @@ pub(crate) struct TextStats {
     pub lowest_confidence: Option<f64>,
 }
 
+/// Item metadata with the file list filtered to files that exist on disk
+/// (part of the `item_meta` API contract). The existence stats run on a
+/// blocking thread — paths may live on slow network shares.
 pub(crate) async fn get_item_metadata(
+    conn: &mut sqlx::SqliteConnection,
+    identifier: &str,
+    identifier_type: ItemIdentifierType,
+) -> ApiResult<ItemMetadata> {
+    let mut metadata = get_item_metadata_unchecked(conn, identifier, identifier_type).await?;
+    let files = std::mem::take(&mut metadata.files);
+    metadata.files = tokio::task::spawn_blocking(move || {
+        files
+            .into_iter()
+            .filter(|file| PathBuf::from(&file.path).exists())
+            .collect()
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "file existence check task failed");
+        ApiError::internal("Failed to get item")
+    })?;
+    Ok(metadata)
+}
+
+/// Item metadata without touching the filesystem: the file list is returned
+/// as recorded in the database (ordered by `available` DESC). File-serving
+/// endpoints use this and discover missing files at open() instead of paying
+/// a per-request stat.
+pub(crate) async fn get_item_metadata_unchecked(
     conn: &mut sqlx::SqliteConnection,
     identifier: &str,
     identifier_type: ItemIdentifierType,
@@ -238,15 +266,13 @@ pub(crate) async fn get_item_metadata(
             });
         }
 
-        if PathBuf::from(&path).exists() {
-            files.push(FileRecord {
-                id: file_id,
-                sha256,
-                path,
-                last_modified,
-                filename,
-            });
-        }
+        files.push(FileRecord {
+            id: file_id,
+            sha256,
+            path,
+            last_modified,
+            filename,
+        });
     }
 
     Ok(ItemMetadata {

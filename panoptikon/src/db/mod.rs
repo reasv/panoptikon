@@ -17,6 +17,6 @@ pub(crate) mod system_config;
 pub(crate) mod tags;
 
 pub(crate) use connection::{
-    DbConnection, ReadOnly, UserDataWrite, open_index_db_read, open_index_db_read_no_user_data,
-    open_index_db_write_no_user_data, readonly_mode,
+    DbConnection, ReadOnly, ReadOnlyNoUserData, UserDataWrite, open_index_db_read,
+    open_index_db_read_no_user_data, open_index_db_write_no_user_data, readonly_mode,
 };

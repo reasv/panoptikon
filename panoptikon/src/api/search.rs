@@ -140,6 +140,13 @@ pub(crate) struct SearchResult {
     ///
     /// Extra fields retrieved from filters that are not part of the main result object.
     extra: Option<HashMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Bookmarked
+    ///
+    /// Whether this item is bookmarked. Only present when the search was
+    /// requested with `include_bookmarks` and the result has a sha256.
+    /// Computed after the query runs; never part of the compiled search SQL.
+    bookmarked: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -148,6 +155,36 @@ pub(crate) struct FileSearchResponse {
     results: Vec<SearchResult>,
     count_metrics: SearchMetrics,
     result_metrics: SearchMetrics,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct BookmarkStatusParams {
+    /// Include Bookmark Status
+    ///
+    /// When true, each result carries a `bookmarked` field, resolved against
+    /// the selected user data database after the search query runs. This
+    /// avoids a separate round trip for per-item bookmark status without
+    /// coupling the search query itself to bookmark state.
+    #[serde(default)]
+    #[param(default = false)]
+    include_bookmarks: bool,
+    /// Bookmarks Namespace
+    ///
+    /// The bookmark namespace to check against. `*` matches any namespace.
+    #[serde(default = "default_wildcard_namespace")]
+    #[param(default = "*")]
+    bookmarks_namespace: String,
+    /// Bookmarks User
+    ///
+    /// The bookmarks user to check against.
+    #[serde(default = "default_user")]
+    #[param(default = "user")]
+    bookmarks_user: String,
+}
+
+fn default_wildcard_namespace() -> String {
+    "*".to_string()
 }
 
 #[derive(Deserialize, ToSchema, IntoParams)]
@@ -312,8 +349,8 @@ pub async fn get_stats(
     path = "/api/search/pql",
     tag = "search",
     summary = "Search for files and items in the database",
-    description = "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.",
-    params(DbQueryParams),
+    description = "Search for files in the database based on the provided query parameters.\nThis endpoint is meant to be used with the Panoptikon Query Language.\nWith `include_bookmarks`, each result additionally carries a `bookmarked` field\nresolved after the query runs (see the parameter description).",
+    params(DbQueryParams, BookmarkStatusParams),
     request_body(
         content = Option<PqlQuery>,
         description = "The PQL Search query to execute"
@@ -325,6 +362,7 @@ pub async fn get_stats(
 pub async fn search_pql(
     State(state): State<Arc<ProxyState>>,
     mut db: DbConnection<ReadOnly>,
+    Query(bookmark_params): Query<BookmarkStatusParams>,
     body: Option<Json<Value>>,
 ) -> ApiResult<Json<FileSearchResponse>> {
     let payload = body
@@ -347,7 +385,7 @@ pub async fn search_pql(
         0
     };
 
-    let results = if let Some(compiled) = builder.compiled_query.as_ref() {
+    let mut results = if let Some(compiled) = builder.compiled_query.as_ref() {
         let start = Instant::now();
         let rows = run_compiled_query(&mut db.conn, &compiled.sql, &compiled.params).await?;
         result_metrics.execute = elapsed_seconds(start);
@@ -365,6 +403,10 @@ pub async fn search_pql(
     } else {
         Vec::new()
     };
+
+    if bookmark_params.include_bookmarks {
+        annotate_bookmark_status(&mut db.conn, &mut results, &bookmark_params).await?;
+    }
 
     Ok(Json(FileSearchResponse {
         count,
@@ -684,6 +726,78 @@ fn map_pql_error(err: PqlError) -> ApiError {
     ApiError::bad_request(err.message)
 }
 
+/// SQLite's default variable limit is 32766; stay well under it.
+const BOOKMARK_LOOKUP_CHUNK: usize = 5000;
+
+/// Post-query enrichment: stamps `bookmarked` on each result by looking the
+/// page's sha256s up in `user_data.bookmarks` (already attached on read-only
+/// connections). Deliberately NOT a join in the compiled search SQL — search
+/// results stay independent of bookmark state, so a future search cache can
+/// store the un-enriched result set and re-run this on every response.
+/// Semantics mirror `get_bookmark_metadata`: exact user match, `*` namespace
+/// matches any namespace.
+async fn annotate_bookmark_status(
+    conn: &mut sqlx::SqliteConnection,
+    results: &mut [SearchResult],
+    params: &BookmarkStatusParams,
+) -> ApiResult<()> {
+    let mut hashes: Vec<&str> = results
+        .iter()
+        .filter_map(|result| result.sha256.as_deref())
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return Ok(());
+    }
+
+    let any_namespace = params.bookmarks_namespace == "*";
+    let mut bookmarked: HashSet<String> = HashSet::new();
+    for chunk in hashes.chunks(BOOKMARK_LOOKUP_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = if any_namespace {
+            format!(
+                "SELECT DISTINCT sha256 FROM user_data.bookmarks
+                 WHERE user = ? AND sha256 IN ({placeholders})"
+            )
+        } else {
+            format!(
+                "SELECT DISTINCT sha256 FROM user_data.bookmarks
+                 WHERE user = ? AND namespace = ? AND sha256 IN ({placeholders})"
+            )
+        };
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&params.bookmarks_user);
+        if !any_namespace {
+            query = query.bind(&params.bookmarks_namespace);
+        }
+        for hash in chunk {
+            query = query.bind(*hash);
+        }
+        let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
+            tracing::error!(error = %err, "failed to look up bookmark status");
+            ApiError::internal("Failed to look up bookmark status")
+        })?;
+        for row in rows {
+            let sha256: String = row.try_get("sha256").map_err(|err| {
+                tracing::error!(error = %err, "failed to read bookmark sha256");
+                ApiError::internal("Failed to look up bookmark status")
+            })?;
+            bookmarked.insert(sha256);
+        }
+    }
+
+    // Results without a sha256 (custom select lists) stay None rather than
+    // claiming "not bookmarked".
+    let bookmarked_set = bookmarked;
+    for result in results.iter_mut() {
+        if let Some(sha256) = result.sha256.as_deref() {
+            result.bookmarked = Some(bookmarked_set.contains(sha256));
+        }
+    }
+    Ok(())
+}
+
 async fn apply_check_path(
     conn: &mut sqlx::SqliteConnection,
     result: &mut SearchResult,
@@ -890,6 +1004,68 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
+
+    fn result_with_sha(sha256: Option<&str>) -> SearchResult {
+        SearchResult {
+            file_id: 1,
+            item_id: 1,
+            sha256: sha256.map(str::to_string),
+            ..SearchResult::default()
+        }
+    }
+
+    // Enrichment stamps Some(true/false) per sha256 with namespace/user
+    // scoping mirroring get_bookmark_metadata; results without a sha256 stay
+    // None instead of claiming "not bookmarked".
+    #[tokio::test]
+    async fn annotate_bookmark_status_stamps_results() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added)
+            VALUES
+                ('user', 'default', 'sha_a', '2024-01-01T00:00:00'),
+                ('user', 'other', 'sha_b', '2024-01-01T00:00:00'),
+                ('someone_else', 'default', 'sha_c', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let mut results = vec![
+            result_with_sha(Some("sha_a")),
+            result_with_sha(Some("sha_b")),
+            result_with_sha(Some("sha_c")),
+            result_with_sha(None),
+        ];
+
+        let params = BookmarkStatusParams {
+            include_bookmarks: true,
+            bookmarks_namespace: "default".to_string(),
+            bookmarks_user: "user".to_string(),
+        };
+        annotate_bookmark_status(&mut dbs.index_conn, &mut results, &params)
+            .await
+            .unwrap();
+        assert_eq!(results[0].bookmarked, Some(true));
+        assert_eq!(results[1].bookmarked, Some(false), "other namespace");
+        assert_eq!(results[2].bookmarked, Some(false), "other user");
+        assert_eq!(results[3].bookmarked, None, "no sha256");
+
+        // Wildcard namespace matches any namespace for the user.
+        let params = BookmarkStatusParams {
+            include_bookmarks: true,
+            bookmarks_namespace: "*".to_string(),
+            bookmarks_user: "user".to_string(),
+        };
+        annotate_bookmark_status(&mut dbs.index_conn, &mut results, &params)
+            .await
+            .unwrap();
+        assert_eq!(results[0].bookmarked, Some(true));
+        assert_eq!(results[1].bookmarked, Some(true));
+        assert_eq!(results[2].bookmarked, Some(false));
+    }
 
     async fn setup_tag_db() -> crate::db::migrations::InMemoryDatabases {
         let mut dbs = setup_test_databases().await;
