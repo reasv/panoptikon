@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
@@ -69,6 +69,12 @@ pub(crate) struct TextStats {
     pub lowest_confidence: Option<f64>,
 }
 
+/// Ceiling on the existence stats before giving up on the request. Paths may
+/// live on network shares; a hung mount must not stall requests indefinitely.
+/// The orphaned blocking task still runs to completion in the background (a
+/// blocked stat cannot be cancelled), but the request itself returns.
+const EXISTENCE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Item metadata with the file list filtered to files that exist on disk
 /// (part of the `item_meta` API contract). The existence stats run on a
 /// blocking thread — paths may live on slow network shares.
@@ -79,17 +85,23 @@ pub(crate) async fn get_item_metadata(
 ) -> ApiResult<ItemMetadata> {
     let mut metadata = get_item_metadata_unchecked(conn, identifier, identifier_type).await?;
     let files = std::mem::take(&mut metadata.files);
-    metadata.files = tokio::task::spawn_blocking(move || {
+    let check = tokio::task::spawn_blocking(move || {
         files
             .into_iter()
             .filter(|file| PathBuf::from(&file.path).exists())
             .collect()
-    })
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "file existence check task failed");
-        ApiError::internal("Failed to get item")
-    })?;
+    });
+    metadata.files = match tokio::time::timeout(EXISTENCE_CHECK_TIMEOUT, check).await {
+        Ok(Ok(files)) => files,
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "file existence check task failed");
+            return Err(ApiError::internal("Failed to get item"));
+        }
+        Err(_) => {
+            tracing::error!("timed out checking file existence");
+            return Err(ApiError::internal("Timed out checking file existence"));
+        }
+    };
     Ok(metadata)
 }
 
