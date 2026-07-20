@@ -336,7 +336,6 @@ async fn bounded_vector_count(
     row.try_get("n").map_err(read_err)
 }
 
-#[allow(dead_code)] // wired up by the UI status stage
 pub(crate) async fn full_vector_count(
     conn: &mut sqlx::SqliteConnection,
     setter_id: i64,
@@ -1232,7 +1231,6 @@ pub(crate) async fn compute_mean_artifact(
 // Status (UI-facing)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // wired up by the UI status stage
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct VectorQuantSetterStatus {
     pub setter_name: String,
@@ -1244,7 +1242,6 @@ pub(crate) struct VectorQuantSetterStatus {
     pub dim: Option<i64>,
 }
 
-#[allow(dead_code)] // wired up by the UI status stage
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct VectorQuantProfileStatus {
     pub name: String,
@@ -1257,7 +1254,6 @@ pub(crate) struct VectorQuantProfileStatus {
     pub setters: Vec<VectorQuantSetterStatus>,
 }
 
-#[allow(dead_code)] // wired up by the UI status stage
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct VectorQuantStatus {
     pub profiles: Vec<VectorQuantProfileStatus>,
@@ -1267,7 +1263,6 @@ pub(crate) struct VectorQuantStatus {
 }
 
 /// Desired-merged-with-actual status for the scan page.
-#[allow(dead_code)] // wired up by the UI status stage
 pub(crate) async fn load_status(
     conn: &mut sqlx::SqliteConnection,
     desired: DesiredState,
@@ -1373,7 +1368,6 @@ pub(crate) async fn load_status(
     })
 }
 
-#[allow(dead_code)] // wired up by the UI status stage
 async fn quantized_count(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
@@ -1516,6 +1510,47 @@ pub(crate) async fn compute_query_quant(
         ApiError::internal("Failed to quantize query embedding")
     })?;
     row.try_get("q").map_err(read_err)
+}
+
+/// Looks up an active profile's id by name.
+pub(crate) async fn active_profile_id(
+    conn: &mut sqlx::SqliteConnection,
+    name: &str,
+) -> ApiResult<Option<i64>> {
+    let row = sqlx::query(
+        "SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to look up vector quant profile");
+        ApiError::internal("Failed to look up vector quant profile")
+    })?;
+    match row {
+        Some(row) => Ok(Some(row.try_get("id").map_err(read_err)?)),
+        None => Ok(None),
+    }
+}
+
+/// The setter ids of the embedding space containing the named setter
+/// (itself plus its xmodal sibling, if any). Empty when the setter has no
+/// embeddings.
+pub(crate) async fn space_setter_ids(
+    conn: &mut sqlx::SqliteConnection,
+    setter_name: &str,
+) -> ApiResult<Vec<i64>> {
+    let setters = load_embedding_setters(conn).await?;
+    let spaces = group_spaces(&setters);
+    for space in spaces {
+        if space
+            .iter()
+            .any(|&idx| setters[idx].name == setter_name)
+        {
+            return Ok(space.iter().map(|&idx| setters[idx].id).collect());
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// The default profile's name, if one is marked in the DB.

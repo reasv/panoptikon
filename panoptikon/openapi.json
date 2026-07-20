@@ -2953,6 +2953,161 @@
         }
       }
     },
+    "/api/jobs/quants": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get vector quantization status",
+        "description": "Desired (config.toml) merged with actual (DB) state of the vector quant profiles: per-profile setters coverage, build progress, size on disk and whether a reconcile is needed.",
+        "operationId": "get_vector_quants",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vector quantization status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorQuantStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/quants/rebuild": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Rebuild a quant profile's artifact for an embedding space",
+        "description": "Marks the embedding space containing the given setter for rebuild under the given profile (artifact recomputed at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — artifact recomputation reshuffles coarse order and is never background-silent.",
+        "operationId": "rebuild_vector_quant_pair",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The profile and setter to rebuild",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VectorQuantRebuildRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Rebuild scheduled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorQuantActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/quants/reconcile": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Enqueue a vector quant reconcile job",
+        "description": "Enqueues a reconcile job for the selected database (deduplicated: no-op when one is already queued or running). The job is stateless and converges the DB to the configured desired state.",
+        "operationId": "enqueue_vector_quant_reconcile",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Reconcile triggered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorQuantActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/jobs/queue": {
       "get": {
         "tags": [
@@ -9140,6 +9295,17 @@
         }
       },
       "Value": {},
+      "VectorQuantActionResponse": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
       "VectorQuantProfileConfig": {
         "type": "object",
         "required": [
@@ -9157,6 +9323,122 @@
           "quantizer": {
             "type": "string",
             "description": "'binary' in v1; 'int8' is a reserved future recipe slot."
+          }
+        }
+      },
+      "VectorQuantProfileStatus": {
+        "type": "object",
+        "required": [
+          "name",
+          "quantizer",
+          "centered",
+          "state",
+          "is_default",
+          "size_bytes",
+          "setters"
+        ],
+        "properties": {
+          "centered": {
+            "type": "boolean"
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "quantizer": {
+            "type": "string"
+          },
+          "setters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorQuantSetterStatus"
+            }
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "state": {
+            "type": "string",
+            "description": "active | removing | missing (desired but not yet in the DB)"
+          }
+        }
+      },
+      "VectorQuantRebuildRequest": {
+        "type": "object",
+        "required": [
+          "profile",
+          "setter_name"
+        ],
+        "properties": {
+          "profile": {
+            "type": "string",
+            "description": "The quant profile name to rebuild."
+          },
+          "setter_name": {
+            "type": "string",
+            "description": "A setter of the embedding space to rebuild; xmodal siblings rebuild\ntogether."
+          }
+        }
+      },
+      "VectorQuantSetterStatus": {
+        "type": "object",
+        "required": [
+          "setter_name",
+          "state",
+          "vectors",
+          "quantized"
+        ],
+        "properties": {
+          "dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "n_at_artifact": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "quantized": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "setter_name": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "pending | building | ready"
+          },
+          "vectors": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "VectorQuantStatus": {
+        "type": "object",
+        "required": [
+          "profiles",
+          "reconcile_needed"
+        ],
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorQuantProfileStatus"
+            }
+          },
+          "reconcile_needed": {
+            "type": "boolean",
+            "description": "True when desired and actual state differ (reconcile needed or\nrunning)."
           }
         }
       },

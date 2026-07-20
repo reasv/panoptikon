@@ -18,9 +18,11 @@ use crate::jobs::continuous_scan;
 use crate::jobs::cron::{self, CronRunOutcome};
 use crate::jobs::files::is_resync_needed;
 use crate::jobs::inference_pool::job_inference_context;
+use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::jobs::queue::{
-    JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs, cancel_running_job,
-    enqueue_job, get_queue_status,
+    BatchDedup, JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs,
+    cancel_running_job, enqueue_job, enqueue_jobs_unless_tagged, get_queue_status,
 };
 
 #[derive(Deserialize, IntoParams)]
@@ -529,6 +531,126 @@ pub(crate) async fn get_setter_data_count(
     Ok(Json(SetterDataStats {
         total_counts: totals,
     }))
+}
+
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub(crate) struct VectorQuantActionResponse {
+    pub detail: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct VectorQuantRebuildRequest {
+    /// The quant profile name to rebuild.
+    pub profile: String,
+    /// A setter of the embedding space to rebuild; xmodal siblings rebuild
+    /// together.
+    pub setter_name: String,
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "get_vector_quants",
+    path = "/api/jobs/quants",
+    tag = "jobs",
+    summary = "Get vector quantization status",
+    description = "Desired (config.toml) merged with actual (DB) state of the vector quant profiles: per-profile setters coverage, build progress, size on disk and whether a reconcile is needed.",
+    params(DbQueryParams),
+    responses(
+        (status = 200, description = "Vector quantization status", body = VectorQuantStatus)
+    )
+)]
+pub(crate) async fn get_vector_quants(
+    mut conn: DbConnection<ReadOnly>,
+) -> Result<Json<VectorQuantStatus>, ApiError> {
+    let desired = crate::db::vector_quants::load_desired_state(&conn.index_db);
+    let status = crate::db::vector_quants::load_status(&mut conn.conn, desired).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "enqueue_vector_quant_reconcile",
+    path = "/api/jobs/quants/reconcile",
+    tag = "jobs",
+    summary = "Enqueue a vector quant reconcile job",
+    description = "Enqueues a reconcile job for the selected database (deduplicated: no-op when one is already queued or running). The job is stateless and converges the DB to the configured desired state.",
+    params(DbQueryParams),
+    responses(
+        (status = 200, description = "Reconcile triggered", body = VectorQuantActionResponse)
+    )
+)]
+pub(crate) async fn enqueue_vector_quant_reconcile(
+    conn: DbConnection<ReadOnly>,
+) -> Result<Json<VectorQuantActionResponse>, ApiError> {
+    let detail = enqueue_reconcile_deduped(&conn.index_db, &conn.user_data_db).await?;
+    Ok(Json(VectorQuantActionResponse { detail }))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "rebuild_vector_quant_pair",
+    path = "/api/jobs/quants/rebuild",
+    tag = "jobs",
+    summary = "Rebuild a quant profile's artifact for an embedding space",
+    description = "Marks the embedding space containing the given setter for rebuild under the given profile (artifact recomputed at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — artifact recomputation reshuffles coarse order and is never background-silent.",
+    params(DbQueryParams),
+    request_body(content = VectorQuantRebuildRequest, description = "The profile and setter to rebuild"),
+    responses(
+        (status = 200, description = "Rebuild scheduled", body = VectorQuantActionResponse)
+    )
+)]
+pub(crate) async fn rebuild_vector_quant_pair(
+    mut conn: DbConnection<ReadOnly>,
+    Json(request): Json<VectorQuantRebuildRequest>,
+) -> Result<Json<VectorQuantActionResponse>, ApiError> {
+    let profile_id = crate::db::vector_quants::active_profile_id(&mut conn.conn, &request.profile)
+        .await?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Unknown vector quant profile: {}", request.profile))
+        })?;
+    let setter_ids =
+        crate::db::vector_quants::space_setter_ids(&mut conn.conn, &request.setter_name).await?;
+    if setter_ids.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Setter has no embeddings: {}",
+            request.setter_name
+        )));
+    }
+    call_index_db_writer(&conn.index_db, |reply| {
+        IndexDbWriterMessage::VectorQuantMarkRebuild {
+            profile_id,
+            setter_ids: setter_ids.clone(),
+            reply,
+        }
+    })
+    .await?;
+    let detail = enqueue_reconcile_deduped(&conn.index_db, &conn.user_data_db).await?;
+    Ok(Json(VectorQuantActionResponse {
+        detail: format!("Rebuild marked. {detail}"),
+    }))
+}
+
+async fn enqueue_reconcile_deduped(index_db: &str, user_data_db: &str) -> Result<String, ApiError> {
+    let request = JobRequest {
+        job_type: JobType::VectorQuantReconcile,
+        index_db: index_db.to_string(),
+        user_data_db: user_data_db.to_string(),
+        metadata: None,
+        batch_size: None,
+        threshold: None,
+        log_id: None,
+        tag: Some(RECONCILE_JOB_TAG.to_string()),
+    };
+    let dedup = BatchDedup {
+        tag: RECONCILE_JOB_TAG.to_string(),
+        index_db: index_db.to_string(),
+    };
+    match enqueue_jobs_unless_tagged(vec![request], Some(dedup)).await? {
+        Some(_) => Ok("Reconcile job enqueued.".to_string()),
+        None => {
+            Ok("A reconcile job for this database is already queued or running.".to_string())
+        }
+    }
 }
 
 #[utoipa::path(

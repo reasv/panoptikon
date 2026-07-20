@@ -253,7 +253,6 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// Marks a space for explicit rebuild (pending, artifact cleared).
-    #[allow(dead_code)] // wired up by the UI rebuild-action stage
     VectorQuantMarkRebuild {
         profile_id: i64,
         setter_ids: Vec<i64>,

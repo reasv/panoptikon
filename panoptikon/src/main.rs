@@ -534,6 +534,15 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/jobs/data/setters/total",
                 get(api::jobs::get_setter_data_count),
             )
+            .route("/api/jobs/quants", get(api::jobs::get_vector_quants))
+            .route(
+                "/api/jobs/quants/reconcile",
+                post(api::jobs::enqueue_vector_quant_reconcile),
+            )
+            .route(
+                "/api/jobs/quants/rebuild",
+                post(api::jobs::rebuild_vector_quant_pair),
+            )
             .route(
                 "/api/jobs/cronjob/run",
                 post(api::jobs::manual_trigger_cronjob),
