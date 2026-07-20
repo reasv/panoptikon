@@ -597,6 +597,7 @@ base_url = "http://127.0.0.1:6342"
             policy_name: "demo".to_string(),
             db_action: crate::policy::DbAction::Skipped,
             selected_by: crate::policy::PolicySelection::ListenerHost,
+            search_cache: true,
         });
         let response = proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -625,6 +626,7 @@ base_url = "http://127.0.0.1:6342"
             policy_name: "demo".to_string(),
             db_action: crate::policy::DbAction::Skipped,
             selected_by: crate::policy::PolicySelection::ListenerHost,
+            search_cache: true,
         });
         let response = proxy_request(client_addr, state, UpstreamKind::Api, req).await;
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)

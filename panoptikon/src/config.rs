@@ -702,10 +702,28 @@ pub struct InferenceEndpointConfig {
 pub struct SearchConfig {
     #[serde(default = "default_embedding_cache_size")]
     pub embedding_cache_size: usize,
+    /// Byte budget for the search result cache, in megabytes. `0` disables
+    /// it. Runtime-adjustable via `PUT /api/search/cache`; this value is
+    /// what the cache starts with (and returns to) at process startup.
+    #[serde(default = "default_search_cache_size_mb")]
+    pub cache_size_mb: usize,
+    /// Ceiling on the search result cache budget, in megabytes. Bounds both
+    /// `cache_size_mb` and the runtime resize endpoint (which is reachable
+    /// by any client on any listener). Not exposed in the Desktop app.
+    #[serde(default = "default_search_cache_size_max_mb")]
+    pub cache_size_max_mb: usize,
 }
 
 fn default_embedding_cache_size() -> usize {
     1024
+}
+
+fn default_search_cache_size_mb() -> usize {
+    128
+}
+
+fn default_search_cache_size_max_mb() -> usize {
+    65_536
 }
 
 fn default_inference_weight() -> f64 {
@@ -720,6 +738,8 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             embedding_cache_size: default_embedding_cache_size(),
+            cache_size_mb: default_search_cache_size_mb(),
+            cache_size_max_mb: default_search_cache_size_max_mb(),
         }
     }
 }
@@ -749,6 +769,11 @@ pub struct PolicyConfig {
     pub user_data_db: DbPolicy,
     #[serde(default)]
     pub identity: Option<IdentityConfig>,
+    /// Whether requests under this policy may use the search result cache.
+    /// Enforced by the gateway (unlike the free-form `client` table below);
+    /// dev policies set it to false to benchmark real query speed.
+    #[serde(default = "default_search_cache")]
+    pub search_cache: bool,
     /// `[policies.client]`: free-form table returned verbatim as the
     /// `client` object of `GET /api/client-config`. It is primarily
     /// per-policy UI configuration; `relay_enabled` is also enforced by the
@@ -762,6 +787,10 @@ pub struct PolicyConfig {
 
 pub(crate) fn default_client_table() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
+}
+
+pub(crate) fn default_search_cache() -> bool {
+    true
 }
 
 /// `[policies.match]`: which requests a policy applies to. `hosts` matches
@@ -843,6 +872,14 @@ impl Settings {
             .set_default(
                 "search.embedding_cache_size",
                 default_embedding_cache_size() as i64,
+            )?
+            .set_default(
+                "search.cache_size_mb",
+                default_search_cache_size_mb() as i64,
+            )?
+            .set_default(
+                "search.cache_size_max_mb",
+                default_search_cache_size_max_mb() as i64,
             )?;
         // A missing config file is fine (defaults only), matching the old
         // `required(false)` behavior. There is no env override layer: env

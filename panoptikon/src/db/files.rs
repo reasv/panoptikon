@@ -536,9 +536,10 @@ pub(crate) async fn delete_files_not_allowed(
         tracing::error!(error = ?err, "failed to compile job filter PQL query");
         ApiError::internal("Failed to delete files")
     })?;
+    let paginated = built.paginated_query();
     let (sql, values) = match built.with_clause {
-        Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
-        None => built.query.build_sqlx(SqliteQueryBuilder),
+        Some(with_clause) => paginated.with(with_clause).build_sqlx(SqliteQueryBuilder),
+        None => paginated.build_sqlx(SqliteQueryBuilder),
     };
     let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
         .fetch_all(&mut *conn)

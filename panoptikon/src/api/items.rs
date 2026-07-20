@@ -1134,15 +1134,9 @@ mod tests {
             filename: "gone.png".to_string(),
         };
 
-        let response = file_response(
-            &item,
-            &[missing, file],
-            "inline",
-            &HeaderMap::new(),
-            false,
-        )
-        .await
-        .unwrap();
+        let response = file_response(&item, &[missing, file], "inline", &HeaderMap::new(), false)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_bytes(response).await, b"test");
     }
@@ -1231,8 +1225,7 @@ mod tests {
         // Record the actual on-disk mtime the way the scanner does: match,
         // fully immutable.
         file.last_modified =
-            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap())
-                .unwrap();
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
         let response = file_response(
             &item,
             std::slice::from_ref(&file),

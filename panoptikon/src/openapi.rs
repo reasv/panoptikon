@@ -26,6 +26,9 @@ impl Modify for JsonValueSchema {
         crate::api::search::search_pql_build,
         crate::api::search::get_search_cache,
         crate::api::search::clear_search_cache,
+        crate::api::search_cache::get_result_cache,
+        crate::api::search_cache::clear_result_cache,
+        crate::api::search_cache::resize_result_cache,
         crate::api::search::get_tags,
         crate::api::search::get_top_tags,
         crate::api::search::get_stats,
@@ -91,6 +94,11 @@ impl Modify for JsonValueSchema {
     components(
         schemas(
             crate::api::search::SearchMetrics,
+            crate::api::search::CacheOutcome,
+            crate::api::search_cache::SearchCacheStats,
+            crate::api::search_cache::SearchCacheDbGroup,
+            crate::api::search_cache::SearchCacheEntryInfo,
+            crate::api::search_cache::SearchCacheResize,
             crate::api::search::CompiledQuery,
             crate::api::search::PqlBuildResponse,
             crate::api::search::SearchResult,

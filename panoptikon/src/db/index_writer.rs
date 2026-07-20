@@ -288,6 +288,13 @@ impl IndexDbWriterState {
             self.last_used = Some(Instant::now());
         }
 
+        // Every index-DB mutation commits through here, making it the single
+        // choke point for search-cache invalidation. Maintenance statements
+        // (VACUUM/ANALYZE) bypass it, which is fine: they don't change data.
+        if result.is_ok() {
+            crate::db::epochs::bump_index_epoch(&self.index_db);
+        }
+
         result
     }
 

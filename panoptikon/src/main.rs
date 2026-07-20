@@ -238,6 +238,12 @@ async fn async_main() -> anyhow::Result<()> {
     // cleanup task cancels jobs and flushes the DB writers.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Startup values for the search result cache byte budget; the PUT
+    // endpoint can adjust the budget at runtime (never above the ceiling)
+    // without persisting.
+    api::search_cache::set_budget_limit_mb(settings.search.cache_size_max_mb);
+    api::search_cache::set_budget_mb(settings.search.cache_size_mb);
+
     let state = Arc::new(proxy::ProxyState::new(
         ui_upstream,
         api_upstream,
@@ -471,6 +477,12 @@ async fn async_main() -> anyhow::Result<()> {
             .route(
                 "/api/search/embeddings/cache",
                 get(api::search::get_search_cache).delete(api::search::clear_search_cache),
+            )
+            .route(
+                "/api/search/cache",
+                get(api::search_cache::get_result_cache)
+                    .delete(api::search_cache::clear_result_cache)
+                    .put(api::search_cache::resize_result_cache),
             )
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))

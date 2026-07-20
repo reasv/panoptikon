@@ -181,6 +181,9 @@ pub(crate) struct PolicyContext {
     pub policy_name: String,
     pub db_action: DbAction,
     pub selected_by: PolicySelection,
+    /// Resolved `search_cache` policy flag, carried here because handlers
+    /// never see the full `PolicyConfig`.
+    pub search_cache: bool,
 }
 
 struct PolicyDecision {
@@ -334,6 +337,7 @@ fn apply_policy(
         policy_name: policy.name.clone(),
         db_action,
         selected_by,
+        search_cache: policy.search_cache,
     });
 
     Ok(PolicyDecision {
@@ -1084,6 +1088,7 @@ mod tests {
             index_db,
             user_data_db,
             identity: None,
+            search_cache: true,
             client: crate::config::default_client_table(),
         }
     }

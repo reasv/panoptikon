@@ -303,6 +303,7 @@ disable_backend_open = true
             policy_name: "demo".to_string(),
             db_action: crate::policy::DbAction::Skipped,
             selected_by: crate::policy::PolicySelection::ListenerHost,
+            search_cache: true,
         };
 
         let response = client_config(State(state), Extension(context))

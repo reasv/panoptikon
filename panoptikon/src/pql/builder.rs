@@ -17,10 +17,35 @@ use self::filters::FilterCompiler;
 const VERY_LARGE_NUMBER: &str = "9223372036854775805";
 const VERY_SMALL_NUMBER: &str = "-9223372036854775805";
 
+/// LIMIT/OFFSET computed from the input query's page/page_size. Kept off the
+/// built statement so the API layer can key its result cache on the
+/// pagination-free SQL and synthesize keys for prefetched pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Pagination {
+    pub(crate) limit: u64,
+    pub(crate) offset: u64,
+}
+
 pub(crate) struct PqlBuilderResult {
     pub(crate) query: SelectStatement,
     pub(crate) with_clause: Option<WithClause>,
     pub(crate) extra_columns: HashMap<String, String>,
+    /// `None` for count queries and for `page_size < 1` (no limit).
+    pub(crate) pagination: Option<Pagination>,
+    /// True when any filter joins the attached user_data database.
+    pub(crate) uses_user_data: bool,
+}
+
+impl PqlBuilderResult {
+    /// The built statement with pagination applied, for callers that execute
+    /// it directly and don't care about the pagination/statement split.
+    pub(crate) fn paginated_query(&self) -> SelectStatement {
+        let mut query = self.query.clone();
+        if let Some(pagination) = self.pagination {
+            query.limit(pagination.limit).offset(pagination.offset);
+        }
+        query
+    }
 }
 
 // pub(crate): exposed through `FilterCompiler::build` in the filters
@@ -80,6 +105,7 @@ pub(crate) struct QueryState {
     is_count_query: bool,
     item_data_query: bool,
     entity: EntityType,
+    uses_user_data: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +210,7 @@ fn build_query_with_root(
         is_count_query: count_query,
         item_data_query: matches!(input_query.entity, EntityType::Text),
         entity: input_query.entity,
+        uses_user_data: false,
     };
 
     let mut root_cte_name: Option<String> = None;
@@ -299,6 +326,8 @@ fn build_query_with_root(
             query: count_query,
             with_clause,
             extra_columns,
+            pagination: None,
+            uses_user_data: state.uses_user_data,
         });
     }
 
@@ -362,12 +391,10 @@ fn build_query_with_root(
     }
 
     let page = std::cmp::Ord::max(input_query.page, 1);
-    if input_query.page_size >= 1 {
-        let offset = (page - 1) * input_query.page_size;
-        full_query
-            .limit(input_query.page_size as u64)
-            .offset(offset as u64);
-    }
+    let pagination = (input_query.page_size >= 1).then(|| Pagination {
+        limit: input_query.page_size as u64,
+        offset: ((page - 1) * input_query.page_size) as u64,
+    });
 
     let with_clause = build_with_clause(&state, root_cte_name.as_deref(), last_cte_name.as_deref());
 
@@ -375,6 +402,8 @@ fn build_query_with_root(
         query: full_query,
         with_clause,
         extra_columns,
+        pagination,
+        uses_user_data: state.uses_user_data,
     })
 }
 

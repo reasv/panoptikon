@@ -296,6 +296,9 @@ function renderServerConfiguration(configuration) {
   renderSource('intermediate-budget-source', configuration.performance.intermediate_data_budget_mb);
   byId('embedding-cache-size').value = configuration.performance.embedding_cache_size.value;
   renderSource('embedding-cache-source', configuration.performance.embedding_cache_size);
+  byId('search-cache-size').value = configuration.search_cache.size_mb.value;
+  renderSource('search-cache-size-source', configuration.search_cache.size_mb);
+  byId('search-cache-enabled').checked = configuration.search_cache.policy_enabled;
   const custom = configuration.lan.mode === 'custom';
   byId('lan-enabled').checked = configuration.lan.mode === 'managed';
   byId('lan-enabled').disabled = custom;
@@ -353,7 +356,23 @@ function readServerConfiguration() {
       intermediate_data_budget_mb: positiveInteger('intermediate-budget', 'Intermediate-data memory', 64, 1048576),
       embedding_cache_size: positiveInteger('embedding-cache-size', 'Embedding cache size', 0, 65536),
     },
+    search_cache_enabled: byId('search-cache-enabled').checked,
   };
+}
+function renderSearchCacheStats(stats) {
+  const mb = value => (value / 1048576).toFixed(1);
+  byId('search-cache-stats').textContent = stats.capacity_bytes === 0
+    ? 'The cache is disabled (size 0).'
+    : `${stats.entries} entries, ${mb(stats.used_bytes)} of ${mb(stats.capacity_bytes)} MB used. ${stats.hits} hits, ${stats.misses} misses, ${stats.stale_hits} invalidated, ${stats.evictions} evicted.`;
+}
+async function refreshSearchCacheStats() {
+  try { renderSearchCacheStats(await invoke('get_search_cache_stats')); }
+  catch { byId('search-cache-stats').textContent = 'Statistics are available while the Server is running.'; }
+}
+function searchCacheStatus(message, ok) {
+  const status = byId('search-cache-status');
+  status.textContent = message;
+  status.className = ok ? 'command-status success' : 'command-status inline-error';
 }
 async function refresh() {
   try {
@@ -377,6 +396,7 @@ async function refresh() {
       : 'Choose the folders and indexing options for your first database.';
     byId('setup-button').textContent = databaseReady ? 'Create New Database' : 'Continue Setup';
     byId('logs').textContent = (await invoke('log_tail', { lines: 150 })).join('\n') || 'No log entries yet.';
+    await refreshSearchCacheStats();
     const relayStatus = await invoke('relay_status');
     byId('relay-enabled').checked = relayStatus.enabled;
     if (!byId('file-commands').children.length) commandEditor(byId('file-commands'), await invoke('file_action_commands'));
@@ -445,6 +465,35 @@ byId('save-server-configuration').addEventListener('click', async () => {
     byId('server-configuration-status').textContent = 'Configuration saved; Server is restarting.';
   } catch (error) { fail(error); }
   finally { button.disabled = !validatePortConflict(); button.textContent = 'Save and restart Server'; }
+});
+byId('apply-search-cache-size').addEventListener('click', async () => {
+  const button = byId('apply-search-cache-size');
+  try {
+    const size = positiveInteger('search-cache-size', 'Result cache memory', 0, 65536);
+    button.disabled = true; button.textContent = 'Applying…';
+    // The command succeeds whenever the size was persisted, even if the
+    // running Server could not apply it (reported via applied/apply_error).
+    const { configuration: saved, applied, apply_error } = await invoke('set_search_cache_size', { sizeMb: size });
+    // Update in place so other unsaved edits in the form survive; the
+    // revision must track the on-disk file or the next full save is refused.
+    if (serverConfiguration) {
+      serverConfiguration.revision = saved.revision;
+      serverConfiguration.search_cache = saved.search_cache;
+    }
+    byId('search-cache-size').value = saved.search_cache.size_mb.value;
+    renderSource('search-cache-size-source', saved.search_cache.size_mb);
+    if (applied) searchCacheStatus('Cache size saved and applied to the running Server.', true);
+    else if (apply_error) searchCacheStatus(`The size was saved, but applying it to the running Server failed: ${apply_error}. It takes effect at the next restart.`, false);
+    else searchCacheStatus('Cache size saved. It takes effect when the Server starts.', true);
+    await refreshSearchCacheStats();
+  } catch (error) { searchCacheStatus(String(error), false); }
+  finally { button.disabled = false; button.textContent = 'Apply now'; }
+});
+byId('clear-search-cache').addEventListener('click', async () => {
+  try {
+    renderSearchCacheStats(await invoke('clear_search_result_cache'));
+    searchCacheStatus('Search result cache cleared.', true);
+  } catch (error) { searchCacheStatus(String(error), false); }
 });
 byId('save-file-commands').addEventListener('click', async () => { try { await invoke('set_file_action_commands', { commands: readCommands(byId('file-commands')) }); byId('file-command-status').textContent = 'File-opening settings saved.'; } catch (error) { fail(error); } });
 window.__TAURI__?.event?.listen('desktop-state', refresh);

@@ -1,7 +1,16 @@
 # PQL search result cache — design
 
 Transparent, epoch-invalidated caching for `POST /api/search/pql`, plus
-opt-in page prefetching on top of it. Settled 2026-07-19. Not implemented.
+opt-in page prefetching on top of it. Settled 2026-07-19. Implemented
+2026-07-20 (gateway: `api/search_cache.rs` + `db/epochs.rs`; desktop config
+window; UI prefetch policy + metrics hover card).
+
+Implementation note the design implied but did not spell out: the builder
+used to apply LIMIT/OFFSET inside the built statement. It now returns them
+as `PqlBuilderResult::pagination`, and the executable SQL is produced by
+`CompiledQuery::with_pagination` (string-append, pinned byte-identical to
+sea-query's rendering by a regression test), so the cache keys on the
+pagination-free compiled SQL.
 
 Motivation: vector search queries (no vector index yet) scan and compare
 every candidate embedding; on databases with 100s of thousands of vectors

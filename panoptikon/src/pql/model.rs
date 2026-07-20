@@ -364,6 +364,21 @@ pub(crate) struct PqlQuery {
     ///
     /// This is not reflected in the total count of results.
     pub check_path: bool,
+    /// Use Result Cache
+    ///
+    /// If false, this request bypasses the search result cache entirely —
+    /// it neither reads existing entries nor stores its own results.
+    /// Useful for benchmarking real query speed on a live instance.
+    pub cache: bool,
+    /// Prefetch Pages
+    ///
+    /// Number of additional pages to fetch and cache beyond the requested
+    /// one, amortizing the full query cost across page visits (useful for
+    /// vector searches, whose cost does not scale down with LIMIT).
+    /// Executed as a single query with a larger LIMIT and sliced into
+    /// per-page cache entries. Clamped server-side; ignored when the cache
+    /// is disabled or bypassed, or when page_size < 1.
+    pub prefetch_pages: u32,
 }
 
 impl Default for PqlQuery {
@@ -379,6 +394,8 @@ impl Default for PqlQuery {
             count: true,
             results: true,
             check_path: false,
+            cache: true,
+            prefetch_pages: 0,
         }
     }
 }

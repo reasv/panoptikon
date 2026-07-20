@@ -1098,9 +1098,10 @@ fn compile_pql_count(query: PqlQuery) -> ApiResult<CompiledQuery> {
 }
 
 fn compile_select(built: crate::pql::PqlBuilderResult) -> ApiResult<CompiledQuery> {
+    let paginated = built.paginated_query();
     let (sql, values) = match built.with_clause {
-        Some(with_clause) => built.query.with(with_clause).build(SqliteQueryBuilder),
-        None => built.query.build(SqliteQueryBuilder),
+        Some(with_clause) => paginated.with(with_clause).build(SqliteQueryBuilder),
+        None => paginated.build(SqliteQueryBuilder),
     };
     let params = encode_values(values)?;
     Ok(CompiledQuery { sql, params })

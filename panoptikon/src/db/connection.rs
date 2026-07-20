@@ -89,6 +89,18 @@ pub struct DbConnection<M: DbMode> {
     _mode: PhantomData<M>,
 }
 
+impl<M: DbMode> Drop for DbConnection<M> {
+    fn drop(&mut self) {
+        // Unconditional bump on release of a user-data write connection:
+        // over-invalidating the search cache (e.g. on a failed write) is
+        // safe; only under-invalidation would be a bug. `USER_DATA_WL` is a
+        // const, so this compiles out entirely for read connections.
+        if M::USER_DATA_WL {
+            crate::db::epochs::bump_user_data_epoch(&self.user_data_db);
+        }
+    }
+}
+
 pub(crate) async fn open_index_db_read(
     index_db: &str,
     user_data_db: &str,

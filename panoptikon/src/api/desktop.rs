@@ -784,7 +784,7 @@ pub(crate) async fn setup_status(
     ensure_desktop_managed()?;
     let ready = is_ready_for_desktop(&mut conn.conn).await?;
     Ok(Json(DesktopSetupStatus {
-        index_db: conn.index_db,
+        index_db: conn.index_db.clone(),
         ready,
     }))
 }
@@ -1050,7 +1050,7 @@ pub(crate) async fn complete_setup(
         })?;
         (paths.index_db, paths.user_data_db)
     } else {
-        (conn.index_db, conn.user_data_db)
+        (conn.index_db.clone(), conn.user_data_db.clone())
     };
 
     // Recheck empty-folder safety against the actual target database. For a

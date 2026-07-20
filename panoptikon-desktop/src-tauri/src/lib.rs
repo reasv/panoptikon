@@ -150,6 +150,7 @@ pub fn run() {
             file_action_commands, set_file_action_commands,
             choose_file_action_application, choose_file_action_test_file, test_file_action,
             get_server_configuration, set_server_configuration,
+            get_search_cache_stats, clear_search_result_cache, set_search_cache_size,
             set_relay_enabled,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
@@ -1612,6 +1613,137 @@ async fn set_server_configuration(
     Ok(saved)
 }
 
+fn search_cache_http() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+async fn running_server_port(supervisor: &Supervisor) -> Result<u16, String> {
+    let snapshot = supervisor.snapshot().await;
+    if snapshot.sidecar_pid.is_none() {
+        return Err("The local Server is not running.".into());
+    }
+    Ok(snapshot.port)
+}
+
+#[tauri::command]
+async fn get_search_cache_stats(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    validate_control(&window)?;
+    let supervisor = app.state::<Arc<Supervisor>>();
+    let port = running_server_port(&supervisor).await?;
+    let response = search_cache_http()?
+        .get(local_browser_url(port, "/api/search/cache"))
+        .send()
+        .await
+        .map_err(|error| format!("failed to read search cache stats: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to read search cache stats: HTTP {}",
+            response.status()
+        ));
+    }
+    response.json().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn clear_search_result_cache(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    validate_control(&window)?;
+    let supervisor = app.state::<Arc<Supervisor>>();
+    let port = running_server_port(&supervisor).await?;
+    let response = search_cache_http()?
+        .delete(local_browser_url(port, "/api/search/cache"))
+        .send()
+        .await
+        .map_err(|error| format!("failed to clear the search cache: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to clear the search cache: HTTP {}",
+            response.status()
+        ));
+    }
+    response.json().await.map_err(|error| error.to_string())
+}
+
+/// Result of `set_search_cache_size`. Once the size is persisted, the
+/// command always succeeds — apply problems are reported here instead of as
+/// a command error, so the frontend always receives the new configuration
+/// revision (an `Err` would leave its revision stale and make the next full
+/// save be refused as a concurrent edit).
+#[derive(serde::Serialize)]
+struct SearchCacheSizeOutcome {
+    configuration: server_config::ServerConfigurationView,
+    /// True when the running Server accepted the new size.
+    applied: bool,
+    /// Set when the Server was running but applying the size failed; `None`
+    /// with `applied: false` means the Server simply is not running.
+    apply_error: Option<String>,
+}
+
+async fn apply_search_cache_size(port: u16, size_mb: u64) -> Result<(), String> {
+    let response = search_cache_http()?
+        .put(local_browser_url(port, "/api/search/cache"))
+        .json(&serde_json::json!({ "size_mb": size_mb }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| Some(body.get("detail")?.as_str()?.to_string()));
+        return Err(match detail {
+            Some(detail) => format!("HTTP {status}: {detail}"),
+            None => format!("HTTP {status}"),
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_search_cache_size(
+    window: WebviewWindow,
+    app: AppHandle,
+    size_mb: u64,
+) -> Result<SearchCacheSizeOutcome, String> {
+    validate_control(&window)?;
+    let supervisor = app.state::<Arc<Supervisor>>();
+    // TOML first: persistence is the harder half to retry. The runtime
+    // apply below can fail without losing the setting — it converges at
+    // the next restart.
+    let saved = {
+        let _guard = supervisor.config_write.lock().await;
+        server_config::save_search_cache_size(
+            &supervisor.paths.server_root,
+            &supervisor.server_config_path(),
+            size_mb,
+        )
+        .map_err(|error| error.to_string())?
+    };
+    let Ok(port) = running_server_port(&supervisor).await else {
+        return Ok(SearchCacheSizeOutcome {
+            configuration: saved,
+            applied: false,
+            apply_error: None,
+        });
+    };
+    let apply_error = apply_search_cache_size(port, size_mb).await.err();
+    Ok(SearchCacheSizeOutcome {
+        configuration: saved,
+        applied: apply_error.is_none(),
+        apply_error,
+    })
+}
+
 fn command_configured(command: &relay::CommandSpec) -> bool {
     !command.program.trim().is_empty()
         || !command.shell_command.trim().is_empty()
@@ -1950,6 +2082,9 @@ mod tests {
             "test_file_action",
             "get_server_configuration",
             "set_server_configuration",
+            "get_search_cache_stats",
+            "clear_search_result_cache",
+            "set_search_cache_size",
             "set_relay_enabled",
             "get_update_state",
             "check_for_updates",

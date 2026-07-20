@@ -3802,6 +3802,144 @@
         }
       }
     },
+    "/api/search/cache": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Get search result cache stats",
+        "description": "Returns usage counters, per-database groups (with current epochs and stale-entry counts), and a paginated entry listing for the search result cache.",
+        "operationId": "get_search_result_cache",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "Page number for the entry listing",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Page size for the entry listing",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 128,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search result cache stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchCacheStats"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Resize search result cache",
+        "description": "Sets the live byte budget of the search result cache and returns updated stats. Growing is free; shrinking evicts LRU entries until under budget; `0` empties and disables the cache. Sizes above the `[search] cache_size_max_mb` ceiling are rejected. Not persisted — the `[search] cache_size_mb` TOML value applies again at the next startup.",
+        "operationId": "resize_search_result_cache",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchCacheResize"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Search result cache stats after resizing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchCacheStats"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Clear search result cache",
+        "description": "Clears the search result cache and returns updated stats. Optional `index_db`/`user_data_db` params restrict the clear to entries keyed to those databases (exact name match; both given means both must match). Clearing never touches epochs.",
+        "operationId": "clear_search_result_cache",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "Restrict the clear to entries keyed to this index database.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "Restrict the clear to entries keyed to this user data database.\nOnly matches entries whose query touched user_data tables.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "Page number for the entry listing",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Page size for the entry listing",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 128,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search result cache stats after clearing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchCacheStats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/search/embeddings/cache": {
       "get": {
         "tags": [
@@ -4444,6 +4582,17 @@
             }
           }
         }
+      },
+      "CacheOutcome": {
+        "type": "string",
+        "description": "Search result cache outcome for one request side (count or results).",
+        "enum": [
+          "hit",
+          "stale",
+          "miss",
+          "bypass",
+          "disabled"
+        ]
       },
       "CancelResponse": {
         "type": "object",
@@ -7387,6 +7536,11 @@
       "PqlQuery": {
         "type": "object",
         "properties": {
+          "cache": {
+            "type": "boolean",
+            "description": "Use Result Cache\n\nIf false, this request bypasses the search result cache entirely —\nit neither reads existing entries nor stores its own results.\nUseful for benchmarking real query speed on a live instance.",
+            "default": true
+          },
           "check_path": {
             "type": "boolean",
             "description": "Check Paths Exist\n\nIf true, the query will check if the path exists on disk before returning it.\n\nFor `file` queries with no partition by,\nthe result will be omitted if the path does not exist.\nThis is because if another file exists, it will be included later in the results.\n\nIn other cases, the system will try to find another file for the item and substitute it.\nIf no other working path is found, the result will be omitted.\n\nThis is not reflected in the total count of results.",
@@ -7440,6 +7594,13 @@
             },
             "description": "Partition results By\n\nGroup results by the values of the specified column(s) and return the first result\nfor each group according to all of the order settings of the query.\n\nFor example, if you partition by \"item_id\", you'll get one result per unique item.\nIf you partition by \"file_id\", you'll get one result per unique file.\nMultiple columns yield one result for each unique combination of values for those columns.\n\nYou cannot partition by text columns if the entity is \"file\".",
             "default": null
+          },
+          "prefetch_pages": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Prefetch Pages\n\nNumber of additional pages to fetch and cache beyond the requested\none, amortizing the full query cost across page visits (useful for\nvector searches, whose cost does not scale down with LIMIT).\nExecuted as a single query with a larger LIMIT and sliced into\nper-page cache entries. Clamped server-side; ignored when the cache\nis disabled or bypassed, or when page_size < 1.",
+            "default": 0,
+            "minimum": 0
           },
           "query": {
             "oneOf": [
@@ -7786,6 +7947,186 @@
           }
         ]
       },
+      "SearchCacheDbGroup": {
+        "type": "object",
+        "required": [
+          "index_db",
+          "index_epoch",
+          "entries",
+          "bytes",
+          "stale_entries"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "entries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "index_db": {
+            "type": "string"
+          },
+          "index_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current index-DB epoch these entries validate against.",
+            "minimum": 0
+          },
+          "stale_entries": {
+            "type": "integer",
+            "description": "Entries recorded under a different epoch than the current one. High\ncounts mean write churn is defeating the cache.",
+            "minimum": 0
+          },
+          "user_data_db": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_data_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "SearchCacheEntryInfo": {
+        "type": "object",
+        "required": [
+          "sql",
+          "kind",
+          "bytes",
+          "valid"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "rows": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "sql": {
+            "type": "string",
+            "description": "Truncated compiled SQL."
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SearchCacheResize": {
+        "type": "object",
+        "required": [
+          "size_mb"
+        ],
+        "properties": {
+          "size_mb": {
+            "type": "integer",
+            "description": "New byte budget in megabytes. `0` empties and disables the cache;\nvalues above the `[search] cache_size_max_mb` ceiling are rejected.\nNot persisted: the TOML `[search] cache_size_mb` remains the source\nof truth at the next startup.",
+            "minimum": 0
+          }
+        }
+      },
+      "SearchCacheStats": {
+        "type": "object",
+        "required": [
+          "entries",
+          "used_bytes",
+          "capacity_bytes",
+          "hits",
+          "misses",
+          "stale_hits",
+          "evictions",
+          "databases",
+          "page",
+          "page_size",
+          "cached"
+        ],
+        "properties": {
+          "cached": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchCacheEntryInfo"
+            },
+            "description": "Paginated entry listing, most recently used first."
+          },
+          "capacity_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchCacheDbGroup"
+            }
+          },
+          "entries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "evictions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "misses": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "stale_hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "used_bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "SearchMetrics": {
         "type": "object",
         "required": [
@@ -7799,15 +8140,45 @@
             "format": "double",
             "description": "Build time\n\nTime taken to process the query into an SQLAlchemy Core statement"
           },
+          "cache": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CacheOutcome",
+                "description": "Result cache outcome for this request. Times above are always the\nactual times for this request: a hit reports `execute` near zero,\nnever the stored original's timings."
+              }
+            ]
+          },
           "compile": {
             "type": "number",
             "format": "double",
             "description": "Compile time\n\nTime taken to compile the SQLAlchemy Core statement into an SQL string"
           },
+          "enrich": {
+            "type": "number",
+            "format": "double",
+            "description": "Enrichment time\n\nTime spent on per-response result enrichment (path checking and\nbookmark annotation), which runs on every request, cached or not"
+          },
           "execute": {
             "type": "number",
             "format": "double",
             "description": "Execution time\n\nTime taken to execute the SQL query"
+          },
+          "prefetched_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Extra pages fetched and cached beyond the requested one (results\nonly; explains a larger `execute` on the populating request)",
+            "minimum": 0
+          },
+          "preprocess": {
+            "type": "number",
+            "format": "double",
+            "description": "Preprocess time\n\nTime taken to resolve embeddings and normalize the query before building"
           }
         }
       },

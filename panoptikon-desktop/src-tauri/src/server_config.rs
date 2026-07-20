@@ -11,6 +11,9 @@ use std::{
 
 const LAN_ENDPOINT: &str = "lan";
 const LAN_POLICY: &str = "desktop_lan";
+const LOCAL_POLICY: &str = "desktop";
+/// Policies the Desktop app owns and may stamp `search_cache` on.
+const MANAGED_POLICIES: [&str; 2] = [LOCAL_POLICY, LAN_POLICY];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigField<T> {
@@ -31,7 +34,17 @@ pub struct ServerConfigurationView {
     pub local_port: ConfigField<u16>,
     pub lan: LanConfigurationView,
     pub performance: PerformanceConfigurationView,
+    pub search_cache: SearchCacheConfigurationView,
     pub databases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchCacheConfigurationView {
+    /// `[search] cache_size_mb` — applied live via the gateway API, not via
+    /// the save-and-restart flow.
+    pub size_mb: ConfigField<u64>,
+    /// False when any Desktop-managed policy sets `search_cache = false`.
+    pub policy_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +80,9 @@ pub struct ServerConfigurationUpdate {
     pub local_port: u16,
     pub lan: LanConfigurationUpdate,
     pub performance: PerformanceConfigurationUpdate,
+    /// Enable/disable the search result cache for Desktop-managed policies.
+    /// Rides the normal save-and-restart flow (policies load at startup).
+    pub search_cache_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,12 +244,80 @@ pub fn save(
             &mut env_updates,
         )?;
     }
+    // After LAN handling so a regenerated desktop_lan policy is re-stamped.
+    apply_policy_search_cache(&mut after, update.search_cache_enabled)?;
 
-    let mut document = TomlDocument::parse(&source)?;
-    document.patch_values(&before, &after)?;
+    commit_and_reload(
+        server_root,
+        config_path,
+        &env_path,
+        &source,
+        &dotenv_source,
+        &before,
+        &after,
+        &env_updates,
+    )
+}
+
+/// Persist `[search] cache_size_mb` alone. Deliberately outside the normal
+/// save-and-restart flow: the caller applies the value to the running
+/// gateway via `PUT /api/search/cache` after this returns (TOML first —
+/// persistence is the harder half to retry).
+pub fn save_search_cache_size(
+    server_root: &Path,
+    config_path: &Path,
+    size_mb: u64,
+) -> Result<ServerConfigurationView> {
+    if size_mb > 65_536 {
+        bail!("search result cache size must be at most 65536 MB");
+    }
+    let source = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "failed to read Server configuration '{}'",
+            config_path.display()
+        )
+    })?;
+    let before: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("invalid Server configuration '{}'", config_path.display()))?;
+    let env_path = server_root.join(".env");
+    let dotenv_source = fs::read_to_string(&env_path).unwrap_or_default();
+    let mut after = before.clone();
+    let mut env_updates = BTreeMap::new();
+    set_env_aware(
+        &mut after,
+        &["search", "cache_size_mb"],
+        toml::Value::Integer(size_mb as i64),
+        size_mb.to_string(),
+        &mut env_updates,
+    )?;
+    commit_and_reload(
+        server_root,
+        config_path,
+        &env_path,
+        &source,
+        &dotenv_source,
+        &before,
+        &after,
+        &env_updates,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_and_reload(
+    server_root: &Path,
+    config_path: &Path,
+    env_path: &Path,
+    source: &str,
+    dotenv_source: &str,
+    before: &toml::Value,
+    after: &toml::Value,
+    env_updates: &BTreeMap<String, String>,
+) -> Result<ServerConfigurationView> {
+    let mut document = TomlDocument::parse(source)?;
+    document.patch_values(before, after)?;
     let rendered = document.to_string();
-    let mut dotenv = DotenvDocument::parse(&dotenv_source);
-    dotenv.apply(&env_updates, &BTreeSet::new());
+    let mut dotenv = DotenvDocument::parse(dotenv_source);
+    dotenv.apply(env_updates, &BTreeSet::new());
     let rendered_dotenv = dotenv.to_string();
 
     if rendered != source {
@@ -241,7 +325,7 @@ pub fn save(
     }
     if rendered_dotenv != dotenv_source {
         if let Err(error) =
-            panoptikon_config::atomic_write_private(&env_path, rendered_dotenv.as_bytes())
+            panoptikon_config::atomic_write_private(env_path, rendered_dotenv.as_bytes())
         {
             if rendered != source {
                 let _ = panoptikon_config::atomic_write(config_path, source.as_bytes());
@@ -250,6 +334,45 @@ pub fn save(
         }
     }
     load(server_root, config_path)
+}
+
+/// True unless any Desktop-managed policy sets `search_cache = false`.
+fn policy_search_cache_enabled(root: &toml::Value) -> bool {
+    let Some(policies) = lookup(root, &["policies"]).and_then(toml::Value::as_array) else {
+        return true;
+    };
+    !policies.iter().any(|policy| {
+        MANAGED_POLICIES.contains(&table_name(policy).unwrap_or_default())
+            && lookup(policy, &["search_cache"]).and_then(toml::Value::as_bool) == Some(false)
+    })
+}
+
+/// Stamp the enable state on every Desktop-managed policy: disabled writes
+/// `search_cache = false`; enabled removes the key (the gateway default is
+/// true), keeping user TOML files free of noise.
+fn apply_policy_search_cache(root: &mut toml::Value, enabled: bool) -> Result<()> {
+    let Some(policies) = root
+        .as_table_mut()
+        .context("Server configuration root is not a table")?
+        .get_mut("policies")
+        .and_then(toml::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for policy in policies.iter_mut() {
+        if !MANAGED_POLICIES.contains(&table_name(policy).unwrap_or_default()) {
+            continue;
+        }
+        let Some(table) = policy.as_table_mut() else {
+            continue;
+        };
+        if enabled {
+            table.remove("search_cache");
+        } else {
+            table.insert("search_cache".into(), toml::Value::Boolean(false));
+        }
+    }
+    Ok(())
 }
 
 fn view_from_value(
@@ -288,6 +411,10 @@ fn view_from_value(
             environment,
         )?,
     };
+    let search_cache = SearchCacheConfigurationView {
+        size_mb: resolved_field(value, &["search", "cache_size_mb"], 128, environment)?,
+        policy_enabled: policy_search_cache_enabled(value),
+    };
     let data_folder = resolved_string(value, &["data_folder"], "data", environment)?;
     let mut databases = database_names(&server_root.join(data_folder));
     if !databases.contains(&lan.default_database) {
@@ -300,6 +427,7 @@ fn view_from_value(
         local_port,
         lan,
         performance,
+        search_cache,
         databases,
     })
 }
@@ -847,6 +975,7 @@ mod tests {
                 intermediate_data_budget_mb: current.performance.intermediate_data_budget_mb.value,
                 embedding_cache_size: current.performance.embedding_cache_size.value,
             },
+            search_cache_enabled: current.search_cache.policy_enabled,
         }
     }
 
@@ -873,6 +1002,7 @@ mod tests {
                 intermediate_data_budget_mb: 512,
                 embedding_cache_size: 8,
             },
+            search_cache_enabled: true,
         };
         let saved = save(root.path(), &config, Some(6342), &update).unwrap();
         assert_eq!(
@@ -909,6 +1039,7 @@ mod tests {
                 intermediate_data_budget_mb: current.performance.intermediate_data_budget_mb.value,
                 embedding_cache_size: current.performance.embedding_cache_size.value,
             },
+            search_cache_enabled: current.search_cache.policy_enabled,
         };
         save(root.path(), &config, Some(6342), &update).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), source);
@@ -916,6 +1047,74 @@ mod tests {
             fs::read_to_string(root.path().join(".env")).unwrap(),
             "PORT=\"16434\"\n"
         );
+    }
+
+    #[test]
+    fn search_cache_size_saves_without_touching_other_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("desktop.toml");
+        fs::write(&config, fixture()).unwrap();
+        let current = load(root.path(), &config).unwrap();
+        assert_eq!(current.search_cache.size_mb.value, 128, "gateway default");
+
+        let saved = save_search_cache_size(root.path(), &config, 256).unwrap();
+        assert_eq!(saved.search_cache.size_mb.value, 256);
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("cache_size_mb = 256"));
+        assert!(text.starts_with("# Panoptikon Server configuration"));
+        // The dedicated save path must leave everything else untouched.
+        assert_eq!(saved.local_port.value, current.local_port.value);
+        assert_eq!(saved.lan.mode, current.lan.mode);
+
+        assert!(save_search_cache_size(root.path(), &config, 100_000).is_err());
+    }
+
+    #[test]
+    fn search_cache_toggle_stamps_managed_policies_and_survives_lan_regen() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("desktop.toml");
+        fs::write(&config, fixture()).unwrap();
+        let current = load(root.path(), &config).unwrap();
+        assert!(current.search_cache.policy_enabled);
+
+        // Disable while also enabling the managed LAN endpoint: both the
+        // local `desktop` policy and the regenerated `desktop_lan` policy
+        // must carry the stamp.
+        let mut update = unchanged_update(&current);
+        update.lan = LanConfigurationUpdate {
+            enabled: true,
+            port: 16437,
+            allowed_databases: None,
+            default_database: "default".into(),
+        };
+        update.search_cache_enabled = false;
+        let saved = save(root.path(), &config, Some(6342), &update).unwrap();
+        assert!(!saved.search_cache.policy_enabled);
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let policies = lookup(&parsed, &["policies"])
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        for name in MANAGED_POLICIES {
+            let policy = policies
+                .iter()
+                .find(|policy| table_name(policy) == Some(name))
+                .unwrap_or_else(|| panic!("{name} policy present"));
+            assert_eq!(
+                lookup(policy, &["search_cache"]).and_then(toml::Value::as_bool),
+                Some(false),
+                "{name} policy stamped"
+            );
+        }
+        // The stamped LAN policy still reads as Managed in the simple UI.
+        assert_eq!(saved.lan.mode, LanMode::Managed);
+
+        // Re-enabling removes the keys instead of writing `true`.
+        let mut update = unchanged_update(&saved);
+        update.search_cache_enabled = true;
+        let saved = save(root.path(), &config, Some(6342), &update).unwrap();
+        assert!(saved.search_cache.policy_enabled);
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(!text.contains("search_cache"));
     }
 
     #[test]

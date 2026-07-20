@@ -90,6 +90,9 @@ fn default_sort_desc() -> SortableOptions {
 impl FilterCompiler for InBookmarks {
     fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
         let args = &self.in_bookmarks;
+        // Structural user_data dependency marker: the result cache keys and
+        // invalidates on the user-data epoch only for queries that set this.
+        state.uses_user_data = true;
         let cte_name = format!("n{}_InBookmarks", state.cte_counter);
         let user_data = Alias::new("user_data");
 
@@ -262,6 +265,38 @@ mod tests {
         run_full_pql_query(QueryElement::InBookmarks(filter), EntityType::File)
             .await
             .expect("in_bookmarks query with bounds");
+    }
+
+    // The result cache keys and invalidates on the user-data epoch only for
+    // queries that structurally touch user_data; in_bookmarks is (today) the
+    // only filter that does.
+    #[test]
+    fn in_bookmarks_marks_user_data_dependency() {
+        use crate::pql::builder::build_query;
+        use crate::pql::model::PqlQuery;
+
+        let filter: InBookmarks = serde_json::from_value(json!({
+            "in_bookmarks": { "filter": true }
+        }))
+        .expect("in_bookmarks filter");
+        let mut state = build_base_state(EntityType::File, false);
+        assert!(!state.uses_user_data);
+        let context = build_begin_cte(&mut state);
+        filter.build(&context, &mut state).expect("filter build");
+        assert!(state.uses_user_data);
+
+        // And the flag propagates through full builds, for both query kinds.
+        let query = PqlQuery {
+            query: Some(QueryElement::InBookmarks(filter)),
+            ..PqlQuery::default()
+        };
+        let results = build_query(query.clone(), false).expect("results build");
+        assert!(results.uses_user_data);
+        let count = build_query(query, true).expect("count build");
+        assert!(count.uses_user_data);
+
+        let plain = build_query(PqlQuery::default(), false).expect("plain build");
+        assert!(!plain.uses_user_data);
     }
 
     #[tokio::test]

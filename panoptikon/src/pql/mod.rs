@@ -4,7 +4,7 @@ pub(crate) mod model;
 pub(crate) mod preprocess;
 pub(crate) mod utils;
 
-pub(crate) use builder::{PqlBuilderResult, build_query, build_query_preprocessed};
+pub(crate) use builder::{Pagination, PqlBuilderResult, build_query, build_query_preprocessed};
 pub(crate) use preprocess::{
     EmbeddingCacheEntry, EmbeddingCacheStats, PqlError, clear_embedding_cache,
     embedding_cache_stats, preprocess_query_async,

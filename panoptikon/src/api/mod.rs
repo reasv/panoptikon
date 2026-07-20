@@ -9,4 +9,5 @@ pub(crate) mod open;
 pub(crate) mod pinboards;
 pub(crate) mod relay;
 pub(crate) mod search;
+pub(crate) mod search_cache;
 pub(crate) mod utils;

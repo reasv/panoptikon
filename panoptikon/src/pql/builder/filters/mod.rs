@@ -75,6 +75,7 @@ pub(crate) mod test_support {
             is_count_query: count_query,
             item_data_query: matches!(entity, EntityType::Text),
             entity,
+            uses_user_data: false,
         }
     }
 
@@ -124,9 +125,10 @@ pub(crate) mod test_support {
         let built = build_query(query, false).expect("build_query");
         let mut dbs = setup_test_databases().await;
 
+        let paginated = built.paginated_query();
         let (sql, values) = match built.with_clause {
-            Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
-            None => built.query.build_sqlx(SqliteQueryBuilder),
+            Some(with_clause) => paginated.with(with_clause).build_sqlx(SqliteQueryBuilder),
+            None => paginated.build_sqlx(SqliteQueryBuilder),
         };
 
         let _rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
