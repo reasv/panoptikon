@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use notify::event::{ModifyKind, RenameMode};
@@ -42,6 +43,10 @@ type ApiResult<T> = Result<T, ApiError>;
 
 const CONTINUOUS_PATH_SENTINEL: &str = "<continuous>";
 const SUPERVISOR_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
+// Watcher-driven resyncs are coalesced into one pass per window: a config save
+// arrives as a burst (temp file created, written, renamed over the target), and
+// a resync per event is pure waste.
+const SUPERVISOR_RESYNC_DEBOUNCE: Duration = Duration::from_secs(1);
 // Watcher deletions happen outside any job, so no post-job maintenance pass
 // ever accounts for them; compact once this many rows have been removed.
 const MAINTENANCE_DELETION_THRESHOLD: u64 = 1000;
@@ -1335,6 +1340,14 @@ pub(crate) struct ContinuousScanSupervisorState {
     config_store: SystemConfigStore,
     actors: HashMap<String, ActorRef<ContinuousScanMessage>>,
     watcher: Option<RecommendedWatcher>,
+    /// Set by the watcher callback when it has queued a `ResyncFromDisk`, and
+    /// cleared when that resync *starts*. The callback drops events while it is
+    /// set, so at most one watcher-driven resync is ever in the mailbox — the
+    /// mailbox is unbounded, and an event source that outruns the actor would
+    /// otherwise grow it without limit. Clearing on entry rather than on
+    /// completion is what makes this safe: an event arriving mid-resync queues
+    /// the next pass instead of being swallowed.
+    resync_pending: Arc<AtomicBool>,
     shutting_down: bool,
 }
 
@@ -1349,12 +1362,15 @@ impl Actor for ContinuousScanSupervisor {
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         let config_store = SystemConfigStore::new(args.data_dir.clone());
-        let watcher = start_supervisor_watcher(myself.clone(), &args.data_dir).ok();
+        let resync_pending = Arc::new(AtomicBool::new(false));
+        let watcher =
+            start_supervisor_watcher(myself.clone(), &args.data_dir, resync_pending.clone()).ok();
         let mut state = ContinuousScanSupervisorState {
             data_dir: args.data_dir,
             config_store,
             actors: HashMap::new(),
             watcher,
+            resync_pending,
             shutting_down: false,
         };
         let _ = myself.send_interval(
@@ -1386,6 +1402,10 @@ impl Actor for ContinuousScanSupervisor {
         }
         match message {
             ContinuousScanSupervisorMessage::ResyncFromDisk => {
+                // Re-open the gate before the pass, not after: this resync
+                // cannot observe changes made while it is running, so an event
+                // arriving now must be able to queue the next one.
+                state.resync_pending.store(false, Ordering::Release);
                 let _ = resync_from_disk(state).await;
             }
             ContinuousScanSupervisorMessage::ConfigChanged { index_db } => {
@@ -1564,13 +1584,28 @@ fn is_sqlite_db_file(path: &Path) -> bool {
 /// transaction and checkpoint; an event touching only those is skipped. Events
 /// touching anything else (a `config.toml`, or a DB directory being added or
 /// removed) are relevant, as are path-less events some backends emit.
+///
+/// Access events (open/read/close-without-write) are never a configuration
+/// change, and treating them as one is self-sustaining: `resync_from_disk`
+/// reads the very tree being watched — `read_dir` over `data/index` plus a
+/// `config.toml` read per DB — and inotify reports those reads back as
+/// `IN_OPEN`/`IN_ACCESS`/`IN_CLOSE_NOWRITE`. Since `config.toml` is not a DB
+/// file, the name filter above cannot catch them, so each resync scheduled the
+/// next one and the supervisor spun at ~3k resyncs/s (issue #18). Only inotify
+/// reports reads at all, which is why this never appeared on Windows
+/// (ReadDirectoryChangesW) or macOS (FSEvents). Real edits still arrive as
+/// Create/Modify/Remove/rename.
 fn event_is_relevant(event: &Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
     event.paths.is_empty() || event.paths.iter().any(|p| !is_sqlite_db_file(p))
 }
 
 fn start_supervisor_watcher(
     actor: ActorRef<ContinuousScanSupervisorMessage>,
     data_dir: &Path,
+    resync_pending: Arc<AtomicBool>,
 ) -> Result<RecommendedWatcher, notify::Error> {
     let watch_root = data_dir.join("index");
     let _ = std::fs::create_dir_all(&watch_root);
@@ -1580,9 +1615,20 @@ fn start_supervisor_watcher(
                 // Ignore the scanner's own DB writes; real config saves also
                 // arrive out-of-band via notify_config_change, so this watcher
                 // is only a backstop for on-disk edits and DB dir changes.
-                if event_is_relevant(&event) {
-                    let _ = actor.cast(ContinuousScanSupervisorMessage::ResyncFromDisk);
+                if !event_is_relevant(&event) {
+                    return;
                 }
+                // Coalesce: queue a resync only when none is already pending,
+                // so a burst of events (or a misclassified one) can never grow
+                // the mailbox. The delay lets a multi-event save settle into a
+                // single pass. Deliberately not a filter of last resort — the
+                // gate bounds the damage of any event we fail to classify.
+                if resync_pending.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let _ = actor.send_after(SUPERVISOR_RESYNC_DEBOUNCE, || {
+                    ContinuousScanSupervisorMessage::ResyncFromDisk
+                });
             }
             Err(err) => {
                 tracing::error!(error = ?err, "continuous scan supervisor watcher error");
@@ -2164,5 +2210,38 @@ mod tests {
         ));
         // Path-less events (some backends emit them) are treated as relevant.
         assert!(event_is_relevant(&Event::new(EventKind::Any)));
+    }
+
+    /// Regression test for issue #18: `resync_from_disk` reads the watched
+    /// tree, inotify reports those reads back as access events, and treating
+    /// them as config changes made every resync schedule the next one.
+    #[test]
+    fn supervisor_watcher_skips_access_events() {
+        use notify::event::{AccessKind, AccessMode, DataChange};
+
+        let cfg = std::path::Path::new("data/index/mydb/config.toml").to_path_buf();
+        let index_dir = std::path::Path::new("data/index").to_path_buf();
+
+        // Opening and reading config.toml is what resync_from_disk itself
+        // does; neither may schedule another resync.
+        assert!(!event_is_relevant(
+            &Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+                .add_path(cfg.clone())
+        ));
+        assert!(!event_is_relevant(
+            &Event::new(EventKind::Access(AccessKind::Read)).add_path(cfg.clone())
+        ));
+        assert!(!event_is_relevant(
+            &Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+                .add_path(cfg.clone())
+        ));
+        // read_dir over the index root reports against the directory itself.
+        assert!(!event_is_relevant(
+            &Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any))).add_path(index_dir)
+        ));
+        // An actual edit is still a Modify, and still counts.
+        assert!(event_is_relevant(
+            &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(cfg)
+        ));
     }
 }
