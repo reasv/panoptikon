@@ -323,6 +323,11 @@ async fn resolve_vector_quant(
         IndexMode::Ann => unreachable!("rejected by validate_quant_args"),
         IndexMode::Auto | IndexMode::Quant => {}
     }
+    // A blank variant is "no profile named", not a strict selection of a
+    // profile whose name is empty (profile names are never empty — see
+    // resolve_desired). Clients that model "unset" as "" would otherwise
+    // turn every vector query into a validation error.
+    let variant = normalize_variant(variant);
     let strict = index == IndexMode::Quant || variant.is_some();
     let Some(conn) = state.quant_conn().await? else {
         if strict {
@@ -391,6 +396,16 @@ async fn resolve_vector_quant(
     }))
 }
 
+/// Blank/whitespace variant names mean "unset"; profile names are never
+/// empty, so this can never mask a real selection.
+fn normalize_variant(variant: &Option<String>) -> Option<String> {
+    variant
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Argument checks shared by sync and async validation.
 fn validate_quant_args(index: IndexMode, k: i64) -> Result<(), PqlError> {
     if matches!(index, IndexMode::Ann) {
@@ -414,7 +429,7 @@ fn validate_quant_args_sync(
     resolved: bool,
 ) -> Result<(), PqlError> {
     validate_quant_args(index, k)?;
-    if !resolved && (matches!(index, IndexMode::Quant) || variant.is_some()) {
+    if !resolved && (matches!(index, IndexMode::Quant) || normalize_variant(variant).is_some()) {
         return Err(PqlError::invalid(
             "selecting a vector quant profile (index \"quant\" or `variant`) \
              requires async preprocessing",

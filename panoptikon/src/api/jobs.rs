@@ -547,6 +547,21 @@ pub(crate) struct VectorQuantRebuildRequest {
     pub setter_name: String,
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct VectorQuantStatusQuery {
+    /// Include per-setter vector/quantized counts (progress and size on
+    /// disk). These are full index scans over each setter's rows; pass
+    /// false from latency-sensitive surfaces that only need profile names
+    /// and states. Defaults to true.
+    #[serde(default = "default_true")]
+    counts: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[utoipa::path(
     get,
     operation_id = "get_vector_quants",
@@ -554,13 +569,14 @@ pub(crate) struct VectorQuantRebuildRequest {
     tag = "jobs",
     summary = "Get vector quantization status",
     description = "Desired (config.toml) merged with actual (DB) state of the vector quant profiles: per-profile setters coverage, build progress, size on disk and whether a reconcile is needed.",
-    params(DbQueryParams),
+    params(DbQueryParams, VectorQuantStatusQuery),
     responses(
         (status = 200, description = "Vector quantization status", body = VectorQuantStatus)
     )
 )]
 pub(crate) async fn get_vector_quants(
     mut conn: DbConnection<ReadOnly>,
+    Query(params): Query<VectorQuantStatusQuery>,
 ) -> Result<Json<VectorQuantStatus>, ApiError> {
     // Invalid config is inert everywhere else (no reconcile action); here it
     // is worth surfacing, since the card is exactly where the user would fix
@@ -571,7 +587,8 @@ pub(crate) async fn get_vector_quants(
              fix it to manage quant profiles.",
         )
     })?;
-    let status = crate::db::vector_quants::load_status(&mut conn.conn, desired).await?;
+    let status =
+        crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;
     Ok(Json(status))
 }
 

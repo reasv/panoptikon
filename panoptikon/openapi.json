@@ -2985,6 +2985,15 @@
                 "null"
               ]
             }
+          },
+          {
+            "name": "counts",
+            "in": "query",
+            "description": "Include per-setter vector/quantized counts (progress and size on\ndisk). These are full index scans over each setter's rows; pass\nfalse from latency-sensitive surfaces that only need profile names\nand states. Defaults to true.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

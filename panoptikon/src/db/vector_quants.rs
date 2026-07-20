@@ -1150,7 +1150,7 @@ pub(crate) async fn mark_space_rebuild(
     setter_ids: &[i64],
 ) -> ApiResult<()> {
     for setter_id in setter_ids {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE vector_quant_coverage \
              SET state = 'pending', artifact = NULL, n_at_artifact = NULL \
              WHERE profile_id = ? AND setter_id = ?",
@@ -1160,6 +1160,13 @@ pub(crate) async fn mark_space_rebuild(
         .execute(&mut *conn)
         .await
         .map_err(write_err)?;
+        // No coverage row means the pair was never established; reporting
+        // "rebuild marked" for a no-op would be a lie.
+        if result.rows_affected() == 0 {
+            return Err(ApiError::bad_request(
+                "This profile has no coverage for that setter yet; run a reconcile first.",
+            ));
+        }
     }
     Ok(())
 }
@@ -1327,9 +1334,16 @@ pub(crate) struct VectorQuantStatus {
 }
 
 /// Desired-merged-with-actual status for the scan page.
+///
+/// `with_counts` drives the two per-(profile, setter) `COUNT(*)` scans that
+/// produce progress and size-on-disk. They are full index scans on the
+/// setter's rows — fine for the scan card, but the search page's index
+/// selector only needs names and states, and must not pay for scans while
+/// a search is in flight.
 pub(crate) async fn load_status(
     conn: &mut sqlx::SqliteConnection,
     desired: DesiredState,
+    with_counts: bool,
 ) -> ApiResult<VectorQuantStatus> {
     let snapshot = load_snapshot(conn, desired).await?;
     let work = if !plan_data(&snapshot).is_empty() {
@@ -1365,14 +1379,19 @@ pub(crate) async fn load_status(
                 let Some(name) = setter_names.get(&coverage.setter_id) else {
                     continue;
                 };
-                let vectors = full_vector_count(conn, coverage.setter_id).await?;
-                let quantized = quantized_count(
-                    conn,
-                    coverage.profile_id,
-                    coverage.setter_id,
-                    coverage.artifact_rev,
-                )
-                .await?;
+                let (vectors, quantized) = if with_counts {
+                    let vectors = full_vector_count(conn, coverage.setter_id).await?;
+                    let quantized = quantized_count(
+                        conn,
+                        coverage.profile_id,
+                        coverage.setter_id,
+                        coverage.artifact_rev,
+                    )
+                    .await?;
+                    (vectors, quantized)
+                } else {
+                    (0, 0)
+                };
                 if let Some(dim) = coverage.dim {
                     // Binary quant: dim bits, rounded up to bytes.
                     size_bytes += quantized * ((dim + 7) / 8);
@@ -2211,6 +2230,76 @@ mod tests {
         );
         let work = analyze(conn, centered).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None, "below threshold after reset");
+    }
+
+    // Regression guard for the class of bug where a client models "no
+    // variant selected" as "": profile names are never empty, so a blank
+    // variant must mean unset, not a strict selection that always fails.
+    #[tokio::test]
+    async fn blank_variant_is_not_a_strict_selection() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..4 {
+            let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+            seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
+        }
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+
+        for blank in ["", "   "] {
+            let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
+                serde_json::json!({
+                    "image_embeddings": {
+                        "query": "q",
+                        "model": "clip/model",
+                        "variant": blank,
+                    }
+                }),
+            )
+            .expect("filter json");
+            filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
+            filter.image_embeddings._distance_func_override =
+                Some(crate::pql::model::DistanceFunction::Cosine);
+            // The sync path is the one that rejects unresolvable strict
+            // selections; a blank variant must sail through it.
+            let query = crate::pql::model::PqlQuery {
+                query: Some(crate::pql::model::QueryElement::SemanticImageSearch(filter)),
+                entity: crate::pql::model::EntityType::File,
+                ..Default::default()
+            };
+            assert!(
+                crate::pql::build_query(query, false).is_ok(),
+                "blank variant {blank:?} must not be treated as a profile name"
+            );
+        }
+
+        // A real profile name that cannot be resolved synchronously still
+        // errors — the fallback the design forbids stays forbidden.
+        let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
+            serde_json::json!({
+                "image_embeddings": {
+                    "query": "q",
+                    "model": "clip/model",
+                    "variant": "plain",
+                }
+            }),
+        )
+        .expect("filter json");
+        filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
+        filter.image_embeddings._distance_func_override =
+            Some(crate::pql::model::DistanceFunction::Cosine);
+        let query = crate::pql::model::PqlQuery {
+            query: Some(crate::pql::model::QueryElement::SemanticImageSearch(filter)),
+            entity: crate::pql::model::EntityType::File,
+            ..Default::default()
+        };
+        assert!(
+            crate::pql::build_query(query, false).is_err(),
+            "a named profile must not silently fall back to exact"
+        );
     }
 
     #[test]
