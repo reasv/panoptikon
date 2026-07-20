@@ -15,7 +15,7 @@ pub(crate) fn embedding_from_npy_bytes(buffer: &[u8]) -> Result<Vec<u8>, String>
 pub(crate) fn serialize_f32(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for value in values {
-        out.extend_from_slice(&value.to_ne_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
     }
     out
 }
@@ -430,7 +430,7 @@ mod tests {
         let expected_values = [0.0f32, 1.5, -2.25, 3.0];
         let mut expected = Vec::with_capacity(expected_values.len() * 4);
         for value in expected_values {
-            expected.extend_from_slice(&value.to_ne_bytes());
+            expected.extend_from_slice(&value.to_le_bytes());
         }
         assert_eq!(bytes, expected);
     }
