@@ -413,10 +413,10 @@ pub(crate) async fn update_config(
     // Reject invalid [vector_quants] at save time; the load-time paths
     // treat an invalid section as empty, which would silently remove
     // profiles.
-    if let Some(quants) = &config.vector_quants {
-        if let Err(message) = crate::db::vector_quants::resolve_desired(quants) {
-            return Err(ApiError::bad_request(message));
-        }
+    if let Some(quants) = &config.vector_quants
+        && let Err(message) = crate::db::vector_quants::resolve_desired(quants)
+    {
+        return Err(ApiError::bad_request(message));
     }
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
