@@ -771,9 +771,15 @@ pub(crate) struct ContinuousScanStatusResponse {
     /// Whether the scanner is temporarily paused while a job runs on this
     /// database. It resumes automatically when the job finishes.
     paused_for_job: bool,
-    /// Change-detection mode from the configuration.
+    /// Change-detection mode from the configuration. This is what was asked
+    /// for, not necessarily what is running — see `watcher_fallback`.
     mode: ContinuousScanMode,
-    /// Poll interval in effect when `mode` is `poller`.
+    /// True when `mode` is `watcher` but the OS watcher could not be started,
+    /// so polling is standing in for it. The usual cause is the system's limit
+    /// on watched paths being too low for the size of the watched tree.
+    watcher_fallback: bool,
+    /// Poll interval actually in effect, including when `watcher_fallback` is
+    /// set. Null in watcher mode.
     poll_interval_secs: Option<u64>,
     /// The folder roots being watched for changes (the global included
     /// folders when no continuous watched folders are configured).
@@ -817,10 +823,15 @@ pub(crate) async fn get_continuous_scan_status(
     let response = match snapshot {
         Some(snapshot) => ContinuousScanStatusResponse {
             enabled: config.continuous_filescan.enabled,
-            active: !snapshot.paused,
+            // Not merely "unpaused": a watcher that failed to start leaves the
+            // actor unpaused with no change detection running at all.
+            active: !snapshot.paused && snapshot.watching,
             paused_for_job: snapshot.paused_for_job,
             mode,
-            poll_interval_secs,
+            watcher_fallback: snapshot.watcher_fallback,
+            // Prefer the interval actually running, so a fallback poller
+            // reports its own interval rather than the configured null.
+            poll_interval_secs: snapshot.effective_poll_interval_secs.or(poll_interval_secs),
             watch_roots: snapshot.watch_roots,
             invalid_includes: snapshot.invalid_includes,
             roots_valid: snapshot.roots_valid,
@@ -834,6 +845,7 @@ pub(crate) async fn get_continuous_scan_status(
                 active: false,
                 paused_for_job: false,
                 mode,
+                watcher_fallback: false,
                 poll_interval_secs,
                 watch_roots: outcome
                     .watch_roots

@@ -55,6 +55,11 @@ const MAINTENANCE_DELETION_THRESHOLD: u64 = 1000;
 const POLL_SETTLE_DELAY: Duration = Duration::from_secs(2);
 // Backoff ceiling for files that keep changing (e.g. a long copy in progress).
 const SETTLE_MAX_DELAY: Duration = Duration::from_secs(60);
+// Poll interval used when the native watcher was requested but failed to start
+// (commonly the OS watch-descriptor limit on a large tree). Polling is heavier
+// than the watcher, so this only ever applies as a degraded fallback, and the
+// status endpoint reports it so the choice is visible rather than silent.
+const WATCHER_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct FileWork {
@@ -210,6 +215,15 @@ pub(crate) struct ContinuousScanSnapshot {
     pub watch_roots: Vec<String>,
     pub invalid_includes: Vec<String>,
     pub roots_valid: bool,
+    /// Whether change detection is actually running (a watcher or a poller).
+    /// Reported separately from `paused` because a failed start leaves the
+    /// actor unpaused with nothing watching — which used to read as healthy.
+    pub watching: bool,
+    /// The native watcher was requested but failed; the poller is standing in.
+    pub watcher_fallback: bool,
+    /// Interval of the poller actually running, including the fallback one.
+    /// None in watcher mode.
+    pub effective_poll_interval_secs: Option<u64>,
 }
 
 pub(crate) struct ContinuousScanActor;
@@ -359,6 +373,11 @@ pub(crate) struct ContinuousScanState {
     factory_handle: Option<ractor::concurrency::JoinHandle<()>>,
     watcher: Option<RecommendedWatcher>,
     poller: Option<PollerRuntime>,
+    /// True when the native watcher was configured but failed to start and the
+    /// poller is standing in for it. Surfaced through the status endpoint: a
+    /// log line alone would leave most users unaware their chosen mode is not
+    /// the one in effect.
+    watcher_fallback: bool,
     enable_watcher: bool,
     deletions_since_maintenance: u64,
 }
@@ -655,6 +674,7 @@ impl ContinuousScanState {
     async fn start_watching(&mut self) {
         self.watcher = None;
         self.poller = None;
+        self.watcher_fallback = false;
         if !self.enable_watcher {
             return;
         }
@@ -690,11 +710,27 @@ impl ContinuousScanState {
                 }
             }
             Err(err) => {
+                // Degrade to polling rather than leaving the DB with no change
+                // detection at all. Without this the actor keeps `poller` unset,
+                // which both disables continuous scanning silently and latches
+                // `needs_restart` on for every later config reload.
                 tracing::error!(
                     index_db = %self.index_db,
                     error = ?err,
-                    "failed to start continuous scan watcher"
+                    fallback_poll_interval_secs = WATCHER_FALLBACK_POLL_INTERVAL.as_secs(),
+                    "failed to start continuous scan watcher; falling back to polling"
                 );
+                match self
+                    .start_poller(Some(WATCHER_FALLBACK_POLL_INTERVAL))
+                    .await
+                {
+                    Ok(()) => self.watcher_fallback = true,
+                    Err(err) => tracing::error!(
+                        index_db = %self.index_db,
+                        error = ?err,
+                        "continuous scan fallback poller also failed to start"
+                    ),
+                }
             }
         }
     }
@@ -825,6 +861,7 @@ impl Actor for ContinuousScanActor {
             factory_handle: Some(handle),
             watcher: None,
             poller: None,
+            watcher_fallback: false,
             enable_watcher: args.enable_watcher,
             deletions_since_maintenance: 0,
         };
@@ -1261,6 +1298,13 @@ impl Actor for ContinuousScanActor {
                         .collect(),
                     invalid_includes: state.invalid_includes.clone(),
                     roots_valid: state.roots_valid,
+                    watching: state.watcher.is_some() || state.poller.is_some(),
+                    watcher_fallback: state.watcher_fallback,
+                    effective_poll_interval_secs: state
+                        .poller
+                        .as_ref()
+                        .and_then(|poller| poller.interval)
+                        .map(|interval| interval.as_secs()),
                 });
             }
         }
@@ -1478,7 +1522,21 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
             if !index_db_file.is_file() {
                 continue;
             }
-            let config = state.config_store.load(&index_db)?;
+            // One unreadable or malformed config.toml must not abort the whole
+            // pass: `desired` drives every start/stop below, so propagating
+            // here would leave every *other* database unmanaged too, on every
+            // resync, forever.
+            let config = match state.config_store.load(&index_db) {
+                Ok(config) => config,
+                Err(err) => {
+                    tracing::error!(
+                        index_db = %index_db,
+                        error = ?err,
+                        "failed to load system config; skipping this database"
+                    );
+                    continue;
+                }
+            };
             if config.continuous_filescan.enabled {
                 desired.insert(index_db, config);
             }
@@ -2035,6 +2093,18 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+
+        // A running poller reports itself as watching, at its real interval,
+        // and not as a degraded fallback from the native watcher.
+        let (tx, rx) = oneshot::channel();
+        actor
+            .cast(ContinuousScanMessage::GetStatus { reply: tx })
+            .unwrap();
+        let snapshot = rx.await.unwrap();
+        assert!(snapshot.watching);
+        assert!(!snapshot.watcher_fallback);
+        assert_eq!(snapshot.effective_poll_interval_secs, Some(1));
+
         actor.stop(None);
         assert!(found, "poll mode did not index the new file in time");
     }
@@ -2132,6 +2202,11 @@ mod tests {
         assert!(snapshot.roots_valid);
         assert_eq!(snapshot.watch_roots.len(), 1);
         assert_eq!(snapshot.invalid_includes.len(), 1);
+        // Change detection is off here (`enable_watcher: false`), and the
+        // snapshot says so rather than letting an unpaused actor read as
+        // healthy — which is what hid a failed watcher from the status page.
+        assert!(!snapshot.watching);
+        assert!(!snapshot.watcher_fallback);
 
         let (tx, rx) = oneshot::channel();
         actor

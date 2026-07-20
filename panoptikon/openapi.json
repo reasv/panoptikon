@@ -4934,6 +4934,7 @@
           "active",
           "paused_for_job",
           "mode",
+          "watcher_fallback",
           "watch_roots",
           "invalid_includes",
           "roots_valid"
@@ -4956,7 +4957,7 @@
           },
           "mode": {
             "$ref": "#/components/schemas/ContinuousScanMode",
-            "description": "Change-detection mode from the configuration."
+            "description": "Change-detection mode from the configuration. This is what was asked\nfor, not necessarily what is running — see `watcher_fallback`."
           },
           "paused_for_job": {
             "type": "boolean",
@@ -4968,7 +4969,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Poll interval in effect when `mode` is `poller`.",
+            "description": "Poll interval actually in effect, including when `watcher_fallback` is\nset. Null in watcher mode.",
             "minimum": 0
           },
           "roots_valid": {
@@ -4981,6 +4982,10 @@
               "type": "string"
             },
             "description": "The folder roots being watched for changes (the global included\nfolders when no continuous watched folders are configured)."
+          },
+          "watcher_fallback": {
+            "type": "boolean",
+            "description": "True when `mode` is `watcher` but the OS watcher could not be started,\nso polling is standing in for it. The usual cause is the system's limit\non watched paths being too low for the size of the watched tree."
           }
         }
       },
