@@ -186,16 +186,23 @@ async fn build_space(index_db: &str, profile_id: i64, build: &SpaceBuild) -> Api
     for setter_id in &build.setter_ids {
         let setter_id = *setter_id;
         let mut written_total: u64 = 0;
+        // Keyset cursor over item_data.id, so each chunk starts where the
+        // last one stopped instead of re-walking the quantized prefix. It
+        // is an optimization only: a crash restarts at 0 and `NOT EXISTS`
+        // still makes the resumed pass idempotent.
+        let mut after_id: i64 = 0;
         loop {
-            let written = call_index_db_writer(index_db, |reply| {
+            let (written, cursor) = call_index_db_writer(index_db, |reply| {
                 IndexDbWriterMessage::VectorQuantBackfillChunk {
                     profile_id,
                     setter_id,
                     limit: BACKFILL_CHUNK_ROWS,
+                    after_id,
                     reply,
                 }
             })
             .await?;
+            after_id = cursor;
             written_total += written;
             if written == 0 {
                 break;

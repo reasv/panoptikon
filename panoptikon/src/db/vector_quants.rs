@@ -335,14 +335,46 @@ async fn bounded_vector_count(
     row.try_get("n").map_err(read_err)
 }
 
+/// Vectors a setter holds, for the status card's progress and staleness
+/// ratios. Polled while a build runs, so it must not be O(vector bytes):
+/// joining `embeddings` to prove each row exists means one page fault per
+/// 3KB vector, seconds on a large index.
+///
+/// Instead this counts the `item_data` rows that *must* have a vector. That
+/// set is identical, by construction of the only code that writes either
+/// table:
+/// - `add_item_data` is the sole non-test writer of `item_data`, and always
+///   binds `is_placeholder` from a `bool`, so the column is never NULL and
+///   `= 0` is exhaustive rather than a filter that could drop rows.
+/// - Nothing anywhere updates `is_placeholder` after insert.
+/// - `write_clip_output` / `write_text_embedding_output` are the only
+///   producers of these data types, and each either writes one placeholder
+///   row *or* follows every `add_item_data(.., false)` immediately with
+///   `add_embedding`, both inside the index writer's transaction — so the
+///   two rows commit together or not at all.
+/// - Nothing deletes from `embeddings`; a vector can only disappear by
+///   cascade with the `item_data` row being counted here.
+///
+/// Legacy rows are the one thing code cannot speak for, since the large
+/// indexes were written by the deprecated Python version; those were
+/// checked directly instead (12 indexes, 7.8M rows: no NULL placeholders,
+/// no row where `is_placeholder = 0` disagreed with having a vector).
+///
+/// If the invariant were ever broken this over-counts and the card's
+/// progress bar sticks below 100%. Nothing else is affected:
+/// `finish_space_build` decides readiness from its own `embeddings` scan,
+/// and `n_at_artifact` comes from there too — this number is display only.
+/// Kept in step with [`EMBEDDING_DATA_TYPES`] by a test — the types have to
+/// be inline for the index to answer this without touching a table row.
+const FULL_VECTOR_COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM item_data \
+     WHERE is_placeholder = 0 AND setter_id = ? \
+       AND data_type IN ('clip', 'text-embedding')";
+
 pub(crate) async fn full_vector_count(
     conn: &mut sqlx::SqliteConnection,
     setter_id: i64,
 ) -> ApiResult<i64> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS n FROM item_data d JOIN embeddings e ON e.id = d.id \
-         WHERE d.setter_id = ?",
-    )
+    let row = sqlx::query(FULL_VECTOR_COUNT_SQL)
     .bind(setter_id)
     .fetch_one(&mut *conn)
     .await
@@ -991,19 +1023,22 @@ pub(crate) async fn start_space_build(
     Ok(rev)
 }
 
-/// One chunked backfill transaction for a pair. Returns rows written; zero
-/// means the pair's quants are complete at its current revision — or that
-/// the pair is no longer `building` (e.g. an explicit rebuild was marked
+/// One chunked backfill transaction for a pair, resuming after `after_id`.
+/// Returns rows written and the cursor for the next chunk; zero rows means
+/// the pair's quants are complete at its current revision — or that the
+/// pair is no longer `building` (e.g. an explicit rebuild was marked
 /// mid-build, which cleared the artifact; writing plain-binarized rows at
 /// the frozen rev then would corrupt the pair).
-pub(crate) async fn backfill_chunk(
-    conn: &mut sqlx::SqliteConnection,
-    profile_id: i64,
-    setter_id: i64,
-    limit: i64,
-) -> ApiResult<u64> {
-    let result = sqlx::query(
-        "INSERT OR REPLACE INTO embedding_quants (id, profile_id, rev, quant) \
+///
+/// The cursor is what keeps a full backfill linear. `NOT EXISTS` alone is
+/// enough for correctness (and remains the resume mechanism after a crash,
+/// where the caller restarts at 0), but without `d.id > ?` every chunk
+/// re-walks the whole already-quantized prefix — on a 679k-vector setter
+/// the late chunks spend seconds on skips, holding the index writer the
+/// whole time. `ORDER BY d.id` makes the LIMIT window match the cursor by
+/// construction rather than by luck of the query plan; it is free, since
+/// `idx_item_data_setter_id` already yields rowid order within a setter.
+const BACKFILL_CHUNK_SQL: &str = "INSERT OR REPLACE INTO embedding_quants (id, profile_id, rev, quant) \
          SELECT e.id, c.profile_id, c.artifact_rev, \
                 vec_quantize_binary( \
                     CASE WHEN c.artifact IS NOT NULL \
@@ -1014,25 +1049,51 @@ pub(crate) async fn backfill_chunk(
          JOIN embeddings e ON e.id = d.id \
          WHERE c.profile_id = ? AND c.setter_id = ? \
            AND c.state = 'building' \
+           AND d.id > ? \
            AND length(e.embedding) = c.dim * 4 \
            AND NOT EXISTS (SELECT 1 FROM embedding_quants q \
                            WHERE q.id = e.id AND q.profile_id = c.profile_id \
                              AND q.rev = c.artifact_rev) \
-         LIMIT ?",
-    )
+         ORDER BY d.id \
+         LIMIT ? \
+         RETURNING id";
+
+pub(crate) async fn backfill_chunk(
+    conn: &mut sqlx::SqliteConnection,
+    profile_id: i64,
+    setter_id: i64,
+    limit: i64,
+    after_id: i64,
+) -> ApiResult<(u64, i64)> {
+    let rows = sqlx::query(BACKFILL_CHUNK_SQL)
     .bind(profile_id)
     .bind(setter_id)
+    .bind(after_id)
     .bind(limit)
-    .execute(&mut *conn)
+    .fetch_all(&mut *conn)
     .await
     .map_err(write_err)?;
-    Ok(result.rows_affected())
+    let mut cursor = after_id;
+    for row in &rows {
+        let id: i64 = row.try_get("id").map_err(read_err)?;
+        cursor = cursor.max(id);
+    }
+    Ok((rows.len() as u64, cursor))
 }
 
 /// Completing transaction of a space build: verifies the coverage invariant
 /// actually holds for every pair (all vectors quantized at the current rev,
 /// no dim-mismatched vectors skipped), then flips the pairs to ready and
 /// records n_at_artifact.
+///
+/// The check is one pass over the setter's rows, and deliberately does not
+/// touch `e.embedding`'s contents: a `length(e.embedding)` term would force
+/// every 3KB vector page into cache just to confirm what the backfill
+/// already enforced. Dim mismatches are counted only when the cheap pass
+/// finds work remaining — they are a strict subset of it (the backfill
+/// filters on `length = dim * 4`, so a mismatched vector is always an
+/// un-quantized one), so this reports the same failure for the same pairs,
+/// it just pays for the diagnosis only when there is something to diagnose.
 pub(crate) async fn finish_space_build(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
@@ -1040,18 +1101,14 @@ pub(crate) async fn finish_space_build(
 ) -> ApiResult<()> {
     for setter_id in setter_ids {
         let row = sqlx::query(
-            "SELECT c.state AS state, \
-                (SELECT COUNT(*) FROM item_data d JOIN embeddings e ON e.id = d.id \
-                 WHERE d.setter_id = c.setter_id) AS total, \
-                (SELECT COUNT(*) FROM item_data d JOIN embeddings e ON e.id = d.id \
-                 WHERE d.setter_id = c.setter_id AND length(e.embedding) != c.dim * 4) \
-                    AS dim_mismatched, \
-                (SELECT COUNT(*) FROM item_data d JOIN embeddings e ON e.id = d.id \
-                 WHERE d.setter_id = c.setter_id \
-                   AND NOT EXISTS (SELECT 1 FROM embedding_quants q \
-                                   WHERE q.id = e.id AND q.profile_id = c.profile_id \
-                                     AND q.rev = c.artifact_rev)) AS remaining \
+            "SELECT c.state AS state, COUNT(e.id) AS total, \
+                COALESCE(SUM(e.id IS NOT NULL \
+                    AND NOT EXISTS (SELECT 1 FROM embedding_quants q \
+                                    WHERE q.id = e.id AND q.profile_id = c.profile_id \
+                                      AND q.rev = c.artifact_rev)), 0) AS remaining \
              FROM vector_quant_coverage c \
+             LEFT JOIN item_data d ON d.setter_id = c.setter_id \
+             LEFT JOIN embeddings e ON e.id = d.id \
              WHERE c.profile_id = ? AND c.setter_id = ?",
         )
         .bind(profile_id)
@@ -1061,28 +1118,29 @@ pub(crate) async fn finish_space_build(
         .map_err(write_err)?;
         // A pair that left 'building' mid-backfill (an explicit rebuild
         // marked it pending, or a recipe change reset it) must never flip
-        // ready here — its quants may mix transforms.
-        let state: String = row.try_get("state").map_err(read_err)?;
-        if state != "building" {
+        // ready here — its quants may mix transforms. The aggregate always
+        // returns a row, so a vanished coverage row reads as a NULL state.
+        let state: Option<String> = row.try_get("state").map_err(read_err)?;
+        if state.as_deref() != Some("building") {
             return Err(ApiError::internal(
                 "Vector quant pair no longer building at finish",
             ));
         }
         let total: i64 = row.try_get("total").map_err(read_err)?;
-        let dim_mismatched: i64 = row.try_get("dim_mismatched").map_err(read_err)?;
         let remaining: i64 = row.try_get("remaining").map_err(read_err)?;
-        if dim_mismatched > 0 {
-            tracing::error!(
-                profile_id,
-                setter_id,
-                dim_mismatched,
-                "setter has vectors of mismatched dimensionality; refusing to mark ready"
-            );
-            return Err(ApiError::internal(
-                "Setter has vectors of mismatched dimensionality",
-            ));
-        }
         if remaining > 0 {
+            let dim_mismatched = count_dim_mismatched(conn, profile_id, *setter_id).await?;
+            if dim_mismatched > 0 {
+                tracing::error!(
+                    profile_id,
+                    setter_id,
+                    dim_mismatched,
+                    "setter has vectors of mismatched dimensionality; refusing to mark ready"
+                );
+                return Err(ApiError::internal(
+                    "Setter has vectors of mismatched dimensionality",
+                ));
+            }
             return Err(ApiError::internal(
                 "Vector quant backfill incomplete at finish",
             ));
@@ -1099,6 +1157,29 @@ pub(crate) async fn finish_space_build(
         .map_err(write_err)?;
     }
     Ok(())
+}
+
+/// Vectors whose byte length disagrees with the pair's declared dimension.
+/// Only ever called to explain a failed finish (it reads every vector's
+/// blob header), never on the path that flips a pair ready.
+async fn count_dim_mismatched(
+    conn: &mut sqlx::SqliteConnection,
+    profile_id: i64,
+    setter_id: i64,
+) -> ApiResult<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM vector_quant_coverage c \
+         JOIN item_data d ON d.setter_id = c.setter_id \
+         JOIN embeddings e ON e.id = d.id \
+         WHERE c.profile_id = ? AND c.setter_id = ? \
+           AND length(e.embedding) != c.dim * 4",
+    )
+    .bind(profile_id)
+    .bind(setter_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(read_err)?;
+    row.try_get("n").map_err(read_err)
 }
 
 /// One chunked delete transaction for a removing profile's quants.
@@ -1335,11 +1416,18 @@ pub(crate) struct VectorQuantStatus {
 
 /// Desired-merged-with-actual status for the scan page.
 ///
-/// `with_counts` drives the two per-(profile, setter) `COUNT(*)` scans that
+/// `with_counts` drives the per-(profile, setter) `COUNT(*)` scans that
 /// produce progress and size-on-disk. They are full index scans on the
 /// setter's rows — fine for the scan card, but the search page's index
 /// selector only needs names and states, and must not pay for scans while
 /// a search is in flight.
+///
+/// The vector count is per *setter*, not per pair — it is the same number
+/// for every profile covering that setter, and it is the expensive half
+/// (it probes the 3KB-row `embeddings` table once per vector, seconds on a
+/// large index, where the quant count walks the far denser quant table).
+/// Profiles exist to be compared side by side, so a naive loop would run
+/// that scan once per profile for the same answer; memoize it.
 pub(crate) async fn load_status(
     conn: &mut sqlx::SqliteConnection,
     desired: DesiredState,
@@ -1366,6 +1454,7 @@ pub(crate) async fn load_status(
         .collect();
 
     let mut profiles = Vec::new();
+    let mut vector_counts: HashMap<i64, i64> = HashMap::new();
     for desired_profile in &snapshot.desired.profiles {
         let row = by_name.get(desired_profile.name.as_str()).copied();
         let mut setters = Vec::new();
@@ -1380,7 +1469,14 @@ pub(crate) async fn load_status(
                     continue;
                 };
                 let (vectors, quantized) = if with_counts {
-                    let vectors = full_vector_count(conn, coverage.setter_id).await?;
+                    let vectors = match vector_counts.get(&coverage.setter_id) {
+                        Some(cached) => *cached,
+                        None => {
+                            let counted = full_vector_count(conn, coverage.setter_id).await?;
+                            vector_counts.insert(coverage.setter_id, counted);
+                            counted
+                        }
+                    };
                     let quantized = quantized_count(
                         conn,
                         coverage.profile_id,
@@ -1723,9 +1819,13 @@ mod tests {
         idx: i64,
         vector: &[f32],
     ) -> i64 {
+        // `is_placeholder` is explicit because the real writer always binds
+        // it (`add_item_data`) and the status count keys off `= 0` — a
+        // fixture leaving it NULL would model a row shape production has
+        // never produced (verified: 0 NULLs across all 12 local indexes).
         let data_id = sqlx::query(
-            "INSERT INTO item_data (item_id, setter_id, data_type, idx, is_origin) \
-             VALUES (?, ?, ?, ?, 1) RETURNING id",
+            "INSERT INTO item_data (item_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+             VALUES (?, ?, ?, ?, 1, 0) RETURNING id",
         )
         .bind(item_id)
         .bind(setter_id)
@@ -1761,11 +1861,16 @@ mod tests {
             .await
             .expect("start build");
         for setter_id in &build.setter_ids {
-            while backfill_chunk(conn, profile_id, *setter_id, 3)
-                .await
-                .expect("backfill chunk")
-                > 0
-            {}
+            let mut after_id = 0;
+            loop {
+                let (written, cursor) = backfill_chunk(conn, profile_id, *setter_id, 3, after_id)
+                    .await
+                    .expect("backfill chunk");
+                after_id = cursor;
+                if written == 0 {
+                    break;
+                }
+            }
         }
         finish_space_build(conn, profile_id, &build.setter_ids)
             .await
@@ -1927,8 +2032,37 @@ mod tests {
         start_space_build(conn, profile_id, &build.setter_ids, None, build.dim)
             .await
             .expect("start");
+        // The chunk cursor is only worth anything if the plan can seek to
+        // it: `d.id > ?` must be an index range constraint on the driving
+        // scan, and `ORDER BY d.id` must be satisfied by that same scan.
+        // A temp b-tree here would sort the whole remaining candidate set
+        // per chunk — the exact quadratic this cursor exists to remove.
+        let plan: Vec<String> =
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {BACKFILL_CHUNK_SQL}"
+            )))
+                .bind(profile_id)
+                .bind(setter)
+                .bind(0_i64)
+                .bind(4_i64)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "backfill chunk must not sort: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("item_data") && step.contains("idx_item_data_setter")),
+            "backfill chunk must drive off the setter index: {plan:?}"
+        );
+
         // One chunk of 4, then "crash".
-        let written = backfill_chunk(conn, profile_id, setter, 4).await.expect("chunk");
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 4, 0).await.expect("chunk");
         assert_eq!(written, 4);
         assert_eq!(quant_rows(conn).await, 4);
 
@@ -1945,7 +2079,10 @@ mod tests {
         assert_eq!(work, ReconcileWork::DataWork);
 
         // Resume path: no new artifact, no rev bump — only the remainder.
-        let written = backfill_chunk(conn, profile_id, setter, 100)
+        // The cursor restarts at 0 after a crash, so this also pins that
+        // NOT EXISTS (not the cursor) is what makes a resumed pass skip the
+        // already-committed prefix.
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 100, 0)
             .await
             .expect("resume chunk");
         assert_eq!(written, 6, "only the 6 uncommitted rows are written");
@@ -1986,7 +2123,7 @@ mod tests {
         start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
             .await
             .expect("start");
-        let written = backfill_chunk(conn, profile_id, setter, 10)
+        let (written, after_id) = backfill_chunk(conn, profile_id, setter, 10, 0)
             .await
             .expect("first chunk");
         assert_eq!(written, 10);
@@ -1998,7 +2135,7 @@ mod tests {
 
         // The in-flight job's next chunk must write nothing (the pair left
         // 'building'), and its finish must refuse to flip ready.
-        let written = backfill_chunk(conn, profile_id, setter, 100)
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 100, after_id)
             .await
             .expect("post-rebuild chunk");
         assert_eq!(written, 0, "no rows may be written to a non-building pair");
@@ -2029,6 +2166,127 @@ mod tests {
             analyze(conn, state).await.expect("analyze"),
             ReconcileWork::None
         );
+    }
+
+    // The status card's vector count no longer joins `embeddings` — it
+    // trusts that a non-placeholder embedding row always has one. Pin that
+    // against the join it replaced, with a placeholder and a foreign
+    // data_type present to make the two able to disagree.
+    #[tokio::test]
+    async fn full_vector_count_matches_the_join_it_replaces() {
+        for data_type in EMBEDDING_DATA_TYPES {
+            assert!(
+                FULL_VECTOR_COUNT_SQL.contains(&format!("'{data_type}'")),
+                "{data_type} vectors would be counted as zero"
+            );
+        }
+
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..5 {
+            seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0, -1.0)).await;
+        }
+        // A model that returned nothing: item_data row, no embeddings row.
+        sqlx::query(
+            "INSERT INTO item_data (item_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+             VALUES (?, ?, 'clip', 99, 1, 1)",
+        )
+        .bind(item)
+        .bind(setter)
+        .execute(&mut *conn)
+        .await
+        .expect("placeholder");
+        // Same setter, non-embedding output: must not inflate the count.
+        sqlx::query(
+            "INSERT INTO item_data (item_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+             VALUES (?, ?, 'tags', 0, 1, 0)",
+        )
+        .bind(item)
+        .bind(setter)
+        .execute(&mut *conn)
+        .await
+        .expect("tags row");
+
+        let joined: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM item_data d JOIN embeddings e ON e.id = d.id \
+             WHERE d.setter_id = ?",
+        )
+        .bind(setter)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("join count")
+        .get("n");
+        assert_eq!(joined, 5, "the fixture must exercise both exclusions");
+        assert_eq!(
+            full_vector_count(conn, setter).await.expect("count"),
+            joined,
+            "the cheap count must agree with the embeddings join"
+        );
+
+        // And it must stay cheap: answered from the index, no table rows.
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {FULL_VECTOR_COUNT_SQL}"
+        )))
+        .bind(setter)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("plan")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_item_data_placeholder_setter_type")),
+            "vector count must be answered from the covering index: {plan:?}"
+        );
+    }
+
+    // A vector whose length disagrees with the pair's dimension is skipped
+    // by the backfill, so the finish must refuse to flip ready AND must say
+    // why. The finish counts mismatches only after its cheap pass reports
+    // work remaining — this pins that the mismatch is in fact always part
+    // of that remainder, i.e. that the cheap pass can never miss it.
+    #[tokio::test]
+    async fn dim_mismatched_vector_blocks_finish_with_its_own_error() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..8 {
+            let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+            seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
+        }
+        // Same setter, twice the dimension: the odd one out.
+        let wide: Vec<f32> = vec8(1.0, -1.0).iter().chain(vec8(2.0, -2.0).iter()).copied().collect();
+        seed_embedding(conn, item, setter, "clip", 8, &wide).await;
+
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        let build = &plan_data(&snapshot).builds[0];
+        assert_eq!(build.dim, 8, "the majority dimension defines the pair");
+        start_space_build(conn, profile_id, &build.setter_ids, None, build.dim)
+            .await
+            .expect("start");
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 100, 0)
+            .await
+            .expect("chunk");
+        assert_eq!(written, 8, "the mismatched vector must not be quantized");
+
+        let err = finish_space_build(conn, profile_id, &[setter])
+            .await
+            .expect_err("finish must refuse an incompletely covered pair");
+        assert!(
+            format!("{err:?}").contains("dimensionality"),
+            "the mismatch must be named, not reported as a generic shortfall: {err:?}"
+        );
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "building", "a refused finish must not flip");
     }
 
     // The inline hook writes quants (same rev, same transform) for building

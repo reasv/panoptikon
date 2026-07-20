@@ -228,12 +228,14 @@ pub(crate) enum IndexDbWriterMessage {
         dim: i64,
         reply: Reply<i64>,
     },
-    /// One chunked backfill transaction; replies rows written (0 = done).
+    /// One chunked backfill transaction, resuming after `after_id`; replies
+    /// (rows written, cursor for the next chunk). Zero rows = done.
     VectorQuantBackfillChunk {
         profile_id: i64,
         setter_id: i64,
         limit: i64,
-        reply: Reply<u64>,
+        after_id: i64,
+        reply: Reply<(u64, i64)>,
     },
     /// Verifies the coverage invariant and flips a space's pairs to ready.
     VectorQuantFinishSpaceBuild {
@@ -845,13 +847,14 @@ impl Actor for IndexDbWriter {
                 profile_id,
                 setter_id,
                 limit,
+                after_id,
                 reply,
             } => {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
                             crate::db::vector_quants::backfill_chunk(
-                                conn, profile_id, setter_id, limit,
+                                conn, profile_id, setter_id, limit, after_id,
                             )
                             .await
                         })
