@@ -1405,7 +1405,6 @@ async fn quantized_count(
 /// A ready (profile, setter) pair as the query preprocessor needs it: the
 /// artifact to center the query embedding with (None for artifact-free
 /// recipes) and the profile id for the quant join.
-#[allow(dead_code)] // wired up by the query-side stage
 #[derive(Debug, Clone)]
 pub(crate) struct ReadyPair {
     pub profile_id: i64,
@@ -1413,10 +1412,11 @@ pub(crate) struct ReadyPair {
     pub dim: i64,
 }
 
-/// Resolves a profile for querying a setter (and optionally its xmodal
-/// sibling). Returns None unless the profile is active and every involved
-/// setter's pair is ready — the `auto` fallback contract.
-#[allow(dead_code)] // wired up by the query-side stage
+/// Resolves a profile for querying a set of setters (a model and optionally
+/// its xmodal sibling). Setter names with no setters row at all are skipped
+/// — they contribute nothing to the query. Returns None unless the profile
+/// is active and every *existing* involved setter's pair is ready — the
+/// `auto` fallback contract.
 pub(crate) async fn resolve_ready_pair(
     conn: &mut sqlx::SqliteConnection,
     profile_name: &str,
@@ -1439,14 +1439,24 @@ pub(crate) async fn resolve_ready_pair(
 
     let mut result: Option<ReadyPair> = None;
     for setter_name in setter_names {
+        let setter = sqlx::query("SELECT id FROM setters WHERE name = ?")
+            .bind(setter_name)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to resolve setter for vector quants");
+                ApiError::internal("Failed to resolve vector quant coverage")
+            })?;
+        let Some(setter) = setter else {
+            continue;
+        };
+        let setter_id: i64 = setter.try_get("id").map_err(read_err)?;
         let row = sqlx::query(
-            "SELECT c.artifact AS artifact, c.dim AS dim \
-             FROM vector_quant_coverage c \
-             JOIN setters s ON s.id = c.setter_id \
-             WHERE c.profile_id = ? AND s.name = ? AND c.state = 'ready'",
+            "SELECT artifact, dim FROM vector_quant_coverage \
+             WHERE profile_id = ? AND setter_id = ? AND state = 'ready'",
         )
         .bind(profile_id)
-        .bind(setter_name)
+        .bind(setter_id)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|err| {
@@ -1481,8 +1491,34 @@ pub(crate) async fn resolve_ready_pair(
     Ok(result)
 }
 
+/// Binarizes a query embedding for a pair: centered against the artifact
+/// when one exists, plain sign-binarization otherwise. Computed in SQL by
+/// the same sqlite-vec functions the write path uses, so bit order is
+/// definitionally consistent.
+pub(crate) async fn compute_query_quant(
+    conn: &mut sqlx::SqliteConnection,
+    embedding: &[u8],
+    artifact: Option<&[u8]>,
+) -> ApiResult<Vec<u8>> {
+    let row = match artifact {
+        Some(artifact) => sqlx::query("SELECT vec_quantize_binary(vec_sub(?, ?)) AS q")
+            .bind(embedding)
+            .bind(artifact)
+            .fetch_one(&mut *conn)
+            .await,
+        None => sqlx::query("SELECT vec_quantize_binary(?) AS q")
+            .bind(embedding)
+            .fetch_one(&mut *conn)
+            .await,
+    }
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to quantize query embedding");
+        ApiError::internal("Failed to quantize query embedding")
+    })?;
+    row.try_get("q").map_err(read_err)
+}
+
 /// The default profile's name, if one is marked in the DB.
-#[allow(dead_code)] // wired up by the query-side stage
 pub(crate) async fn default_profile_name(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Option<String>> {
@@ -2004,6 +2040,209 @@ mod tests {
         let mut bad = config(vec![("a", true)], Some("a"));
         bad.profiles[0].quantizer = "int8".to_string();
         assert!(resolve_desired(&bad).is_err(), "int8 is reserved, not implemented");
+    }
+
+    async fn seed_file(conn: &mut SqliteConnection, item_id: i64, sha: &str) {
+        let scan_id = sqlx::query(
+            "INSERT INTO file_scans (start_time, path) VALUES ('2026-01-01', '/') RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("insert scan")
+        .try_get::<i64, _>("id")
+        .expect("scan id");
+        sqlx::query(
+            "INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (?, ?, ?, ?, '2026-01-01', ?, 1)",
+        )
+        .bind(sha)
+        .bind(item_id)
+        .bind(format!("/f/{sha}.png"))
+        .bind(format!("{sha}.png"))
+        .bind(scan_id)
+        .execute(&mut *conn)
+        .await
+        .expect("insert file");
+    }
+
+    async fn run_query_order(
+        conn: &mut SqliteConnection,
+        query: crate::pql::model::PqlQuery,
+    ) -> Vec<i64> {
+        use sea_query::SqliteQueryBuilder;
+        use sea_query_sqlx::SqlxBinder;
+        let built = crate::pql::build_query(query, false).expect("build query");
+        let paginated = built.paginated_query();
+        let (sql, values) = match built.with_clause {
+            Some(with_clause) => paginated.with(with_clause).build_sqlx(SqliteQueryBuilder),
+            None => paginated.build_sqlx(SqliteQueryBuilder),
+        };
+        let rows = match sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .fetch_all(&mut *conn)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => panic!("run query failed: {err}\nSQL:\n{sql}"),
+        };
+        rows.iter()
+            .map(|row| row.try_get::<i64, _>("file_id").expect("file_id"))
+            .collect()
+    }
+
+    fn image_filter(
+        model: &str,
+        embedding: Vec<u8>,
+        quant: Option<crate::pql::model::QuantResolved>,
+        k: Option<i64>,
+    ) -> crate::pql::model::QueryElement {
+        let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
+            serde_json::json!({ "image_embeddings": { "query": "q", "model": model } }),
+        )
+        .expect("filter json");
+        filter.image_embeddings._embedding = Some(embedding);
+        filter.image_embeddings._distance_func_override =
+            Some(crate::pql::model::DistanceFunction::Cosine);
+        filter.image_embeddings._quant = quant;
+        if let Some(k) = k {
+            filter.image_embeddings.k = k;
+        }
+        crate::pql::model::QueryElement::SemanticImageSearch(filter)
+    }
+
+    fn le_bytes(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    // The two-stage quant scorer is bit-identical to exact search when the
+    // candidate set fits inside k, and stays deterministic (same membership,
+    // repeatable order) when k truncates the head.
+    #[tokio::test]
+    async fn quant_query_matches_exact_and_is_deterministic() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let setter = seed_setter(conn, "clip/model").await;
+        // Distinct angles from the query vector so cosine distances are
+        // strictly ordered.
+        for idx in 0..12 {
+            let sha = format!("i{idx:02}");
+            let item = seed_item(conn, &sha).await;
+            seed_file(conn, item, &sha).await;
+            let spread = 0.1 + idx as f32 * 0.3;
+            seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
+        }
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+
+        let query_vec = le_bytes(&vec8(1.0, 0.05));
+        let query_quant = compute_query_quant(conn, &query_vec, None)
+            .await
+            .expect("query quant");
+        let make_query = |element| crate::pql::model::PqlQuery {
+            query: Some(element),
+            entity: crate::pql::model::EntityType::File,
+            page_size: 100,
+            ..Default::default()
+        };
+
+        let exact = run_query_order(
+            conn,
+            make_query(image_filter("clip/model", query_vec.clone(), None, None)),
+        )
+        .await;
+        assert_eq!(exact.len(), 12, "all seeded files match");
+
+        let quant = Some(crate::pql::model::QuantResolved {
+            profile_id,
+            query_quant: Some(query_quant.clone()),
+        });
+        let quant_full = run_query_order(
+            conn,
+            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), None)),
+        )
+        .await;
+        assert_eq!(
+            exact, quant_full,
+            "candidates <= k: quant must be bit-identical to exact"
+        );
+
+        // k truncates the head: same membership, exact head prefix,
+        // deterministic across repeated executions.
+        let quant_small_k = run_query_order(
+            conn,
+            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(3))),
+        )
+        .await;
+        assert_eq!(quant_small_k.len(), 12, "membership is never truncated");
+        assert_eq!(
+            &quant_small_k[..3],
+            &exact[..3],
+            "head rows are exact-ordered"
+        );
+        let repeat = run_query_order(
+            conn,
+            make_query(image_filter("clip/model", query_vec.clone(), quant, Some(3))),
+        )
+        .await;
+        assert_eq!(quant_small_k, repeat, "ordering is deterministic");
+    }
+
+    // similar_to under a quant profile: same membership as exact, exact head.
+    #[tokio::test]
+    async fn similar_to_quant_matches_exact() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..8 {
+            let sha = format!("s{idx:02}");
+            let item = seed_item(conn, &sha).await;
+            seed_file(conn, item, &sha).await;
+            let spread = 0.2 + idx as f32 * 0.4;
+            seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
+        }
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+
+        let make_filter = |quant: Option<crate::pql::model::QuantResolved>| {
+            let mut filter: crate::pql::model::SimilarTo = serde_json::from_value(
+                serde_json::json!({ "similar_to": {
+                    "target": "s00", "model": "clip/model",
+                    "force_distance_function": true
+                } }),
+            )
+            .expect("similar_to json");
+            filter.similar_to._quant = quant;
+            crate::pql::model::QueryElement::SimilarTo(filter)
+        };
+        let make_query = |element| crate::pql::model::PqlQuery {
+            query: Some(element),
+            entity: crate::pql::model::EntityType::File,
+            page_size: 100,
+            ..Default::default()
+        };
+
+        let exact = run_query_order(conn, make_query(make_filter(None))).await;
+        assert_eq!(exact.len(), 7, "target excluded, everything else matches");
+        let quant = run_query_order(
+            conn,
+            make_query(make_filter(Some(crate::pql::model::QuantResolved {
+                profile_id,
+                query_quant: None,
+            }))),
+        )
+        .await;
+        assert_eq!(exact, quant, "candidates <= k: identical to exact");
     }
 
     #[test]

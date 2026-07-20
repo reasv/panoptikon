@@ -446,7 +446,7 @@ pub async fn search_pql(
         query.check_path && matches!(query.entity, EntityType::File) && is_empty_partition(&query);
     let cache_requested = query.cache;
     let prefetch_pages = query.prefetch_pages.min(MAX_PREFETCH_PAGES);
-    let builder = compile_pql(&state, query).await?;
+    let builder = compile_pql(&state, query, &db.index_db).await?;
 
     let mut count_metrics = builder.count_metrics.clone();
     let mut result_metrics = builder.result_metrics.clone();
@@ -694,13 +694,14 @@ async fn execute_results(
 )]
 pub async fn search_pql_build(
     State(state): State<Arc<ProxyState>>,
+    db: DbConnection<ReadOnly>,
     body: Option<Json<Value>>,
 ) -> ApiResult<Json<PqlBuildResponse>> {
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     let query = decode_pql_payload(&payload)?;
-    let mut builder = compile_pql(&state, query).await?;
+    let mut builder = compile_pql(&state, query, &db.index_db).await?;
     // The builder keeps pagination out of the compiled SQL (cache keying);
     // this endpoint contracts to return the executable query, so re-apply it.
     if let (Some(compiled), Some(pagination)) =
@@ -770,7 +771,11 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
     }
 }
 
-async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBuildResponse> {
+async fn compile_pql(
+    state: &ProxyState,
+    mut query: PqlQuery,
+    index_db: &str,
+) -> ApiResult<PqlBuildResponse> {
     let mut count_metrics = SearchMetrics::default();
     let mut result_metrics = SearchMetrics::default();
     let check_path = query.check_path;
@@ -784,6 +789,7 @@ async fn compile_pql(state: &ProxyState, mut query: PqlQuery) -> ApiResult<PqlBu
             root,
             &state.inference_client,
             state.search_embedding_cache_size,
+            Some(index_db),
         )
         .await
         .map_err(map_pql_error)?;

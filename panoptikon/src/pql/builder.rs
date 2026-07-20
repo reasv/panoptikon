@@ -1584,6 +1584,14 @@ enum Embeddings {
 }
 
 #[derive(sea_query::Iden)]
+enum EmbeddingQuants {
+    Table,
+    Id,
+    ProfileId,
+    Quant,
+}
+
+#[derive(sea_query::Iden)]
 enum FilesPathFts {
     Table,
     Path,

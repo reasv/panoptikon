@@ -1,9 +1,9 @@
 use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
-    DistanceFunction, EmbedArgs, HasUnprocessedData, InBookmarks, Match, MatchAnd, MatchOps,
-    MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches, ProcessedBy,
-    QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
+    DistanceFunction, EmbedArgs, HasUnprocessedData, InBookmarks, IndexMode, Match, MatchAnd,
+    MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches,
+    ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
 };
 use crate::pql::utils::parse_and_escape_query;
 use base64::{Engine as _, engine::general_purpose};
@@ -251,11 +251,14 @@ pub(crate) async fn preprocess_query_async(
     el: QueryElement,
     inference: &InferenceApiClient,
     embedding_cache_size: usize,
+    index_db: Option<&str>,
 ) -> Result<Option<QueryElement>, PqlError> {
     let mut state = AsyncPreprocessState {
         inference,
         metadata: None,
         embedding_cache_size,
+        index_db: index_db.map(str::to_string),
+        quant_conn: None,
     };
     preprocess_query_async_inner(el, &mut state).await
 }
@@ -264,6 +267,10 @@ struct AsyncPreprocessState<'a> {
     inference: &'a InferenceApiClient,
     metadata: Option<Value>,
     embedding_cache_size: usize,
+    /// The index DB vector filters resolve quant profiles against; None
+    /// (no DB context) makes `auto` resolve to exact.
+    index_db: Option<String>,
+    quant_conn: Option<sqlx::SqliteConnection>,
 }
 
 impl<'a> AsyncPreprocessState<'a> {
@@ -278,6 +285,123 @@ impl<'a> AsyncPreprocessState<'a> {
         }
         Ok(self.metadata.as_ref().expect("metadata cached"))
     }
+
+    /// Lazily opened read connection for quant-profile resolution.
+    async fn quant_conn(&mut self) -> Result<Option<&mut sqlx::SqliteConnection>, PqlError> {
+        if self.quant_conn.is_none() {
+            let Some(index_db) = self.index_db.clone() else {
+                return Ok(None);
+            };
+            let conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .map_err(|err| {
+                    tracing::error!(index_db, error = ?err, "failed to open index db for quant resolution");
+                    PqlError::invalid("Failed to resolve vector quant profiles")
+                })?;
+            self.quant_conn = Some(conn);
+        }
+        Ok(self.quant_conn.as_mut())
+    }
+}
+
+/// Resolves the quant profile for a vector filter (docs:
+/// "Filter arguments"). `auto` falls back to exact (None) when anything
+/// isn't ready; `quant` (or an explicit `variant`) turns the same
+/// conditions into validation errors instead of silent fallbacks.
+async fn resolve_vector_quant(
+    state: &mut AsyncPreprocessState<'_>,
+    index: IndexMode,
+    variant: &Option<String>,
+    k: i64,
+    model: &str,
+    clip_xmodal: bool,
+    embedding: Option<&[u8]>,
+) -> Result<Option<QuantResolved>, PqlError> {
+    validate_quant_args(index, k)?;
+    match index {
+        IndexMode::Exact => return Ok(None),
+        IndexMode::Ann => unreachable!("rejected by validate_quant_args"),
+        IndexMode::Auto | IndexMode::Quant => {}
+    }
+    let strict = index == IndexMode::Quant || variant.is_some();
+    let Some(conn) = state.quant_conn().await? else {
+        if strict {
+            return Err(PqlError::invalid(
+                "vector quant profiles are unavailable in this context",
+            ));
+        }
+        return Ok(None);
+    };
+    let profile_name = match variant {
+        Some(name) => Some(name.clone()),
+        None => crate::db::vector_quants::default_profile_name(conn)
+            .await
+            .map_err(|err| PqlError::invalid(format!("{err:?}")))?,
+    };
+    let Some(profile_name) = profile_name else {
+        if strict {
+            return Err(PqlError::invalid(
+                "no default vector quant profile is configured",
+            ));
+        }
+        return Ok(None);
+    };
+    let mut setters = vec![model.to_string()];
+    if clip_xmodal {
+        setters.push(crate::db::vector_quants::xmodal_text_sibling_name(model));
+    }
+    let pair = crate::db::vector_quants::resolve_ready_pair(conn, &profile_name, &setters)
+        .await
+        .map_err(|err| PqlError::invalid(format!("{err:?}")))?;
+    let Some(pair) = pair else {
+        if strict {
+            return Err(PqlError::invalid(format!(
+                "vector quant profile '{profile_name}' does not exist or is not ready for model '{model}'"
+            )));
+        }
+        return Ok(None);
+    };
+    let query_quant = match embedding {
+        Some(embedding) => {
+            if embedding.len() as i64 != pair.dim * 4 {
+                if strict {
+                    return Err(PqlError::invalid(format!(
+                        "query embedding dimension mismatch for model '{model}' \
+                         (expected {}, got {})",
+                        pair.dim,
+                        embedding.len() / 4
+                    )));
+                }
+                return Ok(None);
+            }
+            let quant = crate::db::vector_quants::compute_query_quant(
+                conn,
+                embedding,
+                pair.artifact.as_deref(),
+            )
+            .await
+            .map_err(|err| PqlError::invalid(format!("{err:?}")))?;
+            Some(quant)
+        }
+        None => None,
+    };
+    Ok(Some(QuantResolved {
+        profile_id: pair.profile_id,
+        query_quant,
+    }))
+}
+
+/// Argument checks shared by sync and async validation.
+fn validate_quant_args(index: IndexMode, k: i64) -> Result<(), PqlError> {
+    if matches!(index, IndexMode::Ann) {
+        return Err(PqlError::invalid(
+            "index \"ann\" is reserved and not yet available",
+        ));
+    }
+    if k < 1 {
+        return Err(PqlError::invalid("k must be a positive integer"));
+    }
+    Ok(())
 }
 
 fn preprocess_query_async_inner<'a, 'b>(
@@ -447,6 +571,14 @@ impl SemanticTextSearch {
         if self.text_embeddings.query.trim().is_empty() {
             return Ok(None);
         }
+        validate_quant_args(self.text_embeddings.index, self.text_embeddings.k)?;
+        if self.text_embeddings._quant.is_none()
+            && matches!(self.text_embeddings.index, IndexMode::Quant)
+        {
+            return Err(PqlError::invalid(
+                "index \"quant\" requires async preprocessing to resolve the profile",
+            ));
+        }
         if self.text_embeddings._embedding.is_some() {
             return Ok(Some(self));
         }
@@ -484,6 +616,16 @@ impl SemanticTextSearch {
                 self.text_embeddings._embedding = Some(embedding);
             }
         }
+        self.text_embeddings._quant = resolve_vector_quant(
+            state,
+            self.text_embeddings.index,
+            &self.text_embeddings.variant,
+            self.text_embeddings.k,
+            &self.text_embeddings.model,
+            false,
+            self.text_embeddings._embedding.as_deref(),
+        )
+        .await?;
         Ok(Some(self))
     }
 }
@@ -492,6 +634,14 @@ impl SemanticImageSearch {
     fn validate_sync(mut self) -> Result<Option<Self>, PqlError> {
         if self.image_embeddings.query.trim().is_empty() {
             return Ok(None);
+        }
+        validate_quant_args(self.image_embeddings.index, self.image_embeddings.k)?;
+        if self.image_embeddings._quant.is_none()
+            && matches!(self.image_embeddings.index, IndexMode::Quant)
+        {
+            return Err(PqlError::invalid(
+                "index \"quant\" requires async preprocessing to resolve the profile",
+            ));
         }
         if self.image_embeddings._embedding.is_none() {
             if self.image_embeddings.embed.is_none() {
@@ -548,6 +698,16 @@ impl SemanticImageSearch {
         if !self.image_embeddings.clip_xmodal && self.image_embeddings.src_text.is_some() {
             self.image_embeddings.src_text = None;
         }
+        self.image_embeddings._quant = resolve_vector_quant(
+            state,
+            self.image_embeddings.index,
+            &self.image_embeddings.variant,
+            self.image_embeddings.k,
+            &self.image_embeddings.model,
+            self.image_embeddings.clip_xmodal,
+            self.image_embeddings._embedding.as_deref(),
+        )
+        .await?;
         Ok(Some(self))
     }
 }
@@ -559,6 +719,12 @@ impl SimilarTo {
         }
         if self.similar_to.model.trim().is_empty() {
             return Ok(None);
+        }
+        validate_quant_args(self.similar_to.index, self.similar_to.k)?;
+        if self.similar_to._quant.is_none() && matches!(self.similar_to.index, IndexMode::Quant) {
+            return Err(PqlError::invalid(
+                "index \"quant\" requires async preprocessing to resolve the profile",
+            ));
         }
         if self.similar_to.force_distance_function.unwrap_or(false) {
             return Ok(Some(self));
@@ -585,6 +751,16 @@ impl SimilarTo {
                 self.similar_to.distance_function = override_fn;
             }
         }
+        self.similar_to._quant = resolve_vector_quant(
+            state,
+            self.similar_to.index,
+            &self.similar_to.variant,
+            self.similar_to.k,
+            &self.similar_to.model,
+            self.similar_to.clip_xmodal,
+            None,
+        )
+        .await?;
         Ok(Some(self))
     }
 }

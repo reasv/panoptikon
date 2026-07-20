@@ -8,12 +8,13 @@ mod match_path;
 mod match_tags;
 mod match_text;
 mod processed_by;
+mod quant;
 mod text_embeddings;
 
 use super::{CteRef, QueryState};
 use crate::pql::preprocess::PqlError;
 
-pub(crate) use embedding_types::{DistanceAggregation, DistanceFunction};
+pub(crate) use embedding_types::{DistanceAggregation, DistanceFunction, IndexMode, QuantResolved};
 pub(crate) use has_unprocessed::{DerivedDataArgs, HasUnprocessedData};
 pub(crate) use image_embeddings::{SemanticImageArgs, SemanticImageSearch};
 pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};

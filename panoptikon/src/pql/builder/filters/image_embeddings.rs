@@ -6,13 +6,16 @@ use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions}
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
-    BaseTable, CteRef, Embeddings, ExtraColumn, ExtractedText, ItemData, Items, JoinedTables,
-    OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
-    get_std_group_by, wrap_query,
+    BaseTable, CteRef, EmbeddingQuants, Embeddings, ExtraColumn, ExtractedText, ItemData, Items,
+    JoinedTables, OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by,
+    apply_sort_bounds, get_std_group_by, wrap_query,
 };
 use super::FilterCompiler;
-use super::embedding_types::{DistanceAggregation, DistanceFunction};
+use super::embedding_types::{
+    DistanceAggregation, DistanceFunction, IndexMode, QuantResolved, default_k,
+};
 use super::item_similarity::SourceArgs;
+use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
 use super::text_embeddings::EmbedArgs;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -57,6 +60,28 @@ pub(crate) struct SemanticImageArgs {
     /// Otherwise, it will be ignored, as it only applies to text embeddings.
     #[serde(default)]
     pub src_text: Option<SourceArgs>,
+    /// Index mode: `auto` (default) uses the default quant profile where its
+    /// coverage is ready for this model, else exact; `exact` always
+    /// brute-forces full-precision vectors; `quant` demands a quant profile
+    /// and errors when it isn't ready. `ann` is reserved.
+    ///
+    /// Under a quant profile the displayed head order is always re-scored
+    /// against full-precision vectors (see `k`), and `order_rank` is a rank,
+    /// not a raw distance.
+    #[serde(default)]
+    pub index: IndexMode,
+    /// Selects a specific quant profile by name (requires quant/auto index
+    /// semantics). Naming a profile that doesn't exist or isn't ready for
+    /// this model is a validation error, not a silent fallback.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The exactness horizon: the coarse-top-k candidates re-scored with
+    /// full-precision distances. Ignored by `exact`. Keep it fixed across a
+    /// pagination session.
+    #[serde(default = "default_k")]
+    pub k: i64,
+    #[serde(skip)]
+    pub _quant: Option<QuantResolved>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -103,15 +128,24 @@ fn default_sort_asc() -> SortableOptions {
     options
 }
 
-impl FilterCompiler for SemanticImageSearch {
-    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
-        let args = &self.image_embeddings;
-        let embedding = args
-            ._embedding
-            .as_ref()
-            .ok_or_else(|| PqlError::invalid("image_embeddings missing embedding bytes"))?;
-        let cte_name = format!("n{}_SemanticImageSearch", state.cte_counter);
+/// Which vector payload the candidate skeleton joins.
+enum ImageVectorJoin {
+    Embeddings,
+    Quants { profile_id: i64 },
+}
 
+impl SemanticImageSearch {
+    /// The shared candidate skeleton: model/setter joins, src_text filters,
+    /// context join and standard columns. The count path and both scoring
+    /// passes build on this; only the vector payload join differs, so
+    /// membership is identical in every mode.
+    fn candidate_skeleton(
+        &self,
+        context: &CteRef,
+        state: &QueryState,
+        join: &ImageVectorJoin,
+    ) -> (sea_query::SelectStatement, bool) {
+        let args = &self.image_embeddings;
         let mut model_cond = Expr::col((Setters::Table, Setters::Name)).eq(args.model.clone());
         if args.clip_xmodal {
             model_cond = model_cond
@@ -132,11 +166,28 @@ impl FilterCompiler for SemanticImageSearch {
             )
             .add(model_cond);
         query.join(JoinType::InnerJoin, Setters::Table, setter_cond);
-        query.join(
-            JoinType::InnerJoin,
-            Embeddings::Table,
-            Expr::col((Embeddings::Table, Embeddings::Id)).equals((ItemData::Table, ItemData::Id)),
-        );
+        match join {
+            ImageVectorJoin::Embeddings => {
+                query.join(
+                    JoinType::InnerJoin,
+                    Embeddings::Table,
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .equals((ItemData::Table, ItemData::Id)),
+                );
+            }
+            ImageVectorJoin::Quants { profile_id } => {
+                let quant_cond = Cond::all()
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Id))
+                            .equals((ItemData::Table, ItemData::Id)),
+                    )
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::ProfileId))
+                            .eq(*profile_id),
+                    );
+                query.join(JoinType::InnerJoin, EmbeddingQuants::Table, quant_cond);
+            }
+        }
 
         let src_setters = Alias::new("src_setters");
         let src_item_data = Alias::new("src_item_data");
@@ -249,22 +300,12 @@ impl FilterCompiler for SemanticImageSearch {
             query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
         }
 
-        if state.is_count_query {
-            apply_group_by(&mut query, get_std_group_by(context, state));
-            let mut joined_tables = JoinedTables::default();
-            joined_tables.mark(BaseTable::Items);
-            joined_tables.mark(BaseTable::ItemData);
-            joined_tables.mark(BaseTable::Setters);
-            // The unaliased extracted_text join only exists when a src_text
-            // criterion (or weight) required it.
-            if join_text {
-                joined_tables.mark(BaseTable::ExtractedText);
-            }
-            let cte = wrap_query(state, query, context, cte_name, &joined_tables);
-            state.cte_counter += 1;
-            return Ok(cte);
-        }
+        (query, join_text)
+    }
 
+    /// The full-precision rank aggregate, including confidence weighting.
+    fn exact_rank_column(&self, embedding: &[u8]) -> Expr {
+        let args = &self.image_embeddings;
         let distance_func = match args._distance_func_override {
             Some(DistanceFunction::L2) => "vec_distance_L2",
             _ => "vec_distance_cosine",
@@ -272,7 +313,7 @@ impl FilterCompiler for SemanticImageSearch {
         let vec_distance: Expr = Func::cust(distance_func)
             .args([
                 Expr::col((Embeddings::Table, Embeddings::Embedding)),
-                Expr::val(embedding.clone()),
+                Expr::val(embedding.to_vec()),
             ])
             .into();
         let mut rank_column = match args.distance_aggregation {
@@ -325,11 +366,127 @@ impl FilterCompiler for SemanticImageSearch {
                     .div(lang_conf_weight_clause.sum());
             }
         }
+        rank_column
+    }
 
-        apply_group_by(&mut query, get_std_group_by(context, state));
-        if !state.is_count_query {
-            add_rank_column_expr(&mut query, &self.sort, rank_column)?;
+    /// The weight-free coarse proxy: plain aggregated Hamming distance over
+    /// binary quants (part of the bounded approximation by design).
+    /// Stored quants and the bound parameter are plain BLOBs, which
+    /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
+    fn coarse_rank_column(&self, query_quant: &[u8]) -> Expr {
+        let hamming: Expr = Func::cust("vec_distance_hamming")
+            .args([
+                Func::cust("vec_bit")
+                    .arg(Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Quant)))
+                    .into(),
+                Func::cust("vec_bit")
+                    .arg(Expr::val(query_quant.to_vec()))
+                    .into(),
+            ])
+            .into();
+        match self.image_embeddings.distance_aggregation {
+            DistanceAggregation::Max => hamming.max(),
+            DistanceAggregation::Avg => hamming.avg(),
+            DistanceAggregation::Min => hamming.min(),
         }
+    }
+
+    fn register_outputs(&self, state: &mut QueryState, cte: &CteRef) {
+        if let Some(alias) = &self.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+        if self.sort.order_by {
+            state.order_list.push(OrderByFilter {
+                cte: cte.clone(),
+                direction: self.sort.direction,
+                priority: self.sort.priority,
+                rrf: self.sort.rrf.clone(),
+            });
+        }
+    }
+}
+
+impl FilterCompiler for SemanticImageSearch {
+    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
+        let args = &self.image_embeddings;
+        let embedding = args
+            ._embedding
+            .as_ref()
+            .ok_or_else(|| PqlError::invalid("image_embeddings missing embedding bytes"))?;
+        let cte_name = format!("n{}_SemanticImageSearch", state.cte_counter);
+
+        if state.is_count_query {
+            // Membership only — identical in every index mode, so counts
+            // never consult quants.
+            let (mut query, join_text) =
+                self.candidate_skeleton(context, state, &ImageVectorJoin::Embeddings);
+            apply_group_by(&mut query, get_std_group_by(context, state));
+            let mut joined_tables = JoinedTables::default();
+            joined_tables.mark(BaseTable::Items);
+            joined_tables.mark(BaseTable::ItemData);
+            joined_tables.mark(BaseTable::Setters);
+            // The unaliased extracted_text join only exists when a src_text
+            // criterion (or weight) required it.
+            if join_text {
+                joined_tables.mark(BaseTable::ExtractedText);
+            }
+            let cte = wrap_query(state, query, context, cte_name, &joined_tables);
+            state.cte_counter += 1;
+            return Ok(cte);
+        }
+
+        if let Some(quant) = &args._quant {
+            let query_quant = quant
+                .query_quant
+                .as_ref()
+                .ok_or_else(|| PqlError::invalid("image_embeddings missing query quant"))?;
+
+            let (mut coarse, _) = self.candidate_skeleton(
+                context,
+                state,
+                &ImageVectorJoin::Quants {
+                    profile_id: quant.profile_id,
+                },
+            );
+            apply_group_by(&mut coarse, get_std_group_by(context, state));
+            coarse.expr_as(self.coarse_rank_column(query_quant), Alias::new(COARSE_DIST));
+
+            let k = args.k;
+            let (merge, merge_context) =
+                assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
+                    let (mut head, _) =
+                        self.candidate_skeleton(ranked, state, &ImageVectorJoin::Embeddings);
+                    head.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
+                    apply_group_by(&mut head, get_std_group_by(ranked, state));
+                    head.expr_as(self.exact_rank_column(embedding), Alias::new(EXACT_DIST));
+                    head
+                });
+
+            // The merge selects only from CTEs, so no base tables are
+            // visible to the final query (same as the sort-bounds wrapper);
+            // its context is the ranked CTE in its FROM scope.
+            let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
+                state,
+                merge,
+                merge_context,
+                &cte_name,
+                &self.sort,
+                JoinedTables::default(),
+            );
+            let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
+            state.cte_counter += 1;
+            self.register_outputs(state, &cte);
+            return Ok(cte);
+        }
+
+        let (mut query, join_text) =
+            self.candidate_skeleton(context, state, &ImageVectorJoin::Embeddings);
+        apply_group_by(&mut query, get_std_group_by(context, state));
+        add_rank_column_expr(&mut query, &self.sort, self.exact_rank_column(embedding))?;
 
         let mut joined_tables = JoinedTables::default();
         joined_tables.mark(BaseTable::Items);
@@ -351,23 +508,7 @@ impl FilterCompiler for SemanticImageSearch {
 
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
-        if !state.is_count_query {
-            if let Some(alias) = &self.sort.select_as {
-                state.extra_columns.push(ExtraColumn {
-                    column: "order_rank".to_string(),
-                    cte: cte.clone(),
-                    alias: alias.clone(),
-                });
-            }
-            if self.sort.order_by {
-                state.order_list.push(OrderByFilter {
-                    cte: cte.clone(),
-                    direction: self.sort.direction,
-                    priority: self.sort.priority,
-                    rrf: self.sort.rrf.clone(),
-                });
-            }
-        }
+        self.register_outputs(state, &cte);
         Ok(cte)
     }
 }

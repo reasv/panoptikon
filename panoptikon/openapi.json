@@ -5749,6 +5749,16 @@
           }
         }
       },
+      "IndexMode": {
+        "type": "string",
+        "description": "Index mode for vector filters (docs/vector-index-design.md).\n\n`auto` resolves to the default quant profile where its coverage is ready\nfor the queried setter(s), else exact. `exact` always brute-forces\nfull-precision vectors. `quant` demands a quant profile (the `variant`\nor the default) and errors when it isn't ready. `ann` is reserved.",
+        "enum": [
+          "auto",
+          "exact",
+          "quant",
+          "ann"
+        ]
+      },
       "InferencePredictRequest": {
         "type": "object",
         "description": "Multipart form body of `POST /predict/{group}/{inference_id}`.",
@@ -8464,6 +8474,15 @@
               }
             ]
           },
+          "index": {
+            "$ref": "#/components/schemas/IndexMode",
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+          },
+          "k": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+          },
           "model": {
             "type": "string",
             "description": "The image embedding model to use\n\nThe image embedding model to use for the semantic search.\nWill search embeddings produced by this model."
@@ -8482,6 +8501,13 @@
                 "description": "Filters and options to apply on source text.\nCan exclusively be used with `clip_xmodal` set to True.\nOtherwise, it will be ignored, as it only applies to text embeddings."
               }
             ]
+          },
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Selects a specific quant profile by name (requires quant/auto index\nsemantics). Naming a profile that doesn't exist or isn't ready for\nthis model is a validation error, not a silent fallback."
           }
         }
       },
@@ -8526,6 +8552,15 @@
               }
             ]
           },
+          "index": {
+            "$ref": "#/components/schemas/IndexMode",
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+          },
+          "k": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+          },
           "model": {
             "type": "string",
             "description": "The text embedding model to use\n\nThe text embedding model to use for the semantic search.\nWill search embeddings produced by this model."
@@ -8544,6 +8579,13 @@
                 "description": "Filters and options to apply on source text that the embeddings are derived from."
               }
             ]
+          },
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Selects a specific quant profile by name (requires quant/auto index\nsemantics). Naming a profile that doesn't exist or isn't ready for\nthis model is a validation error, not a silent fallback."
           }
         }
       },
@@ -8635,6 +8677,15 @@
             ],
             "description": "Force the use of the distance function specified in the `distance_function` field.\nIf set to True, the distance function specified in the `distance_function` field will be used,\neven if the model used for similarity search has a different distance function override specified in its config."
           },
+          "index": {
+            "$ref": "#/components/schemas/IndexMode",
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile both sides of the similarity self-join use\nbinary quants for the coarse pass, and `order_rank` is a rank, not a\nraw distance."
+          },
+          "k": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+          },
           "model": {
             "type": "string",
             "description": "The name of the embedding model used for similarity search"
@@ -8653,6 +8704,13 @@
           "target": {
             "type": "string",
             "description": "Sha256 hash of the target item to find similar items for"
+          },
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Selects a specific quant profile by name (requires quant/auto index\nsemantics). Naming a profile that doesn't exist or isn't ready for\nthis model is a validation error, not a silent fallback."
           },
           "xmodal_i2i": {
             "type": "boolean",

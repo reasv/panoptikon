@@ -6,12 +6,15 @@ use crate::pql::model::{OrderDirection, PartialSortableOptions, SortableOptions}
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
-    BaseTable, CteRef, Embeddings, ExtraColumn, ExtractedText, ItemData, Items, JoinedTables,
-    OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
-    create_cte, get_std_group_by, wrap_query,
+    BaseTable, CteRef, EmbeddingQuants, Embeddings, ExtraColumn, ExtractedText, ItemData, Items,
+    JoinedTables, OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by,
+    apply_sort_bounds, create_cte, get_std_group_by, wrap_query,
 };
 use super::FilterCompiler;
-use super::embedding_types::{DistanceAggregation, DistanceFunction};
+use super::embedding_types::{
+    DistanceAggregation, DistanceFunction, IndexMode, QuantResolved, default_k,
+};
+use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SourceArgs {
@@ -116,6 +119,28 @@ pub(crate) struct SimilarityArgs {
     /// When using CLIP cross-modal similarity, whether to use image-to-image similarity as well or just image-to-text and text-to-text.
     #[serde(default = "default_true")]
     pub xmodal_i2i: bool,
+    /// Index mode: `auto` (default) uses the default quant profile where its
+    /// coverage is ready for this model, else exact; `exact` always
+    /// brute-forces full-precision vectors; `quant` demands a quant profile
+    /// and errors when it isn't ready. `ann` is reserved.
+    ///
+    /// Under a quant profile both sides of the similarity self-join use
+    /// binary quants for the coarse pass, and `order_rank` is a rank, not a
+    /// raw distance.
+    #[serde(default)]
+    pub index: IndexMode,
+    /// Selects a specific quant profile by name (requires quant/auto index
+    /// semantics). Naming a profile that doesn't exist or isn't ready for
+    /// this model is a validation error, not a silent fallback.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The exactness horizon: the coarse-top-k candidates re-scored with
+    /// full-precision distances. Ignored by `exact`. Keep it fixed across a
+    /// pagination session.
+    #[serde(default = "default_k")]
+    pub k: i64,
+    #[serde(skip)]
+    pub _quant: Option<QuantResolved>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -181,10 +206,18 @@ fn default_sort_asc() -> SortableOptions {
     options
 }
 
-impl FilterCompiler for SimilarTo {
-    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
+/// Which vector payload the unqualified-embeddings CTE carries.
+enum SimVectorJoin {
+    Embeddings,
+    Quants { profile_id: i64 },
+}
+
+impl SimilarTo {
+    /// The shared candidate skeleton: model/setter joins, src_text joins and
+    /// filters, context left-join. Both the exact and the coarse
+    /// vector-collection CTEs build on this, so membership is identical.
+    fn base_skeleton(&self, context: &CteRef) -> sea_query::SelectStatement {
         let args = &self.similar_to;
-        let cte_name = format!("n{}_SimilarTo", state.cte_counter);
         let mut model_cond = Expr::col((Setters::Table, Setters::Name)).eq(args.model.clone());
         if args.clip_xmodal {
             model_cond = model_cond
@@ -205,11 +238,6 @@ impl FilterCompiler for SimilarTo {
             )
             .add(model_cond);
         base_query.join(JoinType::InnerJoin, Setters::Table, model_join);
-        base_query.join(
-            JoinType::InnerJoin,
-            Embeddings::Table,
-            Expr::col((Embeddings::Table, Embeddings::Id)).equals((ItemData::Table, ItemData::Id)),
-        );
 
         let src_setters = Alias::new("src_setters");
         let src_item_data = Alias::new("src_item_data");
@@ -317,93 +345,162 @@ impl FilterCompiler for SimilarTo {
             Expr::col(context.column_ref("item_id")).equals((Items::Table, Items::Id)),
         );
 
-        if state.is_count_query {
-            let mut count_query = base_query.to_owned();
-            count_query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
-            count_query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
-            if state.item_data_query {
-                count_query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
-            }
-            count_query.and_where(Expr::col(context.column_ref("item_id")).is_not_null());
-            count_query.and_where(Expr::col((Items::Table, Items::Sha256)).ne(args.target.clone()));
-            apply_group_by(&mut count_query, get_std_group_by(context, state));
+        base_query
+    }
 
-            let mut joined_tables = JoinedTables::default();
-            joined_tables.mark(BaseTable::Items);
-            joined_tables.mark(BaseTable::ItemData);
-            joined_tables.mark(BaseTable::Setters);
-            if args.src_text.is_some() {
-                joined_tables.mark(BaseTable::ExtractedText);
+    /// The per-vector collection select (both the target's and the
+    /// candidates' vectors): standard columns, sha256, data_type and the
+    /// vector payload.
+    fn vector_collection(
+        &self,
+        context: &CteRef,
+        state: &QueryState,
+        join: &SimVectorJoin,
+    ) -> sea_query::SelectStatement {
+        let args = &self.similar_to;
+        let mut query = self.base_skeleton(context);
+        match join {
+            SimVectorJoin::Embeddings => {
+                query.join(
+                    JoinType::InnerJoin,
+                    Embeddings::Table,
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .equals((ItemData::Table, ItemData::Id)),
+                );
+                query.expr_as(
+                    Expr::col((Embeddings::Table, Embeddings::Embedding)),
+                    Alias::new("embedding"),
+                );
             }
-            let cte = wrap_query(state, count_query, context, cte_name, &joined_tables);
-            state.cte_counter += 1;
-            return Ok(cte);
+            SimVectorJoin::Quants { profile_id } => {
+                let quant_cond = Cond::all()
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Id))
+                            .equals((ItemData::Table, ItemData::Id)),
+                    )
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::ProfileId))
+                            .eq(*profile_id),
+                    );
+                query.join(JoinType::InnerJoin, EmbeddingQuants::Table, quant_cond);
+                query.expr_as(
+                    Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Quant)),
+                    Alias::new("embedding"),
+                );
+            }
         }
 
-        let mut embeddings_query = base_query.to_owned();
-        embeddings_query.expr_as(
-            Expr::col((Items::Table, Items::Id)),
-            Alias::new("item_id_all"),
-        );
-        embeddings_query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
-        embeddings_query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
+        query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
+        query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
         if state.item_data_query {
-            embeddings_query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
+            query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
         }
-        embeddings_query.expr_as(
+        query.expr_as(
             Expr::col((Items::Table, Items::Sha256)),
             Alias::new("sha256"),
         );
-        embeddings_query.expr_as(
-            Expr::col((Embeddings::Table, Embeddings::Id)),
-            Alias::new("emb_id"),
-        );
-        embeddings_query.expr_as(
-            Expr::col((Embeddings::Table, Embeddings::Embedding)),
-            Alias::new("embedding"),
-        );
-        embeddings_query.expr_as(
+        query.expr_as(
             Expr::col((ItemData::Table, ItemData::DataType)),
             Alias::new("data_type"),
         );
-        if let Some(src_text) = &args.src_text {
-            if src_text.confidence_weight != 0.0 {
-                embeddings_query.expr_as(
-                    Expr::col((ExtractedText::Table, ExtractedText::Confidence)),
-                    Alias::new("confidence"),
-                );
-            }
-            if src_text.language_confidence_weight != 0.0 {
-                embeddings_query.expr_as(
-                    Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence)),
-                    Alias::new("language_confidence"),
-                );
+        if matches!(join, SimVectorJoin::Embeddings) {
+            if let Some(src_text) = &args.src_text {
+                if src_text.confidence_weight != 0.0 {
+                    query.expr_as(
+                        Expr::col((ExtractedText::Table, ExtractedText::Confidence)),
+                        Alias::new("confidence"),
+                    );
+                }
+                if src_text.language_confidence_weight != 0.0 {
+                    query.expr_as(
+                        Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence)),
+                        Alias::new("language_confidence"),
+                    );
+                }
             }
         }
 
         let target_cond = Expr::col((Items::Table, Items::Sha256)).eq(args.target.clone());
         let context_cond = Expr::col(context.column_ref("item_id")).is_not_null();
-        embeddings_query.and_where(context_cond.or(target_cond));
+        query.and_where(context_cond.or(target_cond));
+        query
+    }
 
-        let unqemb_cte = create_cte(
-            state,
-            format!("unqemb_{cte_name}"),
-            embeddings_query.to_owned(),
-        );
+    /// The self-join distance select over a vector collection CTE. The rank
+    /// aggregate comes from the caller (exact weighted vs coarse Hamming);
+    /// `None` leaves the rank column to the caller (the exact path
+    /// materializes it through the row_n machinery).
+    fn distance_select(
+        &self,
+        state: &QueryState,
+        collection_cte: &CteRef,
+        rank: Option<(Expr, &str)>,
+    ) -> (sea_query::SelectStatement, CteRef) {
+        let args = &self.similar_to;
         let other_alias = Alias::new("other_embeddings");
         let main_alias = Alias::new("main_embeddings");
         let other_ctx = CteRef {
             name: "other_embeddings".to_string(),
         };
-        let mut distance_select = Query::select();
-        distance_select.from_as(Alias::new(unqemb_cte.name.as_str()), other_alias.clone());
-        distance_select.join_as(
+        let mut select = Query::select();
+        select.from_as(Alias::new(collection_cte.name.as_str()), other_alias.clone());
+        select.join_as(
             JoinType::InnerJoin,
-            Alias::new(unqemb_cte.name.as_str()),
+            Alias::new(collection_cte.name.as_str()),
             main_alias.clone(),
             Expr::col((main_alias.clone(), Alias::new("sha256"))).eq(args.target.clone()),
         );
 
+        select.expr_as(
+            Expr::col((other_alias.clone(), Alias::new("item_id"))),
+            Alias::new("item_id"),
+        );
+        select.expr_as(
+            Expr::col((other_alias.clone(), Alias::new("file_id"))),
+            Alias::new("file_id"),
+        );
+        if state.item_data_query {
+            select.expr_as(
+                Expr::col((other_alias.clone(), Alias::new("data_id"))),
+                Alias::new("data_id"),
+            );
+        }
+
+        select.and_where(
+            Expr::col((other_alias.clone(), Alias::new("sha256"))).ne(args.target.clone()),
+        );
+        apply_group_by(&mut select, get_std_group_by(&other_ctx, state));
+
+        if args.clip_xmodal {
+            if !args.xmodal_i2i {
+                select.and_where(
+                    Expr::col((main_alias.clone(), Alias::new("data_type")))
+                        .ne("clip")
+                        .or(Expr::col((other_alias.clone(), Alias::new("data_type"))).ne("clip")),
+                );
+            }
+            if !args.xmodal_t2t {
+                select.and_where(
+                    Expr::col((main_alias.clone(), Alias::new("data_type")))
+                        .ne("text-embedding")
+                        .or(Expr::col((other_alias.clone(), Alias::new("data_type")))
+                            .ne("text-embedding")),
+                );
+            }
+        }
+
+        if let Some((rank_column, rank_alias)) = rank {
+            select.expr_as(rank_column, Alias::new(rank_alias));
+        }
+        (select, other_ctx)
+    }
+
+    /// The full-precision self-join rank aggregate, including confidence
+    /// weighting.
+    fn exact_rank_column(&self) -> Expr {
+        let args = &self.similar_to;
+        let other_alias = Alias::new("other_embeddings");
+        let main_alias = Alias::new("main_embeddings");
         let distance_func = match args.distance_function {
             DistanceFunction::L2 => "vec_distance_L2",
             DistanceFunction::Cosine => "vec_distance_cosine",
@@ -472,48 +569,161 @@ impl FilterCompiler for SimilarTo {
                     .div(lang_conf_weight_clause.sum());
             }
         }
+        rank_column
+    }
 
-        distance_select.expr_as(
-            Expr::col((other_alias.clone(), Alias::new("item_id"))),
-            Alias::new("item_id"),
-        );
-        distance_select.expr_as(
-            Expr::col((other_alias.clone(), Alias::new("file_id"))),
-            Alias::new("file_id"),
-        );
-        if state.item_data_query {
-            distance_select.expr_as(
-                Expr::col((other_alias.clone(), Alias::new("data_id"))),
-                Alias::new("data_id"),
+    /// The weight-free coarse proxy: aggregated Hamming distance between
+    /// both sides' binary quants. Stored quants are plain BLOBs, which
+    /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
+    fn coarse_rank_column(&self) -> Expr {
+        let other_alias = Alias::new("other_embeddings");
+        let main_alias = Alias::new("main_embeddings");
+        let hamming: Expr = Func::cust("vec_distance_hamming")
+            .args([
+                Func::cust("vec_bit")
+                    .arg(Expr::col((main_alias.clone(), Alias::new("embedding"))))
+                    .into(),
+                Func::cust("vec_bit")
+                    .arg(Expr::col((other_alias.clone(), Alias::new("embedding"))))
+                    .into(),
+            ])
+            .into();
+        match self.similar_to.distance_aggregation {
+            DistanceAggregation::Max => hamming.max(),
+            DistanceAggregation::Avg => hamming.avg(),
+            DistanceAggregation::Min => hamming.min(),
+        }
+    }
+
+    fn register_outputs(&self, state: &mut QueryState, cte: &CteRef) {
+        if let Some(alias) = &self.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+        if self.sort.order_by {
+            state.order_list.push(OrderByFilter {
+                cte: cte.clone(),
+                direction: self.sort.direction,
+                priority: self.sort.priority,
+                rrf: self.sort.rrf.clone(),
+            });
+        }
+    }
+}
+
+impl FilterCompiler for SimilarTo {
+    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
+        let args = &self.similar_to;
+        let cte_name = format!("n{}_SimilarTo", state.cte_counter);
+
+        if state.is_count_query {
+            // Membership only — identical in every index mode, so counts
+            // never consult quants.
+            let mut count_query = self.base_skeleton(context);
+            count_query.join(
+                JoinType::InnerJoin,
+                Embeddings::Table,
+                Expr::col((Embeddings::Table, Embeddings::Id))
+                    .equals((ItemData::Table, ItemData::Id)),
             );
+            count_query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
+            count_query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
+            if state.item_data_query {
+                count_query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
+            }
+            count_query.and_where(Expr::col(context.column_ref("item_id")).is_not_null());
+            count_query.and_where(Expr::col((Items::Table, Items::Sha256)).ne(args.target.clone()));
+            apply_group_by(&mut count_query, get_std_group_by(context, state));
+
+            let mut joined_tables = JoinedTables::default();
+            joined_tables.mark(BaseTable::Items);
+            joined_tables.mark(BaseTable::ItemData);
+            joined_tables.mark(BaseTable::Setters);
+            if args.src_text.is_some() {
+                joined_tables.mark(BaseTable::ExtractedText);
+            }
+            let cte = wrap_query(state, count_query, context, cte_name, &joined_tables);
+            state.cte_counter += 1;
+            return Ok(cte);
         }
 
-        distance_select.and_where(
-            Expr::col((other_alias.clone(), Alias::new("sha256"))).ne(args.target.clone()),
+        if let Some(quant) = &args._quant {
+            let coarse_collection = self.vector_collection(
+                context,
+                state,
+                &SimVectorJoin::Quants {
+                    profile_id: quant.profile_id,
+                },
+            );
+            let unqquant_cte = create_cte(
+                state,
+                format!("unqquant_{cte_name}"),
+                coarse_collection,
+            );
+            let (coarse, _) = self.distance_select(
+                state,
+                &unqquant_cte,
+                Some((self.coarse_rank_column(), COARSE_DIST)),
+            );
+
+            let k = args.k;
+            let (merge, merge_context) =
+                assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
+                let exact_collection =
+                    self.vector_collection(context, state, &SimVectorJoin::Embeddings);
+                let unqemb_cte = create_cte(
+                    state,
+                    format!("unqemb_{cte_name}"),
+                    exact_collection,
+                );
+                let (mut head, _) = self.distance_select(
+                    state,
+                    &unqemb_cte,
+                    Some((self.exact_rank_column(), EXACT_DIST)),
+                );
+                let other_alias = Alias::new("other_embeddings");
+                let ranked_alias = Alias::new(ranked.name.as_str());
+                let mut join_cond = Expr::col((ranked_alias.clone(), Alias::new("file_id")))
+                    .equals((other_alias.clone(), Alias::new("file_id")));
+                if state.item_data_query {
+                    join_cond = join_cond.and(
+                        Expr::col((ranked_alias.clone(), Alias::new("data_id")))
+                            .equals((other_alias.clone(), Alias::new("data_id"))),
+                    );
+                }
+                head.join(JoinType::InnerJoin, ranked_alias.clone(), join_cond);
+                head.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
+                head
+            });
+
+            // The merge selects only from CTEs, so no base tables are
+            // visible to the final query; its context is the ranked CTE in
+            // its FROM scope.
+            let (merge, context_for_wrap, joined_tables) = apply_sort_bounds(
+                state,
+                merge,
+                merge_context,
+                &cte_name,
+                &self.sort,
+                JoinedTables::default(),
+            );
+            let cte = wrap_query(state, merge, &context_for_wrap, cte_name, &joined_tables);
+            state.cte_counter += 1;
+            self.register_outputs(state, &cte);
+            return Ok(cte);
+        }
+
+        let exact_collection = self.vector_collection(context, state, &SimVectorJoin::Embeddings);
+        let unqemb_cte = create_cte(
+            state,
+            format!("unqemb_{cte_name}"),
+            exact_collection,
         );
-        apply_group_by(&mut distance_select, get_std_group_by(&other_ctx, state));
-
-        if args.clip_xmodal {
-            if !args.xmodal_i2i {
-                distance_select.and_where(
-                    Expr::col((main_alias.clone(), Alias::new("data_type")))
-                        .ne("clip")
-                        .or(Expr::col((other_alias.clone(), Alias::new("data_type"))).ne("clip")),
-                );
-            }
-            if !args.xmodal_t2t {
-                distance_select.and_where(
-                    Expr::col((main_alias.clone(), Alias::new("data_type")))
-                        .ne("text-embedding")
-                        .or(Expr::col((other_alias.clone(), Alias::new("data_type")))
-                            .ne("text-embedding")),
-                );
-            }
-        }
-
-        if !state.is_count_query {
-            add_rank_column_expr(&mut distance_select, &self.sort, rank_column)?;
-        }
+        let (mut distance_select, other_ctx) = self.distance_select(state, &unqemb_cte, None);
+        add_rank_column_expr(&mut distance_select, &self.sort, self.exact_rank_column())?;
 
         let (distance_select, context_for_wrap, joined_tables) = apply_sort_bounds(
             state,
@@ -532,23 +742,7 @@ impl FilterCompiler for SimilarTo {
             &joined_tables,
         );
         state.cte_counter += 1;
-        if !state.is_count_query {
-            if let Some(alias) = &self.sort.select_as {
-                state.extra_columns.push(ExtraColumn {
-                    column: "order_rank".to_string(),
-                    cte: cte.clone(),
-                    alias: alias.clone(),
-                });
-            }
-            if self.sort.order_by {
-                state.order_list.push(OrderByFilter {
-                    cte: cte.clone(),
-                    direction: self.sort.direction,
-                    priority: self.sort.priority,
-                    rrf: self.sort.rrf.clone(),
-                });
-            }
-        }
+        self.register_outputs(state, &cte);
         Ok(cte)
     }
 }

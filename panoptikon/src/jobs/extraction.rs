@@ -207,10 +207,14 @@ async fn run_extraction_job_inner(
 
     let mut query = build_job_pql(&config, &model)?;
     if let Some(root) = query.query.take() {
-        let preprocessed =
-            preprocess_query_async(root, &context.primary, context.embedding_cache_size)
-                .await
-                .map_err(|err| ApiError::bad_request(err.message))?;
+        let preprocessed = preprocess_query_async(
+            root,
+            &context.primary,
+            context.embedding_cache_size,
+            Some(&job.index_db),
+        )
+        .await
+        .map_err(|err| ApiError::bad_request(err.message))?;
         query.query = preprocessed;
     }
 

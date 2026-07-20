@@ -6,13 +6,14 @@ use crate::pql::model::{EntityType, OrderDirection, PartialSortableOptions, Sort
 use crate::pql::preprocess::PqlError;
 
 use super::super::{
-    BaseTable, CteRef, Embeddings, ExtraColumn, ExtractedText, ItemData, JoinedTables,
-    OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by, apply_sort_bounds,
-    get_std_group_by, select_std_from_cte, wrap_query,
+    BaseTable, CteRef, EmbeddingQuants, Embeddings, ExtraColumn, ExtractedText, ItemData,
+    JoinedTables, OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by,
+    apply_sort_bounds, get_std_group_by, select_std_from_cte, wrap_query,
 };
 use super::FilterCompiler;
-use super::embedding_types::DistanceAggregation;
+use super::embedding_types::{DistanceAggregation, IndexMode, QuantResolved, default_k};
 use super::item_similarity::SourceArgs;
+use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct EmbedArgs {
@@ -71,6 +72,28 @@ pub(crate) struct SemanticTextArgs {
     /// Filters and options to apply on source text that the embeddings are derived from.
     #[serde(default)]
     pub src_text: Option<SourceArgs>,
+    /// Index mode: `auto` (default) uses the default quant profile where its
+    /// coverage is ready for this model, else exact; `exact` always
+    /// brute-forces full-precision vectors; `quant` demands a quant profile
+    /// and errors when it isn't ready. `ann` is reserved.
+    ///
+    /// Under a quant profile the displayed head order is always re-scored
+    /// against full-precision vectors (see `k`), and `order_rank` is a rank,
+    /// not a raw distance.
+    #[serde(default)]
+    pub index: IndexMode,
+    /// Selects a specific quant profile by name (requires quant/auto index
+    /// semantics). Naming a profile that doesn't exist or isn't ready for
+    /// this model is a validation error, not a silent fallback.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The exactness horizon: the coarse-top-k candidates re-scored with
+    /// full-precision distances. Ignored by `exact`. Keep it fixed across a
+    /// pagination session.
+    #[serde(default = "default_k")]
+    pub k: i64,
+    #[serde(skip)]
+    pub _quant: Option<QuantResolved>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -129,20 +152,21 @@ fn default_sort_asc() -> SortableOptions {
     options
 }
 
-impl FilterCompiler for SemanticTextSearch {
-    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
+/// Which vector payload the candidate skeletons join.
+enum TextVectorJoin {
+    Embeddings,
+    Quants { profile_id: i64 },
+}
+
+struct TextCriteria {
+    conditions: Vec<Expr>,
+    weights_used: bool,
+}
+
+impl SemanticTextSearch {
+    fn criteria(&self) -> TextCriteria {
         let args = &self.text_embeddings;
-        let embedding = args
-            ._embedding
-            .as_ref()
-            .ok_or_else(|| PqlError::invalid("text_embeddings missing embedding bytes"))?;
-        let cte_name = format!("n{}_SemanticTextSearch", state.cte_counter);
-
-        let text_data = Alias::new("text_data");
         let text_setters = Alias::new("text_setters");
-        let vec_data = Alias::new("vec_data");
-        let vec_setters = Alias::new("vec_setters");
-
         let mut criteria = Vec::new();
         let mut weights_used = false;
         if let Some(src_text) = &args.src_text {
@@ -195,11 +219,176 @@ impl FilterCompiler for SemanticTextSearch {
                 weights_used = true;
             }
         }
+        TextCriteria {
+            conditions: criteria,
+            weights_used,
+        }
+    }
 
+    /// Adds the vector payload join keyed on the embedding's item_data row.
+    fn join_vector_table(
+        query: &mut sea_query::SelectStatement,
+        vec_data: &Alias,
+        join: &TextVectorJoin,
+    ) {
+        match join {
+            TextVectorJoin::Embeddings => {
+                query.join(
+                    JoinType::InnerJoin,
+                    Embeddings::Table,
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .equals((vec_data.clone(), ItemData::Id)),
+                );
+            }
+            TextVectorJoin::Quants { profile_id } => {
+                let quant_cond = Cond::all()
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Id))
+                            .equals((vec_data.clone(), ItemData::Id)),
+                    )
+                    .add(
+                        Expr::col((EmbeddingQuants::Table, EmbeddingQuants::ProfileId))
+                            .eq(*profile_id),
+                    );
+                query.join(JoinType::InnerJoin, EmbeddingQuants::Table, quant_cond);
+            }
+        }
+    }
+
+    /// Candidate skeleton for text-entity queries: the context's own text
+    /// rows joined to the embeddings derived from them.
+    fn text_entity_skeleton(
+        &self,
+        context: &CteRef,
+        state: &QueryState,
+        join: &TextVectorJoin,
+        criteria: &TextCriteria,
+    ) -> sea_query::SelectStatement {
+        let args = &self.text_embeddings;
+        let text_data = Alias::new("text_data");
+        let text_setters = Alias::new("text_setters");
+        let vec_data = Alias::new("vec_data");
+        let vec_setters = Alias::new("vec_setters");
+
+        let mut query = select_std_from_cte(context, state);
+        query.join_as(
+            JoinType::InnerJoin,
+            ItemData::Table,
+            text_data.clone(),
+            Expr::col((text_data.clone(), ItemData::Id)).equals(context.column_ref("data_id")),
+        );
+        query.join_as(
+            JoinType::InnerJoin,
+            Setters::Table,
+            text_setters.clone(),
+            Expr::col((text_setters.clone(), Setters::Id))
+                .equals((text_data.clone(), ItemData::SetterId)),
+        );
+        query.join(
+            JoinType::InnerJoin,
+            ExtractedText::Table,
+            Expr::col((ExtractedText::Table, ExtractedText::Id))
+                .equals(context.column_ref("data_id")),
+        );
+        query.join_as(
+            JoinType::InnerJoin,
+            ItemData::Table,
+            vec_data.clone(),
+            Expr::col((vec_data.clone(), ItemData::SourceId))
+                .equals((ExtractedText::Table, ExtractedText::Id)),
+        );
+        let vec_join = Cond::all()
+            .add(
+                Expr::col((vec_setters.clone(), Setters::Id))
+                    .equals((vec_data.clone(), ItemData::SetterId)),
+            )
+            .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
+        query.join_as(
+            JoinType::InnerJoin,
+            Setters::Table,
+            vec_setters.clone(),
+            vec_join,
+        );
+        Self::join_vector_table(&mut query, &vec_data, join);
+
+        for condition in &criteria.conditions {
+            query.and_where(condition.clone());
+        }
+        query
+    }
+
+    /// Candidate skeleton for file/item queries: the context's items joined
+    /// to their text-embedding rows (and, when criteria or weights need it,
+    /// the source text).
+    fn file_skeleton(
+        &self,
+        context: &CteRef,
+        state: &QueryState,
+        join: &TextVectorJoin,
+        criteria: &TextCriteria,
+    ) -> sea_query::SelectStatement {
+        let args = &self.text_embeddings;
+        let text_data = Alias::new("text_data");
+        let text_setters = Alias::new("text_setters");
+        let vec_data = Alias::new("vec_data");
+        let vec_setters = Alias::new("vec_setters");
+
+        let mut query = select_std_from_cte(context, state);
+        query.join_as(
+            JoinType::InnerJoin,
+            ItemData::Table,
+            vec_data.clone(),
+            Expr::col((vec_data.clone(), ItemData::ItemId)).equals(context.column_ref("item_id")),
+        );
+        let vec_join = Cond::all()
+            .add(
+                Expr::col((vec_setters.clone(), Setters::Id))
+                    .equals((vec_data.clone(), ItemData::SetterId)),
+            )
+            .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
+        query.join_as(
+            JoinType::InnerJoin,
+            Setters::Table,
+            vec_setters.clone(),
+            vec_join,
+        );
+        Self::join_vector_table(&mut query, &vec_data, join);
+
+        if !criteria.conditions.is_empty() || criteria.weights_used {
+            query.join_as(
+                JoinType::InnerJoin,
+                ItemData::Table,
+                text_data.clone(),
+                Expr::col((text_data.clone(), ItemData::Id))
+                    .equals((vec_data.clone(), ItemData::SourceId)),
+            );
+            query.join_as(
+                JoinType::InnerJoin,
+                Setters::Table,
+                text_setters.clone(),
+                Expr::col((text_setters.clone(), Setters::Id))
+                    .equals((text_data.clone(), ItemData::SetterId)),
+            );
+            query.join(
+                JoinType::InnerJoin,
+                ExtractedText::Table,
+                Expr::col((ExtractedText::Table, ExtractedText::Id))
+                    .equals((text_data.clone(), ItemData::Id)),
+            );
+        }
+        for condition in &criteria.conditions {
+            query.and_where(condition.clone());
+        }
+        query
+    }
+
+    /// The full-precision rank aggregate, including confidence weighting.
+    fn exact_rank_column(&self, embedding: &[u8]) -> Expr {
+        let args = &self.text_embeddings;
         let vec_distance: Expr = Func::cust("vec_distance_L2")
             .args([
                 Expr::col((Embeddings::Table, Embeddings::Embedding)),
-                Expr::val(embedding.clone()),
+                Expr::val(embedding.to_vec()),
             ])
             .into();
         let mut rank_column = match args.distance_aggregation {
@@ -252,186 +441,144 @@ impl FilterCompiler for SemanticTextSearch {
                     .div(lang_conf_weight_clause.sum());
             }
         }
+        rank_column
+    }
 
-        if state.item_data_query && matches!(state.entity, EntityType::Text) {
-            let mut query = select_std_from_cte(context, state);
-            query.join_as(
-                JoinType::InnerJoin,
-                ItemData::Table,
-                text_data.clone(),
-                Expr::col((text_data.clone(), ItemData::Id)).equals(context.column_ref("data_id")),
-            );
-            query.join_as(
-                JoinType::InnerJoin,
-                Setters::Table,
-                text_setters.clone(),
-                Expr::col((text_setters.clone(), Setters::Id))
-                    .equals((text_data.clone(), ItemData::SetterId)),
-            );
-            query.join(
-                JoinType::InnerJoin,
-                ExtractedText::Table,
-                Expr::col((ExtractedText::Table, ExtractedText::Id))
-                    .equals(context.column_ref("data_id")),
-            );
-            query.join_as(
-                JoinType::InnerJoin,
-                ItemData::Table,
-                vec_data.clone(),
-                Expr::col((vec_data.clone(), ItemData::SourceId))
-                    .equals((ExtractedText::Table, ExtractedText::Id)),
-            );
-            let vec_join = Cond::all()
-                .add(
-                    Expr::col((vec_setters.clone(), Setters::Id))
-                        .equals((vec_data.clone(), ItemData::SetterId)),
-                )
-                .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
-            query.join_as(
-                JoinType::InnerJoin,
-                Setters::Table,
-                vec_setters.clone(),
-                vec_join,
-            );
-            query.join(
-                JoinType::InnerJoin,
-                Embeddings::Table,
-                Expr::col((Embeddings::Table, Embeddings::Id))
-                    .equals((vec_data.clone(), ItemData::Id)),
-            );
+    /// The weight-free coarse proxy: plain aggregated Hamming distance over
+    /// binary quants (part of the bounded approximation by design).
+    /// Stored quants and the bound parameter are plain BLOBs, which
+    /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
+    fn coarse_rank_column(&self, query_quant: &[u8]) -> Expr {
+        let hamming: Expr = Func::cust("vec_distance_hamming")
+            .args([
+                Func::cust("vec_bit")
+                    .arg(Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Quant)))
+                    .into(),
+                Func::cust("vec_bit")
+                    .arg(Expr::val(query_quant.to_vec()))
+                    .into(),
+            ])
+            .into();
+        match self.text_embeddings.distance_aggregation {
+            DistanceAggregation::Max => hamming.max(),
+            DistanceAggregation::Avg => hamming.avg(),
+            DistanceAggregation::Min => hamming.min(),
+        }
+    }
 
-            for condition in &criteria {
-                query.and_where(condition.clone());
-            }
+    fn register_outputs(&self, state: &mut QueryState, cte: &CteRef) {
+        if let Some(alias) = &self.sort.select_as {
+            state.extra_columns.push(ExtraColumn {
+                column: "order_rank".to_string(),
+                cte: cte.clone(),
+                alias: alias.clone(),
+            });
+        }
+        if self.sort.order_by {
+            state.order_list.push(OrderByFilter {
+                cte: cte.clone(),
+                direction: self.sort.direction,
+                priority: self.sort.priority,
+                rrf: self.sort.rrf.clone(),
+            });
+        }
+    }
+}
 
-            apply_group_by(&mut query, get_std_group_by(context, state));
-            if !state.is_count_query {
-                add_rank_column_expr(&mut query, &self.sort, rank_column)?;
-            }
+impl FilterCompiler for SemanticTextSearch {
+    fn build(&self, context: &CteRef, state: &mut QueryState) -> Result<CteRef, PqlError> {
+        let args = &self.text_embeddings;
+        let embedding = args
+            ._embedding
+            .as_ref()
+            .ok_or_else(|| PqlError::invalid("text_embeddings missing embedding bytes"))?;
+        let cte_name = format!("n{}_SemanticTextSearch", state.cte_counter);
+        let criteria = self.criteria();
+        let text_entity = state.item_data_query && matches!(state.entity, EntityType::Text);
 
-            // Only `extracted_text` is joined without an alias (and on the same
-            // condition add_inner_joins would use); `item_data`/`setters` exist
-            // only under the text_/vec_ aliases, so references to the unaliased
-            // tables in the final query would not resolve against this select.
+        // The text-entity shape only joins `extracted_text` without an alias
+        // (and on the same condition add_inner_joins would use); the file
+        // shape joins item_data/setters only under aliases (and its
+        // extracted_text join is bound to the embedding's source text), so
+        // no marks there.
+        let make_joined_tables = |for_bounds: bool| {
             let mut joined_tables = JoinedTables::default();
-            joined_tables.mark(BaseTable::ExtractedText);
+            if text_entity && !for_bounds {
+                joined_tables.mark(BaseTable::ExtractedText);
+            }
+            joined_tables
+        };
+
+        let skeleton = |state: &QueryState, ctx: &CteRef, join: &TextVectorJoin| {
+            if text_entity {
+                self.text_entity_skeleton(ctx, state, join, &criteria)
+            } else {
+                self.file_skeleton(ctx, state, join, &criteria)
+            }
+        };
+
+        if let Some(quant) = args._quant.as_ref().filter(|_| !state.is_count_query) {
+            let query_quant = quant
+                .query_quant
+                .as_ref()
+                .ok_or_else(|| PqlError::invalid("text_embeddings missing query quant"))?;
+
+            let mut coarse = skeleton(
+                state,
+                context,
+                &TextVectorJoin::Quants {
+                    profile_id: quant.profile_id,
+                },
+            );
+            apply_group_by(&mut coarse, get_std_group_by(context, state));
+            coarse.expr_as(self.coarse_rank_column(query_quant), Alias::new(COARSE_DIST));
+
+            let k = args.k;
+            let (merge, merge_context) =
+                assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
+                    let mut head = skeleton(state, ranked, &TextVectorJoin::Embeddings);
+                    head.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
+                    apply_group_by(&mut head, get_std_group_by(ranked, state));
+                    head.expr_as(self.exact_rank_column(embedding), Alias::new(EXACT_DIST));
+                    head
+                });
+
+            // The merge selects only from CTEs, so no base tables are
+            // visible to the final query; its context is the ranked CTE in
+            // its FROM scope.
             let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
                 state,
-                query,
-                context.clone(),
+                merge,
+                merge_context,
                 &cte_name,
                 &self.sort,
-                joined_tables,
+                JoinedTables::default(),
             );
-
             let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
             state.cte_counter += 1;
-            if !state.is_count_query {
-                if let Some(alias) = &self.sort.select_as {
-                    state.extra_columns.push(ExtraColumn {
-                        column: "order_rank".to_string(),
-                        cte: cte.clone(),
-                        alias: alias.clone(),
-                    });
-                }
-                if self.sort.order_by {
-                    state.order_list.push(OrderByFilter {
-                        cte: cte.clone(),
-                        direction: self.sort.direction,
-                        priority: self.sort.priority,
-                        rrf: self.sort.rrf.clone(),
-                    });
-                }
-            }
+            self.register_outputs(state, &cte);
             return Ok(cte);
         }
 
-        let mut query = select_std_from_cte(context, state);
-        query.join_as(
-            JoinType::InnerJoin,
-            ItemData::Table,
-            vec_data.clone(),
-            Expr::col((vec_data.clone(), ItemData::ItemId)).equals(context.column_ref("item_id")),
-        );
-        let vec_join = Cond::all()
-            .add(
-                Expr::col((vec_setters.clone(), Setters::Id))
-                    .equals((vec_data.clone(), ItemData::SetterId)),
-            )
-            .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
-        query.join_as(
-            JoinType::InnerJoin,
-            Setters::Table,
-            vec_setters.clone(),
-            vec_join,
-        );
-        query.join(
-            JoinType::InnerJoin,
-            Embeddings::Table,
-            Expr::col((Embeddings::Table, Embeddings::Id)).equals((vec_data.clone(), ItemData::Id)),
-        );
-
-        if !criteria.is_empty() || weights_used {
-            query.join_as(
-                JoinType::InnerJoin,
-                ItemData::Table,
-                text_data.clone(),
-                Expr::col((text_data.clone(), ItemData::Id))
-                    .equals((vec_data.clone(), ItemData::SourceId)),
-            );
-            query.join_as(
-                JoinType::InnerJoin,
-                Setters::Table,
-                text_setters.clone(),
-                Expr::col((text_setters.clone(), Setters::Id))
-                    .equals((text_data.clone(), ItemData::SetterId)),
-            );
-            query.join(
-                JoinType::InnerJoin,
-                ExtractedText::Table,
-                Expr::col((ExtractedText::Table, ExtractedText::Id))
-                    .equals((text_data.clone(), ItemData::Id)),
-            );
-        }
-        for condition in &criteria {
-            query.and_where(condition.clone());
-        }
-
+        let mut query = skeleton(state, context, &TextVectorJoin::Embeddings);
         apply_group_by(&mut query, get_std_group_by(context, state));
         if !state.is_count_query {
-            add_rank_column_expr(&mut query, &self.sort, rank_column)?;
+            add_rank_column_expr(&mut query, &self.sort, self.exact_rank_column(embedding))?;
         }
 
-        // No marks: `item_data`/`setters` are only joined under aliases here, and
-        // `extracted_text` (when joined) is bound to the embedding's source text,
-        // not to the standard data_id join that add_inner_joins provides.
         let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
             state,
             query,
             context.clone(),
             &cte_name,
             &self.sort,
-            JoinedTables::default(),
+            make_joined_tables(false),
         );
 
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
         state.cte_counter += 1;
         if !state.is_count_query {
-            if let Some(alias) = &self.sort.select_as {
-                state.extra_columns.push(ExtraColumn {
-                    column: "order_rank".to_string(),
-                    cte: cte.clone(),
-                    alias: alias.clone(),
-                });
-            }
-            if self.sort.order_by {
-                state.order_list.push(OrderByFilter {
-                    cte: cte.clone(),
-                    direction: self.sort.direction,
-                    priority: self.sort.priority,
-                    rrf: self.sort.rrf.clone(),
-                });
-            }
+            self.register_outputs(state, &cte);
         }
         Ok(cte)
     }
