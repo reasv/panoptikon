@@ -404,6 +404,25 @@ fn validate_quant_args(index: IndexMode, k: i64) -> Result<(), PqlError> {
     Ok(())
 }
 
+/// Sync-path guard: naming a profile is a strict selection, and only async
+/// preprocessing can resolve one — silently searching exact instead would
+/// be the fallback the design forbids.
+fn validate_quant_args_sync(
+    index: IndexMode,
+    variant: &Option<String>,
+    k: i64,
+    resolved: bool,
+) -> Result<(), PqlError> {
+    validate_quant_args(index, k)?;
+    if !resolved && (matches!(index, IndexMode::Quant) || variant.is_some()) {
+        return Err(PqlError::invalid(
+            "selecting a vector quant profile (index \"quant\" or `variant`) \
+             requires async preprocessing",
+        ));
+    }
+    Ok(())
+}
+
 fn preprocess_query_async_inner<'a, 'b>(
     el: QueryElement,
     state: &'b mut AsyncPreprocessState<'a>,
@@ -571,14 +590,12 @@ impl SemanticTextSearch {
         if self.text_embeddings.query.trim().is_empty() {
             return Ok(None);
         }
-        validate_quant_args(self.text_embeddings.index, self.text_embeddings.k)?;
-        if self.text_embeddings._quant.is_none()
-            && matches!(self.text_embeddings.index, IndexMode::Quant)
-        {
-            return Err(PqlError::invalid(
-                "index \"quant\" requires async preprocessing to resolve the profile",
-            ));
-        }
+        validate_quant_args_sync(
+            self.text_embeddings.index,
+            &self.text_embeddings.variant,
+            self.text_embeddings.k,
+            self.text_embeddings._quant.is_some(),
+        )?;
         if self.text_embeddings._embedding.is_some() {
             return Ok(Some(self));
         }
@@ -635,14 +652,12 @@ impl SemanticImageSearch {
         if self.image_embeddings.query.trim().is_empty() {
             return Ok(None);
         }
-        validate_quant_args(self.image_embeddings.index, self.image_embeddings.k)?;
-        if self.image_embeddings._quant.is_none()
-            && matches!(self.image_embeddings.index, IndexMode::Quant)
-        {
-            return Err(PqlError::invalid(
-                "index \"quant\" requires async preprocessing to resolve the profile",
-            ));
-        }
+        validate_quant_args_sync(
+            self.image_embeddings.index,
+            &self.image_embeddings.variant,
+            self.image_embeddings.k,
+            self.image_embeddings._quant.is_some(),
+        )?;
         if self.image_embeddings._embedding.is_none() {
             if self.image_embeddings.embed.is_none() {
                 let embedding =
@@ -720,12 +735,12 @@ impl SimilarTo {
         if self.similar_to.model.trim().is_empty() {
             return Ok(None);
         }
-        validate_quant_args(self.similar_to.index, self.similar_to.k)?;
-        if self.similar_to._quant.is_none() && matches!(self.similar_to.index, IndexMode::Quant) {
-            return Err(PqlError::invalid(
-                "index \"quant\" requires async preprocessing to resolve the profile",
-            ));
-        }
+        validate_quant_args_sync(
+            self.similar_to.index,
+            &self.similar_to.variant,
+            self.similar_to.k,
+            self.similar_to._quant.is_some(),
+        )?;
         if self.similar_to.force_distance_function.unwrap_or(false) {
             return Ok(Some(self));
         }

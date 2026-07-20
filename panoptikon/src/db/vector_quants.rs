@@ -128,30 +128,30 @@ pub(crate) fn resolve_desired(config: &VectorQuantsConfig) -> Result<DesiredStat
     })
 }
 
-/// Loads and validates the desired state from the DB's config.toml. Invalid
-/// config is logged and treated as "no desired profiles" so it can never
-/// break startup or a job's finishing phase.
-pub(crate) fn load_desired_state(index_db: &str) -> DesiredState {
+/// Loads and validates the desired state from the DB's config.toml.
+/// Returns None on unreadable or invalid config: "invalid" must be inert
+/// (no reconcile action at all), never an implicit opt-out — an empty
+/// desired state would mark every profile removing and delete the quants,
+/// turning a hand-edit typo into a multi-hour rebuild.
+pub(crate) fn load_desired_state(index_db: &str) -> Option<DesiredState> {
     let store = crate::db::system_config::SystemConfigStore::from_env();
     let config = match store.load(index_db) {
         Ok(config) => config,
         Err(err) => {
             tracing::error!(index_db, error = ?err, "failed to load system config for vector quants");
-            return DesiredState {
-                profiles: Vec::new(),
-                default_name: None,
-            };
+            return None;
         }
     };
     let quants = effective_vector_quants(&config);
     match resolve_desired(&quants) {
-        Ok(state) => state,
+        Ok(state) => Some(state),
         Err(message) => {
-            tracing::error!(index_db, message, "invalid [vector_quants] config; treating as empty");
-            DesiredState {
-                profiles: Vec::new(),
-                default_name: None,
-            }
+            tracing::error!(
+                index_db,
+                message,
+                "invalid [vector_quants] config; skipping reconcile until it is fixed"
+            );
+            None
         }
     }
 }
@@ -178,7 +178,6 @@ pub(crate) struct CoverageRow {
     #[allow(dead_code)]
     pub needs_artifact: bool,
     pub artifact: Option<Vec<u8>>,
-    #[allow(dead_code)]
     pub artifact_rev: i64,
     #[allow(dead_code)]
     pub n_at_artifact: Option<i64>,
@@ -624,6 +623,11 @@ pub(crate) struct SpaceBuild {
     pub needs_artifact: bool,
     pub setter_ids: Vec<i64>,
     pub dim: i64,
+    /// True when every pair of the space is already `building` at one
+    /// shared revision with a frozen (consistent) artifact: the committed
+    /// chunks are the checkpoint, so the build resumes at the stored rev —
+    /// no artifact recompute, no rev bump, no rewriting of finished chunks.
+    pub resume: bool,
 }
 
 #[derive(Debug, Default)]
@@ -734,11 +738,26 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
                 total >= 1
             };
             if gate {
+                // Resume detection: a cancelled backfill leaves the pairs
+                // 'building' with the artifact already frozen; the NOT
+                // EXISTS remainder is exactly the unfinished work.
+                let resume = pairs.iter().all(|pair| {
+                    matches!(pair, Some(row) if row.state == "building"
+                        && row.dim == Some(dim)
+                        && (row.artifact.is_some() || !desired.needs_artifact()))
+                }) && {
+                    let first = pairs[0].expect("all pairs present when resuming");
+                    pairs.iter().all(|pair| {
+                        let row = pair.expect("all pairs present when resuming");
+                        row.artifact == first.artifact && row.artifact_rev == first.artifact_rev
+                    })
+                };
                 plan.builds.push(SpaceBuild {
                     profile_name: desired.name.clone(),
                     needs_artifact: desired.needs_artifact(),
                     setter_ids: members.iter().map(|setter| setter.id).collect(),
                     dim,
+                    resume,
                 });
             }
         }
@@ -973,7 +992,10 @@ pub(crate) async fn start_space_build(
 }
 
 /// One chunked backfill transaction for a pair. Returns rows written; zero
-/// means the pair's quants are complete at its current revision.
+/// means the pair's quants are complete at its current revision — or that
+/// the pair is no longer `building` (e.g. an explicit rebuild was marked
+/// mid-build, which cleared the artifact; writing plain-binarized rows at
+/// the frozen rev then would corrupt the pair).
 pub(crate) async fn backfill_chunk(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
@@ -991,6 +1013,7 @@ pub(crate) async fn backfill_chunk(
          JOIN item_data d ON d.setter_id = c.setter_id \
          JOIN embeddings e ON e.id = d.id \
          WHERE c.profile_id = ? AND c.setter_id = ? \
+           AND c.state = 'building' \
            AND length(e.embedding) = c.dim * 4 \
            AND NOT EXISTS (SELECT 1 FROM embedding_quants q \
                            WHERE q.id = e.id AND q.profile_id = c.profile_id \
@@ -1017,7 +1040,7 @@ pub(crate) async fn finish_space_build(
 ) -> ApiResult<()> {
     for setter_id in setter_ids {
         let row = sqlx::query(
-            "SELECT \
+            "SELECT c.state AS state, \
                 (SELECT COUNT(*) FROM item_data d JOIN embeddings e ON e.id = d.id \
                  WHERE d.setter_id = c.setter_id) AS total, \
                 (SELECT COUNT(*) FROM item_data d JOIN embeddings e ON e.id = d.id \
@@ -1036,6 +1059,15 @@ pub(crate) async fn finish_space_build(
         .fetch_one(&mut *conn)
         .await
         .map_err(write_err)?;
+        // A pair that left 'building' mid-backfill (an explicit rebuild
+        // marked it pending, or a recipe change reset it) must never flip
+        // ready here — its quants may mix transforms.
+        let state: String = row.try_get("state").map_err(read_err)?;
+        if state != "building" {
+            return Err(ApiError::internal(
+                "Vector quant pair no longer building at finish",
+            ));
+        }
         let total: i64 = row.try_get("total").map_err(read_err)?;
         let dim_mismatched: i64 = row.try_get("dim_mismatched").map_err(read_err)?;
         let remaining: i64 = row.try_get("remaining").map_err(read_err)?;
@@ -1165,6 +1197,38 @@ pub(crate) async fn write_inline_quants(
         tracing::error!(error = %err, data_id, "failed to write inline embedding quants");
         ApiError::internal("Failed to write embedding quants")
     })?;
+
+    // A vector whose dimensionality doesn't match the pair's snapshot is
+    // skipped above — silently leaving it out of quant-mode membership
+    // forever, since the coarse pass inner-joins the quants. Downgrade any
+    // such pair instead: search falls back to exact for that setter and the
+    // next reconcile repairs it (the same policy finish_space_build
+    // enforces at build time).
+    let downgraded = sqlx::query(
+        "UPDATE vector_quant_coverage \
+         SET state = 'pending', artifact = NULL, n_at_artifact = NULL \
+         WHERE state IN ('building', 'ready') \
+           AND setter_id = (SELECT setter_id FROM item_data WHERE id = ?) \
+           AND dim IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM embeddings e \
+                       WHERE e.id = ? AND length(e.embedding) != dim * 4)",
+    )
+    .bind(data_id)
+    .bind(data_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, data_id, "failed to downgrade vector quant coverage");
+        ApiError::internal("Failed to write embedding quants")
+    })?;
+    if downgraded.rows_affected() > 0 {
+        tracing::error!(
+            data_id,
+            pairs = downgraded.rows_affected(),
+            "embedding dimensionality does not match the quant coverage snapshot; \
+             coverage downgraded to pending (setter searches exact until rebuilt)"
+        );
+    }
     Ok(())
 }
 
@@ -1172,31 +1236,31 @@ pub(crate) async fn write_inline_quants(
 // Artifact computation (read side)
 // ---------------------------------------------------------------------------
 
-/// Streams every vector of the given setters and returns the per-dimension
-/// mean as a little-endian f32 blob (the artifact payload — same layout as
-/// the embedding blobs). Errors on dimensionality mismatches.
+/// Streams every vector of the given setters (one row at a time — never the
+/// whole space in memory) and returns the per-dimension mean as a
+/// little-endian f32 blob (the artifact payload — same layout as the
+/// embedding blobs). Errors on dimensionality mismatches.
 pub(crate) async fn compute_mean_artifact(
     conn: &mut sqlx::SqliteConnection,
     setter_ids: &[i64],
     dim: i64,
 ) -> ApiResult<Option<Vec<u8>>> {
+    use futures_util::TryStreamExt;
     let dim = usize::try_from(dim).map_err(|_| ApiError::internal("Invalid dimension"))?;
     let mut sums = vec![0f64; dim];
     let mut count: u64 = 0;
     for setter_id in setter_ids {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT e.embedding AS embedding \
              FROM item_data d JOIN embeddings e ON e.id = d.id \
              WHERE d.setter_id = ?",
         )
         .bind(*setter_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|err| {
+        .fetch(&mut *conn);
+        while let Some(row) = rows.try_next().await.map_err(|err| {
             tracing::error!(error = %err, "failed to read embeddings for artifact");
             ApiError::internal("Failed to read embeddings for artifact computation")
-        })?;
-        for row in rows {
+        })? {
             let blob: Vec<u8> = row.try_get("embedding").map_err(read_err)?;
             if blob.len() != dim * 4 {
                 tracing::error!(
@@ -1862,16 +1926,103 @@ mod tests {
         assert_eq!(written, 4);
         assert_eq!(quant_rows(conn).await, 4);
 
-        // Restart: the pair is 'building', so the plan still lists it.
+        // Restart: the pair is 'building' with its artifact frozen, so the
+        // plan lists it as a RESUME — committed chunks are the checkpoint,
+        // so the revision must not bump and finished rows must not be
+        // rewritten (a rev bump would restart a 679k-vector build at zero
+        // on every interruption).
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.builds.len(), 1, "building pair must remain in the plan");
+        assert!(plan.builds[0].resume, "an in-flight build must resume, not restart");
         let work = analyze(conn, state.clone()).await.expect("analyze");
         assert_eq!(work, ReconcileWork::DataWork);
-        run_build(conn, &plan.builds[0], profile_id).await;
+
+        // Resume path: no new artifact, no rev bump — only the remainder.
+        let written = backfill_chunk(conn, profile_id, setter, 100)
+            .await
+            .expect("resume chunk");
+        assert_eq!(written, 6, "only the 6 uncommitted rows are written");
+        finish_space_build(conn, profile_id, &[setter])
+            .await
+            .expect("finish");
         assert_eq!(quant_rows(conn).await, 10);
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].artifact_rev, 1, "resume must not bump the revision");
+        assert_eq!(coverage[0].state, "ready");
         let work = analyze(conn, state).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None);
+    }
+
+    // An explicit rebuild landing mid-build must not corrupt the pair: the
+    // rebuild clears the artifact, so any further chunk at the frozen rev
+    // would write plain-binarized rows alongside centered ones, and the
+    // finish would flip that mixture to ready.
+    #[tokio::test]
+    async fn rebuild_during_build_cannot_corrupt_or_flip_ready() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..ARTIFACT_MIN_VECTORS {
+            let offset = (idx % 6) as f32;
+            seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0 + offset, 2.0)).await;
+        }
+        let state = desired(vec![("default", true)], Some("default"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "default").await;
+        let build = &plan_data(&snapshot).builds[0];
+        let artifact = compute_mean_artifact(conn, &build.setter_ids, build.dim)
+            .await
+            .expect("artifact");
+        start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
+            .await
+            .expect("start");
+        let written = backfill_chunk(conn, profile_id, setter, 10)
+            .await
+            .expect("first chunk");
+        assert_eq!(written, 10);
+
+        // The user hits Rebuild while the job is mid-backfill.
+        mark_space_rebuild(conn, profile_id, &[setter])
+            .await
+            .expect("mark rebuild");
+
+        // The in-flight job's next chunk must write nothing (the pair left
+        // 'building'), and its finish must refuse to flip ready.
+        let written = backfill_chunk(conn, profile_id, setter, 100)
+            .await
+            .expect("post-rebuild chunk");
+        assert_eq!(written, 0, "no rows may be written to a non-building pair");
+        assert!(
+            finish_space_build(conn, profile_id, &[setter]).await.is_err(),
+            "finish must refuse a pair that left 'building'"
+        );
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "pending");
+        assert!(
+            resolve_ready_pair(conn, "default", &["clip/model".to_string()])
+                .await
+                .expect("resolve")
+                .is_none(),
+            "a rebuilding pair must not be served to queries"
+        );
+
+        // The next reconcile rebuilds cleanly at a bumped revision.
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let plan = plan_data(&snapshot);
+        assert_eq!(plan.builds.len(), 1);
+        assert!(!plan.builds[0].resume, "a cleared artifact forces a fresh build");
+        run_build(conn, &plan.builds[0], profile_id).await;
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "ready");
+        assert_eq!(coverage[0].artifact_rev, 2);
+        assert_eq!(
+            analyze(conn, state).await.expect("analyze"),
+            ReconcileWork::None
+        );
     }
 
     // The inline hook writes quants (same rev, same transform) for building
@@ -2152,23 +2303,50 @@ mod tests {
         out
     }
 
-    // The two-stage quant scorer is bit-identical to exact search when the
-    // candidate set fits inside k, and stays deterministic (same membership,
-    // repeatable order) when k truncates the head.
-    #[tokio::test]
-    async fn quant_query_matches_exact_and_is_deterministic() {
-        ensure_vec_extension_loaded();
-        let mut dbs = setup_test_databases().await;
-        let conn = &mut dbs.index_conn;
+    /// A candidate set whose Hamming (coarse) order genuinely disagrees
+    /// with cosine (exact) order — without this the head/merge machinery
+    /// is never exercised: identical quants collapse every cdist to 0 and
+    /// the coarse order degenerates into the tiebreaker, which trivially
+    /// matches exact.
+    ///
+    /// Binarization keeps only signs. "Spread" vectors are all-positive
+    /// (Hamming 0 from the all-positive query) but point far off-axis, so
+    /// their cosine distance is large; "tight" vectors flip one small
+    /// component (Hamming 1+) while staying nearly parallel to the query,
+    /// so their cosine distance is tiny. Coarse ranks spread first, exact
+    /// ranks tight first.
+    fn disagreeing_vectors() -> Vec<[f32; 8]> {
+        let mut vectors = Vec::new();
+        // Hamming 0, poor cosine: one dominant dimension.
+        for idx in 0..6 {
+            let mut vector = [0.02f32; 8];
+            vector[idx] = 6.0 + idx as f32;
+            vectors.push(vector);
+        }
+        // Hamming 1..3, excellent cosine: nearly parallel to the query with
+        // a few tiny negative components.
+        for idx in 0..6 {
+            let mut vector = [1.0f32; 8];
+            for flip in 0..=(idx % 3) {
+                vector[7 - flip] = -0.001 * (1.0 + idx as f32);
+            }
+            vectors.push(vector);
+        }
+        vectors
+    }
+
+    const QUERY_VECTOR: [f32; 8] = [1.0; 8];
+
+    async fn seed_disagreeing_space(
+        conn: &mut SqliteConnection,
+        prefix: &str,
+    ) -> (i64, i64, Vec<u8>, Vec<u8>) {
         let setter = seed_setter(conn, "clip/model").await;
-        // Distinct angles from the query vector so cosine distances are
-        // strictly ordered.
-        for idx in 0..12 {
-            let sha = format!("i{idx:02}");
+        for (idx, vector) in disagreeing_vectors().into_iter().enumerate() {
+            let sha = format!("{prefix}{idx:02}");
             let item = seed_item(conn, &sha).await;
             seed_file(conn, item, &sha).await;
-            let spread = 0.1 + idx as f32 * 0.3;
-            seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
+            seed_embedding(conn, item, setter, "clip", 0, &vector).await;
         }
         let state = desired(vec![("plain", false)], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
@@ -2176,10 +2354,27 @@ mod tests {
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
 
-        let query_vec = le_bytes(&vec8(1.0, 0.05));
+        let query_vec = le_bytes(&QUERY_VECTOR);
         let query_quant = compute_query_quant(conn, &query_vec, None)
             .await
             .expect("query quant");
+        (setter, profile_id, query_vec, query_quant)
+    }
+
+    // The two-stage quant scorer is bit-identical to exact search when the
+    // candidate set fits inside k, and stays deterministic (same membership,
+    // repeatable order) when k truncates the head — on a candidate set whose
+    // coarse order genuinely disagrees with the exact order, so the head
+    // selection and the head/tail merge are actually exercised.
+    #[tokio::test]
+    async fn quant_query_matches_exact_and_is_deterministic() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let (_setter, profile_id, query_vec, query_quant) =
+            seed_disagreeing_space(conn, "i").await;
+        let total = disagreeing_vectors().len();
+
         let make_query = |element| crate::pql::model::PqlQuery {
             query: Some(element),
             entity: crate::pql::model::EntityType::File,
@@ -2192,7 +2387,7 @@ mod tests {
             make_query(image_filter("clip/model", query_vec.clone(), None, None)),
         )
         .await;
-        assert_eq!(exact.len(), 12, "all seeded files match");
+        assert_eq!(exact.len(), total, "all seeded files match");
 
         let quant = Some(crate::pql::model::QuantResolved {
             profile_id,
@@ -2208,25 +2403,49 @@ mod tests {
             "candidates <= k: quant must be bit-identical to exact"
         );
 
-        // k truncates the head: same membership, exact head prefix,
-        // deterministic across repeated executions.
+        // k=1 rescores only the coarse-best group; everything else keeps
+        // coarse (Hamming) order.
         let quant_small_k = run_query_order(
             conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(3))),
+            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(1))),
         )
         .await;
-        assert_eq!(quant_small_k.len(), 12, "membership is never truncated");
+        assert_eq!(quant_small_k.len(), total, "membership is never truncated");
         assert_eq!(
-            &quant_small_k[..3],
-            &exact[..3],
-            "head rows are exact-ordered"
+            exact.iter().collect::<std::collections::HashSet<_>>(),
+            quant_small_k.iter().collect::<std::collections::HashSet<_>>(),
+            "membership is identical to exact regardless of k"
+        );
+        // Guard against a degenerate fixture: if this ever passes, the
+        // coarse pass agrees with exact everywhere and the head/merge
+        // machinery is not being tested at all.
+        assert_ne!(
+            exact, quant_small_k,
+            "fixture must produce a coarse order that disagrees with exact"
         );
         let repeat = run_query_order(
             conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant, Some(3))),
+            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(1))),
         )
         .await;
         assert_eq!(quant_small_k, repeat, "ordering is deterministic");
+
+        // Growing k monotonically re-scores more of the head: at k = |set|
+        // the result must converge back to exact.
+        let quant_full_k = run_query_order(
+            conn,
+            make_query(image_filter(
+                "clip/model",
+                query_vec.clone(),
+                quant,
+                Some(total as i64),
+            )),
+        )
+        .await;
+        assert_eq!(
+            exact, quant_full_k,
+            "k covering the whole candidate set must reproduce exact"
+        );
     }
 
     // Offset pagination never overlaps or skips: walking pages under a
@@ -2236,24 +2455,8 @@ mod tests {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let setter = seed_setter(conn, "clip/model").await;
-        for idx in 0..12 {
-            let sha = format!("p{idx:02}");
-            let item = seed_item(conn, &sha).await;
-            seed_file(conn, item, &sha).await;
-            let spread = 0.1 + idx as f32 * 0.3;
-            seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
-        }
-        let state = desired(vec![("plain", false)], Some("plain"));
-        sync_metadata(conn, state.clone()).await.expect("sync");
-        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
-        let profile_id = profile_id_by_name(conn, "plain").await;
-        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
-
-        let query_vec = le_bytes(&vec8(1.0, 0.05));
-        let query_quant = compute_query_quant(conn, &query_vec, None)
-            .await
-            .expect("query quant");
+        let (_setter, profile_id, query_vec, query_quant) =
+            seed_disagreeing_space(conn, "p").await;
         let quant = crate::pql::model::QuantResolved {
             profile_id,
             query_quant: Some(query_quant),

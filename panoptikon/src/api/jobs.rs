@@ -562,7 +562,15 @@ pub(crate) struct VectorQuantRebuildRequest {
 pub(crate) async fn get_vector_quants(
     mut conn: DbConnection<ReadOnly>,
 ) -> Result<Json<VectorQuantStatus>, ApiError> {
-    let desired = crate::db::vector_quants::load_desired_state(&conn.index_db);
+    // Invalid config is inert everywhere else (no reconcile action); here it
+    // is worth surfacing, since the card is exactly where the user would fix
+    // it.
+    let desired = crate::db::vector_quants::load_desired_state(&conn.index_db).ok_or_else(|| {
+        ApiError::bad_request(
+            "The [vector_quants] section of this database's config.toml is invalid; \
+             fix it to manage quant profiles.",
+        )
+    })?;
     let status = crate::db::vector_quants::load_status(&mut conn.conn, desired).await?;
     Ok(Json(status))
 }

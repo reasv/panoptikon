@@ -18,8 +18,10 @@
 //! untouched. If the candidate set is ≤ k items the head covers everything
 //! and the result is bit-identical to exact search.
 
-use sea_query::{Alias, Asterisk, Expr, ExprTrait, JoinType, Order, Query, SelectStatement,
-    WindowStatement};
+use sea_query::{
+    Alias, Asterisk, Expr, ExprTrait, JoinType, NullOrdering, Order, Query, SelectStatement,
+    WindowStatement,
+};
 
 use crate::pql::model::SortableOptions;
 
@@ -60,9 +62,18 @@ where
     ranked
         .from(Alias::new(coarse_cte.name.as_str()))
         .column((Alias::new(coarse_cte.name.as_str()), Asterisk));
+    // The tiebreaker must be a TOTAL key over the grouped rows, or
+    // row_number() assignment between tied rows is engine-defined and the
+    // "deterministic function of (query, DB state, k)" contract rests on
+    // luck: one item can own several files (and, in item_data queries,
+    // several data rows), so item_id alone leaves genuine ties.
     let mut window = WindowStatement::new();
     window.order_by_expr(Expr::col(Alias::new(COARSE_DIST)).into(), direction.clone());
     window.order_by_expr(Expr::col(Alias::new("item_id")).into(), Order::Asc);
+    window.order_by_expr(Expr::col(Alias::new("file_id")).into(), Order::Asc);
+    if state.item_data_query {
+        window.order_by_expr(Expr::col(Alias::new("data_id")).into(), Order::Asc);
+    }
     ranked.expr_window_as(Expr::cust("row_number()"), window, Alias::new(COARSE_RANK));
     let ranked_cte = create_cte(state, format!("ranked_{cte_name}"), ranked);
 
@@ -113,18 +124,34 @@ where
         .into(),
         Order::Asc,
     );
-    window.order_by_expr(
+    // A NULL exact aggregate (e.g. confidence weights that sum to zero)
+    // sorts last, matching the exact path's NullOrdering::Last — otherwise
+    // SQLite's ASC default would promote such a row to rank 1 and the same
+    // query would differ between `exact` and `auto`.
+    window.order_by_expr_with_nulls(
         Expr::col((head_alias.clone(), Alias::new(EXACT_DIST))).into(),
         direction.clone(),
+        NullOrdering::Last,
     );
-    window.order_by_expr(
+    window.order_by_expr_with_nulls(
         Expr::col((ranked_alias.clone(), Alias::new(COARSE_DIST))).into(),
         direction,
+        NullOrdering::Last,
     );
     window.order_by_expr(
         Expr::col((ranked_alias.clone(), Alias::new("item_id"))).into(),
         Order::Asc,
     );
+    window.order_by_expr(
+        Expr::col((ranked_alias.clone(), Alias::new("file_id"))).into(),
+        Order::Asc,
+    );
+    if state.item_data_query {
+        window.order_by_expr(
+            Expr::col((ranked_alias.clone(), Alias::new("data_id"))).into(),
+            Order::Asc,
+        );
+    }
     merge.expr_window_as(Expr::cust("row_number()"), window, Alias::new("order_rank"));
 
     (merge, ranked_cte)
