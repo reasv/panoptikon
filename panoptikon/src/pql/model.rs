@@ -426,6 +426,20 @@ pub(crate) struct SeedResolution {
     pub synthesized: bool,
 }
 
+/// Exclusive upper bound on a server-minted seed.
+///
+/// The seed is echoed to the caller as a JSON number and the contract is that
+/// they pass it back verbatim to page through the same shuffle. JSON numbers
+/// are IEEE doubles in every JavaScript client, so anything above 2^53 comes
+/// back rounded — a *different* seed, and therefore a different permutation,
+/// with no error to notice. Minting inside the exactly-representable range
+/// makes that round trip lossless. 2^53 shuffles is not a meaningful limit on
+/// anything, and the mixer avalanches small seeds as well as large ones.
+///
+/// A caller-supplied seed is left alone: any client that can send a value
+/// beyond this range can also read it back unharmed.
+pub(crate) const MAX_SYNTHESIZED_SEED: i64 = 1 << 53;
+
 impl PqlQuery {
     /// True if any top-level order term is `random`. Filter-derived orders
     /// (`order_list`) never produce `Random`, so this is the whole picture.
@@ -447,7 +461,9 @@ impl PqlQuery {
             };
         }
         let synthesized = self.seed.is_none();
-        let seed = *self.seed.get_or_insert_with(rand::random::<i64>);
+        let seed = *self
+            .seed
+            .get_or_insert_with(|| rand::random_range(0..MAX_SYNTHESIZED_SEED));
         SeedResolution {
             effective: Some(seed),
             synthesized,

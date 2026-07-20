@@ -7713,6 +7713,14 @@
           },
           "result_metrics": {
             "$ref": "#/components/schemas/SearchMetrics"
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Random Order Seed\n\nThe seed bound into the returned results SQL, present only when the\nquery orders by `random`. Filled in by the `/pql/build` endpoint —\nwithout it the compiled SQL carries a seed the caller never chose and\nhas no way to read back, so re-running it by hand would reproduce\nneither this build nor a search."
           }
         }
       },

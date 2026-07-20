@@ -148,6 +148,15 @@ pub(crate) struct PqlBuildResponse {
     /// Same, for the count query.
     #[serde(skip)]
     count_uses_user_data: bool,
+    /// Random Order Seed
+    ///
+    /// The seed bound into the returned results SQL, present only when the
+    /// query orders by `random`. Filled in by the `/pql/build` endpoint —
+    /// without it the compiled SQL carries a seed the caller never chose and
+    /// has no way to read back, so re-running it by hand would reproduce
+    /// neither this build nor a search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
 }
 
 #[derive(Clone, Default, Serialize, ToSchema)]
@@ -719,7 +728,8 @@ pub async fn search_pql_build(
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     let mut query = decode_pql_payload(&payload)?;
     // Mirrors the search handler so the returned SQL is what a search would
-    // actually execute, seed included.
+    // actually execute, seed included. The seed lands in the response, so a
+    // caller who omitted one can still reproduce this exact build.
     query.resolve_seed();
     let mut builder = compile_pql(&state, query, &db.index_db).await?;
     // The builder keeps pagination out of the compiled SQL (cache keying);
@@ -822,6 +832,11 @@ async fn compile_pql(
         result_metrics.preprocess = preprocess_time;
     }
 
+    // Reported rather than recomputed by the caller: this is the seed that
+    // actually reached the results SQL below. Only randomly-ordered queries
+    // have one — for anything else the seed never leaves the request body.
+    let seed = query.orders_by_random().then_some(query.seed).flatten();
+
     if !query.results && !query.count {
         return Ok(PqlBuildResponse {
             compiled_query: None,
@@ -833,6 +848,7 @@ async fn compile_pql(
             pagination: None,
             uses_user_data: false,
             count_uses_user_data: false,
+            seed,
         });
     }
 
@@ -858,6 +874,7 @@ async fn compile_pql(
                 pagination: None,
                 uses_user_data: false,
                 count_uses_user_data,
+                seed,
             });
         }
     }
@@ -882,6 +899,7 @@ async fn compile_pql(
         pagination,
         uses_user_data,
         count_uses_user_data,
+        seed,
     })
 }
 
@@ -1309,7 +1327,7 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
-    use crate::pql::model::{OrderArgs, OrderByField};
+    use crate::pql::model::{MAX_SYNTHESIZED_SEED, OrderArgs, OrderByField};
 
     fn result_with_sha(sha256: Option<&str>) -> SearchResult {
         SearchResult {
@@ -1809,6 +1827,23 @@ mod tests {
         assert!(resolved.synthesized);
         assert_eq!(resolved.effective, missing.seed);
         assert!(missing.seed.is_some());
+    }
+
+    /// A minted seed is echoed to the caller as a JSON number and is meant to
+    /// be passed back verbatim. Above 2^53 a JavaScript client would round it
+    /// on the way in, silently paging through a *different* shuffle, so the
+    /// mint has to stay inside the exactly-representable range.
+    #[test]
+    fn synthesized_seeds_survive_a_json_number_round_trip() {
+        for _ in 0..1_000 {
+            let mut query = random_order_query(None);
+            let seed = query.resolve_seed().effective.expect("seed minted");
+            assert!(
+                (0..MAX_SYNTHESIZED_SEED).contains(&seed),
+                "minted seed {seed} is outside the JSON-safe range"
+            );
+            assert_eq!(seed as f64 as i64, seed, "seed {seed} is not exact as f64");
+        }
     }
 
     #[test]
