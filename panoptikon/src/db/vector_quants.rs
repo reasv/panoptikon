@@ -2229,6 +2229,164 @@ mod tests {
         assert_eq!(quant_small_k, repeat, "ordering is deterministic");
     }
 
+    // Offset pagination never overlaps or skips: walking pages under a
+    // truncating k reproduces exactly the single-shot ordering.
+    #[tokio::test]
+    async fn quant_page_walk_matches_single_shot_ordering() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..12 {
+            let sha = format!("p{idx:02}");
+            let item = seed_item(conn, &sha).await;
+            seed_file(conn, item, &sha).await;
+            let spread = 0.1 + idx as f32 * 0.3;
+            seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
+        }
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+
+        let query_vec = le_bytes(&vec8(1.0, 0.05));
+        let query_quant = compute_query_quant(conn, &query_vec, None)
+            .await
+            .expect("query quant");
+        let quant = crate::pql::model::QuantResolved {
+            profile_id,
+            query_quant: Some(query_quant),
+        };
+        let make_query = |page: i64, page_size: i64| crate::pql::model::PqlQuery {
+            query: Some(image_filter(
+                "clip/model",
+                query_vec.clone(),
+                Some(quant.clone()),
+                Some(3),
+            )),
+            entity: crate::pql::model::EntityType::File,
+            page,
+            page_size,
+            ..Default::default()
+        };
+        let full = run_query_order(conn, make_query(1, 100)).await;
+        let mut walked = Vec::new();
+        for page in 1..=3 {
+            walked.extend(run_query_order(conn, make_query(page, 4)).await);
+        }
+        assert_eq!(full, walked, "page walk must equal the single-shot ordering");
+    }
+
+    // New-setter flow: a setter appearing after the profile is ready gets
+    // covered by the next reconcile pass (the finishing phase of the job
+    // that created it).
+    #[tokio::test]
+    async fn new_setter_flow_converges() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let first = seed_setter(conn, "clip/a").await;
+        for idx in 0..4 {
+            let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+            seed_embedding(conn, item, first, "clip", idx, &vec8(sign, -sign)).await;
+        }
+        let state = desired(vec![("plain", false)], Some("plain"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+        assert_eq!(
+            analyze(conn, state.clone()).await.expect("analyze"),
+            ReconcileWork::None
+        );
+
+        // A new embedding setter appears (mid-job): its coverage row does
+        // not exist yet, so the check reports work.
+        let second = seed_setter(conn, "textembed/b").await;
+        seed_embedding(conn, item, second, "text-embedding", 0, &vec8(-1.0, 1.0)).await;
+        assert_ne!(
+            analyze(conn, state.clone()).await.expect("analyze"),
+            ReconcileWork::None
+        );
+        sync_metadata(conn, state.clone()).await.expect("resync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let plan = plan_data(&snapshot);
+        assert_eq!(plan.builds.len(), 1);
+        assert_eq!(plan.builds[0].setter_ids, vec![second]);
+        run_build(conn, &plan.builds[0], profile_id).await;
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage.len(), 2);
+        assert!(coverage.iter().all(|row| row.state == "ready"));
+        assert_eq!(
+            analyze(conn, state).await.expect("analyze"),
+            ReconcileWork::None
+        );
+    }
+
+    // Xmodal sibling appearance: when a text sibling first appears for an
+    // already-ready image setter, the space changed — both rebuild under
+    // the union artifact (correctness, not tuning).
+    #[tokio::test]
+    async fn sibling_appearance_triggers_union_rebuild() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let image_setter = seed_setter(conn, "clip/M").await;
+        for idx in 0..ARTIFACT_MIN_VECTORS {
+            let offset = (idx % 5) as f32;
+            seed_embedding(conn, item, image_setter, "clip", idx, &vec8(2.0 + offset, -1.0))
+                .await;
+        }
+        let state = desired(vec![("default", true)], Some("default"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let profile_id = profile_id_by_name(conn, "default").await;
+        run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+        let solo_artifact = load_coverage(conn).await.expect("coverage")[0]
+            .artifact
+            .clone()
+            .expect("solo artifact");
+
+        // The sibling appears with a handful of vectors.
+        let text_setter = seed_setter(conn, "tclip/M").await;
+        for idx in 0..3 {
+            seed_embedding(
+                conn,
+                item,
+                text_setter,
+                "text-embedding",
+                idx,
+                &vec8(-2.0, 1.0),
+            )
+            .await;
+        }
+        sync_metadata(conn, state.clone()).await.expect("resync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let plan = plan_data(&snapshot);
+        assert_eq!(plan.builds.len(), 1, "the union space must rebuild");
+        let mut setter_ids = plan.builds[0].setter_ids.clone();
+        setter_ids.sort();
+        assert_eq!(setter_ids, vec![image_setter, text_setter]);
+        run_build(conn, &plan.builds[0], profile_id).await;
+
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage.len(), 2);
+        assert!(coverage.iter().all(|row| row.state == "ready"));
+        let union_artifact = coverage[0].artifact.clone().expect("union artifact");
+        assert_eq!(coverage[0].artifact, coverage[1].artifact);
+        assert_ne!(
+            union_artifact, solo_artifact,
+            "the union mean must differ from the solo mean"
+        );
+        assert_eq!(
+            analyze(conn, state).await.expect("analyze"),
+            ReconcileWork::None
+        );
+    }
+
     // similar_to under a quant profile: same membership as exact, exact head.
     #[tokio::test]
     async fn similar_to_quant_matches_exact() {
