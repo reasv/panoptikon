@@ -487,16 +487,20 @@ upgrade. Maps 1:1 onto `index`/`variant`.
 
 ## Client policy
 
-- `k = max(k_default, page_size × (prefetch_pages + 1))` — the quality
-  floor dominates; page geometry only ever raises k.
+- `k = max(k_default, max(page_size, prefetch_rows))` — the quality
+  floor dominates; page geometry only ever raises k. (Updated for the
+  `prefetch_pages` → `prefetch_rows` rename in
+  [`search-span-cache-design.md`](search-span-cache-design.md); the
+  executed LIMIT is now `max(page_size, prefetch_rows)` rather than
+  `page_size × (prefetch_pages + 1)`.)
 - **Prefetch is a row budget, not a page count**: for vector queries,
-  execution cost is LIMIT-insensitive and enrich is per-served-page,
-  so `prefetch_pages = clamp(floor(ROW_BUDGET / page_size) - 1, 0,
-  32)` with `ROW_BUDGET = 320` (replaces `VECTOR_PREFETCH_PAGES = 4`):
-  ~31 extra pages at 10/page, 2 at 100/page, 0 at ≥320/page. Applies
-  **only to queries containing vector filters** (any index mode); pure
-  FTS/metadata queries keep prefetch 0 (their cost does scale with
-  LIMIT; re-execution is cheap).
+  execution cost is LIMIT-insensitive and enrich is per-served-page, so
+  the client sends `prefetch_rows = ROW_BUDGET` with `ROW_BUDGET = 320`
+  (replaces `VECTOR_PREFETCH_PAGES = 4`, and the back-computation into a
+  page count that preceded the rename — that lost rows to rounding,
+  asking for 300 at page size 100). Applies **only to queries containing
+  vector filters** (any index mode); pure FTS/metadata queries keep
+  prefetch 0 (their cost does scale with LIMIT; re-execution is cheap).
 - **10k-row pages are a normal mode** (virtualization is merged; a
   scroll-one-big-page preset is plausible). Vector-side cost is
   ~identical to small pages. The watch item for big pages is per-row

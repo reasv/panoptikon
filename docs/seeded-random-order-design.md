@@ -306,7 +306,8 @@ different groups and a reroll ages the old group out under LRU.
 
 Both changes touch `ui/lib/searchHooks.ts` (that design renames
 `prefetch_pages` to `prefetch_rows`), so they are worth sequencing rather than
-landing in parallel.
+landing in parallel. Sequenced as written: seeded random shipped first
+(548d011), span keying second, including the rename.
 
 ## Known limitation
 

@@ -5,6 +5,17 @@ opt-in page prefetching on top of it. Settled 2026-07-19. Implemented
 2026-07-20 (gateway: `api/search_cache.rs` + `db/epochs.rs`; desktop config
 window; UI prefetch policy + metrics hover card).
 
+> **Storage model superseded 2026-07-20** by
+> [`search-span-cache-design.md`](search-span-cache-design.md), which is
+> implemented. Rows are no longer stored as fixed per-page entries keyed by
+> `(offset, limit)`; they are stored as page-size-agnostic row **spans** under
+> a pagination-free query key, so any window falling inside cached rows is a
+> hit. Consequently `prefetch_pages` is now `prefetch_rows` (a row budget, not
+> a page count) and `prefetched_pages` is now `prefetched_rows`. Everything
+> here that is *not* about keying and storage — epochs, placement in the
+> handler, policy/bypass, config, endpoints, metrics — still describes the
+> shipped system.
+
 Implementation note the design implied but did not spell out: the builder
 used to apply LIMIT/OFFSET inside the built statement. It now returns them
 as `PqlBuilderResult::pagination`, and the executable SQL is produced by

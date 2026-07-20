@@ -61,7 +61,7 @@ def search(base, dbs, filter_element, order_dir="asc"):
         # The cache would make repeat timings meaningless; bypass skips both
         # the read and the write.
         "cache": False,
-        "prefetch_pages": 0,
+        "prefetch_rows": 0,
     }
     start = time.perf_counter()
     data = api(base, "/api/search/pql", dbs, body)

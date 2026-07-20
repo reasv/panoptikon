@@ -1,7 +1,5 @@
 use crate::api::db_params::DbQueryParams;
-use crate::api::search_cache::{
-    self, CacheLookup, CachedSearchValue, EpochSnapshot, SearchCacheKey,
-};
+use crate::api::search_cache::{self, CacheLookup, EpochSnapshot, QueryKey};
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
 use crate::db::extraction_log::get_existing_setters;
@@ -41,8 +39,10 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const DEFAULT_LIMIT: i64 = 10;
 const DEFAULT_USER: &str = "user";
-/// Server-side clamp on the request's `prefetch_pages`.
-const MAX_PREFETCH_PAGES: u32 = 32;
+/// Server-side clamp on the request's `prefetch_rows`. A row budget rather
+/// than a page count, so a large page size can no longer multiply into an
+/// enormous execution.
+const MAX_PREFETCH_ROWS: u32 = 4096;
 
 /// Search result cache outcome for one request side (count or results).
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -89,10 +89,10 @@ pub(crate) struct SearchMetrics {
     /// never the stored original's timings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache: Option<CacheOutcome>,
-    /// Extra pages fetched and cached beyond the requested one (results
+    /// Extra rows fetched and cached beyond the requested page (results
     /// only; explains a larger `execute` on the populating request)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    prefetched_pages: Option<u32>,
+    prefetched_rows: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -228,6 +228,22 @@ pub(crate) struct SearchResult {
     /// requested with `include_bookmarks` and the result has a sha256.
     /// Computed after the query runs; never part of the compiled search SQL.
     bookmarked: Option<bool>,
+}
+
+#[cfg(test)]
+impl SearchResult {
+    /// A row identifiable only by `file_id`, for cache tests that care about
+    /// which rows came back and in what order, not what is in them.
+    pub(crate) fn with_file_id(file_id: i64) -> Self {
+        Self {
+            file_id,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn file_id(&self) -> i64 {
+        self.file_id
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -462,7 +478,7 @@ pub async fn search_pql(
     let skip_missing_file =
         query.check_path && matches!(query.entity, EntityType::File) && is_empty_partition(&query);
     let cache_requested = query.cache;
-    let prefetch_pages = query.prefetch_pages.min(MAX_PREFETCH_PAGES);
+    let prefetch_rows = query.prefetch_rows.min(MAX_PREFETCH_ROWS);
     // Must happen before compiling: the seed is bound into the results SQL.
     let seed = query.resolve_seed();
     let builder = compile_pql(&state, query, &db.index_db).await?;
@@ -497,22 +513,20 @@ pub async fn search_pql(
             let user_data_db = builder
                 .count_uses_user_data
                 .then_some(db.user_data_db.as_str());
-            let key = SearchCacheKey::new(
+            let key = QueryKey::new(
                 &db.index_db,
                 user_data_db,
                 Arc::from(compiled.sql.as_str()),
                 encode_params_key(&compiled.params)?,
-                None,
-                None,
             );
             let snapshot = EpochSnapshot::take(&db.index_db, user_data_db);
-            match search_cache::lookup(&key) {
-                CacheLookup::Hit(CachedSearchValue::Count(total)) => (total, CacheOutcome::Hit),
+            match search_cache::lookup_count(&key) {
+                CacheLookup::Hit(total) => (total, CacheOutcome::Hit),
                 lookup => {
                     let stale = matches!(lookup, CacheLookup::Stale);
                     let total =
                         run_compiled_count(&mut db.conn, &compiled.sql, &compiled.params).await?;
-                    search_cache::insert(key, CachedSearchValue::Count(total), snapshot);
+                    search_cache::insert_count(&key, snapshot, total);
                     (
                         total,
                         if stale {
@@ -538,28 +552,28 @@ pub async fn search_pql(
         let start = Instant::now();
         let (page_results, outcome, prefetched) = if use_results_cache {
             let user_data_db = builder.uses_user_data.then_some(db.user_data_db.as_str());
-            let key = SearchCacheKey::new(
+            let key = QueryKey::new(
                 &db.index_db,
                 user_data_db,
                 Arc::from(compiled.sql.as_str()),
                 encode_params_key(&compiled.params)?,
-                builder.pagination.map(|p| p.offset),
-                builder.pagination.map(|p| p.limit),
             );
             let snapshot = EpochSnapshot::take(&db.index_db, user_data_db);
-            match search_cache::lookup(&key) {
-                CacheLookup::Hit(CachedSearchValue::Results(cached)) => {
-                    // Clone: the enrichment below mutates results, and the
-                    // stored vec must stay pristine.
-                    (cached.as_ref().clone(), CacheOutcome::Hit, 0)
-                }
+            // The window is not part of the key: any stored span covering it
+            // answers, whatever page size produced it. Rows come back already
+            // cloned out of the cache, so the enrichment below is free to
+            // mutate them without touching the stored spans.
+            let offset = builder.pagination.map_or(0, |p| p.offset);
+            let limit = builder.pagination.map(|p| p.limit);
+            match search_cache::lookup_rows(&key, offset, limit) {
+                CacheLookup::Hit(cached) => (cached, CacheOutcome::Hit, 0),
                 lookup => {
                     let stale = matches!(lookup, CacheLookup::Stale);
                     let (page, prefetched) = execute_results(
                         &mut db.conn,
                         compiled,
                         builder.pagination,
-                        prefetch_pages,
+                        prefetch_rows,
                         Some((key, snapshot)),
                         &builder.extra_columns,
                     )
@@ -589,7 +603,7 @@ pub async fn search_pql(
         };
         result_metrics.execute = elapsed_seconds(start);
         result_metrics.cache = Some(outcome);
-        result_metrics.prefetched_pages = Some(prefetched);
+        result_metrics.prefetched_rows = Some(prefetched);
         page_results
     } else {
         Vec::new()
@@ -628,37 +642,50 @@ fn encode_params_key(params: &[Value]) -> ApiResult<Arc<str>> {
     Ok(Arc::from(encoded.as_str()))
 }
 
-/// Execute the results query and, when caching, store what it saw.
+/// Execute the results query and, when caching, store what it saw as one
+/// contiguous row span at the executed offset.
 ///
-/// With prefetch, a single execution with `LIMIT limit × (N+1)` is sliced
-/// into N+1 per-page entries. Every slice is correct by construction — the
-/// execution saw the full prefix, so a short or empty slice means the real
-/// query at that offset would also come up short/empty at these epochs.
-/// Returns the requested page and the number of extra pages stored.
+/// `prefetch_rows` is a **row budget**, not a page count: the execution runs
+/// with `LIMIT max(page, budget)` and the whole result is handed to the cache
+/// in one piece. The cache carves it into fixed-size spans of its own, so
+/// nothing here depends on the client's page size — which is the point.
+///
+/// Storing the full prefix is correct by construction: the execution saw
+/// every row from `offset` onward, so a result shorter than the executed
+/// LIMIT is authoritative about where the result set ends at these epochs.
+///
+/// Returns the requested page and how many extra rows were fetched beyond it.
 async fn execute_results(
     conn: &mut sqlx::SqliteConnection,
     compiled: &CompiledQuery,
     pagination: Option<crate::pql::Pagination>,
-    prefetch_pages: u32,
-    cache_target: Option<(SearchCacheKey, EpochSnapshot)>,
+    prefetch_rows: u32,
+    cache_target: Option<(Arc<QueryKey>, EpochSnapshot)>,
     extra_columns: &HashMap<String, String>,
-) -> ApiResult<(Vec<SearchResult>, u32)> {
-    // Prefetch requires somewhere to put the extra slices and a page size
-    // to slice by.
-    let prefetch = if cache_target.is_some() && pagination.is_some() {
-        prefetch_pages
+) -> ApiResult<(Vec<SearchResult>, u64)> {
+    // Prefetching only pays for itself if there is somewhere to put the extra
+    // rows.
+    let prefetch = if cache_target.is_some() {
+        prefetch_rows as u64
     } else {
         0
     };
 
     let executed;
+    let executed_limit;
     let (sql, params): (&str, &[Value]) = match pagination {
         Some(p) => {
-            executed =
-                compiled.with_pagination(p.limit.saturating_mul(prefetch as u64 + 1), p.offset);
+            let limit = p.limit.max(prefetch);
+            executed_limit = Some(limit);
+            executed = compiled.with_pagination(limit, p.offset);
             (&executed.sql, &executed.params)
         }
-        None => (&compiled.sql, &compiled.params),
+        // Unpaginated: the execution returns the entire result set, so there
+        // is no LIMIT for a short read to be short of.
+        None => {
+            executed_limit = None;
+            (&compiled.sql, &compiled.params)
+        }
     };
     let rows = run_compiled_query(conn, sql, params).await?;
     let mut mapped = Vec::with_capacity(rows.len());
@@ -666,40 +693,16 @@ async fn execute_results(
         mapped.push(map_search_result(&row, extra_columns)?);
     }
 
-    let Some((key, snapshot)) = cache_target else {
-        return Ok((mapped, 0));
-    };
+    let page_len = pagination.map_or(mapped.len(), |p| (p.limit as usize).min(mapped.len()));
+    let prefetched = (mapped.len() - page_len) as u64;
 
-    if prefetch > 0 {
-        let p = pagination.expect("prefetch requires pagination");
-        let page_len = p.limit as usize;
-        let mut first_page = Vec::new();
-        for page_index in 0..=(prefetch as usize) {
-            let start = page_index * page_len;
-            let end = (start + page_len).min(mapped.len());
-            let slice: Vec<SearchResult> = mapped
-                .get(start..end)
-                .map(|slice| slice.to_vec())
-                .unwrap_or_default();
-            if page_index == 0 {
-                first_page = slice.clone();
-            }
-            let entry_key = key.at_page(p.offset + page_index as u64 * p.limit, p.limit);
-            search_cache::insert(
-                entry_key,
-                CachedSearchValue::Results(Arc::new(slice)),
-                snapshot,
-            );
-        }
-        Ok((first_page, prefetch))
-    } else {
-        search_cache::insert(
-            key,
-            CachedSearchValue::Results(Arc::new(mapped.clone())),
-            snapshot,
-        );
-        Ok((mapped, 0))
+    if let Some((key, snapshot)) = cache_target {
+        let offset = pagination.map_or(0, |p| p.offset);
+        search_cache::insert_rows(&key, snapshot, offset, executed_limit, &mapped);
     }
+
+    mapped.truncate(page_len);
+    Ok((mapped, prefetched))
 }
 
 #[utoipa::path(
@@ -1880,77 +1883,83 @@ mod tests {
         (compiled, pagination, extra_columns)
     }
 
-    fn results_key(
-        compiled: &CompiledQuery,
-        index_db: &str,
-        pagination: Option<crate::pql::Pagination>,
-    ) -> SearchCacheKey {
-        SearchCacheKey::new(
+    fn results_key(compiled: &CompiledQuery, index_db: &str) -> Arc<QueryKey> {
+        QueryKey::new(
             index_db,
             None,
             Arc::from(compiled.sql.as_str()),
             encode_params_key(&compiled.params).expect("params key"),
-            pagination.map(|p| p.offset),
-            pagination.map(|p| p.limit),
         )
     }
 
-    fn expect_results_hit(lookup: CacheLookup) -> Vec<SearchResult> {
+    fn expect_results_hit(lookup: CacheLookup<Vec<SearchResult>>) -> Vec<SearchResult> {
         match lookup {
-            CacheLookup::Hit(CachedSearchValue::Results(results)) => results.as_ref().clone(),
-            CacheLookup::Hit(_) => panic!("expected results hit, got count"),
+            CacheLookup::Hit(results) => results,
             CacheLookup::Stale => panic!("expected hit, got stale"),
             CacheLookup::Miss => panic!("expected hit, got miss"),
         }
     }
 
-    // One execution with LIMIT page_size×(N+1) is sliced into N+1 page
-    // entries; later pages are then served from the cache, and an epoch
-    // bump invalidates them.
+    // One execution with a row budget larger than the page stores the whole
+    // prefix, which then serves later pages *and* page sizes the execution
+    // never ran at. An epoch bump invalidates the lot.
     #[tokio::test]
-    async fn prefetch_populates_page_entries_and_serves_hits() {
+    async fn prefetch_stores_rows_servable_at_any_page_size() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
         search_cache::clear(None, None);
         let mut dbs = setup_stats_db().await;
-        let index_db = "sc-prefetch-pages";
+        let index_db = "sc-prefetch-rows";
 
         let (compiled, pagination, extra_columns) = compiled_default_query(1).await;
-        let key = results_key(&compiled, index_db, pagination);
+        let key = results_key(&compiled, index_db);
         let snapshot = EpochSnapshot::take(index_db, None);
+        // The stats fixture has 3 files; a 4-row budget at page size 1 covers
+        // all of them in one execution, and comes up short of its LIMIT,
+        // which is what records where the result set ends.
         let (page, prefetched) = execute_results(
             &mut dbs.index_conn,
             &compiled,
             pagination,
-            2,
-            Some((key.clone(), snapshot)),
+            4,
+            Some((Arc::clone(&key), snapshot)),
             &extra_columns,
         )
         .await
         .expect("execute");
-        // The stats fixture has 3 files; page_size 1 with 2 prefetched pages
-        // covers all of them in one execution.
         assert_eq!(prefetched, 2);
         assert_eq!(page.len(), 1);
 
+        // Every page at the size that populated it.
         for offset in [0u64, 1, 2] {
-            let cached = expect_results_hit(search_cache::lookup(&key.at_page(offset, 1)));
+            let cached = expect_results_hit(search_cache::lookup_rows(&key, offset, Some(1)));
             assert_eq!(cached.len(), 1, "page at offset {offset}");
         }
-        assert!(matches!(
-            search_cache::lookup(&key.at_page(3, 1)),
-            CacheLookup::Miss
-        ));
+        // And at sizes it never ran at — the whole point of span keying.
+        assert_eq!(
+            expect_results_hit(search_cache::lookup_rows(&key, 0, Some(3))).len(),
+            3
+        );
+        assert_eq!(
+            expect_results_hit(search_cache::lookup_rows(&key, 1, Some(2))).len(),
+            2
+        );
+        // Past the end: the short read recorded where the result set stops,
+        // so this is a truncated hit rather than a miss.
+        assert!(expect_results_hit(search_cache::lookup_rows(&key, 3, Some(1))).is_empty());
 
         crate::db::epochs::bump_index_epoch(index_db);
-        assert!(matches!(search_cache::lookup(&key), CacheLookup::Stale));
+        assert!(matches!(
+            search_cache::lookup_rows(&key, 0, Some(1)),
+            CacheLookup::Stale
+        ));
     }
 
-    // Short and empty prefetch slices are cached too: the single execution
-    // saw the full prefix, so they are exactly what re-execution would
-    // return at the same epochs.
+    // A result set shorter than the executed LIMIT is cached along with where
+    // it ends, so windows straddling or past the end are served rather than
+    // re-executed.
     #[tokio::test]
-    async fn prefetch_caches_short_and_empty_slices() {
+    async fn short_read_is_cached_with_its_end() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
         search_cache::clear(None, None);
@@ -1958,32 +1967,37 @@ mod tests {
         let index_db = "sc-prefetch-short";
 
         let (compiled, pagination, extra_columns) = compiled_default_query(2).await;
-        let key = results_key(&compiled, index_db, pagination);
+        let key = results_key(&compiled, index_db);
         let snapshot = EpochSnapshot::take(index_db, None);
+        // Budget of 6 against 3 files: the execution comes up short.
         let (page, prefetched) = execute_results(
             &mut dbs.index_conn,
             &compiled,
             pagination,
-            2,
-            Some((key.clone(), snapshot)),
+            6,
+            Some((Arc::clone(&key), snapshot)),
             &extra_columns,
         )
         .await
         .expect("execute");
-        // 3 files at page_size 2: full first page, short second, empty third.
-        assert_eq!(prefetched, 2);
+        assert_eq!(prefetched, 1);
         assert_eq!(page.len(), 2);
+
         assert_eq!(
-            expect_results_hit(search_cache::lookup(&key.at_page(0, 2))).len(),
+            expect_results_hit(search_cache::lookup_rows(&key, 0, Some(2))).len(),
             2
         );
+        // Straddles the end.
         assert_eq!(
-            expect_results_hit(search_cache::lookup(&key.at_page(2, 2))).len(),
+            expect_results_hit(search_cache::lookup_rows(&key, 2, Some(2))).len(),
             1
         );
+        // Entirely past it.
+        assert!(expect_results_hit(search_cache::lookup_rows(&key, 4, Some(2))).is_empty());
+        // Unpaginated, now that the end is known.
         assert_eq!(
-            expect_results_hit(search_cache::lookup(&key.at_page(4, 2))).len(),
-            0
+            expect_results_hit(search_cache::lookup_rows(&key, 0, None)).len(),
+            3
         );
     }
 
@@ -2002,7 +2016,7 @@ mod tests {
             &mut dbs.index_conn,
             &compiled,
             pagination,
-            2,
+            3,
             None,
             &extra_columns,
         )
@@ -2010,7 +2024,10 @@ mod tests {
         .expect("execute");
         assert_eq!(prefetched, 0);
         assert_eq!(page.len(), 1);
-        let key = results_key(&compiled, index_db, pagination);
-        assert!(matches!(search_cache::lookup(&key), CacheLookup::Miss));
+        let key = results_key(&compiled, index_db);
+        assert!(matches!(
+            search_cache::lookup_rows(&key, 0, Some(1)),
+            CacheLookup::Miss
+        ));
     }
 }

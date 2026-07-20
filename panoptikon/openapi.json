@@ -3972,7 +3972,7 @@
           "search"
         ],
         "summary": "Get search result cache stats",
-        "description": "Returns usage counters, per-database groups (with current epochs and stale-entry counts), and a paginated entry listing for the search result cache.",
+        "description": "Returns usage counters, per-database groups (with current epochs and stale-entry counts), and a paginated listing of cached row spans for the search result cache. Entry counts are spans, not client pages.",
         "operationId": "get_search_result_cache",
         "parameters": [
           {
@@ -4016,7 +4016,7 @@
           "search"
         ],
         "summary": "Resize search result cache",
-        "description": "Sets the live byte budget of the search result cache and returns updated stats. Growing is free; shrinking evicts LRU entries until under budget; `0` empties and disables the cache. Sizes above the `[search] cache_size_max_mb` ceiling are rejected. Not persisted — the `[search] cache_size_mb` TOML value applies again at the next startup.",
+        "description": "Sets the live byte budget of the search result cache and returns updated stats. Growing is free; shrinking evicts LRU spans until under budget; `0` empties and disables the cache. Sizes above the `[search] cache_size_max_mb` ceiling are rejected. Not persisted — the `[search] cache_size_mb` TOML value applies again at the next startup.",
         "operationId": "resize_search_result_cache",
         "requestBody": {
           "content": {
@@ -7786,10 +7786,10 @@
             "description": "Partition results By\n\nGroup results by the values of the specified column(s) and return the first result\nfor each group according to all of the order settings of the query.\n\nFor example, if you partition by \"item_id\", you'll get one result per unique item.\nIf you partition by \"file_id\", you'll get one result per unique file.\nMultiple columns yield one result for each unique combination of values for those columns.\n\nYou cannot partition by text columns if the entity is \"file\".",
             "default": null
           },
-          "prefetch_pages": {
+          "prefetch_rows": {
             "type": "integer",
             "format": "int32",
-            "description": "Prefetch Pages\n\nNumber of additional pages to fetch and cache beyond the requested\none, amortizing the full query cost across page visits (useful for\nvector searches, whose cost does not scale down with LIMIT).\nExecuted as a single query with a larger LIMIT and sliced into\nper-page cache entries. Clamped server-side; ignored when the cache\nis disabled or bypassed, or when page_size < 1.",
+            "description": "Prefetch Rows\n\nTotal number of rows to fetch and cache from the requested offset,\namortizing the full query cost across page visits (useful for vector\nsearches, whose cost does not scale down with LIMIT). Executed as a\nsingle query with `LIMIT max(page_size, prefetch_rows)`; the extra\nrows are cached and serve any later window that falls inside them,\nwhatever page size asks for it. Clamped server-side; ignored when the\ncache is disabled or bypassed.",
             "default": 0,
             "minimum": 0
           },
@@ -8163,6 +8163,7 @@
           },
           "entries": {
             "type": "integer",
+            "description": "Cached spans, not client pages: one 320-row prefetch is 2 spans.",
             "minimum": 0
           },
           "index_db": {
@@ -8176,7 +8177,7 @@
           },
           "stale_entries": {
             "type": "integer",
-            "description": "Entries recorded under a different epoch than the current one. High\ncounts mean write churn is defeating the cache.",
+            "description": "Spans recorded under a different epoch than the current one. High\ncounts mean write churn is defeating the cache.",
             "minimum": 0
           },
           "user_data_db": {
@@ -8208,24 +8209,17 @@
             "type": "integer",
             "minimum": 0
           },
+          "end": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "One past the last row index this span holds. Absent for count entries.",
+            "minimum": 0
+          },
           "kind": {
             "type": "string"
-          },
-          "limit": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          },
-          "offset": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
           },
           "rows": {
             "type": [
@@ -8236,7 +8230,16 @@
           },
           "sql": {
             "type": "string",
-            "description": "Truncated compiled SQL."
+            "description": "Truncated compiled SQL, shared by every span of the same query."
+          },
+          "start": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "First row index this span holds. Absent for count entries.",
+            "minimum": 0
           },
           "valid": {
             "type": "boolean"
@@ -8277,7 +8280,7 @@
             "items": {
               "$ref": "#/components/schemas/SearchCacheEntryInfo"
             },
-            "description": "Paginated entry listing, most recently used first."
+            "description": "Paginated span listing, most recently used first."
           },
           "capacity_bytes": {
             "type": "integer",
@@ -8291,6 +8294,7 @@
           },
           "entries": {
             "type": "integer",
+            "description": "Cached spans, not client pages.",
             "minimum": 0
           },
           "evictions": {
@@ -8366,13 +8370,13 @@
             "format": "double",
             "description": "Execution time\n\nTime taken to execute the SQL query"
           },
-          "prefetched_pages": {
+          "prefetched_rows": {
             "type": [
               "integer",
               "null"
             ],
-            "format": "int32",
-            "description": "Extra pages fetched and cached beyond the requested one (results\nonly; explains a larger `execute` on the populating request)",
+            "format": "int64",
+            "description": "Extra rows fetched and cached beyond the requested page (results\nonly; explains a larger `execute` on the populating request)",
             "minimum": 0
           },
           "preprocess": {
