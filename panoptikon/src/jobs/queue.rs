@@ -11,6 +11,7 @@ use crate::db::index_writer::call_index_db_writer;
 use crate::jobs::continuous_scan;
 use crate::jobs::extraction;
 use crate::jobs::files::FileScanService;
+use crate::jobs::vector_quants;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -22,6 +23,7 @@ pub(crate) enum JobType {
     FolderRescan,
     FolderUpdate,
     JobDataDeletion,
+    VectorQuantReconcile,
     #[cfg(test)]
     #[serde(rename = "test_sleep")]
     TestSleep,
@@ -583,6 +585,7 @@ async fn execute_job(job: Job) -> Result<(), String> {
             let result = service.rescan_folders().await;
             guard.resume().await;
             result.map_err(|err| format!("{err:?}"))?;
+            vector_quants::finishing_phase(&job.index_db).await;
             Ok(())
         }
         JobType::FolderUpdate => {
@@ -593,18 +596,21 @@ async fn execute_job(job: Job) -> Result<(), String> {
             let result = service.run_folder_update().await;
             guard.resume().await;
             result.map_err(|err| format!("{err:?}"))?;
+            vector_quants::finishing_phase(&job.index_db).await;
             Ok(())
         }
         JobType::DataExtraction => {
-            extraction::run_extraction_job(job)
+            extraction::run_extraction_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
+            vector_quants::finishing_phase(&job.index_db).await;
             Ok(())
         }
         JobType::DataDeletion => {
-            extraction::run_data_deletion_job(job)
+            extraction::run_data_deletion_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
+            vector_quants::finishing_phase(&job.index_db).await;
             Ok(())
         }
         JobType::JobDataDeletion => {
@@ -624,6 +630,7 @@ async fn execute_job(job: Job) -> Result<(), String> {
                     // when the deletion turned out to be a no-op.
                     crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0).await;
                     guard.resume().await;
+                    vector_quants::finishing_phase(&job.index_db).await;
                     Ok(())
                 }
                 Err(err) => {
@@ -631,6 +638,15 @@ async fn execute_job(job: Job) -> Result<(), String> {
                     Err(format!("{err:?}"))
                 }
             }
+        }
+        JobType::VectorQuantReconcile => {
+            // No continuous-scan pause: the reconcile touches only quant
+            // tables and serializes with extraction via the job queue
+            // itself; continuous scan writes no embeddings.
+            crate::jobs::vector_quants::run_reconcile(&job.index_db)
+                .await
+                .map_err(|err| format!("{err:?}"))?;
+            Ok(())
         }
         #[cfg(test)]
         JobType::TestSleep => {

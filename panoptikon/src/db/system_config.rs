@@ -32,6 +32,49 @@ pub(crate) struct JobSettings {
     pub default_threshold: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub(crate) struct VectorQuantProfileConfig {
+    pub name: String,
+    /// 'binary' in v1; 'int8' is a reserved future recipe slot.
+    pub quantizer: String,
+    /// Mean-center vectors before binarization (per embedding space).
+    #[serde(default)]
+    pub centered: bool,
+}
+
+/// Desired state for vector quantization (docs/vector-index-design.md).
+/// `None` (section absent from TOML) means the built-in default profile;
+/// an explicit empty `profiles` list means opted out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub(crate) struct VectorQuantsConfig {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<VectorQuantProfileConfig>,
+}
+
+impl VectorQuantsConfig {
+    /// The day-1 desired state used when the TOML section is absent.
+    pub(crate) fn builtin_default() -> Self {
+        Self {
+            default: Some("default".to_string()),
+            profiles: vec![VectorQuantProfileConfig {
+                name: "default".to_string(),
+                quantizer: "binary".to_string(),
+                centered: true,
+            }],
+        }
+    }
+}
+
+/// Resolves the effective desired state: absent section = built-in default.
+pub(crate) fn effective_vector_quants(config: &SystemConfig) -> VectorQuantsConfig {
+    config
+        .vector_quants
+        .clone()
+        .unwrap_or_else(VectorQuantsConfig::builtin_default)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SystemConfig {
     #[serde(default = "default_true")]
@@ -71,6 +114,10 @@ pub(crate) struct SystemConfig {
     pub prewarm_embedding_models: bool,
     #[serde(default)]
     pub continuous_filescan: ContinuousFilescanConfig,
+
+    /// Vector quantization desired state; absent = built-in default profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_quants: Option<VectorQuantsConfig>,
 
     /// PQL job filters (parsed).
     #[serde(default)]
@@ -125,6 +172,7 @@ impl Default for SystemConfig {
                 poll_interval_secs: None,
                 included_folders: Vec::new(),
             },
+            vector_quants: None,
             job_filters: Vec::new(),
             filescan_filter: None,
             extra: BTreeMap::new(),

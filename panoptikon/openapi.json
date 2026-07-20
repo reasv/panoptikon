@@ -6078,6 +6078,7 @@
           "folder_rescan",
           "folder_update",
           "job_data_deletion",
+          "vector_quant_reconcile",
           "test_sleep",
           "test_panic"
         ]
@@ -8902,6 +8903,17 @@
           },
           "scan_video": {
             "type": "boolean"
+          },
+          "vector_quants": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VectorQuantsConfig",
+                "description": "Vector quantization desired state; absent = built-in default profile."
+              }
+            ]
           }
         },
         "additionalProperties": {
@@ -9069,7 +9081,45 @@
           }
         }
       },
-      "Value": {}
+      "Value": {},
+      "VectorQuantProfileConfig": {
+        "type": "object",
+        "required": [
+          "name",
+          "quantizer"
+        ],
+        "properties": {
+          "centered": {
+            "type": "boolean",
+            "description": "Mean-center vectors before binarization (per embedding space)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "quantizer": {
+            "type": "string",
+            "description": "'binary' in v1; 'int8' is a reserved future recipe slot."
+          }
+        }
+      },
+      "VectorQuantsConfig": {
+        "type": "object",
+        "description": "Desired state for vector quantization (docs/vector-index-design.md).\n`None` (section absent from TOML) means the built-in default profile;\nan explicit empty `profiles` list means opted out.",
+        "properties": {
+          "default": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorQuantProfileConfig"
+            }
+          }
+        }
+      }
     }
   },
   "tags": [

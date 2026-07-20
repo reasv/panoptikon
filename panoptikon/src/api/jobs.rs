@@ -408,11 +408,24 @@ pub(crate) async fn update_config(
             .collect::<Vec<_>>(),
     )
     .await?;
+    // Reject invalid [vector_quants] at save time; the load-time paths
+    // treat an invalid section as empty, which would silently remove
+    // profiles.
+    if let Some(quants) = &config.vector_quants {
+        if let Err(message) = crate::db::vector_quants::resolve_desired(quants) {
+            return Err(ApiError::bad_request(message));
+        }
+    }
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
     let config = store.load(&conn.index_db)?;
     let _ = continuous_scan::notify_config_change(&conn.index_db).await;
     let _ = cron::notify_config_change(&conn.index_db).await;
+    // Commit semantics: the TOML write, the discrepancy check, and its
+    // consequence (synchronous metadata sync or a reconcile job) are one
+    // action — there is no state where the config was written but the work
+    // was not scheduled.
+    crate::jobs::vector_quants::check_and_schedule(&conn.index_db, &conn.user_data_db).await;
     let resync_needed = is_resync_needed(&conn.index_db, &conn.user_data_db, &config).await?;
     if resync_needed {
         let _ = enqueue_job(JobRequest {

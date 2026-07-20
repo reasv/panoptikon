@@ -16,6 +16,7 @@ pub(crate) mod setup;
 pub(crate) mod storage;
 pub(crate) mod system_config;
 pub(crate) mod tags;
+pub(crate) mod vector_quants;
 
 #[allow(unused_imports)] // For the future DB delete/rename/restore flow.
 pub(crate) use connection::invalidate_read_pools;

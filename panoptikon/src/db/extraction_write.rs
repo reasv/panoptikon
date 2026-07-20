@@ -585,6 +585,11 @@ async fn add_embedding(
         tracing::error!(error = %err, "failed to insert embedding");
         ApiError::internal("Failed to write extraction data")
     })?;
+    // Inline quant maintenance (docs/vector-index-design.md): once a pair's
+    // artifact is frozen, every vector's quant commits in the same
+    // transaction as the vector itself, so no future vector can be missed
+    // across cancellations and restarts.
+    crate::db::vector_quants::write_inline_quants(conn, data_id).await?;
     Ok(result.last_insert_rowid())
 }
 

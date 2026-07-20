@@ -266,6 +266,12 @@ async fn async_main() -> anyhow::Result<()> {
     if local_api && !db::readonly_mode() {
         db::migrations::migrate_databases_on_disk(None, None).await?;
         db::migrations::migrate_all_databases_on_disk().await?;
+        // Vector-quant discrepancy check (crash/power-loss recovery and
+        // first-post-upgrade convergence): metadata-only diffs are applied
+        // synchronously, real data work enqueues a reconcile job. Runs in
+        // the background — nobody waits; `auto` resolves to exact until
+        // coverage is ready.
+        tokio::spawn(jobs::vector_quants::check_all_at_startup());
     }
 
     // Managed Python environment: when local inference is enabled with no

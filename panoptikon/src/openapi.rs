@@ -133,6 +133,8 @@ impl Modify for JsonValueSchema {
             crate::db::system_config::SystemConfig,
             crate::db::system_config::CronJob,
             crate::db::system_config::JobSettings,
+            crate::db::system_config::VectorQuantsConfig,
+            crate::db::system_config::VectorQuantProfileConfig,
             crate::db::items::ExtractedTextRecord,
             crate::db::items::ItemIdentifierType,
             crate::api::bookmarks::BookmarkNamespaces,

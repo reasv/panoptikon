@@ -212,6 +212,53 @@ pub(crate) enum IndexDbWriterMessage {
     DeleteFilesNotUnderIncludedFolders {
         reply: Reply<u64>,
     },
+    /// Applies the vector-quant metadata diff (profiles/coverage rows) for
+    /// the given desired state in one transaction. Replies whether anything
+    /// changed.
+    VectorQuantSyncMetadata {
+        desired: crate::db::vector_quants::DesiredState,
+        reply: Reply<bool>,
+    },
+    /// Freezes an artifact and moves a space's pairs to `building` under one
+    /// new revision (replied).
+    VectorQuantStartSpaceBuild {
+        profile_id: i64,
+        setter_ids: Vec<i64>,
+        artifact: Option<Vec<u8>>,
+        dim: i64,
+        reply: Reply<i64>,
+    },
+    /// One chunked backfill transaction; replies rows written (0 = done).
+    VectorQuantBackfillChunk {
+        profile_id: i64,
+        setter_id: i64,
+        limit: i64,
+        reply: Reply<u64>,
+    },
+    /// Verifies the coverage invariant and flips a space's pairs to ready.
+    VectorQuantFinishSpaceBuild {
+        profile_id: i64,
+        setter_ids: Vec<i64>,
+        reply: Reply<()>,
+    },
+    /// One chunked delete of a removing profile's quants (0 = done).
+    VectorQuantDeleteChunk {
+        profile_id: i64,
+        limit: i64,
+        reply: Reply<u64>,
+    },
+    /// Drops a removing profile row once its quants are gone.
+    VectorQuantDropProfile {
+        profile_id: i64,
+        reply: Reply<()>,
+    },
+    /// Marks a space for explicit rebuild (pending, artifact cleared).
+    #[allow(dead_code)] // wired up by the UI rebuild-action stage
+    VectorQuantMarkRebuild {
+        profile_id: i64,
+        setter_ids: Vec<i64>,
+        reply: Reply<()>,
+    },
     Vacuum {
         reply: Reply<()>,
     },
@@ -758,6 +805,120 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_files_not_under_included_folders(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantSyncMetadata { desired, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::sync_metadata(conn, desired).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantStartSpaceBuild {
+                profile_id,
+                setter_ids,
+                artifact,
+                dim,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::start_space_build(
+                                conn,
+                                profile_id,
+                                &setter_ids,
+                                artifact.as_deref(),
+                                dim,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantBackfillChunk {
+                profile_id,
+                setter_id,
+                limit,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::backfill_chunk(
+                                conn, profile_id, setter_id, limit,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantFinishSpaceBuild {
+                profile_id,
+                setter_ids,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::finish_space_build(
+                                conn,
+                                profile_id,
+                                &setter_ids,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantDeleteChunk {
+                profile_id,
+                limit,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::delete_quants_chunk(conn, profile_id, limit)
+                                .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantDropProfile { profile_id, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::drop_profile(conn, profile_id).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::VectorQuantMarkRebuild {
+                profile_id,
+                setter_ids,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::vector_quants::mark_space_rebuild(
+                                conn,
+                                profile_id,
+                                &setter_ids,
+                            )
+                            .await
+                        })
                     })
                     .await;
                 let _ = reply.send(result);
