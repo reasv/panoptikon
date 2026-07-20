@@ -348,11 +348,17 @@ Mechanics:
   initial backfill** — one pass over the setter's vectors to
   accumulate the mean, freeze with rev, then quantize in the same job.
   One backfill per pair, not two.
+- **Payload encoding**: the per-space mean vector as little-endian
+  f32 — the same layout as the embedding blobs (post rider fix).
+  Format changes ride rev bumps; no self-describing header.
+- **`artifact_min_vectors` is a compile-time constant in v1** (1024),
+  not a TOML knob — no known reason to tune it per install; promote
+  to config only if one appears.
 - **The query side applies the same transform**: preprocess loads the
   (profile, setter) artifact and centers the query embedding before
   binarizing. Artifacts are therefore needed at read time, cached
   keyed on (db, profile, rev).
-- **`artifact_min_vectors` (default 1024)**: below it, the pair stays
+- **`artifact_min_vectors` (constant, 1024)**: below it, the pair stays
   `pending`, nothing is quantized, search is exact for that setter
   (instant at that size, literally correct). The threshold exists
   because artifacts freeze: a mean from 3 vectors frozen forever is
@@ -405,6 +411,10 @@ Mechanics:
 
 Pair state machine: `absent → pending → building(rev r) → ready(r)
 [→ rebuilding(r+1) → ready(r+1)]`, `removing` at profile level.
+Explicitly: bumping rev **clears `ready` immediately** (the coverage
+invariant demands it — not all quants are at the current rev), so the
+pair searches exact for the duration of the rebuild backfill.
+Mixed-rev Hamming against the new artifact is never served.
 
 New-setter flow end to end: new embedding model's first extraction job
 creates the setter and vectors (inline hook writes nothing — no
