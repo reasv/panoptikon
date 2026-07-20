@@ -227,6 +227,14 @@ pub(crate) struct FileSearchResponse {
     results: Vec<SearchResult>,
     count_metrics: SearchMetrics,
     result_metrics: SearchMetrics,
+    /// Random Order Seed
+    ///
+    /// The seed this query actually shuffled by, present only when the query
+    /// orders by `random`. Pass it back as `seed` on subsequent pages to page
+    /// through one coherent shuffle; omit it (or send a new one) to reshuffle.
+    /// Echoed whether the caller supplied it or the server minted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -441,11 +449,13 @@ pub async fn search_pql(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let query = decode_pql_payload(&payload)?;
+    let mut query = decode_pql_payload(&payload)?;
     let skip_missing_file =
         query.check_path && matches!(query.entity, EntityType::File) && is_empty_partition(&query);
     let cache_requested = query.cache;
     let prefetch_pages = query.prefetch_pages.min(MAX_PREFETCH_PAGES);
+    // Must happen before compiling: the seed is bound into the results SQL.
+    let seed = query.resolve_seed();
     let builder = compile_pql(&state, query, &db.index_db).await?;
 
     let mut count_metrics = builder.count_metrics.clone();
@@ -458,6 +468,12 @@ pub async fn search_pql(
         .is_none_or(|Extension(context)| context.search_cache);
     let cache_available = search_cache::is_enabled() && policy_allows;
     let use_cache = cache_available && cache_requested;
+    // A synthesized seed differs on every request, so its rows are keyed
+    // where nothing will ever look again: storing them would fill the byte
+    // budget with permanently-dead entries and evict useful ones. Counts are
+    // unaffected — the count SQL is built before any ORDER BY, so no seed
+    // reaches it and one cached count serves every seed and page.
+    let use_results_cache = use_cache && !seed.synthesized;
     // Bypass skips the read AND the write: a benchmark request must not
     // pollute the cache.
     let inactive_outcome = if cache_available {
@@ -511,7 +527,7 @@ pub async fn search_pql(
 
     let mut results = if let Some(compiled) = builder.compiled_query.as_ref() {
         let start = Instant::now();
-        let (page_results, outcome, prefetched) = if use_cache {
+        let (page_results, outcome, prefetched) = if use_results_cache {
             let user_data_db = builder.uses_user_data.then_some(db.user_data_db.as_str());
             let key = SearchCacheKey::new(
                 &db.index_db,
@@ -590,6 +606,7 @@ pub async fn search_pql(
         results,
         count_metrics,
         result_metrics,
+        seed: seed.effective,
     }))
 }
 
@@ -700,7 +717,10 @@ pub async fn search_pql_build(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    let query = decode_pql_payload(&payload)?;
+    let mut query = decode_pql_payload(&payload)?;
+    // Mirrors the search handler so the returned SQL is what a search would
+    // actually execute, seed included.
+    query.resolve_seed();
     let mut builder = compile_pql(&state, query, &db.index_db).await?;
     // The builder keeps pagination out of the compiled SQL (cache keying);
     // this endpoint contracts to return the executable query, so re-apply it.
@@ -1289,6 +1309,7 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
+    use crate::pql::model::{OrderArgs, OrderByField};
 
     fn result_with_sha(sha256: Option<&str>) -> SearchResult {
         SearchResult {
@@ -1684,6 +1705,110 @@ mod tests {
             executable.params,
             encode_values(expected_values).expect("encode")
         );
+    }
+
+    fn random_order_query(seed: Option<i64>) -> PqlQuery {
+        PqlQuery {
+            order_by: vec![OrderArgs {
+                order_by: OrderByField::Random,
+                ..OrderArgs::default()
+            }],
+            seed,
+            ..PqlQuery::default()
+        }
+    }
+
+    /// The seed must reach the SQL as a *bound parameter*, not inlined text:
+    /// that is what puts it in the cache key's params and lets SQLite reuse
+    /// the prepared statement across reshuffles.
+    #[test]
+    fn random_order_binds_seed_as_a_parameter() {
+        let built = build_query_preprocessed(random_order_query(Some(987_654)), false)
+            .expect("results build");
+        let compiled = compile_select(built).expect("compile");
+
+        assert!(
+            compiled.sql.contains("pk_mix"),
+            "random order must sort by pk_mix, got: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("random()"),
+            "unseeded random() must not survive: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("987654"),
+            "the seed must be bound, not inlined: {}",
+            compiled.sql
+        );
+        assert!(
+            compiled.params.contains(&Value::from(987_654_i64)),
+            "the seed must appear in the bound params: {:?}",
+            compiled.params
+        );
+    }
+
+    /// Counts are built before any ORDER BY, so no seed reaches them — this
+    /// is what lets one cached count serve every seed and every page.
+    #[test]
+    fn count_query_is_free_of_the_seed() {
+        let built =
+            build_query_preprocessed(random_order_query(Some(987_654)), true).expect("count build");
+        let compiled = compile_select(built).expect("compile");
+
+        assert!(
+            !compiled.sql.contains("pk_mix"),
+            "count SQL must not order at all: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.params.contains(&Value::from(987_654_i64)),
+            "count params must not carry the seed: {:?}",
+            compiled.params
+        );
+    }
+
+    /// Two seeds must produce SQL that differs only in the bound value, so
+    /// they land in different cache entries rather than sharing one.
+    #[test]
+    fn different_seeds_differ_only_in_bound_params() {
+        let a = compile_select(
+            build_query_preprocessed(random_order_query(Some(1)), false).expect("build"),
+        )
+        .expect("compile");
+        let b = compile_select(
+            build_query_preprocessed(random_order_query(Some(2)), false).expect("build"),
+        )
+        .expect("compile");
+
+        assert_eq!(a.sql, b.sql, "seed must not vary the SQL text");
+        assert_ne!(a.params, b.params, "seed must vary the bound params");
+    }
+
+    #[test]
+    fn resolve_seed_mints_only_for_random_order() {
+        // Non-random queries are left alone: minting would cost them the
+        // result cache for no benefit.
+        let mut plain = PqlQuery::default();
+        let resolved = plain.resolve_seed();
+        assert!(resolved.effective.is_none());
+        assert!(!resolved.synthesized);
+        assert!(plain.seed.is_none());
+
+        // A supplied seed is preserved and not flagged as synthesized.
+        let mut supplied = random_order_query(Some(42));
+        let resolved = supplied.resolve_seed();
+        assert_eq!(resolved.effective, Some(42));
+        assert!(!resolved.synthesized);
+
+        // A missing seed is minted, flagged, and written back so the builder
+        // sees it.
+        let mut missing = random_order_query(None);
+        let resolved = missing.resolve_seed();
+        assert!(resolved.synthesized);
+        assert_eq!(resolved.effective, missing.seed);
+        assert!(missing.seed.is_some());
     }
 
     #[test]

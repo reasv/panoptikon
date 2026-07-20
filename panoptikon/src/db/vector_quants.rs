@@ -1657,28 +1657,15 @@ pub(crate) async fn default_profile_name(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
-    use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
-    use sqlite_vec::sqlite3_vec_init;
     use sqlx::{Row, SqliteConnection};
 
     use super::*;
     use crate::db::migrations::setup_test_databases;
+    use crate::db::sql_functions::ensure_sqlite_extensions;
     use crate::db::system_config::{VectorQuantProfileConfig, VectorQuantsConfig};
 
     fn ensure_vec_extension_loaded() {
-        static EXT_LOADED: OnceLock<()> = OnceLock::new();
-        if EXT_LOADED.get().is_some() {
-            return;
-        }
-        let status = unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
-        };
-        if status != SQLITE_OK {
-            panic!("failed to register sqlite-vec extension for tests");
-        }
-        let _ = EXT_LOADED.set(());
+        ensure_sqlite_extensions().expect("failed to register SQLite extensions for tests");
     }
 
     // sqlite-vec bit vectors need dims divisible by 8; all test vectors are

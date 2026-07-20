@@ -339,6 +339,20 @@ pub(crate) struct PqlQuery {
     ///
     /// You cannot partition by text columns if the entity is "file".
     pub partition_by: Option<Vec<Column>>,
+    /// Random Order Seed
+    ///
+    /// Seeds the shuffle used by `order_by: "random"`, making it a stable
+    /// total order: the same seed reproduces the same ordering, so pages
+    /// partition the result set instead of each being an independent sample.
+    /// Pass the same seed across a pagination session, and a new one to
+    /// reshuffle.
+    ///
+    /// Ignored unless the query orders by "random". If omitted, the server
+    /// mints a fresh seed per request — which reproduces the legacy
+    /// behaviour (a new sample every time, and pages that may repeat or skip
+    /// results) and bypasses the result cache. The seed actually used is
+    /// always returned in the response.
+    pub seed: Option<i64>,
     pub page: i64,
     pub page_size: i64,
     /// Count Results
@@ -389,6 +403,7 @@ impl Default for PqlQuery {
             select: default_select_fields(),
             entity: EntityType::File,
             partition_by: None,
+            seed: None,
             page: 1,
             page_size: 10,
             count: true,
@@ -396,6 +411,46 @@ impl Default for PqlQuery {
             check_path: false,
             cache: true,
             prefetch_pages: 0,
+        }
+    }
+}
+
+/// What happened when a query's random-order seed was resolved.
+pub(crate) struct SeedResolution {
+    /// The seed the query will actually use, if it orders randomly at all.
+    pub effective: Option<i64>,
+    /// True when the server minted the seed because the caller omitted one.
+    /// Such a seed differs on every request, so its results are unreachable
+    /// by any later request: caching them would fill the byte budget with
+    /// entries that can never be hit. Callers use this to bypass the cache.
+    pub synthesized: bool,
+}
+
+impl PqlQuery {
+    /// True if any top-level order term is `random`. Filter-derived orders
+    /// (`order_list`) never produce `Random`, so this is the whole picture.
+    pub(crate) fn orders_by_random(&self) -> bool {
+        self.order_by
+            .iter()
+            .any(|args| matches!(args.order_by, OrderByField::Random))
+    }
+
+    /// Ensure a randomly-ordered query has a seed, minting one if the caller
+    /// omitted it. Queries that do not order randomly are left alone — their
+    /// seed never reaches the SQL, so minting one would only cost them the
+    /// result cache.
+    pub(crate) fn resolve_seed(&mut self) -> SeedResolution {
+        if !self.orders_by_random() {
+            return SeedResolution {
+                effective: None,
+                synthesized: false,
+            };
+        }
+        let synthesized = self.seed.is_none();
+        let seed = *self.seed.get_or_insert_with(rand::random::<i64>);
+        SeedResolution {
+            effective: Some(seed),
+            synthesized,
         }
     }
 }

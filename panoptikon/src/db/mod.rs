@@ -13,6 +13,7 @@ pub(crate) mod migrations;
 pub(crate) mod pinboards;
 pub(crate) mod pql;
 pub(crate) mod setup;
+pub(crate) mod sql_functions;
 pub(crate) mod storage;
 pub(crate) mod system_config;
 pub(crate) mod tags;

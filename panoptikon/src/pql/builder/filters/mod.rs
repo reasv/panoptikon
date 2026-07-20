@@ -36,14 +36,12 @@ pub(crate) trait FilterCompiler {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
-    use std::sync::OnceLock;
 
-    use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
     use sea_query::{Alias, Cond, Expr, ExprTrait, Query, SqliteQueryBuilder};
     use sea_query_sqlx::SqlxBinder;
-    use sqlite_vec::sqlite3_vec_init;
 
     use crate::db::migrations::setup_test_databases;
+    use crate::db::sql_functions::ensure_sqlite_extensions;
     use crate::pql::build_query;
     use crate::pql::model::{EntityType, PqlQuery, QueryElement};
 
@@ -53,17 +51,7 @@ pub(crate) mod test_support {
     use super::{CteRef, FilterCompiler, QueryState};
 
     fn ensure_vec_extension_loaded() {
-        static EXT_LOADED: OnceLock<()> = OnceLock::new();
-        if EXT_LOADED.get().is_some() {
-            return;
-        }
-        let status = unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
-        };
-        if status != SQLITE_OK {
-            panic!("failed to register sqlite-vec extension for tests");
-        }
-        let _ = EXT_LOADED.set(());
+        ensure_sqlite_extensions().expect("failed to register SQLite extensions for tests");
     }
 
     pub(crate) fn build_base_state(entity: EntityType, count_query: bool) -> QueryState {

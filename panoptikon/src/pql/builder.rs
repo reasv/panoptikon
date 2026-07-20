@@ -364,12 +364,18 @@ fn build_query_with_root(
         &mut selected_columns,
     );
 
+    // The API layer resolves the seed (minting one when the caller omitted
+    // it), so this is Some for every request that orders randomly. The
+    // fallback keeps direct builder callers — tests, tooling — deterministic
+    // rather than reintroducing an unseeded shuffle.
+    let seed = input_query.seed.unwrap_or(0);
     let (mut full_query, order_specs, order_columns) = build_order_by(
         full_query,
         root_cte_name.as_deref(),
         input_query.partition_by.is_some(),
         &state.order_list,
         &input_query.order_by,
+        seed,
     );
 
     if let Some(partition_by) = input_query.partition_by.clone() {
@@ -842,6 +848,7 @@ fn build_order_by(
     select_conds: bool,
     order_list: &[OrderByFilter],
     order_args: &[OrderArgs],
+    seed: i64,
 ) -> (SelectStatement, Vec<OrderSpec>, Vec<OrderByColumn>) {
     let combined = combine_order_lists(order_list, order_args);
     let mut order_specs = Vec::new();
@@ -851,7 +858,7 @@ fn build_order_by(
         match spec {
             OrderItem::Args(args) => {
                 let (query_out, order_spec, order_column) =
-                    apply_order_args(query, &args, index, select_conds);
+                    apply_order_args(query, &args, index, select_conds, seed);
                 query = query_out;
                 order_specs.push(order_spec);
                 if let Some(order_column) = order_column {
@@ -959,9 +966,10 @@ fn apply_order_args(
     args: &OrderArgs,
     index: usize,
     select_conds: bool,
+    seed: i64,
 ) -> (SelectStatement, OrderSpec, Option<OrderByColumn>) {
     let (order_by, order) = get_order_by_and_direction(args);
-    let expr = get_order_by_expr(order_by);
+    let expr = get_order_by_expr(order_by, seed);
     let order_spec = OrderSpec {
         expr: expr.clone(),
         order: order.clone(),
@@ -1329,9 +1337,21 @@ fn get_column_expr(column: Column) -> Expr {
     }
 }
 
-fn get_order_by_expr(field: OrderByField) -> Expr {
+/// The expression a top-level order term sorts by.
+///
+/// `seed` is only consulted for `Random`, which orders by `pk_mix(file_id,
+/// seed)` rather than SQLite's `random()`. That makes the shuffle a
+/// deterministic permutation reproducible from the seed, so pages partition
+/// the result set and the result cache can serve them (see
+/// `docs/seeded-random-order-design.md`). `files.id` is available in every
+/// query shape this builder emits — `add_inner_joins` always joins files and
+/// `file_id` is unconditionally selected.
+fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
     match field {
-        OrderByField::Random => Func::random().into(),
+        OrderByField::Random => Func::cust(Alias::new("pk_mix"))
+            .arg(Expr::col((Files::Table, Files::Id)))
+            .arg(seed)
+            .into(),
         OrderByField::FileId => Expr::col((Files::Table, Files::Id)),
         OrderByField::Sha256 => Expr::col((Files::Table, Files::Sha256)),
         OrderByField::Path => Expr::col((Files::Table, Files::Path)),

@@ -5699,6 +5699,14 @@
             "items": {
               "$ref": "#/components/schemas/SearchResult"
             }
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Random Order Seed\n\nThe seed this query actually shuffled by, present only when the query\norders by `random`. Pass it back as `seed` on subsequent pages to page\nthrough one coherent shuffle; omit it (or send a new one) to reshuffle.\nEchoed whether the caller supplied it or the server minted it."
           }
         }
       },
@@ -7792,6 +7800,15 @@
             "type": "boolean",
             "description": "Return Results\n\nIf true, the query will return the results that match the query.\nIf false, only the total count will be returned, if requested.",
             "default": true
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Random Order Seed\n\nSeeds the shuffle used by `order_by: \"random\"`, making it a stable\ntotal order: the same seed reproduces the same ordering, so pages\npartition the result set instead of each being an independent sample.\nPass the same seed across a pagination session, and a new one to\nreshuffle.\n\nIgnored unless the query orders by \"random\". If omitted, the server\nmints a fresh seed per request — which reproduces the legacy\nbehaviour (a new sample every time, and pages that may repeat or skip\nresults) and bypasses the result cache. The seed actually used is\nalways returned in the response.",
+            "default": null
           },
           "select": {
             "type": "array",

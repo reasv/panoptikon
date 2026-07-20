@@ -2,9 +2,7 @@ use axum::{
     extract::{FromRequestParts, Query},
     http::request::Parts,
 };
-use libsqlite3_sys::{SQLITE_OK, sqlite3_auto_extension};
 use serde::Deserialize;
-use sqlite_vec::sqlite3_vec_init;
 use sqlx::{
     Connection, SqliteConnection, SqlitePool,
     pool::PoolConnection,
@@ -22,6 +20,7 @@ use std::{
 use url::Url;
 
 use crate::api_error::ApiError;
+use crate::db::sql_functions::ensure_sqlite_extensions;
 
 pub struct ReadOnly;
 /// Read-only mode that skips the user_data attach for endpoints that never
@@ -271,7 +270,7 @@ async fn acquire_read_conn(
 }
 
 fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
-    ensure_sqlite_vec_loaded()?;
+    ensure_sqlite_extensions()?;
     let options = SqliteConnectOptions::new()
         .filename(&paths.index_db_file)
         .read_only(true);
@@ -472,7 +471,7 @@ async fn connect_db(
     user_data_wl: bool,
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
-    ensure_sqlite_vec_loaded()?;
+    ensure_sqlite_extensions()?;
     let readonly_mode = readonly_mode();
     let write_lock = write_lock && !readonly_mode;
     let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
@@ -580,20 +579,4 @@ fn user_data_attach_path(path: &Path, read_only: bool) -> String {
     }
     let path = path.to_string_lossy().replace('\\', "/");
     format!("file:{path}?mode=ro")
-}
-
-fn ensure_sqlite_vec_loaded() -> Result<(), ApiError> {
-    static EXT_LOADED: OnceLock<()> = OnceLock::new();
-    if EXT_LOADED.get().is_some() {
-        return Ok(());
-    }
-
-    let status =
-        unsafe { sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ()))) };
-    if status != SQLITE_OK {
-        tracing::error!(status, "failed to register sqlite-vec extension");
-        return Err(ApiError::internal("Failed to load sqlite-vec extension"));
-    }
-    let _ = EXT_LOADED.set(());
-    Ok(())
 }
