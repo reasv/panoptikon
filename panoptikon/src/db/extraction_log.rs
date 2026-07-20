@@ -277,18 +277,25 @@ pub(crate) async fn delete_data_job_by_log_id(
     Ok(deleted)
 }
 
+/// Served to the scan page, which polls it. `idx_item_data_placeholder_setter_type`
+/// is what keeps it off the item_data heap: grouping on the bare `setter_id`
+/// column (rather than on the joined `setters.id`) is what lets the index
+/// supply both the count and its order — see the migration that adds it.
+const SETTER_TOTALS_SQL: &str = r#"
+        SELECT s.name as setter_name, t.total_count as total_count
+        FROM (
+            SELECT setter_id, COUNT(*) as total_count
+            FROM item_data
+            WHERE is_placeholder = 0
+            GROUP BY setter_id
+        ) t
+        JOIN setters s ON s.id = t.setter_id
+        "#;
+
 pub(crate) async fn get_setters_total_data(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Vec<(String, i64)>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT s.name as setter_name, COUNT(ie.id) as total_count
-        FROM item_data ie
-        JOIN setters s ON ie.setter_id = s.id
-        WHERE ie.is_placeholder = 0
-        GROUP BY s.id, s.name
-        "#,
-    )
+    let rows = sqlx::query(SETTER_TOTALS_SQL)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| {
@@ -482,6 +489,30 @@ mod tests {
         .unwrap();
         let totals = get_setters_total_data(&mut dbs.index_conn).await.unwrap();
         assert_eq!(totals, vec![("alpha".to_string(), 2)]);
+
+        // The count is polled by the scan page, so it must never touch the
+        // item_data heap: the index has to answer it outright. Column order
+        // drifting out of sync with the query would not fail anything —
+        // SQLite would just quietly go back to scanning every row.
+        let plan: Vec<String> =
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {SETTER_TOTALS_SQL}"
+            )))
+            .fetch_all(&mut dbs.index_conn)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_item_data_placeholder_setter")),
+            "setter totals must be answered from the covering index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "the index already yields setter order; grouping must not sort: {plan:?}"
+        );
     }
 
     // Ensures data job deletion removes data_jobs row for a log.
