@@ -281,6 +281,20 @@ from the predicate*: first post-upgrade check finds desired ≠ empty
 actual → one job, once; thereafter the diff is empty forever. No
 version flags, and it self-heals anything half-done.
 
+Two consequences of "TOML is editable by anyone at any time":
+
+- **Invalid config is inert, never an implicit opt-out.** An unparseable
+  or invalid `[vector_quants]` section produces *no* reconcile action at
+  all (logged; the status endpoint surfaces it so the card can say so).
+  Treating it as "no profiles desired" would delete every quant on a
+  typo and force a full rebuild once it was fixed.
+- **A running reconcile re-reads desired state until it converges.** Its
+  own enqueue is deduplicated against it, so a config commit landing
+  mid-run would otherwise be silently dropped; instead the running job
+  re-plans against the newest TOML. Per-space failures are isolated: one
+  corrupt setter leaves its own pair non-ready (exact search) without
+  blocking the rest of the plan.
+
 ### The reconcile job
 
 A maintenance job serialized in the batch queue — the serialization
@@ -308,8 +322,13 @@ recomputes its work list from the diff:
    drop row.
 
 Cancellation/restart at any point leaves committed chunks; the next
-run's `NOT EXISTS` finds exactly the remainder. Progress = missing
-rows vs total. Cancelling is "not now": nothing is auto-rescheduled,
+run's `NOT EXISTS` finds exactly the remainder. A pair left `building`
+with its artifact already frozen **resumes at that revision** — no
+artifact recompute, no rev bump, no rewriting of finished chunks — so an
+interrupted large build never restarts from zero. Conversely a pair that
+has *left* `building` (explicit rebuild, recipe change) accepts no
+further chunks and cannot be flipped ready: its quants would otherwise
+mix transforms under one revision. Progress = missing rows vs total. Cancelling is "not now": nothing is auto-rescheduled,
 and the remainder converges at the next natural point (any batch
 job's finishing phase, a config commit, or startup) while desired ≠
 actual; "never" is removing the profile — itself another commit.
