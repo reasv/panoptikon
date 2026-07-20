@@ -585,6 +585,16 @@ async fn add_embedding(
         tracing::error!(error = %err, "failed to insert embedding");
         ApiError::internal("Failed to write extraction data")
     })?;
+    // The `SELECT ... WHERE` guard above makes a mismatched data_type insert
+    // nothing and report success, which would leave a non-placeholder
+    // item_data row with no vector — the pairing every embedding count
+    // relies on, and which `last_insert_rowid` below would paper over with a
+    // stale id. Both callers pass the data_type they just inserted, so this
+    // only fires if that stops being true. Mirrors `add_item_data`.
+    if result.rows_affected() == 0 {
+        tracing::error!(data_id, data_type, "embedding did not match its item data");
+        return Err(ApiError::internal("Failed to write extraction data"));
+    }
     // Inline quant maintenance (docs/vector-index-design.md): once a pair's
     // artifact is frozen, every vector's quant commits in the same
     // transaction as the vector itself, so no future vector can be missed
