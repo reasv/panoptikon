@@ -34,7 +34,7 @@ use crate::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
             FileScanData, FileUpsertResult, ItemScanMeta, get_file_by_path, get_item_id,
-            get_item_visual_meta, has_blurhash,
+            get_item_dimensions, get_item_visual_meta, has_blurhash,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -453,6 +453,11 @@ pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
 pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// Images at or below this size never get a stored thumbnail.
 const SMALL_IMAGE_FILE_SIZE: u64 = 5 * 1024 * 1024;
+/// Images within this pixel size are served from the original file.
+const MAX_SERVED_IMAGE_DIMENSION: i64 = 4096;
+/// Images above this file size get a thumbnail even when their pixel
+/// dimensions are modest.
+const MAX_SERVED_IMAGE_FILE_SIZE: u64 = 24 * 1024 * 1024;
 
 struct FolderStats {
     new_items: i64,
@@ -1039,13 +1044,25 @@ impl ScanContext {
             !has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
         let needs_blurhash = !has_blurhash(&mut self.conn, &sha256).await?;
         if needs_thumb && mime_type.starts_with("image") {
-            // Small images never get stored thumbnails; skip without decoding.
-            let small = fs::metadata(&path)
-                .map(|metadata| metadata.len() <= SMALL_IMAGE_FILE_SIZE)
-                .unwrap_or(true);
-            if small {
-                needs_thumb = false;
-            }
+            // Images served from the original file never get a stored
+            // thumbnail, so `has_thumbnail` stays false for them forever.
+            // Decide from the indexed dimensions instead of decoding, or every
+            // rescan re-decodes every such image to produce nothing.
+            needs_thumb = match fs::metadata(&path) {
+                // Unreadable now: leave the visuals to a later scan.
+                Err(_) => false,
+                Ok(metadata) => {
+                    let file_size = metadata.len();
+                    match get_item_dimensions(&mut self.conn, &sha256).await? {
+                        Some((Some(width), Some(height))) => {
+                            !image_is_served_directly(file_size, width, height)
+                        }
+                        // Dimensions were never recorded; fall back to the
+                        // size-only check and let the worker decode.
+                        _ => file_size > SMALL_IMAGE_FILE_SIZE,
+                    }
+                }
+            };
         }
         if !needs_thumb && !needs_blurhash {
             return Ok(());
@@ -1947,27 +1964,33 @@ fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
     image.thumbnail(max_dim, max_dim)
 }
 
+/// Whether an image is served from its original file and therefore gets no
+/// stored thumbnail. Kept separate from [`generate_thumbnail`] so a rescan can
+/// answer the question from indexed metadata instead of decoding the file:
+/// nothing is stored for these images, so `has_thumbnail` stays false forever
+/// and an unguarded backfill would decode them on every single scan.
+fn image_is_served_directly(file_size: u64, width: i64, height: i64) -> bool {
+    file_size <= SMALL_IMAGE_FILE_SIZE
+        || (width <= MAX_SERVED_IMAGE_DIMENSION
+            && height <= MAX_SERVED_IMAGE_DIMENSION
+            && file_size <= MAX_SERVED_IMAGE_FILE_SIZE)
+}
+
 fn generate_thumbnail(
     path: &Path,
     image: &DynamicImage,
 ) -> Result<Option<DynamicImage>, FileProcessError> {
     let metadata = fs::metadata(path).map_err(|err| FileProcessError::Io(err.to_string()))?;
     let file_size = metadata.len();
-    if file_size <= SMALL_IMAGE_FILE_SIZE {
-        return Ok(None);
-    }
-
     let (width, height) = image.dimensions();
-    let max_dimensions = (4096u32, 4096u32);
-    let max_file_size = 24 * 1024 * 1024u64;
-
-    if width <= max_dimensions.0 && height <= max_dimensions.1 && file_size <= max_file_size {
+    if image_is_served_directly(file_size, width as i64, height as i64) {
         return Ok(None);
     }
 
+    let max_dimension = MAX_SERVED_IMAGE_DIMENSION as u32;
     Ok(Some(image.resize(
-        max_dimensions.0,
-        max_dimensions.1,
+        max_dimension,
+        max_dimension,
         image::imageops::FilterType::Lanczos3,
     )))
 }
@@ -3167,6 +3190,101 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(item_count.0, 1);
+    }
+
+    #[test]
+    fn served_directly_matches_the_thumbnail_decision() {
+        // Small file: never thumbnailed, whatever the dimensions.
+        assert!(image_is_served_directly(SMALL_IMAGE_FILE_SIZE, 9000, 9000));
+        // Large pixels or a large file force a thumbnail.
+        assert!(!image_is_served_directly(
+            SMALL_IMAGE_FILE_SIZE + 1,
+            MAX_SERVED_IMAGE_DIMENSION + 1,
+            10
+        ));
+        assert!(!image_is_served_directly(
+            MAX_SERVED_IMAGE_FILE_SIZE + 1,
+            10,
+            10
+        ));
+        // The common case that used to be re-decoded on every scan: bigger
+        // than the small-file cutoff, but modest in both other dimensions.
+        assert!(image_is_served_directly(
+            SMALL_IMAGE_FILE_SIZE + 1,
+            MAX_SERVED_IMAGE_DIMENSION,
+            MAX_SERVED_IMAGE_DIMENSION
+        ));
+        assert!(image_is_served_directly(MAX_SERVED_IMAGE_FILE_SIZE, 10, 10));
+    }
+
+    // An image that is served from its original file stores no thumbnail, so
+    // `has_thumbnail` stays false for it forever. The backfill must decide
+    // from the indexed dimensions instead of decoding the file again on every
+    // scan; the on-disk contents are swapped for an image that *would* need a
+    // thumbnail, so any stray decode leaves a visible thumbnail row.
+    #[tokio::test]
+    async fn rescan_does_not_redecode_directly_served_images() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // A dedicated folder: the temp root is shared by every test in the
+        // process, so a leftover file would show up in another scan.
+        let media_dir = root.join("media-served-directly");
+        fs::create_dir_all(&media_dir).unwrap();
+        let image_path = media_dir.join("large.bmp");
+        // 1400x1400 uncompressed = 5.88 MB: over the small-file cutoff, but
+        // well inside the dimension and file-size limits.
+        image::RgbImage::new(1400, 1400).save(&image_path).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let thumbnails: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM storage.thumbnails")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(thumbnails.0, 0);
+        drop(conn);
+
+        // Same mtime, same byte count, but 4900 pixels wide: a decode would
+        // now produce a thumbnail. The indexed dimensions still say 1400x1400.
+        let mtime = fs::metadata(&image_path).unwrap().modified().unwrap();
+        image::RgbImage::new(4900, 400).save(&image_path).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
+        assert_eq!(
+            (unchanged, new_files, modified, errors, marked),
+            (1, 0, 0, 0, 0)
+        );
+        let thumbnails: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM storage.thumbnails")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(thumbnails.0, 0, "the backfill re-decoded the image");
     }
 
     // VACUUM must run outside the writer's usual transaction wrapper; both

@@ -289,6 +289,24 @@ pub(crate) async fn get_item_visual_meta(
     Ok(row)
 }
 
+/// Returns the item's stored pixel dimensions, used to decide whether an
+/// image would produce a thumbnail at all without decoding it again.
+pub(crate) async fn get_item_dimensions(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<(Option<i64>, Option<i64>)>> {
+    let row: Option<(Option<i64>, Option<i64>)> =
+        sqlx::query_as("SELECT width, height FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read item dimensions");
+                ApiError::internal("Failed to query item")
+            })?;
+    Ok(row)
+}
+
 pub(crate) async fn has_blurhash(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
