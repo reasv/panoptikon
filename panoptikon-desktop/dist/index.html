@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Panoptikon Desktop</title>
-    <link rel="stylesheet" href="styles.css?v=8" />
+    <link rel="stylesheet" href="styles.css?v=9" />
   </head>
   <body>
     <main class="app-shell">
@@ -25,7 +25,8 @@
           <div class="page-heading"><div><h2>Overview</h2><p>Control the local Panoptikon service, create databases, and manage Desktop updates.</p></div></div>
           <section class="card" aria-labelledby="local-server-title">
             <div class="card-heading"><div><h3 id="local-server-title">Local Server</h3><p>Runs Panoptikon on this computer and keeps it available to the Desktop app.</p></div><label class="switch"><span class="switch-label">Run locally</span><input id="local" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></label></div>
-            <dl class="server-details"><dt>Server root</dt><dd id="root"></dd><dt>Active port</dt><dd id="port"></dd></dl>
+            <dl class="server-details"><dt>Server root</dt><dd id="root"></dd><dt>Active port</dt><dd id="port"></dd><dt>Address</dt><dd class="address-row"><code id="address"></code><button id="copy-address" type="button">Copy</button><span id="copy-address-status" class="muted" aria-live="polite"></span></dd></dl>
+            <p class="muted">Open this address in any browser on this computer to use Panoptikon.</p>
             <div class="button-row secondary-actions"><button data-folder="server_root">Open Data Folder</button><button data-folder="config">Open Config Files</button><button data-folder="logs">Open Logs</button></div>
           </section>
           <section class="card" aria-labelledby="setup-title">
@@ -90,6 +91,6 @@
         </div>
       </div>
     </main>
-    <script src="app.js?v=6"></script>
+    <script src="app.js?v=7"></script>
   </body>
 </html>

@@ -6,6 +6,14 @@ Desktop release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Desktop shows Panoptikon's address.** The setup wizard's last step and the
+  Local Server section of Desktop settings now show the address Panoptikon is
+  running on, with a copy button. Every other way out of Desktop asks the
+  operating system to open a browser for you; when that fails there was nothing
+  on screen to tell you that Panoptikon is a web app you can simply visit.
+
 ### Fixed
 
 - **Linux Desktop (AppImage): opening things in the browser or a file manager

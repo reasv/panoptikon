@@ -50,6 +50,9 @@ h4 { margin: 24px 0 5px; color: var(--muted); font-size: .72rem; letter-spacing:
 .server-details { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 6px 14px; margin: 16px 0; padding: 13px 14px; background: var(--surface-subtle); border-radius: 7px; }
 .server-details dt { color: var(--muted); }
 .server-details dd { margin: 0; overflow-wrap: anywhere; }
+.address-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.address-row code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.address-row button { padding: 3px 9px; font-size: .82rem; }
 .secondary-actions { padding-top: 2px; }
 .setting-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(130px, 190px); align-items: center; gap: 22px; min-height: 70px; padding: 13px 0; border-top: 1px solid var(--border); }
 .card-heading + .setting-row, h4 + .setting-row { border-top: 0; }

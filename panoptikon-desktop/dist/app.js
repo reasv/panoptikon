@@ -385,6 +385,9 @@ async function refresh() {
     byId('state').textContent = status.state_label;
     byId('root').textContent = status.server_root;
     byId('port').textContent = status.port;
+    // The way out of Desktop that does not depend on the operating system
+    // agreeing to open a browser for us.
+    byId('address').textContent = `http://localhost:${status.port}`;
     byId('local').checked = status.local_server_enabled;
     byId('start-at-login').checked = status.start_at_login;
     if (!serverConfiguration) await loadServerConfiguration();
@@ -442,6 +445,33 @@ byId('start-at-login').addEventListener('change', async (event) => {
   const enabled = event.target.checked;
   try { await invoke('set_start_at_login', { enabled }); }
   catch (error) { event.target.checked = !enabled; fail(error); }
+});
+byId('copy-address').addEventListener('click', async () => {
+  const address = byId('address').textContent;
+  const status = byId('copy-address-status');
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(address);
+    copied = true;
+  } catch {
+    // The control window is not a secure origin on every platform, so the
+    // clipboard API may be missing entirely; the legacy path still works.
+    const field = document.createElement('textarea');
+    field.value = address;
+    document.body.appendChild(field);
+    field.select();
+    copied = document.execCommand('copy');
+    field.remove();
+  }
+  status.textContent = copied ? 'Copied' : 'Press Ctrl+C to copy';
+  if (!copied) {
+    const range = document.createRange();
+    range.selectNodeContents(byId('address'));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  window.setTimeout(() => { status.textContent = ''; }, 2500);
 });
 byId('relay-enabled').addEventListener('change', async (event) => {
   try { await invoke('set_relay_enabled', { enabled: event.target.checked }); await refresh(); } catch (error) { event.target.checked = !event.target.checked; fail(error); }
