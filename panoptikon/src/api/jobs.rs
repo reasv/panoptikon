@@ -587,8 +587,12 @@ pub(crate) async fn get_vector_quants(
              fix it to manage quant profiles.",
         )
     })?;
-    let status =
+    let mut status =
         crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;
+    // Drift alone doesn't mean the user has to do anything: every action that
+    // creates drift also enqueues the reconcile that resolves it. Report the
+    // in-flight job so the card can say "converging" instead of "act now".
+    status.reconcile_scheduled = reconcile_job_pending(&conn.index_db).await?;
     Ok(Json(status))
 }
 
@@ -653,6 +657,16 @@ pub(crate) async fn rebuild_vector_quant_pair(
     Ok(Json(VectorQuantActionResponse {
         detail: format!("Rebuild marked. {detail}"),
     }))
+}
+
+/// True when a reconcile job for this index DB is queued or running — the
+/// same condition `enqueue_reconcile_deduped` dedups on.
+async fn reconcile_job_pending(index_db: &str) -> Result<bool, ApiError> {
+    let queue = get_queue_status().await?;
+    Ok(queue
+        .queue
+        .iter()
+        .any(|job| job.index_db == index_db && job.tag.as_deref() == Some(RECONCILE_JOB_TAG)))
 }
 
 async fn enqueue_reconcile_deduped(index_db: &str, user_data_db: &str) -> Result<String, ApiError> {

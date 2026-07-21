@@ -1412,6 +1412,11 @@ pub(crate) struct VectorQuantStatus {
     /// True when desired and actual state differ (reconcile needed or
     /// running).
     pub reconcile_needed: bool,
+    /// True when a reconcile job for this index DB is already queued or
+    /// running, so the drift above is already being converged and asking
+    /// for another one would be a no-op. Filled in by the API layer, which
+    /// is the only place that can see the job queue.
+    pub reconcile_scheduled: bool,
 }
 
 /// Desired-merged-with-actual status for the scan page.
@@ -1544,6 +1549,7 @@ pub(crate) async fn load_status(
     Ok(VectorQuantStatus {
         profiles,
         reconcile_needed: work != ReconcileWork::None,
+        reconcile_scheduled: false,
     })
 }
 

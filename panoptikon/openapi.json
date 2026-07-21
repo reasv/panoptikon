@@ -9470,7 +9470,8 @@
         "type": "object",
         "required": [
           "profiles",
-          "reconcile_needed"
+          "reconcile_needed",
+          "reconcile_scheduled"
         ],
         "properties": {
           "profiles": {
@@ -9482,6 +9483,10 @@
           "reconcile_needed": {
             "type": "boolean",
             "description": "True when desired and actual state differ (reconcile needed or\nrunning)."
+          },
+          "reconcile_scheduled": {
+            "type": "boolean",
+            "description": "True when a reconcile job for this index DB is already queued or\nrunning, so the drift above is already being converged and asking\nfor another one would be a no-op. Filled in by the API layer, which\nis the only place that can see the job queue."
           }
         }
       },
