@@ -1553,18 +1553,36 @@ pub(crate) async fn load_status(
     })
 }
 
+/// Polled by the status card, so like [`FULL_VECTOR_COUNT_SQL`] it must not
+/// be O(vector bytes) — and here that is the whole trick.
+///
+/// `embedding_quants` is WITHOUT ROWID: its rows *are* its b-tree leaves,
+/// each carrying the `quant` blob. Any plan that reaches a quant row to
+/// read a column pages in every quant byte it walks past. Written as a
+/// join, this one did: the planner drove the loop off `profile_id` alone
+/// and fell through to the row for `rev`, seconds per count on a large
+/// index.
+///
+/// As a semi-join both sides stay in their indexes —
+/// `idx_item_data_setter_id` supplies the setter's ids, and
+/// `embedding_quants_profile_rev_id` answers the probe from the entry.
+/// `EXISTS` rather than `JOIN` is what makes the planner pick that shape
+/// without an `INDEXED BY` hint; the counted set is identical, since the
+/// `(id, profile_id)` primary key admits at most one quant per row anyway.
+/// Pinned by a test.
+const QUANTIZED_COUNT_SQL: &str = "SELECT COUNT(*) AS n \
+         FROM item_data d \
+         WHERE d.setter_id = ? \
+           AND EXISTS (SELECT 1 FROM embedding_quants q \
+                       WHERE q.profile_id = ? AND q.rev = ? AND q.id = d.id)";
+
 async fn quantized_count(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
     setter_id: i64,
     rev: i64,
 ) -> ApiResult<i64> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS n \
-         FROM item_data d \
-         JOIN embedding_quants q ON q.id = d.id \
-         WHERE d.setter_id = ? AND q.profile_id = ? AND q.rev = ?",
-    )
+    let row = sqlx::query(QUANTIZED_COUNT_SQL)
     .bind(setter_id)
     .bind(profile_id)
     .bind(rev)
@@ -2247,6 +2265,102 @@ mod tests {
             plan.iter()
                 .any(|step| step.contains("idx_item_data_placeholder_setter_type")),
             "vector count must be answered from the covering index: {plan:?}"
+        );
+    }
+
+    // The quant count is polled while a build runs, and `embedding_quants`
+    // rows carry the quant blob, so a plan that touches one of those rows
+    // reads the profile's whole payload per poll — 1.5s per count on a
+    // large index, which is what this shape exists to avoid. Pin that both
+    // sides stay in their indexes, and that the semi-join counts what the
+    // join it replaced counted.
+    #[tokio::test]
+    async fn quantized_count_is_answered_from_indexes() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {QUANTIZED_COUNT_SQL}"
+        )))
+        .bind(1)
+        .bind(1)
+        .bind(1)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("plan")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        for step in &plan {
+            assert!(
+                step.contains("COVERING INDEX"),
+                "the quant count must never reach a table row: {plan:?}"
+            );
+        }
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("embedding_quants_profile_rev_id")),
+            "the quant probe must be served by the profile/rev/id index: {plan:?}"
+        );
+
+        // Same answer as the join it replaced, on a fixture where the two
+        // could disagree: a row of the setter with no quant at all, a quant
+        // left at a stale revision, another profile's quant on every row,
+        // and this profile's quant on another setter's row.
+        sync_metadata(conn, desired(vec![("plain", false)], Some("plain")))
+            .await
+            .expect("sync");
+        let profile_id = profile_id_by_name(conn, "plain").await;
+        let other_profile = sqlx::query(
+            "INSERT INTO vector_quant_profiles (name, quantizer, state) \
+             VALUES ('other', 'binary', 'active') RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("other profile")
+        .try_get::<i64, _>("id")
+        .expect("profile id");
+
+        let item = seed_item(conn, "bb").await;
+        let setter = seed_setter(conn, "clip/counted").await;
+        let elsewhere = seed_setter(conn, "clip/elsewhere").await;
+        let mut ids = Vec::new();
+        for idx in 0..4 {
+            ids.push(seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0, -1.0)).await);
+        }
+        ids.push(seed_embedding(conn, item, elsewhere, "clip", 0, &vec8(1.0, -1.0)).await);
+
+        let seed_quant = |id: i64, profile: i64, rev: i64| {
+            sqlx::query(
+                "INSERT INTO embedding_quants (id, profile_id, rev, quant) VALUES (?, ?, ?, x'00')",
+            )
+            .bind(id)
+            .bind(profile)
+            .bind(rev)
+        };
+        for (n, id) in ids.iter().enumerate() {
+            // ids[3] stays at a stale revision, ids[4] belongs to the other
+            // setter — so only three of them may be counted.
+            let rev = if n == 3 { 1 } else { 2 };
+            seed_quant(*id, profile_id, rev)
+                .execute(&mut *conn)
+                .await
+                .expect("quant");
+            seed_quant(*id, other_profile, 2)
+                .execute(&mut *conn)
+                .await
+                .expect("other quant");
+        }
+        // A row of the setter with no quant of any kind.
+        seed_embedding(conn, item, setter, "clip", 9, &vec8(1.0, -1.0)).await;
+
+        assert_eq!(
+            quantized_count(conn, profile_id, setter, 2)
+                .await
+                .expect("count"),
+            3,
+            "only this setter's rows quantized by this profile at this revision"
         );
     }
 
