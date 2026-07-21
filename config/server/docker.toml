@@ -82,7 +82,9 @@ html_renderer_args = ["--no-sandbox", "--disable-dev-shm-usage"]
 enabled = true
 
 [search]
-embedding_cache_size = 1024
+# Size of the in-process embedding cache. Default: 1024. Uncomment to override
+# (leaving it commented tracks the built-in default across image upgrades).
+# embedding_cache_size = 1024
 
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
