@@ -15,6 +15,11 @@ pub(crate) async fn get_existing_setters(
         FROM item_data
         JOIN setters
             ON item_data.setter_id = setters.id
+        -- Explicit: DISTINCT alone leaves the order to whatever plan SQLite
+        -- picks, which has shifted with SQLite versions. Clients present this
+        -- list to the user and index into it for defaults, so it must not
+        -- reshuffle under them.
+        ORDER BY data_type, setter_name
         "#,
     )
     .fetch_all(&mut *conn)
