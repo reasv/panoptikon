@@ -115,6 +115,22 @@ pub(crate) async fn open_index_db_read_no_user_data(
     connect_db(&paths, false, false, false).await
 }
 
+/// Read-only open by explicit file paths, for the query-plan harness
+/// (`pql::explain_plan`): it runs against a real user database, which the
+/// config-driven name resolvers cannot reach from a test process.
+#[cfg(test)]
+pub(crate) async fn open_index_db_read_at_path(
+    index_db_file: PathBuf,
+    storage_db_file: PathBuf,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = DbPaths {
+        index_db_file,
+        storage_db_file,
+        user_db_file: PathBuf::new(),
+    };
+    connect_db(&paths, false, false, false).await
+}
+
 pub(crate) async fn open_index_db_write_no_user_data(
     index_db: &str,
 ) -> Result<SqliteConnection, ApiError> {

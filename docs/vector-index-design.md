@@ -7,6 +7,13 @@ TOML desired-state, reconcile job, artifacts in v1). Not implemented.
 Companion to `docs/search-cache-design.md` (the cache amortizes scan
 cost; this design shrinks it).
 
+> **Superseded in part by `docs/vector-quant-measurements.md` (2026-07-21).**
+> The implemented two-stage scorer was benchmarked for the first time and is
+> slower than exact on every query shape except the RRF `or` composition, so
+> `auto` now resolves to exact and quant is opt-in. The performance claims
+> below (§Motivation, "~10–50×") did not survive measurement; read the
+> measurements doc before acting on this one.
+
 The core mechanism is **binary quantization with exact rescoring**
 inside the existing vector filters, built entirely on stable
 sqlite-vec 0.1.9 scalar functions (`vec_quantize_binary`,
