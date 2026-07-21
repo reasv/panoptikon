@@ -48,6 +48,29 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CALL_RETRY_ATTEMPTS: usize = 2;
 
+/// Statistics refresh, run after every job by `run_post_job_maintenance`.
+///
+/// Unconditional and unbounded on purpose: every table is re-analyzed in full,
+/// so the planner's row estimates are never staler than the last completed job.
+///
+/// `PRAGMA optimize` alone does **not** substitute for that, despite reading
+/// like it should. It re-analyzes a table only once the row count has moved by
+/// roughly an order of magnitude — measured on SQLite 3.51.3, a table seeded at
+/// 1000 rows kept `sqlite_stat1` saying 1000 through +10%, +50% and +100%
+/// growth, and only refreshed once it reached 16500. On indexes that grow
+/// incrementally that freezes the statistics indefinitely, which is the failure
+/// this call exists to prevent. It is kept here as a cheap trailing no-op.
+///
+/// The cost is real and worth knowing: 7.7s on the 10.6GB `default` index with
+/// nothing else running, 80-102s under the load a job creates. Extraction jobs
+/// finish every ~100s, so on 2026-07-21 03:07-04:07 this ran for ~90% of the
+/// wall clock and dragged two concurrent searches out to 50 minutes each
+/// (0.5s against an idle database). If that recurs, the lever is
+/// `PRAGMA analysis_limit` — bounded sampling keeps the refresh unconditional
+/// while capping what each index costs — or calling this less often than
+/// once per job, not swapping in `optimize`.
+const ANALYZE_STATEMENTS: &[&str] = &["ANALYZE", "PRAGMA optimize"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IndexDbKey {
     index_db: String,
@@ -937,7 +960,7 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::Analyze { reply } => {
-                let result = state.run_maintenance(&["ANALYZE", "PRAGMA optimize"]).await;
+                let result = state.run_maintenance(ANALYZE_STATEMENTS).await;
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::Flush { reply } => {
@@ -1299,4 +1322,54 @@ async fn rollback_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
             ApiError::internal("Failed to rollback transaction")
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::Row;
+
+    use super::*;
+    use crate::db::migrations::setup_test_databases;
+
+
+    // Guards the property the constant's comment argues for: post-job
+    // maintenance must leave real statistics behind, on a connection with no
+    // query history (the writer is always in that state after an idle
+    // reconnect). Statement forms that quietly analyze nothing — a bare
+    // `PRAGMA optimize`, or a pragma with a value SQLite doesn't recognize —
+    // fail silently rather than erroring, so this asserts on `sqlite_stat1`
+    // rather than on the statements returning Ok.
+    #[tokio::test]
+    async fn analyze_statements_populate_statistics_without_query_history() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        for i in 0..64 {
+            sqlx::query(
+                "INSERT INTO items (sha256, md5, type, time_added) \
+                 VALUES (?, ?, 'image/png', '2026-01-01')",
+            )
+            .bind(format!("sha{i:04}"))
+            .bind(format!("md5{i:04}"))
+            .execute(&mut *conn)
+            .await
+            .expect("seed item");
+        }
+
+        for statement in ANALYZE_STATEMENTS {
+            sqlx::query(*statement)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
+        }
+
+        let analyzed: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sqlite_stat1 WHERE tbl = 'items'")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read sqlite_stat1")
+            .get("n");
+        assert!(
+            analyzed > 0,
+            "post-job maintenance left `items` unanalyzed: {ANALYZE_STATEMENTS:?}"
+        );
+    }
 }
