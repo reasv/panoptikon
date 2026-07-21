@@ -1660,6 +1660,32 @@ fn event_is_relevant(event: &Event) -> bool {
     event.paths.is_empty() || event.paths.iter().any(|p| !is_sqlite_db_file(p))
 }
 
+/// Queue one debounced `ResyncFromDisk` unless one is already pending.
+///
+/// Coalesce: queue a resync only when none is already pending, so a burst of
+/// events (or a misclassified one) can never grow the mailbox. The delay lets
+/// a multi-event save settle into a single pass. Deliberately not a filter of
+/// last resort — the gate bounds the damage of any event we fail to classify.
+///
+/// This runs on notify's own event thread, which has no ambient tokio runtime
+/// — `ActorRef::send_after` is `tokio::spawn` under the hood and would panic
+/// there, killing the watcher thread. The delayed send is therefore spawned
+/// onto an explicitly captured runtime handle, which is safe from any thread.
+fn schedule_supervisor_resync(
+    runtime: &tokio::runtime::Handle,
+    actor: &ActorRef<ContinuousScanSupervisorMessage>,
+    resync_pending: &AtomicBool,
+) {
+    if resync_pending.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let actor = actor.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(SUPERVISOR_RESYNC_DEBOUNCE).await;
+        let _ = actor.cast(ContinuousScanSupervisorMessage::ResyncFromDisk);
+    });
+}
+
 fn start_supervisor_watcher(
     actor: ActorRef<ContinuousScanSupervisorMessage>,
     data_dir: &Path,
@@ -1667,26 +1693,17 @@ fn start_supervisor_watcher(
 ) -> Result<RecommendedWatcher, notify::Error> {
     let watch_root = data_dir.join("index");
     let _ = std::fs::create_dir_all(&watch_root);
+    // Captured inside the runtime (pre_start); the callback runs outside it.
+    let runtime = tokio::runtime::Handle::current();
     let mut watcher = RecommendedWatcher::new(
         move |res| match res {
             Ok(event) => {
                 // Ignore the scanner's own DB writes; real config saves also
                 // arrive out-of-band via notify_config_change, so this watcher
                 // is only a backstop for on-disk edits and DB dir changes.
-                if !event_is_relevant(&event) {
-                    return;
+                if event_is_relevant(&event) {
+                    schedule_supervisor_resync(&runtime, &actor, &resync_pending);
                 }
-                // Coalesce: queue a resync only when none is already pending,
-                // so a burst of events (or a misclassified one) can never grow
-                // the mailbox. The delay lets a multi-event save settle into a
-                // single pass. Deliberately not a filter of last resort — the
-                // gate bounds the damage of any event we fail to classify.
-                if resync_pending.swap(true, Ordering::AcqRel) {
-                    return;
-                }
-                let _ = actor.send_after(SUPERVISOR_RESYNC_DEBOUNCE, || {
-                    ContinuousScanSupervisorMessage::ResyncFromDisk
-                });
             }
             Err(err) => {
                 tracing::error!(error = ?err, "continuous scan supervisor watcher error");
@@ -2318,5 +2335,75 @@ mod tests {
         assert!(event_is_relevant(
             &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(cfg)
         ));
+    }
+
+    /// Counts `ResyncFromDisk` deliveries so the scheduling path can be
+    /// observed without a full supervisor (whose resync has no visible effect
+    /// on an empty data dir).
+    struct ResyncProbe;
+
+    impl Actor for ResyncProbe {
+        type Msg = ContinuousScanSupervisorMessage;
+        type State = Arc<AtomicU64>;
+        type Arguments = Arc<AtomicU64>;
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(args)
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            if matches!(message, ContinuousScanSupervisorMessage::ResyncFromDisk) {
+                state.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// notify invokes its event handler on a thread of its own, with no
+    /// ambient tokio runtime. Scheduling a resync from such a thread must
+    /// neither panic (as `ActorRef::send_after` = `tokio::spawn` would) nor
+    /// drop the message, and the pending-gate must still hold follow-up
+    /// requests back.
+    #[tokio::test]
+    async fn supervisor_resync_schedules_from_non_runtime_thread() {
+        let resyncs = Arc::new(AtomicU64::new(0));
+        let (actor, _handle) = Actor::spawn(None, ResyncProbe, resyncs.clone())
+            .await
+            .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let gate = Arc::new(AtomicBool::new(false));
+
+        let events = std::thread::spawn({
+            let (runtime, actor, gate) = (runtime.clone(), actor.clone(), gate.clone());
+            move || {
+                schedule_supervisor_resync(&runtime, &actor, &gate);
+                // A second event during the debounce window is coalesced.
+                schedule_supervisor_resync(&runtime, &actor, &gate);
+            }
+        });
+        events
+            .join()
+            .expect("scheduling a resync panicked on a non-runtime thread");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while resyncs.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            resyncs.load(Ordering::SeqCst),
+            1,
+            "exactly one gated resync must be delivered"
+        );
+        assert!(gate.load(Ordering::SeqCst), "probe never re-opens the gate");
+        actor.stop(None);
     }
 }
