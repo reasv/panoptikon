@@ -587,12 +587,21 @@ pub(crate) async fn get_vector_quants(
              fix it to manage quant profiles.",
         )
     })?;
-    let mut status =
-        crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;
     // Drift alone doesn't mean the user has to do anything: every action that
     // creates drift also enqueues the reconcile that resolves it. Report the
     // in-flight job so the card can say "converging" instead of "act now".
-    status.reconcile_scheduled = reconcile_job_pending(&conn.index_db).await?;
+    //
+    // The two reads can't be taken atomically, so bracket the DB read with
+    // them and take either. Sampling the queue only afterwards makes the
+    // one failure that matters: a job that finishes *during* the DB read
+    // leaves drift in the snapshot and nothing in the queue, which is
+    // exactly the "act now" banner flashing as the job completes. Bracketed,
+    // the worst case is the harmless direction — one extra poll reading
+    // "converging" after the work is already done.
+    let pending_before = reconcile_job_pending(&conn.index_db).await?;
+    let mut status =
+        crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;
+    status.reconcile_scheduled = pending_before || reconcile_job_pending(&conn.index_db).await?;
     Ok(Json(status))
 }
 
