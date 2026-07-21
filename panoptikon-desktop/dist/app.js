@@ -386,8 +386,9 @@ async function refresh() {
     byId('root').textContent = status.server_root;
     byId('port').textContent = status.port;
     // The way out of Desktop that does not depend on the operating system
-    // agreeing to open a browser for us.
-    byId('address').textContent = `http://localhost:${status.port}`;
+    // agreeing to open a browser for us. It names Search rather than the site
+    // root, which is of no use to a Desktop user.
+    byId('address').textContent = `http://localhost:${status.port}/search`;
     byId('local').checked = status.local_server_enabled;
     byId('start-at-login').checked = status.start_at_login;
     if (!serverConfiguration) await loadServerConfiguration();

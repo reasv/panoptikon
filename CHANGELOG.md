@@ -8,9 +8,9 @@ Desktop release notes.
 
 ### Added
 
-- **Desktop shows Panoptikon's address.** The setup wizard's last step and the
-  Local Server section of Desktop settings now show the address Panoptikon is
-  running on, with a copy button. Every other way out of Desktop asks the
+- **Desktop shows the address of the Search UI.** The setup wizard's last step
+  and the Local Server section of Desktop settings now show the address Search
+  is reachable at, with a copy button. Every other way out of Desktop asks the
   operating system to open a browser for you; when that fails there was nothing
   on screen to tell you that Panoptikon is a web app you can simply visit.
 
