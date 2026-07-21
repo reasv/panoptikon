@@ -6,27 +6,77 @@ Desktop release notes.
 
 ## [Unreleased]
 
+## [v0.1.7] - 2026-07-21
+
 ### Added
 
+- **Search results are now cached.** The server keeps recent search results in
+  memory, so revisiting a page, refreshing, or re-running a query answers
+  instantly instead of re-executing it. Semantic search benefits most: the
+  scan over your embeddings is paid once per query instead of once per page,
+  and the UI now also has the server prefetch rows beyond the current page, so
+  the next pages of a semantic search open instantly too.
+  - Never stale: every write to a database invalidates its cached entries, so
+    a cached answer is always identical to re-running the query.
+  - Changing the page size or offset still hits the cache: rows are cached as
+    contiguous spans, not exact pages.
+  - Enabled by default with a 128 MB budget (`[search] cache_size_mb`; `0`
+    disables). Desktop settings gained cache controls: the budget (applied
+    live, no restart), usage and hit-rate stats, a clear button, and a disable
+    toggle - use that one if you edit your databases outside Panoptikon, since
+    the cache can't see those writes.
+- **Random ordering is now stable and pageable.** Randomly ordered searches
+  accept a `seed`: the same seed always produces the same shuffle, so pages no
+  longer repeat or skip items, and refreshing, navigating back, or sharing a
+  link reproduces exactly what you saw. Omitting the seed keeps the old
+  fresh-shuffle-per-request behavior, and the response reports the seed used
+  so clients can keep paging through the same shuffle.
+- **Vector quantization (experimental).** Panoptikon can maintain compact
+  binary copies of your embeddings (about 3% of their size) and use them for a
+  fast first pass in semantic search, re-scoring the best candidates against
+  the full-precision vectors so the results you see keep their exact ordering.
+  Quant profiles are declared in the index database's `config.toml`, are built
+  and kept up to date automatically (builds are resumable, and new embeddings
+  are quantized as they are written), and can be managed from a new Vector
+  Quantization card on the scan page. The vector search filters gained
+  `index`, `variant`, and `k` arguments, with matching selectors in the search
+  UI. So far the fast path only wins on the default combined-search query
+  shape (up to ~3x there) and loses elsewhere, so no search uses quants unless
+  you explicitly select a profile.
 - **Desktop shows the address of the Search UI.** The setup wizard's last step
   and the Local Server section of Desktop settings now show the address Search
-  is reachable at, with a copy button. Every other way out of Desktop asks the
-  operating system to open a browser for you; when that fails there was nothing
-  on screen to tell you that Panoptikon is a web app you can simply visit.
+  is reachable at, with a copy button - so there is a way in even when asking
+  the operating system to open a browser fails.
+
+### Changed
+
+- **Rescans of image-heavy libraries are much faster.** Whether an image needs
+  a stored thumbnail is now decided from its already-indexed dimensions.
+  Previously, every image small enough to be displayed as-is was fully decoded
+  again on every rescan, only to conclude there was nothing to do.
+- The scan page's per-model extracted-data counts are answered by a new
+  database index instead of scanning the whole data table, so they load
+  quickly and no longer tax large databases on every refresh.
+- The search UI no longer runs searches in the background while the pinboard
+  is maximized.
 
 ### Fixed
 
+- **Continuous scanning no longer goes silently dead when file watching
+  fails.** When the OS file watcher cannot start (typically inotify limits on
+  large directory trees on Linux), Panoptikon now falls back to checking for
+  changes every 60 seconds and says so in the scan page's status, instead of
+  reporting a healthy watcher that watches nothing. Also fixed a Linux bug
+  where the watcher re-triggered itself in a tight loop, pinning a CPU core.
 - **Linux Desktop (AppImage): opening things in the browser or a file manager
-  works again.** Every button that hands something to the desktop - Open
-  Panoptikon in the tray menu and the settings window, the setup wizard's Open
-  Search and Open Scan, release notes, the Open Folder buttons, Relay's
-  open-file action, and Open File / Show in Folder in search results - did
-  nothing at all on Linux. The AppImage launcher points the library and data
-  paths at its own transient mount, and every program Panoptikon started
-  inherited them and died before it could draw anything; the failure was also
-  swallowed rather than reported. Panoptikon now hands its own environment to
-  the desktop instead of the AppImage's, and says what went wrong when no
-  launcher works.
+  works again.** Every open-in-browser, open-file, and show-in-folder action
+  across Desktop did nothing on Linux: programs it launched inherited library
+  paths pointing into the AppImage's transient mount and died on startup, and
+  the failure was swallowed rather than reported. Desktop now hands its
+  children the host environment and says what went wrong when no launcher
+  works.
+- Changing the results-per-page setting no longer throws you back to the first
+  page - the result you were looking at stays in view.
 
 ## [v0.1.6] - 2026-07-19
 
