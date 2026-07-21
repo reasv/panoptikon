@@ -318,10 +318,8 @@ async fn resolve_vector_quant(
     embedding: Option<&[u8]>,
 ) -> Result<Option<QuantResolved>, PqlError> {
     validate_quant_args(index, k)?;
-    match index {
-        IndexMode::Exact => return Ok(None),
-        IndexMode::Ann => unreachable!("rejected by validate_quant_args"),
-        IndexMode::Auto | IndexMode::Quant => {}
+    if !quant_requested(index, variant) {
+        return Ok(None);
     }
     // A blank variant is "no profile named", not a strict selection of a
     // profile whose name is empty (profile names are never empty — see
@@ -394,6 +392,31 @@ async fn resolve_vector_quant(
         profile_id: pair.profile_id,
         query_quant,
     }))
+}
+
+/// Whether the filter is asking for a quant profile at all.
+///
+/// **Release policy: a bare `auto` resolves to exact.** Measured on the
+/// `default` index 2026-07-21 (harness: `pql::explain_plan`), the two-stage
+/// scorer is a win only on the RRF-composed search shape and a loss
+/// everywhere else — `similar_to` t2t went 12.8s → 55s, i2i 0.68s → 1.7s,
+/// pure semantic search 0.60s → 1.55s. Until the coarse pass stops being a
+/// row-at-a-time join (see docs/vector-quant-measurements.md), `auto` must
+/// not silently choose it.
+///
+/// An explicit `variant` under `auto` stays a strict selection, exactly like
+/// `quant`: naming a profile is an opt-in, and the sync validator already
+/// treats it as one (unresolvable ⇒ error, never a silent fallback), so
+/// short-circuiting it here would turn those queries into 400s.
+fn quant_requested(index: IndexMode, variant: &Option<String>) -> bool {
+    match index {
+        IndexMode::Exact => false,
+        // Rejected by validate_quant_args before this is reached; false is
+        // the safe answer either way.
+        IndexMode::Ann => false,
+        IndexMode::Auto => normalize_variant(variant).is_some(),
+        IndexMode::Quant => true,
+    }
 }
 
 /// Blank/whitespace variant names mean "unset"; profile names are never
@@ -1195,5 +1218,40 @@ impl MatchValues {
             && self.setter_name.is_none()
             && self.data_index.is_none()
             && self.source_id.is_none()
+    }
+}
+
+#[cfg(test)]
+mod quant_policy_tests {
+    use super::{IndexMode, quant_requested};
+
+    // Guards the release policy: a bare `auto` must never pick a quant
+    // profile. The two-stage scorer regresses every query shape except the
+    // RRF-composed search (measured — see `quant_requested`), so it stays
+    // opt-in until the coarse pass is rebuilt.
+    #[test]
+    fn bare_auto_does_not_request_quants() {
+        assert!(!quant_requested(IndexMode::Auto, &None));
+        assert!(!quant_requested(IndexMode::Auto, &Some(String::new())));
+        assert!(!quant_requested(IndexMode::Auto, &Some("   ".to_string())));
+        assert!(!quant_requested(IndexMode::Exact, &None));
+        assert!(!quant_requested(
+            IndexMode::Exact,
+            &Some("plain".to_string())
+        ));
+    }
+
+    // Naming a profile is an explicit opt-in under either mode. If this
+    // regressed to `false`, the sync validator would reject the very same
+    // queries as unresolvable strict selections (400s), not silently run
+    // them exact.
+    #[test]
+    fn explicit_selection_still_requests_quants() {
+        assert!(quant_requested(IndexMode::Auto, &Some("plain".to_string())));
+        assert!(quant_requested(IndexMode::Quant, &None));
+        assert!(quant_requested(
+            IndexMode::Quant,
+            &Some("plain".to_string())
+        ));
     }
 }
