@@ -1,3 +1,5 @@
+mod host_env;
+mod host_open;
 mod lifecycle;
 mod paths;
 mod relay;
@@ -201,7 +203,7 @@ pub fn run() {
                     return execute_file_action_command(&command, &path);
                 }
                 match action {
-                    RelayAction::OpenFile => opener.opener().open_path(path.display().to_string(), None::<&str>)?,
+                    RelayAction::OpenFile => host_open::open_path(&opener, &path)?,
                     RelayAction::RevealInFolder => opener.opener().reveal_item_in_dir(path)?,
                 }
                 Ok(())
@@ -534,7 +536,16 @@ fn route_activation(app: AppHandle, intent: ActivationIntent) {
         return;
     }
     tauri::async_runtime::spawn(async move {
-        let _ = open_action_inner(&app).await;
+        // The tray menu and a second launch have nowhere to show an error, so
+        // a failure here used to be indistinguishable from a dead click. Put
+        // it in the log the user can read back from settings, and show the
+        // control window so the click does something.
+        if let Err(error) = open_action_inner(&app).await {
+            app.state::<Arc<Supervisor>>()
+                .record(format!("could not open Panoptikon: {error}"))
+                .await;
+            let _ = show_control_window(&app, true);
+        }
     });
 }
 
@@ -567,8 +578,7 @@ async fn open_action_inner(app: &AppHandle) -> Result<(), String> {
     }
     if fetch_setup_status(snapshot.port).await?.ready {
         close_launch_window(app);
-        app.opener()
-            .open_url(local_browser_url(snapshot.port, "/search"), None::<&str>)
+        host_open::open_url(app, &local_browser_url(snapshot.port, "/search"))
             .map_err(|e| e.to_string())
     } else {
         show_setup_window(app, snapshot.port, SetupMode::Onboarding).map_err(|e| e.to_string())
@@ -1119,9 +1129,7 @@ async fn open_panoptikon_page(
     let mut url = url::Url::parse(&local_browser_url(snapshot.port, path))
         .map_err(|error| error.to_string())?;
     url.query_pairs_mut().append_pair("index_db", &index_db);
-    app.opener()
-        .open_url(url.as_str(), None::<&str>)
-        .map_err(|error| error.to_string())
+    host_open::open_url(&app, url.as_str()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1269,9 +1277,7 @@ fn open_folder(app: &AppHandle, kind: &str) -> Result<(), String> {
     if !paths.path_is_within_shell_roots(path) {
         return Err("folder is outside Desktop-owned roots".into());
     }
-    app.opener()
-        .open_path(path.display().to_string(), None::<&str>)
-        .map_err(|e| e.to_string())
+    host_open::open_path(app, path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1840,9 +1846,7 @@ async fn test_file_action(
         return Err("the selected test file does not exist".into());
     }
     if !command_configured(&command) {
-        app.opener()
-            .open_path(path.display().to_string(), None::<&str>)
-            .map_err(|error| error.to_string())?;
+        host_open::open_path(&app, &path).map_err(|error| error.to_string())?;
         return Ok(FileActionTestResult {
             status: "started",
             exit_code: None,
@@ -1945,19 +1949,15 @@ fn spawn_file_action_command(
             .replace("{filename}", &filename)
     };
     if !command.program.trim().is_empty() {
-        return Ok(std::process::Command::new(replace(&command.program))
+        return Ok(host_env::command(replace(&command.program))
             .args(command.args.iter().map(|arg| replace(arg)))
             .spawn()?);
     }
     let shell = replace(&command.shell_command);
     if cfg!(windows) {
-        Ok(std::process::Command::new("cmd")
-            .args(["/C", &shell])
-            .spawn()?)
+        Ok(host_env::command("cmd").args(["/C", &shell]).spawn()?)
     } else {
-        Ok(std::process::Command::new("sh")
-            .args(["-c", &shell])
-            .spawn()?)
+        Ok(host_env::command("sh").args(["-c", &shell]).spawn()?)
     }
 }
 

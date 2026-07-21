@@ -161,11 +161,18 @@ impl Supervisor {
         supervisor.set_state(&app, LifecycleState::Starting).await;
         let generation = supervisor.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let args = sidecar_arguments(&supervisor.paths, supervisor.server_config);
+        // The Server and everything it goes on to spawn — uv, the managed
+        // venv, inferio workers, ffmpeg, the file-open launchers — get a host
+        // environment. Desktop is the only process that ever sees the AppImage
+        // mount, and this is where it stops.
         let mut command = app
             .shell()
             .sidecar("panoptikon")
             .context("bundled Panoptikon Server sidecar is missing")?
             .args(args);
+        if let Some(environment) = crate::host_env::child_environment() {
+            command = command.env_clear().envs(environment);
+        }
         if let Some((bridge_url, bridge_token)) = crate::updates::bridge_environment(&app) {
             command = command
                 .env("PANOPTIKON_DESKTOP_BRIDGE_URL", bridge_url)
@@ -338,7 +345,7 @@ impl Supervisor {
             .collect()
     }
 
-    async fn record(&self, line: String) {
+    pub(crate) async fn record(&self, line: String) {
         tracing::info!(target: "panoptikon_desktop", "{line}");
         let mut tail = self.log_tail.lock().await;
         if tail.len() == 500 {

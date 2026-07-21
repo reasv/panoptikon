@@ -23,7 +23,6 @@ use std::{
 use tauri::{
     AppHandle, Emitter as _, Manager as _, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
-use tauri_plugin_opener::OpenerExt as _;
 use tauri_plugin_updater::{Update, UpdaterExt as _};
 use tokio::sync::{Mutex, watch};
 
@@ -1425,9 +1424,7 @@ pub fn open_update_link(window: WebviewWindow, app: AppHandle, url: String) -> R
     if parsed.scheme() != "https" {
         return Err("release-note links must use HTTPS".into());
     }
-    app.opener()
-        .open_url(parsed.as_str(), None::<&str>)
-        .map_err(|error| error.to_string())
+    crate::host_open::open_url(&app, parsed.as_str()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

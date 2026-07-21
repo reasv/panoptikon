@@ -6,6 +6,20 @@ Desktop release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux Desktop (AppImage): opening things in the browser or a file manager
+  works again.** Every button that hands something to the desktop - Open
+  Panoptikon in the tray menu and the settings window, the setup wizard's Open
+  Search and Open Scan, release notes, the Open Folder buttons, Relay's
+  open-file action, and Open File / Show in Folder in search results - did
+  nothing at all on Linux. The AppImage launcher points the library and data
+  paths at its own transient mount, and every program Panoptikon started
+  inherited them and died before it could draw anything; the failure was also
+  swallowed rather than reported. Panoptikon now hands its own environment to
+  the desktop instead of the AppImage's, and says what went wrong when no
+  launcher works.
+
 ## [v0.1.6] - 2026-07-19
 
 ### Added

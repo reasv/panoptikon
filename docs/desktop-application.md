@@ -147,7 +147,7 @@ components unless implementation evidence requires a documented change:
 | `tauri-plugin-single-instance` | Required | Register it first, before any plugin or setup code that can create state. |
 | `tauri-plugin-updater` | Required | Drive it from Rust and the restricted control UI; do not expose raw updater commands to server-hosted pages. |
 | `tauri-plugin-dialog` | Required | Native bootstrap/emergency confirmations and the setup wizard's platform folder picker; richer routine flows use the bundled control UI. |
-| `tauri-plugin-opener` | Required | Rust-owned opening of browser URLs and known local folders; do not grant a generic opener capability to remote pages. |
+| `tauri-plugin-opener` | Required | Rust-owned opening of browser URLs and known local folders; do not grant a generic opener capability to remote pages. On Linux, go through `host_open` rather than the plugin's `open_url`/`open_path` (see below). |
 | `tauri-plugin-autostart` | Required | User-scoped Start at Login, always with background activation intent. |
 | `tauri-plugin-shell` | Required for the sidecar | Use its Rust sidecar API only. No webview receives generic shell or spawn permission. |
 
@@ -166,6 +166,27 @@ preferring the Tauri notification plugin: Desktop requires a cross-platform
 body/action response callback so clicking a preparation, readiness, or failure
 notification can run the state-aware Open action, while the Tauri plugin does
 not expose desktop click responses.
+
+Desktop MUST create every child process through `host_env::command`, or - for
+builders that take an environment map rather than a `std::process::Command`,
+the sidecar among them - through `env_clear` plus `host_env::child_environment`.
+The AppImage `AppRun` script exports `LD_LIBRARY_PATH`, `XDG_DATA_DIRS`,
+`GIO_MODULE_DIR`, `PYTHONHOME`, and friends pointing into the transient mount.
+Desktop is the only process that ever sees them, and every other Panoptikon
+process is downstream of a child Desktop spawns, so this is the single boundary
+where the mount stops: the Server sidecar and everything it goes on to run - uv,
+the managed venv, inferio workers, ffmpeg, its own file-open launchers - are
+covered by the sidecar spawn alone, and MUST NOT carry their own workarounds for
+it. Desktop's own environment stays untouched, because WebKitGTK's subprocesses
+need the bundled paths and the updater needs `APPIMAGE` to relaunch. A unit test
+in `host_env` fails the build on any spawn site that bypasses the boundary.
+
+On Linux, opening a URL or a path additionally MUST go through `host_open`
+rather than `tauri-plugin-opener`: `open::that_detached` reports success as soon
+as the launcher forks, which turned every failed browser launch into a silent
+no-op. `host_open` runs the launcher chain itself and reports what failed.
+Revealing a file stays on the plugin - its Linux implementation is D-Bus, not a
+child process.
 
 Release builds MUST NOT enable Tauri developer tools. The control frontend MUST
 use a strict CSP: no `unsafe-eval`, broad network access, or generic localhost
