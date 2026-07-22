@@ -243,6 +243,16 @@ would mean betting on a planner behaviour nobody has explained yet.
   explain why the quant path escapes the same penalty. **This is the single
   largest unexplained number in the system and the highest-value thing to
   investigate next.**
+  **RESOLVED 2026-07-23 — see `docs/or-composition-penalty.md`.** The
+  arithmetic hypothesis above was wrong: it is one GROUP BY sorter whose
+  rows carry the raw 3 KB embedding blob as the un-evaluated aggregate
+  argument (~2.3 GB through a temp b-tree), not three extra sorts. The
+  union/RRF machinery costs ~0.25s. Follow-up measurements there also
+  overturn parts of §6–§7 here: the head's whole-setter join is *not*
+  cosmetic (fat-row page density makes probes expensive without blob
+  extraction), and payload size *does* matter — a single-pass scan over
+  96 B quants is 3.2× faster than the identical shape over 3 KB embeddings.
+  With execution fixed on both sides, two-stage quant wins 2× at 690k rows.
 - The `WITHOUT ROWID` double descent is *assumed* to be the reason the
   coarse pass costs more per row than the exact scan. Not isolated.
 - `similar_to` t2t at 55s is *assumed* to be coarse + a full exact

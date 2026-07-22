@@ -406,6 +406,590 @@ async fn explain_plan_similar_to() {
     }
 }
 
+/// A parameter for the hand-assembled decomposition SQL below.
+enum BindVal {
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+/// `dump_plan` for raw SQL with explicit binds (the decomposition variants
+/// are assembled by hand, not through sea-query).
+async fn dump_plan_raw(conn: &mut SqliteConnection, sql: &str, binds: &[BindVal]) {
+    let explain = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(explain.as_str()));
+    for bind in binds {
+        query = match bind {
+            BindVal::Text(text) => query.bind(text.clone()),
+            BindVal::Blob(blob) => query.bind(blob.clone()),
+        };
+    }
+    let rows = query
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain query plan (raw)");
+    let nodes: Vec<(i64, i64, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<i64, _>("id"),
+                row.get::<i64, _>("parent"),
+                row.get::<String, _>("detail"),
+            )
+        })
+        .collect();
+    fn print_children(nodes: &[(i64, i64, String)], parent: i64, depth: usize) {
+        for (id, node_parent, detail) in nodes {
+            if *node_parent == parent {
+                println!("{:indent$}{detail}", "", indent = depth * 2);
+                print_children(nodes, *id, depth + 1);
+            }
+        }
+    }
+    print_children(&nodes, 0, 0);
+}
+
+/// Times one decomposition variant: plan first, then `runs` executions.
+async fn run_variant(
+    conn: &mut SqliteConnection,
+    label: &str,
+    sql: &str,
+    binds: &[BindVal],
+    runs: usize,
+) {
+    println!("\n===== {label} =====");
+    dump_plan_raw(conn, sql, binds).await;
+    for run in 1..=runs {
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for bind in binds {
+            query = match bind {
+                BindVal::Text(text) => query.bind(text.clone()),
+                BindVal::Blob(blob) => query.bind(blob.clone()),
+            };
+        }
+        let started = Instant::now();
+        let rows = query.fetch_all(&mut *conn).await.expect("execute variant");
+        // Single-row aggregates print their value so branch cardinalities
+        // land in the transcript next to the timings they explain.
+        let detail = if rows.len() == 1 && !rows[0].is_empty() {
+            let mut parts = Vec::new();
+            for (idx, column) in rows[0].columns().iter().enumerate() {
+                use sqlx::Column;
+                if let Ok(value) = rows[0].try_get::<i64, _>(idx) {
+                    parts.push(format!("{}={value}", column.name()));
+                }
+            }
+            format!(" [{}]", parts.join(" "))
+        } else {
+            String::new()
+        };
+        println!(
+            "run {run}: {:.3}s ({} rows){detail}",
+            started.elapsed().as_secs_f64(),
+            rows.len()
+        );
+    }
+}
+
+/// Decomposes the exact-path RRF `or` shape to locate the composition
+/// penalty (docs/vector-quant-measurements.md §8: exact standalone ~2.3s,
+/// exact-in-or ~13.5s on the same 690k-row setter — where do the extra
+/// seconds go?).
+///
+/// The SQL fragments below are copied verbatim from the compiler's rendered
+/// output for the `path OR text OR semantic` query (see
+/// `explain_plan_exact_vs_quant` with `PANOPTIKON_EXPLAIN_SQL=1`), so each
+/// variant is a strict subset or a controlled mutation of the production
+/// query:
+///
+/// - each branch alone (`count(*) + max(order_rank)` forces the window),
+/// - the 3-way `UNION` membership CTE alone,
+/// - the full query (baseline; must reproduce the measured 13.5s),
+/// - the full query with the semantic branch replaced by a trivial
+///   same-cardinality window over `begin_cte` (the §11.1 falsification
+///   experiment: if the penalty stays, it's union/merge machinery; if it
+///   vanishes, it's the semantic branch being replanned),
+/// - `UNION ALL` instead of `UNION` (prices the distinct temp b-tree),
+/// - a fix candidate: RRF as one `UNION ALL` of per-branch contributions
+///   `GROUP BY file_id` — no re-join of branch CTEs, no automatic indexes.
+// Shared fragments of the compiler's rendered SQL for the production
+// `path OR text OR semantic (RRF)` query, used by the decomposition tests
+// below. Captured verbatim via `PANOPTIKON_EXPLAIN_SQL=1`.
+const BEGIN: &str = r#""begin_cte" AS (SELECT "files"."id" AS "file_id", "files"."item_id" AS "item_id" FROM "files")"#;
+// binds: [match text]
+const N0_PATH: &str = r#""n0_MatchPath" AS (SELECT "begin_cte"."item_id", "begin_cte"."file_id", row_number() OVER (  ORDER BY rank ASC ) AS "order_rank" FROM "begin_cte" INNER JOIN "files_path_fts" ON (files_path_fts.rowid) = "begin_cte"."file_id" WHERE "files_path_fts"."path" MATCH ?)"#;
+// binds: [match text]
+const N1_TEXT: &str = r#""n1_MatchText" AS (SELECT "begin_cte"."item_id", "begin_cte"."file_id", row_number() OVER (  ORDER BY MIN(rank) ASC ) AS "order_rank" FROM "begin_cte" INNER JOIN "item_data" ON "item_data"."item_id" = "begin_cte"."item_id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" INNER JOIN "extracted_text" ON "extracted_text"."id" = "item_data"."id" INNER JOIN "extracted_text_fts" ON (extracted_text_fts.rowid) = "extracted_text"."id" WHERE "extracted_text_fts"."text" MATCH ? GROUP BY "begin_cte"."file_id")"#;
+const OR3: &str = r#""n3_or" AS (SELECT "n0_MatchPath"."item_id", "n0_MatchPath"."file_id" FROM "n0_MatchPath" UNION SELECT "n1_MatchText"."item_id", "n1_MatchText"."file_id" FROM "n1_MatchText" UNION SELECT "n2_SemanticImageSearch"."item_id", "n2_SemanticImageSearch"."file_id" FROM "n2_SemanticImageSearch")"#;
+const FINAL: &str = r#"SELECT "n3_or"."item_id", "n3_or"."file_id", "files"."sha256" AS "sha256", "files"."path" AS "path", "files"."last_modified" AS "last_modified", "items"."type" AS "type" FROM "n3_or" INNER JOIN "items" ON "items"."id" = "n3_or"."item_id" INNER JOIN "files" ON "files"."id" = "n3_or"."file_id" LEFT JOIN "n0_MatchPath" ON "n0_MatchPath"."file_id" = "n3_or"."file_id" LEFT JOIN "n1_MatchText" ON "n1_MatchText"."file_id" = "n3_or"."file_id" LEFT JOIN "n2_SemanticImageSearch" ON "n2_SemanticImageSearch"."file_id" = "n3_or"."file_id" ORDER BY (((1.0) / ((5) + COALESCE("n0_MatchPath"."order_rank", 9223372036854775805))) * (1)) + (((1.0) / ((5) + COALESCE("n1_MatchText"."order_rank", 9223372036854775805))) * (1)) + (((1.0) / ((10) + COALESCE("n2_SemanticImageSearch"."order_rank", 9223372036854775805))) * (0.7)) ASC NULLS LAST, "files"."last_modified" DESC NULLS LAST LIMIT 320 OFFSET 0"#;
+// Fix B for the exact path: evaluate the distance in a materialized inner
+// CTE so the GROUP BY sorter carries 8 bytes per row instead of the blob.
+// binds: [embedding blob, model name]
+const N2_INNER_DIST: &str = r#""dist_n2" AS MATERIALIZED (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", vec_distance_cosine("embeddings"."embedding", ?) AS "d" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL), "n2_SemanticImageSearch" AS (SELECT "item_id", "file_id", row_number() OVER (  ORDER BY AVG("d") ASC ) AS "order_rank" FROM "dist_n2" GROUP BY "file_id")"#;
+
+#[tokio::test]
+#[ignore = "needs a populated index database (PANOPTIKON_EXPLAIN_DB)"]
+async fn explain_plan_or_decomposition() {
+    // binds: [embedding blob, model name]
+    const N2_SEMANTIC: &str = r#""n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", row_number() OVER (  ORDER BY AVG(vec_distance_cosine("embeddings"."embedding", ?)) ASC ) AS "order_rank" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL GROUP BY "begin_cte"."file_id")"#;
+    // Same CTE name, trivial body: one window over begin_cte, cardinality =
+    // every file, zero per-row compute. binds: none
+    const N2_TRIVIAL: &str = r#""n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", row_number() OVER (  ORDER BY "begin_cte"."file_id" ASC ) AS "order_rank" FROM "begin_cte")"#;
+    const OR3_ALL: &str = r#""n3_or" AS (SELECT "n0_MatchPath"."item_id", "n0_MatchPath"."file_id" FROM "n0_MatchPath" UNION ALL SELECT "n1_MatchText"."item_id", "n1_MatchText"."file_id" FROM "n1_MatchText" UNION ALL SELECT "n2_SemanticImageSearch"."item_id", "n2_SemanticImageSearch"."file_id" FROM "n2_SemanticImageSearch")"#;
+    // Fix candidate: fuse rank contributions in one pass. Ordering is DESC
+    // (best RRF sum first); a branch that misses a file contributes nothing
+    // instead of ~1e-19, which is numerically equivalent.
+    const SCORES: &str = r#""n3_scores" AS (SELECT "item_id", "file_id", (1.0 / (5 + "order_rank")) * 1.0 AS "s" FROM "n0_MatchPath" UNION ALL SELECT "item_id", "file_id", (1.0 / (5 + "order_rank")) * 1.0 FROM "n1_MatchText" UNION ALL SELECT "item_id", "file_id", (1.0 / (10 + "order_rank")) * 0.7 FROM "n2_SemanticImageSearch"), "fused" AS (SELECT "item_id", "file_id", SUM("s") AS "score" FROM "n3_scores" GROUP BY "file_id")"#;
+    const FUSED_FINAL: &str = r#"SELECT "fused"."item_id", "fused"."file_id", "files"."sha256" AS "sha256", "files"."path" AS "path", "files"."last_modified" AS "last_modified", "items"."type" AS "type" FROM "fused" INNER JOIN "items" ON "items"."id" = "fused"."item_id" INNER JOIN "files" ON "files"."id" = "fused"."file_id" ORDER BY "fused"."score" DESC, "files"."last_modified" DESC NULLS LAST LIMIT 320 OFFSET 0"#;
+
+    let (dir, mut conn) = open_target_db().await;
+    let fixture = load_fixture(&mut conn).await;
+    let text = env_or("PANOPTIKON_EXPLAIN_TEXT", "cat");
+    let runs: usize = env_or("PANOPTIKON_EXPLAIN_RUNS", "2")
+        .parse()
+        .expect("runs");
+    println!("db={} model={} text={text}", dir.display(), fixture.model);
+
+    let with = |parts: &[&str], body: &str| format!("WITH {} {body}", parts.join(" , "));
+    let text_bind = || BindVal::Text(text.clone());
+    let semantic_binds = || {
+        vec![
+            BindVal::Blob(fixture.embedding.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ]
+    };
+
+    // Branch cardinalities + costs in isolation.
+    run_variant(
+        &mut conn,
+        "branch: match_path alone",
+        &with(
+            &[BEGIN, N0_PATH],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n0_MatchPath""#,
+        ),
+        &[text_bind()],
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "branch: match_text alone",
+        &with(
+            &[BEGIN, N1_TEXT],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n1_MatchText""#,
+        ),
+        &[text_bind()],
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "branch: semantic alone (composed rendering)",
+        &with(
+            &[BEGIN, N2_SEMANTIC],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &semantic_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "branch: trivial stand-in alone",
+        &with(
+            &[BEGIN, N2_TRIVIAL],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &[],
+        runs,
+    )
+    .await;
+
+    // Union membership alone: branches + UNION-distinct temp b-trees.
+    let union_binds = || {
+        vec![
+            text_bind(),
+            text_bind(),
+            BindVal::Blob(fixture.embedding.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ]
+    };
+    run_variant(
+        &mut conn,
+        "union3: membership CTE only",
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, N2_SEMANTIC, OR3],
+            r#"SELECT count(*) AS n FROM "n3_or""#,
+        ),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // The production query, verbatim — must reproduce the measured baseline.
+    run_variant(
+        &mut conn,
+        "full: production composed query (baseline)",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_SEMANTIC, OR3], FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // Falsification experiment (docs §11.1): same machinery, trivial
+    // semantic branch of ~equal cardinality.
+    run_variant(
+        &mut conn,
+        "full: trivial semantic branch (falsification)",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_TRIVIAL, OR3], FINAL),
+        &[text_bind(), text_bind()],
+        runs,
+    )
+    .await;
+
+    // Price of the UNION-distinct temp b-tree specifically (result rows may
+    // duplicate; timing-only variant).
+    run_variant(
+        &mut conn,
+        "full: UNION ALL instead of UNION (timing only)",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_SEMANTIC, OR3_ALL], FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // Fix candidate: single-pass RRF, no branch re-join.
+    run_variant(
+        &mut conn,
+        "fix: fused UNION ALL + GROUP BY rrf",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_SEMANTIC, SCORES], FUSED_FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // The branch misplans in isolation: setter-driven (690k non-covering
+    // item_data descents + 690k items/files probes + 690k-row GROUP BY
+    // sorter) instead of files-driven (85k outer rows, covering item_data
+    // probe, GROUP BY free in file order). CROSS JOIN pins the good order —
+    // SQLite treats CROSS JOIN join order as mandatory.
+    // binds: [embedding blob, model name]
+    const N2_FORCED: &str = r#""n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", row_number() OVER (  ORDER BY AVG(vec_distance_cosine("embeddings"."embedding", ?)) ASC ) AS "order_rank" FROM "begin_cte" CROSS JOIN "items" CROSS JOIN "item_data" CROSS JOIN "setters" CROSS JOIN "embeddings" WHERE "items"."id" = "begin_cte"."item_id" AND "item_data"."item_id" = "items"."id" AND "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? AND "embeddings"."id" = "item_data"."id" GROUP BY "begin_cte"."file_id")"#;
+    // Setter-driven shape with the blob read replaced by an integer column:
+    // prices the join scaffolding + sorter without the 2.1 GB of embeddings.
+    // binds: [model name]
+    const N2_NOBLOB: &str = r#""n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", row_number() OVER (  ORDER BY AVG("embeddings"."id") ASC ) AS "order_rank" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL GROUP BY "begin_cte"."file_id")"#;
+
+    run_variant(
+        &mut conn,
+        "branch: forced files-driven (CROSS JOIN)",
+        &with(
+            &[BEGIN, N2_FORCED],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &semantic_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "branch: setter-driven, no blob read",
+        &with(
+            &[BEGIN, N2_NOBLOB],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &[BindVal::Text(fixture.model.clone())],
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "full: forced files-driven semantic branch",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_FORCED, OR3], FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // Mechanism probe: same setter-driven joins and blob reads, but no
+    // GROUP BY. If this is fast, the 10s is not the blob reads themselves
+    // but the GROUP BY sorter carrying the 3 KB blob as the un-evaluated
+    // aggregate argument (690k rows x 3 KB through the temp b-tree).
+    // binds: [embedding blob, model name]
+    const N2_NOGROUP: &str = r#""n2_scalar" AS (SELECT sum(vec_distance_cosine("embeddings"."embedding", ?)) AS "s", count(*) AS "n" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL)"#;
+    run_variant(
+        &mut conn,
+        "probe: setter-driven, SUM without GROUP BY",
+        &with(
+            &[BEGIN, N2_NOGROUP],
+            r#"SELECT "n" FROM "n2_scalar""#,
+        ),
+        &semantic_binds(),
+        runs,
+    )
+    .await;
+
+    // Fix candidate B: keep the planner free, but evaluate the distance in a
+    // materialized inner CTE so the GROUP BY sorter carries 8 bytes per row
+    // instead of the blob (N2_INNER_DIST, module scope).
+    run_variant(
+        &mut conn,
+        "fix B: distance in materialized inner CTE, then GROUP BY",
+        &with(
+            &[BEGIN, N2_INNER_DIST],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &semantic_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "full: fix B semantic branch",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_INNER_DIST, OR3], FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+
+    // Refined forced order: setters before item_data restores the
+    // two-column (item_id, setter_id) covering probe the standalone plan
+    // uses. binds: [embedding blob, model name]
+    const N2_FORCED2: &str = r#""n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", row_number() OVER (  ORDER BY AVG(vec_distance_cosine("embeddings"."embedding", ?)) ASC ) AS "order_rank" FROM "begin_cte" CROSS JOIN "items" CROSS JOIN "setters" CROSS JOIN "item_data" CROSS JOIN "embeddings" WHERE "items"."id" = "begin_cte"."item_id" AND "setters"."name" = ? AND "item_data"."item_id" = "items"."id" AND "item_data"."setter_id" = "setters"."id" AND "embeddings"."id" = "item_data"."id" GROUP BY "begin_cte"."file_id")"#;
+    run_variant(
+        &mut conn,
+        "branch: forced files-driven, setters-first (refined)",
+        &with(
+            &[BEGIN, N2_FORCED2],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &semantic_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "full: forced files-driven refined semantic branch",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_FORCED2, OR3], FINAL),
+        &union_binds(),
+        runs,
+    )
+    .await;
+}
+
+/// Re-races exact vs quant on the composed RRF `or` shape after giving
+/// *both* paths the sorter fix (docs/or-composition-penalty.md §5 fix B).
+///
+/// The question this answers: quantization's one measured win was the
+/// composed shape, and that win turned out to be the exact path's
+/// blob-through-sorter accident. But the quant pipeline has the same
+/// GROUP BY-over-distance structure in its coarse pass (96–128 B quant
+/// through the sorter) and its head re-score (3–4 KB blobs for ~k files),
+/// so the fix must be applied to quant too before declaring it winless.
+///
+/// Quant SQL is the compiler's rendered output with `profile_id`, `k`, and
+/// the merge CASE constants inlined as literals; fix-B variants move each
+/// `vec_distance_*` into a `MATERIALIZED` inner CTE, leaving everything
+/// else identical.
+#[tokio::test]
+#[ignore = "needs a populated index database (PANOPTIKON_EXPLAIN_DB)"]
+async fn explain_plan_quant_sorter_fix() {
+    let (dir, mut conn) = open_target_db().await;
+    let fixture = load_fixture(&mut conn).await;
+    let text = env_or("PANOPTIKON_EXPLAIN_TEXT", "cat");
+    let k: i64 = env_or("PANOPTIKON_EXPLAIN_K", "10000").parse().expect("k");
+    let runs: usize = env_or("PANOPTIKON_EXPLAIN_RUNS", "2")
+        .parse()
+        .expect("runs");
+    let pid = fixture.profile_id;
+    println!(
+        "db={} model={} profile_id={pid} k={k} text={text}",
+        dir.display(),
+        fixture.model
+    );
+
+    // binds: [query quant blob, model name]
+    let coarse_baseline = format!(
+        r#""coarse_n2_SemanticImageSearch" AS (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", AVG(vec_distance_hamming(vec_bit("embedding_quants"."quant"), vec_bit(?))) AS "cdist" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embedding_quants" ON "embedding_quants"."id" = "item_data"."id" AND "embedding_quants"."profile_id" = {pid} LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL GROUP BY "begin_cte"."file_id")"#
+    );
+    // binds: [query quant blob, model name]
+    let coarse_fixb = format!(
+        r#""qdist_n2" AS MATERIALIZED (SELECT "begin_cte"."item_id" AS "item_id", "begin_cte"."file_id" AS "file_id", vec_distance_hamming(vec_bit("embedding_quants"."quant"), vec_bit(?)) AS "qd" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embedding_quants" ON "embedding_quants"."id" = "item_data"."id" AND "embedding_quants"."profile_id" = {pid} LEFT JOIN "begin_cte" ON "begin_cte"."item_id" = "items"."id" WHERE "begin_cte"."item_id" IS NOT NULL), "coarse_n2_SemanticImageSearch" AS (SELECT "item_id", "file_id", AVG("qd") AS "cdist" FROM "qdist_n2" GROUP BY "file_id")"#
+    );
+    const RANKED: &str = r#""ranked_n2_SemanticImageSearch" AS (SELECT "coarse_n2_SemanticImageSearch".*, row_number() OVER (  ORDER BY "cdist" ASC, "item_id" ASC, "file_id" ASC ) AS "crank" FROM "coarse_n2_SemanticImageSearch")"#;
+    // binds: [embedding blob, model name]
+    let head_baseline = format!(
+        r#""head_n2_SemanticImageSearch" AS (SELECT "ranked_n2_SemanticImageSearch"."item_id" AS "item_id", "ranked_n2_SemanticImageSearch"."file_id" AS "file_id", AVG(vec_distance_cosine("embeddings"."embedding", ?)) AS "edist" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "ranked_n2_SemanticImageSearch" ON "ranked_n2_SemanticImageSearch"."item_id" = "items"."id" WHERE "ranked_n2_SemanticImageSearch"."item_id" IS NOT NULL AND "ranked_n2_SemanticImageSearch"."crank" <= {k} GROUP BY "ranked_n2_SemanticImageSearch"."file_id")"#
+    );
+    // binds: [embedding blob, model name]
+    let head_fixb = format!(
+        r#""hdist_n2" AS MATERIALIZED (SELECT "ranked_n2_SemanticImageSearch"."item_id" AS "item_id", "ranked_n2_SemanticImageSearch"."file_id" AS "file_id", vec_distance_cosine("embeddings"."embedding", ?) AS "hd" FROM "items" INNER JOIN "item_data" ON "item_data"."item_id" = "items"."id" INNER JOIN "setters" ON "setters"."id" = "item_data"."setter_id" AND "setters"."name" = ? INNER JOIN "embeddings" ON "embeddings"."id" = "item_data"."id" LEFT JOIN "ranked_n2_SemanticImageSearch" ON "ranked_n2_SemanticImageSearch"."item_id" = "items"."id" WHERE "ranked_n2_SemanticImageSearch"."item_id" IS NOT NULL AND "ranked_n2_SemanticImageSearch"."crank" <= {k}), "head_n2_SemanticImageSearch" AS (SELECT "item_id", "file_id", AVG("hd") AS "edist" FROM "hdist_n2" GROUP BY "file_id")"#
+    );
+    // Merge CASE constants inlined: 0 = has an exact re-score, 1 = coarse
+    // only (sorts after), matching the compiler's bound values.
+    const MERGE: &str = r#""n2_SemanticImageSearch" AS (SELECT "ranked_n2_SemanticImageSearch"."item_id" AS "item_id", "ranked_n2_SemanticImageSearch"."file_id" AS "file_id", row_number() OVER (  ORDER BY (CASE WHEN ("head_n2_SemanticImageSearch"."file_id" IS NULL) THEN 1 ELSE 0 END) ASC, "head_n2_SemanticImageSearch"."edist" ASC NULLS LAST, "ranked_n2_SemanticImageSearch"."cdist" ASC NULLS LAST, "ranked_n2_SemanticImageSearch"."item_id" ASC, "ranked_n2_SemanticImageSearch"."file_id" ASC ) AS "order_rank" FROM "ranked_n2_SemanticImageSearch" LEFT JOIN "head_n2_SemanticImageSearch" ON "head_n2_SemanticImageSearch"."file_id" = "ranked_n2_SemanticImageSearch"."file_id")"#;
+
+    let with = |parts: &[&str], body: &str| format!("WITH {} {body}", parts.join(" , "));
+    let quant_binds = || {
+        vec![
+            BindVal::Text(text.clone()),
+            BindVal::Text(text.clone()),
+            BindVal::Blob(fixture.query_quant.clone()),
+            BindVal::Text(fixture.model.clone()),
+            BindVal::Blob(fixture.embedding.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ]
+    };
+
+    run_variant(
+        &mut conn,
+        "exact composed with fix B (reference)",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, N2_INNER_DIST, OR3], FINAL),
+        &[
+            BindVal::Text(text.clone()),
+            BindVal::Text(text.clone()),
+            BindVal::Blob(fixture.embedding.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ],
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "quant composed baseline (literals inlined)",
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, &coarse_baseline, RANKED, &head_baseline, MERGE, OR3],
+            FINAL,
+        ),
+        &quant_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "quant composed, fix B on coarse",
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_baseline, MERGE, OR3],
+            FINAL,
+        ),
+        &quant_binds(),
+        runs,
+    )
+    .await;
+    run_variant(
+        &mut conn,
+        "quant composed, fix B on coarse + head",
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_fixb, MERGE, OR3],
+            FINAL,
+        ),
+        &quant_binds(),
+        runs,
+    )
+    .await;
+
+    // The ceiling question: what is the most quantization could EVER buy in
+    // this execution model? A hypothetical no-rerank quant method (e.g.
+    // int8) would run exactly one pass: distance over stored quants, GROUP
+    // BY, rank window — the same shape as the fixed exact branch with the
+    // payload swapped 3072 B → 96 B. Comparing these two isolates the
+    // payload term from the per-row join scaffolding.
+    // binds: [embedding blob, model name]
+    run_variant(
+        &mut conn,
+        "branch: exact single-pass, fix B shape (payload = full vector)",
+        &with(
+            &[BEGIN, N2_INNER_DIST],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2_SemanticImageSearch""#,
+        ),
+        &[
+            BindVal::Blob(fixture.embedding.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ],
+        runs,
+    )
+    .await;
+    // binds: [query quant blob, model name]
+    let pure_quant_fixb = format!(
+        r#"{coarse_fixb}, "n2q" AS (SELECT "item_id", "file_id", row_number() OVER (  ORDER BY "cdist" ASC ) AS "order_rank" FROM "coarse_n2_SemanticImageSearch")"#
+    );
+    run_variant(
+        &mut conn,
+        "branch: pure-quant single-pass, fix B shape (payload = quant)",
+        &with(
+            &[BEGIN, &pure_quant_fixb],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2q""#,
+        ),
+        &[
+            BindVal::Blob(fixture.query_quant.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ],
+        runs,
+    )
+    .await;
+    // Same, without the materialized inner CTE (the 96 B quant through the
+    // GROUP BY sorter directly — cheaper than materializing at this size).
+    // binds: [query quant blob, model name]
+    let pure_quant_direct = format!(
+        r#"{coarse_baseline}, "n2q" AS (SELECT "item_id", "file_id", row_number() OVER (  ORDER BY "cdist" ASC ) AS "order_rank" FROM "coarse_n2_SemanticImageSearch")"#
+    );
+    run_variant(
+        &mut conn,
+        "branch: pure-quant single-pass, direct GROUP BY",
+        &with(
+            &[BEGIN, &pure_quant_direct],
+            r#"SELECT count(*) AS n, max("order_rank") AS max_rank FROM "n2q""#,
+        ),
+        &[
+            BindVal::Blob(fixture.query_quant.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ],
+        runs,
+    )
+    .await;
+
+    // The full composed query under a hypothetical no-rerank quant method:
+    // the pure-quant single pass as the semantic branch.
+    // binds: [text, text, query quant blob, model name]
+    let pure_quant_as_branch = format!(
+        r#"{coarse_fixb}, "n2_SemanticImageSearch" AS (SELECT "item_id", "file_id", row_number() OVER (  ORDER BY "cdist" ASC ) AS "order_rank" FROM "coarse_n2_SemanticImageSearch")"#
+    );
+    run_variant(
+        &mut conn,
+        "full composed: pure-quant no-rerank branch",
+        &with(&[BEGIN, N0_PATH, N1_TEXT, &pure_quant_as_branch, OR3], FINAL),
+        &[
+            BindVal::Text(text.clone()),
+            BindVal::Text(text.clone()),
+            BindVal::Blob(fixture.query_quant.clone()),
+            BindVal::Text(fixture.model.clone()),
+        ],
+        runs,
+    )
+    .await;
+
+    // Two-stage quant with the head actually driven from `ranked`
+    // (parent doc §11.4): probe only the crank <= k candidates' embeddings
+    // instead of joining the whole setter. CROSS JOIN pins the order
+    // (ranked → setters → item_data via the (item_id, setter_id) covering
+    // index → embeddings); the distance is materialized fix-B style so the
+    // GROUP BY sorter carries 8 B.
+    // binds: [embedding blob, model name]
+    let head_ranked_driven = format!(
+        r#""hdist_n2" AS MATERIALIZED (SELECT "ranked_n2_SemanticImageSearch"."item_id" AS "item_id", "ranked_n2_SemanticImageSearch"."file_id" AS "file_id", vec_distance_cosine("embeddings"."embedding", ?) AS "hd" FROM "ranked_n2_SemanticImageSearch" CROSS JOIN "setters" CROSS JOIN "item_data" CROSS JOIN "embeddings" WHERE "ranked_n2_SemanticImageSearch"."crank" <= {k} AND "setters"."name" = ? AND "item_data"."item_id" = "ranked_n2_SemanticImageSearch"."item_id" AND "item_data"."setter_id" = "setters"."id" AND "embeddings"."id" = "item_data"."id"), "head_n2_SemanticImageSearch" AS (SELECT "item_id", "file_id", AVG("hd") AS "edist" FROM "hdist_n2" GROUP BY "file_id")"#
+    );
+    run_variant(
+        &mut conn,
+        "quant composed, fix B coarse + ranked-driven head",
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_ranked_driven, MERGE, OR3],
+            FINAL,
+        ),
+        &quant_binds(),
+        runs,
+    )
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs a populated index database (PANOPTIKON_EXPLAIN_DB)"]
 async fn explain_plan_exact_vs_quant() {
