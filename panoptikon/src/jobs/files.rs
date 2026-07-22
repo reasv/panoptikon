@@ -2025,20 +2025,40 @@ static PDFIUM_CALL_LOCK: Mutex<()> = Mutex::new(());
 fn pdfium() -> Option<&'static Pdfium> {
     PDFIUM
         .get_or_init(|| {
-            let mut candidates: Vec<PathBuf> = Vec::new();
+            let mut file_candidates: Vec<PathBuf> = Vec::new();
+            let mut dir_candidates: Vec<PathBuf> = Vec::new();
             if let Some(custom) = &crate::config::runtime().pdfium {
-                candidates.push(custom.clone());
+                if custom.is_file() {
+                    file_candidates.push(custom.clone());
+                } else {
+                    dir_candidates.push(custom.clone());
+                }
+            }
+            if let Some(venv_lib) = crate::host_paths::find_pdfium_in_venvs() {
+                file_candidates.push(venv_lib);
             }
             if let Some(exe_dir) = env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(Path::to_path_buf))
             {
-                candidates.push(exe_dir);
+                dir_candidates.push(exe_dir);
             }
             if let Ok(cwd) = env::current_dir() {
-                candidates.push(cwd);
+                dir_candidates.push(cwd);
             }
-            for dir in &candidates {
+            for library in &file_candidates {
+                match Pdfium::bind_to_library(library) {
+                    Ok(bindings) => return Some(Pdfium::new(bindings)),
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            path = %library.display(),
+                            "failed to bind pdfium library"
+                        );
+                    }
+                }
+            }
+            for dir in &dir_candidates {
                 let library = Pdfium::pdfium_platform_library_name_at_path(dir);
                 match Pdfium::bind_to_library(&library) {
                     Ok(bindings) => return Some(Pdfium::new(bindings)),
@@ -2056,7 +2076,8 @@ fn pdfium() -> Option<&'static Pdfium> {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        searched = ?candidates,
+                        files = ?file_candidates,
+                        dirs = ?dir_candidates,
                         "pdfium library not found; PDF thumbnails are disabled"
                     );
                     None
@@ -2126,32 +2147,21 @@ static HTML_RENDERER: OnceLock<Option<PathBuf>> = OnceLock::new();
 fn html_renderer() -> Option<&'static PathBuf> {
     HTML_RENDERER
         .get_or_init(|| {
-            let mut candidates: Vec<PathBuf> = Vec::new();
             if let Some(custom) = &crate::config::runtime().html_renderer {
-                candidates.push(custom.clone());
-            }
-            candidates.extend(
-                [
-                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                    "/usr/bin/chromium",
-                    "/usr/bin/chromium-browser",
-                    "/usr/bin/google-chrome",
-                    "/usr/bin/google-chrome-stable",
-                ]
-                .iter()
-                .map(PathBuf::from),
-            );
-            for candidate in &candidates {
-                if candidate.is_file() {
-                    return Some(candidate.clone());
+                if let Some(path) = crate::host_paths::resolve_configured_executable(custom) {
+                    tracing::debug!(path = %path.display(), "html renderer from config");
+                    return Some(path);
                 }
+                tracing::debug!(
+                    path = %custom.display(),
+                    "configured html_renderer not found; falling back to discovery"
+                );
             }
-            tracing::warn!(
-                searched = ?candidates,
-                "no headless browser found; HTML thumbnails are disabled"
-            );
+            if let Some(path) = crate::host_paths::find_html_renderer() {
+                tracing::debug!(path = %path.display(), "html renderer resolved");
+                return Some(path);
+            }
+            tracing::warn!("no headless browser found; HTML thumbnails are disabled");
             None
         })
         .as_ref()
@@ -2359,9 +2369,7 @@ fn run_html_screenshot(
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
 
-/// Lazily loads a system font for thumbnail text. Mirrors the Python code,
-/// which tries arial.ttf and degrades gracefully: when no font is found the
-/// text helpers become no-ops and images are produced without labels.
+/// Config font, then host_paths discovery, then Windows fixed paths. Optional.
 fn label_font() -> Option<&'static FontVec> {
     LABEL_FONT
         .get_or_init(|| {
@@ -2369,21 +2377,30 @@ fn label_font() -> Option<&'static FontVec> {
             if let Some(custom) = &crate::config::runtime().thumbnail_font {
                 candidates.push(custom.clone());
             }
-            candidates.extend(
-                [
-                    r"C:\Windows\Fonts\segoeui.ttf",
-                    r"C:\Windows\Fonts\arial.ttf",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-                ]
-                .iter()
-                .map(PathBuf::from),
-            );
+            if let Some(found) = crate::host_paths::find_label_font() {
+                candidates.push(found);
+            }
+            #[cfg(windows)]
+            {
+                candidates.extend(
+                    [
+                        r"C:\Windows\Fonts\segoeui.ttf",
+                        r"C:\Windows\Fonts\arial.ttf",
+                    ]
+                    .iter()
+                    .map(PathBuf::from),
+                );
+            }
             for candidate in candidates {
                 if let Ok(bytes) = fs::read(&candidate) {
                     match FontVec::try_from_vec(bytes) {
-                        Ok(font) => return Some(font),
+                        Ok(font) => {
+                            tracing::debug!(
+                                path = %candidate.display(),
+                                "thumbnail label font resolved"
+                            );
+                            return Some(font);
+                        }
                         Err(err) => {
                             tracing::debug!(
                                 error = %err,
