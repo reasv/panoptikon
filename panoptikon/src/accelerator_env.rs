@@ -89,7 +89,9 @@ fn is_hip_related_lib_dir(dir: &Path) -> bool {
 }
 
 /// Prepend HIP dirs to `LD_LIBRARY_PATH`; default `ROCM_PATH`/`HIP_PATH` to
-/// `/opt/rocm` when unset. Empty on non-Linux.
+/// `/opt/rocm` when unset. Also sets MIOpen find/cache defaults so conv/GEMM
+/// solver search does not stall (EasyOCR/CRAFT: IsEnoughWorkspace size 0).
+/// Empty on non-Linux.
 fn hip_worker_env() -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -114,8 +116,44 @@ fn hip_worker_env() -> Vec<(String, String)> {
                 out.push(("HIP_PATH".to_owned(), "/opt/rocm".to_owned()));
             }
         }
+        // MIOpen defaults (only if unset so operators can override):
+        // FAST (2): FindDb hit or immediate fallback — avoids exhaustive
+        // GemmFwdRest evaluation with workspace ptr=0 that stalls OCR for
+        // tens of seconds until the unload grace kills the worker.
+        // See ROCm/TheRock#3077, rocm-libraries#4071.
+        if env::var_os("MIOPEN_FIND_MODE").is_none() {
+            out.push(("MIOPEN_FIND_MODE".to_owned(), "FAST".to_owned()));
+        }
+        if let Some(cache) = miopen_cache_dir() {
+            if env::var_os("MIOPEN_USER_DB_PATH").is_none() {
+                out.push((
+                    "MIOPEN_USER_DB_PATH".to_owned(),
+                    cache.join("db").to_string_lossy().into_owned(),
+                ));
+            }
+            if env::var_os("MIOPEN_CUSTOM_CACHE_DIR").is_none() {
+                out.push((
+                    "MIOPEN_CUSTOM_CACHE_DIR".to_owned(),
+                    cache.join("cache").to_string_lossy().into_owned(),
+                ));
+            }
+        }
         out
     }
+}
+
+/// Writable MIOpen FindDb/kernel cache root (`$XDG_CACHE_HOME/panoptikon/miopen`
+/// or `~/.cache/panoptikon/miopen`). Best-effort create; `None` if HOME/XDG
+/// unavailable.
+fn miopen_cache_dir() -> Option<PathBuf> {
+    let root = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = root.join("panoptikon").join("miopen");
+    std::fs::create_dir_all(dir.join("db")).ok()?;
+    std::fs::create_dir_all(dir.join("cache")).ok()?;
+    Some(dir)
 }
 
 fn merge_ld_library_path(prepend: &[PathBuf]) -> Option<OsString> {
@@ -206,8 +244,15 @@ mod tests {
         assert!(worker_env(Accelerator::Cuda).is_empty());
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto).is_empty());
-        // Rocm may be empty on hosts without HIP dirs; never panics.
-        let _ = worker_env(Accelerator::Rocm);
+        // Rocm may be empty of HIP libs on hosts without ROCm, but still
+        // carries MIOpen defaults when those env vars are unset.
+        let rocm = worker_env(Accelerator::Rocm);
+        if env::var_os("MIOPEN_FIND_MODE").is_none() {
+            assert!(
+                rocm.iter().any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
+                "expected MIOPEN_FIND_MODE=FAST in {rocm:?}"
+            );
+        }
     }
 
     #[test]
