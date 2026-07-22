@@ -254,9 +254,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     }
     write_sentinel(&venv, extra, &managed.uv_lock)?;
     prefetch_static_ffmpeg(&interpreter).await;
-    if accelerator == Accelerator::Rocm {
-        crate::accelerator_env::probe_rocm_torch(&interpreter).await?;
-    }
+    crate::accelerator_env::probe_after_setup(accelerator, &interpreter).await?;
     tracing::info!(
         interpreter = %interpreter.display(),
         extra,
@@ -473,7 +471,7 @@ fn accelerator_extra(accelerator: Accelerator) -> &'static str {
 /// Resolve an accelerator request into a concrete choice plus the evidence
 /// for logging. Explicit choices are validated (ROCm is Linux-only);
 /// `auto` runs the platform probes.
-fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> {
+pub(crate) fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> {
     match requested {
         Accelerator::Auto => Ok(decide_accelerator(&DetectionProbes::gather())),
         Accelerator::Rocm if !cfg!(target_os = "linux") => {
@@ -490,6 +488,14 @@ fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> 
         }
         explicit => Ok((explicit, "explicitly configured".into())),
     }
+}
+
+/// Resolved accelerator for runtime decisions (worker env, etc.).
+/// On validation failure, returns `requested` unchanged.
+pub(crate) fn effective_accelerator(requested: Accelerator) -> Accelerator {
+    resolve_accelerator(requested)
+        .map(|(resolved, _)| resolved)
+        .unwrap_or(requested)
 }
 
 /// Everything the auto-detection decision looks at, gathered up front so

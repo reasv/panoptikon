@@ -1,8 +1,10 @@
 //! Host accelerator environment for inference workers and setup probes.
 //!
-//! Today this is ROCm/HIP-focused (library path injection + torch probe).
-//! Spawn sites pass the configured [`crate::config::Accelerator`] so
-//! explicit `cpu`/`cuda` do not pick up host HIP paths.
+//! Callers pass a **resolved** [`Accelerator`] (not `auto` — use
+//! [`crate::setup::effective_accelerator`]). Today the only non-empty
+//! worker env is ROCm/HIP; `cpu`/`cuda` stay empty so host HIP trees do
+//! not alter linking. [`probe_after_setup`] is the extension point for
+//! post-sync validation (ROCm torch probe now; others later).
 
 use std::env;
 use std::ffi::OsString;
@@ -11,26 +13,32 @@ use std::process::Stdio;
 
 use crate::config::Accelerator;
 
-/// Whether workers should receive host HIP/HSA env for this accelerator.
+/// Env vars for an inference worker for a **resolved** accelerator.
 ///
-/// `rocm` always; `auto` yes (setup may have installed the ROCm extra);
-/// explicit `cpu`/`cuda` never.
-pub fn injects_hip_worker_env(accelerator: Accelerator) -> bool {
-    matches!(accelerator, Accelerator::Rocm | Accelerator::Auto)
-}
-
-/// Env vars for an inference worker given the configured accelerator.
-/// Empty for `cpu`/`cuda` so a host `/opt/rocm` does not alter linking.
+/// HIP/HSA injection only for [`Accelerator::Rocm`]. `auto` is treated as
+/// empty (resolve first). Explicit `cpu`/`cuda` never inject, even if
+/// `/opt/rocm` exists on the host.
 pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
-    if injects_hip_worker_env(accelerator) {
+    if accelerator == Accelerator::Rocm {
         hip_worker_env()
     } else {
         Vec::new()
     }
 }
 
-/// Existing HIP/HSA (or NixOS opengl-driver) lib dirs, discovery order.
-pub fn hip_library_dirs() -> Vec<PathBuf> {
+/// Post-`uv sync` accelerator checks. No-op for cpu/cuda/auto; ROCm runs
+/// a trivial HIP kernel probe (soft-ok with no GPU).
+pub async fn probe_after_setup(
+    accelerator: Accelerator,
+    interpreter: &Path,
+) -> anyhow::Result<()> {
+    match accelerator {
+        Accelerator::Rocm => probe_rocm_torch(interpreter).await,
+        Accelerator::Cpu | Accelerator::Cuda | Accelerator::Auto => Ok(()),
+    }
+}
+
+fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
         return Vec::new();
@@ -52,8 +60,7 @@ pub fn hip_library_dirs() -> Vec<PathBuf> {
     }
 }
 
-/// Keep dirs that exist and look like HIP/HSA or the NixOS driver tree.
-pub fn select_existing_hip_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
+fn select_existing_hip_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in candidates {
         if !dir.is_dir() || !is_hip_related_lib_dir(dir) {
@@ -147,7 +154,7 @@ print("rocm_gpu_probe_ok")
 "#;
 
 /// Soft-ok if no GPU; Err if a trivial HIP kernel fails on a visible device.
-pub async fn probe_rocm_torch(interpreter: &Path) -> anyhow::Result<()> {
+async fn probe_rocm_torch(interpreter: &Path) -> anyhow::Result<()> {
     let output = tokio::process::Command::new(interpreter)
         .arg("-c")
         .arg(ROCM_TORCH_PROBE)
@@ -194,13 +201,13 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn injects_hip_matches_accelerator() {
-        assert!(!injects_hip_worker_env(Accelerator::Cpu));
-        assert!(!injects_hip_worker_env(Accelerator::Cuda));
-        assert!(injects_hip_worker_env(Accelerator::Rocm));
-        assert!(injects_hip_worker_env(Accelerator::Auto));
+    fn worker_env_only_for_resolved_rocm() {
         assert!(worker_env(Accelerator::Cpu).is_empty());
         assert!(worker_env(Accelerator::Cuda).is_empty());
+        // Unresolved auto must not inject; callers resolve first.
+        assert!(worker_env(Accelerator::Auto).is_empty());
+        // Rocm may be empty on hosts without HIP dirs; never panics.
+        let _ = worker_env(Accelerator::Rocm);
     }
 
     #[test]
