@@ -14,7 +14,7 @@ mod inferio_client;
 mod jobs;
 mod logging;
 mod host_paths;
-mod rocm_env;
+mod accelerator_env;
 mod media_tools;
 mod openapi;
 mod policy;

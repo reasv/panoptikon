@@ -21,7 +21,7 @@ enabled = true
 
 [inference_local.python_env]
 auto_setup = true
-# GPU package wraps set PANOPTIKON_ACCELERATOR (rocm/cuda); default auto-detect.
+# Packagers may set PANOPTIKON_ACCELERATOR (e.g. rocm/cuda); default is auto-detect.
 accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 
 [rulesets.allow_all]

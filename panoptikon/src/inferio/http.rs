@@ -121,7 +121,7 @@ impl InferioState {
             python: local.resolved_python(),
             impl_dirs: local.resolved_impl_dirs(),
             pythonpath: local.resolved_pythonpath(),
-            env: crate::rocm_env::worker_env(),
+            env: crate::accelerator_env::worker_env(local.python_env.accelerator),
             env_remove: Vec::new(),
             cwd: None,
             deadlines,

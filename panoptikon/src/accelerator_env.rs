@@ -1,13 +1,36 @@
-//! Host HIP/HSA discovery for Linux workers and setup probes.
-//! Workers use [`worker_env`]; setup `--accelerator rocm` runs [`probe_rocm_torch`].
+//! Host accelerator environment for inference workers and setup probes.
+//!
+//! Today this is ROCm/HIP-focused (library path injection + torch probe).
+//! Spawn sites pass the configured [`crate::config::Accelerator`] so
+//! explicit `cpu`/`cuda` do not pick up host HIP paths.
 
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use crate::config::Accelerator;
+
+/// Whether workers should receive host HIP/HSA env for this accelerator.
+///
+/// `rocm` always; `auto` yes (setup may have installed the ROCm extra);
+/// explicit `cpu`/`cuda` never.
+pub fn injects_hip_worker_env(accelerator: Accelerator) -> bool {
+    matches!(accelerator, Accelerator::Rocm | Accelerator::Auto)
+}
+
+/// Env vars for an inference worker given the configured accelerator.
+/// Empty for `cpu`/`cuda` so a host `/opt/rocm` does not alter linking.
+pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
+    if injects_hip_worker_env(accelerator) {
+        hip_worker_env()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Existing HIP/HSA (or NixOS opengl-driver) lib dirs, discovery order.
-pub fn rocm_library_dirs() -> Vec<PathBuf> {
+pub fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
         return Vec::new();
@@ -25,15 +48,15 @@ pub fn rocm_library_dirs() -> Vec<PathBuf> {
             PathBuf::from("/run/current-system/sw/lib"),
             PathBuf::from("/run/opengl-driver/lib"),
         ]);
-        select_existing_rocm_lib_dirs(&candidates)
+        select_existing_hip_lib_dirs(&candidates)
     }
 }
 
 /// Keep dirs that exist and look like HIP/HSA or the NixOS driver tree.
-pub fn select_existing_rocm_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
+pub fn select_existing_hip_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in candidates {
-        if !dir.is_dir() || !is_rocm_related_lib_dir(dir) {
+        if !dir.is_dir() || !is_hip_related_lib_dir(dir) {
             continue;
         }
         if !out.iter().any(|seen| seen == dir) {
@@ -43,7 +66,7 @@ pub fn select_existing_rocm_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-fn is_rocm_related_lib_dir(dir: &Path) -> bool {
+fn is_hip_related_lib_dir(dir: &Path) -> bool {
     const MARKERS: &[&str] = &[
         "libamdhip64.so",
         "libamdhip64.so.6",
@@ -60,7 +83,7 @@ fn is_rocm_related_lib_dir(dir: &Path) -> bool {
 
 /// Prepend HIP dirs to `LD_LIBRARY_PATH`; default `ROCM_PATH`/`HIP_PATH` to
 /// `/opt/rocm` when unset. Empty on non-Linux.
-pub fn worker_env() -> Vec<(String, String)> {
+fn hip_worker_env() -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
     {
         return Vec::new();
@@ -68,7 +91,7 @@ pub fn worker_env() -> Vec<(String, String)> {
     #[cfg(target_os = "linux")]
     {
         let mut out = Vec::new();
-        if let Some(joined) = merge_ld_library_path(&rocm_library_dirs()) {
+        if let Some(joined) = merge_ld_library_path(&hip_library_dirs()) {
             out.push((
                 "LD_LIBRARY_PATH".to_owned(),
                 joined.to_string_lossy().into_owned(),
@@ -131,7 +154,7 @@ pub async fn probe_rocm_torch(interpreter: &Path) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(worker_env())
+        .envs(hip_worker_env())
         .output()
         .await
         .map_err(|err| {
@@ -171,6 +194,16 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn injects_hip_matches_accelerator() {
+        assert!(!injects_hip_worker_env(Accelerator::Cpu));
+        assert!(!injects_hip_worker_env(Accelerator::Cuda));
+        assert!(injects_hip_worker_env(Accelerator::Rocm));
+        assert!(injects_hip_worker_env(Accelerator::Auto));
+        assert!(worker_env(Accelerator::Cpu).is_empty());
+        assert!(worker_env(Accelerator::Cuda).is_empty());
+    }
+
+    #[test]
     fn select_existing_keeps_hip_and_driver_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let hip = tmp.path().join("hip/lib");
@@ -183,7 +216,7 @@ mod tests {
         let driver = tmp.path().join("run/opengl-driver/lib");
         fs::create_dir_all(&driver).unwrap();
 
-        let selected = select_existing_rocm_lib_dirs(&[
+        let selected = select_existing_hip_lib_dirs(&[
             hip.clone(),
             empty,
             driver.clone(),

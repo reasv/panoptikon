@@ -209,7 +209,7 @@ out of scope for the initial release.
   (or no Node at all). Docker images will install Node natively rather than
   inherit this.
 - **ROCm (Linux x86_64):** pytorch.org multi-arch `rocm7.2` (`torch` 2.11;
-  not AMD `.lw`). Host ROCm 7.2.x; `rocm_env` + setup HIP probe. cpu/cu128
+  not AMD `.lw`). Host ROCm 7.2.x; `accelerator_env` + setup HIP probe. cpu/cu128
   remain torch 2.7.1.
 - **`cudnn/` vendored dir** remains supported as a legacy fallback path in the
   worker's cuDNN setup.

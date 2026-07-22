@@ -255,7 +255,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     write_sentinel(&venv, extra, &managed.uv_lock)?;
     prefetch_static_ffmpeg(&interpreter).await;
     if accelerator == Accelerator::Rocm {
-        crate::rocm_env::probe_rocm_torch(&interpreter).await?;
+        crate::accelerator_env::probe_rocm_torch(&interpreter).await?;
     }
     tracing::info!(
         interpreter = %interpreter.display(),
