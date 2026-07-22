@@ -21,7 +21,7 @@ enabled = true
 
 [inference_local.python_env]
 auto_setup = true
-accelerator = "auto"
+accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 
 [rulesets.allow_all]
 allow_all = true
