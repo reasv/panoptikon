@@ -21,7 +21,8 @@ enabled = true
 
 [inference_local.python_env]
 auto_setup = true
-accelerator = "auto"
+# Packagers may set PANOPTIKON_ACCELERATOR (e.g. rocm/cuda); default is auto-detect.
+accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 
 [rulesets.allow_all]
 allow_all = true
