@@ -2030,8 +2030,17 @@ fn pdfium() -> Option<&'static Pdfium> {
             if let Some(custom) = &crate::config::runtime().pdfium {
                 if custom.is_file() {
                     file_candidates.push(custom.clone());
-                } else {
+                } else if custom.is_dir() {
                     dir_candidates.push(custom.clone());
+                } else {
+                    // A configured path that resolves nowhere is a config
+                    // error the user should see, not a debug-level shrug
+                    // before discovery quietly picks something else.
+                    tracing::warn!(
+                        path = %custom.display(),
+                        "configured pdfium path does not exist; falling back \
+                         to discovery"
+                    );
                 }
             }
             if let Some(venv_lib) = crate::host_paths::find_pdfium_in_venvs() {
@@ -2152,7 +2161,7 @@ fn html_renderer() -> Option<&'static PathBuf> {
                     tracing::debug!(path = %path.display(), "html renderer from config");
                     return Some(path);
                 }
-                tracing::debug!(
+                tracing::warn!(
                     path = %custom.display(),
                     "configured html_renderer not found; falling back to discovery"
                 );
@@ -2375,7 +2384,15 @@ fn label_font() -> Option<&'static FontVec> {
         .get_or_init(|| {
             let mut candidates: Vec<PathBuf> = Vec::new();
             if let Some(custom) = &crate::config::runtime().thumbnail_font {
-                candidates.push(custom.clone());
+                if custom.is_file() {
+                    candidates.push(custom.clone());
+                } else {
+                    tracing::warn!(
+                        path = %custom.display(),
+                        "configured thumbnail_font not found; falling back \
+                         to discovery"
+                    );
+                }
             }
             if let Some(found) = crate::host_paths::find_label_font() {
                 candidates.push(found);
