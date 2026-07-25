@@ -160,8 +160,8 @@ runs on the Node.js runtime bundled inside that same environment.
    This finds `uv` on PATH (or downloads a pinned copy into `runtime/uv/`),
    detects your accelerator, creates `python/.venv`, and installs the locked
    dependency set for it. Accelerator selection is automatic — **CUDA** when
-   an NVIDIA driver is present, **ROCm** on Linux with a ROCm install
-   (untested), otherwise **CPU**; macOS always gets the standard PyPI wheels
+   an NVIDIA driver is present, **ROCm** on Linux with ROCm 7.2.x (pytorch.org
+   multi-arch `rocm7.2` wheels), otherwise **CPU**; macOS always gets PyPI wheels
    (which include MPS support on Apple Silicon). Override it with
    `--accelerator cuda|rocm|cpu` or pin it in the config
    (`[inference_local.python_env] accelerator`). `--force` recreates the

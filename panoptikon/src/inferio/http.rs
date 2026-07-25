@@ -121,7 +121,19 @@ impl InferioState {
             python: local.resolved_python(),
             impl_dirs: local.resolved_impl_dirs(),
             pythonpath: local.resolved_pythonpath(),
-            env: Vec::new(),
+            // Worker env follows the wheels actually installed (the setup
+            // sentinel), not a re-probe of the hardware: config `auto` on a
+            // host with /opt/rocm must not inject HIP paths into a venv that
+            // was deliberately synced as cpu/cuda. Config resolution remains
+            // the fallback for user-managed interpreters and legacy venvs,
+            // which have no sentinel.
+            env: crate::accelerator_env::worker_env(if local.python.is_some() {
+                crate::setup::effective_accelerator(local.python_env.accelerator)
+            } else {
+                crate::setup::installed_accelerator().unwrap_or_else(|| {
+                    crate::setup::effective_accelerator(local.python_env.accelerator)
+                })
+            }),
             env_remove: Vec::new(),
             cwd: None,
             deadlines,

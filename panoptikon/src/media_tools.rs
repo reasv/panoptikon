@@ -123,6 +123,16 @@ fn venv_static_ffmpeg(python: &Path) -> Option<(PathBuf, PathBuf)> {
         );
         return None;
     }
+    if !crate::host_paths::can_spawn(&ffmpeg, &["-version"])
+        || !crate::host_paths::can_spawn(&ffprobe, &["-version"])
+    {
+        tracing::debug!(
+            ffmpeg = %ffmpeg.display(),
+            ffprobe = %ffprobe.display(),
+            "static-ffmpeg not runnable; using ffmpeg/ffprobe from PATH"
+        );
+        return None;
+    }
     Some((ffmpeg, ffprobe))
 }
 
