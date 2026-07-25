@@ -356,3 +356,7 @@ docker compose up -d --build              # ACCELERATOR=cpu for a CPU image
 Panoptikon is free software released under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
 
 You may use, modify, and redistribute it under the terms of that license. If you run a modified version of Panoptikon as a network service, the AGPL requires you to offer the modified source code to that service's users.
+
+## Contributions
+
+Panoptikon is written and copyrighted by a single author. Contributions are welcome, but are accepted only under the terms in [CONTRIBUTING.md](CONTRIBUTING.md): by submitting a contribution you assign its copyright to the maintainer and agree to its release under the AGPL. Read that file before opening a pull request.
