@@ -3,7 +3,14 @@
 What actually restricts Panoptikon to newer NVIDIA hardware, and how the
 inference stack should behave when a GPU is old, small, or both. Findings
 verified 2026-07-25 against the dev venv (`torch 2.7.1+cu128`, Windows,
-RTX 5090). Plan only — nothing here is implemented.
+RTX 5090). Plan only — nothing in the plan sections is implemented.
+
+> **Revised 2026-07-25** after PR #19 (host tool discovery + ROCm 7.2,
+> merged at `492f87c`) landed on several of these surfaces. ROCm is no
+> longer aspirational, the setup sentinel is now readable ground truth for
+> the installed accelerator, and a post-setup probe hook exists. The
+> detection probes themselves are unchanged, so the findings about them
+> still hold. Changed points are marked inline.
 
 Two separate problems are covered because they surface as the same user
 experience ("I tried a model and it died"):
@@ -32,6 +39,12 @@ should not be diagnosed as one.
 No ONNX Runtime is involved anywhere; the only non-torch CUDA component is
 CTranslate2 (faster-whisper), plus the `nvidia-cublas-cu12` /
 `nvidia-cudnn-cu12` wheels it needs.
+
+The arch list above is a property of the `cu128` extra (torch 2.7.1), which
+`cpu` shares. Since PR #19 the `rocm` extra is a different torch generation
+entirely — 2.11.0 from the `rocm7.2` index — so "our torch" is no longer one
+version, and any future statement about kernel coverage has to name the extra
+it applies to.
 
 ### What actually gates old cards: hardcoded dtypes and attention kernels
 
@@ -77,16 +90,35 @@ Pascal user.
   on Windows, `/proc/driver/nvidia` on Linux. It never reads compute
   capability. `on_path` does append `.exe` on Windows.
 - The decision is made once, when the venv is created. `maybe_auto_setup`
-  (`panoptikon/src/setup.rs:1074`) only re-runs when the environment is
-  missing, incomplete (no sentinel), or the `uv.lock` hash changed, and it
-  passes `accelerator: None`. A CPU venv built before a driver existed is
-  never revisited.
-- Nothing surfaces the result. `panoptikon-desktop/src-tauri/src/server_config.rs`
-  exposes port, search cache and inference performance knobs — no accelerator
-  field — so recovery means hand-editing `config/server/desktop.toml` and
-  deleting `runtime/venv`. The only record of the choice is the
-  `accelerator selected` log line (`panoptikon/src/setup.rs:212`), which
-  carries the evidence string.
+  only re-runs when the environment is missing, incomplete (no sentinel), or
+  the `uv.lock` hash changed, and it passes `accelerator: None`. A CPU venv
+  built before a driver existed is never revisited. **Unchanged by PR #19**:
+  the early-return in `setup::run` for a converged venv is now conditional,
+  but its `options.accelerator.is_none()` arm is exactly the auto-setup path,
+  and deliberately so — auto-setup must never silently swap a torch build the
+  user synced on purpose.
+- **Changed by PR #19 — the installed variant is now knowable.**
+  `installed_accelerator()` reads the sentinel's `extra=` line, and
+  `panoptikon setup --accelerator X --if-needed` re-syncs when the installed
+  extra differs from the requested one (plain `panoptikon setup` always runs;
+  `--if-needed` is the new opt-in skip). Switching accelerators from the CLI
+  therefore no longer requires deleting the venv by hand.
+- Desktop still cannot do any of that. It has no CLI surface,
+  `panoptikon-desktop/src-tauri/src/server_config.rs` still exposes no
+  accelerator field, and the config-only change a user can make is exactly the
+  case auto-setup ignores — so deleting `runtime/venv` remains the Desktop-side
+  recovery. The only record of the choice is the `accelerator selected` log
+  line, which carries the evidence string.
+- **Changed by PR #19 — `desktop.toml` now ships a live env bridge**,
+  `accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"`, added for packagers
+  (e.g. a ROCm-targeted build). Per the config-authoring rules its fallback
+  freezes for anyone who has already seeded the file, and releases up to
+  v0.1.7 seeded the *commented* form — so field installs have a commented
+  `accelerator` line, not the template.
+- **Changed by PR #19 — a post-setup probe hook exists.**
+  `accelerator_env::probe_after_setup(accelerator, interpreter)` runs after a
+  successful sync and is documented as the extension point for post-sync
+  validation (a HIP kernel probe for ROCm today, no-op for cpu/cuda).
 - The AppImage environment boundary is not implicated: `host_env` rewrites
   nothing unless `APPDIR` is set, and the sidecar's `env_clear` is gated on
   that being `Some` (`panoptikon-desktop/src-tauri/src/supervisor.rs:173`).
@@ -97,9 +129,13 @@ CUDA 13 drops compute capability below 7.5. When PyTorch moves its default
 wheels to cu13x, Pascal loses kernel coverage for real and will need a
 pinned legacy extra (the last cu12 torch); Turing survives. Nothing to do
 today beyond not designing the accelerator matrix as if `cu128` were
-permanent.
+permanent — and PR #19 already set the precedent, since the single universal
+lock now spans two torch generations behind a `constraint-dependencies` range
+(`torch>=2.7.1,<=2.11.0`). A legacy CUDA extra would be the same shape.
 
 ### Incidental defects found while reading
+
+(Both re-checked at `492f87c` and still present.)
 
 - `python/inferio/impl/md_tagger.py:92` and
   `python/inferio/impl/md_captioner.py:75` compare a `torch.device` to the
@@ -147,7 +183,9 @@ permanent.
 9. **Per-model-family GPU self-test** (tiny input, each family and dtype),
    runnable on demand. This is what turns "we do not know if it works on
    card X" into data, and is the artifact to hand a user testing old
-   hardware.
+   hardware. The hook now exists — PR #19 added
+   `accelerator_env::probe_after_setup` as the post-sync validation
+   dispatcher — so this extends that rather than introducing a new one.
 
 Rationale for the shape of 4–8: VRAM use depends on model, dtype, attention
 kernel, input resolution and batch composition simultaneously, and the model
@@ -164,10 +202,22 @@ failed attempt cheap and letting each install accumulate its own measurements.
   now exists, offer a rebuild instead of silently staying on CPU forever.
 - Keep `cu128` as the CUDA extra (it covers sm_50+). Add a pinned legacy
   extra only when torch moves to cu13x.
-- A pending community PR adds **ROCm support and NixOS fixes** and touches
-  this same decision path. Review it before rewriting `decide_accelerator`
-  and build on whatever shape it lands in. ROCm remains listed as
-  aspirational/untested in the tech-debt register.
+- **Desktop needs the CLI's new capability.** `--accelerator X --if-needed`
+  already re-syncs a mismatched venv; Desktop should invoke that path (or the
+  same code) from the planned inference tab instead of leaving "delete
+  `runtime/venv`" as the only route.
+- Build the re-probe on the merged pieces: `installed_accelerator()` for what
+  is installed, `resolve_accelerator`/`effective_accelerator` for what the
+  hardware now suggests, and surface the mismatch rather than acting on it
+  silently.
+
+ROCm (merged in PR #19, `492f87c`) is no longer aspirational: `rocm` maps to
+torch 2.11.0 from the `rocm7.2` index, HIP/HSA worker env is injected only
+when the *installed* accelerator is `rocm` (sentinel-derived, so a host with
+`/opt/rocm` cannot poison a deliberately-`cuda` venv), MIOpen is forced to
+FAST find, and EasyOCR is pinned to a single `cuda:0` device under HIP. It is
+untested in CI by design. None of that touched the detection probes or the
+dtype sites below, so the rest of this document stands.
 
 ## Plan — Desktop inference tab (UX)
 
@@ -178,6 +228,9 @@ A dedicated config tab for the inference environment, replacing the current
   variant; venv state.
 - Switch accelerator / reinstall the Python venv from the UI.
 - Select which GPUs participate in inference (drives `CUDA_VISIBLE_DEVICES`).
+  Note the `PANOPTIKON_ACCELERATOR` bridge added in PR #19 is a packager
+  affordance, not a user-facing control — it is set before first run, not
+  changed afterwards.
 - Per-model compatibility: **verified** (ran here, ≈X GB), **untested here**,
   **requires newer GPU**, **known too large** — populated by the self-test and
   the recorded footprints.
