@@ -4,7 +4,7 @@ Why `index.db-wal` can reach tens of GB on a large index, and what bounds it.
 Investigated 2026-07-25 by reading the writer/connection code; no measurement
 run. Not a correctness problem — the database is intact and the space is
 reclaimed — but the high-water mark is larger and lives longer than it needs
-to. Nothing here is implemented.
+to. The fix below was implemented the same day.
 
 ## Findings
 
@@ -35,16 +35,32 @@ to. Nothing here is implemented.
   through the log, so on a multi-GB index it is a large single contributor
   whenever it does run.
 
-## Plan
+## Fix (implemented 2026-07-25)
 
-- Set `journal_size_limit` on write connections so a checkpointed log is
-  truncated back to a bound instead of persisting at its high-water mark.
-- Run a truncating checkpoint at a natural quiet point — between job batches,
-  and after the post-job maintenance step — so a long run recycles the log
-  mid-flight rather than only when everything goes idle.
-- Consider whether the read-side snapshot lifetime can be shortened for the
-  long-running search path, since that is what stalls the passive checkpoints
-  in the first place.
+- `journal_size_limit = 64 MiB` is set on every write connection for each
+  writable schema — index, storage, and user_data when write-locked
+  (`connect_db`, `panoptikon/src/db/connection.rs`). Any checkpoint that
+  resets the log now truncates the file back to the bound instead of leaving
+  it at its high-water mark. The pragma is per-connection and not persistent,
+  which is sufficient: autocheckpoints run on the committing connection, and
+  every committing connection opens through this path.
+- `run_post_job_maintenance` (`panoptikon/src/jobs/files.rs`) ends with a new
+  writer message running `PRAGMA wal_checkpoint(TRUNCATE)` — unqualified, so
+  it covers the attached storage schema too. Ordered after VACUUM/ANALYZE so
+  it also reclaims what those pushed through the log. If an open read
+  snapshot blocks it, the pragma waits out sqlx's 5s busy timeout, does what
+  a passive checkpoint can, and reports busy without erroring; the log is
+  then reclaimed at a later reset via `journal_size_limit`.
+- The read-side idea (shortening snapshot lifetime on the long-running search
+  path) was deliberately dropped: restructuring long reads risks correctness
+  for a problem the two changes above reduce to bounded transient growth, and
+  the ANALYZE-storm fix already removed the main source of pathological
+  long readers.
 
 Neither change affects durability: checkpointing is what SQLite does anyway,
 only sooner and with the file bounded.
+
+What remains, by design: VACUUM still pushes the whole database through the
+log while it runs, and a genuinely long reader still accumulates all writes
+made during its snapshot — both are inherent peaks that now recover at the
+next checkpoint instead of persisting until full idle.

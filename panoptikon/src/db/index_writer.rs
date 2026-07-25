@@ -71,6 +71,16 @@ const CALL_RETRY_ATTEMPTS: usize = 2;
 /// once per job, not swapping in `optimize`.
 const ANALYZE_STATEMENTS: &[&str] = &["ANALYZE", "PRAGMA optimize"];
 
+/// Truncating WAL checkpoint, run after the post-job ANALYZE by
+/// `run_post_job_maintenance` so a long run reclaims the log between jobs
+/// rather than only when everything goes idle. The unqualified pragma covers
+/// every attached schema (index + storage), unlike most pragmas. If an open
+/// read snapshot blocks it, the pragma waits out sqlx's busy timeout (5s),
+/// does what a passive checkpoint can, and reports busy without erroring;
+/// the log is then reclaimed at a later reset via the `journal_size_limit`
+/// set in connection.rs.
+const CHECKPOINT_STATEMENTS: &[&str] = &["PRAGMA wal_checkpoint(TRUNCATE)"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IndexDbKey {
     index_db: String,
@@ -287,6 +297,10 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     Analyze {
+        reply: Reply<()>,
+    },
+    /// Truncating WAL checkpoint; see `CHECKPOINT_STATEMENTS`.
+    Checkpoint {
         reply: Reply<()>,
     },
     /// No-op barrier: the writer handles messages in order, so a reply proves
@@ -963,6 +977,10 @@ impl Actor for IndexDbWriter {
                 let result = state.run_maintenance(ANALYZE_STATEMENTS).await;
                 let _ = reply.send(result);
             }
+            IndexDbWriterMessage::Checkpoint { reply } => {
+                let result = state.run_maintenance(CHECKPOINT_STATEMENTS).await;
+                let _ = reply.send(result);
+            }
             IndexDbWriterMessage::Flush { reply } => {
                 let _ = reply.send(Ok(()));
             }
@@ -1370,6 +1388,60 @@ mod tests {
         assert!(
             analyzed > 0,
             "post-job maintenance left `items` unanalyzed: {ANALYZE_STATEMENTS:?}"
+        );
+    }
+
+    // `CHECKPOINT_STATEMENTS` must actually truncate the log: SQLite ignores
+    // unknown pragmas silently, so a typo would pass an Ok()-based test while
+    // leaving the WAL at its high-water mark. Asserts on the -wal file size
+    // instead. Needs a file-backed database — WAL does not apply to the
+    // in-memory databases the other tests use.
+    #[tokio::test]
+    async fn checkpoint_statements_truncate_the_wal_file() {
+        use sqlx::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open test database");
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .expect("enable WAL");
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)")
+            .execute(&mut conn)
+            .await
+            .expect("create table");
+        // ~2 MiB of committed pages: enough that the WAL is visibly non-empty,
+        // below the ~4 MiB default autocheckpoint threshold.
+        for _ in 0..32 {
+            sqlx::query("INSERT INTO t (data) VALUES (zeroblob(65536))")
+                .execute(&mut conn)
+                .await
+                .expect("insert blob");
+        }
+
+        let wal_path = dir.path().join("index.db-wal");
+        assert!(
+            std::fs::metadata(&wal_path).expect("stat wal file").len() > 0,
+            "test setup failed to grow the WAL"
+        );
+
+        for statement in CHECKPOINT_STATEMENTS {
+            sqlx::query(*statement)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
+        }
+
+        assert_eq!(
+            std::fs::metadata(&wal_path).expect("stat wal file").len(),
+            0,
+            "checkpoint left the WAL untruncated: {CHECKPOINT_STATEMENTS:?}"
         );
     }
 }

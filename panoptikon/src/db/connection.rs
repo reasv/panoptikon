@@ -481,6 +481,14 @@ pub(crate) fn readonly_mode() -> bool {
     crate::config::runtime().readonly
 }
 
+/// `journal_size_limit` for writable schemas (64 MiB). A checkpoint that
+/// resets the WAL truncates the file back to this bound instead of leaving it
+/// at its high-water mark; without a limit, tens-of-GB logs from long jobs
+/// persist until every connection has closed. Roomy enough (~16x the default
+/// 1000-page autocheckpoint threshold) that steady-state commits never churn
+/// truncate/regrow cycles. See docs/sqlite-wal-growth.md.
+const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 async fn connect_db(
     paths: &DbPaths,
     write_lock: bool,
@@ -540,6 +548,24 @@ async fn connect_db(
                     tracing::error!(error = %err, "failed to enable WAL mode");
                     ApiError::internal("Failed to open database")
                 })?;
+            // Bound the WAL high-water mark: with a limit set, any checkpoint
+            // that resets the log truncates the file back to the limit instead
+            // of leaving it at peak size until every connection closes. The
+            // pragma is per-connection and per-schema: autocheckpoints run on
+            // the committing connection, which is opened through this path,
+            // and each writable schema needs its own line.
+            for pragma in [
+                format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+                format!("PRAGMA storage.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(pragma))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        tracing::error!(error = %err, "failed to set WAL size limit");
+                        ApiError::internal("Failed to open database")
+                    })?;
+            }
         }
         conn
     };
@@ -563,6 +589,15 @@ async fn connect_db(
                         tracing::error!(error = %err, "failed to enable WAL for user data");
                         ApiError::internal("Failed to open database")
                     })?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "PRAGMA user_data.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"
+                )))
+                .execute(&mut conn)
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to set WAL size limit for user data");
+                    ApiError::internal("Failed to open database")
+                })?;
             }
         }
     }

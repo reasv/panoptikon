@@ -336,8 +336,8 @@ pub(crate) async fn is_resync_needed(
     Ok(current_included != new_included || current_excluded != new_excluded)
 }
 
-/// Post-job VACUUM/ANALYZE. Failures are logged but never fail the job: the
-/// job's own work has already been committed at this point.
+/// Post-job VACUUM/ANALYZE/checkpoint. Failures are logged but never fail the
+/// job: the job's own work has already been committed at this point.
 pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
     if vacuum {
         if let Err(err) =
@@ -350,6 +350,13 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Analyze { reply }).await
     {
         tracing::error!(error = ?err, index_db, "failed to analyze index database");
+    }
+    // Last so it also reclaims what VACUUM/ANALYZE themselves pushed through
+    // the log.
+    if let Err(err) =
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Checkpoint { reply }).await
+    {
+        tracing::error!(error = ?err, index_db, "failed to checkpoint index database");
     }
 }
 
