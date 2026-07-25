@@ -193,22 +193,37 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     // Serialize concurrent setups (gateway + `inferio` starting together):
     // held for the whole run, released when dropped at return.
     let _setup_lock = SetupLock::acquire().await?;
-    if options.skip_if_converged && auto_setup_needed().is_none() {
-        tracing::info!(
-            "the environment converged while waiting for the setup lock \
-             (another panoptikon process finished setup); nothing to do"
-        );
-        return Ok(());
-    }
-
-    let uv = locate_uv().await?;
-    tracing::info!(uv = %uv.path.display(), version = %uv.version, "using uv");
 
     let requested = options
         .accelerator
         .unwrap_or(settings.inference_local.python_env.accelerator);
     let (accelerator, evidence) = resolve_accelerator(requested)?;
     let extra = accelerator_extra(accelerator);
+
+    // A converged venv only counts when it also holds the right wheels: an
+    // explicit `--accelerator X --if-needed` must re-sync a venv installed
+    // for a different extra (the sentinel records which one). Without an
+    // explicit request (the startup auto-trigger, config-driven runs) the
+    // installed extra is left alone — auto-setup must never silently swap
+    // the torch build a user deliberately synced.
+    if options.skip_if_converged && auto_setup_needed().is_none() {
+        let installed = installed_accelerator().map(accelerator_extra);
+        if options.accelerator.is_none() || installed == Some(extra) {
+            tracing::info!(
+                "the environment converged while waiting for the setup lock \
+                 (another panoptikon process finished setup); nothing to do"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            requested = extra,
+            installed = ?installed,
+            "venv is complete but holds a different accelerator; re-syncing"
+        );
+    }
+
+    let uv = locate_uv().await?;
+    tracing::info!(uv = %uv.path.display(), version = %uv.version, "using uv");
     tracing::info!(
         requested = ?requested,
         accelerator = ?accelerator,
@@ -496,6 +511,39 @@ pub(crate) fn effective_accelerator(requested: Accelerator) -> Accelerator {
     resolve_accelerator(requested)
         .map(|(resolved, _)| resolved)
         .unwrap_or(requested)
+}
+
+/// The accelerator actually installed in the managed venv, read from the
+/// setup sentinel's `extra=` line — the ground truth for which torch build
+/// `uv sync` put there. `None` when no completed setup is recorded (user-
+/// managed interpreter, legacy venv, interrupted sync, or an unknown extra).
+///
+/// Runtime decisions that depend on the *installed* wheels (the ROCm worker
+/// env) must use this over [`effective_accelerator`]: config `auto` re-probes
+/// the hardware, and on a host with `/opt/rocm` that would inject HIP paths
+/// into workers even when the venv was deliberately synced as `cpu`/`cuda`.
+pub(crate) fn installed_accelerator() -> Option<Accelerator> {
+    let managed = ManagedPython::active();
+    let content = std::fs::read_to_string(managed.venv.join(SETUP_SENTINEL)).ok()?;
+    sentinel_extra(&content).and_then(extra_accelerator)
+}
+
+/// The `extra=` line of a sentinel file, if present.
+fn sentinel_extra(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("extra="))
+}
+
+/// Inverse of [`accelerator_extra`]; `None` for unknown extras (a future
+/// rename degrades to config-based resolution instead of misclassifying).
+fn extra_accelerator(extra: &str) -> Option<Accelerator> {
+    match extra {
+        "cpu" => Some(Accelerator::Cpu),
+        "cu128" => Some(Accelerator::Cuda),
+        "rocm" => Some(Accelerator::Rocm),
+        _ => None,
+    }
 }
 
 /// Everything the auto-detection decision looks at, gathered up front so
@@ -1314,6 +1362,25 @@ mod tests {
             SentinelStatus::Stale
         );
         assert_eq!(sentinel_status_from(None, None), SentinelStatus::Missing);
+    }
+
+    /// The sentinel's `extra=` line round-trips through the accelerator
+    /// mapping: what `write_sentinel` records for a resolved accelerator is
+    /// exactly what `installed_accelerator` reads back. Unknown extras and
+    /// sentinels without the key degrade to `None` (config-based fallback).
+    #[test]
+    fn sentinel_extra_round_trips_accelerators() {
+        for accel in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Rocm] {
+            let extra = accelerator_extra(accel);
+            let content = format!("extra={extra}\nuv_lock_sha256=abc123\n");
+            assert_eq!(
+                sentinel_extra(&content).and_then(extra_accelerator),
+                Some(accel),
+                "extra '{extra}' must map back to {accel:?}"
+            );
+        }
+        assert_eq!(sentinel_extra("uv_lock_sha256=abc123\n"), None);
+        assert_eq!(extra_accelerator("cu999"), None);
     }
 
     /// The auto-trigger decision table: a managed interpreter is judged by

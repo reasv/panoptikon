@@ -14,7 +14,7 @@ Architecture (current)
 - Local API: `panoptikon/src/api/*.rs` implements `/api/db`, `/api/db/create`, `/api/bookmarks/ns`, `/api/bookmarks/users`, `/api/bookmarks/ns/{namespace}`, `/api/bookmarks/ns/{namespace}/{sha256}`, `/api/bookmarks/item/{sha256}`, `/api/items/item`, `/api/items/item/file`, `/api/items/item/thumbnail`, `/api/items/item/text`, `/api/items/item/tags`, `/api/items/text/any`, `/api/open/file/{sha256}`, `/api/open/folder/{sha256}`, `/api/search/pql`, `/api/search/pql/build`, `/api/search/embeddings/cache`, `/api/search/tags`, `/api/search/tags/top`, `/api/search/stats`, and `/api/jobs/*` locally when `upstreams.api.local = true`. `/openapi.json`, `/docs`, and `/redoc` are served locally when `upstreams.api.local = true`.
 - Config: `panoptikon/src/config.rs` loads TOML + env and validates policies/rulesets. `config/server/default.toml` is the single canonical local configuration: primary loopback port 6342 with the API, inference, and supervised UI enabled.
 - Host tool/asset discovery (`panoptikon/src/host_paths.rs`): thumbnail fonts, Chromium, and pdfium are resolved without baking `/nix/store` paths into config. Prefer explicit config, then PATH + NixOS profile bins (`/run/current-system/sw/bin`), fontconfig (`fc-match`) / `XDG_DATA_DIRS` for fonts, managed-venv `pypdfium2_raw` for pdfium, then classic FHS fixed paths. Venv `nodejs-wheel` / `static-ffmpeg` binaries are used only when they actually spawn successfully (skips NixOS stub-ld failures so system/PATH tools win).
-- Setup: `panoptikon setup` always re-syncs unless `--if-needed` (skip when the managed venv is complete and the lockfile hash matches — for idempotent service restarts). `--force` rebuilds the venv and ignores `--if-needed`.
+- Setup: `panoptikon setup` always re-syncs unless `--if-needed` (skip when the managed venv is complete, the lockfile hash matches, and — with an explicit `--accelerator` — the sentinel's installed extra matches; for idempotent service restarts). `--force` rebuilds the venv and ignores `--if-needed`.
 - Config writes: `panoptikon-config` owns lossless TOML/`.env` patching and atomic replacement. Per-index `SystemConfigStore::save` diffs the typed current/requested values into the original document; unchanged comments, order, unknown keys, literal spelling, and absent defaults survive. Desktop uses the same layer for its preferences, Server TOML, file actions, and managed `.env`.
 
 Behavior (important)
@@ -128,9 +128,13 @@ Behavior (important)
   - Embedding-model preload (`preload_embedding_models`) runs on the same minute tick, mirroring Python: existing text-embedding/clip setters (excluding `tclip/`) are kept loaded under cache key `preload[<index_db>]` with 1h TTL and renewal ~2 minutes before expiry; disabling clears the inference cache once.
   - System config parses `job_filters` and `filescan_filter` as PQL objects; invalid PQL in config fails to load (mirrors Python).
 - Accelerator env (`panoptikon/src/accelerator_env.rs`): workers get host
-  HIP/HSA on `LD_LIBRARY_PATH` only when the **resolved** accelerator is
-  `rocm` (`auto` is re-probed via `setup::effective_accelerator`; explicit
-  `cpu`/`cuda` never inject). Also sets MIOpen defaults when unset:
+  HIP/HSA on `LD_LIBRARY_PATH` only when the **installed** accelerator is
+  `rocm` — read from the setup sentinel's `extra=` line
+  (`setup::installed_accelerator`), the ground truth for what `uv sync` put
+  in the managed venv. Config-based resolution
+  (`setup::effective_accelerator`) is only the fallback for user-managed
+  interpreters and legacy venvs (no sentinel); explicit `cpu`/`cuda` never
+  inject. Also sets MIOpen defaults when unset:
   `MIOPEN_FIND_MODE=FAST` and cache dirs under
   `$XDG_CACHE_HOME/panoptikon/miopen` (avoids EasyOCR/CRAFT stalls from
   GemmFwdRest workspace=0 solver search). `probe_after_setup` runs post-sync

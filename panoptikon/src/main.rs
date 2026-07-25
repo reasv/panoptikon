@@ -91,8 +91,9 @@ enum Command {
         /// Delete the managed venv first and recreate it from scratch.
         #[arg(long)]
         force: bool,
-        /// Skip when the managed venv is already complete (lockfile current).
-        /// Ignored with `--force`.
+        /// Skip when the managed venv is already complete (lockfile current
+        /// and, with an explicit `--accelerator`, the installed variant
+        /// matches). Ignored with `--force`.
         #[arg(long)]
         if_needed: bool,
     },
