@@ -1,0 +1,40 @@
+name: CLA Assistant
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the contribution terms in CONTRIBUTING.md and I agree to them, including the copyright assignment') || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: signatures/cla.json
+          path-to-document: https://github.com/reasv/panoptikon/blob/master/CONTRIBUTING.md
+          branch: cla-signatures
+          allowlist: reasv,dependabot[bot],*[bot]
+          custom-pr-sign-comment: I have read the contribution terms in CONTRIBUTING.md and I agree to them, including the copyright assignment
+          custom-notsigned-prcomment: >-
+            Thank you for your contribution! Before it can be merged, you must
+            agree to this project's
+            [contribution terms](https://github.com/reasv/panoptikon/blob/master/CONTRIBUTING.md),
+            which include assigning the copyright in your contribution to the
+            maintainer and releasing it under AGPL-3.0-or-later. To agree,
+            post a comment on this pull request containing exactly the
+            following text:
+          custom-allsigned-prcomment: >-
+            All contributors have agreed to the
+            [contribution terms](https://github.com/reasv/panoptikon/blob/master/CONTRIBUTING.md).
