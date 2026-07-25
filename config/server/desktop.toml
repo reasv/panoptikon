@@ -22,10 +22,12 @@ local = true
 enabled = true
 
 [inference_local.python_env]
-# auto_setup defaults to true; accelerator defaults to "auto". Uncomment to
-# override — commented keys track the built-in defaults on upgrade.
+# auto_setup defaults to true. Uncomment to override — commented keys track
+# the built-in defaults on upgrade.
 # auto_setup = true
-# accelerator = "auto"
+# Packagers may set PANOPTIKON_ACCELERATOR (e.g. rocm/cuda); default is auto-detect.
+# This ${VAR} bridge only expands as a live line, so it does not track defaults.
+accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 
 [rulesets.allow_all]
 allow_all = true

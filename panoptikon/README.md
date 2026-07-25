@@ -408,8 +408,9 @@ location, relative to the working directory like every other path; a
    logged.
 3. **Locked sync** — `uv venv --python 3.12` when the venv is missing (uv
    auto-fetches CPython), then `uv sync --locked --extra <variant>` in
-   `python/` (`cuda` → the `cu128` extra; the committed `uv.lock` is
-   authoritative and covers all variants). Child output streams to the log.
+   `python/` (`cuda` → the `cu128` extra, `rocm` → pytorch.org multi-arch
+   ROCm 7.2 wheels; the committed `uv.lock` is authoritative and covers all
+   variants). Child output streams to the log.
 
 Re-running converges (idempotent, fast when nothing changed); `--force`
 deletes the managed venv first. As a safety guard, setup refuses to operate

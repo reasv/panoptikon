@@ -51,10 +51,27 @@ class EasyOCRModel(InferenceModel):
 
         self.devices = get_device()
         use_gpu = self.gpu and torch.cuda.is_available()
-        
+        # ROCm/HIP: EasyOCR's CRAFT detector hits MIOpen GEMM paths that warn
+        # IsEnoughWorkspace (ptr=0) and can stall for tens of seconds per unique
+        # shape under default HYBRID find. Prefer a single device string over
+        # bool True so DataParallel still gets one GPU; quantize only applies
+        # on CPU in EasyOCR so leave it as configured.
+        hip = bool(getattr(torch.version, "hip", None))
+        if use_gpu and hip:
+            # Single-device string avoids multi-GPU DataParallel fan-out.
+            gpu_arg: bool | str = "cuda:0"
+            if self.verbose:
+                logger.info(
+                    "EasyOCR on ROCm/HIP (device=%s); MIOpen find-mode should "
+                    "be FAST via accelerator_env to avoid workspace stalls",
+                    gpu_arg,
+                )
+        else:
+            gpu_arg = use_gpu
+
         self.model = easyocr.Reader(
             lang_list=self.languages,
-            gpu=use_gpu,
+            gpu=gpu_arg,
             model_storage_directory=self.model_storage_directory,
             download_enabled=self.download_enabled,
             recog_network=self.recog_network,

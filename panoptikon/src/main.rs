@@ -13,6 +13,8 @@ mod inferio;
 mod inferio_client;
 mod jobs;
 mod logging;
+mod host_paths;
+mod accelerator_env;
 mod media_tools;
 mod openapi;
 mod policy;
@@ -45,7 +47,8 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(Parser, Debug)]
 #[command(
     name = "panoptikon",
-    about = "Panoptikon media indexing and search server"
+    about = "Panoptikon media indexing and search server",
+    version = crate::resources::VERSION,
 )]
 struct Args {
     /// Config file path (global: also valid after the subcommand).
@@ -88,6 +91,10 @@ enum Command {
         /// Delete the managed venv first and recreate it from scratch.
         #[arg(long)]
         force: bool,
+        /// Skip when the managed venv is already complete (lockfile current).
+        /// Ignored with `--force`.
+        #[arg(long)]
+        if_needed: bool,
     },
     /// Download and install the latest release, replacing this executable.
     /// Checks GitHub every time (ignoring the startup-check throttle).
@@ -174,15 +181,17 @@ async fn async_main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Command::Inferio) => return inferio_main(settings, token_key).await,
-        Some(Command::Setup { accelerator, force }) => {
-            // An explicit `panoptikon setup` always runs (never skipped by
-            // the completion sentinel; a successful sync rewrites it).
+        Some(Command::Setup {
+            accelerator,
+            force,
+            if_needed,
+        }) => {
             return setup::run(
                 &settings,
                 setup::SetupOptions {
                     accelerator,
                     force,
-                    skip_if_converged: false,
+                    skip_if_converged: if_needed && !force,
                 },
             )
             .await;

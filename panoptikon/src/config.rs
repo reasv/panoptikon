@@ -391,9 +391,10 @@ pub struct JobsConfig {
     /// used.
     #[serde(default)]
     pub html_renderer_args: Vec<String>,
-    /// Explicit TTF font file for thumbnail text labels. Default:
-    /// well-known system fonts (Segoe UI/Arial/DejaVu). Empty string =
-    /// unset (templated as `${PANOPTIKON_FONT:-}`).
+    /// Explicit TTF/OTF font file for thumbnail text labels. Default:
+    /// host discovery via fontconfig (`fc-match`), `XDG_DATA_DIRS` /
+    /// profile share trees, then classic FHS paths (Segoe UI / Arial /
+    /// DejaVu). Empty string = unset (templated as `${PANOPTIKON_FONT:-}`).
     #[serde(default)]
     pub thumbnail_font: Option<PathBuf>,
 }

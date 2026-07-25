@@ -113,15 +113,15 @@ on a `runtime/setup.lock` file lock):
 extras (`[tool.uv] conflicts`), explicit PyTorch indexes per extra
 (`[tool.uv.sources]`), and macOS routed to default PyPI wheels via markers.
 One universal `uv.lock` covers Windows/Linux × CUDA/CPU, macOS aarch64, and
-(untested) ROCm. Because the accelerator variant is locked, `uv sync` can never
-downgrade torch out from under a working environment again (a
-`constraint-dependencies` pin keeps even an extra-less `uv sync` on the same
-torch). `[tool.uv] environments` restricts the lock to the platforms we
+Linux x86_64 ROCm 7.2. Because the accelerator variant is locked, `uv sync`
+installs exactly one torch build. `constraint-dependencies` floors/ceilings
+torch so an extra-less sync cannot drift below 2.7.1 or above the rocm pin
+(2.11.0). `[tool.uv] environments` restricts the lock to the platforms we
 actually target — Windows x86_64, Linux x86_64, macOS aarch64; Linux aarch64
 is excluded because torch 2.7.1's pinned triton publishes no aarch64 wheels.
-The extras spell the CUDA variant `cu128` (torch 2.7.1); `panoptikon setup`
-maps `accelerator = "cuda"` to it, so a future CUDA bump is a pyproject +
-setup.rs change, not a config change.
+CUDA is `cu128` (torch 2.7.1); ROCm is `rocm` (torch 2.11.0+rocm7.2 multi-arch
+from pytorch.org). `panoptikon setup` maps `accelerator = "cuda"|"rocm"` to
+those extras.
 
 Escape hatch: `[inference_local].python` points at any interpreter the user
 manages themselves. Never run `uv sync` against a user-managed venv.
@@ -208,7 +208,10 @@ out of scope for the initial release.
   but it is debt: the UI server should eventually get a properly-managed Node
   (or no Node at all). Docker images will install Node natively rather than
   inherit this.
-- **ROCm support is aspirational and has never been tested.**
+- **ROCm (Linux x86_64):** pytorch.org multi-arch `rocm7.2` (`torch` 2.11;
+  not AMD `.lw`). Host ROCm 7.2.x; `accelerator_env` (resolved-`rocm` HIP
+  worker env + post-setup probe). cpu/cu128
+  remain torch 2.7.1.
 - **`cudnn/` vendored dir** remains supported as a legacy fallback path in the
   worker's cuDNN setup.
 
