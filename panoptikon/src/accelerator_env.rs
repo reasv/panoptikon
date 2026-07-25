@@ -38,6 +38,10 @@ pub async fn probe_after_setup(
     }
 }
 
+// The HIP helpers below are only reachable from the `target_os = "linux"`
+// arm of `hip_worker_env` (and its tests); allow dead_code elsewhere so
+// non-Linux builds stay warning-free (see the rustc dead-code ICE history).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -60,6 +64,7 @@ fn hip_library_dirs() -> Vec<PathBuf> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn select_existing_hip_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in candidates {
@@ -73,6 +78,7 @@ fn select_existing_hip_lib_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_hip_related_lib_dir(dir: &Path) -> bool {
     const MARKERS: &[&str] = &[
         "libamdhip64.so",
@@ -145,6 +151,7 @@ fn hip_worker_env() -> Vec<(String, String)> {
 /// Writable MIOpen FindDb/kernel cache root (`$XDG_CACHE_HOME/panoptikon/miopen`
 /// or `~/.cache/panoptikon/miopen`). Best-effort create; `None` if HOME/XDG
 /// unavailable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn miopen_cache_dir() -> Option<PathBuf> {
     let root = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -156,6 +163,7 @@ fn miopen_cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn merge_ld_library_path(prepend: &[PathBuf]) -> Option<OsString> {
     if prepend.is_empty() {
         return None;
@@ -244,15 +252,19 @@ mod tests {
         assert!(worker_env(Accelerator::Cuda).is_empty());
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto).is_empty());
-        // Rocm may be empty of HIP libs on hosts without ROCm, but still
-        // carries MIOpen defaults when those env vars are unset.
+        // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
+        // still carries MIOpen defaults when those env vars are unset. Off
+        // Linux the whole HIP env is empty by design.
         let rocm = worker_env(Accelerator::Rocm);
+        #[cfg(target_os = "linux")]
         if env::var_os("MIOPEN_FIND_MODE").is_none() {
             assert!(
                 rocm.iter().any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
                 "expected MIOPEN_FIND_MODE=FAST in {rocm:?}"
             );
         }
+        #[cfg(not(target_os = "linux"))]
+        assert!(rocm.is_empty(), "non-Linux HIP env must be empty: {rocm:?}");
     }
 
     #[test]
