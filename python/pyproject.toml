@@ -68,8 +68,18 @@ inference = [
     "qwen-vl-utils>=0.0.14",
 ]
 # Python tests live in tests/ next to this file and run from this directory:
-#   uv sync --group test   (the test group is not in default-groups)
+#   ../runtime/uv/<ver>/uv sync --group test --extra <accelerator>
 #   .venv/Scripts/python -m pytest        (or .venv/bin/python -m pytest)
+# The test group is not in default-groups, so it needs --group test. Passing
+# the accelerator extra is NOT optional: there is no default-extras, and
+# `conflicts` below only makes cpu/cu128/rocm mutually exclusive, it never
+# selects one. Syncing without --extra leaves no extra active, so the
+# [tool.uv.sources] index routing (all gated on `extra = ...`) stops matching
+# and torch silently resolves from PyPI -- uninstalling a working +cu128 /
+# +rocm build. Use the pinned uv in runtime/uv/, not a system one; older uv
+# versions corrupt the lock.
+# Integration tests are additionally gated: they need PANOPTIKON_RUN_INTEGRATION=1
+# (see tests/conftest.py) and most also self-skip without CUDA.
 test = [
     "pytest>=8.3.4,<9",
     # conftest.py loads the repo-root .env for integration tests.
