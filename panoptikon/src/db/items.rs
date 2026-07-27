@@ -75,6 +75,33 @@ pub(crate) struct TextStats {
 /// blocked stat cannot be cancelled), but the request itself returns.
 const EXISTENCE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Inclusive lower and exclusive upper bound selecting every hash that starts
+/// with `prefix`, or `None` when no stored hash can match.
+///
+/// `sha256 LIKE ? || '%'` cannot use the index on the column. SQLite only
+/// applies the LIKE optimisation when the pattern is a string literal or a
+/// bare bound parameter *and* the column collation agrees with LIKE's
+/// case-sensitivity; `? || '%'` is a concatenation expression, and the column
+/// is BINARY while LIKE defaults to case-insensitive, so the optimisation is
+/// off twice over. Left with no usable constraint on `items`, the planner
+/// drove the join from `files` and walked every file row instead — over a
+/// second per request on a large library, once per thumbnail.
+///
+/// Stored hashes are lowercase hex (`format!("{:x}", ..)`), so a BINARY range
+/// is equivalent and seeks the index instead.
+fn sha256_prefix_range(prefix: &str) -> Option<(String, String)> {
+    let lower = prefix.to_ascii_lowercase();
+    if lower.is_empty() || !lower.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Stepping the final digit past its own value bounds the prefix: any hash
+    // continuing past `lower` sorts below it, anything else sorts at or above.
+    let mut upper = lower.clone().into_bytes();
+    *upper.last_mut().expect("prefix is non-empty") += 1;
+    let upper = String::from_utf8(upper).expect("'9' + 1 and 'f' + 1 are both ASCII");
+    Some((lower, upper))
+}
+
 /// Item metadata with the file list filtered to files that exist on disk
 /// (part of the `item_meta` API contract). The existence stats run on a
 /// blocking thread — paths may live on slow network shares.
@@ -105,15 +132,17 @@ pub(crate) async fn get_item_metadata(
     Ok(metadata)
 }
 
-/// Item metadata without touching the filesystem: the file list is returned
-/// as recorded in the database (ordered by `available` DESC). File-serving
-/// endpoints use this and discover missing files at open() instead of paying
-/// a per-request stat.
-pub(crate) async fn get_item_metadata_unchecked(
-    conn: &mut sqlx::SqliteConnection,
+/// The item-metadata lookup and its bind values, or `None` when the
+/// identifier cannot match any row.
+///
+/// Split out from `get_item_metadata_unchecked` so tests can assert the query
+/// plan: this is the hottest lookup in the serving path (one per thumbnail and
+/// per file request), and a predicate that fails to seek the index costs a
+/// full scan of `items` without changing a single result.
+fn item_metadata_query(
     identifier: &str,
     identifier_type: ItemIdentifierType,
-) -> ApiResult<ItemMetadata> {
+) -> Option<(String, Vec<String>)> {
     let select = r#"
     SELECT
         items.id AS item_id,
@@ -137,25 +166,25 @@ pub(crate) async fn get_item_metadata_unchecked(
         JOIN files ON items.id = files.item_id
     "#;
 
-    let (query, value) = match identifier_type {
-        ItemIdentifierType::Sha256 if identifier.len() < 64 => (
-            format!(
-                "{select}
-        WHERE items.sha256 LIKE ? || '%'
+    let query = match identifier_type {
+        ItemIdentifierType::Sha256 if identifier.len() < 64 => {
+            let (lower, upper) = sha256_prefix_range(identifier)?;
+            return Some((
+                format!(
+                    "{select}
+        WHERE items.sha256 >= ? AND items.sha256 < ?
         ORDER BY files.available DESC
         "
-            ),
-            identifier,
-        ),
-        ItemIdentifierType::DataId => (
-            format!(
-                "{select}
+                ),
+                vec![lower, upper],
+            ));
+        }
+        ItemIdentifierType::DataId => format!(
+            "{select}
         JOIN item_data ON items.id = item_data.item_id
         WHERE item_data.id = ?
         ORDER BY files.available DESC
         "
-            ),
-            identifier,
         ),
         _ => {
             let column = match identifier_type {
@@ -166,26 +195,44 @@ pub(crate) async fn get_item_metadata_unchecked(
                 ItemIdentifierType::Path => "path",
                 ItemIdentifierType::Md5 => "md5",
             };
-            (
-                format!(
-                    "{select}
+            format!(
+                "{select}
         WHERE {column} = ?
         ORDER BY files.available DESC
         "
-                ),
-                identifier,
             )
         }
     };
 
-    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
-        .bind(value)
-        .fetch_all(conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to query item metadata");
-            ApiError::internal("Failed to get item")
-        })?;
+    Some((query, vec![identifier.to_string()]))
+}
+
+/// Item metadata without touching the filesystem: the file list is returned
+/// as recorded in the database (ordered by `available` DESC). File-serving
+/// endpoints use this and discover missing files at open() instead of paying
+/// a per-request stat.
+pub(crate) async fn get_item_metadata_unchecked(
+    conn: &mut sqlx::SqliteConnection,
+    identifier: &str,
+    identifier_type: ItemIdentifierType,
+) -> ApiResult<ItemMetadata> {
+    // `None` means the identifier cannot match any row, so there is nothing
+    // worth asking the database.
+    let Some((query, values)) = item_metadata_query(identifier, identifier_type) else {
+        return Ok(ItemMetadata {
+            item: None,
+            files: Vec::new(),
+        });
+    };
+
+    let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
+    for value in values {
+        statement = statement.bind(value);
+    }
+    let rows = statement.fetch_all(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to query item metadata");
+        ApiError::internal("Failed to get item")
+    })?;
 
     let mut item_record = None;
     let mut files = Vec::new();
@@ -354,24 +401,29 @@ pub(crate) async fn get_existing_files_for_sha256(
 ) -> ApiResult<Vec<FileRecord>> {
     // A full sha256 is 64 hex chars; anything shorter is treated as a prefix
     // (the pinboard stores only a 10-char prefix), matching the item-lookup
-    // endpoint's behaviour.
-    let where_clause = if sha256.len() < 64 {
-        "WHERE sha256 LIKE ? || '%'"
+    // endpoint's behaviour. Prefixes use a range rather than a LIKE pattern so
+    // the lookup can seek `idx_files_sha256`; see `sha256_prefix_range`.
+    let (where_clause, values) = if sha256.len() < 64 {
+        let Some((lower, upper)) = sha256_prefix_range(sha256) else {
+            return Ok(Vec::new());
+        };
+        ("WHERE sha256 >= ? AND sha256 < ?", vec![lower, upper])
     } else {
-        "WHERE sha256 = ?"
+        ("WHERE sha256 = ?", vec![sha256.to_string()])
     };
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+    let query = format!(
         r#"
         SELECT id, sha256, path, last_modified, filename
         FROM files
         {where_clause}
         ORDER BY available DESC
         "#
-    )))
-    .bind(sha256)
-    .fetch_all(conn)
-    .await
-    .map_err(|err| {
+    );
+    let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
+    for value in values {
+        statement = statement.bind(value);
+    }
+    let rows = statement.fetch_all(conn).await.map_err(|err| {
         tracing::error!(error = %err, "failed to read files for sha256");
         ApiError::internal("Failed to read file metadata")
     })?;
@@ -947,6 +999,174 @@ mod tests {
         assert!(result.item.is_some());
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, file_path.to_string_lossy());
+    }
+
+    // Ensures prefix bounds cover exactly the hashes starting with the prefix.
+    #[test]
+    fn sha256_prefix_range_bounds_the_prefix() {
+        assert_eq!(
+            sha256_prefix_range("abc"),
+            Some(("abc".to_string(), "abd".to_string()))
+        );
+        // '9' is the top of the digit run; the next byte still sorts above it
+        // and below 'a', so hashes continuing "a9" stay inside the range.
+        assert_eq!(
+            sha256_prefix_range("a9"),
+            Some(("a9".to_string(), "a:".to_string()))
+        );
+        // 'f' is the last hex digit, so the bound leaves the alphabet.
+        assert_eq!(
+            sha256_prefix_range("ff"),
+            Some(("ff".to_string(), "fg".to_string()))
+        );
+        // LIKE was case-insensitive; a binary range is not, so normalise.
+        assert_eq!(
+            sha256_prefix_range("ABC"),
+            Some(("abc".to_string(), "abd".to_string()))
+        );
+        // Nothing a stored lowercase-hex hash could ever match.
+        assert_eq!(sha256_prefix_range(""), None);
+        assert_eq!(sha256_prefix_range("sha256"), None);
+        // '_' and '%' were LIKE wildcards; they match no hash as literals.
+        assert_eq!(sha256_prefix_range("__________"), None);
+    }
+
+    // Ensures a prefix lookup returns the one item it identifies, and that
+    // neighbours on either side of the range boundary are excluded.
+    #[tokio::test]
+    async fn item_metadata_by_sha256_prefix_selects_only_the_prefix() {
+        let hash = |prefix: &str| format!("{prefix}{}", "0".repeat(64 - prefix.len()));
+        let target = hash("00000000af");
+        let below = hash("00000000ae");
+        let above = hash("00000000b0");
+
+        let mut dbs = setup_test_databases().await;
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
+        for (id, sha256) in [(1_i64, &target), (2, &below), (3, &above)] {
+            sqlx::query(
+                r#"
+                INSERT INTO items (id, sha256, md5, type, time_added)
+                VALUES (?, ?, 'md5', 'image/png', '2024-01-01T00:00:00')
+                "#,
+            )
+            .bind(id)
+            .bind(sha256)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO files (
+                    id, sha256, item_id, path, filename, last_modified, scan_id, available
+                ) VALUES (?, ?, ?, ?, 'file.png', '2024-01-01T00:00:00', 1, 1)
+                "#,
+            )
+            .bind(id + 10)
+            .bind(sha256)
+            .bind(id)
+            .bind(format!(r"C:\data\{id}.png"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+
+        let result = get_item_metadata_unchecked(
+            &mut dbs.index_conn,
+            "00000000af",
+            ItemIdentifierType::Sha256,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.item.map(|item| item.sha256), Some(target.clone()));
+        assert_eq!(result.files.len(), 1);
+
+        // The full hash still takes the equality path.
+        let full =
+            get_item_metadata_unchecked(&mut dbs.index_conn, &target, ItemIdentifierType::Sha256)
+                .await
+                .unwrap();
+        assert_eq!(full.item.map(|item| item.sha256), Some(target));
+
+        // A prefix that cannot be a hash resolves to nothing rather than
+        // wildcard-matching, as `LIKE` would have done for '_'.
+        let none = get_item_metadata_unchecked(
+            &mut dbs.index_conn,
+            "__________",
+            ItemIdentifierType::Sha256,
+        )
+        .await
+        .unwrap();
+        assert!(none.item.is_none());
+    }
+
+    // Guards the reason the prefix lookup uses a range instead of a LIKE
+    // pattern. A LIKE predicate returns identical rows, so only the query plan
+    // can catch the regression: `LIKE ? || '%'` scans every row in `items` on
+    // every thumbnail and file request.
+    #[tokio::test]
+    async fn sha256_prefix_lookup_seeks_the_index() {
+        let mut dbs = setup_test_databases().await;
+        // The planner picks a join order from the table shapes; with both
+        // tables empty it would drive from `files` and never touch the
+        // predicate under test.
+        insert_scan(&mut dbs.index_conn, 1, r"C:\data").await;
+        for id in 1..200_i64 {
+            let sha256 = format!("{id:064x}");
+            sqlx::query(
+                r#"
+                INSERT INTO items (id, sha256, md5, type, time_added)
+                VALUES (?, ?, 'md5', 'image/png', '2024-01-01T00:00:00')
+                "#,
+            )
+            .bind(id)
+            .bind(&sha256)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO files (
+                    id, sha256, item_id, path, filename, last_modified, scan_id, available
+                ) VALUES (?, ?, ?, ?, 'f.png', '2024-01-01T00:00:00', 1, 1)
+                "#,
+            )
+            .bind(id)
+            .bind(&sha256)
+            .bind(id)
+            .bind(format!(r"C:\data\{id}.png"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        sqlx::query("ANALYZE")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+
+        let (query, values) =
+            item_metadata_query("00000000af", ItemIdentifierType::Sha256).unwrap();
+
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")));
+        for value in values {
+            statement = statement.bind(value);
+        }
+        let plan = statement
+            .fetch_all(&mut dbs.index_conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("SEARCH items") && plan.contains("sha256>"),
+            "prefix lookup must seek the sha256 index, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN items"),
+            "prefix lookup must not scan items, got:\n{plan}"
+        );
     }
 
     // Ensures mime type stats include general type prefixes.
