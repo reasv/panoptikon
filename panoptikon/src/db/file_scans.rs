@@ -1,6 +1,7 @@
 use sqlx::Row;
 
 use crate::api_error::ApiError;
+use crate::db::prefix::escape_like_literal;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -350,6 +351,19 @@ pub(crate) async fn mark_unavailable_files(
     path_prefix: &str,
     excluded_paths: &[String],
 ) -> ApiResult<(i64, i64)> {
+    // `%` and `_` in a registered folder name are LIKE wildcards, so the root
+    // `D:\Photos_2024` also matched `D:\PhotosX2024\...`. Those files are
+    // under a different root, so their rows carry a different scan_id and were
+    // marked unavailable here — then deleted outright by the end-of-scan
+    // `delete_unavailable_files` when `remove_unavailable_files` is on, taking
+    // the item and its extracted text, tags and embeddings with it.
+    //
+    // The escape keeps LIKE rather than switching to a range: matching here is
+    // deliberately case-insensitive, for the same reason the exclusion list
+    // below folds case on Windows.
+    let path_prefix = escape_like_literal(path_prefix);
+    let path_prefix = path_prefix.as_str();
+
     // SQLite caps the number of bind variables; a scan with this many
     // failures should not be trusted to mark availability at all.
     if excluded_paths.len() > 30_000 {
@@ -384,7 +398,7 @@ pub(crate) async fn mark_unavailable_files(
 SELECT COUNT(*) AS marked_unavailable
 FROM files
 WHERE scan_id != ?
-AND path LIKE ? || '%'{exclusion}
+AND path LIKE ? || '%' ESCAPE '\'{exclusion}
         "#
     );
     let mut count_query = sqlx::query(sqlx::AssertSqlSafe(count_sql.as_str()))
@@ -408,7 +422,7 @@ AND path LIKE ? || '%'{exclusion}
 UPDATE files
 SET available = FALSE
 WHERE scan_id != ?
-AND path LIKE ? || '%'{exclusion}
+AND path LIKE ? || '%' ESCAPE '\'{exclusion}
         "#
     );
     let mut update_query = sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
@@ -427,6 +441,7 @@ AND path LIKE ? || '%'{exclusion}
     Ok((marked_unavailable, available_files))
 }
 
+/// `path_prefix` must already be escaped with [`escape_like_literal`].
 async fn count_available_files(
     conn: &mut sqlx::SqliteConnection,
     path_prefix: &str,
@@ -436,7 +451,7 @@ async fn count_available_files(
 SELECT COUNT(*) AS available_files
 FROM files
 WHERE available = TRUE
-AND path LIKE ?1 || '%'
+AND path LIKE ?1 || '%' ESCAPE '\'
         "#,
     )
     .bind(path_prefix)
@@ -681,6 +696,65 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                 .await
                 .unwrap();
         assert_eq!(row.0, 1);
+    }
+
+    // Ensures a `_` in a registered folder name stays literal. Before the
+    // escape, scanning `C:\Photos_2024` also matched the unrelated sibling
+    // `C:\PhotosX2024`, marking its files unavailable — and the end-of-scan
+    // delete then removed them along with their items.
+    #[tokio::test]
+    async fn mark_unavailable_does_not_wildcard_match_sibling_folders() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let sibling_scan = add_file_scan(
+            &mut dbs.index_conn,
+            "2024-01-01T00:00:00",
+            r"C:\PhotosX2024",
+        )
+        .await
+        .unwrap();
+        let current_scan = add_file_scan(
+            &mut dbs.index_conn,
+            "2024-01-02T00:00:00",
+            r"C:\Photos_2024",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+INSERT INTO files (sha256, item_id, path, filename, last_modified, scan_id, available)
+VALUES
+    ('sha_one', 1, 'C:\PhotosX2024\sibling.png', 'sibling.png', '2024-01-01T00:00:00', ?1, 1),
+    ('sha_one', 1, 'C:\Photos_2024\stale.png', 'stale.png', '2024-01-01T00:00:00', ?1, 1)
+            "#,
+        )
+        .bind(sibling_scan)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let (marked, _available) =
+            mark_unavailable_files(&mut dbs.index_conn, current_scan, r"C:\Photos_2024", &[])
+                .await
+                .unwrap();
+
+        // Only the stale file under the scanned root is marked.
+        assert_eq!(marked, 1);
+        let sibling: (i64,) = sqlx::query_as(
+            r"SELECT available FROM files WHERE path = 'C:\PhotosX2024\sibling.png'",
+        )
+        .fetch_one(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        assert_eq!(sibling.0, 1, "sibling folder must not be touched");
     }
 
     // Ensures unavailable deletion removes only files flagged unavailable.

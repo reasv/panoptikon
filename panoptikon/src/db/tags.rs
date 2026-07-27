@@ -2,6 +2,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 
 use crate::api_error::ApiError;
+use crate::db::prefix::prefix_upper_bound;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -105,14 +106,14 @@ pub(crate) async fn get_most_common_tags_frequency(
         return Ok(Vec::new());
     }
 
+    // Same dead-join rule as `get_most_common_tags`: `setters` is only needed
+    // when it is being filtered on.
     let mut sql = String::from(
         r#"
         SELECT COUNT(DISTINCT item_data.item_id || '-' || item_data.setter_id) AS distinct_count
         FROM tags_items
         JOIN item_data
             ON tags_items.item_data_id = item_data.id
-        JOIN setters
-            ON item_data.setter_id = setters.id
         "#,
     );
     if !setters.is_empty() {
@@ -120,7 +121,12 @@ pub(crate) async fn get_most_common_tags_frequency(
             .take(setters.len())
             .collect::<Vec<_>>()
             .join(", ");
-        sql.push_str(&format!(" WHERE setters.name IN ({placeholders})"));
+        sql.push_str(&format!(
+            r#"
+        JOIN setters
+            ON item_data.setter_id = setters.id
+        WHERE setters.name IN ({placeholders})"#
+        ));
     }
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
@@ -225,16 +231,41 @@ async fn get_most_common_tags(
         FROM tags
         JOIN tags_items
             ON tags.id = tags_items.tag_id
+        "#,
+    );
+
+    // `item_data` and `setters` are reachable only through FK-enforced 1:1
+    // links (`foreign_keys` is ON for every connection), so as inner joins
+    // they cannot add, drop or duplicate a row — they exist purely to reach
+    // `setters.name`. Joining them unconditionally was catastrophic: with no
+    // setter filter to anchor on, the planner paired every tag with every
+    // setter and built a transient index over `item_data` per pair
+    // (`SEARCH item_data USING AUTOMATIC COVERING INDEX`). Unfiltered top-tags
+    // never completed on a real library; dropping the dead joins takes it to
+    // well under a second.
+    if !setters.is_empty() {
+        sql.push_str(
+            r#"
         JOIN item_data
             ON tags_items.item_data_id = item_data.id
         JOIN setters
             ON item_data.setter_id = setters.id
         "#,
-    );
+        );
+    }
 
+    // A namespace filter is a prefix match (the picker offers `ns` alongside
+    // `ns:sub`). As a range it seeks `idx_tags_namespace_name`; as a LIKE it
+    // was invisible to the planner, so the whole tag/tags_items join had to be
+    // aggregated before the filter applied. See `db::prefix`.
+    let namespace_bound = namespace.and_then(prefix_upper_bound);
     let mut conditions: Vec<String> = Vec::new();
     if namespace.is_some() {
-        conditions.push("tags.namespace LIKE ? || '%'".to_string());
+        conditions.push(if namespace_bound.is_some() {
+            "tags.namespace >= ? AND tags.namespace < ?".to_string()
+        } else {
+            "tags.namespace >= ?".to_string()
+        });
     }
     if confidence_threshold.unwrap_or(0.0) > 0.0 {
         conditions.push("tags_items.confidence >= ?".to_string());
@@ -253,12 +284,19 @@ async fn get_most_common_tags(
     }
 
     sql.push_str(" GROUP BY tags.namespace, tags.name");
-    sql.push_str(" ORDER BY count DESC");
+    // Counts alone do not order the result: tags tied at the LIMIT cutoff were
+    // returned in whatever order the plan happened to produce, so identical
+    // calls could return different tags. The name tie-break is arbitrary but
+    // stable, which is what a caller paging or re-fetching needs.
+    sql.push_str(" ORDER BY count DESC, tags.namespace, tags.name");
     sql.push_str(" LIMIT ?");
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(namespace) = namespace {
         query = query.bind(namespace);
+        if let Some(upper) = namespace_bound {
+            query = query.bind(upper);
+        }
     }
     if let Some(confidence_threshold) = confidence_threshold {
         if confidence_threshold > 0.0 {
@@ -429,5 +467,139 @@ mod tests {
         assert_eq!(tags[2].1, "dog");
         assert_eq!(tags[2].2, 1);
         assert!((tags[2].3 - (1.0 / 3.0)).abs() < 1e-6);
+    }
+
+    // Ensures tags tied on count come back in a stable order. Inserted in
+    // reverse-alphabetical order with descending ids so that both insertion
+    // and rowid order would disagree with the expected result.
+    #[tokio::test]
+    async fn top_tags_ties_are_ordered_deterministically() {
+        let mut dbs = setup_tag_db().await;
+        sqlx::query(
+            r#"
+            INSERT INTO tags (id, namespace, name)
+            VALUES (33, 'zz', 'yak'), (32, 'zz', 'emu'), (31, 'aa', 'owl')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        // One application each, so all three tie at count 1.
+        sqlx::query(
+            r#"
+            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            VALUES (10, 33, 1.0), (10, 32, 1.0), (10, 31, 1.0)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let first = get_most_common_tags(&mut dbs.index_conn, None, &[], None, 10)
+            .await
+            .unwrap();
+        let second = get_most_common_tags(&mut dbs.index_conn, None, &[], None, 10)
+            .await
+            .unwrap();
+        assert_eq!(first, second, "repeated calls must agree");
+
+        // count DESC first, then namespace, then name.
+        let tied: Vec<(&str, &str)> = first
+            .iter()
+            .filter(|tag| tag.2 == 1)
+            .map(|tag| (tag.0.as_str(), tag.1.as_str()))
+            .collect();
+        assert_eq!(
+            tied,
+            vec![
+                ("aa", "owl"),
+                ("ns", "caterpillar"),
+                ("ns", "dog"),
+                ("zz", "emu"),
+                ("zz", "yak"),
+            ]
+        );
+        // The un-tied winner still leads.
+        assert_eq!(first[0], ("ns".to_string(), "cat".to_string(), 3));
+    }
+
+    // Ensures the setter filter still selects the same rows now that the
+    // `item_data`/`setters` joins are only emitted when they are filtered on.
+    // In the fixture, tag `cat` is set by both alpha (item_data 10, 11) and
+    // beta (item_data 12); `caterpillar` and `dog` are alpha-only.
+    #[tokio::test]
+    async fn top_tags_setter_filter_matches_the_unfiltered_counts() {
+        let mut dbs = setup_tag_db().await;
+
+        let unfiltered = get_most_common_tags(&mut dbs.index_conn, None, &[], None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            unfiltered,
+            vec![
+                ("ns".to_string(), "cat".to_string(), 3),
+                ("ns".to_string(), "caterpillar".to_string(), 1),
+                ("ns".to_string(), "dog".to_string(), 1),
+            ]
+        );
+
+        let beta = get_most_common_tags(&mut dbs.index_conn, None, &["beta".to_string()], None, 10)
+            .await
+            .unwrap();
+        assert_eq!(beta, vec![("ns".to_string(), "cat".to_string(), 1)]);
+
+        // Filtering on every setter must reproduce the unfiltered counts.
+        let both = get_most_common_tags(
+            &mut dbs.index_conn,
+            None,
+            &["alpha".to_string(), "beta".to_string()],
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(both, unfiltered);
+    }
+
+    // Ensures the namespace filter is a literal, case-sensitive prefix. The
+    // `tags` UNIQUE(namespace, name) constraint is BINARY, so `src_a` and
+    // `SRC_A` are distinct namespaces; the old LIKE filter folded case and
+    // treated `_` as a wildcard, so a filter on one returned all three.
+    #[tokio::test]
+    async fn top_tags_namespace_filter_is_a_literal_prefix() {
+        let mut dbs = setup_tag_db().await;
+        sqlx::query(
+            r#"
+            INSERT INTO tags (id, namespace, name)
+            VALUES
+                (20, 'src_a', 'literal'),
+                (21, 'srcXa', 'wildcard'),
+                (22, 'SRC_A', 'uppercase'),
+                (23, 'src_a:sub', 'nested')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            VALUES (10, 20, 1.0), (10, 21, 1.0), (10, 22, 1.0), (10, 23, 1.0)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let tags =
+            get_most_common_tags_frequency(&mut dbs.index_conn, Some("src_a"), &[], None, 10)
+                .await
+                .unwrap();
+        let mut names: Vec<&str> = tags.iter().map(|tag| tag.1.as_str()).collect();
+        names.sort_unstable();
+
+        // The nested namespace shares the prefix and stays; the wildcard and
+        // case variants are different namespaces and must not.
+        assert_eq!(names, vec!["literal", "nested"]);
     }
 }

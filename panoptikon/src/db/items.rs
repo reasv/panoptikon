@@ -4,6 +4,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
+use crate::db::prefix::prefix_upper_bound;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -94,11 +95,10 @@ fn sha256_prefix_range(prefix: &str) -> Option<(String, String)> {
     if lower.is_empty() || !lower.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    // Stepping the final digit past its own value bounds the prefix: any hash
-    // continuing past `lower` sorts below it, anything else sorts at or above.
-    let mut upper = lower.clone().into_bytes();
-    *upper.last_mut().expect("prefix is non-empty") += 1;
-    let upper = String::from_utf8(upper).expect("'9' + 1 and 'f' + 1 are both ASCII");
+    // Hex digits sit far below `char::MAX`, so a bound always exists here;
+    // `prefix_upper_bound` only returns `None` for an empty or all-`char::MAX`
+    // prefix, both already excluded above.
+    let upper = prefix_upper_bound(&lower)?;
     Some((lower, upper))
 }
 
@@ -721,9 +721,26 @@ pub(crate) async fn get_all_tags_for_item(
         sql.push_str(" AND tags_items.confidence >= ?");
     }
 
+    // This query is already driven by `item_data.item_id = ?`, so the
+    // namespace filter is a residual test over a handful of rows rather than a
+    // lookup — it is here for behaviour, not speed. Ranges match what the
+    // `tags` UNIQUE(namespace, name) constraint considers distinct: LIKE
+    // folded case and treated `_` as a wildcard, so `source_site` also
+    // returned `sourceXsite`, and `character` also returned `Character`.
+    let namespace_bounds: Vec<Option<String>> = namespaces
+        .iter()
+        .map(|namespace| prefix_upper_bound(namespace))
+        .collect();
     if !namespaces.is_empty() {
-        let conditions = std::iter::repeat("tags.namespace LIKE ? || '%'")
-            .take(namespaces.len())
+        let conditions = namespace_bounds
+            .iter()
+            .map(|bound| {
+                if bound.is_some() {
+                    "(tags.namespace >= ? AND tags.namespace < ?)"
+                } else {
+                    "(tags.namespace >= ?)"
+                }
+            })
             .collect::<Vec<_>>()
             .join(" OR ");
         sql.push_str(&format!(" AND ({conditions})"));
@@ -738,8 +755,11 @@ pub(crate) async fn get_all_tags_for_item(
     if confidence_threshold > 0.0 {
         query = query.bind(confidence_threshold);
     }
-    for namespace in namespaces {
+    for (namespace, bound) in namespaces.iter().zip(&namespace_bounds) {
         query = query.bind(namespace);
+        if let Some(upper) = bound {
+            query = query.bind(upper);
+        }
     }
 
     let rows = query.fetch_all(conn).await.map_err(|err| {
