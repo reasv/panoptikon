@@ -1,3 +1,4 @@
+import logging
 from io import BytesIO
 from typing import List, Sequence, Type, Union
 
@@ -10,6 +11,8 @@ from inferio.inferio_types import PredictionInput
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+logger = logging.getLogger(__name__)
+
 
 class ClipModel(InferenceModel):
     def __init__(
@@ -17,11 +20,18 @@ class ClipModel(InferenceModel):
         model_name: str,
         pretrained: str | None = None,
         context_length: int | None = None,
+        precision: str = "fp16",
         init_args: dict = {},
     ):
         self.model_name: str = model_name
         self.pretrained: str | None = pretrained
         self.context_length: int | None = context_length
+        # fp16 halves resident VRAM (3829 -> 1982 MiB for ViT-H-14-378) and is
+        # substantially faster, since fp32 matmuls do not use tensor cores.
+        # Retrieval impact was measured as negligible; see
+        # docs/clip-fp16-precision-evaluation.md. Override per inference id
+        # with `config.precision` if a model or GPU needs fp32.
+        self.precision: str = precision
         self.init_args = init_args
         self._model_loaded: bool = False
 
@@ -34,9 +44,16 @@ class ClipModel(InferenceModel):
             return
         import open_clip
 
+        self.devices = get_device()
+        self.device = (
+            self.devices[0] if isinstance(self.devices, list) else self.devices
+        )
+        precision = self._effective_precision()
+
         self.model, _, preprocess = open_clip.create_model_and_transforms(
             model_name=self.model_name,
             pretrained=self.pretrained,
+            precision=precision,
             **self.init_args,
         )
         assert not isinstance(
@@ -44,15 +61,46 @@ class ClipModel(InferenceModel):
         ), "Expected single preprocess function"
         self.preprocess = preprocess
 
-        self.devices = get_device()
-        self.device = (
-            self.devices[0] if isinstance(self.devices, list) else self.devices
-        )
+        # open_clip builds and converts on CPU; moving afterwards transfers
+        # half the bytes, so a low-precision load is faster, not slower.
         self.model.eval().to(self.device)
+        self.input_dtype = self._input_dtype()
         self.tokenizer = open_clip.get_tokenizer(
             model_name=self.model_name, context_length=self.context_length
         )
         self._model_loaded = True
+
+    def _effective_precision(self) -> str:
+        """Low precision only on CUDA/ROCm; fp16 on CPU is slow and patchily
+        supported, and MPS is unvalidated for this path."""
+        if self.precision == "fp32" or self.device.type == "cuda":
+            return self.precision
+        logger.warning(
+            "Precision %r requested for %s but device is %s; using fp32.",
+            self.precision,
+            self.model_name,
+            self.device.type,
+        )
+        return "fp32"
+
+    def _input_dtype(self):
+        """Dtype the image tower expects its input in.
+
+        open_clip's fp16/bf16 modes cast weights only and leave input casting
+        to the caller (the same contract as OpenAI's original reference
+        implementation, `model.encode_image(image.half())`). Feeding fp32
+        pixels to converted weights raises at the patch-embed conv. Taking the
+        first conv/linear in the visual tower covers both the native and the
+        timm-backed branches of `_set_model_device_and_precision`.
+        """
+        import torch
+
+        for module in self.model.visual.modules():
+            if isinstance(
+                module, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear)
+            ):
+                return module.weight.dtype
+        return torch.float32
 
     def predict(
         self, inputs: Sequence[PredictionInput]
@@ -99,10 +147,10 @@ class ClipModel(InferenceModel):
                 indices, images = zip(*image_inputs)
                 processed_images = torch.stack(
                     [
-                        self.preprocess(img).to(self.device)  # type: ignore
+                        self.preprocess(img)  # type: ignore
                         for img in images
                     ]
-                )
+                ).to(self.device, dtype=self.input_dtype)
 
                 image_features = self.model.encode_image(
                     processed_images, normalize=True

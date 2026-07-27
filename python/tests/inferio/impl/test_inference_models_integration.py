@@ -141,6 +141,42 @@ def test_clip_model_runs_text_and_image(model_cache_env):
 
 
 @pytest.mark.integration
+def test_clip_model_defaults_to_fp16_and_honours_override(model_cache_env):
+    """open_clip's fp16 mode casts weights only and leaves input casting to
+    the caller, so an uncast image tensor raises at the patch-embed conv.
+    Pin both the default and the escape hatch."""
+    import torch
+
+    from inferio.impl.clip import ClipModel
+    from inferio.inferio_types import PredictionInput
+
+    if not _requires_cuda():
+        pytest.skip("Low precision is only enabled on CUDA; fp32 elsewhere.")
+
+    image_bytes = _make_test_image_bytes()
+
+    model = ClipModel(model_name="ViT-B-32", pretrained="openai")
+    assert model.precision == "fp16"
+    model.load()
+    try:
+        assert model.input_dtype == torch.float16
+        # The image path is what breaks without the cast; text alone passes.
+        outputs = model.predict([PredictionInput(data=None, file=image_bytes)])
+        _assert_embedding_bytes(bytes(outputs[0]))
+    finally:
+        model.unload()
+
+    override = ClipModel(model_name="ViT-B-32", pretrained="openai", precision="fp32")
+    override.load()
+    try:
+        assert override.input_dtype == torch.float32
+        outputs = override.predict([PredictionInput(data=None, file=image_bytes)])
+        _assert_embedding_bytes(bytes(outputs[0]))
+    finally:
+        override.unload()
+
+
+@pytest.mark.integration
 def test_jina_clip_model_runs_if_api_key_present(model_cache_env):
     if not os.environ.get("JINA_API_KEY"):
         pytest.skip("JINA_API_KEY not set")
