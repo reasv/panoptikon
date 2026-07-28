@@ -299,6 +299,10 @@ pub(crate) enum IndexDbWriterMessage {
     Analyze {
         reply: Reply<()>,
     },
+    /// Refreshes every `tags.item_count`; see `db::tags::RECOUNT_TAG_ITEMS_SQL`.
+    RecountTagItems {
+        reply: Reply<()>,
+    },
     /// Truncating WAL checkpoint; see `CHECKPOINT_STATEMENTS`.
     Checkpoint {
         reply: Reply<()>,
@@ -975,6 +979,14 @@ impl Actor for IndexDbWriter {
             }
             IndexDbWriterMessage::Analyze { reply } => {
                 let result = state.run_maintenance(ANALYZE_STATEMENTS).await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RecountTagItems { reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { crate::db::tags::recount_tag_items(conn).await })
+                    })
+                    .await;
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::Checkpoint { reply } => {

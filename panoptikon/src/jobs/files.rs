@@ -336,8 +336,8 @@ pub(crate) async fn is_resync_needed(
     Ok(current_included != new_included || current_excluded != new_excluded)
 }
 
-/// Post-job VACUUM/ANALYZE/checkpoint. Failures are logged but never fail the
-/// job: the job's own work has already been committed at this point.
+/// Post-job VACUUM/recount/ANALYZE/checkpoint. Failures are logged but never
+/// fail the job: the job's own work has already been committed at this point.
 pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
     if vacuum {
         if let Err(err) =
@@ -345,6 +345,15 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
         {
             tracing::error!(error = ?err, index_db, "failed to vacuum index database");
         }
+    }
+    // Before ANALYZE, so the statistics are sampled from the updated table.
+    // Unconditional: tagging jobs add rows and scans remove them via cascade,
+    // and neither is distinguishable here without extra bookkeeping. The index
+    // epoch is no guard either — every job that does anything bumps it.
+    if let Err(err) =
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems { reply }).await
+    {
+        tracing::error!(error = ?err, index_db, "failed to recount tag item counts");
     }
     if let Err(err) =
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Analyze { reply }).await

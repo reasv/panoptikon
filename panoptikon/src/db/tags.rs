@@ -5,20 +5,57 @@ use crate::db::prefix::prefix_upper_bound;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+/// Recomputes `tags.item_count` for every tag from scratch.
+///
+/// Run after every job by `run_post_job_maintenance`, which is also what makes
+/// deletions correct: every bulk-deletion flow ends there, so nothing has to
+/// hook the delete paths individually. A full recompute rather than
+/// incremental maintenance because it is cheap enough not to need one — a
+/// single ordered walk of `idx_tags_items_tag_item`, measured 0.83s over 22.4M
+/// rows — while trigger-maintained counters cost 86-104% on bulk insert and
+/// cannot decrement soundly at this level (a cascade deletes the sibling rows
+/// the check would need).
+///
+/// COUNT(DISTINCT item_id), not COUNT(*): an item is tagged once per setter
+/// (`write_tags_output` pins `idx = 0`, and `UNIQUE(item_id, setter_id,
+/// data_type, idx, is_origin)` allows exactly one tags row per item per
+/// setter), so a row count would multiply by the number of taggers that
+/// agreed. The number is meant to answer "how many items would this tag
+/// match".
+pub(crate) const RECOUNT_TAG_ITEMS_SQL: &str = "UPDATE tags SET item_count = (
+    SELECT COUNT(DISTINCT tags_items.item_id) FROM tags_items
+    WHERE tags_items.tag_id = tags.id)";
+
+/// Runs [`RECOUNT_TAG_ITEMS_SQL`]. Goes through the index writer actor like
+/// every other index mutation.
+pub(crate) async fn recount_tag_items(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
+    sqlx::query(RECOUNT_TAG_ITEMS_SQL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to recount tag item counts");
+            ApiError::internal("Failed to recount tag item counts")
+        })?;
+    Ok(())
+}
+
 /// Tags whose name contains `name`, most-used first.
 ///
 /// Substring matching is binary — a tag either contains the string or does
-/// not — so there is no relevance signal to order by, and the previous
+/// not — so there is no relevance signal to order by, and the original
 /// implementation ordered by nothing: it took whichever `limit` rows the scan
 /// reached first (rowid, i.e. roughly the order tags were first encountered)
 /// and only then counted them. Item count is the one meaningful tiebreak
 /// available, and it answers what the caller wants to know anyway: how many
 /// results this tag would return.
 ///
-/// Counting distinct `item_id` rather than rows matters because an item is
-/// tagged once per setter: with two taggers agreeing, a row count would report
-/// double. The denormalised `tags_items.item_id` keeps that exact count a
-/// single walk of `idx_tags_items_tag_item` instead of a join to `item_data`.
+/// The count is read from `tags.item_count` rather than computed, so this
+/// touches `tags` alone. Counting live over `tags_items` was correct but its
+/// cost scaled with how many tags matched, which is exactly backwards for an
+/// autocomplete: the short, fast-typed prefixes are the broad ones. On the
+/// 22.4M-row `default` index a one-letter query cost ~600ms live and ~1.5ms
+/// from the stored column. See [`RECOUNT_TAG_ITEMS_SQL`] for what keeps it
+/// current, and how stale it can be.
 pub(crate) async fn find_tags(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
@@ -27,12 +64,9 @@ pub(crate) async fn find_tags(
     let rows = sqlx::query(
         r#"
         SELECT tags.namespace AS namespace, tags.name AS name,
-               COUNT(DISTINCT tags_items.item_id) AS count
+               tags.item_count AS count
         FROM tags
-        JOIN tags_items
-            ON tags_items.tag_id = tags.id
         WHERE tags.name LIKE ?
-        GROUP BY tags.id
         ORDER BY count DESC, tags.namespace, tags.name
         LIMIT ?
         "#,
@@ -378,6 +412,10 @@ mod tests {
         .await
         .unwrap();
 
+        // The fixture writes `tags_items` directly, bypassing the job that
+        // would normally refresh the counts.
+        recount_tag_items(conn).await.unwrap();
+
         dbs
     }
 
@@ -395,6 +433,71 @@ mod tests {
                 ("ns".to_string(), "caterpillar".to_string(), 1)
             ]
         );
+    }
+
+    // The backfill in the migration and the post-job recount must compute the
+    // same number, or an upgraded database disagrees with a freshly recounted
+    // one. They cannot share a definition across the SQL/Rust boundary, so
+    // pin the text instead. (Line endings differ by checkout: the migrator
+    // normalizes them, so normalize here too.)
+    #[test]
+    fn recount_sql_matches_the_migration() {
+        let migration =
+            include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
+                .replace("\r\n", "\n");
+        assert!(
+            migration.contains(RECOUNT_TAG_ITEMS_SQL),
+            "migration 20260727130000 no longer runs RECOUNT_TAG_ITEMS_SQL verbatim"
+        );
+    }
+
+    // Deletion is the path that makes a stored count hard: it happens by FK
+    // cascade from `item_data`, which is why this is a full recompute rather
+    // than incremental maintenance. Deleting one of the two setters' rows for
+    // item 100 must NOT drop `cat` (item 101 and item 100 via the other setter
+    // both remain); deleting the last row for an item must.
+    #[tokio::test]
+    async fn recount_tag_items_follows_cascading_deletes() {
+        async fn count(conn: &mut sqlx::SqliteConnection, name: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>("SELECT item_count FROM tags WHERE name = ?")
+                .bind(name)
+                .fetch_one(conn)
+                .await
+                .unwrap()
+        }
+
+        let mut dbs = setup_tag_db().await;
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 2);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 1);
+
+        // item_data 12 is setter beta on item 100; alpha (item_data 10) still
+        // covers the same item, so the distinct-item count is unchanged.
+        sqlx::query("DELETE FROM item_data WHERE id = 12")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 2);
+
+        // item_data 11 is the only row for item 101, and the only one carrying
+        // `dog`.
+        sqlx::query("DELETE FROM item_data WHERE id = 11")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 1);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 0);
+
+        // A recount over unchanged data must not move anything.
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 1);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 0);
+
+        // A tag whose applications are all gone still matches — only its
+        // count and its position change.
+        let tags = find_tags(&mut dbs.index_conn, "dog", 10).await.unwrap();
+        assert_eq!(tags, vec![("ns".to_string(), "dog".to_string(), 0)]);
     }
 
     // Ensures tag namespaces include colon prefixes for search stats.
@@ -562,6 +665,7 @@ mod tests {
             .await
             .unwrap();
         }
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
 
         let tags = find_tags(&mut dbs.index_conn, "cat", 2).await.unwrap();
 
