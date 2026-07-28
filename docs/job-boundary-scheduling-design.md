@@ -3,9 +3,10 @@
 Status: fully implemented, all four phases (2026-07-28). Server: 43f0fab..4c05001; UI: dfe42ae, 63f3726.
 Follow-up package (see final section): recount gating + durable tags-dirty
 marker, back-of-queue maintenance placement, manual maintenance trigger —
-server side implemented 2026-07-28. The marker table is `maintenance_state`
-(migration `20260728120000_maintenance_state.sql`, one row, column
-`tags_dirty`, seeded dirty). The maintenance card in the UI is still to do.
+fully implemented 2026-07-28 (server: 2dd7bc7, b43f0b2; UI: eb77cd1,
+398034a). The marker table is `maintenance_state` (migration
+`20260728120000_maintenance_state.sql`, one row, column `tags_dirty`, seeded
+dirty).
 
 ## Follow-up package: recount gating, durable marker, placement, manual trigger
 
