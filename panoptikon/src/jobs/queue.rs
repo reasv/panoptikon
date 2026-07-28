@@ -515,6 +515,24 @@ impl Actor for JobQueueActor {
                 }
             }
             JobQueueMessage::RecordOwed { index_db, summary } => {
+                // Structural guard for the invariant "owed[X] cannot be re-set
+                // while a maintenance job runs". The message carries no job
+                // type, so the running job is the only thing that can say where
+                // it came from: a report from inside a maintenance pass would
+                // repopulate the flags that pass was synthesized to clear, and
+                // its own boundary would then synthesize a replacement — an
+                // unbounded synthesize/record loop.
+                if state
+                    .running_job
+                    .as_ref()
+                    .is_some_and(|running| running.job_type == JobType::DbMaintenance)
+                {
+                    tracing::warn!(
+                        index_db,
+                        "ignoring an owed report made while maintenance is running"
+                    );
+                    return Ok(());
+                }
                 merge_owed(state, &index_db, summary);
             }
             JobQueueMessage::Shutdown { reply } => {
@@ -1084,6 +1102,12 @@ pub(crate) async fn cancel_running_job(suppress_maintenance: bool) -> ApiResult<
 /// the owed flags survive that job failing or being cancelled afterwards.
 /// Fire-and-forget, and a no-op when the queue was never started (nothing can
 /// be owed if no job ever ran).
+///
+/// **Never call this from a `DbMaintenance` job.** The flags a maintenance pass
+/// is paying off are cleared when it is synthesized; re-owing them from inside
+/// the pass makes its own boundary synthesize a replacement, forever. The actor
+/// drops such reports (the running job's type is the only signal it has), but
+/// the call site is where this has to be got right.
 pub(crate) fn record_owed_now(index_db: &str, summary: ChangeSummary) {
     if summary.is_empty() {
         return;
@@ -1804,6 +1828,69 @@ mod tests {
             "cancelled maintenance must not re-own its flags: {state:?}"
         );
         assert_eq!(state.synthesized.len(), 1, "no second synthesis: {state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Mass cancel ("Cancel Selected" with a running job and its queued
+    // successors) must remove the queued ids outright, never promote them into
+    // the runner slot only to abort them again: a job that executed no
+    // instruction has nothing to owe. The queued jobs here are of a *deleting*
+    // type, so a promoted-then-aborted one would pessimistically owe the
+    // VACUUM that nothing in this queue ever earned.
+    #[tokio::test]
+    async fn mass_cancel_does_not_start_the_jobs_it_is_cancelling() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-mass-cancel");
+        let running = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+        // `log_id: None` makes this job fail immediately *if* it is ever
+        // started, without touching a database — which is what makes the old
+        // promote-then-abort behaviour observable rather than merely slow.
+        let deleting = JobRequest {
+            job_type: JobType::JobDataDeletion,
+            index_db: db.clone(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: None,
+        };
+        let first = enqueue_on(&queue, deleting.clone()).await;
+        let second = enqueue_on(&queue, deleting).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        let cancelled = cancel_on(
+            &queue,
+            vec![running.queue_id, first.queue_id, second.queue_id],
+        )
+        .await;
+        assert_eq!(cancelled.len(), 3, "all three cancelled: {cancelled:?}");
+
+        let status = status_on(&queue).await;
+        for queue_id in [running.queue_id, first.queue_id, second.queue_id] {
+            assert!(
+                status.outcomes.iter().any(|outcome| {
+                    outcome.queue_id == queue_id && outcome.status == JobOutcomeStatus::Cancelled
+                }),
+                "missing cancel outcome for {queue_id}: {status:?}"
+            );
+        }
+
+        let state = debug_on(&queue).await;
+        assert_eq!(state.synthesized.len(), 1, "one pass for the DB: {state:?}");
+        assert_eq!(
+            state.synthesized[0],
+            (
+                db.clone(),
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: false
+                }
+            ),
+            "only the job that actually ran may owe anything"
+        );
 
         queue.stop(None);
         handle.await.unwrap();

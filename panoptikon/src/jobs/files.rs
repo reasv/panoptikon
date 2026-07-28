@@ -3374,7 +3374,12 @@ LIMIT 1
             .await
             .unwrap();
         drop(write_conn);
-        service.rescan_folders().await.unwrap();
+        let result = service.rescan_folders().await.unwrap();
+        // A backfilling rescan writes, even though nothing is new or modified.
+        assert!(
+            result.summary.wrote_data,
+            "a backfilled blurhash is a write the boundary owes maintenance for"
+        );
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
@@ -3398,7 +3403,19 @@ LIMIT 1
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        service.rescan_folders().await.unwrap();
+        let result = service.rescan_folders().await.unwrap();
+        // Nothing new, nothing modified, nothing backfilled — and still a
+        // write, because every unchanged file gets an `UPDATE files SET
+        // scan_id`. This is the nightly-no-change-rescan case: dropping it
+        // from `wrote_data` costs the WAL checkpoint on a 500k-file library.
+        assert!(
+            result.summary.wrote_data,
+            "an all-unchanged rescan still rewrites every file row"
+        );
+        assert!(
+            !result.summary.deleted_data,
+            "an all-unchanged rescan deletes nothing"
+        );
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
@@ -3437,6 +3454,43 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(item_count.0, 1);
+    }
+
+    // The other half of the `wrote_data` contract: a scan that touches no file
+    // at all must report nothing, so an idle cron pass over a database with no
+    // configured folders never schedules a maintenance job.
+    #[tokio::test]
+    async fn empty_folder_set_scan_reports_no_changes() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let config = SystemConfig::default();
+        assert!(config.included_folders.is_empty());
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        let result = service.rescan_folders().await.unwrap();
+        assert!(
+            result.scan_ids.is_empty(),
+            "no folders means no scans: {:?}",
+            result.scan_ids
+        );
+        assert!(
+            !result.summary.wrote_data && !result.summary.deleted_data,
+            "a scan that saw no files owes no maintenance"
+        );
     }
 
     #[test]
