@@ -36,7 +36,9 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 mod input_handlers;
 mod output_handlers;
 
-const CACHE_KEY: &str = "batch";
+/// The inferio cache key every batch job loads under. Shared with the queue's
+/// boundary unload, which must target the same key.
+pub(crate) const CACHE_KEY: &str = "batch";
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
 
@@ -417,10 +419,10 @@ async fn run_extraction_job_inner(
     })
     .await;
 
-    let _ = context
-        .pool
-        .unload_model_all(&model.setter_name, CACHE_KEY)
-        .await;
+    // No unload here: the job reports the model it loaded and the queue's
+    // boundary decides, so a following job for the same setter reuses it
+    // instead of reloading (design §B). Every path that loses the boundary's
+    // unload still falls back to the inferio TTL sweep, as it always did.
 
     if total_failure {
         return Err(ApiError::internal(format!(

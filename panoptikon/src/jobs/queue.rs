@@ -89,9 +89,8 @@ impl ChangeSummary {
 /// What a job reports back to the queue when it finishes successfully.
 pub(crate) struct JobSuccess {
     pub summary: ChangeSummary,
-    /// The batch-cache model the job left loaded, if any. Recorded now;
-    /// consumed by the boundary's model-continuity rule (design phase 2).
-    #[allow(dead_code)]
+    /// The batch-cache model the job left loaded, if any. Drives the
+    /// boundary's model-continuity rule.
     pub loaded_model: Option<String>,
 }
 
@@ -171,8 +170,7 @@ pub(crate) struct JobRunResult {
     /// `None` when the job ended without reporting (cancelled, panicked, or
     /// failed); the boundary then falls back to the pessimistic rule.
     summary: Option<ChangeSummary>,
-    /// Recorded for the phase-2 model-continuity rule; nothing reads it yet.
-    #[allow(dead_code)]
+    /// The batch-cache model the job left loaded, when it reported one.
     loaded_model: Option<String>,
 }
 
@@ -271,6 +269,11 @@ pub(crate) enum JobQueueMessage {
 pub(crate) struct QueueDebugState {
     owed: HashMap<String, ChangeSummary>,
     synthesized: Vec<(String, ChangeSummary)>,
+    batch_loaded: Option<String>,
+    /// Setters the boundary decided to unload, in order. Recorded instead of
+    /// performed under `cfg(test)`: queue tests run without an inference
+    /// context, and the decision is what these tests are about.
+    unloads: Vec<String>,
 }
 
 pub(crate) struct JobQueueActor;
@@ -291,8 +294,14 @@ pub(crate) struct JobQueueState {
     /// when a maintenance job is synthesized for that DB; dies with the
     /// process (the queue is not persistent, by design).
     owed: HashMap<String, ChangeSummary>,
+    /// The setter currently loaded under the inferio `batch` cache key, as far
+    /// as the queue knows. Exact rather than approximate: batch loads use
+    /// `lru_size = 1`, so loading a setter evicts whatever was there.
+    batch_loaded: Option<String>,
     #[cfg(test)]
     synthesized: Vec<(String, ChangeSummary)>,
+    #[cfg(test)]
+    unloads: Vec<String>,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -358,8 +367,11 @@ impl Actor for JobQueueActor {
             runner,
             shutting_down: false,
             owed: HashMap::new(),
+            batch_loaded: None,
             #[cfg(test)]
             synthesized: Vec::new(),
+            #[cfg(test)]
+            unloads: Vec::new(),
         })
     }
 
@@ -470,6 +482,10 @@ impl Actor for JobQueueActor {
                         maybe_schedule_maintenance(state, job);
                     }
                 }
+                // Removing queued jobs can also remove the reason a batch model
+                // was being kept warm. Never suppressed: freeing VRAM on cancel
+                // is cheap and wanted (design §B).
+                maybe_unload_batch_model(state);
                 // Unconditional: a suppressed cancel must still not leave the
                 // queue holding work while the runner sits idle.
                 start_next_job(state).await;
@@ -506,10 +522,15 @@ impl Actor for JobQueueActor {
                         }
                         state.running_job = None;
                         record_owed(state, &finished, result.summary);
+                        record_batch_load(state, &finished, result.success, result.loaded_model);
                         // Before starting the next job: a maintenance job goes
                         // to the front of the queue, which is exactly the slot
                         // the maintenance work occupied before it was deferred.
                         maybe_schedule_maintenance(state, &finished);
+                        // Strictly after synthesis: the model-continuity rule
+                        // reads the queue, and a maintenance job it must skip
+                        // over has to be in there already.
+                        maybe_unload_batch_model(state);
                         start_next_job(state).await;
                     }
                 }
@@ -546,6 +567,10 @@ impl Actor for JobQueueActor {
                 // Owed maintenance dies with the process (design: accepted
                 // performance-only staleness), so shutdown never synthesizes.
                 let cancelled = cancel_running_job_inner(state, true).await;
+                // The batch model does not die with the process: desktop
+                // shutdown leaves the inference workers running for a moment,
+                // and an unload costs one HTTP call we are not waiting on.
+                maybe_unload_batch_model(state);
                 let _ = reply.send(cancelled);
             }
             #[cfg(test)]
@@ -553,6 +578,8 @@ impl Actor for JobQueueActor {
                 let _ = reply.send(QueueDebugState {
                     owed: state.owed.clone(),
                     synthesized: state.synthesized.clone(),
+                    batch_loaded: state.batch_loaded.clone(),
+                    unloads: state.unloads.clone(),
                 });
             }
         }
@@ -670,9 +697,15 @@ async fn cancel_running_job_inner(
                 // pessimistic — but the maintenance job itself can be
                 // suppressed by the caller (this cancel only).
                 record_owed(state, &running, None);
+                // A cancelled extraction job reports nothing either, so the
+                // model tracking is pessimistic too: it may have loaded.
+                record_unreported_batch_load(state, &running);
                 if !suppress_maintenance {
                     maybe_schedule_maintenance(state, &running);
                 }
+                // Not gated on `suppress_maintenance`: that flag is about the
+                // maintenance job only.
+                maybe_unload_batch_model(state);
                 start_next_job(state).await;
                 Some(queue_id)
             } else {
@@ -774,6 +807,115 @@ fn maybe_schedule_maintenance(state: &mut JobQueueState, finished: &Job) {
     state.synthesized.push((finished.index_db.clone(), owed));
     state.queue.push_front(job.clone());
     state.queued_jobs.insert(job.queue_id, job);
+}
+
+/// The setter the next batch extraction in the queue will load, if the queue
+/// starts with one. `DbMaintenance` jobs are skipped over — a synthesized
+/// maintenance pass between two jobs for the same setter must not cost a model
+/// reload — but nothing else is: any other job type means real work (a scan
+/// can run for hours) stands between here and the next extraction, and the
+/// model should not sit in VRAM through it.
+fn next_batch_setter(queue: &VecDeque<Job>) -> Option<&str> {
+    for job in queue {
+        match job.job_type {
+            JobType::DbMaintenance => continue,
+            JobType::DataExtraction => return job.metadata.as_deref(),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Folds a finished job's model report into `batch_loaded`. A job that ended
+/// without reporting is treated like a cancel (see
+/// [`record_unreported_batch_load`]); a job that reported "loaded nothing"
+/// (the no-data early return) leaves the previous model tracked, because it
+/// did not evict it.
+fn record_batch_load(
+    state: &mut JobQueueState,
+    job: &Job,
+    success: bool,
+    loaded_model: Option<String>,
+) {
+    match loaded_model {
+        Some(setter) => state.batch_loaded = Some(setter),
+        None if !success => record_unreported_batch_load(state, job),
+        None => {}
+    }
+}
+
+fn record_unreported_batch_load(state: &mut JobQueueState, job: &Job) {
+    if let Some(setter) = unreported_batch_load(job) {
+        state.batch_loaded = Some(setter);
+    }
+}
+
+/// An extraction job that ended without reporting (cancelled, failed, panicked)
+/// may have loaded its model before dying, and `setter_name == inference_id ==
+/// metadata`. Assume it did: the cost of being wrong is one no-op unload call,
+/// while the cost of not tracking it is a model left in VRAM until the TTL
+/// sweep. Any other job type loads nothing under the batch cache key.
+fn unreported_batch_load(job: &Job) -> Option<String> {
+    if job.job_type != JobType::DataExtraction {
+        return None;
+    }
+    job.metadata.clone()
+}
+
+/// The model-continuity half of the boundary: the batch model stays loaded
+/// exactly when the next extraction in the queue wants the same setter.
+/// Otherwise it is unloaded without blocking the actor — a lost call is
+/// covered by the inferio TTL sweep, the same backstop that has always been
+/// the real guarantee here.
+fn maybe_unload_batch_model(state: &mut JobQueueState) {
+    // Only a real boundary: while a job runs, `batch_loaded` describes a model
+    // that job may itself be using (or have already evicted).
+    if state.running_job.is_some() {
+        return;
+    }
+    let Some(loaded) = state.batch_loaded.clone() else {
+        return;
+    };
+    if next_batch_setter(&state.queue) == Some(loaded.as_str()) {
+        return;
+    }
+    state.batch_loaded = None;
+    tracing::info!(setter = %loaded, "unloading batch model at job boundary");
+    spawn_batch_unload(state, loaded);
+}
+
+fn spawn_batch_unload(state: &mut JobQueueState, setter: String) {
+    if record_test_unload(state, &setter) {
+        return;
+    }
+    // Fire and forget: an HTTP round trip must not stall the actor between two
+    // jobs, and every way this call can be lost is already covered by the
+    // inferio TTL sweep.
+    tokio::spawn(async move {
+        // Absent when no inference endpoints were ever configured; then there
+        // is nothing loaded and nothing to unload.
+        let Some(context) = crate::jobs::inference_pool::try_job_inference_context() else {
+            return;
+        };
+        let _ = context
+            .pool
+            .unload_model_all(&setter, extraction::CACHE_KEY)
+            .await;
+    });
+}
+
+/// Always `false`: the unload really happens.
+#[cfg(not(test))]
+fn record_test_unload(_state: &mut JobQueueState, _setter: &str) -> bool {
+    false
+}
+
+/// Queue tests have neither an inference context nor an inference server, and
+/// the *decision* is what they assert — so it is recorded instead of performed.
+#[cfg(test)]
+fn record_test_unload(state: &mut JobQueueState, setter: &str) -> bool {
+    state.unloads.push(setter.to_string());
+    true
 }
 
 impl Actor for JobRunnerActor {
@@ -917,6 +1059,42 @@ fn test_maintenance_delays() -> &'static std::sync::Mutex<HashMap<String, u64>> 
     DELAYS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Always `None`: extraction jobs run their real body. (Under `cfg(test)` the
+/// stub below takes over — the seam is here rather than around the whole arm so
+/// that the real call stays compiled in test builds, which is what keeps the
+/// extraction module from looking dead to the compiler.)
+#[cfg(not(test))]
+async fn extraction_stub(_job: &Job) -> Option<Result<JobSuccess, String>> {
+    None
+}
+
+/// The boundary's model-continuity rule is about real `DataExtraction` jobs, so
+/// the queue tests enqueue real ones — but the real body needs an inference
+/// server and a populated database. The stub reports what matters: the setter
+/// it "loaded", which is the job's `metadata`, exactly as the real job does
+/// (`setter_name == inference_id == metadata`). Tag: `"<delay_ms>"`, or
+/// `"<delay_ms>:noload"` for the no-data early return, which loads nothing.
+#[cfg(test)]
+async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
+    let tag = job.tag.clone().unwrap_or_default();
+    let (delay, flags) = match tag.split_once(':') {
+        Some((delay, flags)) => (delay, flags),
+        None => (tag.as_str(), ""),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(
+        delay.parse::<u64>().unwrap_or(0),
+    ))
+    .await;
+    let loaded = !flags.contains("noload");
+    Some(Ok(JobSuccess {
+        summary: ChangeSummary {
+            wrote_data: loaded,
+            deleted_data: false,
+        },
+        loaded_model: loaded.then(|| job.metadata.clone()).flatten(),
+    }))
+}
+
 async fn execute_job(job: Job) -> Result<JobSuccess, String> {
     match job.job_type {
         JobType::FolderRescan => {
@@ -942,6 +1120,9 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             Ok(JobSuccess::from_summary(result.summary))
         }
         JobType::DataExtraction => {
+            if let Some(stubbed) = Box::pin(extraction_stub(&job)).await {
+                return stubbed;
+            }
             let outcome = extraction::run_extraction_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
@@ -1234,6 +1415,37 @@ mod tests {
             threshold: None,
             log_id: None,
             tag: Some(tag.to_string()),
+        }
+    }
+
+    /// A `DataExtraction` job whose body is the `cfg(test)` stub: it reports
+    /// `metadata` as the setter it loaded (`"<delay_ms>:noload"` to report
+    /// loading nothing, as the no-data early return does).
+    fn extraction_job(index_db: &str, setter: &str, tag: &str) -> JobRequest {
+        JobRequest {
+            job_type: JobType::DataExtraction,
+            index_db: index_db.to_string(),
+            user_data_db: "default".to_string(),
+            metadata: Some(setter.to_string()),
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some(tag.to_string()),
+        }
+    }
+
+    /// A queue entry for the pure decision-function tests; never executed.
+    fn queued_job(job_type: JobType, metadata: Option<&str>) -> Job {
+        Job {
+            queue_id: 1,
+            job_type,
+            index_db: "db".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: metadata.map(str::to_string),
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: None,
         }
     }
 
@@ -2036,6 +2248,196 @@ mod tests {
             ChangeSummary::default(),
             "the reconcile owes no maintenance, even when it is cancelled"
         );
+    }
+
+    // The model-continuity decision, without actors: the batch model survives
+    // exactly as long as the next extraction in the queue wants the same
+    // setter, and a synthesized maintenance job in between does not count.
+    #[test]
+    fn next_batch_setter_skips_maintenance_but_nothing_else() {
+        let extraction = |setter| queued_job(JobType::DataExtraction, Some(setter));
+        let maintenance = || queued_job(JobType::DbMaintenance, Some("wrote_data"));
+
+        assert_eq!(next_batch_setter(&VecDeque::new()), None, "empty queue");
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![extraction("group/a")])),
+            Some("group/a")
+        );
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![extraction("group/b")])),
+            Some("group/b"),
+            "a different setter is reported as-is; the caller compares"
+        );
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![maintenance(), extraction("group/a")])),
+            Some("group/a"),
+            "the model must survive a deferred maintenance pass between two \
+             jobs for the same setter"
+        );
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![
+                maintenance(),
+                maintenance(),
+                extraction("group/a"),
+            ])),
+            Some("group/a"),
+            "several DBs can owe maintenance at the same boundary"
+        );
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![
+                queued_job(JobType::FolderRescan, None),
+                extraction("group/a"),
+            ])),
+            None,
+            "a scan can run for hours; the model must not wait in VRAM"
+        );
+        assert_eq!(
+            next_batch_setter(&VecDeque::from(vec![queued_job(
+                JobType::DataExtraction,
+                None
+            )])),
+            None,
+            "an extraction job without a setter cannot keep anything warm"
+        );
+    }
+
+    // The conservative rule for jobs that end without reporting: only a
+    // `DataExtraction` can have loaded a batch model, and its `metadata` is the
+    // setter (`setter_name == inference_id`).
+    #[test]
+    fn only_extraction_jobs_track_an_unreported_load() {
+        assert_eq!(
+            unreported_batch_load(&queued_job(JobType::DataExtraction, Some("group/a"))),
+            Some("group/a".to_string())
+        );
+        assert_eq!(
+            unreported_batch_load(&queued_job(JobType::DataExtraction, None)),
+            None
+        );
+        for job_type in [
+            JobType::FolderRescan,
+            JobType::DataDeletion,
+            JobType::DbMaintenance,
+            JobType::VectorQuantReconcile,
+        ] {
+            assert_eq!(
+                unreported_batch_load(&queued_job(job_type.clone(), Some("group/a"))),
+                None,
+                "{job_type:?} never loads a batch model"
+            );
+        }
+    }
+
+    // The point of the whole phase: consecutive extraction jobs for the same
+    // setter — different databases, with a deferred maintenance pass for the
+    // first DB in between — reuse one loaded model instead of reloading it.
+    #[tokio::test]
+    async fn same_setter_chain_keeps_the_model_loaded_across_jobs() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-chain-a");
+        let other_db = unique_db("batch-chain-b");
+        let setter = "group/model-a";
+        let _first = enqueue_on(&queue, extraction_job(&db, setter, "10")).await;
+        let second = enqueue_on(&queue, extraction_job(&other_db, setter, "60000")).await;
+
+        // The second job running means the first one's boundary (and the
+        // maintenance job synthesized there) has already been through the
+        // model-continuity decision.
+        wait_for_running(&queue, second.queue_id).await;
+        let state = debug_on(&queue).await;
+        assert_eq!(
+            state.batch_loaded.as_deref(),
+            Some(setter),
+            "the first job's model must still be tracked: {state:?}"
+        );
+        assert!(
+            state.unloads.is_empty(),
+            "the model must survive both the boundary and the maintenance job \
+             in between: {state:?}"
+        );
+
+        // Nothing follows the second job, so its boundary unloads.
+        assert_eq!(cancel_running_on(&queue, true).await, Some(second.queue_id));
+        let state = wait_for(&queue, |state| !state.unloads.is_empty()).await;
+        assert_eq!(state.unloads, vec![setter.to_string()]);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The end of a queue drain: with nothing left to reuse the model, the
+    // boundary unloads it — the explicit unload the jobs used to do
+    // themselves, now made at a point that can see what comes next.
+    #[tokio::test]
+    async fn last_extraction_unloads_its_model() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-last");
+        let setter = "group/model-a";
+        let _job = enqueue_on(&queue, extraction_job(&db, setter, "10")).await;
+
+        let state = wait_for(&queue, |state| !state.unloads.is_empty()).await;
+        assert_eq!(state.unloads, vec![setter.to_string()]);
+        assert!(
+            state.batch_loaded.is_none(),
+            "the unloaded model must stop being tracked: {state:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Any other job type ends the run of extraction jobs: a scan can take
+    // hours, and holding VRAM across it to save one model load is a bad trade.
+    #[tokio::test]
+    async fn a_non_extraction_job_in_between_unloads_the_model() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-interrupted");
+        let other_db = unique_db("batch-interrupted-scan");
+        let setter = "group/model-a";
+        let _first = enqueue_on(&queue, extraction_job(&db, setter, "10")).await;
+        let blocker = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        let _later = enqueue_on(&queue, extraction_job(&other_db, setter, "10")).await;
+
+        wait_for_running(&queue, blocker.queue_id).await;
+        let state = debug_on(&queue).await;
+        assert_eq!(
+            state.unloads,
+            vec![setter.to_string()],
+            "the queued job between the two extractions is not an extraction: {state:?}"
+        );
+        assert!(state.batch_loaded.is_none(), "{state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // A cancelled extraction job reports nothing, so the queue assumes it
+    // loaded its model and unloads it at the boundary — an explicit unload the
+    // cancel path never had before (it relied entirely on the TTL sweep).
+    #[tokio::test]
+    async fn cancelled_extraction_tracks_and_unloads_its_model() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-cancel");
+        let setter = "group/model-a";
+        let running = enqueue_on(&queue, extraction_job(&db, setter, "60000")).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        // Suppressed: this is about the model, and the maintenance job the
+        // cancel would otherwise synthesize is not part of it.
+        assert_eq!(
+            cancel_running_on(&queue, true).await,
+            Some(running.queue_id)
+        );
+        let state = debug_on(&queue).await;
+        assert_eq!(
+            state.unloads,
+            vec![setter.to_string()],
+            "a cancelled extraction must be assumed to have loaded: {state:?}"
+        );
+        assert!(state.batch_loaded.is_none(), "{state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
     }
 
     // The maintenance job is a normal queue row: cancelling it does not put
