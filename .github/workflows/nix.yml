@@ -1,0 +1,217 @@
+# Nix packaging: format/pin checks, package smokes, NixOS VMs, weekly lock/pin PR.
+#
+# The `ui` git submodule is NEVER updated by automation — only maintainers bump
+# it. CI only realigns ui-pin.json (rev + source NAR hash) to the current gitlink.
+# npm deps use importNpmLock (package-lock.json); not part of the pin.
+#
+# Uses cache.nixos.org only (no Magic Nix Cache / GHA cache proxy).
+# Package install checks and NixOS VMs run as separate matrices so a slow VM
+# does not block light smokes. Determinate installer enables KVM when available.
+name: nix
+
+on:
+  schedule:
+    # Weekly Monday 05:17 UTC
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**.nix"
+      - "flake.lock"
+      - "flake.nix"
+      - "contrib/package/nix/**"
+      - "contrib/package/common/**"
+      - "contrib/nixos/**"
+      - "config/server/nixos.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "panoptikon/Cargo.toml"
+      - "panoptikon/src/**"
+      - "panoptikon-desktop/**"
+      - "ui"
+      - "scripts/sync-nix-ui-pin.py"
+      - "scripts/generate-hicolor-icons.sh"
+      - "scripts/git-hooks/**"
+      - ".github/workflows/nix.yml"
+  push:
+    branches: [master, main, "dev/**"]
+    paths:
+      - "**.nix"
+      - "flake.lock"
+      - "flake.nix"
+      - "contrib/package/nix/**"
+      - "contrib/package/common/**"
+      - "contrib/nixos/**"
+      - "config/server/nixos.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "panoptikon/Cargo.toml"
+      - "panoptikon/src/**"
+      - "panoptikon-desktop/**"
+      - "ui"
+      - "scripts/sync-nix-ui-pin.py"
+      - "scripts/generate-hicolor-icons.sh"
+      - "scripts/git-hooks/**"
+      - ".github/workflows/nix.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Flake formatter check (alejandra via nix)
+        run: nix build .#checks.x86_64-linux.alejandra -L
+
+      - name: UI pin check (rev + source hash)
+        run: python3 scripts/sync-nix-ui-pin.py --check
+
+  # Light package/cli smokes (no QEMU).
+  packages:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - panoptikon-cli
+          - panoptikon-install
+          - panoptikon-cpu-install
+          - panoptikon-cuda-install
+          - panoptikon-rocm-install
+          - panoptikon-desktop-install
+          - panoptikon-desktop-cpu-install
+          - panoptikon-desktop-cuda-install
+          - panoptikon-desktop-rocm-install
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: nix build check
+        run: |
+          set -euo pipefail
+          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
+          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
+
+  # NixOS VM smokes (KVM when DETERMINATE_NIX_KVM=1 from the installer).
+  nixos:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - panoptikon-nixos
+          - panoptikon-nixos-gpu-cpu
+          - panoptikon-nixos-gpu-rocm
+          - panoptikon-nixos-gpu-cuda
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: KVM availability
+        run: |
+          set -euo pipefail
+          if [[ -e /dev/kvm ]]; then
+            echo "KVM device present"
+            ls -l /dev/kvm || true
+          else
+            echo "warning: /dev/kvm missing; NixOS tests use TCG (slower)" >&2
+          fi
+
+      - name: nix build NixOS check
+        run: |
+          set -euo pipefail
+          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
+          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
+
+  update:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Serialize maintenance so concurrent schedule+dispatch do not race.
+    concurrency:
+      group: nix-update
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Submodule contents not required; gitlink is enough for pin sync.
+          # Never run `git submodule update --remote` here — ui is manual only.
+          submodules: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: nix flake update
+        run: nix flake update
+
+      - name: Sync UI pin to current submodule gitlink
+        run: |
+          # Aligns ui-pin.json (rev + NAR hash) with the *existing* ui gitlink.
+          # Does not change the submodule pointer itself.
+          python3 scripts/sync-nix-ui-pin.py
+
+      - name: Format Nix (flake formatter / nix fmt)
+        run: nix fmt
+
+      # GITHUB_TOKEN PRs do not re-trigger pull_request/push workflows (GitHub
+      # recursion guard). Validate pin + light package smokes here before
+      # opening the PR so the maintenance branch is not untested.
+      - name: Validate pin and light smokes
+        run: |
+          set -euo pipefail
+          python3 scripts/sync-nix-ui-pin.py --check
+          nix build .#checks.x86_64-linux.alejandra -L
+          nix build .#checks.x86_64-linux.panoptikon-cli -L
+          nix build .#checks.x86_64-linux.panoptikon-install -L
+
+      - name: Create pull request if anything changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(nix): update flake.lock and UI pin"
+          title: "chore(nix): update flake.lock and UI pin"
+          body: |
+            Automated maintenance (does **not** bump the `ui` git submodule):
+
+            - `nix flake update` → `flake.lock` (nixpkgs, flake-utils, …)
+            - `scripts/sync-nix-ui-pin.py` → refresh `ui-pin.json` for the
+              **current** `ui` gitlink (rev + source NAR hash; npm via lockfile)
+            - `nix fmt` (flake formatter = alejandra) on all `*.nix` files
+            - **Pre-PR validation in this job** (no PAT): pin `--check`,
+              alejandra, `panoptikon-cli`, `panoptikon-install`
+
+            The monorepo `ui` submodule is only updated by maintainers. If the
+            pin rev is already correct, this PR may only touch hashes/lock
+            inputs.
+
+            **Note:** PRs opened with `GITHUB_TOKEN` do not re-trigger the
+            package/VM matrix (GitHub recursion guard). Light smokes above ran
+            on the update job itself; re-run the full `nix` workflow manually
+            after merge or push an empty commit with a human token if needed.
+
+            Review before merge.
+          branch: chore/nix-update
+          delete-branch: true
