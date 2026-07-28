@@ -931,9 +931,14 @@ impl UpdateCoordinator {
             return Err(format!("Update installation failed: {error}"));
         }
         emit_progress(app, "restarting", 0, None, true);
+        // On Unix, restart replaces this process and never returns. Windows
+        // completes install without an in-process restart here.
+        #[cfg(windows)]
+        {
+            return Ok(());
+        }
         #[cfg(not(windows))]
         app.restart();
-        Ok(())
     }
 
     async fn validate_exact_install_target(
