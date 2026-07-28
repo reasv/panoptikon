@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Safety net if pre-commit was skipped (--no-verify): after commit, if pin still
+# drifts from HEAD's ui gitlink, sync and commit the pin as a follow-up.
+set -euo pipefail
+
+if [[ -n "${PANOPTIKON_HOOK_SKIP:-}" ]]; then
+  exit 0
+fi
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+# shellcheck source=common.sh
+source "$(dirname "$0")/common.sh"
+
+if ! git symbolic-ref -q HEAD >/dev/null; then
+  exit 0
+fi
+git_dir="$(git rev-parse --git-dir)"
+if [[ -d $git_dir/rebase-merge || -d $git_dir/rebase-apply ]]; then
+  exit 0
+fi
+if [[ -f $git_dir/MERGE_HEAD || -f $git_dir/CHERRY_PICK_HEAD ]]; then
+  exit 0
+fi
+
+[[ -f $SYNC_SCRIPT ]] || exit 0
+ui_rev=$(ui_gitlink_rev HEAD)
+[[ -n $ui_rev ]] || exit 0
+
+# Fast path: rev already matches and last commit did not touch ui/pin.
+if pin_rev_matches_gitlink HEAD; then
+  if ! git diff-tree --no-commit-id --name-only -r HEAD | grep -qE "^(ui|${PIN_PATH})$"; then
+    exit 0
+  fi
+fi
+
+echo "post-commit: ensuring ui-pin.json matches ui@${ui_rev:0:12} …"
+if ! py "$SYNC_SCRIPT"; then
+  echo "post-commit: warning: pin sync failed; run: python3 $SYNC_SCRIPT" >&2
+  exit 0
+fi
+
+if git diff --quiet HEAD -- "$PIN_PATH"; then
+  exit 0
+fi
+
+if ! py "$SYNC_SCRIPT" --check --quiet; then
+  echo "post-commit: warning: pin check failed after sync" >&2
+  exit 0
+fi
+
+git add -- "$PIN_PATH"
+if git diff --cached --quiet -- "$PIN_PATH"; then
+  exit 0
+fi
+
+echo "post-commit: committing $PIN_PATH …"
+export PANOPTIKON_HOOK_SKIP=1
+git commit -m "chore(nix): sync ui-pin.json to ui submodule"

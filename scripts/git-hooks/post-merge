@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# After merge/pull: if ui-pin.json drifts from the ui gitlink, sync it into the
+# working tree and warn to commit (do not auto-commit on merge).
+set -euo pipefail
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+# shellcheck source=common.sh
+source "$(dirname "$0")/common.sh"
+
+[[ -f $SYNC_SCRIPT && -f $PIN_PATH ]] || exit 0
+ui_rev=$(ui_gitlink_rev HEAD)
+[[ -n $ui_rev ]] || exit 0
+
+if pin_rev_matches_gitlink HEAD; then
+  exit 0
+fi
+
+echo "post-merge: ui gitlink and ui-pin.json disagree — syncing pin …" >&2
+if ! py "$SYNC_SCRIPT"; then
+  echo "post-merge: error: pin sync failed; run: python3 $SYNC_SCRIPT" >&2
+  exit 0
+fi
+
+if git diff --quiet HEAD -- "$PIN_PATH"; then
+  exit 0
+fi
+
+echo "post-merge: ui-pin.json updated in the working tree — commit it:" >&2
+echo "  git add $PIN_PATH && git commit -m 'chore(nix): sync ui-pin.json to ui submodule'" >&2

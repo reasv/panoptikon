@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Pre-commit:
+# 1) nix fmt staged *.nix when nix is available
+# 2) full ui-pin.json --check (rev + NAR hash) against the index gitlink
+#
+# npm is not in the pin (importNpmLock). On mismatch: sync, stage pin, --check;
+# abort the commit if that fails.
+# Enable: git config core.hooksPath scripts/git-hooks
+set -euo pipefail
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+# shellcheck source=common.sh
+source "$(dirname "$0")/common.sh"
+
+# Follow-up pin commits from post-commit set this to avoid re-entry.
+if [[ -n "${PANOPTIKON_HOOK_SKIP:-}" ]]; then
+  exit 0
+fi
+
+# --- flake formatter ---
+if have_nix; then
+  mapfile -t nix_files < <(
+    git diff --cached --name-only --diff-filter=ACM | grep '\.nix$' || true
+  )
+  if [[ ${#nix_files[@]} -gt 0 ]]; then
+    echo "pre-commit: nix fmt ${#nix_files[@]} file(s) …"
+    nix fmt -- "${nix_files[@]}"
+    git add -- "${nix_files[@]}"
+  fi
+fi
+
+# --- UI pin (full hash check whenever a ui gitlink exists) ---
+[[ -f $SYNC_SCRIPT ]] || exit 0
+
+ui_rev=$(ui_gitlink_rev index)
+if [[ -z $ui_rev ]]; then
+  exit 0
+fi
+
+# Always verify rev + hash (not rev-only). Sync+stage if needed.
+if py "$SYNC_SCRIPT" --check --quiet 2>/dev/null; then
+  echo "pre-commit: ui-pin.json OK for ${ui_rev:0:12}"
+  exit 0
+fi
+
+echo "pre-commit: syncing ui-pin.json to ui@${ui_rev:0:12} …"
+if ! py "$SYNC_SCRIPT"; then
+  echo "pre-commit: error: pin sync failed (need python3 + network to GitHub)" >&2
+  echo "pre-commit: fix: git submodule update --init ui && python3 $SYNC_SCRIPT" >&2
+  echo "pre-commit: offline only: python3 $SYNC_SCRIPT --allow-offline-hash (do not push)" >&2
+  exit 1
+fi
+git add -- "$PIN_PATH"
+
+if ! py "$SYNC_SCRIPT" --check --quiet; then
+  echo "pre-commit: error: ui-pin.json still does not match the ui gitlink" >&2
+  echo "pre-commit: fix: python3 $SYNC_SCRIPT && git add $PIN_PATH" >&2
+  exit 1
+fi
+
+echo "pre-commit: ui-pin.json OK for ${ui_rev:0:12}"
