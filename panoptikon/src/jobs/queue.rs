@@ -192,12 +192,30 @@ impl JobRunResult {
     }
 }
 
-/// Dedup condition for batch enqueueing: the whole batch is skipped when any
-/// queued or running job carries this tag for this index DB.
+/// Dedup condition for batch enqueueing, evaluated per index DB: when a queued
+/// or running job carries this tag for this index DB, the batch's requests
+/// *for that DB* are dropped. Requests for other DBs still enqueue — one batch
+/// can carry work for several DBs (the merged cron tick), and one DB's stale
+/// run must not hold the others back.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchDedup {
     pub tag: String,
     pub index_db: String,
+}
+
+/// Outcome of an [`JobQueueMessage::EnqueueBatch`]: the jobs that made it into
+/// the queue, plus the index DBs whose requests a dedup entry dropped.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BatchEnqueueResult {
+    pub enqueued: Vec<JobModel>,
+    pub skipped_dbs: Vec<String>,
+}
+
+impl BatchEnqueueResult {
+    /// Whether `index_db`'s requests were dropped by a dedup conflict.
+    pub(crate) fn was_skipped(&self, index_db: &str) -> bool {
+        self.skipped_dbs.iter().any(|db| db == index_db)
+    }
 }
 
 impl JobModel {
@@ -221,13 +239,14 @@ pub(crate) enum JobQueueMessage {
         request: JobRequest,
         reply: oneshot::Sender<ApiResult<JobModel>>,
     },
-    /// All-or-nothing enqueue of several jobs, with an optional dedup check
-    /// evaluated atomically inside the actor (a check-then-enqueue done by the
-    /// caller would race concurrent triggers). Replies `None` when skipped.
+    /// Atomic enqueue of several jobs, with per-DB dedup checks evaluated
+    /// inside the actor (a check-then-enqueue done by the caller would race
+    /// concurrent triggers). A conflicting [`BatchDedup`] drops only the
+    /// requests whose `index_db` matches it; everything else still enqueues.
     EnqueueBatch {
         requests: Vec<JobRequest>,
-        dedup: Option<BatchDedup>,
-        reply: oneshot::Sender<ApiResult<Option<Vec<JobModel>>>>,
+        dedups: Vec<BatchDedup>,
+        reply: oneshot::Sender<ApiResult<BatchEnqueueResult>>,
     },
     GetQueueStatus {
         reply: oneshot::Sender<ApiResult<QueueStatusModel>>,
@@ -402,35 +421,39 @@ impl Actor for JobQueueActor {
             }
             JobQueueMessage::EnqueueBatch {
                 requests,
-                dedup,
+                dedups,
                 reply,
             } => {
                 if state.shutting_down {
                     let _ = reply.send(Err(ApiError::internal("Job queue is shutting down")));
                     return Ok(());
                 }
-                let conflict = dedup.as_ref().is_some_and(|dedup| {
-                    state
+                let mut skipped_dbs: Vec<String> = Vec::new();
+                for dedup in &dedups {
+                    let conflict = state
                         .running_job
                         .iter()
                         .chain(state.queue.iter())
                         .any(|job| {
                             job.tag.as_deref() == Some(dedup.tag.as_str())
                                 && job.index_db == dedup.index_db
-                        })
-                });
-                if conflict {
-                    let _ = reply.send(Ok(None));
-                } else {
-                    let models = requests
-                        .into_iter()
-                        .map(|request| push_job(state, request))
-                        .collect();
-                    if state.running_job.is_none() {
-                        start_next_job(state).await;
+                        });
+                    if conflict && !skipped_dbs.contains(&dedup.index_db) {
+                        skipped_dbs.push(dedup.index_db.clone());
                     }
-                    let _ = reply.send(Ok(Some(models)));
                 }
+                let enqueued = requests
+                    .into_iter()
+                    .filter(|request| !skipped_dbs.contains(&request.index_db))
+                    .map(|request| push_job(state, request))
+                    .collect();
+                if state.running_job.is_none() {
+                    start_next_job(state).await;
+                }
+                let _ = reply.send(Ok(BatchEnqueueResult {
+                    enqueued,
+                    skipped_dbs,
+                }));
             }
             JobQueueMessage::GetQueueStatus { reply } => {
                 let mut queue = Vec::new();
@@ -1269,18 +1292,19 @@ pub(crate) async fn enqueue_job(request: JobRequest) -> ApiResult<JobModel> {
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
 }
 
-/// Enqueues all `requests` atomically, unless `dedup` matches a queued or
-/// running job — in which case nothing is enqueued and `None` is returned.
-pub(crate) async fn enqueue_jobs_unless_tagged(
+/// Enqueues all `requests` in one atomic step, minus the requests belonging to
+/// an index DB whose [`BatchDedup`] matches a queued or running job. The reply
+/// names the DBs that were dropped that way.
+pub(crate) async fn enqueue_jobs_with_dedup(
     requests: Vec<JobRequest>,
-    dedup: Option<BatchDedup>,
-) -> ApiResult<Option<Vec<JobModel>>> {
+    dedups: Vec<BatchDedup>,
+) -> ApiResult<BatchEnqueueResult> {
     let queue = ensure_job_queue().await?;
     let (reply, rx) = oneshot::channel();
     queue
         .send_message(JobQueueMessage::EnqueueBatch {
             requests,
-            dedup,
+            dedups,
             reply,
         })
         .map_err(|_| ApiError::internal("Job queue unavailable"))?;
@@ -1755,21 +1779,28 @@ mod tests {
     async fn enqueue_batch_on(
         queue: &ActorRef<JobQueueMessage>,
         requests: Vec<JobRequest>,
-        dedup: Option<BatchDedup>,
-    ) -> Option<Vec<JobModel>> {
+        dedups: Vec<BatchDedup>,
+    ) -> BatchEnqueueResult {
         let (reply, rx) = oneshot::channel();
         queue
             .send_message(JobQueueMessage::EnqueueBatch {
                 requests,
-                dedup,
+                dedups,
                 reply,
             })
             .unwrap();
         rx.await.unwrap().unwrap()
     }
 
+    fn cron_dedup(index_db: &str) -> BatchDedup {
+        BatchDedup {
+            tag: "cronjob".to_string(),
+            index_db: index_db.to_string(),
+        }
+    }
+
     // The batch dedup must be atomic in the actor: while a tagged job for the
-    // same index DB is queued or running, the whole batch is skipped; other
+    // same index DB is queued or running, that DB's requests are skipped; other
     // index DBs are unaffected; once the tagged jobs are gone the batch goes
     // through.
     #[tokio::test]
@@ -1786,42 +1817,119 @@ mod tests {
             log_id: None,
             tag: Some("cronjob".to_string()),
         };
-        let dedup = || {
-            Some(BatchDedup {
-                tag: "cronjob".to_string(),
-                index_db: "default".to_string(),
-            })
-        };
 
-        let first = enqueue_batch_on(&queue, vec![job.clone(), job.clone()], dedup()).await;
-        assert_eq!(first.map(|jobs| jobs.len()), Some(2));
+        let first = enqueue_batch_on(
+            &queue,
+            vec![job.clone(), job.clone()],
+            vec![cron_dedup("default")],
+        )
+        .await;
+        assert_eq!(first.enqueued.len(), 2);
+        assert!(first.skipped_dbs.is_empty());
 
         // One of the batch is running, one queued: a second batch is skipped.
-        let second = enqueue_batch_on(&queue, vec![job.clone()], dedup()).await;
-        assert!(second.is_none());
+        let second = enqueue_batch_on(&queue, vec![job.clone()], vec![cron_dedup("default")]).await;
+        assert!(second.enqueued.is_empty());
+        assert_eq!(second.skipped_dbs, ["default"]);
+        assert!(second.was_skipped("default"));
 
         // A different index DB does not collide with the dedup condition.
         let other_db = JobRequest {
             index_db: "other".to_string(),
             ..job.clone()
         };
-        let other = enqueue_batch_on(
-            &queue,
-            vec![other_db],
-            Some(BatchDedup {
-                tag: "cronjob".to_string(),
-                index_db: "other".to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(other.map(|jobs| jobs.len()), Some(1));
+        let other = enqueue_batch_on(&queue, vec![other_db], vec![cron_dedup("other")]).await;
+        assert_eq!(other.enqueued.len(), 1);
+        assert!(other.skipped_dbs.is_empty());
 
         // After all tagged jobs have drained, the batch enqueues again.
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
         let status = status_on(&queue).await;
         assert!(status.queue.is_empty(), "queue should be idle: {status:?}");
-        let third = enqueue_batch_on(&queue, vec![job.clone()], dedup()).await;
-        assert_eq!(third.map(|jobs| jobs.len()), Some(1));
+        let third = enqueue_batch_on(&queue, vec![job.clone()], vec![cron_dedup("default")]).await;
+        assert_eq!(third.enqueued.len(), 1);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The merged cron batch carries several DBs at once: a conflict on one of
+    // them drops only that DB's requests, the rest of the batch still enqueues
+    // atomically, and the reply names the skipped DB.
+    #[tokio::test]
+    async fn batch_enqueue_drops_only_the_conflicting_db() {
+        let (queue, handle) = spawn_test_queue().await;
+        let job = |index_db: &str| JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: index_db.to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            // Unparseable tag: a 200ms sleep, and the cron dedup tag.
+            tag: Some("cronjob".to_string()),
+        };
+
+        // Occupy "one" with a tagged job (running plus one queued behind it).
+        let first = enqueue_batch_on(
+            &queue,
+            vec![job("one"), job("one")],
+            vec![cron_dedup("one")],
+        )
+        .await;
+        assert_eq!(first.enqueued.len(), 2);
+
+        // A merged batch for both DBs: "one" conflicts, "two" does not.
+        let merged = enqueue_batch_on(
+            &queue,
+            vec![job("one"), job("two"), job("one"), job("two")],
+            vec![cron_dedup("one"), cron_dedup("two")],
+        )
+        .await;
+        assert_eq!(merged.skipped_dbs, ["one"]);
+        let dbs: Vec<&str> = merged
+            .enqueued
+            .iter()
+            .map(|job| job.index_db.as_str())
+            .collect();
+        assert_eq!(dbs, ["two", "two"], "only the conflicting DB is dropped");
+
+        let status = status_on(&queue).await;
+        assert_eq!(
+            status.queue.len(),
+            4,
+            "two pre-existing + two newly enqueued: {status:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // With no dedup entries at all a batch is unconditional, and an empty
+    // request list is a well-formed no-op rather than a skip.
+    #[tokio::test]
+    async fn batch_enqueue_without_dedups_never_skips() {
+        let (queue, handle) = spawn_test_queue().await;
+        let job = JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: "default".to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some("cronjob".to_string()),
+        };
+        let first = enqueue_batch_on(&queue, vec![job.clone()], Vec::new()).await;
+        assert_eq!(first.enqueued.len(), 1);
+        let second = enqueue_batch_on(&queue, vec![job.clone()], Vec::new()).await;
+        assert_eq!(second.enqueued.len(), 1);
+        assert!(second.skipped_dbs.is_empty());
+
+        let empty = enqueue_batch_on(&queue, Vec::new(), vec![cron_dedup("nothing")]).await;
+        assert!(empty.enqueued.is_empty());
+        assert!(empty.skipped_dbs.is_empty());
 
         queue.stop(None);
         handle.await.unwrap();

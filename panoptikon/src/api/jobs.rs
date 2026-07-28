@@ -22,7 +22,7 @@ use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::jobs::queue::{
     BatchDedup, JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs,
-    cancel_running_job, enqueue_job, enqueue_jobs_unless_tagged, get_queue_status,
+    cancel_running_job, enqueue_job, enqueue_jobs_with_dedup, get_queue_status,
 };
 
 #[derive(Deserialize, IntoParams)]
@@ -717,11 +717,11 @@ async fn enqueue_reconcile_deduped(index_db: &str, user_data_db: &str) -> Result
         tag: RECONCILE_JOB_TAG.to_string(),
         index_db: index_db.to_string(),
     };
-    match enqueue_jobs_unless_tagged(vec![request], Some(dedup)).await? {
-        Some(_) => Ok("Reconcile job enqueued.".to_string()),
-        None => {
-            Ok("A reconcile job for this database is already queued or running.".to_string())
-        }
+    let result = enqueue_jobs_with_dedup(vec![request], vec![dedup]).await?;
+    if result.was_skipped(index_db) {
+        Ok("A reconcile job for this database is already queued or running.".to_string())
+    } else {
+        Ok("Reconcile job enqueued.".to_string())
     }
 }
 
