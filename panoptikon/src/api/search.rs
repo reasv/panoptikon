@@ -379,7 +379,7 @@ pub(crate) struct SearchStats {
     path = "/api/search/tags",
     tag = "search",
     summary = "Search tag names for autocompletion",
-    description = "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nThe tags are returned in descending order of the number of items tagged.",
+    description = "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nMatching is a plain substring test, so there is no notion of a closer or \nweaker match. When more tags match than `limit` allows, the most-used ones \nare returned: results are both selected and ordered by the number of items \ntagged, descending, with ties broken by namespace then name.",
     params(DbQueryParams, TagSearchQuery),
     responses(
         (status = 200, description = "Tag autocomplete results", body = TagSearchResults)
@@ -750,9 +750,9 @@ async fn load_tags(
     name: &str,
     limit: i64,
 ) -> ApiResult<Vec<(String, String, i64)>> {
-    let mut tags = find_tags(conn, name, limit).await?;
-    tags.sort_by(|a, b| b.2.cmp(&a.2));
-    Ok(tags)
+    // `find_tags` selects and orders by item count in SQL; re-sorting here
+    // would only add a second place where the order is decided.
+    find_tags(conn, name, limit).await
 }
 
 async fn load_top_tags(
@@ -1483,11 +1483,12 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            -- item_id mirrors item_data: 10 -> item 100, 11 -> item 101.
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
             VALUES
-                (10, 2, 0.6),
-                (10, 1, 0.9),
-                (11, 1, 0.8)
+                (10, 2, 100, 0.6),
+                (10, 1, 100, 0.9),
+                (11, 1, 101, 0.8)
             "#,
         )
         .execute(&mut dbs.index_conn)
@@ -1610,10 +1611,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            -- item_data 11 belongs to item 2.
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
             VALUES
-                (11, 1, 0.4),
-                (11, 2, 0.8)
+                (11, 1, 2, 0.4),
+                (11, 2, 2, 0.8)
             "#,
         )
         .execute(&mut dbs.index_conn)

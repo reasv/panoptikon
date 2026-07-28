@@ -1,11 +1,24 @@
 use sqlx::Row;
-use std::collections::HashMap;
 
 use crate::api_error::ApiError;
 use crate::db::prefix::prefix_upper_bound;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+/// Tags whose name contains `name`, most-used first.
+///
+/// Substring matching is binary — a tag either contains the string or does
+/// not — so there is no relevance signal to order by, and the previous
+/// implementation ordered by nothing: it took whichever `limit` rows the scan
+/// reached first (rowid, i.e. roughly the order tags were first encountered)
+/// and only then counted them. Item count is the one meaningful tiebreak
+/// available, and it answers what the caller wants to know anyway: how many
+/// results this tag would return.
+///
+/// Counting distinct `item_id` rather than rows matters because an item is
+/// tagged once per setter: with two taggers agreeing, a row count would report
+/// double. The denormalised `tags_items.item_id` keeps that exact count a
+/// single walk of `idx_tags_items_tag_item` instead of a join to `item_data`.
 pub(crate) async fn find_tags(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
@@ -13,9 +26,14 @@ pub(crate) async fn find_tags(
 ) -> ApiResult<Vec<(String, String, i64)>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, namespace, name
+        SELECT tags.namespace AS namespace, tags.name AS name,
+               COUNT(DISTINCT tags_items.item_id) AS count
         FROM tags
-        WHERE name LIKE ?
+        JOIN tags_items
+            ON tags_items.tag_id = tags.id
+        WHERE tags.name LIKE ?
+        GROUP BY tags.id
+        ORDER BY count DESC, tags.namespace, tags.name
         LIMIT ?
         "#,
     )
@@ -28,17 +46,8 @@ pub(crate) async fn find_tags(
         ApiError::internal("Failed to get tags")
     })?;
 
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = Vec::with_capacity(rows.len());
-    let mut id_to_tag = HashMap::with_capacity(rows.len());
+    let mut results = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.try_get("id").map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to get tags")
-        })?;
         let namespace: String = row.try_get("namespace").map_err(|err| {
             tracing::error!(error = %err, "failed to read tag namespace");
             ApiError::internal("Failed to get tags")
@@ -47,48 +56,11 @@ pub(crate) async fn find_tags(
             tracing::error!(error = %err, "failed to read tag name");
             ApiError::internal("Failed to get tags")
         })?;
-        ids.push(id);
-        id_to_tag.insert(id, (namespace, tag_name));
-    }
-
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        r#"
-        SELECT tags_items.tag_id AS tag_id, COUNT(DISTINCT item_data.item_id) AS count
-        FROM tags_items
-        JOIN item_data
-            ON tags_items.item_data_id = item_data.id
-        WHERE tags_items.tag_id IN ({placeholders})
-        GROUP BY tags_items.tag_id
-        "#
-    );
-
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    for tag_id in &ids {
-        query = query.bind(tag_id);
-    }
-
-    let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to query tag frequencies");
-        ApiError::internal("Failed to get tags")
-    })?;
-
-    let mut results = Vec::with_capacity(rows.len());
-    for row in rows {
-        let tag_id: i64 = row.try_get("tag_id").map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to get tags")
-        })?;
         let count: i64 = row.try_get("count").map_err(|err| {
             tracing::error!(error = %err, "failed to read tag count");
             ApiError::internal("Failed to get tags")
         })?;
-        if let Some((namespace, tag_name)) = id_to_tag.get(&tag_id) {
-            results.push((namespace.clone(), tag_name.clone(), count));
-        }
+        results.push((namespace, tag_name, count));
     }
 
     Ok(results)
@@ -390,13 +362,16 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            -- item_id mirrors item_data: 10 -> item 100, 11 -> 101, 12 -> 100.
+            -- Note 10 and 12 are two setters on the SAME item, so tag 1 covers
+            -- two distinct items despite having three rows.
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
             VALUES
-                (10, 1, 0.9),
-                (11, 1, 0.7),
-                (12, 1, 0.8),
-                (10, 2, 0.6),
-                (11, 3, 0.5)
+                (10, 1, 100, 0.9),
+                (11, 1, 101, 0.7),
+                (12, 1, 100, 0.8),
+                (10, 2, 100, 0.6),
+                (11, 3, 101, 0.5)
             "#,
         )
         .execute(&mut *conn)
@@ -487,8 +462,8 @@ mod tests {
         // One application each, so all three tie at count 1.
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
-            VALUES (10, 33, 1.0), (10, 32, 1.0), (10, 31, 1.0)
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
+            VALUES (10, 33, 100, 1.0), (10, 32, 100, 1.0), (10, 31, 100, 1.0)
             "#,
         )
         .execute(&mut dbs.index_conn)
@@ -521,6 +496,84 @@ mod tests {
         );
         // The un-tied winner still leads.
         assert_eq!(first[0], ("ns".to_string(), "cat".to_string(), 3));
+    }
+
+    // Ensures matches are SELECTED by item count, not just ordered by it once
+    // chosen. The popular tag is given the highest id so it sorts last by
+    // rowid — the order the previous implementation took its `limit` rows in,
+    // which would have dropped it.
+    #[tokio::test]
+    async fn find_tags_selects_the_most_used_matches() {
+        let mut dbs = setup_tag_db().await;
+        // Ten more items, so counts can exceed the fixture's two.
+        for item in 200..210_i64 {
+            sqlx::query(
+                r#"
+                INSERT INTO items (id, sha256, md5, type, time_added)
+                VALUES (?, ?, 'md5', 'image/png', '2024-01-01T00:00:00')
+                "#,
+            )
+            .bind(item)
+            .bind(format!("sha_{item}"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+                VALUES (?, ?, 1, 'tags', 0, 1)
+                "#,
+            )
+            .bind(item)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        // Three rare "cat*" tags with low ids, one popular one with a high id.
+        sqlx::query(
+            r#"
+            INSERT INTO tags (id, namespace, name)
+            VALUES (40, 'ns', 'cat_a'), (41, 'ns', 'cat_b'), (42, 'ns', 'cat_c'),
+                   (99, 'ns', 'cat_popular')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        for item in 200..210_i64 {
+            sqlx::query(
+                "INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence) VALUES (?, 99, ?, 1.0)",
+            )
+            .bind(item)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        for (tag, item) in [(40_i64, 200_i64), (41, 201), (42, 202)] {
+            sqlx::query(
+                "INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence) VALUES (?, ?, ?, 1.0)",
+            )
+            .bind(item)
+            .bind(tag)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+
+        let tags = find_tags(&mut dbs.index_conn, "cat", 2).await.unwrap();
+
+        // 'cat_popular' (10 items) must win despite sorting last by rowid;
+        // 'cat' from the fixture (2 items) takes the remaining slot.
+        assert_eq!(
+            tags,
+            vec![
+                ("ns".to_string(), "cat_popular".to_string(), 10),
+                ("ns".to_string(), "cat".to_string(), 2),
+            ]
+        );
     }
 
     // Ensures the setter filter still selects the same rows now that the
@@ -583,8 +636,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
-            VALUES (10, 20, 1.0), (10, 21, 1.0), (10, 22, 1.0), (10, 23, 1.0)
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
+            VALUES (10, 20, 100, 1.0), (10, 21, 100, 1.0), (10, 22, 100, 1.0), (10, 23, 100, 1.0)
             "#,
         )
         .execute(&mut dbs.index_conn)
