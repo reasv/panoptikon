@@ -1,6 +1,76 @@
 # Job-boundary scheduling: deferred maintenance, model continuity, cross-DB cron ordering
 
 Status: fully implemented, all four phases (2026-07-28). Server: 43f0fab..4c05001; UI: dfe42ae, 63f3726.
+Follow-up package (see final section): recount gating + durable tags-dirty
+marker, back-of-queue maintenance placement, manual maintenance trigger —
+designed 2026-07-28, in implementation.
+
+## Follow-up package: recount gating, durable marker, placement, manual trigger
+
+Decided after the initial rollout; supersedes two earlier judgments.
+
+### F1. Back-of-queue maintenance placement
+
+Synthesized `DbMaintenance` jobs move from `push_front` to `push_back`.
+Rationale: maintenance can run minutes (VACUUM, and the recount — measured at
+multi-second on an 85k-item DB, scaling with `tags_items`; DBs exist at 21M
+items), so front placement inserts CPU/IO work between GPU jobs and defeats
+model continuity via the 60s TTL. Back placement keeps the GPU pipeline
+uninterrupted; all maintenance accumulates at the tail and runs after the last
+extraction. Costs accepted: stats/counts/WAL truncation for early-finishing
+DBs wait until drain end. Unchanged: the cancel-suppression flag (a drained
+queue still starts maintenance immediately), the skip-over-maintenance rule in
+the unload decision (no longer load-bearing; kept as belt-and-braces), the
+synthesis conditions.
+
+### F2. `tags_changed` owed flag + durable tags-dirty marker
+
+The recount is the one maintenance step whose staleness is user-visible
+(autocomplete ranking/counts), and it is too expensive to run unconditionally
+per drain. It becomes gated — but gating on an in-memory flag alone would
+break the current accidental healing property (every scan owes wrote_data, so
+every cron drain recounts, healing any lost debt within one cycle). Hence a
+durable marker with these mechanics:
+
+- **New single-row marker table** in the index DB (new migration; no kv table
+  exists). Semantics: "tags_items may have changed since the last successful
+  recount".
+- **Set, writer-side, immediate — tag writes**: inside the
+  `WriteTagsOutput` handler's transaction, on the first tag write, latched in
+  writer-actor state so per-tag writes cost nothing (writer respawn ⇒ one
+  redundant upsert per session). Jobs are not atomic: a shutdown mid-tagging
+  job has already committed tags, so the marker cannot depend on job
+  completion.
+- **Set, writer-side, immediate — continuous scan**: `DeleteItemIfOrphan`
+  sets the marker when it actually deleted (item deletion cascades to
+  `tags_items`; continuous scan is not a queue job and has no boundary).
+- **Set, boundary-time — job deletions**: `ChangeSummary` gains
+  `tags_changed` (tag-output extraction jobs with output, any job reporting
+  deletions; pessimistic true on cancel for those types). Recording it at the
+  boundary fires a set-marker writer message. Job-end deletes are near-atomic,
+  so the boundary window is acceptable here.
+- **Gate**: the maintenance job recounts iff `owed.tags_changed || marker`.
+  ANALYZE/checkpoint stay gated on `wrote_data`; vacuum unchanged.
+- **Clear**: only a successful recount clears the marker — the
+  `RecountTagItems` handler clears the row in the same transaction that
+  completes the rebuild, and resets the writer latch.
+
+Loss paths closed: shutdown (marker survives), cancelled maintenance (only
+success clears), suppressed cancel (flags kept anyway). A pure no-deletion
+rescan drain now skips the recount entirely.
+
+### F3. Manual maintenance trigger
+
+- **API**: `POST /api/jobs/maintenance` with the standard per-DB params.
+  Enqueues a `DbMaintenance` job with all flags set (recount runs
+  unconditionally; vacuum still freelist-gated so a misclick cannot trigger a
+  pointless multi-minute rewrite). Deduped: skipped when a DbMaintenance job
+  for that DB is already queued or running. Back-of-queue like all
+  maintenance.
+- **UI**: a compact "Database Maintenance" card in the scan page's Config
+  stack — one-line description (recount tags, refresh statistics, reclaim
+  space), a "Run Now" button, room to later surface last-run time or the
+  marker state.
 
 ## Problem
 
