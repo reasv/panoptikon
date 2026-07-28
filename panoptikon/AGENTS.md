@@ -115,7 +115,8 @@ Behavior (important)
   - `POST /api/jobs/data/extraction` validates models and resolves effective `batch_size`/`threshold` at enqueue time (mirrors Python): a bad inference ID fails the request, and queue status shows the resolved values.
   - Threshold semantics mirror Python: a zero threshold anywhere in the chain (request, job settings) means "unset" and falls back to the model default; a still-unset/zero final value is omitted from inference payloads so the server-side fallback (e.g. mcut for taggers) applies.
   - Extraction input handlers render PDFs natively via the shared pdfium binding (all pages, 2x scale) and HTML via the shared headless-browser screenshot path — the same code the scan pipeline uses for thumbnails. Render failures (including pdfium/browser not installed) fail the item so it is retried next run; they never write a placeholder.
-  - Image inputs get a header-level readability check before upload (mirrors Python `is_image_readable`); unreadable files fail the item instead of reaching the inference server where they could fail a coalesced batch.
+  - Image inputs get a **full decode** before upload (not header-only) so pixel-corrupt files soft-fail as `ApiError::input_media` before coalesced inference. Format/decode failures are `ApiError::input_media` (logged with `path` + `sha256`, placeholder with one write retry + short backoff, soft-succeed when placeholder lands). Open/read I/O failures are **not** soft-failed (`ApiError::internal`) so transient mount/NFS issues do not permanent-skip the item. If both placeholder attempts fail after input_media, the error is counted as **systemic** (not input-media) and the item task returns `Err`, so a DB/write outage cannot soft-complete as pure corrupt media. When every attempted item fails only on input media (and placeholders landed), the job completes with a warning instead of "check the inference server". Job-level total failure is reserved for all-failed runs that include at least one non-input (inference/output/placeholder-write) error. Classification is pure (`classify_extraction_job_failure`); unit + DB integration tests cover it.
+  - Every extraction item failure log includes `path` and `sha256`.
   - Sliced image inputs are re-encoded in their source format (PNG stays PNG with alpha; unknown formats fall back to PNG); JPEG slices keep the quality-85 encoder. PDF pages and HTML screenshots are sliced using their own rendered dimensions, other frames use the item's stored dimensions.
   - Tag output text entries keep Python's ordering: namespaces in first-appearance order, tags confidence-sorted within each namespace. Empty `metadata` objects produce no metadata text entry.
   - `data_log` start and end times use the same local-time format (`db::extraction_write::current_iso_timestamp`), and incomplete-job cleanup runs before the remaining count so `[jobs].atomic_extraction_jobs` cleanup is reflected in it.
@@ -127,6 +128,16 @@ Behavior (important)
   - `PUT /api/jobs/config` rejects unparseable `cron_schedule` strings with 400 (Python accepts them and fails silently in the ticker). `GET /api/jobs/cronjob/schedule` (additive, not in Python) reports enabled/valid/next_run/last_run.
   - Embedding-model preload (`preload_embedding_models`) runs on the same minute tick, mirroring Python: existing text-embedding/clip setters (excluding `tclip/`) are kept loaded under cache key `preload[<index_db>]` with 1h TTL and renewal ~2 minutes before expiry; disabling clears the inference cache once.
   - System config parses `job_filters` and `filescan_filter` as PQL objects; invalid PQL in config fails to load (mirrors Python).
+- Accelerator report (`panoptikon/src/accelerator_report.rs`): at server and
+  `inferio` startup (and via `panoptikon accelerator`) we always log the
+  resolved inference **backend** (`cpu` / `cuda` / `rocm`, extensible) and any
+  detected GPU names. Backend priority: managed-venv sentinel →
+  `PANOPTIKON_ACCELERATOR` (Nix wrap) → config/`auto` host probes. GPU stacks
+  are pluggable probes (NVIDIA + AMD/ROCm today; add Intel XPU etc. later).
+  ROCm device names prefer `rocm-smi`; fallback `rocminfo` keeps only agents
+  with `Device Type: GPU` (CPU agents also have a Marketing Name and must not
+  be listed as devices). **CPU** backend is logged as using CPU (no warning).
+  A **GPU** backend with no device name yields a **warning**, not a failure.
 - Accelerator env (`panoptikon/src/accelerator_env.rs`): workers get host
   HIP/HSA on `LD_LIBRARY_PATH` only when the **installed** accelerator is
   `rocm` — read from the setup sentinel's `extra=` line
