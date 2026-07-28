@@ -65,6 +65,7 @@ pub(crate) struct ModelMetadata {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 struct JobInputData {
     file_id: i64,
     item_id: i64,
@@ -107,6 +108,11 @@ struct JobCounters {
     other_files: i64,
     total_segments: i64,
     errors: i64,
+    /// Subset of `errors` caused by unreadable/corrupt source media (input
+    /// path), not by inference. When every attempted item fails but all
+    /// failures are input-side, the job completes with errors rather than
+    /// being treated as a systemic inference outage.
+    input_errors: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
 }
@@ -335,8 +341,13 @@ async fn run_extraction_job_inner(
                 total_remaining,
             )
             .await;
+            // process_item logs path/sha256 on every failure; soft input-media
+            // failures return Ok after counting the error.
             if let Err(err) = result {
-                tracing::error!(error = ?err, "extraction item failed");
+                tracing::error!(
+                    error = %err.detail(),
+                    "extraction item task returned error"
+                );
             }
         });
     }
@@ -353,13 +364,14 @@ async fn run_extraction_job_inner(
         remaining
     };
 
-    let (final_update, total_failure) = {
+    let (final_update, failure_kind) = {
         let guard = counters.lock().await;
-        // Every attempted item failing means a systemic cause (inference
-        // server down, model broken), not per-item bad data: surface it as a
-        // job failure instead of a "completed" job that did nothing. The
-        // log row is left unfinished so the cleanup pass marks it incomplete.
-        let total_failure = guard.processed > 0 && guard.errors >= guard.processed;
+        let failure_kind = classify_extraction_job_failure(
+            guard.processed,
+            guard.errors,
+            guard.input_errors,
+        );
+        let total_failure = matches!(failure_kind, ExtractionJobFailureKind::Systemic);
         let update = DataLogUpdate {
             image_files: guard.image_files,
             video_files: guard.video_files,
@@ -378,9 +390,12 @@ async fn run_extraction_job_inner(
             data_load_work_secs = guard.data_load_time.work_secs(),
             inference_busy_secs = guard.inference_time.busy_secs(),
             inference_work_secs = guard.inference_time.work_secs(),
+            errors = guard.errors,
+            input_errors = guard.input_errors,
+            ?failure_kind,
             "extraction job phase timing"
         );
-        (update, total_failure)
+        (update, failure_kind)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -394,11 +409,20 @@ async fn run_extraction_job_inner(
         .unload_model_all(&model.setter_name, CACHE_KEY)
         .await;
 
-    if total_failure {
-        return Err(ApiError::internal(format!(
-            "All {} attempted items failed; check the inference server",
-            final_update.errors
-        )));
+    match failure_kind {
+        ExtractionJobFailureKind::Systemic => {
+            return Err(ApiError::internal(format!(
+                "All {} attempted items failed; check the inference server",
+                final_update.errors
+            )));
+        }
+        ExtractionJobFailureKind::InputMediaOnly => {
+            tracing::warn!(
+                errors = final_update.errors,
+                "extraction completed: every attempted item failed on input media (corrupt/unreadable files); not treating as inference outage"
+            );
+        }
+        ExtractionJobFailureKind::None => {}
     }
     Ok(())
 }
@@ -457,12 +481,36 @@ async fn process_item(
     total_remaining: i64,
 ) -> ApiResult<()> {
     let item_type = item.item_type.clone();
+    let path = item.path.clone();
+    let sha256 = item.sha256.clone();
     let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item).await;
     drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
+            tracing::error!(
+                error = %err.detail(),
+                path = %path,
+                sha256 = %sha256,
+                input_media = err.is_input_media(),
+                "extraction item failed"
+            );
+            // Soft-fail unreadable/corrupt media: write a placeholder so the
+            // item is not re-selected every cron run, count the error, continue.
+            if err.is_input_media() {
+                return soft_fail_input_media(
+                    index_db,
+                    model,
+                    job_id,
+                    &path,
+                    &sha256,
+                    &item_type,
+                    counters,
+                    total_remaining,
+                )
+                .await;
+            }
             finalize_item(
                 index_db,
                 job_id,
@@ -470,6 +518,7 @@ async fn process_item(
                 0,
                 false,
                 true,
+                false,
                 counters,
                 total_remaining,
             )
@@ -481,6 +530,14 @@ async fn process_item(
     if prepared.inputs.is_empty() {
         let result =
             output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
+        if let Err(ref err) = result {
+            tracing::error!(
+                error = %err.detail(),
+                path = %prepared.item.path,
+                sha256 = %prepared.item.sha256,
+                "extraction item failed"
+            );
+        }
         finalize_item(
             index_db,
             job_id,
@@ -488,6 +545,7 @@ async fn process_item(
             0,
             result.is_ok(),
             result.is_err(),
+            false,
             counters,
             total_remaining,
         )
@@ -531,6 +589,12 @@ async fn process_item(
         Ok(outputs) => outputs,
         Err(err) => {
             let api_err = ApiError::internal(format!("Inference failed: {err}"));
+            tracing::error!(
+                error = %api_err.detail(),
+                path = %prepared.item.path,
+                sha256 = %prepared.item.sha256,
+                "extraction item failed"
+            );
             finalize_item(
                 index_db,
                 job_id,
@@ -538,6 +602,7 @@ async fn process_item(
                 segments,
                 false,
                 true,
+                false,
                 counters,
                 total_remaining,
             )
@@ -549,6 +614,14 @@ async fn process_item(
     let result =
         output_handlers::handle_outputs(index_db, model, job_id, prepared.item.clone(), outputs)
             .await;
+    if let Err(ref err) = result {
+        tracing::error!(
+            error = %err.detail(),
+            path = %prepared.item.path,
+            sha256 = %prepared.item.sha256,
+            "extraction item failed"
+        );
+    }
     finalize_item(
         index_db,
         job_id,
@@ -556,6 +629,7 @@ async fn process_item(
         segments,
         result.is_ok(),
         result.is_err(),
+        false,
         counters,
         total_remaining,
     )
@@ -642,6 +716,147 @@ fn merge_outputs(first: PredictOutput, second: PredictOutput) -> anyhow::Result<
     }
 }
 
+/// Soft-fail path for unreadable/corrupt source media: write a placeholder
+/// (retry once on write failure), count as an input-media error, and continue
+/// the job. Returns `Ok(())` only when the placeholder lands so the item is
+/// not re-selected every cron. If both write attempts fail, the failure is
+/// counted as **systemic** (not input-media) so a DB/write outage cannot soft-
+/// complete as "all corrupt media"; `Err` is returned so the failure is not silent.
+async fn soft_fail_input_media(
+    index_db: &str,
+    model: &ModelMetadata,
+    job_id: i64,
+    path: &str,
+    sha256: &str,
+    item_type: &str,
+    counters: Arc<Mutex<JobCounters>>,
+    total_remaining: i64,
+) -> ApiResult<()> {
+    // prepare_item consumed `item`; placeholder writer keys on sha256.
+    let placeholder_item = JobInputData {
+        path: path.to_string(),
+        sha256: sha256.to_string(),
+        item_type: item_type.to_string(),
+        ..Default::default()
+    };
+
+    let mut last_ph_err: Option<ApiError> = None;
+    for attempt in 0..2 {
+        match output_handlers::write_placeholder(index_db, model, job_id, &placeholder_item).await
+        {
+            Ok(_) => {
+                finalize_item(
+                    index_db,
+                    job_id,
+                    item_type,
+                    0,
+                    false,
+                    true,
+                    true,
+                    counters,
+                    total_remaining,
+                )
+                .await;
+                return Ok(());
+            }
+            Err(ph_err) => {
+                tracing::error!(
+                    error = %ph_err.detail(),
+                    path = %path,
+                    sha256 = %sha256,
+                    attempt,
+                    "failed to write placeholder after input media error"
+                );
+                last_ph_err = Some(ph_err);
+                // Brief backoff before the second attempt (writer contention / SQLITE_BUSY).
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    // Placeholder never landed: count as systemic (is_input_error = false) so
+    // a write/DB outage cannot soft-complete as InputMediaOnly. Surface Err.
+    finalize_item(
+        index_db,
+        job_id,
+        item_type,
+        0,
+        false,
+        true,
+        false,
+        counters,
+        total_remaining,
+    )
+    .await;
+    Err(last_ph_err.unwrap_or_else(|| {
+        ApiError::internal("Failed to write placeholder after input media error")
+    }))
+}
+
+/// How the extraction job should finish after all items have been attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractionJobFailureKind {
+    /// Not a total failure (successes, or nothing processed).
+    None,
+    /// Every attempted item failed, all as input-media → soft complete.
+    InputMediaOnly,
+    /// Every attempted item failed, at least one non-input → hard fail.
+    Systemic,
+}
+
+/// Classifies job-wide failure from aggregate counters.
+///
+/// - Soft-fail corrupt media increments both `errors` and `input_errors`.
+/// - Inference/output failures increment only `errors`.
+/// - `input_errors` is always ≤ `errors` in normal operation.
+fn classify_extraction_job_failure(
+    processed: i64,
+    errors: i64,
+    input_errors: i64,
+) -> ExtractionJobFailureKind {
+    let all_failed = processed > 0 && errors >= processed;
+    if !all_failed {
+        return ExtractionJobFailureKind::None;
+    }
+    if input_errors == errors {
+        ExtractionJobFailureKind::InputMediaOnly
+    } else {
+        // input_errors < errors (mixed), or inconsistent input_errors > errors
+        ExtractionJobFailureKind::Systemic
+    }
+}
+
+impl JobCounters {
+    /// Apply one item's outcome to in-memory job counters (no I/O).
+    fn record_item(
+        &mut self,
+        item_type: &str,
+        segments: i64,
+        count_file: bool,
+        is_error: bool,
+        is_input_error: bool,
+    ) {
+        self.processed += 1;
+        self.total_segments += segments;
+        if count_file {
+            if item_type.starts_with("video") {
+                self.video_files += 1;
+            } else if item_type.starts_with("image") {
+                self.image_files += 1;
+            } else {
+                self.other_files += 1;
+            }
+        } else if is_error {
+            self.errors += 1;
+            if is_input_error {
+                self.input_errors += 1;
+            }
+        }
+    }
+}
+
 async fn finalize_item(
     index_db: &str,
     job_id: i64,
@@ -649,26 +864,13 @@ async fn finalize_item(
     segments: i64,
     count_file: bool,
     is_error: bool,
+    is_input_error: bool,
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
 ) {
     let update = {
         let mut guard = counters.lock().await;
-        guard.processed += 1;
-        guard.total_segments += segments;
-
-        if count_file {
-            if item_type.starts_with("video") {
-                guard.video_files += 1;
-            } else if item_type.starts_with("image") {
-                guard.image_files += 1;
-            } else {
-                guard.other_files += 1;
-            }
-        } else if is_error {
-            guard.errors += 1;
-        }
-
+        guard.record_item(item_type, segments, count_file, is_error, is_input_error);
         let remaining = total_remaining.saturating_sub(guard.processed);
         DataLogUpdate {
             image_files: guard.image_files,
@@ -1226,5 +1428,295 @@ fn bind_param<'q>(
             })?;
             Ok(query.bind(encoded))
         }
+    }
+}
+
+#[cfg(test)]
+mod soft_fail_tests {
+    use super::*;
+
+    #[test]
+    fn no_items_is_not_a_failure() {
+        assert_eq!(
+            classify_extraction_job_failure(0, 0, 0),
+            ExtractionJobFailureKind::None
+        );
+    }
+
+    #[test]
+    fn partial_success_is_not_total_failure() {
+        // 3 processed, 1 error (input or not) → job completes
+        assert_eq!(
+            classify_extraction_job_failure(3, 1, 1),
+            ExtractionJobFailureKind::None
+        );
+        assert_eq!(
+            classify_extraction_job_failure(3, 1, 0),
+            ExtractionJobFailureKind::None
+        );
+    }
+
+    #[test]
+    fn all_input_media_failures_soft_complete() {
+        assert_eq!(
+            classify_extraction_job_failure(5, 5, 5),
+            ExtractionJobFailureKind::InputMediaOnly
+        );
+        assert_eq!(
+            classify_extraction_job_failure(1, 1, 1),
+            ExtractionJobFailureKind::InputMediaOnly
+        );
+    }
+
+    #[test]
+    fn any_non_input_failure_among_all_failed_is_systemic() {
+        // All failed, but one inference/output error mixed with input media
+        assert_eq!(
+            classify_extraction_job_failure(4, 4, 3),
+            ExtractionJobFailureKind::Systemic
+        );
+        // All inference failures
+        assert_eq!(
+            classify_extraction_job_failure(2, 2, 0),
+            ExtractionJobFailureKind::Systemic
+        );
+    }
+
+    #[test]
+    fn record_item_tracks_input_errors_separately() {
+        let mut c = JobCounters::default();
+        // soft-fail input media: not a "file" success, is_error + is_input_error
+        c.record_item("image/png", 0, false, true, true);
+        assert_eq!(c.processed, 1);
+        assert_eq!(c.errors, 1);
+        assert_eq!(c.input_errors, 1);
+        assert_eq!(c.image_files, 0);
+
+        // inference failure
+        c.record_item("image/jpeg", 2, false, true, false);
+        assert_eq!(c.processed, 2);
+        assert_eq!(c.errors, 2);
+        assert_eq!(c.input_errors, 1);
+        assert_eq!(c.total_segments, 2);
+
+        // successful image
+        c.record_item("image/webp", 1, true, false, false);
+        assert_eq!(c.processed, 3);
+        assert_eq!(c.errors, 2);
+        assert_eq!(c.input_errors, 1);
+        assert_eq!(c.image_files, 1);
+
+        assert_eq!(
+            classify_extraction_job_failure(c.processed, c.errors, c.input_errors),
+            ExtractionJobFailureKind::None
+        );
+    }
+
+    #[test]
+    fn all_recorded_input_errors_classify_as_soft() {
+        let mut c = JobCounters::default();
+        c.record_item("image/gif", 0, false, true, true);
+        c.record_item("image/png", 0, false, true, true);
+        assert_eq!(
+            classify_extraction_job_failure(c.processed, c.errors, c.input_errors),
+            ExtractionJobFailureKind::InputMediaOnly
+        );
+    }
+
+    #[test]
+    fn mixed_recorded_failures_classify_as_systemic() {
+        let mut c = JobCounters::default();
+        c.record_item("image/gif", 0, false, true, true);
+        c.record_item("image/png", 3, false, true, false);
+        assert_eq!(
+            classify_extraction_job_failure(c.processed, c.errors, c.input_errors),
+            ExtractionJobFailureKind::Systemic
+        );
+    }
+
+    fn tagger_model() -> ModelMetadata {
+        ModelMetadata {
+            group: "test".into(),
+            inference_id: "test-tagger".into(),
+            setter_name: "test_tagger".into(),
+            input_handler: "image_frames".into(),
+            input_handler_opts: serde_json::Map::new(),
+            target_entities: vec!["items".into()],
+            output_type: "tags".into(),
+            default_batch_size: 1,
+            default_threshold: None,
+            input_mime_types: vec!["image".into()],
+            skip_processed_items: true,
+            name: None,
+            description: None,
+            link: None,
+        }
+    }
+
+    fn next_db_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{prefix}_{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// End-to-end soft-fail: corrupt file on disk → prepare fails as
+    /// input_media → placeholder lands in the index DB → job counters
+    /// classify as InputMediaOnly.
+    #[tokio::test]
+    async fn soft_fail_corrupt_image_writes_placeholder_row() {
+        use crate::db::migrations::migrate_databases_on_disk;
+        use crate::db::open_index_db_read_no_user_data;
+        use crate::test_utils::test_data_dir;
+        use tokio::sync::Mutex;
+
+        let _env = test_data_dir();
+        let index_db = next_db_name("softfail");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .expect("migrate");
+
+        let media = tempfile::TempDir::new().unwrap();
+        let bad_path = media.path().join("corrupt.png");
+        std::fs::write(&bad_path, b"not-a-real-png").unwrap();
+        let sha256 = "softfail_corrupt_sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Item + data_jobs must exist: write_placeholder joins items/setters and
+        // item_data.job_id FKs to data_jobs.
+        let job_id = {
+            use crate::db::open_index_db_write_no_user_data;
+            let mut conn = open_index_db_write_no_user_data(&index_db)
+                .await
+                .expect("open write");
+            sqlx::query(
+                "INSERT INTO items (id, sha256, md5, type, time_added) VALUES (1, ?, 'md5', 'image/png', '2020-01-01T00:00:00')",
+            )
+            .bind(sha256)
+            .execute(&mut conn)
+            .await
+            .expect("insert item");
+            let row = sqlx::query("INSERT INTO data_jobs (completed) VALUES (0) RETURNING id")
+                .fetch_one(&mut conn)
+                .await
+                .expect("insert data_jobs");
+            use sqlx::Row;
+            row.try_get::<i64, _>("id").expect("job id")
+        };
+
+        let model = tagger_model();
+        // Production jobs upsert the setter before writing outputs.
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+            setter_name: model.setter_name.clone(),
+            reply,
+        })
+        .await
+        .expect("upsert setter");
+
+        let item = JobInputData {
+            path: bad_path.to_string_lossy().into_owned(),
+            sha256: sha256.into(),
+            item_type: "image/png".into(),
+            width: Some(64),
+            height: Some(64),
+            ..Default::default()
+        };
+
+        let prepare_err = input_handlers::prepare_item(&index_db, &model, item.clone())
+            .await
+            .expect_err("corrupt image must fail prepare");
+        assert!(
+            prepare_err.is_input_media(),
+            "prepare should be input_media, got: {}",
+            prepare_err.detail()
+        );
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        soft_fail_input_media(
+            &index_db,
+            &model,
+            job_id,
+            &item.path,
+            &item.sha256,
+            &item.item_type,
+            Arc::clone(&counters),
+            /* total_remaining */ 1,
+        )
+        .await
+        .expect("placeholder write should succeed");
+
+        let guard = counters.lock().await;
+        assert_eq!(guard.processed, 1);
+        assert_eq!(guard.errors, 1);
+        assert_eq!(guard.input_errors, 1);
+        assert_eq!(
+            classify_extraction_job_failure(guard.processed, guard.errors, guard.input_errors),
+            ExtractionJobFailureKind::InputMediaOnly
+        );
+        drop(guard);
+
+        let mut conn = open_index_db_read_no_user_data(&index_db)
+            .await
+            .expect("reopen");
+        let row: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), COALESCE(SUM(is_placeholder), 0)
+            FROM item_data
+            JOIN items ON items.id = item_data.item_id
+            WHERE items.sha256 = ?
+            "#,
+        )
+        .bind(sha256)
+        .fetch_one(&mut conn)
+        .await
+        .expect("query item_data");
+        assert_eq!(row.0, 1, "expected one item_data row");
+        assert_eq!(row.1, 1, "expected is_placeholder=1");
+    }
+
+    /// When the placeholder cannot land (unknown output type → write fails),
+    /// soft_fail counts a systemic error (not input_errors) and returns Err.
+    #[tokio::test]
+    async fn soft_fail_returns_err_when_placeholder_cannot_write() {
+        use crate::db::migrations::migrate_databases_on_disk;
+        use crate::test_utils::test_data_dir;
+        use tokio::sync::Mutex;
+
+        let _env = test_data_dir();
+        let index_db = next_db_name("softfail_noph");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .expect("migrate");
+
+        let mut model = tagger_model();
+        model.output_type = "not-a-real-output".into();
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let err = soft_fail_input_media(
+            &index_db,
+            &model,
+            0,
+            "/tmp/x.png",
+            "no_item_sha",
+            "image/png",
+            Arc::clone(&counters),
+            1,
+        )
+        .await
+        .expect_err("placeholder must fail without a valid output type / item");
+
+        assert!(!err.detail().is_empty());
+        let guard = counters.lock().await;
+        assert_eq!(guard.processed, 1);
+        assert_eq!(guard.errors, 1);
+        assert_eq!(
+            guard.input_errors, 0,
+            "failed placeholder write must not count as input-media"
+        );
+        assert_eq!(
+            classify_extraction_job_failure(guard.processed, guard.errors, guard.input_errors),
+            ExtractionJobFailureKind::Systemic
+        );
     }
 }

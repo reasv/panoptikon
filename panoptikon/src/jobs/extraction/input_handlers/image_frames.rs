@@ -17,6 +17,7 @@ use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
 /// carry their own pixel dimensions (each page differs from the item's stored
 /// size); frames without dimensions are sliced using the item's stored
 /// width/height, mirroring the Python loader.
+#[derive(Debug)]
 pub(super) struct BaseFrame {
     pub bytes: Vec<u8>,
     pub width: Option<i64>,
@@ -73,6 +74,8 @@ pub(super) async fn build_image_frames_inputs(
             width,
             height,
             slice_settings.as_ref(),
+            &item.path,
+            &item.sha256,
         )?);
     }
     let mut outputs = Vec::new();
@@ -104,14 +107,23 @@ pub(super) async fn load_base_frames(
         }
     }
     if item.item_type.starts_with("image/gif") {
-        return gif_to_frames(&item.path);
+        return gif_to_frames(&item.path, &item.sha256);
     }
     if item.item_type.starts_with("image") {
+        // Open/read I/O is *not* input_media: soft-fail would write a permanent
+        // placeholder and skip the item after transient mount/NFS blips.
         let buffer = tokio::fs::read(&item.path).await.map_err(|err| {
-            tracing::error!(error = %err, path = %item.path, "failed to read image");
+            tracing::error!(
+                error = %err,
+                path = %item.path,
+                sha256 = %item.sha256,
+                "failed to read image"
+            );
             ApiError::internal("Failed to read image")
         })?;
-        ensure_image_readable(&buffer, &item.path)?;
+        // Full decode (not header-only): pixel-corrupt / truncated files must
+        // soft-fail as input_media before reaching coalesced inference.
+        load_dynamic_image(&buffer, &item.path, &item.sha256)?;
         return Ok(vec![BaseFrame::sized_by_item(buffer)]);
     }
     if item.item_type.starts_with("video") {
@@ -164,25 +176,7 @@ pub(super) async fn load_base_frames(
     Ok(Vec::new())
 }
 
-/// Header-level readability check mirroring Python's `is_image_readable`
-/// (PIL `verify()` with truncated images accepted): rejects files whose
-/// header cannot even be parsed, without decoding pixel data. Without this,
-/// a corrupt file reaches the inference server where it can fail an entire
-/// coalesced GPU batch instead of just this item.
-fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
-    image::ImageReader::new(std::io::Cursor::new(buffer))
-        .with_guessed_format()
-        .map_err(|err| {
-            tracing::error!(error = %err, path, "image format detection failed");
-            ApiError::internal(format!("Image {path} is not readable"))
-        })?
-        .into_dimensions()
-        .map_err(|err| {
-            tracing::error!(error = %err, path, "image is not readable");
-            ApiError::internal(format!("Image {path} is not readable"))
-        })?;
-    Ok(())
-}
+
 
 #[derive(Debug, Clone)]
 struct ImageSliceSettings {
@@ -244,6 +238,8 @@ fn slice_target_size(
     width: Option<i64>,
     height: Option<i64>,
     settings: Option<&ImageSliceSettings>,
+    path: &str,
+    sha256: &str,
 ) -> ApiResult<Vec<Vec<u8>>> {
     let (Some(width), Some(height), Some(settings)) = (width, height, settings) else {
         return Ok(input_images);
@@ -260,7 +256,7 @@ fn slice_target_size(
             let slices = calculate_slices_needed(width, height, settings);
             let mut output = Vec::new();
             for image in input_images {
-                output.extend(slice_image(&image, slices)?);
+                output.extend(slice_image(&image, slices, path, sha256)?);
             }
             Ok(output)
         }
@@ -271,7 +267,7 @@ fn slice_target_size(
             let (rows, cols) = grid_for_pixels(width, height, settings);
             let mut output = Vec::new();
             for image in input_images {
-                output.extend(slice_image_grid(&image, rows, cols)?);
+                output.extend(slice_image_grid(&image, rows, cols, path, sha256)?);
             }
             Ok(output)
         }
@@ -305,9 +301,14 @@ fn calculate_slices_needed(width: f64, height: f64, settings: &ImageSliceSetting
     ((image_ratio / target_ratio).ceil() as usize).max(1)
 }
 
-fn slice_image(image_bytes: &[u8], num_slices: usize) -> ApiResult<Vec<Vec<u8>>> {
+fn slice_image(
+    image_bytes: &[u8],
+    num_slices: usize,
+    path: &str,
+    sha256: &str,
+) -> ApiResult<Vec<Vec<u8>>> {
     let format = slice_output_format(image_bytes);
-    let image = load_dynamic_image(image_bytes)?;
+    let image = load_dynamic_image(image_bytes, path, sha256)?;
     let (width, height) = image.dimensions();
     let mut output = Vec::new();
     if width >= height {
@@ -372,9 +373,15 @@ fn grid_for_pixels(width: f64, height: f64, settings: &ImageSliceSettings) -> (u
     (rows, cols)
 }
 
-fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<Vec<Vec<u8>>> {
+fn slice_image_grid(
+    image_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    path: &str,
+    sha256: &str,
+) -> ApiResult<Vec<Vec<u8>>> {
     let format = slice_output_format(image_bytes);
-    let image = load_dynamic_image(image_bytes)?;
+    let image = load_dynamic_image(image_bytes, path, sha256)?;
     let (width, height) = image.dimensions();
     let tile_w = width as f64 / cols as f64;
     let tile_h = height as f64 / rows as f64;
@@ -392,10 +399,15 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
     Ok(output)
 }
 
-fn load_dynamic_image(buffer: &[u8]) -> ApiResult<DynamicImage> {
+fn load_dynamic_image(buffer: &[u8], path: &str, sha256: &str) -> ApiResult<DynamicImage> {
     crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode image");
-        ApiError::internal("Failed to decode image")
+        tracing::error!(
+            error = %err,
+            path,
+            sha256,
+            "failed to decode image"
+        );
+        ApiError::input_media("Failed to decode image")
     })
 }
 
@@ -417,28 +429,48 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
     Ok(buffer)
 }
 
-fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
+fn gif_to_frames(path: &str, sha256: &str) -> ApiResult<Vec<BaseFrame>> {
+    // Open/read I/O is not soft-failed (see still-image branch above).
     let buffer = std::fs::read(path).map_err(|err| {
-        tracing::error!(error = %err, "failed to open gif");
+        tracing::error!(
+            error = %err,
+            path,
+            sha256,
+            "failed to open gif"
+        );
         ApiError::internal("Failed to open gif")
     })?;
     // Files are routed here by extension-derived mime type; a mis-named
     // non-GIF (which PIL decoded regardless of extension) is handled as a
     // single still frame instead of failing the item.
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
-        let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
-            tracing::error!(error = %err, path, "failed to decode mis-named gif");
-            ApiError::internal("Failed to decode gif")
+        let image = load_dynamic_image(&buffer, path, sha256).map_err(|err| {
+            // load_dynamic_image already logs; normalize message for GIF path.
+            if err.is_input_media() {
+                ApiError::input_media("Failed to decode gif")
+            } else {
+                err
+            }
         })?;
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
     let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode gif");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(
+            error = %err,
+            path,
+            sha256,
+            "failed to decode gif"
+        );
+        ApiError::input_media("Failed to decode gif")
     })?;
     let frames = decoder.into_frames().collect_frames().map_err(|err| {
-        tracing::error!(error = %err, "failed to collect gif frames");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(
+            error = %err,
+            path,
+            sha256,
+            "failed to collect gif frames"
+        );
+        ApiError::input_media("Failed to decode gif")
     })?;
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -619,4 +651,68 @@ async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
         height: Some(shot.height() as i64),
         bytes: encode_jpeg(&shot)?,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode a real 1×1 RGB PNG via the image crate (must fully decode).
+    fn tiny_png() -> Vec<u8> {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([0, 0, 0]),
+        ));
+        let mut buf = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Png,
+        )
+        .expect("encode 1x1 png");
+        buf
+    }
+
+    #[test]
+    fn readable_png_decodes() {
+        load_dynamic_image(&tiny_png(), "/tmp/ok.png", "abc").unwrap();
+    }
+
+    #[test]
+    fn garbage_bytes_are_input_media() {
+        let err = load_dynamic_image(b"not-an-image", "/tmp/bad.png", "deadbeef").unwrap_err();
+        assert!(
+            err.is_input_media(),
+            "expected input_media, got generic: {}",
+            err.detail()
+        );
+    }
+
+    #[test]
+    fn empty_buffer_is_input_media() {
+        let err = load_dynamic_image(b"", "/tmp/empty.png", "0").unwrap_err();
+        assert!(err.is_input_media());
+    }
+
+    #[test]
+    fn truncated_png_header_is_input_media() {
+        let mut buf = tiny_png();
+        buf.truncate(16);
+        let err = load_dynamic_image(&buf, "/tmp/trunc.png", "t").unwrap_err();
+        assert!(err.is_input_media());
+    }
+
+    #[test]
+    fn load_dynamic_image_marks_corrupt_as_input_media() {
+        let err = load_dynamic_image(b"GIF89a-not-really", "/tmp/x.gif", "sha").unwrap_err();
+        assert!(err.is_input_media());
+    }
+
+    #[test]
+    fn gif_missing_file_is_not_soft_fail() {
+        // Transient missing mounts must not write a permanent placeholder.
+        let err = gif_to_frames("/nonexistent/path/missing.gif", "sha").unwrap_err();
+        assert!(!err.is_input_media());
+        assert!(err.detail().contains("open") || err.detail().contains("gif"));
+    }
 }

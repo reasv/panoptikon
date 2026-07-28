@@ -15,10 +15,13 @@ pub(super) enum OutputDisposition {
     Skipped,
 }
 
-/// Writes the placeholder row for an item that produced zero inputs, marking
-/// it processed. Only for the zero-input case: an *inference* response with
-/// missing outputs must go through `handle_outputs`, where it can be
-/// distinguished from this and treated as a failure.
+/// Writes an empty output row so the item is treated as processed for this
+/// model (not re-selected every cron). Used for:
+/// - zero prepared inputs (too-small image, no video frames, …)
+/// - soft-failed corrupt/unreadable source media (`ApiError::input_media`)
+///
+/// An *inference* response with missing outputs must go through
+/// `handle_outputs` instead, so it can fail the item properly.
 pub(super) async fn write_placeholder(
     index_db: &str,
     model: &ModelMetadata,
