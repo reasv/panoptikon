@@ -123,6 +123,16 @@ API endpoints support specifying the name of the `index` and `user_data` databas
 
 Prebuilt binaries are planned; until they arrive you build from source.
 
+### Nix / NixOS
+
+Packaging lives under `contrib/` (flake, packages, NixOS module). See
+[`contrib/package/nix/README.md`](contrib/package/nix/README.md).
+
+```bash
+nix build .#panoptikon
+# NixOS: import inputs.panoptikon.nixosModules.default and the overlay
+```
+
 ### Prerequisites
 
 - **Git**
