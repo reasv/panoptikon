@@ -1,6 +1,6 @@
 # Job-boundary scheduling: deferred maintenance, model continuity, cross-DB cron ordering
 
-Status: phases 1-3 implemented (2026-07-28); phase 4 (UI) not started.
+Status: fully implemented, all four phases (2026-07-28). Server: 43f0fab..4c05001; UI: dfe42ae, 63f3726.
 
 ## Problem
 
