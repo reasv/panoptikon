@@ -101,6 +101,13 @@ impl JobSuccess {
             loaded_model: None,
         }
     }
+
+    fn from_extraction(outcome: extraction::ExtractionOutcome) -> Self {
+        Self {
+            summary: outcome.summary,
+            loaded_model: outcome.loaded_model,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,9 +489,13 @@ impl Actor for JobQueueActor {
                         maybe_schedule_maintenance(state, job);
                     }
                 }
-                // Removing queued jobs can also remove the reason a batch model
-                // was being kept warm. Never suppressed: freeing VRAM on cancel
-                // is cheap and wanted (design §B).
+                // Unreachable in normal operation: `batch_loaded` is only
+                // `Some` while a job runs, because every boundary either
+                // unloads or immediately starts the job that keeps the model
+                // warm — and this decision no-ops while a job runs. Kept as
+                // belt-and-braces for the degenerate state where
+                // `start_next_job` could not hand a job to the runner and left
+                // the queue with nothing running.
                 maybe_unload_batch_model(state);
                 // Unconditional: a suppressed cancel must still not leave the
                 // queue holding work while the runner sits idle.
@@ -527,9 +538,11 @@ impl Actor for JobQueueActor {
                         // to the front of the queue, which is exactly the slot
                         // the maintenance work occupied before it was deferred.
                         maybe_schedule_maintenance(state, &finished);
-                        // Strictly after synthesis: the model-continuity rule
-                        // reads the queue, and a maintenance job it must skip
-                        // over has to be in there already.
+                        // After synthesis so the model-continuity rule reads
+                        // the queue it will actually run. Belt-and-braces
+                        // rather than load-bearing: `next_batch_setter` skips
+                        // `DbMaintenance`, so today the decision is the same
+                        // either way and no test can tell the orders apart.
                         maybe_unload_batch_model(state);
                         start_next_job(state).await;
                     }
@@ -568,9 +581,11 @@ impl Actor for JobQueueActor {
                 // performance-only staleness), so shutdown never synthesizes.
                 let cancelled = cancel_running_job_inner(state, true).await;
                 // The batch model does not die with the process: desktop
-                // shutdown leaves the inference workers running for a moment,
-                // and an unload costs one HTTP call we are not waiting on.
-                maybe_unload_batch_model(state);
+                // shutdown leaves the inference workers running for a moment.
+                // This is where the cancelled job's model is unloaded (the
+                // cancel path defers to here while shutting down), waited on
+                // with a short timeout rather than detached.
+                unload_batch_model_on_shutdown(state).await;
                 let _ = reply.send(cancelled);
             }
             #[cfg(test)]
@@ -704,8 +719,12 @@ async fn cancel_running_job_inner(
                     maybe_schedule_maintenance(state, &running);
                 }
                 // Not gated on `suppress_maintenance`: that flag is about the
-                // maintenance job only.
-                maybe_unload_batch_model(state);
+                // maintenance job only. During shutdown the `Shutdown` handler
+                // does it instead, awaited — a task detached here as the
+                // runtime tears down would usually never be polled.
+                if !state.shutting_down {
+                    maybe_unload_batch_model(state);
+                }
                 start_next_job(state).await;
                 Some(queue_id)
             } else {
@@ -864,44 +883,76 @@ fn unreported_batch_load(job: &Job) -> Option<String> {
 
 /// The model-continuity half of the boundary: the batch model stays loaded
 /// exactly when the next extraction in the queue wants the same setter.
-/// Otherwise it is unloaded without blocking the actor — a lost call is
-/// covered by the inferio TTL sweep, the same backstop that has always been
-/// the real guarantee here.
-fn maybe_unload_batch_model(state: &mut JobQueueState) {
+/// Returns the setter to unload (and stops tracking it) otherwise.
+fn take_batch_unload(state: &mut JobQueueState) -> Option<String> {
     // Only a real boundary: while a job runs, `batch_loaded` describes a model
     // that job may itself be using (or have already evicted).
     if state.running_job.is_some() {
-        return;
+        return None;
     }
-    let Some(loaded) = state.batch_loaded.clone() else {
-        return;
-    };
+    let loaded = state.batch_loaded.clone()?;
     if next_batch_setter(&state.queue) == Some(loaded.as_str()) {
-        return;
+        return None;
     }
     state.batch_loaded = None;
     tracing::info!(setter = %loaded, "unloading batch model at job boundary");
-    spawn_batch_unload(state, loaded);
+    Some(loaded)
 }
 
-fn spawn_batch_unload(state: &mut JobQueueState, setter: String) {
+/// Unloads without blocking the actor on an HTTP round trip — a lost call is
+/// covered by the inferio TTL sweep, the same backstop that has always been
+/// the real guarantee here.
+fn maybe_unload_batch_model(state: &mut JobQueueState) {
+    let Some(setter) = take_batch_unload(state) else {
+        return;
+    };
     if record_test_unload(state, &setter) {
         return;
     }
-    // Fire and forget: an HTTP round trip must not stall the actor between two
-    // jobs, and every way this call can be lost is already covered by the
-    // inferio TTL sweep.
-    tokio::spawn(async move {
-        // Absent when no inference endpoints were ever configured; then there
-        // is nothing loaded and nothing to unload.
-        let Some(context) = crate::jobs::inference_pool::try_job_inference_context() else {
-            return;
-        };
-        let _ = context
-            .pool
-            .unload_model_all(&setter, extraction::CACHE_KEY)
-            .await;
-    });
+    // The generation is captured *here*, in the actor, so a load that starts
+    // after this point invalidates the unload rather than being undone by it.
+    tokio::spawn(unload_batch_model(
+        setter,
+        extraction::batch_load_generation(),
+    ));
+}
+
+/// Shutdown variant: waits, briefly. A task detached while the runtime tears
+/// down is usually never polled, and the inference workers outlive the process
+/// by long enough for the unload to matter (desktop quit).
+async fn unload_batch_model_on_shutdown(state: &mut JobQueueState) {
+    const SHUTDOWN_UNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let Some(setter) = take_batch_unload(state) else {
+        return;
+    };
+    if record_test_unload(state, &setter) {
+        return;
+    }
+    let generation = extraction::batch_load_generation();
+    let _ = tokio::time::timeout(
+        SHUTDOWN_UNLOAD_TIMEOUT,
+        unload_batch_model(setter, generation),
+    )
+    .await;
+}
+
+async fn unload_batch_model(setter: String, generation: u64) {
+    // Absent when no inference endpoints were ever configured; then there is
+    // nothing loaded and nothing to unload.
+    let Some(context) = crate::jobs::inference_pool::try_job_inference_context() else {
+        return;
+    };
+    let _slot = extraction::lock_batch_slot().await;
+    if !extraction::batch_unload_is_current(generation) {
+        // A newer job loaded a batch model while this unload was in flight.
+        // Landing now would kill everything queued on that model's dispatcher.
+        tracing::debug!(setter = %setter, "skipping a stale batch model unload");
+        return;
+    }
+    let _ = context
+        .pool
+        .unload_model_all(&setter, extraction::CACHE_KEY)
+        .await;
 }
 
 /// Always `false`: the unload really happens.
@@ -1072,8 +1123,10 @@ async fn extraction_stub(_job: &Job) -> Option<Result<JobSuccess, String>> {
 /// the queue tests enqueue real ones — but the real body needs an inference
 /// server and a populated database. The stub reports what matters: the setter
 /// it "loaded", which is the job's `metadata`, exactly as the real job does
-/// (`setter_name == inference_id == metadata`). Tag: `"<delay_ms>"`, or
-/// `"<delay_ms>:noload"` for the no-data early return, which loads nothing.
+/// (`setter_name == inference_id == metadata`). Tag: `"<delay_ms>"`, plus
+/// `":noload"` for the no-data early return (which loads nothing) or `":fail"`
+/// for the error exits that happen *after* the model is loaded (all items
+/// failed, or a write error).
 #[cfg(test)]
 async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
     let tag = job.tag.clone().unwrap_or_default();
@@ -1085,6 +1138,9 @@ async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
         delay.parse::<u64>().unwrap_or(0),
     ))
     .await;
+    if flags.contains("fail") {
+        return Some(Err("test extraction failure".to_string()));
+    }
     let loaded = !flags.contains("noload");
     Some(Ok(JobSuccess {
         summary: ChangeSummary {
@@ -1127,10 +1183,7 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
                 .await
                 .map_err(|err| format!("{err}"))?;
             vector_quants::finishing_phase(&job.index_db).await;
-            Ok(JobSuccess {
-                summary: outcome.summary,
-                loaded_model: outcome.loaded_model,
-            })
+            Ok(JobSuccess::from_extraction(outcome))
         }
         JobType::DataDeletion => {
             let summary = extraction::run_data_deletion_job(job.clone())
@@ -2409,6 +2462,90 @@ mod tests {
 
         queue.stop(None);
         handle.await.unwrap();
+    }
+
+    // The other half of "ended without reporting": a *failed* extraction job.
+    // Both error exits that matter (all items failed; the model load itself
+    // failing) happen after the model is loaded, so the boundary has to assume
+    // it is resident — this is the arm that covers them.
+    #[tokio::test]
+    async fn failed_extraction_tracks_and_unloads_its_model() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-failed");
+        let setter = "group/model-a";
+        let job = enqueue_on(&queue, extraction_job(&db, setter, "10:fail")).await;
+
+        let state = wait_for(&queue, |state| !state.unloads.is_empty()).await;
+        assert_eq!(
+            state.unloads,
+            vec![setter.to_string()],
+            "a failed extraction must be assumed to have loaded: {state:?}"
+        );
+        assert!(state.batch_loaded.is_none(), "{state:?}");
+        let status = status_on(&queue).await;
+        assert!(
+            status.outcomes.iter().any(|outcome| {
+                outcome.queue_id == job.queue_id && outcome.status == JobOutcomeStatus::Failed
+            }),
+            "the job really has to have failed, not been cancelled: {status:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Shutdown unloads the model of the job it just cancelled. The cancel path
+    // defers to the shutdown handler, which waits for the call instead of
+    // detaching it into a runtime that is about to stop polling.
+    #[tokio::test]
+    async fn shutdown_unloads_the_batch_model() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-shutdown");
+        let setter = "group/model-a";
+        let running = enqueue_on(&queue, extraction_job(&db, setter, "60000")).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::Shutdown { reply })
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), Some(running.queue_id));
+
+        let state = debug_on(&queue).await;
+        assert_eq!(state.unloads, vec![setter.to_string()], "{state:?}");
+        assert!(state.batch_loaded.is_none(), "{state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The mapping from a real extraction job's outcome onto the queue's report.
+    // The queue tests stub the job body, so this is the only place the field
+    // wiring is checked.
+    #[test]
+    fn extraction_outcome_maps_onto_the_job_report() {
+        let success = JobSuccess::from_extraction(extraction::ExtractionOutcome {
+            summary: ChangeSummary {
+                wrote_data: true,
+                deleted_data: true,
+            },
+            loaded_model: Some("group/model-a".to_string()),
+        });
+        assert_eq!(
+            success.summary,
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: true
+            }
+        );
+        assert_eq!(success.loaded_model.as_deref(), Some("group/model-a"));
+
+        let no_data = JobSuccess::from_extraction(extraction::ExtractionOutcome {
+            summary: ChangeSummary::default(),
+            loaded_model: None,
+        });
+        assert_eq!(no_data.summary, ChangeSummary::default());
+        assert_eq!(no_data.loaded_model, None);
     }
 
     // A cancelled extraction job reports nothing, so the queue assumes it

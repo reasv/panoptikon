@@ -39,8 +39,44 @@ mod output_handlers;
 /// The inferio cache key every batch job loads under. Shared with the queue's
 /// boundary unload, which must target the same key.
 pub(crate) const CACHE_KEY: &str = "batch";
+
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
+
+/// Serializes batch-model loads against the queue boundary's unloads. Held
+/// only around the load itself (and around an unload's decision + call), never
+/// for the duration of a job.
+static BATCH_SLOT: Mutex<()> = Mutex::const_new(());
+/// Bumped by every batch load. An unload captures it before it is spawned and
+/// aborts if it changed: without this, a fire-and-forget unload issued at one
+/// boundary can land *after* the next job has already loaded the same setter,
+/// and `unload_model` fails everything queued on that dispatcher.
+static BATCH_LOAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads the current batch-load generation. Cheap and non-blocking: the queue
+/// actor captures it before spawning an unload.
+pub(crate) fn batch_load_generation() -> u64 {
+    BATCH_LOAD_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Locks the batch slot. Loads take it around `load_model_all`, boundary
+/// unloads around the generation check plus `unload_model_all`.
+pub(crate) async fn lock_batch_slot() -> tokio::sync::MutexGuard<'static, ()> {
+    BATCH_SLOT.lock().await
+}
+
+/// Invalidates every unload captured so far. Must be called with the slot held
+/// and immediately before the load, so that an unload waiting on the slot sees
+/// the new generation and aborts instead of unloading what was just loaded.
+pub(crate) fn begin_batch_load() {
+    BATCH_LOAD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Whether an unload that captured `generation` may still proceed. Call with
+/// the batch slot held.
+pub(crate) fn batch_unload_is_current(generation: u64) -> bool {
+    batch_load_generation() == generation
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ModelMetadata {
@@ -288,19 +324,27 @@ async fn run_extraction_job_inner(
     })
     .await?;
 
-    let load_result = context
-        .pool
-        .load_model_all(
-            &model.setter_name,
-            CACHE_KEY,
-            CACHE_LRU_SIZE,
-            CACHE_TTL_SECS,
-            // Batch jobs opt out of lazy prewarming (design doc §8):
-            // batch-only model families must not hold a warm worker's RAM
-            // after the job ends.
-            Some(false),
-        )
-        .await;
+    let load_result = {
+        // Under the batch slot, with the generation bumped first: a boundary
+        // unload spawned before this load either already ran (and this load
+        // undoes it) or finds a newer generation and aborts. It can never land
+        // on the model this job is about to use.
+        let _slot = lock_batch_slot().await;
+        begin_batch_load();
+        context
+            .pool
+            .load_model_all(
+                &model.setter_name,
+                CACHE_KEY,
+                CACHE_LRU_SIZE,
+                CACHE_TTL_SECS,
+                // Batch jobs opt out of lazy prewarming (design doc §8):
+                // batch-only model families must not hold a warm worker's RAM
+                // after the job ends.
+                Some(false),
+            )
+            .await
+    };
     if let Err(err) = load_result {
         return Err(ApiError::internal(format!("Failed to load model: {err}")));
     }
@@ -1267,5 +1311,47 @@ fn bind_param<'q>(
             })?;
             Ok(query.bind(encoded))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The guard that keeps a boundary unload from landing on a model a newer
+    // job has already loaded: a load bumps the generation under the slot, and
+    // an unload holding an older generation must refuse to run.
+    //
+    // Serial by construction: this is the only test that touches the batch
+    // slot (queue tests record the decision instead of performing it).
+    #[tokio::test]
+    async fn a_newer_batch_load_invalidates_a_pending_unload() {
+        // What the queue actor captures when it spawns the unload.
+        let captured = batch_load_generation();
+        {
+            let slot = lock_batch_slot().await;
+            assert!(
+                batch_unload_is_current(captured),
+                "nothing has loaded yet, so the unload is still valid"
+            );
+            drop(slot);
+        }
+
+        // A new extraction job loads its model first.
+        {
+            let _slot = lock_batch_slot().await;
+            begin_batch_load();
+        }
+
+        let _slot = lock_batch_slot().await;
+        assert!(
+            !batch_unload_is_current(captured),
+            "the unload is stale and must abort instead of unloading the \
+             model the new job just loaded"
+        );
+        assert!(
+            batch_unload_is_current(batch_load_generation()),
+            "an unload captured after that load is valid again"
+        );
     }
 }
