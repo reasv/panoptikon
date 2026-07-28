@@ -300,6 +300,11 @@ pub(crate) struct QueueDebugState {
     /// performed under `cfg(test)`: queue tests run without an inference
     /// context, and the decision is what these tests are about.
     unloads: Vec<String>,
+    /// How many times the actor has tried to start the next job. Lets a test
+    /// see that a no-op enqueue really did not touch the queue, which is
+    /// otherwise indistinguishable from a `start_next_job` that found nothing
+    /// to do.
+    start_attempts: usize,
 }
 
 pub(crate) struct JobQueueActor;
@@ -328,6 +333,8 @@ pub(crate) struct JobQueueState {
     synthesized: Vec<(String, ChangeSummary)>,
     #[cfg(test)]
     unloads: Vec<String>,
+    #[cfg(test)]
+    start_attempts: usize,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -398,6 +405,8 @@ impl Actor for JobQueueActor {
             synthesized: Vec::new(),
             #[cfg(test)]
             unloads: Vec::new(),
+            #[cfg(test)]
+            start_attempts: 0,
         })
     }
 
@@ -442,12 +451,14 @@ impl Actor for JobQueueActor {
                         skipped_dbs.push(dedup.index_db.clone());
                     }
                 }
-                let enqueued = requests
+                let enqueued: Vec<JobModel> = requests
                     .into_iter()
                     .filter(|request| !skipped_dbs.contains(&request.index_db))
                     .map(|request| push_job(state, request))
                     .collect();
-                if state.running_job.is_none() {
+                // A batch that enqueued nothing leaves the queue exactly as it
+                // found it, as the all-or-nothing skip path always did.
+                if !enqueued.is_empty() && state.running_job.is_none() {
                     start_next_job(state).await;
                 }
                 let _ = reply.send(Ok(BatchEnqueueResult {
@@ -618,6 +629,7 @@ impl Actor for JobQueueActor {
                     synthesized: state.synthesized.clone(),
                     batch_loaded: state.batch_loaded.clone(),
                     unloads: state.unloads.clone(),
+                    start_attempts: state.start_attempts,
                 });
             }
         }
@@ -662,6 +674,10 @@ fn record_outcome(
 }
 
 async fn start_next_job(state: &mut JobQueueState) {
+    #[cfg(test)]
+    {
+        state.start_attempts += 1;
+    }
     if state.shutting_down || state.running_job.is_some() {
         return;
     }
@@ -1930,6 +1946,118 @@ mod tests {
         let empty = enqueue_batch_on(&queue, Vec::new(), vec![cron_dedup("nothing")]).await;
         assert!(empty.enqueued.is_empty());
         assert!(empty.skipped_dbs.is_empty());
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // A batch that enqueues nothing must leave the queue alone — the property
+    // the old all-or-nothing skip path had for free. Observed through the
+    // start-attempt counter, because "started nothing" and "never looked" are
+    // otherwise the same from outside.
+    #[tokio::test]
+    async fn a_fully_skipped_batch_does_not_touch_the_queue() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("skipped-batch");
+
+        // On an idle queue the difference is visible: a batch that enqueued
+        // nothing must not even reach for the next job.
+        assert_eq!(debug_on(&queue).await.start_attempts, 0);
+        let empty = enqueue_batch_on(&queue, Vec::new(), vec![cron_dedup(&db)]).await;
+        assert!(empty.enqueued.is_empty() && empty.skipped_dbs.is_empty());
+        assert_eq!(
+            debug_on(&queue).await.start_attempts,
+            0,
+            "an enqueue that added nothing must not drive the queue"
+        );
+
+        // Same for a batch whose every DB is deduped away: the queue is left
+        // exactly as it was found.
+        let job = JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: db.clone(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            // Unparseable TestSleep tag: a 200ms sleep, so it is still the
+            // running job for the second batch.
+            tag: Some("cronjob".to_string()),
+        };
+        let first = enqueue_batch_on(&queue, vec![job.clone()], vec![cron_dedup(&db)]).await;
+        assert_eq!(first.enqueued.len(), 1);
+        let before = status_on(&queue).await;
+        let skipped = enqueue_batch_on(&queue, vec![job.clone()], vec![cron_dedup(&db)]).await;
+        assert_eq!(skipped.skipped_dbs, [db.as_str()]);
+        let after = status_on(&queue).await;
+        assert_eq!(
+            before
+                .queue
+                .iter()
+                .map(|entry| (entry.queue_id, entry.running))
+                .collect::<Vec<_>>(),
+            after
+                .queue
+                .iter()
+                .map(|entry| (entry.queue_id, entry.running))
+                .collect::<Vec<_>>()
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The flagship phase-1+2+3 interaction, in the shape a merged cron tick
+    // produces: two DBs interleaved by setter in one batch. Same-setter jobs
+    // from different DBs keep the model loaded across the boundary *and*
+    // across the maintenance job synthesized for the DB that just finished;
+    // the model is unloaded only at the setter change and at the drain.
+    #[tokio::test]
+    async fn a_merged_cron_batch_reuses_models_across_dbs_and_maintenance() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db_a = unique_db("merged-a");
+        let db_b = unique_db("merged-b");
+        let shared = "group/model-shared";
+        let other = "group/model-other";
+
+        // What `merge_cron_batches` would emit for these two DBs: the shared
+        // setter's jobs adjacent, DB A's work finishing first.
+        let batch = enqueue_batch_on(
+            &queue,
+            vec![
+                extraction_job(&db_a, shared, "10"),
+                extraction_job(&db_b, shared, "10"),
+                extraction_job(&db_b, other, "10"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(batch.enqueued.len(), 3);
+
+        // Both DBs owe maintenance (the stub reports wrote_data), so both get
+        // a synthesized job: A's mid-queue, B's at the drain.
+        let state = wait_for(&queue, |state| {
+            state.synthesized.len() == 2 && state.unloads.len() == 2
+        })
+        .await;
+        let synthesized: Vec<&str> = state
+            .synthesized
+            .iter()
+            .map(|(index_db, _)| index_db.as_str())
+            .collect();
+        assert_eq!(
+            synthesized,
+            [db_a.as_str(), db_b.as_str()],
+            "A's maintenance is owed as soon as its last job finishes: {state:?}"
+        );
+        assert_eq!(
+            state.unloads,
+            vec![shared.to_string(), other.to_string()],
+            "the shared model must survive A's boundary, A's maintenance job \
+             and B's first job, and unload only at the setter change: {state:?}"
+        );
+        assert!(state.owed.is_empty(), "{state:?}");
 
         queue.stop(None);
         handle.await.unwrap();

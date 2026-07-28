@@ -125,6 +125,13 @@ enum CronPhase {
     Scan,
     Source,
     Derived,
+    /// Unclassifiable: the inference server was unreachable, so the phase of
+    /// every model in this tick is unknown. Merging then has no dependency
+    /// information to work with and falls back to concatenating each DB's
+    /// block in config order (see [`merge_cron_batches`]). Metadata is fetched
+    /// once per tick and shared, so `Unknown` never mixes with the others in
+    /// one batch; it sorts last purely as a safe default.
+    Unknown,
 }
 
 /// Classifies a model by its resolved target entities.
@@ -141,12 +148,11 @@ fn cron_phase(target_entities: &[String]) -> CronPhase {
 /// merge sorts on.
 ///
 /// `metadata` is the inference server's registry dump, fetched once per tick.
-/// When it is `None` (server unreachable) every model is classified as
-/// `Derived`, which — since first-appearance ordering within a phase preserves
-/// config order for a single DB — reproduces the pre-merge fallback exactly:
-/// scan first, then config order, nothing dropped. Extraction jobs re-resolve
-/// metadata at execution time, so an unreachable inference server only costs
-/// the ordering.
+/// When it is `None` (server unreachable) nothing is dropped and every model
+/// is classified `Unknown`, which the merge concatenates per DB in config
+/// order — the pre-merge fallback behaviour, for any number of DBs. Extraction
+/// jobs re-resolve metadata at execution time, so an unreachable inference
+/// server only costs the ordering.
 fn build_cron_requests(
     index_db: &str,
     user_data_db: &str,
@@ -172,7 +178,7 @@ fn build_cron_requests(
                     continue;
                 }
             },
-            None => CronPhase::Derived,
+            None => CronPhase::Unknown,
         };
         let mut request = cron_request(
             JobType::DataExtraction,
@@ -196,20 +202,35 @@ fn build_cron_requests(
 /// dependencies survive because they are entirely expressed by the phase; two
 /// jobs of one DB in the same phase have no ordering requirement between them,
 /// so setter grouping may interleave them with another DB's.
+///
+/// `CronPhase::Unknown` (inference metadata unavailable) is the exception: the
+/// phase then carries no dependency information, so grouping by setter could
+/// hoist a DB's derived model above the source model it consumes. Those
+/// requests get one rank each, in flattened order, which concatenates the DBs'
+/// blocks with every DB's config order intact — at the cost of the cross-DB
+/// setter grouping, which is the right trade when we cannot prove it is safe.
 fn merge_cron_batches(batches: Vec<Vec<(CronPhase, JobRequest)>>) -> Vec<JobRequest> {
     let mut ranks: HashMap<(CronPhase, Option<String>), usize> = HashMap::new();
     let mut next_rank: HashMap<CronPhase, usize> = HashMap::new();
     let mut keyed: Vec<((CronPhase, usize), JobRequest)> = Vec::new();
     for (phase, request) in batches.into_iter().flatten() {
-        let key = (phase, request.metadata.clone());
-        let rank = match ranks.get(&key) {
-            Some(rank) => *rank,
-            None => {
-                let next = next_rank.entry(phase).or_insert(0);
-                let rank = *next;
-                *next += 1;
-                ranks.insert(key, rank);
-                rank
+        let mut fresh_rank = |phase| {
+            let next = next_rank.entry(phase).or_insert(0);
+            let rank = *next;
+            *next += 1;
+            rank
+        };
+        let rank = if phase == CronPhase::Unknown {
+            fresh_rank(phase)
+        } else {
+            let key = (phase, request.metadata.clone());
+            match ranks.get(&key) {
+                Some(rank) => *rank,
+                None => {
+                    let rank = fresh_rank(phase);
+                    ranks.insert(key, rank);
+                    rank
+                }
             }
         };
         keyed.push(((phase, rank), request));
@@ -461,6 +482,10 @@ async fn run_cron_batch(fired: Vec<(String, SystemConfig)>) {
         })
         .collect();
 
+    // One call for every fired DB: a failure here (queue actor gone or
+    // shutting down) costs all of them the slot their schedule already
+    // consumed, where it used to cost one. Accepted — both error sources are
+    // global, so a per-DB call would fail for every DB anyway.
     match enqueue_cron_batches(per_db).await {
         Ok(result) => {
             for index_db in &result.skipped_dbs {
@@ -995,6 +1020,30 @@ mod tests {
         )]);
         let setters: Vec<&str> = order.iter().map(|(_, setter)| setter.as_str()).collect();
         assert_eq!(setters, ["FolderRescan", "derived/a", "src/b", "missing/c"]);
+    }
+
+    // Same fallback, several DBs: with nothing classified the merge has no
+    // dependency information, so it must concatenate the DBs' blocks instead
+    // of grouping setters. Grouping would run `b`'s embedding model before the
+    // OCR model that feeds it, purely because `a` happens to list them the
+    // other way round.
+    #[test]
+    fn metadata_unavailable_never_permutes_a_dbs_config_order() {
+        let order = merged_order(vec![
+            batch("a", &["derived/embed", "src/ocr"], None),
+            batch("b", &["src/ocr", "derived/embed"], None),
+        ]);
+        assert_eq!(
+            order,
+            [
+                ("a".into(), "FolderRescan".into()),
+                ("b".into(), "FolderRescan".into()),
+                ("a".into(), "derived/embed".into()),
+                ("a".into(), "src/ocr".into()),
+                ("b".into(), "src/ocr".into()),
+                ("b".into(), "derived/embed".into()),
+            ]
+        );
     }
 
     // Degenerate inputs: nothing in, nothing out.

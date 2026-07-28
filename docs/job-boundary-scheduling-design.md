@@ -198,7 +198,11 @@ sweep evict the warm model. Harmless — the next job reloads. Raising
 `CACHE_TTL_SECS` (e.g. 300s) would widen the reuse window, and is cheaper
 than it used to be since the boundary unload now handles the end-of-queue
 case promptly; but keep 60s initially and tune only if gaps show up in
-practice.
+practice. Phase 3 makes one such gap common: a synthesized maintenance job
+between two same-setter jobs from different DBs can exceed 60s (VACUUM/ANALYZE
+on a large index runs for minutes), so the boundary keeps the model but the
+sweeper unloads it anyway and the next job reloads. Bounded cost — one reload
+per maintenance pass, never a correctness issue.
 
 **No job parameter needed.** The original idea of telling a job at start
 whether to unload at end is unnecessary once the decision moves to the
@@ -217,13 +221,22 @@ multi-DB work "at once" is the cron tick.
 - `tick_all` collects **all DBs due in the same tick** (the typical
   same-time-each-night config makes them fire together), builds each DB's
   request list, and merges with a stable sort on:
-  `(phase, setter-first-appearance, original DB order)` where
-  phase = scan(0) / source-model(1) / derived-model(2).
-  Stability preserves each DB's internal order, so per-DB dependencies
-  (scan before extraction, text before text-embedding) hold: a model's
+  `(phase, setter-first-appearance-within-phase, original (batch, position))`
+  where phase = scan(0) / source-model(1) / derived-model(2).
+  Per-DB dependencies (scan before extraction, source before derived) are
+  carried by the *phase ranking itself*, not by stability: a model's
   source/derived classification comes from global inference metadata and is
   identical across DBs, so grouping by setter can never hoist a derived job
-  above a source job of its own DB.
+  above a source job of its own DB. Stability only preserves a DB's internal
+  order *within* one phase — and only when no other DB's setter ordering
+  interleaves, which is fine because two same-phase jobs of one DB have no
+  ordering requirement between them.
+- **Fallback when inference metadata is unavailable:** nothing can be
+  classified, so the phase carries no dependency information and setter
+  grouping *could* invert a DB's own source→derived order. Those requests get
+  a fourth phase, unknown(3), ranked by (batch, position) — the DBs' blocks
+  concatenated, each in config order, giving up cross-DB grouping in exactly
+  the case where it cannot be proven safe.
 - Enqueue as one `EnqueueBatch`. `BatchDedup` generalizes to per-DB
   conditions: a DB whose `cronjob` tag is still queued/running drops only
   *its* requests; the other DBs' requests still enqueue (today this
@@ -254,7 +267,7 @@ within that call.
 | | today | after |
 |---|---|---|
 | maintenance passes | D×(M+1), each recount+ANALYZE+checkpoint | ≤D, skipped entirely when nothing changed |
-| model loads | one per job that has data | one per (setter, consecutive run) — M in the common case |
+| model loads | one per job that has data | one per (setter, consecutive run) — M in the common case, plus one reload per >60s maintenance gap |
 | VACUUM | per deleting job | per DB per queue-drain, optionally freelist-gated |
 | cancel of extraction job | model lingers until TTL sweep | explicit boundary unload |
 
