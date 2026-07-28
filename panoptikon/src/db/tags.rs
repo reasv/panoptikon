@@ -1,7 +1,7 @@
 use sqlx::Row;
 
 use crate::api_error::ApiError;
-use crate::db::prefix::prefix_upper_bound;
+use crate::db::prefix::{escape_like_literal, prefix_upper_bound};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -41,6 +41,11 @@ pub(crate) async fn recount_tag_items(conn: &mut sqlx::SqliteConnection) -> ApiR
 
 /// Tags whose name contains `name`, most-used first.
 ///
+/// The query text is matched literally: `%` and `_` are escaped before the
+/// surrounding wildcards are added. Tag names routinely contain underscores,
+/// and unescaped, a lone `_` matches every tag in the database rather than
+/// the ones containing one.
+///
 /// Substring matching is binary — a tag either contains the string or does
 /// not — so there is no relevance signal to order by, and the original
 /// implementation ordered by nothing: it took whichever `limit` rows the scan
@@ -66,12 +71,12 @@ pub(crate) async fn find_tags(
         SELECT tags.namespace AS namespace, tags.name AS name,
                tags.item_count AS count
         FROM tags
-        WHERE tags.name LIKE ?
+        WHERE tags.name LIKE ? ESCAPE '\'
         ORDER BY count DESC, tags.namespace, tags.name
         LIMIT ?
         "#,
     )
-    .bind(format!("%{name}%"))
+    .bind(format!("%{}%", escape_like_literal(name)))
     .bind(limit)
     .fetch_all(&mut *conn)
     .await
@@ -498,6 +503,46 @@ mod tests {
         // count and its position change.
         let tags = find_tags(&mut dbs.index_conn, "dog", 10).await.unwrap();
         assert_eq!(tags, vec![("ns".to_string(), "dog".to_string(), 0)]);
+    }
+
+    // `find_tags` counts distinct `tags_items.item_id`, so a writer that
+    // omitted the column would silently collapse a tag's count to 1; the
+    // migration installs a trigger that rejects such writes instead. Both
+    // referenced rows exist and the (item_data, tag) pair is free, so the
+    // trigger is the only thing that can refuse this insert.
+    #[tokio::test]
+    async fn tags_items_insert_without_item_id_is_rejected() {
+        let mut dbs = setup_tag_db().await;
+        let result =
+            sqlx::query("INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)")
+                .execute(&mut dbs.index_conn)
+                .await;
+        let err = result.expect_err("insert omitting item_id must be rejected");
+        assert!(
+            err.to_string().contains("item_id must be the owning item id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // `%` and `_` are LIKE metacharacters; unescaped, a lone `_` matched
+    // every tag in the database. Tag names routinely contain literal
+    // underscores, so the query text must match them literally.
+    #[tokio::test]
+    async fn find_tags_matches_like_metacharacters_literally() {
+        let mut dbs = setup_tag_db().await;
+        sqlx::query("INSERT INTO tags (id, namespace, name) VALUES (50, 'ns', 'cat_girl')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+
+        // Only the tag with a literal underscore — not "any single
+        // character", which would return the entire fixture.
+        let tags = find_tags(&mut dbs.index_conn, "_", 10).await.unwrap();
+        assert_eq!(tags, vec![("ns".to_string(), "cat_girl".to_string(), 0)]);
+
+        // No tag contains a literal percent sign.
+        let tags = find_tags(&mut dbs.index_conn, "%", 10).await.unwrap();
+        assert_eq!(tags, vec![]);
     }
 
     // Ensures tag namespaces include colon prefixes for search stats.
