@@ -38,10 +38,11 @@ use crate::{
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
-        open_index_db_read,
+        open_index_db_read, open_index_db_read_no_user_data,
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
     },
+    jobs::queue::ChangeSummary,
     jobs::timing::PhaseTimer,
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
@@ -64,17 +65,47 @@ impl Default for ScanOptions {
 }
 
 pub(crate) struct RescanResult {
-    // Only read by tests; production callers ignore the result.
+    // Only read by tests; production callers ignore the scan ids.
     #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
+    /// What the scan changed, for the queue's deferred maintenance boundary.
+    pub summary: ChangeSummary,
 }
 
 pub(crate) struct FolderUpdateResult {
-    // Only read by tests; production callers ignore the result.
+    // Only read by tests; production callers ignore these.
     #[allow(dead_code)]
     pub included_added: Vec<String>,
     #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
+    /// What the update changed, for the queue's deferred maintenance boundary.
+    pub summary: ChangeSummary,
+}
+
+/// Rows written by a folder scan, aggregated over every scanned root. Any of
+/// them being non-zero means the DB changed and maintenance is owed.
+#[derive(Default, Clone, Copy)]
+struct ScanTotals {
+    new_items: i64,
+    new_files: i64,
+    modified_files: i64,
+    marked_unavailable: i64,
+}
+
+impl ScanTotals {
+    fn wrote_data(self) -> bool {
+        self.new_items > 0
+            || self.new_files > 0
+            || self.modified_files > 0
+            || self.marked_unavailable > 0
+    }
+
+    fn add(&mut self, stats: &FolderStats) {
+        self.new_items += stats.new_items;
+        self.new_files += stats.new_files;
+        self.modified_files += stats.modified_files;
+        self.marked_unavailable += stats.marked_unavailable;
+    }
 }
 
 pub(crate) struct FileScanService {
@@ -112,8 +143,11 @@ impl FileScanService {
 
     pub(crate) async fn rescan_folders(&self) -> ApiResult<RescanResult> {
         let config = self.config_store.load(&self.index_db)?;
+        // The embedded update's changes are this job's changes: it no longer
+        // runs maintenance of its own, so its summary has to travel up.
+        let mut summary = ChangeSummary::default();
         if is_resync_needed(&self.index_db, &self.user_data_db, &config).await? {
-            let _ = self.run_folder_update().await?;
+            summary.or_with(self.run_folder_update().await?.summary);
         }
 
         let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
@@ -121,7 +155,7 @@ impl FileScanService {
         let excluded_folders = get_folders_from_database(&mut conn, false).await?;
         drop(conn);
 
-        let scan_ids = execute_folder_scan(
+        let (scan_ids, totals) = execute_folder_scan(
             &self.index_db,
             &self.user_data_db,
             &config,
@@ -162,14 +196,19 @@ impl FileScanService {
         })
         .await?;
 
-        let vacuum = unavailable_files_deleted > 0
+        let deleted_data = unavailable_files_deleted > 0
             || rule_files_deleted > 0
             || orphan_items_deleted > 0
             || orphan_frames_deleted > 0
             || orphan_thumbnails_deleted > 0;
-        run_post_job_maintenance(&self.index_db, vacuum).await;
+        // Maintenance is no longer run here: the queue defers it to the job
+        // boundary, where consecutive jobs on the same DB share one pass.
+        summary.or_with(ChangeSummary {
+            wrote_data: totals.wrote_data() || deleted_data,
+            deleted_data,
+        });
 
-        Ok(RescanResult { scan_ids })
+        Ok(RescanResult { scan_ids, summary })
     }
 
     pub(crate) async fn run_folder_update(&self) -> ApiResult<FolderUpdateResult> {
@@ -253,7 +292,7 @@ impl FileScanService {
             }
         }
 
-        let scan_ids = execute_folder_scan(
+        let (scan_ids, totals) = execute_folder_scan(
             &self.index_db,
             &self.user_data_db,
             &config,
@@ -302,18 +341,24 @@ impl FileScanService {
         })
         .await?;
 
-        let vacuum = unavailable_files_deleted > 0
+        let deleted_data = unavailable_files_deleted > 0
             || excluded_folder_files_deleted > 0
             || orphan_files_deleted > 0
             || rule_files_deleted > 0
             || orphan_items_deleted > 0
             || orphan_frames_deleted > 0
             || orphan_thumbnails_deleted > 0;
-        run_post_job_maintenance(&self.index_db, vacuum).await;
+        // See `rescan_folders`: reported, not run, so the job boundary can
+        // batch it.
+        let summary = ChangeSummary {
+            wrote_data: totals.wrote_data() || deleted_data,
+            deleted_data,
+        };
 
         Ok(FolderUpdateResult {
             included_added,
             scan_ids,
+            summary,
         })
     }
 }
@@ -336,10 +381,22 @@ pub(crate) async fn is_resync_needed(
     Ok(current_included != new_included || current_excluded != new_excluded)
 }
 
+/// Free-page share above which rewriting the whole database is worth it.
+const VACUUM_FREE_RATIO: f64 = 0.10;
+/// Absolute free-page count that justifies a VACUUM whatever the ratio
+/// (~10 MB at the 4 KiB default page size).
+const VACUUM_FREE_PAGES_FLOOR: i64 = 2_500;
+
 /// Post-job VACUUM/recount/ANALYZE/checkpoint. Failures are logged but never
 /// fail the job: the job's own work has already been committed at this point.
+///
+/// `vacuum` means "something was deleted"; whether that is worth a multi-minute
+/// rewrite of a multi-GB file is decided from the actual free-page counts.
 pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
-    if vacuum {
+    // Boxed: opening a connection is a large future, and this one sits inside
+    // the job queue's `execute_job` state machine, which is stack-allocated
+    // before the task is spawned.
+    if vacuum && Box::pin(vacuum_is_worthwhile(index_db)).await {
         if let Err(err) =
             call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Vacuum { reply }).await
         {
@@ -369,6 +426,52 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
     }
 }
 
+/// True when either the index or the attached storage database carries enough
+/// free pages to be worth reclaiming. Both are checked because the writer's
+/// VACUUM rewrites both, and the blobs that dominate the file size live in
+/// `storage`. A failed measurement answers "yes" — that is the behavior every
+/// caller had before the gate existed.
+async fn vacuum_is_worthwhile(index_db: &str) -> bool {
+    let mut conn = match open_index_db_read_no_user_data(index_db).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not measure free pages; vacuuming");
+            return true;
+        }
+    };
+    for (schema, free_sql, pages_sql) in [
+        ("main", "PRAGMA main.freelist_count", "PRAGMA main.page_count"),
+        (
+            "storage",
+            "PRAGMA storage.freelist_count",
+            "PRAGMA storage.page_count",
+        ),
+    ] {
+        let free: i64 = match sqlx::query_scalar(free_sql).fetch_one(&mut conn).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, index_db, schema, "free page query failed");
+                return true;
+            }
+        };
+        let pages: i64 = match sqlx::query_scalar(pages_sql).fetch_one(&mut conn).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, index_db, schema, "page count query failed");
+                return true;
+            }
+        };
+        if free >= VACUUM_FREE_PAGES_FLOOR
+            || (pages > 0 && (free as f64) / (pages as f64) > VACUUM_FREE_RATIO)
+        {
+            tracing::debug!(index_db, schema, free, pages, "vacuum gate passed");
+            return true;
+        }
+    }
+    tracing::info!(index_db, "skipping VACUUM: too few free pages to reclaim");
+    false
+}
+
 async fn execute_folder_scan(
     index_db: &str,
     user_data_db: &str,
@@ -376,7 +479,7 @@ async fn execute_folder_scan(
     included_folders: &[String],
     excluded_folders: &[String],
     options: ScanOptions,
-) -> ApiResult<Vec<i64>> {
+) -> ApiResult<(Vec<i64>, ScanTotals)> {
     let mut conn = open_index_db_read(index_db, user_data_db).await?;
     let mut all_included = Vec::new();
     for folder in included_folders {
@@ -410,6 +513,7 @@ async fn execute_folder_scan(
 
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
+    let mut totals = ScanTotals::default();
 
     for folder in starting_points {
         let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -436,6 +540,7 @@ async fn execute_folder_scan(
             options,
         )
         .await?;
+        totals.add(&stats);
 
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateFileScan {
             scan_id,
@@ -459,7 +564,7 @@ async fn execute_folder_scan(
         .await?;
     }
 
-    Ok(scan_ids)
+    Ok((scan_ids, totals))
 }
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;

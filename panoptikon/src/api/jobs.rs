@@ -50,6 +50,23 @@ pub(crate) struct LogIdQuery {
 pub(crate) struct QueueCancelQuery {
     /// List of Queue IDs to cancel
     queue_ids: Vec<i64>,
+    /// Run deferred DB maintenance after this cancel
+    #[param(nullable, default = true)]
+    run_maintenance: Option<bool>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct CancelRunningQuery {
+    /// Run deferred DB maintenance after this cancel
+    #[param(nullable, default = true)]
+    run_maintenance: Option<bool>,
+}
+
+/// The queue takes the inverse: the flag suppresses the maintenance job this
+/// cancel's boundary would otherwise synthesize (owed work is kept either way).
+fn suppress_maintenance(run_maintenance: Option<bool>) -> bool {
+    !run_maintenance.unwrap_or(true)
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -255,7 +272,11 @@ pub(crate) async fn enqueue_update_folders(
 pub(crate) async fn cancel_queued(
     Query(query): Query<QueueCancelQuery>,
 ) -> Result<Json<QueueCancelResponse>, ApiError> {
-    let cancelled = cancel_queued_jobs(query.queue_ids).await?;
+    let cancelled = cancel_queued_jobs(
+        query.queue_ids,
+        suppress_maintenance(query.run_maintenance),
+    )
+    .await?;
     if cancelled.is_empty() {
         return Err(ApiError::not_found("No matching queued jobs found."));
     }
@@ -270,12 +291,15 @@ pub(crate) async fn cancel_queued(
     path = "/api/jobs/cancel",
     tag = "jobs",
     summary = "Cancel the currently running job",
+    params(CancelRunningQuery),
     responses(
         (status = 200, description = "Running job cancelled", body = CancelResponse)
     )
 )]
-pub(crate) async fn cancel_current_job() -> Result<Json<CancelResponse>, ApiError> {
-    let cancelled = cancel_running_job().await?;
+pub(crate) async fn cancel_current_job(
+    Query(query): Query<CancelRunningQuery>,
+) -> Result<Json<CancelResponse>, ApiError> {
+    let cancelled = cancel_running_job(suppress_maintenance(query.run_maintenance)).await?;
     let job_id = cancelled.ok_or_else(|| ApiError::not_found("No job is currently running."))?;
     Ok(Json(CancelResponse {
         detail: format!("Job {job_id} cancelled."),

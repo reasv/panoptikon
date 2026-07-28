@@ -2123,6 +2123,21 @@
         ],
         "summary": "Cancel the currently running job",
         "operationId": "cancel_current_job",
+        "parameters": [
+          {
+            "name": "run_maintenance",
+            "in": "query",
+            "description": "Run deferred DB maintenance after this cancel",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": true
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Running job cancelled",
@@ -3155,6 +3170,19 @@
                 "type": "integer",
                 "format": "int64"
               }
+            }
+          },
+          {
+            "name": "run_maintenance",
+            "in": "query",
+            "description": "Run deferred DB maintenance after this cancel",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": true
             }
           }
         ],
@@ -6266,8 +6294,10 @@
           "folder_update",
           "job_data_deletion",
           "vector_quant_reconcile",
+          "db_maintenance",
           "test_sleep",
-          "test_panic"
+          "test_panic",
+          "test_report"
         ]
       },
       "LogRecord": {

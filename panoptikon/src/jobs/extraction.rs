@@ -20,7 +20,8 @@ use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
-use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
+use crate::jobs::files::{FileScanService, is_resync_needed};
+use crate::jobs::queue::ChangeSummary;
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
 use crate::jobs::timing::PhaseTimer;
 use crate::pql::builder::filters::OneOrMany;
@@ -111,7 +112,17 @@ struct JobCounters {
     inference_time: PhaseTimer,
 }
 
-pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(), String> {
+/// What an extraction job reports back to the queue: whether it changed the
+/// index (so maintenance is owed for its DB) and which batch-cache model it
+/// left loaded.
+pub(crate) struct ExtractionOutcome {
+    pub summary: ChangeSummary,
+    pub loaded_model: Option<String>,
+}
+
+pub(crate) async fn run_extraction_job(
+    job: crate::jobs::queue::Job,
+) -> Result<ExtractionOutcome, String> {
     let inference_id = job
         .metadata
         .clone()
@@ -125,10 +136,11 @@ pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(
     let result = run_extraction_job_inner(&job, &inference_id).await;
     guard.resume().await;
     match result {
-        Ok(()) => {
+        Ok(outcome) => {
             cleanup.disarm();
-            run_post_job_maintenance(&job.index_db, false).await;
-            Ok(())
+            // Maintenance is no longer run per job: the queue's boundary hook
+            // runs one pass per DB once nothing else is queued for it.
+            Ok(outcome)
         }
         Err(err) => {
             cleanup.run().await;
@@ -186,13 +198,17 @@ async fn cleanup_incomplete_jobs(index_db: &str) {
 async fn run_extraction_job_inner(
     job: &crate::jobs::queue::Job,
     inference_id: &str,
-) -> ApiResult<()> {
+) -> ApiResult<ExtractionOutcome> {
     let config_store = SystemConfigStore::from_env();
     let config = config_store.load(&job.index_db)?;
 
+    // The embedded resync no longer runs maintenance of its own, so its
+    // changes are folded into this job's report (which also removes the old
+    // double maintenance pass: once inside the update, once in the wrapper).
+    let mut summary = ChangeSummary::default();
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
-        service.run_folder_update().await?;
+        summary.or_with(service.run_folder_update().await?.summary);
     }
 
     let model = load_model_metadata(inference_id).await?;
@@ -236,7 +252,12 @@ async fn run_extraction_job_inner(
 
     if total_remaining < 1 {
         tracing::info!(inference_id, "no items to process");
-        return Ok(());
+        // Nothing loaded, nothing written: the common cron no-op reports only
+        // whatever the resync above changed.
+        return Ok(ExtractionOutcome {
+            summary,
+            loaded_model: None,
+        });
     }
 
     // Same local-time format as the writer's end_time updates so
@@ -353,7 +374,7 @@ async fn run_extraction_job_inner(
         remaining
     };
 
-    let (final_update, total_failure) = {
+    let (final_update, total_failure, processed_data) = {
         let guard = counters.lock().await;
         // Every attempted item failing means a systemic cause (inference
         // server down, model broken), not per-item bad data: surface it as a
@@ -380,7 +401,7 @@ async fn run_extraction_job_inner(
             inference_work_secs = guard.inference_time.work_secs(),
             "extraction job phase timing"
         );
-        (update, total_failure)
+        (update, total_failure, guard.processed - guard.errors > 0)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -400,10 +421,19 @@ async fn run_extraction_job_inner(
             final_update.errors
         )));
     }
-    Ok(())
+    summary.or_with(ChangeSummary {
+        wrote_data: processed_data,
+        deleted_data: false,
+    });
+    Ok(ExtractionOutcome {
+        summary,
+        loaded_model: Some(model.setter_name.clone()),
+    })
 }
 
-pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Result<(), String> {
+pub(crate) async fn run_data_deletion_job(
+    job: crate::jobs::queue::Job,
+) -> Result<ChangeSummary, String> {
     let inference_id = job
         .metadata
         .clone()
@@ -419,7 +449,7 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
 async fn run_data_deletion_job_inner(
     job: &crate::jobs::queue::Job,
     inference_id: &str,
-) -> ApiResult<()> {
+) -> ApiResult<ChangeSummary> {
     let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
     let data_types = get_setter_data_types(&mut conn, inference_id).await?;
     drop(conn);
@@ -434,10 +464,12 @@ async fn run_data_deletion_job_inner(
     })
     .await?;
 
-    // VACUUM blocks the writer for the whole run; skip it when the deletion
-    // turned out to be a no-op.
-    run_post_job_maintenance(&job.index_db, deleted > 0 || orphan_tags_deleted > 0).await;
-    Ok(())
+    // Reported, not run: the queue's boundary hook owns maintenance now, and
+    // its VACUUM is additionally gated on the actual free-page count.
+    Ok(ChangeSummary {
+        wrote_data: false,
+        deleted_data: deleted > 0 || orphan_tags_deleted > 0,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

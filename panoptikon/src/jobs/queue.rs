@@ -24,12 +24,84 @@ pub(crate) enum JobType {
     FolderUpdate,
     JobDataDeletion,
     VectorQuantReconcile,
+    /// Deferred per-DB maintenance (recount/ANALYZE/checkpoint, optional
+    /// VACUUM). Synthesized by the queue actor at a job boundary; there is
+    /// deliberately no API surface to enqueue one.
+    DbMaintenance,
     #[cfg(test)]
     #[serde(rename = "test_sleep")]
     TestSleep,
     #[cfg(test)]
     #[serde(rename = "test_panic")]
     TestPanic,
+    /// Reports the change summary encoded in `tag` (`"<delay_ms>:<flags>"`,
+    /// flags `w` = wrote_data, `d` = deleted_data), so boundary scheduling is
+    /// testable without touching a database.
+    #[cfg(test)]
+    #[serde(rename = "test_report")]
+    TestReport,
+}
+
+/// What a finished job changed in its index DB, which is what decides whether
+/// deferred maintenance is owed for that DB (and whether it should VACUUM).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ChangeSummary {
+    pub wrote_data: bool,
+    pub deleted_data: bool,
+}
+
+impl ChangeSummary {
+    fn is_empty(self) -> bool {
+        !self.wrote_data && !self.deleted_data
+    }
+
+    pub(crate) fn or_with(&mut self, other: Self) {
+        self.wrote_data |= other.wrote_data;
+        self.deleted_data |= other.deleted_data;
+    }
+
+    /// Human-readable flag list carried in the synthesized job's `metadata`,
+    /// both for queue display and to tell the maintenance arm what to run.
+    fn to_metadata(self) -> String {
+        let mut flags = Vec::new();
+        if self.wrote_data {
+            flags.push("wrote_data");
+        }
+        if self.deleted_data {
+            flags.push("deleted_data");
+        }
+        flags.join(",")
+    }
+
+    fn from_metadata(metadata: Option<&str>) -> Self {
+        let mut summary = Self::default();
+        for flag in metadata.unwrap_or_default().split(',') {
+            match flag.trim() {
+                "wrote_data" => summary.wrote_data = true,
+                "deleted_data" => summary.deleted_data = true,
+                _ => {}
+            }
+        }
+        summary
+    }
+}
+
+/// What a job reports back to the queue when it finishes successfully.
+pub(crate) struct JobSuccess {
+    pub summary: ChangeSummary,
+    /// The batch-cache model the job left loaded, if any. Recorded now;
+    /// consumed by the boundary's model-continuity rule (design phase 2).
+    #[allow(dead_code)]
+    pub loaded_model: Option<String>,
+}
+
+impl JobSuccess {
+    fn from_summary(summary: ChangeSummary) -> Self {
+        Self {
+            summary,
+            loaded_model: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +168,23 @@ pub(crate) struct JobRequest {
 pub(crate) struct JobRunResult {
     success: bool,
     error: Option<String>,
+    /// `None` when the job ended without reporting (cancelled, panicked, or
+    /// failed); the boundary then falls back to the pessimistic rule.
+    summary: Option<ChangeSummary>,
+    /// Recorded for the phase-2 model-continuity rule; nothing reads it yet.
+    #[allow(dead_code)]
+    loaded_model: Option<String>,
+}
+
+impl JobRunResult {
+    fn failed(error: String) -> Self {
+        Self {
+            success: false,
+            error: Some(error),
+            summary: None,
+            loaded_model: None,
+        }
+    }
 }
 
 /// Dedup condition for batch enqueueing: the whole batch is skipped when any
@@ -138,11 +227,15 @@ pub(crate) enum JobQueueMessage {
     GetQueueStatus {
         reply: oneshot::Sender<ApiResult<QueueStatusModel>>,
     },
+    /// `suppress_maintenance` stops *this* cancel's boundary from synthesizing
+    /// a maintenance job; the owed flags are kept for the next boundary.
     CancelQueued {
         queue_ids: Vec<i64>,
+        suppress_maintenance: bool,
         reply: oneshot::Sender<ApiResult<Vec<i64>>>,
     },
     CancelRunning {
+        suppress_maintenance: bool,
         reply: oneshot::Sender<ApiResult<Option<i64>>>,
     },
     RunnerFinished {
@@ -157,6 +250,19 @@ pub(crate) enum JobQueueMessage {
     Shutdown {
         reply: oneshot::Sender<Option<i64>>,
     },
+    /// Test-only snapshot of the boundary bookkeeping, so tests can observe
+    /// synthesis decisions without racing the synthesized job's execution.
+    #[cfg(test)]
+    DebugState {
+        reply: oneshot::Sender<QueueDebugState>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueueDebugState {
+    owed: HashMap<String, ChangeSummary>,
+    synthesized: Vec<(String, ChangeSummary)>,
 }
 
 pub(crate) struct JobQueueActor;
@@ -173,6 +279,12 @@ pub(crate) struct JobQueueState {
     job_counter: i64,
     runner: ActorRef<JobRunnerMessage>,
     shutting_down: bool,
+    /// Per-index-DB maintenance owed by jobs that already finished. Cleared
+    /// when a maintenance job is synthesized for that DB; dies with the
+    /// process (the queue is not persistent, by design).
+    owed: HashMap<String, ChangeSummary>,
+    #[cfg(test)]
+    synthesized: Vec<(String, ChangeSummary)>,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -237,6 +349,9 @@ impl Actor for JobQueueActor {
             job_counter: 0,
             runner,
             shutting_down: false,
+            owed: HashMap::new(),
+            #[cfg(test)]
+            synthesized: Vec::new(),
         })
     }
 
@@ -303,14 +418,21 @@ impl Actor for JobQueueActor {
                     outcomes: state.outcomes.iter().cloned().collect(),
                 }));
             }
-            JobQueueMessage::CancelQueued { queue_ids, reply } => {
+            JobQueueMessage::CancelQueued {
+                queue_ids,
+                suppress_maintenance,
+                reply,
+            } => {
                 let mut cancelled = Vec::new();
+                let mut removed = Vec::new();
                 for queue_id in queue_ids {
                     if let Some(running) = state.running_job.as_ref() {
                         if running.queue_id == queue_id {
                             // Only report it cancelled if the runner actually
                             // confirmed the cancellation.
-                            if cancel_running_job_inner(state).await == Some(queue_id) {
+                            if cancel_running_job_inner(state, suppress_maintenance).await
+                                == Some(queue_id)
+                            {
                                 cancelled.push(queue_id);
                             }
                             continue;
@@ -320,17 +442,30 @@ impl Actor for JobQueueActor {
                         state.queue.retain(|entry| entry.queue_id != queue_id);
                         record_outcome(state, job.queue_id, JobOutcomeStatus::Cancelled, None);
                         cancelled.push(job.queue_id);
+                        removed.push(job);
                     }
+                }
+                // Removing the last queued job for a DB is a boundary too: the
+                // maintenance its predecessors owe has nothing left to wait for.
+                if !suppress_maintenance {
+                    for job in &removed {
+                        maybe_schedule_maintenance(state, job);
+                    }
+                    start_next_job(state).await;
                 }
                 let _ = reply.send(Ok(cancelled));
             }
-            JobQueueMessage::CancelRunning { reply } => {
-                let result = cancel_running_job_inner(state).await;
+            JobQueueMessage::CancelRunning {
+                suppress_maintenance,
+                reply,
+            } => {
+                let result = cancel_running_job_inner(state, suppress_maintenance).await;
                 let _ = reply.send(Ok(result));
             }
             JobQueueMessage::RunnerFinished { queue_id, result } => {
                 if let Some(running) = state.running_job.as_ref() {
                     if running.queue_id == queue_id {
+                        let finished = running.clone();
                         let error = result.error.clone();
                         record_outcome(
                             state,
@@ -350,6 +485,11 @@ impl Actor for JobQueueActor {
                             );
                         }
                         state.running_job = None;
+                        record_owed(state, &finished, result.summary);
+                        // Before starting the next job: a maintenance job goes
+                        // to the front of the queue, which is exactly the slot
+                        // the maintenance work occupied before it was deferred.
+                        maybe_schedule_maintenance(state, &finished);
                         start_next_job(state).await;
                     }
                 }
@@ -362,8 +502,17 @@ impl Actor for JobQueueActor {
                 if dropped > 0 {
                     tracing::info!(dropped, "dropped queued jobs for shutdown");
                 }
-                let cancelled = cancel_running_job_inner(state).await;
+                // Owed maintenance dies with the process (design: accepted
+                // performance-only staleness), so shutdown never synthesizes.
+                let cancelled = cancel_running_job_inner(state, true).await;
                 let _ = reply.send(cancelled);
+            }
+            #[cfg(test)]
+            JobQueueMessage::DebugState { reply } => {
+                let _ = reply.send(QueueDebugState {
+                    owed: state.owed.clone(),
+                    synthesized: state.synthesized.clone(),
+                });
             }
         }
         Ok(())
@@ -458,7 +607,10 @@ async fn start_next_job(state: &mut JobQueueState) {
     }
 }
 
-async fn cancel_running_job_inner(state: &mut JobQueueState) -> Option<i64> {
+async fn cancel_running_job_inner(
+    state: &mut JobQueueState,
+    suppress_maintenance: bool,
+) -> Option<i64> {
     let running = state.running_job.clone()?;
     let (reply, rx) = oneshot::channel();
     if state
@@ -473,6 +625,13 @@ async fn cancel_running_job_inner(state: &mut JobQueueState) -> Option<i64> {
             if running.queue_id == queue_id {
                 state.running_job = None;
                 record_outcome(state, queue_id, JobOutcomeStatus::Cancelled, None);
+                // A cancelled job reports nothing, so the owed flags are
+                // pessimistic — but the maintenance job itself can be
+                // suppressed by the caller (this cancel only).
+                record_owed(state, &running, None);
+                if !suppress_maintenance {
+                    maybe_schedule_maintenance(state, &running);
+                }
                 start_next_job(state).await;
                 Some(queue_id)
             } else {
@@ -481,6 +640,87 @@ async fn cancel_running_job_inner(state: &mut JobQueueState) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+/// Folds a finished job's change report into the owed flags for its index DB.
+/// A job that ended without reporting (cancelled, panicked, failed) is treated
+/// pessimistically: it wrote something, and scan/deletion jobs may already have
+/// cascaded deletes. Maintenance jobs never owe maintenance.
+fn pessimistic_summary(job_type: &JobType) -> ChangeSummary {
+    ChangeSummary {
+        wrote_data: true,
+        deleted_data: matches!(
+            job_type,
+            JobType::FolderRescan
+                | JobType::FolderUpdate
+                | JobType::DataDeletion
+                | JobType::JobDataDeletion
+        ),
+    }
+}
+
+fn record_owed(state: &mut JobQueueState, job: &Job, summary: Option<ChangeSummary>) {
+    if job.job_type == JobType::DbMaintenance {
+        return;
+    }
+    let summary = summary.unwrap_or_else(|| pessimistic_summary(&job.job_type));
+    if summary.is_empty() {
+        return;
+    }
+    state
+        .owed
+        .entry(job.index_db.clone())
+        .or_default()
+        .or_with(summary);
+}
+
+/// The job boundary: when nothing else in the queue targets the finished job's
+/// index DB, the maintenance its finished jobs owe is synthesized as a real
+/// queue job at the front of the queue (visible, cancellable, and serialized
+/// against other jobs like everything else).
+fn maybe_schedule_maintenance(state: &mut JobQueueState, finished: &Job) {
+    if state.shutting_down {
+        return;
+    }
+    let index_db = finished.index_db.as_str();
+    let Some(owed) = state.owed.get(index_db).copied() else {
+        return;
+    };
+    if owed.is_empty() {
+        state.owed.remove(index_db);
+        return;
+    }
+    let db_busy = state
+        .running_job
+        .iter()
+        .chain(state.queue.iter())
+        .any(|job| job.index_db == index_db);
+    if db_busy {
+        return;
+    }
+    state.owed.remove(index_db);
+    state.job_counter += 1;
+    let job = Job {
+        queue_id: state.job_counter,
+        job_type: JobType::DbMaintenance,
+        index_db: finished.index_db.clone(),
+        user_data_db: finished.user_data_db.clone(),
+        metadata: Some(owed.to_metadata()),
+        batch_size: None,
+        threshold: None,
+        log_id: None,
+        tag: None,
+    };
+    tracing::info!(
+        index_db,
+        queue_id = job.queue_id,
+        owed = %owed.to_metadata(),
+        "scheduling deferred database maintenance"
+    );
+    #[cfg(test)]
+    state.synthesized.push((finished.index_db.clone(), owed));
+    state.queue.push_front(job.clone());
+    state.queued_jobs.insert(job.queue_id, job);
 }
 
 impl Actor for JobRunnerActor {
@@ -521,22 +761,19 @@ impl Actor for JobRunnerActor {
                 let runner = myself.clone();
                 tokio::spawn(async move {
                     let result = match inner.await {
-                        Ok(Ok(())) => JobRunResult {
+                        Ok(Ok(success)) => JobRunResult {
                             success: true,
                             error: None,
+                            summary: Some(success.summary),
+                            loaded_model: success.loaded_model,
                         },
-                        Ok(Err(err)) => JobRunResult {
-                            success: false,
-                            error: Some(err),
-                        },
-                        Err(join_err) if join_err.is_cancelled() => JobRunResult {
-                            success: false,
-                            error: Some("Job cancelled".to_string()),
-                        },
-                        Err(join_err) => JobRunResult {
-                            success: false,
-                            error: Some(format!("Job panicked: {join_err}")),
-                        },
+                        Ok(Err(err)) => JobRunResult::failed(err),
+                        Err(join_err) if join_err.is_cancelled() => {
+                            JobRunResult::failed("Job cancelled".to_string())
+                        }
+                        Err(join_err) => {
+                            JobRunResult::failed(format!("Job panicked: {join_err}"))
+                        }
                     };
                     let _ =
                         runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
@@ -575,7 +812,39 @@ impl Actor for JobRunnerActor {
     }
 }
 
-async fn execute_job(job: Job) -> Result<(), String> {
+/// The deferred maintenance pass, gated by the flags the boundary recorded in
+/// `metadata`. Boxed at the call site: it opens connections and is otherwise
+/// inlined into `execute_job`'s state machine.
+#[cfg(not(test))]
+async fn run_db_maintenance(job: &Job) {
+    let summary = ChangeSummary::from_metadata(job.metadata.as_deref());
+    // Paused for the same reason every write-heavy job pauses: a VACUUM must
+    // not stall continuous-scan writes mid-flight.
+    let guard = match continuous_scan::pause_for_job_guarded(&job.index_db).await {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                index_db = %job.index_db,
+                "could not pause continuous scan for maintenance; running it anyway"
+            );
+            None
+        }
+    };
+    crate::jobs::files::run_post_job_maintenance(&job.index_db, summary.deleted_data).await;
+    if let Some(guard) = guard {
+        guard.resume().await;
+    }
+}
+
+/// Queue tests drive the boundary against index DBs that do not exist. Running
+/// the real pass there would create stray databases and pull the
+/// continuous-scan supervisor into every test; the scheduling decision itself
+/// is asserted through `QueueDebugState`.
+#[cfg(test)]
+async fn run_db_maintenance(_job: &Job) {}
+
+async fn execute_job(job: Job) -> Result<JobSuccess, String> {
     match job.job_type {
         JobType::FolderRescan => {
             let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
@@ -584,9 +853,9 @@ async fn execute_job(job: Job) -> Result<(), String> {
             let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
             let result = service.rescan_folders().await;
             guard.resume().await;
-            result.map_err(|err| format!("{err:?}"))?;
+            let result = result.map_err(|err| format!("{err:?}"))?;
             vector_quants::finishing_phase(&job.index_db).await;
-            Ok(())
+            Ok(JobSuccess::from_summary(result.summary))
         }
         JobType::FolderUpdate => {
             let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
@@ -595,27 +864,30 @@ async fn execute_job(job: Job) -> Result<(), String> {
             let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db);
             let result = service.run_folder_update().await;
             guard.resume().await;
-            result.map_err(|err| format!("{err:?}"))?;
+            let result = result.map_err(|err| format!("{err:?}"))?;
             vector_quants::finishing_phase(&job.index_db).await;
-            Ok(())
+            Ok(JobSuccess::from_summary(result.summary))
         }
         JobType::DataExtraction => {
-            extraction::run_extraction_job(job.clone())
+            let outcome = extraction::run_extraction_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
             vector_quants::finishing_phase(&job.index_db).await;
-            Ok(())
+            Ok(JobSuccess {
+                summary: outcome.summary,
+                loaded_model: outcome.loaded_model,
+            })
         }
         JobType::DataDeletion => {
-            extraction::run_data_deletion_job(job.clone())
+            let summary = extraction::run_data_deletion_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
             vector_quants::finishing_phase(&job.index_db).await;
-            Ok(())
+            Ok(JobSuccess::from_summary(summary))
         }
         JobType::JobDataDeletion => {
             let log_id = job.log_id.ok_or_else(|| "Log ID required".to_string())?;
-            // Paused like every other write-heavy job so the potential
+            // Paused like every other write-heavy job so the deferred
             // VACUUM doesn't stall continuous-scan writes mid-flight.
             let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
                 .await
@@ -624,20 +896,13 @@ async fn execute_job(job: Job) -> Result<(), String> {
                 IndexDbWriterMessage::DeleteJobData { log_id, reply }
             })
             .await;
-            match deleted {
-                Ok(deleted) => {
-                    // VACUUM blocks the writer for the whole run; skip it
-                    // when the deletion turned out to be a no-op.
-                    crate::jobs::files::run_post_job_maintenance(&job.index_db, deleted > 0).await;
-                    guard.resume().await;
-                    vector_quants::finishing_phase(&job.index_db).await;
-                    Ok(())
-                }
-                Err(err) => {
-                    guard.resume().await;
-                    Err(format!("{err:?}"))
-                }
-            }
+            guard.resume().await;
+            let deleted = deleted.map_err(|err| format!("{err:?}"))?;
+            vector_quants::finishing_phase(&job.index_db).await;
+            Ok(JobSuccess::from_summary(ChangeSummary {
+                wrote_data: false,
+                deleted_data: deleted > 0,
+            }))
         }
         JobType::VectorQuantReconcile => {
             // No continuous-scan pause: the reconcile touches only quant
@@ -646,7 +911,18 @@ async fn execute_job(job: Job) -> Result<(), String> {
             crate::jobs::vector_quants::run_reconcile(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
-            Ok(())
+            // Reports nothing: the reconcile never ran post-job maintenance
+            // and its quant tables are outside what recount/ANALYZE serve.
+            Ok(JobSuccess::from_summary(ChangeSummary::default()))
+        }
+        JobType::DbMaintenance => {
+            // Never fails: this is the same contract the maintenance pass has
+            // always had (its work is bookkeeping on top of already-committed
+            // job output), and a failure here would only be noise in the
+            // queue's outcome list.
+            Box::pin(run_db_maintenance(&job)).await;
+            // Maintenance changes no indexed data, so it never owes more.
+            Ok(JobSuccess::from_summary(ChangeSummary::default()))
         }
         #[cfg(test)]
         JobType::TestSleep => {
@@ -656,10 +932,21 @@ async fn execute_job(job: Job) -> Result<(), String> {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(200);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            Ok(())
+            Ok(JobSuccess::from_summary(ChangeSummary::default()))
         }
         #[cfg(test)]
         JobType::TestPanic => panic!("test job panic"),
+        #[cfg(test)]
+        JobType::TestReport => {
+            let tag = job.tag.clone().unwrap_or_default();
+            let (delay, flags) = tag.split_once(':').unwrap_or(("0", tag.as_str()));
+            let delay = delay.parse::<u64>().unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            Ok(JobSuccess::from_summary(ChangeSummary {
+                wrote_data: flags.contains('w'),
+                deleted_data: flags.contains('d'),
+            }))
+        }
     }
 }
 
@@ -704,21 +991,35 @@ pub(crate) async fn get_queue_status() -> ApiResult<QueueStatusModel> {
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
 }
 
-pub(crate) async fn cancel_queued_jobs(queue_ids: Vec<i64>) -> ApiResult<Vec<i64>> {
+/// `suppress_maintenance` keeps the boundary this cancel triggers from
+/// synthesizing a deferred maintenance job (the owed flags survive for the
+/// next boundary).
+pub(crate) async fn cancel_queued_jobs(
+    queue_ids: Vec<i64>,
+    suppress_maintenance: bool,
+) -> ApiResult<Vec<i64>> {
     let queue = ensure_job_queue().await?;
     let (reply, rx) = oneshot::channel();
     queue
-        .send_message(JobQueueMessage::CancelQueued { queue_ids, reply })
+        .send_message(JobQueueMessage::CancelQueued {
+            queue_ids,
+            suppress_maintenance,
+            reply,
+        })
         .map_err(|_| ApiError::internal("Job queue unavailable"))?;
     rx.await
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
 }
 
-pub(crate) async fn cancel_running_job() -> ApiResult<Option<i64>> {
+/// See [`cancel_queued_jobs`] for `suppress_maintenance`.
+pub(crate) async fn cancel_running_job(suppress_maintenance: bool) -> ApiResult<Option<i64>> {
     let queue = ensure_job_queue().await?;
     let (reply, rx) = oneshot::channel();
     queue
-        .send_message(JobQueueMessage::CancelRunning { reply })
+        .send_message(JobQueueMessage::CancelRunning {
+            suppress_maintenance,
+            reply,
+        })
         .map_err(|_| ApiError::internal("Job queue unavailable"))?;
     rx.await
         .map_err(|_| ApiError::internal("Job queue dropped response"))?
@@ -798,14 +1099,83 @@ mod tests {
     }
 
     async fn cancel_on(queue: &ActorRef<JobQueueMessage>, ids: Vec<i64>) -> Vec<i64> {
+        cancel_on_with(queue, ids, false).await
+    }
+
+    async fn cancel_on_with(
+        queue: &ActorRef<JobQueueMessage>,
+        ids: Vec<i64>,
+        suppress_maintenance: bool,
+    ) -> Vec<i64> {
         let (reply, rx) = oneshot::channel();
         queue
             .send_message(JobQueueMessage::CancelQueued {
                 queue_ids: ids,
+                suppress_maintenance,
                 reply,
             })
             .unwrap();
         rx.await.unwrap().unwrap()
+    }
+
+    async fn debug_on(queue: &ActorRef<JobQueueMessage>) -> QueueDebugState {
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::DebugState { reply })
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// A job that reports the change summary encoded in its tag, so the
+    /// boundary logic can be driven without touching a database.
+    fn report_job(index_db: &str, tag: &str) -> JobRequest {
+        JobRequest {
+            job_type: JobType::TestReport,
+            index_db: index_db.to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some(tag.to_string()),
+        }
+    }
+
+    fn sleep_job(index_db: &str, millis: u64) -> JobRequest {
+        JobRequest {
+            job_type: JobType::TestSleep,
+            index_db: index_db.to_string(),
+            user_data_db: "default".to_string(),
+            metadata: None,
+            batch_size: None,
+            threshold: None,
+            log_id: None,
+            tag: Some(millis.to_string()),
+        }
+    }
+
+    /// Per-test index DB name: the synthesized maintenance job really runs,
+    /// and its writer must not collide with another test's database.
+    fn unique_db(prefix: &str) -> String {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "{prefix}-{}",
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    async fn wait_for<F: Fn(&QueueDebugState) -> bool>(
+        queue: &ActorRef<JobQueueMessage>,
+        predicate: F,
+    ) -> QueueDebugState {
+        for _ in 0..200 {
+            let state = debug_on(queue).await;
+            if predicate(&state) {
+                return state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached: {:?}", debug_on(queue).await);
     }
 
     #[tokio::test]
@@ -1083,21 +1453,16 @@ mod tests {
     #[tokio::test]
     async fn cancel_running_job_clears_state() {
         let (queue, handle) = spawn_test_queue().await;
-        let job = JobRequest {
-            job_type: JobType::TestSleep,
-            index_db: "default".to_string(),
-            user_data_db: "default".to_string(),
-            metadata: None,
-            batch_size: None,
-            threshold: None,
-            log_id: None,
-            tag: Some("500".to_string()),
-        };
-        let running = enqueue_on(&queue, job).await;
+        // Own DB name: cancelling a running job owes pessimistic maintenance,
+        // which the boundary immediately synthesizes and runs for real.
+        let running = enqueue_on(&queue, sleep_job(&unique_db("cancel-running"), 500)).await;
 
         let (reply, rx) = oneshot::channel();
         queue
-            .send_message(JobQueueMessage::CancelRunning { reply })
+            .send_message(JobQueueMessage::CancelRunning {
+                suppress_maintenance: false,
+                reply,
+            })
             .unwrap();
         let cancelled = rx.await.unwrap().unwrap();
         assert_eq!(cancelled, Some(running.queue_id));
@@ -1109,6 +1474,252 @@ mod tests {
                 .iter()
                 .all(|entry| entry.queue_id != running.queue_id)
         );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Deferred maintenance is per DB and per queue drain: while more jobs for
+    // the same DB are queued the owed flags just accumulate, and only the last
+    // one's completion synthesizes a single maintenance job carrying the
+    // union of what the finished jobs changed.
+    #[tokio::test]
+    async fn maintenance_waits_until_the_db_has_no_more_jobs() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-batch");
+        // The second job is deliberately slow so the "owed but not yet
+        // scheduled" window is observable without racing it.
+        let _first = enqueue_on(&queue, report_job(&db, "10:w")).await;
+        let _second = enqueue_on(&queue, report_job(&db, "600:d")).await;
+
+        // After the first job: owed, but nothing synthesized — its successor
+        // still targets the same DB.
+        let state = wait_for(&queue, |state| state.owed.contains_key(&db)).await;
+        assert_eq!(
+            state.owed.get(&db).copied(),
+            Some(ChangeSummary {
+                wrote_data: true,
+                deleted_data: false
+            })
+        );
+        assert!(state.synthesized.is_empty(), "too early: {state:?}");
+
+        // After the second: one maintenance job for the union of both.
+        let state = wait_for(&queue, |state| !state.synthesized.is_empty()).await;
+        assert_eq!(
+            state.synthesized,
+            vec![(
+                db.clone(),
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: true
+                }
+            )]
+        );
+        assert!(!state.owed.contains_key(&db), "owed not cleared: {state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // A job that reports "nothing changed" owes nothing, so an idle cron pass
+    // over an unchanged database never schedules a maintenance job.
+    #[tokio::test]
+    async fn no_maintenance_when_nothing_changed() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-empty");
+        let job = enqueue_on(&queue, report_job(&db, "10:")).await;
+
+        // Give the completion (and any boundary it would trigger) time to land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let state = debug_on(&queue).await;
+        assert!(state.owed.is_empty(), "nothing should be owed: {state:?}");
+        assert!(
+            state.synthesized.is_empty(),
+            "nothing should be synthesized: {state:?}"
+        );
+        let status = status_on(&queue).await;
+        assert!(status.queue.is_empty(), "queue should be idle: {status:?}");
+        assert!(status.outcomes.iter().any(|outcome| {
+            outcome.queue_id == job.queue_id && outcome.status == JobOutcomeStatus::Completed
+        }));
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // `suppress_maintenance` only suppresses the maintenance job this cancel
+    // would trigger: the work stays owed and the next natural boundary — the
+    // completion of a later job for that DB — schedules it.
+    #[tokio::test]
+    async fn suppressed_cancel_keeps_owed_for_the_next_boundary() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-suppress");
+        let _first = enqueue_on(&queue, report_job(&db, "10:w")).await;
+        let queued = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+
+        let state = wait_for(&queue, |state| state.owed.contains_key(&db)).await;
+        assert!(state.synthesized.is_empty(), "too early: {state:?}");
+
+        // Cancelling the last queued job for the DB is a boundary, but this
+        // cancel opted out.
+        let cancelled = cancel_on_with(&queue, vec![queued.queue_id], true).await;
+        assert_eq!(cancelled, vec![queued.queue_id]);
+        let state = debug_on(&queue).await;
+        assert!(
+            state.owed.contains_key(&db),
+            "owed must survive a suppressed cancel: {state:?}"
+        );
+        assert!(state.synthesized.is_empty(), "suppressed: {state:?}");
+
+        // The next completed job for the same DB pays the debt.
+        let _later = enqueue_on(&queue, report_job(&db, "10:")).await;
+        let state = wait_for(&queue, |state| !state.synthesized.is_empty()).await;
+        assert_eq!(
+            state.synthesized,
+            vec![(
+                db.clone(),
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: false
+                }
+            )]
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // A cancelled job reports nothing, so the boundary assumes the worst: it
+    // wrote, and — being a scan — may already have cascaded deletes, which is
+    // what decides whether the maintenance job vacuums.
+    #[tokio::test]
+    async fn cancelled_job_owes_pessimistic_maintenance() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-pessimistic");
+        let running = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+
+        // Suppressed so the owed flags stay observable instead of being
+        // consumed by the maintenance job this cancel would otherwise start.
+        let cancelled = cancel_on_with(&queue, vec![running.queue_id], true).await;
+        assert_eq!(cancelled, vec![running.queue_id]);
+
+        let state = debug_on(&queue).await;
+        assert_eq!(
+            state.owed.get(&db).copied(),
+            Some(ChangeSummary {
+                wrote_data: true,
+                deleted_data: false
+            }),
+            "a cancelled job must be assumed to have written: {state:?}"
+        );
+        assert!(state.synthesized.is_empty(), "suppressed: {state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The synthesized job carries its owed flags in `metadata` — that string is
+    // both the queue's display text and how the maintenance arm learns whether
+    // it may VACUUM, so it has to survive the round trip.
+    #[test]
+    fn change_summary_metadata_round_trips() {
+        for summary in [
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: false,
+            },
+            ChangeSummary {
+                wrote_data: false,
+                deleted_data: true,
+            },
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: true,
+            },
+        ] {
+            let metadata = summary.to_metadata();
+            assert_eq!(ChangeSummary::from_metadata(Some(&metadata)), summary);
+        }
+        assert_eq!(ChangeSummary::from_metadata(None), ChangeSummary::default());
+        assert_eq!(
+            ChangeSummary::from_metadata(Some("nonsense")),
+            ChangeSummary::default()
+        );
+    }
+
+    // The pessimistic fallback also has to assume deletions for the job types
+    // that cascade them, since a cancelled scan may already have removed rows
+    // and only a VACUUM reclaims their pages.
+    #[test]
+    fn pessimistic_summary_assumes_deletes_for_deleting_job_types() {
+        for job_type in [
+            JobType::FolderRescan,
+            JobType::FolderUpdate,
+            JobType::DataDeletion,
+            JobType::JobDataDeletion,
+        ] {
+            assert_eq!(
+                pessimistic_summary(&job_type),
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: true
+                },
+                "{job_type:?} may have cascaded deletes"
+            );
+        }
+        for job_type in [JobType::DataExtraction, JobType::VectorQuantReconcile] {
+            assert_eq!(
+                pessimistic_summary(&job_type),
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: false
+                },
+                "{job_type:?} never deletes"
+            );
+        }
+    }
+
+    // The maintenance job is a normal queue row: cancelling it does not put
+    // its flags back, so it is not immediately resurrected by the next
+    // boundary. Its work is simply skipped until something changes again.
+    #[tokio::test]
+    async fn cancelling_maintenance_does_not_resurrect_it() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("owed-cancel-maint");
+        let other_db = unique_db("owed-cancel-other");
+        // Order matters: the reporting job runs first, a long job for another
+        // DB then occupies the runner, and the last job for `db` is cancelled
+        // while queued — so the synthesized maintenance job stays queued and
+        // can be observed and cancelled instead of running immediately.
+        let _reporting = enqueue_on(&queue, report_job(&db, "10:w")).await;
+        let _blocker = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        let last = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+
+        wait_for(&queue, |state| state.owed.contains_key(&db)).await;
+        let cancelled = cancel_on(&queue, vec![last.queue_id]).await;
+        assert_eq!(cancelled, vec![last.queue_id]);
+
+        let state = debug_on(&queue).await;
+        assert_eq!(state.synthesized.len(), 1, "expected synthesis: {state:?}");
+        let status = status_on(&queue).await;
+        let maintenance = status
+            .queue
+            .iter()
+            .find(|entry| entry.job_type == JobType::DbMaintenance)
+            .expect("maintenance job should be queued");
+        assert_eq!(maintenance.index_db, db);
+        assert_eq!(maintenance.metadata.as_deref(), Some("wrote_data"));
+        assert!(!maintenance.running);
+
+        let cancelled = cancel_on(&queue, vec![maintenance.queue_id]).await;
+        assert_eq!(cancelled, vec![maintenance.queue_id]);
+        let state = debug_on(&queue).await;
+        assert!(
+            !state.owed.contains_key(&db),
+            "cancelled maintenance must not re-own its flags: {state:?}"
+        );
+        assert_eq!(state.synthesized.len(), 1, "no second synthesis: {state:?}");
 
         queue.stop(None);
         handle.await.unwrap();
