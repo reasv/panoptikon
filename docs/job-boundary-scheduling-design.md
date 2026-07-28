@@ -154,11 +154,16 @@ surface and decisions (when is "idle", what may fire on startup) that
 aren't justified yet.
 
 **VACUUM gate improvement (recommended, independent).** Replace/augment the
-`deleted_data` flag with a measurement:
-`PRAGMA freelist_count` / `PRAGMA page_count` at boundary time, vacuum only
-above a threshold (e.g. free ratio > 10% or free pages > some absolute
-floor). This decouples "we deleted something" from "a multi-minute rewrite of
-a 10 GB file is worth it" and is strictly better than guessing from job type.
+`deleted_data` flag with a measurement: `PRAGMA freelist_count` /
+`PRAGMA page_count` at boundary time, and vacuum only when
+`(free/pages >= 10% AND free >= 2,500 pages) OR free >= 250,000 pages`. The
+ratio is the primary signal (a VACUUM costs in proportion to the file, so the
+payoff must too); the small floor `AND`ed with it only suppresses trivial
+rewrites of small databases; the large absolute trigger (~1 GB at 4 KiB
+pages) catches huge databases where 10% is never reached but gigabytes are
+reclaimable. This decouples "we deleted something" from "a multi-minute
+rewrite of a 10 GB file is worth it" and is strictly better than guessing
+from job type.
 
 ### B. Model continuity across extraction jobs
 
@@ -302,9 +307,9 @@ server-only; phase 4 is the UI. File references are to the current tree.
   never contributes to `owed`.
 - Vacuum gate inside `run_post_job_maintenance`: when the boundary flags
   say `deleted_data`, open a read connection and check
-  `PRAGMA freelist_count` vs `PRAGMA page_count`; VACUUM only when free
-  ratio > ~10% or free pages exceed an absolute floor. (Thresholds as
-  consts, tuned later.)
+  `PRAGMA freelist_count` vs `PRAGMA page_count`; VACUUM only when
+  `(free/pages >= 10% AND free >= 2,500 pages) OR free >= 250,000 pages`.
+  (Thresholds as consts, tuned later.)
 - `JobQueueState` gains `owed: HashMap<String, ChangeSummary>`. On
   `RunnerFinished`: OR the reported summary into `owed[index_db]`; when the
   result carries no summary (cancel/panic/error), use the pessimistic rule —

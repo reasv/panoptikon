@@ -208,7 +208,14 @@ async fn run_extraction_job_inner(
     let mut summary = ChangeSummary::default();
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
-        summary.or_with(service.run_folder_update().await?.summary);
+        let resync = service.run_folder_update().await?.summary;
+        // Reported to the queue *now*, before the inference work that can fail
+        // or be cancelled: the resync may have deleted tens of thousands of
+        // files, and that debt must not die with this job. The success path
+        // reports it again through `summary`; the flags are ORs, so a double
+        // report is harmless.
+        crate::jobs::queue::record_owed_now(&job.index_db, resync);
+        summary.or_with(resync);
     }
 
     let model = load_model_metadata(inference_id).await?;

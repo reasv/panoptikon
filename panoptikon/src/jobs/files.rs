@@ -87,24 +87,34 @@ pub(crate) struct FolderUpdateResult {
 #[derive(Default, Clone, Copy)]
 struct ScanTotals {
     new_items: i64,
+    /// Files whose contents did not change. They are *not* free: every one of
+    /// them still gets an `UPDATE files SET scan_id …`, so a rescan that finds
+    /// nothing new still grows the WAL and still owes a checkpoint.
+    unchanged_files: i64,
     new_files: i64,
     modified_files: i64,
     marked_unavailable: i64,
+    /// Thumbnail/frame/blurhash rows written for already-indexed content.
+    backfilled_visuals: i64,
 }
 
 impl ScanTotals {
     fn wrote_data(self) -> bool {
         self.new_items > 0
+            || self.unchanged_files > 0
             || self.new_files > 0
             || self.modified_files > 0
             || self.marked_unavailable > 0
+            || self.backfilled_visuals > 0
     }
 
     fn add(&mut self, stats: &FolderStats) {
         self.new_items += stats.new_items;
+        self.unchanged_files += stats.unchanged_files;
         self.new_files += stats.new_files;
         self.modified_files += stats.modified_files;
         self.marked_unavailable += stats.marked_unavailable;
+        self.backfilled_visuals += stats.backfilled_visuals;
     }
 }
 
@@ -381,11 +391,18 @@ pub(crate) async fn is_resync_needed(
     Ok(current_included != new_included || current_excluded != new_excluded)
 }
 
-/// Free-page share above which rewriting the whole database is worth it.
+/// Free-page share above which rewriting the whole database is worth it. This
+/// is the primary signal: the cost of a VACUUM scales with the file, so the
+/// payoff has to as well.
 const VACUUM_FREE_RATIO: f64 = 0.10;
-/// Absolute free-page count that justifies a VACUUM whatever the ratio
-/// (~10 MB at the 4 KiB default page size).
+/// Floor under the ratio (`AND`, not `OR`): on a small database 10% is a
+/// handful of pages, and rewriting it buys nothing. ~10 MB at the 4 KiB
+/// default page size.
 const VACUUM_FREE_PAGES_FLOOR: i64 = 2_500;
+/// Free-page count that justifies a VACUUM on its own, for the databases where
+/// 10% is never reached but gigabytes are still reclaimable (~1 GB at 4 KiB
+/// pages).
+const VACUUM_FREE_PAGES_ABSOLUTE: i64 = 250_000;
 
 /// Post-job VACUUM/recount/ANALYZE/checkpoint. Failures are logged but never
 /// fail the job: the job's own work has already been committed at this point.
@@ -461,9 +478,10 @@ async fn vacuum_is_worthwhile(index_db: &str) -> bool {
                 return true;
             }
         };
-        if free >= VACUUM_FREE_PAGES_FLOOR
-            || (pages > 0 && (free as f64) / (pages as f64) > VACUUM_FREE_RATIO)
-        {
+        let ratio_worthwhile = pages > 0
+            && (free as f64) / (pages as f64) >= VACUUM_FREE_RATIO
+            && free >= VACUUM_FREE_PAGES_FLOOR;
+        if ratio_worthwhile || free >= VACUUM_FREE_PAGES_ABSOLUTE {
             tracing::debug!(index_db, schema, free, pages, "vacuum gate passed");
             return true;
         }
@@ -586,6 +604,8 @@ struct FolderStats {
     new_files: i64,
     modified_files: i64,
     marked_unavailable: i64,
+    /// Not persisted on the scan row; only feeds [`ScanTotals::wrote_data`].
+    backfilled_visuals: i64,
     errors: i64,
     total_available: i64,
     false_changes: i64,
@@ -615,6 +635,7 @@ impl FolderStats {
             new_files: 0,
             modified_files: 0,
             marked_unavailable: 0,
+            backfilled_visuals: 0,
             errors: 0,
             total_available: 0,
             false_changes: 0,
@@ -1102,9 +1123,15 @@ impl ScanContext {
                 .await
                 .unwrap_or(false);
 
+        // Counted whether or not the individual stores succeed: an attempted
+        // write is enough for the WAL to have grown, which is what the
+        // boundary's `wrote_data` flag is about.
+        let mut wrote_visuals = false;
+
         // Storage failures for backfilled visuals are logged and skipped so a
         // single bad file cannot abort the scan; the next scan retries them.
         if !backfill.thumbnails.is_empty() && !already_stored {
+            wrote_visuals = true;
             if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreThumbnails {
                     sha256: backfill.sha256.clone(),
@@ -1124,6 +1151,7 @@ impl ScanContext {
             .await
             .unwrap_or(false);
         if !backfill.extracted_frames.is_empty() && !frames_stored {
+            wrote_visuals = true;
             if let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
                     sha256: backfill.sha256.clone(),
@@ -1139,6 +1167,7 @@ impl ScanContext {
         }
 
         if let Some(blurhash) = &backfill.blurhash {
+            wrote_visuals = true;
             if let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::SetBlurhash {
                     sha256: backfill.sha256.clone(),
@@ -1149,6 +1178,10 @@ impl ScanContext {
             {
                 tracing::error!(error = ?err, "failed to set blurhash");
             }
+        }
+
+        if wrote_visuals {
+            self.stats.backfilled_visuals += 1;
         }
     }
 
@@ -3129,6 +3162,65 @@ mod tests {
     fn next_db_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         format!("testdb_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    // The VACUUM gate decides from a measurement (`PRAGMA freelist_count` vs
+    // `page_count`, on `main` and the attached `storage`), and that
+    // measurement had no coverage anywhere: a freshly migrated database must
+    // not be rewritten, a heavily deleted one must be, and the full
+    // maintenance pass must survive a real database end to end.
+    #[tokio::test]
+    async fn vacuum_gate_follows_the_free_page_counts() {
+        let _test_env = test_data_dir();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        assert!(
+            !vacuum_is_worthwhile(&index_db).await,
+            "a freshly migrated database has nothing worth reclaiming"
+        );
+
+        // Thousands of pages of payload, then deleted: with auto_vacuum off
+        // the pages stay on the freelist until a VACUUM reclaims them, which
+        // clears both the 2,500-page floor and the 10% ratio.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE vacuum_gate_scratch (payload BLOB)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let payload = vec![0_u8; 8192];
+            for _ in 0..3_000 {
+                sqlx::query("INSERT INTO vacuum_gate_scratch (payload) VALUES (?)")
+                    .bind(payload.as_slice())
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("DELETE FROM vacuum_gate_scratch")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vacuum_is_worthwhile(&index_db).await,
+            "thousands of freed pages must pass the gate"
+        );
+
+        // The pass never reports failure, so this is the only way a broken
+        // step shows up at all — and the reclaimed pages prove the VACUUM
+        // really ran.
+        run_post_job_maintenance(&index_db, true).await;
+        assert!(
+            !vacuum_is_worthwhile(&index_db).await,
+            "the VACUUM should have reclaimed the freed pages"
+        );
     }
 
     // Folder validity gates which configured folders get scanned: missing
