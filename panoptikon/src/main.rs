@@ -529,6 +529,10 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .route("/api/jobs/cancel", post(api::jobs::cancel_current_job))
             .route(
+                "/api/jobs/maintenance",
+                post(api::jobs::enqueue_maintenance),
+            )
+            .route(
                 "/api/jobs/folders/history",
                 get(api::jobs::get_scan_history),
             )

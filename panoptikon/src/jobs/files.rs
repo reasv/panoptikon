@@ -216,6 +216,9 @@ impl FileScanService {
         summary.or_with(ChangeSummary {
             wrote_data: totals.wrote_data() || deleted_data,
             deleted_data,
+            // Adding files cannot change a tag count; removing items can, via
+            // the cascade into `tags_items`.
+            tags_changed: deleted_data,
         });
 
         Ok(RescanResult { scan_ids, summary })
@@ -363,6 +366,8 @@ impl FileScanService {
         let summary = ChangeSummary {
             wrote_data: totals.wrote_data() || deleted_data,
             deleted_data,
+            // See `rescan_folders`: only the deletions reach `tags_items`.
+            tags_changed: deleted_data,
         };
 
         Ok(FolderUpdateResult {
@@ -409,7 +414,12 @@ const VACUUM_FREE_PAGES_ABSOLUTE: i64 = 250_000;
 ///
 /// `vacuum` means "something was deleted"; whether that is worth a multi-minute
 /// rewrite of a multi-GB file is decided from the actual free-page counts.
-pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
+///
+/// `tags_changed` is the owed flag the boundary recorded; the durable marker
+/// stands in for everything that flag cannot know (writes committed by a job
+/// that was then killed, and the continuous scan, which is not a queue job and
+/// has no boundary). Either one runs the recount.
+pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool, tags_changed: bool) {
     // Boxed: opening a connection is a large future, and this one sits inside
     // the job queue's `execute_job` state machine, which is stack-allocated
     // before the task is spawned.
@@ -421,11 +431,15 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
         }
     }
     // Before ANALYZE, so the statistics are sampled from the updated table.
-    // Unconditional: tagging jobs add rows and scans remove them via cascade,
-    // and neither is distinguishable here without extra bookkeeping. The index
-    // epoch is no guard either — every job that does anything bumps it.
-    if let Err(err) =
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems { reply }).await
+    // Gated, unlike ANALYZE and the checkpoint: this is a full rebuild of
+    // every `tags.item_count` and the only step whose cost scales with the
+    // size of the tag data. A drain of pure no-deletion rescans now skips it
+    // entirely. The recount clears the marker in its own transaction.
+    if (tags_changed || Box::pin(tags_are_dirty(index_db)).await)
+        && let Err(err) = call_index_db_writer(index_db, |reply| {
+            IndexDbWriterMessage::RecountTagItems { reply }
+        })
+        .await
     {
         tracing::error!(error = ?err, index_db, "failed to recount tag item counts");
     }
@@ -440,6 +454,31 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Checkpoint { reply }).await
     {
         tracing::error!(error = ?err, index_db, "failed to checkpoint index database");
+    }
+}
+
+/// The durable tags-dirty marker: "something changed `tags_items` since the
+/// last successful recount". Read on a plain read connection — this runs
+/// inside the maintenance job, which is serialized against every other job and
+/// pauses the continuous scan, so there is nothing to race.
+///
+/// A failed read answers "yes", which is the pre-gate behavior: recounting
+/// when it was not needed costs one rebuild, while skipping when it was needed
+/// leaves the counts (and the autocomplete ordering they drive) wrong.
+async fn tags_are_dirty(index_db: &str) -> bool {
+    let mut conn = match open_index_db_read_no_user_data(index_db).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not read the tags-dirty marker; recounting");
+            return true;
+        }
+    };
+    match crate::db::maintenance_state::read_tags_dirty(&mut conn).await {
+        Ok(dirty) => dirty,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not read the tags-dirty marker; recounting");
+            true
+        }
     }
 }
 
@@ -3216,10 +3255,97 @@ mod tests {
         // The pass never reports failure, so this is the only way a broken
         // step shows up at all — and the reclaimed pages prove the VACUUM
         // really ran.
-        run_post_job_maintenance(&index_db, true).await;
+        run_post_job_maintenance(&index_db, true, true).await;
         assert!(
             !vacuum_is_worthwhile(&index_db).await,
             "the VACUUM should have reclaimed the freed pages"
+        );
+    }
+
+    // The recount is the one maintenance step that is gated, and both halves
+    // of the gate matter: the owed flag is what a job that knows it wrote tags
+    // passes in, and the durable marker is what covers everything the flags
+    // cannot survive (a killed job, the continuous scan). `tags.item_count` is
+    // the observable: the recount rewrites it, so a deliberately wrong value
+    // that survives a pass proves the pass skipped it.
+    #[tokio::test]
+    async fn the_recount_runs_only_for_the_flag_or_the_marker() {
+        let _test_env = test_data_dir();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // One tagged item, written directly: this test is about the gate, not
+        // about the writer paths that set the marker.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            for statement in [
+                "INSERT INTO items (sha256, md5, type, time_added) \
+                 VALUES ('sha-gate', 'md5-gate', 'image/png', '2026-01-01')",
+                "INSERT INTO setters (name) VALUES ('gate/tagger')",
+                "INSERT INTO item_data \
+                     (item_id, job_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+                 SELECT items.id, NULL, setters.id, 'tags', 0, 1, 0 FROM items, setters",
+                "INSERT INTO tags (namespace, name) VALUES ('general', 'gate-tag')",
+                "INSERT INTO tags_items (item_data_id, tag_id, confidence, item_id) \
+                 SELECT item_data.id, tags.id, 1.0, item_data.item_id FROM item_data, tags",
+            ] {
+                sqlx::query(statement)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
+            }
+        }
+        async fn item_count(index_db: &str) -> i64 {
+            let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
+            sqlx::query_scalar("SELECT item_count FROM tags WHERE name = 'gate-tag'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        }
+
+        // The migration seeds the marker dirty, so the first pass recounts
+        // even though nothing told it to — the property that heals counts a
+        // process death took the owed flags with.
+        assert_eq!(item_count(&index_db).await, 0, "inserted, never counted");
+        run_post_job_maintenance(&index_db, false, false).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            1,
+            "the durable marker alone must run the recount"
+        );
+
+        // The recount cleared the marker, so an identical pass now skips it.
+        assert!(
+            !tags_are_dirty(&index_db).await,
+            "a successful recount must clear the marker"
+        );
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE tags SET item_count = 99 WHERE name = 'gate-tag'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        run_post_job_maintenance(&index_db, false, false).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            99,
+            "neither flag nor marker: the recount must not run"
+        );
+
+        // The owed flag runs it without any marker.
+        run_post_job_maintenance(&index_db, false, true).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            1,
+            "the owed tags_changed flag must run the recount"
         );
     }
 

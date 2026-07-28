@@ -2968,6 +2968,64 @@
         }
       }
     },
+    "/api/jobs/maintenance": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Run database maintenance",
+        "description": "Enqueues a database maintenance job for the selected database: rebuild the tag item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space (the space reclaim is skipped unless the database actually holds enough free pages to be worth rewriting). Runs at the back of the queue, after everything already queued. Responds 409 when a maintenance job for this database is already queued or running.",
+        "operationId": "enqueue_db_maintenance",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Enqueued database maintenance job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobModel"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A maintenance job for this database is already queued or running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/jobs/quants": {
       "get": {
         "tags": [

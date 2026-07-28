@@ -477,6 +477,13 @@ async fn run_extraction_job_inner(
     summary.or_with(ChangeSummary {
         wrote_data: processed_data,
         deleted_data: false,
+        // Tag output is the only extraction output that touches `tags_items`;
+        // text, clip and embedding outputs leave the counts alone. The writer
+        // has already set the durable marker for every tag write this job
+        // committed — this flag is what lets the boundary decide without
+        // reading the DB, and what makes a fully cancelled tagging job still
+        // recount (through the marker).
+        tags_changed: processed_data && model.output_type == "tags",
     });
     Ok(ExtractionOutcome {
         summary,
@@ -519,9 +526,13 @@ async fn run_data_deletion_job_inner(
 
     // Reported, not run: the queue's boundary hook owns maintenance now, and
     // its VACUUM is additionally gated on the actual free-page count.
+    let deleted_data = deleted > 0 || orphan_tags_deleted > 0;
     Ok(ChangeSummary {
         wrote_data: false,
-        deleted_data: deleted > 0 || orphan_tags_deleted > 0,
+        deleted_data,
+        // Deleting a tagger's data removes its `tags_items` rows outright, and
+        // `include_orphan_tags` deletes the tags left with none.
+        tags_changed: deleted_data,
     })
 }
 

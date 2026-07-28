@@ -22,7 +22,8 @@ use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::jobs::queue::{
     BatchDedup, JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs,
-    cancel_running_job, enqueue_job, enqueue_jobs_with_dedup, get_queue_status,
+    cancel_running_job, enqueue_db_maintenance, enqueue_job, enqueue_jobs_with_dedup,
+    get_queue_status,
 };
 
 #[derive(Deserialize, IntoParams)]
@@ -255,6 +256,40 @@ pub(crate) async fn enqueue_update_folders(
         tag: None,
     })
     .await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "enqueue_db_maintenance",
+    path = "/api/jobs/maintenance",
+    tag = "jobs",
+    summary = "Run database maintenance",
+    description = "Enqueues a database maintenance job for the selected database: rebuild the tag \
+        item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space \
+        (the space reclaim is skipped unless the database actually holds enough free pages to be \
+        worth rewriting). Runs at the back of the queue, after everything already queued. \
+        Responds 409 when a maintenance job for this database is already queued or running.",
+    params(DbQueryParams),
+    responses(
+        (status = 202, description = "Enqueued database maintenance job", body = JobModel),
+        (status = 409, description = "A maintenance job for this database is already queued or running", body = crate::api_error::ErrorBody)
+    )
+)]
+pub(crate) async fn enqueue_maintenance(
+    conn: DbConnection<ReadOnly>,
+) -> Result<(StatusCode, Json<JobModel>), ApiError> {
+    // 409 rather than a 200 "skipped" body: unlike the cron and reconcile
+    // triggers this route's success body is a JobModel, and there is no job to
+    // report when the request adds nothing.
+    let job = enqueue_db_maintenance(&conn.index_db, &conn.user_data_db)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "A maintenance job for this database is already queued or running.",
+            )
+        })?;
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 

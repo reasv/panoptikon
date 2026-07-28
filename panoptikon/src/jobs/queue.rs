@@ -35,8 +35,8 @@ pub(crate) enum JobType {
     #[serde(rename = "test_panic")]
     TestPanic,
     /// Reports the change summary encoded in `tag` (`"<delay_ms>:<flags>"`,
-    /// flags `w` = wrote_data, `d` = deleted_data), so boundary scheduling is
-    /// testable without touching a database.
+    /// flags `w` = wrote_data, `d` = deleted_data, `t` = tags_changed), so
+    /// boundary scheduling is testable without touching a database.
     #[cfg(test)]
     #[serde(rename = "test_report")]
     TestReport,
@@ -48,16 +48,23 @@ pub(crate) enum JobType {
 pub(crate) struct ChangeSummary {
     pub wrote_data: bool,
     pub deleted_data: bool,
+    /// `tags_items` may have changed, so `tags.item_count` needs rebuilding.
+    /// Only the recount is gated on this; it is the one maintenance step
+    /// expensive enough to matter and user-visible when skipped (autocomplete
+    /// counts and ordering). Deletions imply it — see [`merge_owed`], which
+    /// derives it centrally so no producer has to remember.
+    pub tags_changed: bool,
 }
 
 impl ChangeSummary {
     fn is_empty(self) -> bool {
-        !self.wrote_data && !self.deleted_data
+        !self.wrote_data && !self.deleted_data && !self.tags_changed
     }
 
     pub(crate) fn or_with(&mut self, other: Self) {
         self.wrote_data |= other.wrote_data;
         self.deleted_data |= other.deleted_data;
+        self.tags_changed |= other.tags_changed;
     }
 
     /// Human-readable flag list carried in the synthesized job's `metadata`,
@@ -70,6 +77,9 @@ impl ChangeSummary {
         if self.deleted_data {
             flags.push("deleted_data");
         }
+        if self.tags_changed {
+            flags.push("tags_changed");
+        }
         flags.join(",")
     }
 
@@ -79,10 +89,23 @@ impl ChangeSummary {
             match flag.trim() {
                 "wrote_data" => summary.wrote_data = true,
                 "deleted_data" => summary.deleted_data = true,
+                "tags_changed" => summary.tags_changed = true,
                 _ => {}
             }
         }
         summary
+    }
+
+    /// Every flag set: what the manual trigger enqueues. The recount then runs
+    /// unconditionally (that is the point of asking for it), while VACUUM
+    /// stays behind its free-page gate so a misclick cannot start a
+    /// multi-minute rewrite of a 10 GB database.
+    fn all() -> Self {
+        Self {
+            wrote_data: true,
+            deleted_data: true,
+            tags_changed: true,
+        }
     }
 }
 
@@ -248,6 +271,17 @@ pub(crate) enum JobQueueMessage {
         dedups: Vec<BatchDedup>,
         reply: oneshot::Sender<ApiResult<BatchEnqueueResult>>,
     },
+    /// The one narrow way to enqueue a `DbMaintenance` job from outside the
+    /// boundary (`POST /api/jobs/maintenance`): all flags set, back of the
+    /// queue, `Ok(None)` when a maintenance job for that DB is already queued
+    /// or running. Deliberately not reachable through `JobRequest` — every
+    /// other maintenance job exists because the boundary synthesized it and
+    /// cleared owed flags for it, and that pairing must stay closed.
+    EnqueueMaintenance {
+        index_db: String,
+        user_data_db: String,
+        reply: oneshot::Sender<ApiResult<Option<JobModel>>>,
+    },
     GetQueueStatus {
         reply: oneshot::Sender<ApiResult<QueueStatusModel>>,
     },
@@ -305,6 +339,11 @@ pub(crate) struct QueueDebugState {
     /// otherwise indistinguishable from a `start_next_job` that found nothing
     /// to do.
     start_attempts: usize,
+    /// Index DBs the boundary cast a set-marker message for, in order.
+    /// Recorded instead of sent under `cfg(test)`, like `unloads`: the queue
+    /// tests use index DBs that do not exist, and spawning a writer for one
+    /// would create a stray database.
+    marked_dirty: Vec<String>,
 }
 
 pub(crate) struct JobQueueActor;
@@ -335,6 +374,8 @@ pub(crate) struct JobQueueState {
     unloads: Vec<String>,
     #[cfg(test)]
     start_attempts: usize,
+    #[cfg(test)]
+    marked_dirty: Vec<String>,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -407,6 +448,8 @@ impl Actor for JobQueueActor {
             unloads: Vec::new(),
             #[cfg(test)]
             start_attempts: 0,
+            #[cfg(test)]
+            marked_dirty: Vec::new(),
         })
     }
 
@@ -465,6 +508,39 @@ impl Actor for JobQueueActor {
                     enqueued,
                     skipped_dbs,
                 }));
+            }
+            JobQueueMessage::EnqueueMaintenance {
+                index_db,
+                user_data_db,
+                reply,
+            } => {
+                if state.shutting_down {
+                    let _ = reply.send(Err(ApiError::internal("Job queue is shutting down")));
+                    return Ok(());
+                }
+                // Dedup inside the actor for the same reason batch dedup is
+                // here: a check-then-enqueue by the caller would race a
+                // boundary synthesizing one between the two steps.
+                let pending = state
+                    .running_job
+                    .iter()
+                    .chain(state.queue.iter())
+                    .any(|job| job.job_type == JobType::DbMaintenance && job.index_db == index_db);
+                if pending {
+                    let _ = reply.send(Ok(None));
+                    return Ok(());
+                }
+                let model =
+                    push_maintenance_job(state, &index_db, &user_data_db, ChangeSummary::all());
+                tracing::info!(
+                    index_db,
+                    queue_id = model.queue_id,
+                    "enqueued database maintenance on request"
+                );
+                if state.running_job.is_none() {
+                    start_next_job(state).await;
+                }
+                let _ = reply.send(Ok(Some(model)));
             }
             JobQueueMessage::GetQueueStatus { reply } => {
                 let mut queue = Vec::new();
@@ -568,9 +644,10 @@ impl Actor for JobQueueActor {
                         state.running_job = None;
                         record_owed(state, &finished, result.summary);
                         record_batch_load(state, &finished, result.success, result.loaded_model);
-                        // Before starting the next job: a maintenance job goes
-                        // to the front of the queue, which is exactly the slot
-                        // the maintenance work occupied before it was deferred.
+                        // Before starting the next job, so the synthesized
+                        // job is in the queue the two decisions below read.
+                        // It goes to the *back*, so a drained queue runs it
+                        // now and a busy one runs it after everything else.
                         maybe_schedule_maintenance(state, &finished);
                         // After synthesis so the model-continuity rule reads
                         // the queue it will actually run. Belt-and-braces
@@ -630,6 +707,7 @@ impl Actor for JobQueueActor {
                     batch_loaded: state.batch_loaded.clone(),
                     unloads: state.unloads.clone(),
                     start_attempts: state.start_attempts,
+                    marked_dirty: state.marked_dirty.clone(),
                 });
             }
         }
@@ -786,16 +864,24 @@ fn pessimistic_summary(job_type: &JobType) -> ChangeSummary {
         // full ANALYZE over a 10 GB index is exactly the starvation this
         // design set out to avoid.
         JobType::VectorQuantReconcile => ChangeSummary::default(),
-        _ => ChangeSummary {
-            wrote_data: true,
-            deleted_data: matches!(
+        _ => {
+            let deleting = matches!(
                 job_type,
                 JobType::FolderRescan
                     | JobType::FolderUpdate
                     | JobType::DataDeletion
                     | JobType::JobDataDeletion
-            ),
-        },
+            );
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: deleting,
+                // Same set as `deleted_data`, and for the same reason: a
+                // cancelled scan may already have cascaded item deletions
+                // into `tags_items`. A cancelled *tagging* job needs nothing
+                // here — its writes set the durable marker as they commit.
+                tags_changed: deleting,
+            }
+        }
     }
 }
 
@@ -807,21 +893,65 @@ fn record_owed(state: &mut JobQueueState, job: &Job, summary: Option<ChangeSumma
     merge_owed(state, &job.index_db, summary);
 }
 
-fn merge_owed(state: &mut JobQueueState, index_db: &str, summary: ChangeSummary) {
+fn merge_owed(state: &mut JobQueueState, index_db: &str, mut summary: ChangeSummary) {
+    // Deleting items and item data cascades into `tags_items`, so anything
+    // that reports a deletion also dirties the tag counts. Derived here — the
+    // one funnel every reported and pessimistic summary passes through —
+    // rather than at each producer, where it would be a rule to remember.
+    summary.tags_changed |= summary.deleted_data;
     if summary.is_empty() {
         return;
     }
-    state
-        .owed
-        .entry(index_db.to_string())
-        .or_default()
-        .or_with(summary);
+    let entry = state.owed.entry(index_db.to_string()).or_default();
+    let already_dirty = entry.tags_changed;
+    entry.or_with(summary);
+    if entry.tags_changed && !already_dirty {
+        mark_tags_dirty(state, index_db);
+    }
+}
+
+/// Mirrors a newly owed `tags_changed` into the DB's durable marker, so the
+/// recount survives the process losing its in-memory flags. The writer-side
+/// sets (tag writes, orphan-item deletions) are the primary guarantee; this
+/// covers what they cannot see — job-end bulk deletions, which the job reports
+/// as a count rather than writing row by row.
+///
+/// Fire-and-forget, and only on the false→true transition: a lost cast costs
+/// at most one skipped recount, which the next change re-owes.
+#[cfg(not(test))]
+fn mark_tags_dirty(_state: &mut JobQueueState, index_db: &str) {
+    let index_db = index_db.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::MarkTagsDirty { reply }
+        })
+        .await
+        {
+            tracing::warn!(error = ?err, index_db, "could not set the tags-dirty marker");
+        }
+    });
+}
+
+/// Recorded, not sent: queue tests drive the boundary against index DBs that
+/// do not exist, and spawning a writer for one would create a stray database
+/// (the same reason `run_db_maintenance` is stubbed here).
+#[cfg(test)]
+fn mark_tags_dirty(state: &mut JobQueueState, index_db: &str) {
+    state.marked_dirty.push(index_db.to_string());
 }
 
 /// The job boundary: when nothing else in the queue targets the finished job's
 /// index DB, the maintenance its finished jobs owe is synthesized as a real
-/// queue job at the front of the queue (visible, cancellable, and serialized
+/// queue job at the *back* of the queue (visible, cancellable, and serialized
 /// against other jobs like everything else).
+///
+/// Back, not front: maintenance can run for minutes (VACUUM, and a recount
+/// that scales with `tags_items`), and inserting that between two GPU jobs
+/// stalls the pipeline and outlives the 60 s model TTL that makes cross-job
+/// model reuse work. At the back it accumulates at the tail of a drain and
+/// runs after the last extraction. The cost accepted is that an
+/// early-finishing DB's statistics and WAL truncation wait for the drain to
+/// end. A drained queue is unaffected: the job starts immediately either way.
 fn maybe_schedule_maintenance(state: &mut JobQueueState, finished: &Job) {
     if state.shutting_down {
         return;
@@ -843,28 +973,43 @@ fn maybe_schedule_maintenance(state: &mut JobQueueState, finished: &Job) {
         return;
     }
     state.owed.remove(index_db);
-    state.job_counter += 1;
-    let job = Job {
-        queue_id: state.job_counter,
-        job_type: JobType::DbMaintenance,
-        index_db: finished.index_db.clone(),
-        user_data_db: finished.user_data_db.clone(),
-        metadata: Some(owed.to_metadata()),
-        batch_size: None,
-        threshold: None,
-        log_id: None,
-        tag: None,
-    };
+    let model = push_maintenance_job(state, index_db, &finished.user_data_db, owed);
     tracing::info!(
         index_db,
-        queue_id = job.queue_id,
+        queue_id = model.queue_id,
         owed = %owed.to_metadata(),
         "scheduling deferred database maintenance"
     );
     #[cfg(test)]
     state.synthesized.push((finished.index_db.clone(), owed));
-    state.queue.push_front(job.clone());
+}
+
+/// Appends a `DbMaintenance` job carrying `flags` in its `metadata` (both the
+/// queue's display text and how the maintenance arm learns what to run).
+/// Shared by the boundary and the manual trigger; neither owns the queue slot
+/// decision, both append.
+fn push_maintenance_job(
+    state: &mut JobQueueState,
+    index_db: &str,
+    user_data_db: &str,
+    flags: ChangeSummary,
+) -> JobModel {
+    state.job_counter += 1;
+    let job = Job {
+        queue_id: state.job_counter,
+        job_type: JobType::DbMaintenance,
+        index_db: index_db.to_string(),
+        user_data_db: user_data_db.to_string(),
+        metadata: Some(flags.to_metadata()),
+        batch_size: None,
+        threshold: None,
+        log_id: None,
+        tag: None,
+    };
+    let model = JobModel::from_job(&job, false);
+    state.queue.push_back(job.clone());
     state.queued_jobs.insert(job.queue_id, job);
+    model
 }
 
 /// The setter the next batch extraction in the queue will load, if the queue
@@ -1116,7 +1261,12 @@ async fn run_db_maintenance(job: &Job) {
             None
         }
     };
-    crate::jobs::files::run_post_job_maintenance(&job.index_db, summary.deleted_data).await;
+    crate::jobs::files::run_post_job_maintenance(
+        &job.index_db,
+        summary.deleted_data,
+        summary.tags_changed,
+    )
+    .await;
     if let Some(guard) = guard {
         guard.resume().await;
     }
@@ -1185,6 +1335,7 @@ async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
         summary: ChangeSummary {
             wrote_data: loaded,
             deleted_data: false,
+            tags_changed: false,
         },
         loaded_model: loaded.then(|| job.metadata.clone()).flatten(),
     }))
@@ -1248,6 +1399,9 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             Ok(JobSuccess::from_summary(ChangeSummary {
                 wrote_data: false,
                 deleted_data: deleted > 0,
+                // Deleting a job's data removes its `item_data` rows, and
+                // `tags_items` hangs off those.
+                tags_changed: deleted > 0,
             }))
         }
         JobType::VectorQuantReconcile => {
@@ -1291,6 +1445,7 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             Ok(JobSuccess::from_summary(ChangeSummary {
                 wrote_data: flags.contains('w'),
                 deleted_data: flags.contains('d'),
+                tags_changed: flags.contains('t'),
             }))
         }
     }
@@ -1321,6 +1476,26 @@ pub(crate) async fn enqueue_jobs_with_dedup(
         .send_message(JobQueueMessage::EnqueueBatch {
             requests,
             dedups,
+            reply,
+        })
+        .map_err(|_| ApiError::internal("Job queue unavailable"))?;
+    rx.await
+        .map_err(|_| ApiError::internal("Job queue dropped response"))?
+}
+
+/// Enqueues a `DbMaintenance` job with every flag set for `index_db`, at the
+/// back of the queue. `Ok(None)` means one was already queued or running for
+/// that DB and nothing was added.
+pub(crate) async fn enqueue_db_maintenance(
+    index_db: &str,
+    user_data_db: &str,
+) -> ApiResult<Option<JobModel>> {
+    let queue = ensure_job_queue().await?;
+    let (reply, rx) = oneshot::channel();
+    queue
+        .send_message(JobQueueMessage::EnqueueMaintenance {
+            index_db: index_db.to_string(),
+            user_data_db: user_data_db.to_string(),
             reply,
         })
         .map_err(|_| ApiError::internal("Job queue unavailable"))?;
@@ -2010,9 +2185,10 @@ mod tests {
 
     // The flagship phase-1+2+3 interaction, in the shape a merged cron tick
     // produces: two DBs interleaved by setter in one batch. Same-setter jobs
-    // from different DBs keep the model loaded across the boundary *and*
-    // across the maintenance job synthesized for the DB that just finished;
-    // the model is unloaded only at the setter change and at the drain.
+    // from different DBs keep the model loaded across the boundary, and both
+    // DBs' maintenance jobs accumulate at the tail of the drain instead of
+    // interrupting it; the model is unloaded only at the setter change and at
+    // the drain.
     #[tokio::test]
     async fn a_merged_cron_batch_reuses_models_across_dbs_and_maintenance() {
         let (queue, handle) = spawn_test_queue().await;
@@ -2036,7 +2212,8 @@ mod tests {
         assert_eq!(batch.enqueued.len(), 3);
 
         // Both DBs owe maintenance (the stub reports wrote_data), so both get
-        // a synthesized job: A's mid-queue, B's at the drain.
+        // a synthesized job — A's as soon as its last job finishes, B's at the
+        // drain, and both behind the extraction work that was still queued.
         let state = wait_for(&queue, |state| {
             state.synthesized.len() == 2 && state.unloads.len() == 2
         })
@@ -2054,10 +2231,135 @@ mod tests {
         assert_eq!(
             state.unloads,
             vec![shared.to_string(), other.to_string()],
-            "the shared model must survive A's boundary, A's maintenance job \
-             and B's first job, and unload only at the setter change: {state:?}"
+            "the shared model must survive A's boundary and B's first job, \
+             and unload only at the setter change: {state:?}"
         );
         assert!(state.owed.is_empty(), "{state:?}");
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    async fn enqueue_maintenance_on(
+        queue: &ActorRef<JobQueueMessage>,
+        index_db: &str,
+    ) -> Option<JobModel> {
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::EnqueueMaintenance {
+                index_db: index_db.to_string(),
+                user_data_db: "default".to_string(),
+                reply,
+            })
+            .unwrap();
+        rx.await.unwrap().unwrap()
+    }
+
+    // Placement: a synthesized maintenance job goes to the *back*. Maintenance
+    // can run for minutes, and at the front it would run between two jobs of a
+    // drain — stalling the GPU pipeline and outliving the 60 s model TTL that
+    // makes cross-job model reuse work. Jobs already queued for other DBs must
+    // therefore all run before it.
+    #[tokio::test]
+    async fn maintenance_queues_behind_the_jobs_already_waiting() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("placement-owed");
+        let other_db = unique_db("placement-other");
+        let running = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+        let first_other = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        let second_other = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        // Cancelling the running job is a boundary: `db` owes pessimistic
+        // maintenance and nothing left in the queue targets it.
+        assert_eq!(
+            cancel_running_on(&queue, false).await,
+            Some(running.queue_id)
+        );
+        let state = debug_on(&queue).await;
+        assert_eq!(state.synthesized.len(), 1, "expected synthesis: {state:?}");
+
+        let status = status_on(&queue).await;
+        let ids: Vec<i64> = status.queue.iter().map(|entry| entry.queue_id).collect();
+        assert_eq!(
+            &ids[..2],
+            &[first_other.queue_id, second_other.queue_id],
+            "the queued other-DB jobs keep their slots: {status:?}"
+        );
+        assert!(status.queue[0].running, "{status:?}");
+        let last = status.queue.last().expect("queue is not empty");
+        assert_eq!(
+            last.job_type,
+            JobType::DbMaintenance,
+            "maintenance must be last, not ahead of the drain: {status:?}"
+        );
+        assert_eq!(last.index_db, db);
+        assert!(!last.running);
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The manual trigger (`POST /api/jobs/maintenance`): a maintenance job
+    // with every flag set, at the back like all maintenance, and deduped
+    // against one that is already queued for the same DB.
+    #[tokio::test]
+    async fn manual_maintenance_enqueues_at_the_back_and_dedups() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("manual-maint");
+        let other_db = unique_db("manual-maint-other");
+        let running = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        let queued = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        let job = enqueue_maintenance_on(&queue, &db)
+            .await
+            .expect("the first request enqueues");
+        assert_eq!(job.job_type, JobType::DbMaintenance);
+        assert_eq!(job.index_db, db);
+        assert_eq!(
+            job.metadata.as_deref(),
+            Some("wrote_data,deleted_data,tags_changed"),
+            "an explicit request always recounts (vacuum stays freelist-gated)"
+        );
+
+        let status = status_on(&queue).await;
+        assert_eq!(
+            status
+                .queue
+                .iter()
+                .map(|entry| entry.queue_id)
+                .collect::<Vec<_>>(),
+            vec![running.queue_id, queued.queue_id, job.queue_id],
+            "the request must not jump the queue: {status:?}"
+        );
+
+        // A second request while the first is still queued adds nothing.
+        assert!(
+            enqueue_maintenance_on(&queue, &db).await.is_none(),
+            "a queued maintenance job must deduplicate the next request"
+        );
+        // Per DB, though: another database is unaffected.
+        assert!(enqueue_maintenance_on(&queue, &other_db).await.is_some());
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The other half of the dedup condition: a maintenance job that is already
+    // *running* also absorbs the request, so an impatient second click cannot
+    // stack a second full pass behind the first.
+    #[tokio::test]
+    async fn manual_maintenance_is_skipped_while_one_is_running() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("manual-maint-running");
+        set_test_maintenance_delay(&db, 60_000);
+
+        let job = enqueue_maintenance_on(&queue, &db)
+            .await
+            .expect("the first request enqueues");
+        wait_for_running(&queue, job.queue_id).await;
+        assert!(enqueue_maintenance_on(&queue, &db).await.is_none());
 
         queue.stop(None);
         handle.await.unwrap();
@@ -2147,12 +2449,19 @@ mod tests {
             state.owed.get(&db).copied(),
             Some(ChangeSummary {
                 wrote_data: true,
-                deleted_data: false
+                deleted_data: false,
+                tags_changed: false
             })
         );
         assert!(state.synthesized.is_empty(), "too early: {state:?}");
+        assert!(
+            state.marked_dirty.is_empty(),
+            "a pure write owes no recount: {state:?}"
+        );
 
-        // After the second: one maintenance job for the union of both.
+        // After the second: one maintenance job for the union of both. The
+        // deletion also dirties the tag counts, which the boundary mirrors
+        // into the DB's durable marker.
         let state = wait_for(&queue, |state| !state.synthesized.is_empty()).await;
         assert_eq!(
             state.synthesized,
@@ -2160,10 +2469,12 @@ mod tests {
                 db.clone(),
                 ChangeSummary {
                     wrote_data: true,
-                    deleted_data: true
+                    deleted_data: true,
+                    tags_changed: true
                 }
             )]
         );
+        assert_eq!(state.marked_dirty, vec![db.clone()]);
         assert!(!state.owed.contains_key(&db), "owed not cleared: {state:?}");
 
         queue.stop(None);
@@ -2250,7 +2561,8 @@ mod tests {
                 db.clone(),
                 ChangeSummary {
                     wrote_data: true,
-                    deleted_data: false
+                    deleted_data: false,
+                    tags_changed: false
                 }
             )]
         );
@@ -2387,7 +2699,8 @@ mod tests {
                 db.clone(),
                 ChangeSummary {
                     wrote_data: true,
-                    deleted_data: false
+                    deleted_data: false,
+                    tags_changed: false
                 }
             ),
             "only the job that actually ran may owe anything"
@@ -2413,6 +2726,7 @@ mod tests {
                 summary: ChangeSummary {
                     wrote_data: true,
                     deleted_data: true,
+                    tags_changed: false,
                 },
             })
             .unwrap();
@@ -2423,7 +2737,8 @@ mod tests {
         assert!(state.synthesized.is_empty(), "too early: {state:?}");
 
         // Cancelling the reporting job on its own would only owe `wrote_data`;
-        // the deletion flag can only have come from the mid-job report.
+        // the deletion flag (and the recount it implies) can only have come
+        // from the mid-job report.
         assert_eq!(
             cancel_running_on(&queue, false).await,
             Some(running.queue_id)
@@ -2435,7 +2750,8 @@ mod tests {
                 db.clone(),
                 ChangeSummary {
                     wrote_data: true,
-                    deleted_data: true
+                    deleted_data: true,
+                    tags_changed: true
                 }
             )]
         );
@@ -2463,7 +2779,8 @@ mod tests {
             state.owed.get(&db).copied(),
             Some(ChangeSummary {
                 wrote_data: true,
-                deleted_data: false
+                deleted_data: false,
+                tags_changed: false
             }),
             "a cancelled job must be assumed to have written: {state:?}"
         );
@@ -2482,15 +2799,19 @@ mod tests {
             ChangeSummary {
                 wrote_data: true,
                 deleted_data: false,
+                tags_changed: false,
             },
             ChangeSummary {
                 wrote_data: false,
                 deleted_data: true,
+                tags_changed: false,
             },
             ChangeSummary {
-                wrote_data: true,
-                deleted_data: true,
+                wrote_data: false,
+                deleted_data: false,
+                tags_changed: true,
             },
+            ChangeSummary::all(),
         ] {
             let metadata = summary.to_metadata();
             assert_eq!(ChangeSummary::from_metadata(Some(&metadata)), summary);
@@ -2499,6 +2820,12 @@ mod tests {
         assert_eq!(
             ChangeSummary::from_metadata(Some("nonsense")),
             ChangeSummary::default()
+        );
+        // The manual trigger's job carries every flag, so its `metadata` is
+        // what the maintenance arm reads to run everything.
+        assert_eq!(
+            ChangeSummary::all().to_metadata(),
+            "wrote_data,deleted_data,tags_changed"
         );
     }
 
@@ -2517,7 +2844,8 @@ mod tests {
                 pessimistic_summary(&job_type),
                 ChangeSummary {
                     wrote_data: true,
-                    deleted_data: true
+                    deleted_data: true,
+                    tags_changed: true
                 },
                 "{job_type:?} may have cascaded deletes"
             );
@@ -2526,7 +2854,10 @@ mod tests {
             pessimistic_summary(&JobType::DataExtraction),
             ChangeSummary {
                 wrote_data: true,
-                deleted_data: false
+                deleted_data: false,
+                // A cancelled tagging job needs no pessimism here: every tag
+                // it committed set the durable marker as it committed.
+                tags_changed: false
             },
             "a partially completed extraction really did write item data"
         );
@@ -2764,6 +3095,7 @@ mod tests {
             summary: ChangeSummary {
                 wrote_data: true,
                 deleted_data: true,
+                tags_changed: true,
             },
             loaded_model: Some("group/model-a".to_string()),
         });
@@ -2771,7 +3103,8 @@ mod tests {
             success.summary,
             ChangeSummary {
                 wrote_data: true,
-                deleted_data: true
+                deleted_data: true,
+                tags_changed: true
             }
         );
         assert_eq!(success.loaded_model.as_deref(), Some("group/model-a"));

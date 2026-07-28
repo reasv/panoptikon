@@ -589,7 +589,10 @@ impl ContinuousScanState {
         self.deletions_since_maintenance += files_deleted + u64::from(item_deleted);
         if self.deletions_since_maintenance >= MAINTENANCE_DELETION_THRESHOLD {
             self.deletions_since_maintenance = 0;
-            run_post_job_maintenance(&self.index_db, true).await;
+            // `tags_changed: false` — the continuous scan has no owed flags to
+            // pass. Its item deletions set the durable marker as they commit
+            // (`DeleteItemIfOrphan`), which is what makes the recount run.
+            run_post_job_maintenance(&self.index_db, true, false).await;
         }
         Ok(())
     }

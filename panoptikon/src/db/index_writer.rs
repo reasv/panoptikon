@@ -300,7 +300,16 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// Refreshes every `tags.item_count`; see `db::tags::RECOUNT_TAG_ITEMS_SQL`.
+    /// Clears the tags-dirty marker in the same transaction, so only a recount
+    /// that actually committed pays off the debt.
     RecountTagItems {
+        reply: Reply<()>,
+    },
+    /// Sets the durable tags-dirty marker on its own. The writes that dirty
+    /// the counts set it inline (see `WriteTagsOutput` and
+    /// `DeleteItemIfOrphan`); this is for the job boundary, which learns about
+    /// bulk deletions from a finished job's report rather than row by row.
+    MarkTagsDirty {
         reply: Reply<()>,
     },
     /// Truncating WAL checkpoint; see `CHECKPOINT_STATEMENTS`.
@@ -327,6 +336,13 @@ pub(crate) struct IndexDbWriterState {
     idle_timeout: Duration,
     last_used: Option<Instant>,
     conn: Option<SqliteConnection>,
+    /// Latch for the durable tags-dirty marker: true once this writer has set
+    /// it and nothing has cleared it since (only `RecountTagItems` does). A
+    /// tagging job writes once per item, and the marker means the same thing
+    /// after the first of them, so the rest cost nothing. Writer state rather
+    /// than a read of the row: a respawned writer starts `false` and pays one
+    /// redundant upsert, which is the cheap direction to be wrong in.
+    tags_dirty_marked: bool,
 }
 
 impl IndexDbWriterState {
@@ -436,6 +452,7 @@ impl Actor for IndexDbWriter {
             idle_timeout: args.idle_timeout,
             last_used: None,
             conn: None,
+            tags_dirty_marked: false,
         })
     }
 
@@ -589,11 +606,25 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::DeleteItemIfOrphan { item_id, reply } => {
+                // Deleting an item cascades into `tags_items`, and the
+                // continuous scan — the caller here — is not a queue job, so
+                // no job boundary will ever report this deletion. The marker
+                // is set in the same transaction as the delete, and only when
+                // a row really went away.
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { delete_item_if_orphan(conn, item_id).await })
+                        Box::pin(async move {
+                            let deleted = delete_item_if_orphan(conn, item_id).await?;
+                            if deleted {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
+                            Ok(deleted)
+                        })
                     })
                     .await;
+                if matches!(result, Ok(true)) {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::SetBlurhash {
@@ -710,6 +741,12 @@ impl Actor for IndexDbWriter {
                 text_entries,
                 reply,
             } => {
+                // Tag writes are what make `tags.item_count` stale, and a
+                // tagging job is not atomic: a shutdown halfway through has
+                // already committed tags. So the marker rides along in the
+                // same transaction as the first write of this writer session,
+                // rather than waiting for the job to report anything.
+                let mark_dirty = !state.tags_dirty_marked;
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
@@ -721,10 +758,17 @@ impl Actor for IndexDbWriter {
                                 &tags,
                                 &text_entries,
                             )
-                            .await
+                            .await?;
+                            if mark_dirty {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
+                            Ok(())
                         })
                     })
                     .await;
+                if mark_dirty && result.is_ok() {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::WriteTextOutput {
@@ -982,11 +1026,36 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::RecountTagItems { reply } => {
+                // The clear commits with the rebuild or not at all: a recount
+                // that failed, or that was interrupted, must leave the debt
+                // where the next maintenance pass will find it.
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { crate::db::tags::recount_tag_items(conn).await })
+                        Box::pin(async move {
+                            crate::db::tags::recount_tag_items(conn).await?;
+                            crate::db::maintenance_state::clear_tags_dirty(conn).await
+                        })
                     })
                     .await;
+                if result.is_ok() {
+                    state.tags_dirty_marked = false;
+                }
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::MarkTagsDirty { reply } => {
+                // Unlatched: this arrives once per job boundary at most, and a
+                // marker that is already set costs one no-op upsert, while a
+                // stale latch would cost a skipped recount.
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { crate::db::maintenance_state::set_tags_dirty(conn).await },
+                        )
+                    })
+                    .await;
+                if result.is_ok() {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::Checkpoint { reply } => {
@@ -1356,11 +1425,204 @@ async fn rollback_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use sqlx::Row;
 
     use super::*;
-    use crate::db::migrations::setup_test_databases;
+    use crate::db::extraction_write::TagEntry;
+    use crate::db::maintenance_state::{clear_tags_dirty, read_tags_dirty};
+    use crate::db::migrations::{migrate_databases_on_disk, setup_test_databases};
+    use crate::test_utils::test_data_dir;
 
+    fn next_db_name() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!("writer_marker_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// An on-disk index DB with one setter, one data-log row and `items`
+    /// count items. The writer actor is the thing under test here, so
+    /// everything it does not own is inserted directly.
+    async fn marker_test_db(items: usize) -> (String, i64) {
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .expect("migrate test databases");
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            for i in 0..items {
+                sqlx::query(
+                    "INSERT INTO items (sha256, md5, type, time_added) \
+                     VALUES (?, ?, 'image/png', '2026-01-01')",
+                )
+                .bind(format!("sha{i}"))
+                .bind(format!("md5{i}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            }
+        }
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+            setter_name: "test/tagger".to_string(),
+            reply,
+        })
+        .await
+        .unwrap();
+        let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: "2026-01-01T00:00:00".to_string(),
+            threshold: None,
+            types: vec!["tags".to_string()],
+            setter: "test/tagger".to_string(),
+            batch_size: 1,
+            reply,
+        })
+        .await
+        .unwrap();
+        (index_db, job_id)
+    }
+
+    async fn write_one_tag(index_db: &str, job_id: i64, sha256: &str, tag: &str) {
+        let tag = tag.to_string();
+        call_index_db_writer(index_db, move |reply| {
+            IndexDbWriterMessage::WriteTagsOutput {
+                job_id,
+                setter_name: "test/tagger".to_string(),
+                item_sha256: sha256.to_string(),
+                tags: vec![TagEntry {
+                    namespace: "general".to_string(),
+                    name: tag.clone(),
+                    confidence: 1.0,
+                }],
+                text_entries: Vec::new(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn recount(index_db: &str) {
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems { reply })
+            .await
+            .unwrap();
+    }
+
+    async fn marker_is_set(index_db: &str) -> bool {
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        read_tags_dirty(&mut conn).await.unwrap()
+    }
+
+    /// Clears the marker behind the writer's back, so the next assertion sees
+    /// whether the writer wrote it *again* rather than whether it was ever set.
+    async fn clear_marker_behind_the_writer(index_db: &str) {
+        let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+            .await
+            .unwrap();
+        clear_tags_dirty(&mut conn).await.unwrap();
+    }
+
+    // The durable marker's whole lifecycle on the writer side: a tag write
+    // sets it in the same transaction as the tags, the latch keeps every
+    // following write in that session from touching it again, a successful
+    // recount clears it *and* the latch, and the next write sets it afresh.
+    #[tokio::test]
+    async fn tag_writes_set_the_marker_once_per_writer_session() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(3).await;
+
+        // The migration seeds it dirty; a recount is the only thing that
+        // clears it, and that also resets the writer's latch.
+        recount(&index_db).await;
+        assert!(
+            !marker_is_set(&index_db).await,
+            "a successful recount must clear the marker"
+        );
+
+        write_one_tag(&index_db, job_id, "sha0", "first").await;
+        assert!(
+            marker_is_set(&index_db).await,
+            "the first tag write of a writer session must set the marker"
+        );
+
+        clear_marker_behind_the_writer(&index_db).await;
+        write_one_tag(&index_db, job_id, "sha1", "second").await;
+        assert!(
+            !marker_is_set(&index_db).await,
+            "the latch must keep later tag writes from re-writing the marker"
+        );
+
+        // A recount resets the latch, so the session starts marking again.
+        recount(&index_db).await;
+        write_one_tag(&index_db, job_id, "sha2", "third").await;
+        assert!(
+            marker_is_set(&index_db).await,
+            "a recount must re-arm the marker for the writes that follow it"
+        );
+    }
+
+    // The continuous scan is not a queue job and has no boundary, so its item
+    // deletions have to mark the DB themselves — but only when a row really
+    // went away, or every no-op call would owe a full recount.
+    #[tokio::test]
+    async fn orphan_item_deletion_marks_only_when_it_deletes() {
+        let _test_env = test_data_dir();
+        let (index_db, _job_id) = marker_test_db(1).await;
+        let item_id: i64 = {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query_scalar("SELECT id FROM items WHERE sha256 = 'sha0'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+        clear_marker_behind_the_writer(&index_db).await;
+
+        // The item has no files, so it really is an orphan.
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteItemIfOrphan { item_id, reply }
+        })
+        .await
+        .unwrap();
+        assert!(deleted, "the orphan item should have been deleted");
+        assert!(
+            marker_is_set(&index_db).await,
+            "an item deletion cascades into tags_items and must mark the DB"
+        );
+
+        // Second call: the row is already gone, so nothing changed.
+        clear_marker_behind_the_writer(&index_db).await;
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteItemIfOrphan { item_id, reply }
+        })
+        .await
+        .unwrap();
+        assert!(!deleted);
+        assert!(
+            !marker_is_set(&index_db).await,
+            "a delete that removed nothing must not owe a recount"
+        );
+    }
+
+    // The boundary's fire-and-forget cast: job-end bulk deletions are reported
+    // as counts, never written row by row, so this is the only way they reach
+    // the marker.
+    #[tokio::test]
+    async fn mark_tags_dirty_sets_the_marker_on_its_own() {
+        let _test_env = test_data_dir();
+        let (index_db, _job_id) = marker_test_db(0).await;
+        clear_marker_behind_the_writer(&index_db).await;
+
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty { reply })
+            .await
+            .unwrap();
+        assert!(marker_is_set(&index_db).await);
+    }
 
     // Guards the property the constant's comment argues for: post-job
     // maintenance must leave real statistics behind, on a connection with no
