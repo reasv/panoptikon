@@ -269,11 +269,14 @@ pub(crate) async fn enqueue_update_folders(
         item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space \
         (the space reclaim is skipped unless the database actually holds enough free pages to be \
         worth rewriting). Runs at the back of the queue, after everything already queued. \
-        Responds 409 when a maintenance job for this database is already queued or running.",
+        If a maintenance job for this database is already queued, that job is upgraded to do all \
+        of the above and returned instead of adding a second one. Responds 409 only when a \
+        maintenance job for this database is already running, since a pass in flight may already \
+        have decided what to skip; retry once it finishes.",
     params(DbQueryParams),
     responses(
-        (status = 202, description = "Enqueued database maintenance job", body = JobModel),
-        (status = 409, description = "A maintenance job for this database is already queued or running", body = crate::api_error::ErrorBody)
+        (status = 202, description = "Enqueued (or upgraded) database maintenance job", body = JobModel),
+        (status = 409, description = "A maintenance job for this database is already running", body = crate::api_error::ErrorBody)
     )
 )]
 pub(crate) async fn enqueue_maintenance(
@@ -281,13 +284,15 @@ pub(crate) async fn enqueue_maintenance(
 ) -> Result<(StatusCode, Json<JobModel>), ApiError> {
     // 409 rather than a 200 "skipped" body: unlike the cron and reconcile
     // triggers this route's success body is a JobModel, and there is no job to
-    // report when the request adds nothing.
+    // report when the request adds nothing. Reachable only for a *running*
+    // pass — a queued one is upgraded and returned, so the promise this
+    // endpoint makes ("this will recount") is kept.
     let job = enqueue_db_maintenance(&conn.index_db, &conn.user_data_db)
         .await?
         .ok_or_else(|| {
             ApiError::new(
                 StatusCode::CONFLICT,
-                "A maintenance job for this database is already queued or running.",
+                "A maintenance job for this database is already running.",
             )
         })?;
     Ok((StatusCode::ACCEPTED, Json(job)))

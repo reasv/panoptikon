@@ -49,7 +49,11 @@ pub(crate) struct EmbeddingEntry {
     pub embedding: Vec<u8>,
 }
 
-pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
+/// Returns how many `data_jobs` rows were deleted — zero in the non-atomic
+/// mode, which only marks them. The count matters because deleting a job
+/// cascades through `item_data` into `tags_items`, so the caller has to know
+/// whether the tag counts just went stale.
+pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
     if !atomic_enabled {
@@ -66,10 +70,10 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
             tracing::error!(error = %err, "failed to mark incomplete jobs");
             ApiError::internal("Failed to update incomplete jobs")
         })?;
-        return Ok(());
+        return Ok(0);
     }
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         DELETE FROM data_jobs
         WHERE completed = 0
@@ -81,7 +85,7 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
         tracing::error!(error = %err, "failed to delete incomplete jobs");
         ApiError::internal("Failed to delete incomplete jobs")
     })?;
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 pub(crate) async fn add_data_log(

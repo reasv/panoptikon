@@ -648,11 +648,24 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::DeleteItemsWithoutFiles { batch_size, reply } => {
+                // Bulk item deletion cascades into `tags_items`. Marked here,
+                // in the deleting transaction, so the debt is durable the
+                // moment it exists — the job boundary's report of the same
+                // deletion is only a backstop (see `queue::mark_tags_dirty`).
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { delete_items_without_files(conn, batch_size).await })
+                        Box::pin(async move {
+                            let deleted = delete_items_without_files(conn, batch_size).await?;
+                            if deleted > 0 {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
+                            Ok(deleted)
+                        })
                     })
                     .await;
+                if matches!(result, Ok(deleted) if deleted > 0) {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::DeleteFilesNotAllowed { job_filters, reply } => {
@@ -680,20 +693,44 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::DeleteJobData { log_id, reply } => {
+                // Deleting the `data_jobs` row cascades through `item_data`
+                // into `tags_items`.
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { delete_data_job_by_log_id(conn, log_id).await })
+                        Box::pin(async move {
+                            let deleted = delete_data_job_by_log_id(conn, log_id).await?;
+                            if deleted > 0 {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
+                            Ok(deleted)
+                        })
                     })
                     .await;
+                if matches!(result, Ok(deleted) if deleted > 0) {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::RemoveIncompleteJobs { reply } => {
+                // Under `atomic_extraction_jobs` this deletes the unfinished
+                // jobs' rows, which cascades into `tags_items` exactly like
+                // `DeleteJobData`. The reply stays `()`; the count is only
+                // needed to decide the marker.
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { remove_incomplete_jobs(conn).await })
+                        Box::pin(async move {
+                            let deleted = remove_incomplete_jobs(conn).await?;
+                            if deleted > 0 {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
+                            Ok(deleted)
+                        })
                     })
                     .await;
-                let _ = reply.send(result);
+                if matches!(result, Ok(deleted) if deleted > 0) {
+                    state.tags_dirty_marked = true;
+                }
+                let _ = reply.send(result.map(|_| ()));
             }
             IndexDbWriterMessage::AddDataLog {
                 scan_time,
@@ -746,7 +783,13 @@ impl Actor for IndexDbWriter {
                 // already committed tags. So the marker rides along in the
                 // same transaction as the first write of this writer session,
                 // rather than waiting for the job to report anything.
-                let mark_dirty = !state.tags_dirty_marked;
+                //
+                // Content only: `write_placeholder` sends this message with
+                // empty vectors to mark an item processed after its inference
+                // failed, and a job whose every item failed writes nothing a
+                // recount could see.
+                let mark_dirty =
+                    !state.tags_dirty_marked && !(tags.is_empty() && text_entries.is_empty());
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
@@ -835,6 +878,9 @@ impl Actor for IndexDbWriter {
                 include_orphan_tags,
                 reply,
             } => {
+                // Deleting the setter cascades its `item_data` (and with it
+                // `tags_items`); `delete_orphan_tags` then removes `tags` rows
+                // outright. Either one invalidates every count.
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
@@ -844,10 +890,16 @@ impl Actor for IndexDbWriter {
                             } else {
                                 0
                             };
+                            if deleted > 0 || orphan_tags > 0 {
+                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                            }
                             Ok((deleted, orphan_tags))
                         })
                     })
                     .await;
+                if matches!(result, Ok((deleted, orphan_tags)) if deleted > 0 || orphan_tags > 0) {
+                    state.tags_dirty_marked = true;
+                }
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::AddFolderToDatabase {
@@ -1606,6 +1658,155 @@ mod tests {
         assert!(
             !marker_is_set(&index_db).await,
             "a delete that removed nothing must not owe a recount"
+        );
+    }
+
+    // A tagging job marks every item it processed, including the ones whose
+    // inference failed: `write_placeholder` sends this message with empty
+    // vectors purely to record "processed". Those writes add no tag rows, so a
+    // job where every item failed must not buy a full recount.
+    #[tokio::test]
+    async fn a_placeholder_only_tag_write_leaves_the_marker_clean() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(2).await;
+        recount(&index_db).await;
+        assert!(!marker_is_set(&index_db).await);
+
+        call_index_db_writer(&index_db, move |reply| {
+            IndexDbWriterMessage::WriteTagsOutput {
+                job_id,
+                setter_name: "test/tagger".to_string(),
+                item_sha256: "sha0".to_string(),
+                tags: Vec::new(),
+                text_entries: Vec::new(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !marker_is_set(&index_db).await,
+            "a placeholder write adds no tag rows and must not dirty the DB"
+        );
+
+        // The latch is untouched by it, so the first real write still marks.
+        write_one_tag(&index_db, job_id, "sha1", "real").await;
+        assert!(marker_is_set(&index_db).await);
+    }
+
+    // Every writer handler whose transaction removes rows the tag counts
+    // depend on marks the DB inside that same transaction. Without this the
+    // only record of a job-end bulk deletion is the queue's detached cast,
+    // which a shutdown can lose — and the counts then overstate those tags
+    // until something unrelated dirties the DB again.
+    #[tokio::test]
+    async fn bulk_deletions_mark_the_db_inside_their_own_transaction() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(2).await;
+        write_one_tag(&index_db, job_id, "sha0", "bulk").await;
+
+        // Orphan items (no files) — the folder-scan cleanup path.
+        recount(&index_db).await;
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteItemsWithoutFiles {
+                batch_size: 10,
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert!(deleted > 0, "the seeded items have no files");
+        assert!(
+            marker_is_set(&index_db).await,
+            "bulk item deletion cascades into tags_items"
+        );
+
+        // Job data — `DELETE FROM data_jobs` cascades through item_data.
+        let (index_db, job_id) = marker_test_db(1).await;
+        write_one_tag(&index_db, job_id, "sha0", "bulk").await;
+        let log_id: i64 = {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query_scalar("SELECT id FROM data_log")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+        recount(&index_db).await;
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteJobData { log_id, reply }
+        })
+        .await
+        .unwrap();
+        assert!(deleted > 0, "the seeded job row should be deleted");
+        assert!(marker_is_set(&index_db).await, "job data carries tag rows");
+
+        // Setter data, with the orphan-tag sweep the deletion job requests.
+        let (index_db, job_id) = marker_test_db(1).await;
+        write_one_tag(&index_db, job_id, "sha0", "bulk").await;
+        recount(&index_db).await;
+        let (deleted, orphan_tags) =
+            call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::DeleteSetterData {
+                setter_name: "test/tagger".to_string(),
+                include_orphan_tags: true,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(deleted > 0 && orphan_tags > 0, "{deleted} {orphan_tags}");
+        assert!(marker_is_set(&index_db).await);
+
+        // A setter that does not exist deletes nothing and owes nothing.
+        recount(&index_db).await;
+        let (deleted, orphan_tags) =
+            call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::DeleteSetterData {
+                setter_name: "test/absent".to_string(),
+                include_orphan_tags: true,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!((deleted, orphan_tags), (0, 0));
+        assert!(
+            !marker_is_set(&index_db).await,
+            "a deletion that removed nothing must not owe a recount"
+        );
+    }
+
+    // Incomplete-job cleanup runs at the start of every extraction job and, in
+    // atomic mode, deletes the unfinished jobs' rows — which cascades into
+    // `tags_items` exactly like an explicit job-data deletion.
+    #[tokio::test]
+    async fn incomplete_job_cleanup_marks_the_db_when_it_deletes() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(1).await;
+        write_one_tag(&index_db, job_id, "sha0", "incomplete").await;
+        recount(&index_db).await;
+
+        // The seeded data_jobs row is still `completed = 0`.
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+        })
+        .await
+        .unwrap();
+        let atomic = crate::config::runtime().atomic_extraction_jobs;
+        assert_eq!(
+            marker_is_set(&index_db).await,
+            atomic,
+            "atomic cleanup deletes the rows; the non-atomic mode only marks them"
+        );
+
+        // Nothing incomplete left: a second pass deletes nothing.
+        recount(&index_db).await;
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !marker_is_set(&index_db).await,
+            "a cleanup that removed nothing must not owe a recount"
         );
     }
 

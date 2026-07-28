@@ -273,10 +273,12 @@ pub(crate) enum JobQueueMessage {
     },
     /// The one narrow way to enqueue a `DbMaintenance` job from outside the
     /// boundary (`POST /api/jobs/maintenance`): all flags set, back of the
-    /// queue, `Ok(None)` when a maintenance job for that DB is already queued
-    /// or running. Deliberately not reachable through `JobRequest` — every
-    /// other maintenance job exists because the boundary synthesized it and
-    /// cleared owed flags for it, and that pairing must stay closed.
+    /// queue. A maintenance job already *queued* for that DB is upgraded to
+    /// all flags and returned instead; `Ok(None)` means one is already
+    /// *running*, which cannot be upgraded retroactively. Deliberately not
+    /// reachable through `JobRequest` — every other maintenance job exists
+    /// because the boundary synthesized it and cleared owed flags for it, and
+    /// that pairing must stay closed.
     EnqueueMaintenance {
         index_db: String,
         user_data_db: String,
@@ -344,6 +346,8 @@ pub(crate) struct QueueDebugState {
     /// tests use index DBs that do not exist, and spawning a writer for one
     /// would create a stray database.
     marked_dirty: Vec<String>,
+    /// The same, for the marks the `Shutdown` handler writes *awaited*.
+    shutdown_marked_dirty: Vec<String>,
 }
 
 pub(crate) struct JobQueueActor;
@@ -368,6 +372,11 @@ pub(crate) struct JobQueueState {
     /// as the queue knows. Exact rather than approximate: batch loads use
     /// `lru_size = 1`, so loading a setter evicts whatever was there.
     batch_loaded: Option<String>,
+    /// Index DBs whose durable tags-dirty marker this message still has to
+    /// set. Collected while the message is handled and flushed at the end of
+    /// it, so a boundary that ends up scheduling a recount can drop the write
+    /// instead of racing it.
+    pending_marks: Vec<String>,
     #[cfg(test)]
     synthesized: Vec<(String, ChangeSummary)>,
     #[cfg(test)]
@@ -376,6 +385,8 @@ pub(crate) struct JobQueueState {
     start_attempts: usize,
     #[cfg(test)]
     marked_dirty: Vec<String>,
+    #[cfg(test)]
+    shutdown_marked_dirty: Vec<String>,
 }
 
 pub(crate) enum JobRunnerMessage {
@@ -442,6 +453,7 @@ impl Actor for JobQueueActor {
             shutting_down: false,
             owed: HashMap::new(),
             batch_loaded: None,
+            pending_marks: Vec::new(),
             #[cfg(test)]
             synthesized: Vec::new(),
             #[cfg(test)]
@@ -450,6 +462,8 @@ impl Actor for JobQueueActor {
             start_attempts: 0,
             #[cfg(test)]
             marked_dirty: Vec::new(),
+            #[cfg(test)]
+            shutdown_marked_dirty: Vec::new(),
         })
     }
 
@@ -521,15 +535,49 @@ impl Actor for JobQueueActor {
                 // Dedup inside the actor for the same reason batch dedup is
                 // here: a check-then-enqueue by the caller would race a
                 // boundary synthesizing one between the two steps.
-                let pending = state
-                    .running_job
-                    .iter()
-                    .chain(state.queue.iter())
-                    .any(|job| job.job_type == JobType::DbMaintenance && job.index_db == index_db);
-                if pending {
+                //
+                // A maintenance job that is already *running* absorbs the
+                // request (`None` → 409): its flags were read when it started,
+                // so it may already have skipped the recount this request is
+                // asking for, and there is no way to make it go back.
+                if state.running_job.as_ref().is_some_and(|job| {
+                    job.job_type == JobType::DbMaintenance && job.index_db == index_db
+                }) {
                     let _ = reply.send(Ok(None));
                     return Ok(());
                 }
+                // A *queued* one is upgraded to all flags instead of rejecting
+                // the request: the endpoint promises a recount, and a job the
+                // boundary synthesized with only `wrote_data` would not do
+                // one. Same queue slot, same id — nothing is added.
+                let upgraded = state
+                    .queue
+                    .iter_mut()
+                    .find(|job| job.job_type == JobType::DbMaintenance && job.index_db == index_db)
+                    .map(|job| {
+                        job.metadata = Some(ChangeSummary::all().to_metadata());
+                        JobModel::from_job(job, false)
+                    });
+                if let Some(model) = upgraded {
+                    if let Some(job) = state.queued_jobs.get_mut(&model.queue_id) {
+                        job.metadata = model.metadata.clone();
+                    }
+                    // Same reason as the fresh-enqueue path below: an all-flag
+                    // pass does strictly more than any owed flags can ask for.
+                    state.owed.remove(&index_db);
+                    tracing::info!(
+                        index_db,
+                        queue_id = model.queue_id,
+                        "upgraded the queued database maintenance job on request"
+                    );
+                    let _ = reply.send(Ok(Some(model)));
+                    return Ok(());
+                }
+                // Synthesis clears owed flags; so does this, for the same
+                // reason. An all-flag pass covers everything owed right now,
+                // and leaving the flags set would make this job's own boundary
+                // synthesize a second full pass (ANALYZE included) behind it.
+                state.owed.remove(&index_db);
                 let model =
                     push_maintenance_job(state, &index_db, &user_data_db, ChangeSummary::all());
                 tracing::info!(
@@ -697,6 +745,12 @@ impl Actor for JobQueueActor {
                 // cancel path defers to here while shutting down), waited on
                 // with a short timeout rather than detached.
                 unload_batch_model_on_shutdown(state).await;
+                // The cancel above may have left a pessimistic `tags_changed`
+                // that no writer transaction recorded, and the owed flags are
+                // about to die with the process: this is the one marker write
+                // that must not be detached. Drains the same `pending_marks`
+                // the end-of-message flush would otherwise spawn.
+                flush_tags_dirty_marks_on_shutdown(state).await;
                 let _ = reply.send(cancelled);
             }
             #[cfg(test)]
@@ -708,9 +762,15 @@ impl Actor for JobQueueActor {
                     unloads: state.unloads.clone(),
                     start_attempts: state.start_attempts,
                     marked_dirty: state.marked_dirty.clone(),
+                    shutdown_marked_dirty: state.shutdown_marked_dirty.clone(),
                 });
             }
         }
+        // One flush per message, after every boundary decision this message
+        // could make. The arms above that `return Ok(())` early all do so
+        // before anything can record an owed flag, so none of them can leave a
+        // mark stranded here.
+        flush_tags_dirty_marks(state);
         Ok(())
     }
 }
@@ -856,15 +916,22 @@ async fn cancel_running_job_inner(
 /// A job that ended without reporting (cancelled, panicked, failed) is treated
 /// pessimistically: it wrote something, and scan/deletion jobs may already have
 /// cascaded deletes. Maintenance jobs never owe maintenance.
-fn pessimistic_summary(job_type: &JobType) -> ChangeSummary {
-    match job_type {
+fn pessimistic_summary(job: &Job) -> ChangeSummary {
+    match &job.job_type {
         // Writes only the quant tables, which recount/ANALYZE/VACUUM do not
         // serve. It never ran post-job maintenance before the boundary existed
         // and must not start owing it now — an aborted reconcile scheduling a
         // full ANALYZE over a 10 GB index is exactly the starvation this
         // design set out to avoid.
         JobType::VectorQuantReconcile => ChangeSummary::default(),
-        _ => {
+        // The test stand-in declares in its tag what it changes, so a
+        // cancelled one owes exactly what a completed one would have reported.
+        // That makes it a usable substitute for the job types whose real
+        // bodies cannot run in a queue test (every deleting type opens
+        // databases and pulls in the continuous-scan supervisor).
+        #[cfg(test)]
+        JobType::TestReport => test_report_summary(job.tag.as_deref()),
+        job_type => {
             let deleting = matches!(
                 job_type,
                 JobType::FolderRescan
@@ -889,7 +956,7 @@ fn record_owed(state: &mut JobQueueState, job: &Job, summary: Option<ChangeSumma
     if job.job_type == JobType::DbMaintenance {
         return;
     }
-    let summary = summary.unwrap_or_else(|| pessimistic_summary(&job.job_type));
+    let summary = summary.unwrap_or_else(|| pessimistic_summary(job));
     merge_owed(state, &job.index_db, summary);
 }
 
@@ -905,39 +972,93 @@ fn merge_owed(state: &mut JobQueueState, index_db: &str, mut summary: ChangeSumm
     let entry = state.owed.entry(index_db.to_string()).or_default();
     let already_dirty = entry.tags_changed;
     entry.or_with(summary);
-    if entry.tags_changed && !already_dirty {
-        mark_tags_dirty(state, index_db);
+    if entry.tags_changed && !already_dirty && !state.pending_marks.iter().any(|db| db == index_db)
+    {
+        state.pending_marks.push(index_db.to_string());
     }
 }
 
-/// Mirrors a newly owed `tags_changed` into the DB's durable marker, so the
-/// recount survives the process losing its in-memory flags. The writer-side
-/// sets (tag writes, orphan-item deletions) are the primary guarantee; this
-/// covers what they cannot see — job-end bulk deletions, which the job reports
-/// as a count rather than writing row by row.
+/// Sends the durable set-marker writes this message's boundary decided it
+/// still needs, and clears the pending list. Called once at the end of every
+/// message; the arms that return early never queue one.
 ///
-/// Fire-and-forget, and only on the false→true transition: a lost cast costs
-/// at most one skipped recount, which the next change re-owes.
-#[cfg(not(test))]
-fn mark_tags_dirty(_state: &mut JobQueueState, index_db: &str) {
-    let index_db = index_db.to_string();
-    tokio::spawn(async move {
-        if let Err(err) = call_index_db_writer(&index_db, |reply| {
-            IndexDbWriterMessage::MarkTagsDirty { reply }
-        })
-        .await
-        {
-            tracing::warn!(error = ?err, index_db, "could not set the tags-dirty marker");
+/// The marker mirrors a newly owed `tags_changed` so the recount survives the
+/// process losing its in-memory flags. It is a *backstop* here: every writer
+/// handler that deletes rows the tag counts depend on sets the marker inside
+/// its own transaction, so this only has to cover flags nothing durable
+/// recorded — chiefly the pessimistic ones from a job that ended without
+/// reporting.
+///
+/// Fire-and-forget: a lost cast costs at most one skipped recount, which the
+/// next change re-owes. The `Shutdown` handler drains the same list itself,
+/// awaited (see [`flush_tags_dirty_marks_on_shutdown`]), so nothing reaches
+/// this spawn while the runtime is tearing down.
+fn flush_tags_dirty_marks(state: &mut JobQueueState) {
+    let pending = std::mem::take(&mut state.pending_marks);
+    for index_db in pending {
+        if record_test_mark(state, &index_db) {
+            continue;
         }
-    });
+        tokio::spawn(write_tags_dirty_marker(index_db));
+    }
+}
+
+/// Shutdown variant: waits, briefly. Cancelling the running job is the last
+/// boundary the process has, its `tags_changed` is pessimistic (so no writer
+/// transaction recorded it), and the owed flags die with the process — this is
+/// the one marker write that must not be detached, for the same reason the
+/// batch-model unload is awaited here (a task spawned as the runtime tears
+/// down is usually never polled).
+async fn flush_tags_dirty_marks_on_shutdown(state: &mut JobQueueState) {
+    const SHUTDOWN_MARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let pending = std::mem::take(&mut state.pending_marks);
+    for index_db in pending {
+        if record_test_shutdown_mark(state, &index_db) {
+            continue;
+        }
+        let _ =
+            tokio::time::timeout(SHUTDOWN_MARK_TIMEOUT, write_tags_dirty_marker(index_db)).await;
+    }
+}
+
+async fn write_tags_dirty_marker(index_db: String) {
+    if let Err(err) = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty {
+        reply,
+    })
+    .await
+    {
+        tracing::warn!(error = ?err, index_db, "could not set the tags-dirty marker");
+    }
+}
+
+/// Always `false`: the marker write really happens.
+#[cfg(not(test))]
+fn record_test_mark(_state: &mut JobQueueState, _index_db: &str) -> bool {
+    false
 }
 
 /// Recorded, not sent: queue tests drive the boundary against index DBs that
 /// do not exist, and spawning a writer for one would create a stray database
 /// (the same reason `run_db_maintenance` is stubbed here).
 #[cfg(test)]
-fn mark_tags_dirty(state: &mut JobQueueState, index_db: &str) {
+fn record_test_mark(state: &mut JobQueueState, index_db: &str) -> bool {
     state.marked_dirty.push(index_db.to_string());
+    true
+}
+
+/// Always `false`: the marker write really happens.
+#[cfg(not(test))]
+fn record_test_shutdown_mark(_state: &mut JobQueueState, _index_db: &str) -> bool {
+    false
+}
+
+/// Recorded separately from [`record_test_mark`] so a test can tell the
+/// awaited shutdown write apart from a detached one — which is the entire
+/// property the shutdown path exists to provide.
+#[cfg(test)]
+fn record_test_shutdown_mark(state: &mut JobQueueState, index_db: &str) -> bool {
+    state.shutdown_marked_dirty.push(index_db.to_string());
+    true
 }
 
 /// The job boundary: when nothing else in the queue targets the finished job's
@@ -973,6 +1094,13 @@ fn maybe_schedule_maintenance(state: &mut JobQueueState, finished: &Job) {
         return;
     }
     state.owed.remove(index_db);
+    if owed.tags_changed {
+        // The pass about to be queued carries the recount, and it will clear
+        // the marker when it succeeds. Writing the marker now would only race
+        // that clear — the durable record is needed for the window *before* a
+        // pass exists, and real deletions are recorded writer-side anyway.
+        state.pending_marks.retain(|db| db != index_db);
+    }
     let model = push_maintenance_job(state, index_db, &finished.user_data_db, owed);
     tracing::info!(
         index_db,
@@ -1439,15 +1567,30 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
         #[cfg(test)]
         JobType::TestReport => {
             let tag = job.tag.clone().unwrap_or_default();
-            let (delay, flags) = tag.split_once(':').unwrap_or(("0", tag.as_str()));
-            let delay = delay.parse::<u64>().unwrap_or(0);
+            let delay = tag
+                .split_once(':')
+                .map_or("0", |(delay, _)| delay)
+                .parse::<u64>()
+                .unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            Ok(JobSuccess::from_summary(ChangeSummary {
-                wrote_data: flags.contains('w'),
-                deleted_data: flags.contains('d'),
-                tags_changed: flags.contains('t'),
-            }))
+            Ok(JobSuccess::from_summary(test_report_summary(
+                job.tag.as_deref(),
+            )))
         }
+    }
+}
+
+/// The change summary a `TestReport` job's tag declares (`"<delay_ms>:<flags>"`
+/// with `w`/`d`/`t`). Shared by the job body and the pessimistic rule so the
+/// two cannot drift.
+#[cfg(test)]
+fn test_report_summary(tag: Option<&str>) -> ChangeSummary {
+    let tag = tag.unwrap_or_default();
+    let flags = tag.split_once(':').map_or(tag, |(_, flags)| flags);
+    ChangeSummary {
+        wrote_data: flags.contains('w'),
+        deleted_data: flags.contains('d'),
+        tags_changed: flags.contains('t'),
     }
 }
 
@@ -1484,8 +1627,9 @@ pub(crate) async fn enqueue_jobs_with_dedup(
 }
 
 /// Enqueues a `DbMaintenance` job with every flag set for `index_db`, at the
-/// back of the queue. `Ok(None)` means one was already queued or running for
-/// that DB and nothing was added.
+/// back of the queue — or upgrades the one already queued for it to all flags
+/// and returns that. `Ok(None)` means a maintenance job for that DB is already
+/// running.
 pub(crate) async fn enqueue_db_maintenance(
     index_db: &str,
     user_data_db: &str,
@@ -2334,11 +2478,12 @@ mod tests {
             "the request must not jump the queue: {status:?}"
         );
 
-        // A second request while the first is still queued adds nothing.
-        assert!(
-            enqueue_maintenance_on(&queue, &db).await.is_none(),
-            "a queued maintenance job must deduplicate the next request"
-        );
+        // A second request while the first is still queued returns that same
+        // job rather than adding a second one.
+        let again = enqueue_maintenance_on(&queue, &db)
+            .await
+            .expect("a queued maintenance job is returned, not rejected");
+        assert_eq!(again.queue_id, job.queue_id);
         // Per DB, though: another database is unaffected.
         assert!(enqueue_maintenance_on(&queue, &other_db).await.is_some());
 
@@ -2346,9 +2491,203 @@ mod tests {
         handle.await.unwrap();
     }
 
-    // The other half of the dedup condition: a maintenance job that is already
-    // *running* also absorbs the request, so an impatient second click cannot
-    // stack a second full pass behind the first.
+    // A maintenance job the boundary synthesized carries only what was owed,
+    // which for a pure-write drain does not include the recount. An explicit
+    // "Run Now" landing on that job must upgrade it in place — same queue slot,
+    // same id, all flags — instead of being absorbed by a pass that would then
+    // skip the very thing the request asked for.
+    #[tokio::test]
+    async fn manual_maintenance_upgrades_a_weaker_queued_job() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("manual-maint-upgrade");
+        let other_db = unique_db("manual-maint-upgrade-other");
+        // The reporting job runs first; a long job on another DB then holds the
+        // runner so the synthesized pass stays queued and observable.
+        let _reporting = enqueue_on(&queue, report_job(&db, "10:w")).await;
+        let _blocker = enqueue_on(&queue, sleep_job(&other_db, 60_000)).await;
+        let last = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+        wait_for(&queue, |state| state.owed.contains_key(&db)).await;
+        assert_eq!(
+            cancel_on(&queue, vec![last.queue_id]).await,
+            [last.queue_id]
+        );
+        let state = wait_for(&queue, |state| !state.synthesized.is_empty()).await;
+        assert_eq!(
+            state.synthesized[0].1,
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: false,
+                tags_changed: false
+            },
+            "a pure-write drain owes no recount: {state:?}"
+        );
+        let before = status_on(&queue).await;
+        let synthesized = before
+            .queue
+            .iter()
+            .find(|entry| entry.job_type == JobType::DbMaintenance)
+            .expect("maintenance job should be queued")
+            .clone();
+        assert_eq!(synthesized.metadata.as_deref(), Some("wrote_data"));
+
+        let upgraded = enqueue_maintenance_on(&queue, &db)
+            .await
+            .expect("the queued job is upgraded, not rejected");
+        assert_eq!(
+            upgraded.queue_id, synthesized.queue_id,
+            "the request must reuse the queued job's slot"
+        );
+        assert_eq!(
+            upgraded.metadata.as_deref(),
+            Some("wrote_data,deleted_data,tags_changed")
+        );
+
+        let after = status_on(&queue).await;
+        assert_eq!(
+            after.queue.len(),
+            before.queue.len(),
+            "no second maintenance job: {after:?}"
+        );
+        let queued_now = after
+            .queue
+            .iter()
+            .find(|entry| entry.queue_id == synthesized.queue_id)
+            .expect("the maintenance job is still queued");
+        assert_eq!(
+            queued_now.metadata.as_deref(),
+            Some("wrote_data,deleted_data,tags_changed"),
+            "the queue's own copy must carry the upgrade: {after:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Verdict 3: an explicit request clears the DB's owed flags, exactly as
+    // synthesis does. Without that, the all-flag pass runs, and *its* boundary
+    // then finds the stale flags and synthesizes a second full pass — another
+    // ANALYZE over the whole index right after one finished.
+    #[tokio::test]
+    async fn manual_maintenance_absorbs_the_owed_flags() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("manual-maint-owed");
+        // The reporting job leaves `db` owing; the short job behind it keeps
+        // the DB busy, so the boundary cannot synthesize a pass of its own
+        // before the request lands.
+        let _reporting = enqueue_on(&queue, report_job(&db, "10:w")).await;
+        let holder = enqueue_on(&queue, sleep_job(&db, 50)).await;
+        let state = wait_for(&queue, |state| state.owed.contains_key(&db)).await;
+        assert!(state.synthesized.is_empty(), "too early: {state:?}");
+
+        let job = enqueue_maintenance_on(&queue, &db)
+            .await
+            .expect("the request enqueues");
+        let state = debug_on(&queue).await;
+        assert!(
+            !state.owed.contains_key(&db),
+            "the request must absorb the owed flags: {state:?}"
+        );
+
+        // Drain: the holder finishes, then the manual pass runs — and its own
+        // boundary must not find leftover flags and schedule a second one.
+        for _ in 0..200 {
+            if status_on(&queue).await.queue.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let status = status_on(&queue).await;
+        assert!(
+            status.queue.is_empty(),
+            "the queue must drain to empty: {status:?}"
+        );
+        for queue_id in [holder.queue_id, job.queue_id] {
+            assert!(
+                status
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.queue_id == queue_id
+                        && outcome.status == JobOutcomeStatus::Completed),
+                "job {queue_id} should have completed: {status:?}"
+            );
+        }
+        let state = debug_on(&queue).await;
+        assert!(
+            state.synthesized.is_empty(),
+            "the manual pass must not be followed by a synthesized one: {state:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The durable marker's reason to exist at the boundary: when the DB is
+    // still busy no pass is scheduled, so nothing else records that the tag
+    // counts went stale until the drain ends — a shutdown in between would
+    // otherwise lose it.
+    #[tokio::test]
+    async fn a_deleting_boundary_marks_the_db_when_no_pass_is_scheduled() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("mark-no-pass");
+        let _first = enqueue_on(&queue, report_job(&db, "10:d")).await;
+        let _second = enqueue_on(&queue, sleep_job(&db, 60_000)).await;
+
+        let state = wait_for(&queue, |state| !state.marked_dirty.is_empty()).await;
+        assert_eq!(state.marked_dirty, vec![db.clone()]);
+        assert!(
+            state.synthesized.is_empty(),
+            "the DB is still busy, so no pass was scheduled: {state:?}"
+        );
+        assert!(
+            state.owed.get(&db).is_some_and(|owed| owed.tags_changed),
+            "{state:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // Shutdown is the last boundary the process gets: the running job is
+    // cancelled, so its `tags_changed` is pessimistic and no writer
+    // transaction recorded it, and the owed flags die with the process. The
+    // marker write therefore has to be awaited here — a task spawned as the
+    // runtime tears down is usually never polled.
+    #[tokio::test]
+    async fn shutdown_writes_the_pending_tags_dirty_marker() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("shutdown-mark");
+        // Declares deletions, so cancelling it owes `tags_changed`.
+        let running = enqueue_on(&queue, report_job(&db, "60000:d")).await;
+        wait_for_running(&queue, running.queue_id).await;
+
+        let (reply, rx) = oneshot::channel();
+        queue
+            .send_message(JobQueueMessage::Shutdown { reply })
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), Some(running.queue_id));
+
+        let state = debug_on(&queue).await;
+        assert_eq!(
+            state.shutdown_marked_dirty,
+            vec![db.clone()],
+            "the marker must be written from inside the shutdown handler: {state:?}"
+        );
+        assert!(
+            state.marked_dirty.is_empty(),
+            "it must not be detached into a runtime that is stopping: {state:?}"
+        );
+        assert!(
+            state.synthesized.is_empty(),
+            "shutdown never synthesizes: {state:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    // The one case that still rejects: a maintenance job already *running*
+    // read its flags when it started, so it may already have skipped the
+    // recount this request is asking for and cannot be upgraded retroactively.
     #[tokio::test]
     async fn manual_maintenance_is_skipped_while_one_is_running() {
         let (queue, handle) = spawn_test_queue().await;
@@ -2460,8 +2799,9 @@ mod tests {
         );
 
         // After the second: one maintenance job for the union of both. The
-        // deletion also dirties the tag counts, which the boundary mirrors
-        // into the DB's durable marker.
+        // deletion also dirties the tag counts — but this boundary schedules
+        // the pass that will recount and clear the marker, so writing the
+        // marker here would only race that clear.
         let state = wait_for(&queue, |state| !state.synthesized.is_empty()).await;
         assert_eq!(
             state.synthesized,
@@ -2474,7 +2814,10 @@ mod tests {
                 }
             )]
         );
-        assert_eq!(state.marked_dirty, vec![db.clone()]);
+        assert!(
+            state.marked_dirty.is_empty(),
+            "the synthesized pass carries the recount: {state:?}"
+        );
         assert!(!state.owed.contains_key(&db), "owed not cleared: {state:?}");
 
         queue.stop(None);
@@ -2841,7 +3184,7 @@ mod tests {
             JobType::JobDataDeletion,
         ] {
             assert_eq!(
-                pessimistic_summary(&job_type),
+                pessimistic_summary(&queued_job(job_type.clone(), None)),
                 ChangeSummary {
                     wrote_data: true,
                     deleted_data: true,
@@ -2851,7 +3194,7 @@ mod tests {
             );
         }
         assert_eq!(
-            pessimistic_summary(&JobType::DataExtraction),
+            pessimistic_summary(&queued_job(JobType::DataExtraction, None)),
             ChangeSummary {
                 wrote_data: true,
                 deleted_data: false,
@@ -2864,7 +3207,7 @@ mod tests {
         // The reconcile writes only quant tables and never ran post-job
         // maintenance; cancelling it must not start scheduling one.
         assert_eq!(
-            pessimistic_summary(&JobType::VectorQuantReconcile),
+            pessimistic_summary(&queued_job(JobType::VectorQuantReconcile, None)),
             ChangeSummary::default(),
             "the reconcile owes no maintenance, even when it is cancelled"
         );

@@ -2974,7 +2974,7 @@
           "jobs"
         ],
         "summary": "Run database maintenance",
-        "description": "Enqueues a database maintenance job for the selected database: rebuild the tag item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space (the space reclaim is skipped unless the database actually holds enough free pages to be worth rewriting). Runs at the back of the queue, after everything already queued. Responds 409 when a maintenance job for this database is already queued or running.",
+        "description": "Enqueues a database maintenance job for the selected database: rebuild the tag item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space (the space reclaim is skipped unless the database actually holds enough free pages to be worth rewriting). Runs at the back of the queue, after everything already queued. If a maintenance job for this database is already queued, that job is upgraded to do all of the above and returned instead of adding a second one. Responds 409 only when a maintenance job for this database is already running, since a pass in flight may already have decided what to skip; retry once it finishes.",
         "operationId": "enqueue_db_maintenance",
         "parameters": [
           {
@@ -3004,7 +3004,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Enqueued database maintenance job",
+            "description": "Enqueued (or upgraded) database maintenance job",
             "content": {
               "application/json": {
                 "schema": {
@@ -3014,7 +3014,7 @@
             }
           },
           "409": {
-            "description": "A maintenance job for this database is already queued or running",
+            "description": "A maintenance job for this database is already running",
             "content": {
               "application/json": {
                 "schema": {
