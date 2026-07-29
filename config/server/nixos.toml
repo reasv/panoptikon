@@ -11,9 +11,10 @@ level = "${LOGLEVEL:-INFO}"
 [server]
 host = "${PANOPTIKON_HOST:-127.0.0.1}"
 port = "${PANOPTIKON_PORT:-6342}"
-# Loopback default: do not trust X-Forwarded-* (spoofable on a public bind).
-# Enable only behind a trusted reverse proxy that sets those headers.
-trust_forwarded_headers = false
+# X-Forwarded-* headers are not trusted by default (the code default;
+# spoofable on a public bind). Uncomment only behind a trusted reverse
+# proxy that sets those headers.
+# trust_forwarded_headers = true
 
 [upstreams.ui]
 base_url = "http://127.0.0.1:6340"
