@@ -11,6 +11,7 @@ from inferio.impl.utils import (
     get_device,
     load_image_from_buffer,
     print_resource_usage,
+    run_with_oom_retry,
     select_dtype,
 )
 from inferio.model import InferenceModel
@@ -169,6 +170,13 @@ class Florence2(InferenceModel):
         return out
 
     def batch_predict(self, prompt: str, image_inputs: List[PILImage.Image]) -> List[str]:
+        return run_with_oom_retry(
+            lambda chunk: self._predict_chunk(prompt, list(chunk)),
+            image_inputs,
+            logger=logger,
+        )
+
+    def _predict_chunk(self, prompt: str, image_inputs: List[PILImage.Image]) -> List[str]:
         import torch
 
         assert self.processor is not None

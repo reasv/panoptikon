@@ -10,6 +10,7 @@ from inferio.impl.utils import (
     clear_cache,
     get_device,
     load_image_from_buffer,
+    run_with_oom_retry,
     select_dtype,
 )
 from inferio.model import InferenceModel
@@ -72,14 +73,16 @@ class DoctrModel(InferenceModel):
             else:
                 raise ValueError("OCR requires image inputs.")
 
-        result = self.model(image_inputs)
+        pages = run_with_oom_retry(
+            lambda chunk: list(self.model(list(chunk)).pages), image_inputs
+        )
 
-        assert len(result.pages) == len(
+        assert len(pages) == len(
             image_inputs
         ), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for page, config in zip(result.pages, configs):
+        for page, config in zip(pages, configs):
             threshold = config.get("threshold", None)
             assert (
                 isinstance(threshold, float) or threshold is None

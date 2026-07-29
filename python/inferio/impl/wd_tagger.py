@@ -14,6 +14,7 @@ from inferio.impl.utils import (
     mcut_threshold,
     pil_ensure_rgb,
     pil_pad_square,
+    run_with_oom_retry,
 )
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
@@ -167,23 +168,23 @@ class WDTagger(InferenceModel):
 
         self.load()
 
-        image_inputs = self.prepare_images(images)
+        def forward_chunk(chunk):
+            image_inputs = self.prepare_images(chunk)
+            with torch.inference_mode():
+                # move inputs to GPU, if available
+                if self.devices[dev_idx].type != "cpu":
+                    image_inputs = image_inputs.to(self.devices[dev_idx])
+                # run the model
+                outputs = self.model.forward(image_inputs)
+                # apply the final activation function
+                # (timm doesn't support doing this internally)
+                outputs = F.sigmoid(outputs)
+                # move outputs back to cpu if we were on GPU
+                if self.devices[dev_idx].type != "cpu":
+                    outputs = outputs.cpu()
+            return [outputs[i] for i in range(outputs.size(0))]
 
-        with torch.inference_mode():
-            # move model to GPU, if available
-            if self.devices[dev_idx].type != "cpu":
-                image_inputs = image_inputs.to(self.devices[dev_idx])
-            # run the model
-            outputs = self.model.forward(image_inputs)
-            # apply the final activation function
-            # (timm doesn't support doing this internally)
-            outputs = F.sigmoid(outputs)
-            # move inputs, outputs, and model back to to cpu if we were on GPU
-            if self.devices[dev_idx].type != "cpu":
-                image_inputs = image_inputs.cpu()
-                outputs = outputs.cpu()
-
-        return [outputs[i] for i in range(outputs.size(0))]
+        return run_with_oom_retry(forward_chunk, list(images))
 
     def get_tags(
         self,

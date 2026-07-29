@@ -6,6 +6,7 @@ from inferio.impl.utils import (
     clear_cache,
     get_device,
     load_image_from_buffer,
+    run_with_oom_retry,
     select_dtype,
 )
 import logging
@@ -77,24 +78,19 @@ class DotsOCRModel(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        
-        all_outputs = []
+
         images = [load_image_from_buffer(inp.file) for inp in inputs]
 
+        # OOM halving replaces the old broad per-chunk fallback; non-OOM
+        # errors now surface to the dispatcher's per-request fallback.
         if self.enable_batching and len(images) > 1:
-            for i in range(0, len(images), self.batch_size):
-                batch = images[i:i + self.batch_size]
-                try:
-                    all_outputs.extend(self._predict_batch(batch))
-                except Exception as e:
-                    logger.error(f"Batch processing failed for a chunk: {e}. Falling back to individual processing for this chunk.")
-                    for image in batch:
-                        all_outputs.append(self._predict_single(image))
-        else:
-            for image in images:
-                all_outputs.append(self._predict_single(image))
-
-        return all_outputs
+            return run_with_oom_retry(
+                self._predict_batch,
+                images,
+                initial_chunk_size=self.batch_size,
+                logger=logger,
+            )
+        return [self._predict_single(image) for image in images]
 
     def _create_messages(self, image: PILImage.Image):
         return [

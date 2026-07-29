@@ -4,7 +4,13 @@ from io import BytesIO
 from typing import List, Sequence, Type
 import numpy as np
 from PIL import Image as PILImage
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device, load_image_from_buffer
+from inferio.impl.utils import (
+    clean_whitespace,
+    clear_cache,
+    get_device,
+    load_image_from_buffer,
+    run_with_oom_retry,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -128,9 +134,12 @@ class EasyOCRModel(InferenceModel):
         # Process with batched method
         if use_batched:
             try:
-                batch_results = self.model.readtext_batched(
+                batch_results = run_with_oom_retry(
+                    lambda chunk: self.model.readtext_batched(
+                        list(chunk), **batch_params
+                    ),
                     image_inputs,
-                    **batch_params
+                    logger=logger,
                 )
             except Exception as e:
                 # Fall back to individual processing if batched processing fails
