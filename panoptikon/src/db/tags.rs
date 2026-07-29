@@ -1,11 +1,66 @@
 use sqlx::Row;
-use std::collections::HashMap;
 
 use crate::api_error::ApiError;
-use crate::db::prefix::prefix_upper_bound;
+use crate::db::prefix::{escape_like_literal, prefix_upper_bound};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+/// Recomputes `tags.item_count` for every tag from scratch.
+///
+/// Run after every job by `run_post_job_maintenance`, which is also what makes
+/// deletions correct: every bulk-deletion flow ends there, so nothing has to
+/// hook the delete paths individually. A full recompute rather than
+/// incremental maintenance because it is cheap enough not to need one — a
+/// single ordered walk of `idx_tags_items_tag_item`, measured 0.83s over 22.4M
+/// rows — while trigger-maintained counters cost 86-104% on bulk insert and
+/// cannot decrement soundly at this level (a cascade deletes the sibling rows
+/// the check would need).
+///
+/// COUNT(DISTINCT item_id), not COUNT(*): an item is tagged once per setter
+/// (`write_tags_output` pins `idx = 0`, and `UNIQUE(item_id, setter_id,
+/// data_type, idx, is_origin)` allows exactly one tags row per item per
+/// setter), so a row count would multiply by the number of taggers that
+/// agreed. The number is meant to answer "how many items would this tag
+/// match".
+pub(crate) const RECOUNT_TAG_ITEMS_SQL: &str = "UPDATE tags SET item_count = (
+    SELECT COUNT(DISTINCT tags_items.item_id) FROM tags_items
+    WHERE tags_items.tag_id = tags.id)";
+
+/// Runs [`RECOUNT_TAG_ITEMS_SQL`]. Goes through the index writer actor like
+/// every other index mutation.
+pub(crate) async fn recount_tag_items(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
+    sqlx::query(RECOUNT_TAG_ITEMS_SQL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to recount tag item counts");
+            ApiError::internal("Failed to recount tag item counts")
+        })?;
+    Ok(())
+}
+
+/// Tags whose name contains `name`, most-used first.
+///
+/// The query text is matched literally: `%` and `_` are escaped before the
+/// surrounding wildcards are added. Tag names routinely contain underscores,
+/// and unescaped, a lone `_` matches every tag in the database rather than
+/// the ones containing one.
+///
+/// Substring matching is binary — a tag either contains the string or does
+/// not — so there is no relevance signal to order by, and the original
+/// implementation ordered by nothing: it took whichever `limit` rows the scan
+/// reached first (rowid, i.e. roughly the order tags were first encountered)
+/// and only then counted them. Item count is the one meaningful tiebreak
+/// available, and it answers what the caller wants to know anyway: how many
+/// results this tag would return.
+///
+/// The count is read from `tags.item_count` rather than computed, so this
+/// touches `tags` alone. Counting live over `tags_items` was correct but its
+/// cost scaled with how many tags matched, which is exactly backwards for an
+/// autocomplete: the short, fast-typed prefixes are the broad ones. On the
+/// 22.4M-row `default` index a one-letter query cost ~600ms live and ~1.5ms
+/// from the stored column. See [`RECOUNT_TAG_ITEMS_SQL`] for what keeps it
+/// current, and how stale it can be.
 pub(crate) async fn find_tags(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
@@ -13,13 +68,15 @@ pub(crate) async fn find_tags(
 ) -> ApiResult<Vec<(String, String, i64)>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, namespace, name
+        SELECT tags.namespace AS namespace, tags.name AS name,
+               tags.item_count AS count
         FROM tags
-        WHERE name LIKE ?
+        WHERE tags.name LIKE ? ESCAPE '\'
+        ORDER BY count DESC, tags.namespace, tags.name
         LIMIT ?
         "#,
     )
-    .bind(format!("%{name}%"))
+    .bind(format!("%{}%", escape_like_literal(name)))
     .bind(limit)
     .fetch_all(&mut *conn)
     .await
@@ -28,17 +85,8 @@ pub(crate) async fn find_tags(
         ApiError::internal("Failed to get tags")
     })?;
 
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = Vec::with_capacity(rows.len());
-    let mut id_to_tag = HashMap::with_capacity(rows.len());
+    let mut results = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.try_get("id").map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to get tags")
-        })?;
         let namespace: String = row.try_get("namespace").map_err(|err| {
             tracing::error!(error = %err, "failed to read tag namespace");
             ApiError::internal("Failed to get tags")
@@ -47,48 +95,11 @@ pub(crate) async fn find_tags(
             tracing::error!(error = %err, "failed to read tag name");
             ApiError::internal("Failed to get tags")
         })?;
-        ids.push(id);
-        id_to_tag.insert(id, (namespace, tag_name));
-    }
-
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        r#"
-        SELECT tags_items.tag_id AS tag_id, COUNT(DISTINCT item_data.item_id) AS count
-        FROM tags_items
-        JOIN item_data
-            ON tags_items.item_data_id = item_data.id
-        WHERE tags_items.tag_id IN ({placeholders})
-        GROUP BY tags_items.tag_id
-        "#
-    );
-
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    for tag_id in &ids {
-        query = query.bind(tag_id);
-    }
-
-    let rows = query.fetch_all(&mut *conn).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to query tag frequencies");
-        ApiError::internal("Failed to get tags")
-    })?;
-
-    let mut results = Vec::with_capacity(rows.len());
-    for row in rows {
-        let tag_id: i64 = row.try_get("tag_id").map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to get tags")
-        })?;
         let count: i64 = row.try_get("count").map_err(|err| {
             tracing::error!(error = %err, "failed to read tag count");
             ApiError::internal("Failed to get tags")
         })?;
-        if let Some((namespace, tag_name)) = id_to_tag.get(&tag_id) {
-            results.push((namespace.clone(), tag_name.clone(), count));
-        }
+        results.push((namespace, tag_name, count));
     }
 
     Ok(results)
@@ -390,18 +401,25 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
+            -- item_id mirrors item_data: 10 -> item 100, 11 -> 101, 12 -> 100.
+            -- Note 10 and 12 are two setters on the SAME item, so tag 1 covers
+            -- two distinct items despite having three rows.
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
             VALUES
-                (10, 1, 0.9),
-                (11, 1, 0.7),
-                (12, 1, 0.8),
-                (10, 2, 0.6),
-                (11, 3, 0.5)
+                (10, 1, 100, 0.9),
+                (11, 1, 101, 0.7),
+                (12, 1, 100, 0.8),
+                (10, 2, 100, 0.6),
+                (11, 3, 101, 0.5)
             "#,
         )
         .execute(&mut *conn)
         .await
         .unwrap();
+
+        // The fixture writes `tags_items` directly, bypassing the job that
+        // would normally refresh the counts.
+        recount_tag_items(conn).await.unwrap();
 
         dbs
     }
@@ -420,6 +438,111 @@ mod tests {
                 ("ns".to_string(), "caterpillar".to_string(), 1)
             ]
         );
+    }
+
+    // The backfill in the migration and the post-job recount must compute the
+    // same number, or an upgraded database disagrees with a freshly recounted
+    // one. They cannot share a definition across the SQL/Rust boundary, so
+    // pin the text instead. (Line endings differ by checkout: the migrator
+    // normalizes them, so normalize here too.)
+    #[test]
+    fn recount_sql_matches_the_migration() {
+        let migration =
+            include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
+                .replace("\r\n", "\n");
+        assert!(
+            migration.contains(RECOUNT_TAG_ITEMS_SQL),
+            "migration 20260727130000 no longer runs RECOUNT_TAG_ITEMS_SQL verbatim"
+        );
+    }
+
+    // Deletion is the path that makes a stored count hard: it happens by FK
+    // cascade from `item_data`, which is why this is a full recompute rather
+    // than incremental maintenance. Deleting one of the two setters' rows for
+    // item 100 must NOT drop `cat` (item 101 and item 100 via the other setter
+    // both remain); deleting the last row for an item must.
+    #[tokio::test]
+    async fn recount_tag_items_follows_cascading_deletes() {
+        async fn count(conn: &mut sqlx::SqliteConnection, name: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>("SELECT item_count FROM tags WHERE name = ?")
+                .bind(name)
+                .fetch_one(conn)
+                .await
+                .unwrap()
+        }
+
+        let mut dbs = setup_tag_db().await;
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 2);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 1);
+
+        // item_data 12 is setter beta on item 100; alpha (item_data 10) still
+        // covers the same item, so the distinct-item count is unchanged.
+        sqlx::query("DELETE FROM item_data WHERE id = 12")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 2);
+
+        // item_data 11 is the only row for item 101, and the only one carrying
+        // `dog`.
+        sqlx::query("DELETE FROM item_data WHERE id = 11")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 1);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 0);
+
+        // A recount over unchanged data must not move anything.
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+        assert_eq!(count(&mut dbs.index_conn, "cat").await, 1);
+        assert_eq!(count(&mut dbs.index_conn, "dog").await, 0);
+
+        // A tag whose applications are all gone still matches — only its
+        // count and its position change.
+        let tags = find_tags(&mut dbs.index_conn, "dog", 10).await.unwrap();
+        assert_eq!(tags, vec![("ns".to_string(), "dog".to_string(), 0)]);
+    }
+
+    // `find_tags` counts distinct `tags_items.item_id`, so a writer that
+    // omitted the column would silently collapse a tag's count to 1; the
+    // migration installs a trigger that rejects such writes instead. Both
+    // referenced rows exist and the (item_data, tag) pair is free, so the
+    // trigger is the only thing that can refuse this insert.
+    #[tokio::test]
+    async fn tags_items_insert_without_item_id_is_rejected() {
+        let mut dbs = setup_tag_db().await;
+        let result =
+            sqlx::query("INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)")
+                .execute(&mut dbs.index_conn)
+                .await;
+        let err = result.expect_err("insert omitting item_id must be rejected");
+        assert!(
+            err.to_string().contains("item_id must be the owning item id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // `%` and `_` are LIKE metacharacters; unescaped, a lone `_` matched
+    // every tag in the database. Tag names routinely contain literal
+    // underscores, so the query text must match them literally.
+    #[tokio::test]
+    async fn find_tags_matches_like_metacharacters_literally() {
+        let mut dbs = setup_tag_db().await;
+        sqlx::query("INSERT INTO tags (id, namespace, name) VALUES (50, 'ns', 'cat_girl')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+
+        // Only the tag with a literal underscore — not "any single
+        // character", which would return the entire fixture.
+        let tags = find_tags(&mut dbs.index_conn, "_", 10).await.unwrap();
+        assert_eq!(tags, vec![("ns".to_string(), "cat_girl".to_string(), 0)]);
+
+        // No tag contains a literal percent sign.
+        let tags = find_tags(&mut dbs.index_conn, "%", 10).await.unwrap();
+        assert_eq!(tags, vec![]);
     }
 
     // Ensures tag namespaces include colon prefixes for search stats.
@@ -487,8 +610,8 @@ mod tests {
         // One application each, so all three tie at count 1.
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
-            VALUES (10, 33, 1.0), (10, 32, 1.0), (10, 31, 1.0)
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
+            VALUES (10, 33, 100, 1.0), (10, 32, 100, 1.0), (10, 31, 100, 1.0)
             "#,
         )
         .execute(&mut dbs.index_conn)
@@ -521,6 +644,85 @@ mod tests {
         );
         // The un-tied winner still leads.
         assert_eq!(first[0], ("ns".to_string(), "cat".to_string(), 3));
+    }
+
+    // Ensures matches are SELECTED by item count, not just ordered by it once
+    // chosen. The popular tag is given the highest id so it sorts last by
+    // rowid — the order the previous implementation took its `limit` rows in,
+    // which would have dropped it.
+    #[tokio::test]
+    async fn find_tags_selects_the_most_used_matches() {
+        let mut dbs = setup_tag_db().await;
+        // Ten more items, so counts can exceed the fixture's two.
+        for item in 200..210_i64 {
+            sqlx::query(
+                r#"
+                INSERT INTO items (id, sha256, md5, type, time_added)
+                VALUES (?, ?, 'md5', 'image/png', '2024-01-01T00:00:00')
+                "#,
+            )
+            .bind(item)
+            .bind(format!("sha_{item}"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+                VALUES (?, ?, 1, 'tags', 0, 1)
+                "#,
+            )
+            .bind(item)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        // Three rare "cat*" tags with low ids, one popular one with a high id.
+        sqlx::query(
+            r#"
+            INSERT INTO tags (id, namespace, name)
+            VALUES (40, 'ns', 'cat_a'), (41, 'ns', 'cat_b'), (42, 'ns', 'cat_c'),
+                   (99, 'ns', 'cat_popular')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        for item in 200..210_i64 {
+            sqlx::query(
+                "INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence) VALUES (?, 99, ?, 1.0)",
+            )
+            .bind(item)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        for (tag, item) in [(40_i64, 200_i64), (41, 201), (42, 202)] {
+            sqlx::query(
+                "INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence) VALUES (?, ?, ?, 1.0)",
+            )
+            .bind(item)
+            .bind(tag)
+            .bind(item)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        recount_tag_items(&mut dbs.index_conn).await.unwrap();
+
+        let tags = find_tags(&mut dbs.index_conn, "cat", 2).await.unwrap();
+
+        // 'cat_popular' (10 items) must win despite sorting last by rowid;
+        // 'cat' from the fixture (2 items) takes the remaining slot.
+        assert_eq!(
+            tags,
+            vec![
+                ("ns".to_string(), "cat_popular".to_string(), 10),
+                ("ns".to_string(), "cat".to_string(), 2),
+            ]
+        );
     }
 
     // Ensures the setter filter still selects the same rows now that the
@@ -583,8 +785,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO tags_items (item_data_id, tag_id, confidence)
-            VALUES (10, 20, 1.0), (10, 21, 1.0), (10, 22, 1.0), (10, 23, 1.0)
+            INSERT INTO tags_items (item_data_id, tag_id, item_id, confidence)
+            VALUES (10, 20, 100, 1.0), (10, 21, 100, 1.0), (10, 22, 100, 1.0), (10, 23, 100, 1.0)
             "#,
         )
         .execute(&mut dbs.index_conn)

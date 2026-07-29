@@ -20,7 +20,8 @@ use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
-use crate::jobs::files::{FileScanService, is_resync_needed, run_post_job_maintenance};
+use crate::jobs::files::{FileScanService, is_resync_needed};
+use crate::jobs::queue::ChangeSummary;
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
 use crate::jobs::timing::PhaseTimer;
 use crate::pql::builder::filters::OneOrMany;
@@ -35,9 +36,47 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 mod input_handlers;
 mod output_handlers;
 
-const CACHE_KEY: &str = "batch";
+/// The inferio cache key every batch job loads under. Shared with the queue's
+/// boundary unload, which must target the same key.
+pub(crate) const CACHE_KEY: &str = "batch";
+
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
+
+/// Serializes batch-model loads against the queue boundary's unloads. Held
+/// only around the load itself (and around an unload's decision + call), never
+/// for the duration of a job.
+static BATCH_SLOT: Mutex<()> = Mutex::const_new(());
+/// Bumped by every batch load. An unload captures it before it is spawned and
+/// aborts if it changed: without this, a fire-and-forget unload issued at one
+/// boundary can land *after* the next job has already loaded the same setter,
+/// and `unload_model` fails everything queued on that dispatcher.
+static BATCH_LOAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads the current batch-load generation. Cheap and non-blocking: the queue
+/// actor captures it before spawning an unload.
+pub(crate) fn batch_load_generation() -> u64 {
+    BATCH_LOAD_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Locks the batch slot. Loads take it around `load_model_all`, boundary
+/// unloads around the generation check plus `unload_model_all`.
+pub(crate) async fn lock_batch_slot() -> tokio::sync::MutexGuard<'static, ()> {
+    BATCH_SLOT.lock().await
+}
+
+/// Invalidates every unload captured so far. Must be called with the slot held
+/// and immediately before the load, so that an unload waiting on the slot sees
+/// the new generation and aborts instead of unloading what was just loaded.
+pub(crate) fn begin_batch_load() {
+    BATCH_LOAD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Whether an unload that captured `generation` may still proceed. Call with
+/// the batch slot held.
+pub(crate) fn batch_unload_is_current(generation: u64) -> bool {
+    batch_load_generation() == generation
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ModelMetadata {
@@ -55,6 +94,10 @@ pub(crate) struct ModelMetadata {
     pub default_threshold: Option<f64>,
     pub input_mime_types: Vec<String>,
     pub skip_processed_items: bool,
+    /// Set when the serving inference host marked the model unavailable
+    /// (e.g. the GPU misses the model's `min_compute_capability` floor);
+    /// jobs bail before loading instead of failing with a CUDA error.
+    pub unavailable_reason: Option<String>,
     // Informational metadata mirrored from the inference server's config.
     #[allow(dead_code)]
     pub name: Option<String>,
@@ -111,7 +154,17 @@ struct JobCounters {
     inference_time: PhaseTimer,
 }
 
-pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(), String> {
+/// What an extraction job reports back to the queue: whether it changed the
+/// index (so maintenance is owed for its DB) and which batch-cache model it
+/// left loaded.
+pub(crate) struct ExtractionOutcome {
+    pub summary: ChangeSummary,
+    pub loaded_model: Option<String>,
+}
+
+pub(crate) async fn run_extraction_job(
+    job: crate::jobs::queue::Job,
+) -> Result<ExtractionOutcome, String> {
     let inference_id = job
         .metadata
         .clone()
@@ -125,10 +178,11 @@ pub(crate) async fn run_extraction_job(job: crate::jobs::queue::Job) -> Result<(
     let result = run_extraction_job_inner(&job, &inference_id).await;
     guard.resume().await;
     match result {
-        Ok(()) => {
+        Ok(outcome) => {
             cleanup.disarm();
-            run_post_job_maintenance(&job.index_db, false).await;
-            Ok(())
+            // Maintenance is no longer run per job: the queue's boundary hook
+            // runs one pass per DB once nothing else is queued for it.
+            Ok(outcome)
         }
         Err(err) => {
             cleanup.run().await;
@@ -186,16 +240,36 @@ async fn cleanup_incomplete_jobs(index_db: &str) {
 async fn run_extraction_job_inner(
     job: &crate::jobs::queue::Job,
     inference_id: &str,
-) -> ApiResult<()> {
+) -> ApiResult<ExtractionOutcome> {
     let config_store = SystemConfigStore::from_env();
     let config = config_store.load(&job.index_db)?;
 
+    // The embedded resync no longer runs maintenance of its own, so its
+    // changes are folded into this job's report (which also removes the old
+    // double maintenance pass: once inside the update, once in the wrapper).
+    let mut summary = ChangeSummary::default();
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
-        service.run_folder_update().await?;
+        let resync = service.run_folder_update().await?.summary;
+        // Reported to the queue *now*, before the inference work that can fail
+        // or be cancelled: the resync may have deleted tens of thousands of
+        // files, and that debt must not die with this job. The success path
+        // reports it again through `summary`; the flags are ORs, so a double
+        // report is harmless.
+        crate::jobs::queue::record_owed_now(&job.index_db, resync);
+        summary.or_with(resync);
     }
 
     let model = load_model_metadata(inference_id).await?;
+    // The /metadata availability overlay reflects the *serving* host's
+    // GPUs (a remote inference server reports its own), so this covers
+    // UI-, API-, and cron-triggered jobs with a clear message instead of
+    // a CUDA error mid-load.
+    if let Some(reason) = &model.unavailable_reason {
+        return Err(ApiError::bad_request(format!(
+            "Model {inference_id} is not available on this system: {reason}"
+        )));
+    }
     let defaults = resolve_job_defaults(&config, &model, job.batch_size, job.threshold);
 
     let context = job_inference_context();
@@ -236,7 +310,12 @@ async fn run_extraction_job_inner(
 
     if total_remaining < 1 {
         tracing::info!(inference_id, "no items to process");
-        return Ok(());
+        // Nothing loaded, nothing written: the common cron no-op reports only
+        // whatever the resync above changed.
+        return Ok(ExtractionOutcome {
+            summary,
+            loaded_model: None,
+        });
     }
 
     // Same local-time format as the writer's end_time updates so
@@ -258,19 +337,27 @@ async fn run_extraction_job_inner(
     })
     .await?;
 
-    let load_result = context
-        .pool
-        .load_model_all(
-            &model.setter_name,
-            CACHE_KEY,
-            CACHE_LRU_SIZE,
-            CACHE_TTL_SECS,
-            // Batch jobs opt out of lazy prewarming (design doc §8):
-            // batch-only model families must not hold a warm worker's RAM
-            // after the job ends.
-            Some(false),
-        )
-        .await;
+    let load_result = {
+        // Under the batch slot, with the generation bumped first: a boundary
+        // unload spawned before this load either already ran (and this load
+        // undoes it) or finds a newer generation and aborts. It can never land
+        // on the model this job is about to use.
+        let _slot = lock_batch_slot().await;
+        begin_batch_load();
+        context
+            .pool
+            .load_model_all(
+                &model.setter_name,
+                CACHE_KEY,
+                CACHE_LRU_SIZE,
+                CACHE_TTL_SECS,
+                // Batch jobs opt out of lazy prewarming (design doc §8):
+                // batch-only model families must not hold a warm worker's RAM
+                // after the job ends.
+                Some(false),
+            )
+            .await
+    };
     if let Err(err) = load_result {
         return Err(ApiError::internal(format!("Failed to load model: {err}")));
     }
@@ -353,7 +440,7 @@ async fn run_extraction_job_inner(
         remaining
     };
 
-    let (final_update, total_failure) = {
+    let (final_update, total_failure, processed_data) = {
         let guard = counters.lock().await;
         // Every attempted item failing means a systemic cause (inference
         // server down, model broken), not per-item bad data: surface it as a
@@ -380,7 +467,7 @@ async fn run_extraction_job_inner(
             inference_work_secs = guard.inference_time.work_secs(),
             "extraction job phase timing"
         );
-        (update, total_failure)
+        (update, total_failure, guard.processed - guard.errors > 0)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -389,10 +476,10 @@ async fn run_extraction_job_inner(
     })
     .await;
 
-    let _ = context
-        .pool
-        .unload_model_all(&model.setter_name, CACHE_KEY)
-        .await;
+    // No unload here: the job reports the model it loaded and the queue's
+    // boundary decides, so a following job for the same setter reuses it
+    // instead of reloading (design §B). Every path that loses the boundary's
+    // unload still falls back to the inferio TTL sweep, as it always did.
 
     if total_failure {
         return Err(ApiError::internal(format!(
@@ -400,10 +487,26 @@ async fn run_extraction_job_inner(
             final_update.errors
         )));
     }
-    Ok(())
+    summary.or_with(ChangeSummary {
+        wrote_data: processed_data,
+        deleted_data: false,
+        // Tag output is the only extraction output that touches `tags_items`;
+        // text, clip and embedding outputs leave the counts alone. The writer
+        // has already set the durable marker for every tag write this job
+        // committed — this flag is what lets the boundary decide without
+        // reading the DB, and what makes a fully cancelled tagging job still
+        // recount (through the marker).
+        tags_changed: processed_data && model.output_type == "tags",
+    });
+    Ok(ExtractionOutcome {
+        summary,
+        loaded_model: Some(model.setter_name.clone()),
+    })
 }
 
-pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Result<(), String> {
+pub(crate) async fn run_data_deletion_job(
+    job: crate::jobs::queue::Job,
+) -> Result<ChangeSummary, String> {
     let inference_id = job
         .metadata
         .clone()
@@ -419,7 +522,7 @@ pub(crate) async fn run_data_deletion_job(job: crate::jobs::queue::Job) -> Resul
 async fn run_data_deletion_job_inner(
     job: &crate::jobs::queue::Job,
     inference_id: &str,
-) -> ApiResult<()> {
+) -> ApiResult<ChangeSummary> {
     let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
     let data_types = get_setter_data_types(&mut conn, inference_id).await?;
     drop(conn);
@@ -434,10 +537,16 @@ async fn run_data_deletion_job_inner(
     })
     .await?;
 
-    // VACUUM blocks the writer for the whole run; skip it when the deletion
-    // turned out to be a no-op.
-    run_post_job_maintenance(&job.index_db, deleted > 0 || orphan_tags_deleted > 0).await;
-    Ok(())
+    // Reported, not run: the queue's boundary hook owns maintenance now, and
+    // its VACUUM is additionally gated on the actual free-page count.
+    let deleted_data = deleted > 0 || orphan_tags_deleted > 0;
+    Ok(ChangeSummary {
+        wrote_data: false,
+        deleted_data,
+        // Deleting a tagger's data removes its `tags_items` rows outright, and
+        // `include_orphan_tags` deletes the tags left with none.
+        tags_changed: deleted_data,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1009,6 +1118,22 @@ pub(crate) fn resolve_model_metadata(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let unavailable_reason = if merged
+        .get("unavailable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some(
+            merged
+                .get("unavailable_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("marked unavailable by the inference server")
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     let name = merged
         .get("name")
         .and_then(Value::as_str)
@@ -1034,6 +1159,7 @@ pub(crate) fn resolve_model_metadata(
         default_threshold,
         input_mime_types,
         skip_processed_items,
+        unavailable_reason,
         name,
         description,
         link,
@@ -1226,5 +1352,85 @@ fn bind_param<'q>(
             })?;
             Ok(query.bind(encoded))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The guard that keeps a boundary unload from landing on a model a newer
+    // job has already loaded: a load bumps the generation under the slot, and
+    // an unload holding an older generation must refuse to run.
+    //
+    // Serial by construction: this is the only test that touches the batch
+    // slot (queue tests record the decision instead of performing it).
+    #[tokio::test]
+    async fn a_newer_batch_load_invalidates_a_pending_unload() {
+        // What the queue actor captures when it spawns the unload.
+        let captured = batch_load_generation();
+        {
+            let slot = lock_batch_slot().await;
+            assert!(
+                batch_unload_is_current(captured),
+                "nothing has loaded yet, so the unload is still valid"
+            );
+            drop(slot);
+        }
+
+        // A new extraction job loads its model first.
+        {
+            let _slot = lock_batch_slot().await;
+            begin_batch_load();
+        }
+
+        let _slot = lock_batch_slot().await;
+        assert!(
+            !batch_unload_is_current(captured),
+            "the unload is stale and must abort instead of unloading the \
+             model the new job just loaded"
+        );
+        assert!(
+            batch_unload_is_current(batch_load_generation()),
+            "an unload captured after that load is valid again"
+        );
+    }
+
+    // The /metadata availability overlay must reach the job layer: an id
+    // carrying `unavailable` resolves with its reason (falling back to a
+    // generic one), and untouched ids resolve with none.
+    #[test]
+    fn resolve_model_metadata_picks_up_unavailable_reason() {
+        let metadata = serde_json::json!({
+            "doctr": {
+                "group_metadata": {
+                    "input_spec": {"handler": "image_frames", "opts": {}}
+                },
+                "inference_ids": {
+                    "dots_ocr": {
+                        "unavailable": true,
+                        "unavailable_reason": "Requires an NVIDIA GPU with \
+                         compute capability >= 8.0 (detected: 6.1)"
+                    },
+                    "bare_flag": {"unavailable": true},
+                    "open_model": {"description": "fine"}
+                }
+            }
+        });
+        let gated = resolve_model_metadata(&metadata, "doctr/dots_ocr").unwrap();
+        assert!(
+            gated
+                .unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains(">= 8.0")
+        );
+        let bare = resolve_model_metadata(&metadata, "doctr/bare_flag").unwrap();
+        assert_eq!(
+            bare.unavailable_reason.as_deref(),
+            Some("marked unavailable by the inference server")
+        );
+        let open = resolve_model_metadata(&metadata, "doctr/open_model").unwrap();
+        assert_eq!(open.unavailable_reason, None);
     }
 }

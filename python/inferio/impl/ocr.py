@@ -5,7 +5,14 @@ from typing import List, Sequence, Type
 import numpy as np
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device, load_image_from_buffer
+from inferio.impl.utils import (
+    clean_whitespace,
+    clear_cache,
+    get_device,
+    load_image_from_buffer,
+    run_with_oom_retry,
+    select_dtype,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -17,12 +24,14 @@ class DoctrModel(InferenceModel):
         recognition_model: str,
         detect_language: bool = True,
         pretrained: bool = True,
+        precision: str | None = None,
         init_args: dict = {},
     ):
         self.detection_model: str = detection_model
         self.recognition_model: str = recognition_model
         self.detect_language: bool = detect_language
         self.pretrained: bool = pretrained
+        self.precision: str | None = precision
         self.init_args = init_args
         self._model_loaded: bool = False
 
@@ -45,8 +54,12 @@ class DoctrModel(InferenceModel):
             pretrained=self.pretrained,
             **self.init_args,
         )
-        if torch.cuda.is_available():
-            self.model = self.model.cuda().half()
+        dev = self.devices[0]
+        if dev.type == "cuda":
+            dtype = select_dtype(dev, "fp16", explicit=self.precision)
+            self.model = self.model.to(dev)
+            if dtype == torch.float16:
+                self.model = self.model.half()
         self._model_loaded = True
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
@@ -60,14 +73,16 @@ class DoctrModel(InferenceModel):
             else:
                 raise ValueError("OCR requires image inputs.")
 
-        result = self.model(image_inputs)
+        pages = run_with_oom_retry(
+            lambda chunk: list(self.model(list(chunk)).pages), image_inputs
+        )
 
-        assert len(result.pages) == len(
+        assert len(pages) == len(
             image_inputs
         ), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for page, config in zip(result.pages, configs):
+        for page, config in zip(pages, configs):
             threshold = config.get("threshold", None)
             assert (
                 isinstance(threshold, float) or threshold is None

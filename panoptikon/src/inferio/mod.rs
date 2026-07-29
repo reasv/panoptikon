@@ -10,6 +10,7 @@
 //! `/api/inference` when `[inference_local].enabled` (or via the `inferio`
 //! subcommand).
 
+pub mod capability;
 pub mod dispatch;
 pub mod http;
 pub mod manager;

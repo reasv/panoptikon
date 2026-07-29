@@ -5,7 +5,13 @@ from typing import List, Sequence, Type, Union
 from PIL import Image as PILImage
 from PIL import ImageFile
 
-from inferio.impl.utils import clear_cache, get_device, load_image_from_buffer, serialize_array
+from inferio.impl.utils import (
+    clear_cache,
+    get_device,
+    load_image_from_buffer,
+    run_with_oom_retry,
+    serialize_array,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -126,41 +132,47 @@ class ClipModel(InferenceModel):
                 assert "text" in input_item.data, "Input must have 'text' key"
                 text_inputs.append((idx, input_item.data["text"]))
 
+        def encode_text_chunk(chunk):
+            tokens = torch.tensor(self.tokenizer(list(chunk))).to(self.device)
+            features = self.model.encode_text(tokens, normalize=True)
+            return [
+                serialize_array(features[i].cpu().numpy())
+                for i in range(features.size(0))
+            ]
+
+        def encode_image_chunk(chunk):
+            processed = torch.stack(
+                [self.preprocess(img) for img in chunk]  # type: ignore
+            ).to(self.device, dtype=self.input_dtype)
+            features = self.model.encode_image(processed, normalize=True)
+            return [
+                serialize_array(features[i].cpu().numpy())
+                for i in range(features.size(0))
+            ]
+
         # Use inference_mode for optimized inference
         with torch.inference_mode():
             # Process text inputs if any
             if text_inputs:
                 indices, texts = zip(*text_inputs)
-                tokens = self.tokenizer(list(texts))
-                tokens = torch.tensor(tokens).to(self.device)
-
-                text_features = self.model.encode_text(tokens, normalize=True)
-
-                # Convert text features to list and store them in the results list
-                for i, idx in enumerate(indices):
-                    results[idx] = serialize_array(
-                        text_features[i].cpu().numpy()
-                    )
+                for idx, res in zip(
+                    indices,
+                    run_with_oom_retry(
+                        encode_text_chunk, list(texts), logger=logger
+                    ),
+                ):
+                    results[idx] = res
 
             # Process image inputs if any
             if image_inputs:
                 indices, images = zip(*image_inputs)
-                processed_images = torch.stack(
-                    [
-                        self.preprocess(img)  # type: ignore
-                        for img in images
-                    ]
-                ).to(self.device, dtype=self.input_dtype)
-
-                image_features = self.model.encode_image(
-                    processed_images, normalize=True
-                )
-
-                # Convert image features to list and store them in the results list
-                for i, idx in enumerate(indices):
-                    results[idx] = serialize_array(
-                        image_features[i].cpu().numpy()
-                    )
+                for idx, res in zip(
+                    indices,
+                    run_with_oom_retry(
+                        encode_image_chunk, list(images), logger=logger
+                    ),
+                ):
+                    results[idx] = res
 
         output = [res for res in results if res is not None]
         assert len(output) == len(

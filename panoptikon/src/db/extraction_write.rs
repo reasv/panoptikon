@@ -49,7 +49,11 @@ pub(crate) struct EmbeddingEntry {
     pub embedding: Vec<u8>,
 }
 
-pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
+/// Returns how many `data_jobs` rows were deleted — zero in the non-atomic
+/// mode, which only marks them. The count matters because deleting a job
+/// cascades through `item_data` into `tags_items`, so the caller has to know
+/// whether the tag counts just went stale.
+pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
     if !atomic_enabled {
@@ -66,10 +70,10 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
             tracing::error!(error = %err, "failed to mark incomplete jobs");
             ApiError::internal("Failed to update incomplete jobs")
         })?;
-        return Ok(());
+        return Ok(0);
     }
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         DELETE FROM data_jobs
         WHERE completed = 0
@@ -81,7 +85,7 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
         tracing::error!(error = %err, "failed to delete incomplete jobs");
         ApiError::internal("Failed to delete incomplete jobs")
     })?;
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 pub(crate) async fn add_data_log(
@@ -662,8 +666,8 @@ async fn insert_tag_item(
     let result = sqlx::query(
         r#"
         INSERT INTO tags_items
-            (item_data_id, tag_id, confidence)
-        SELECT item_data.id, ?, ?
+            (item_data_id, tag_id, item_id, confidence)
+        SELECT item_data.id, ?, item_data.item_id, ?
         FROM item_data
         WHERE item_data.id = ?
         AND item_data.data_type = 'tags'
@@ -703,4 +707,78 @@ fn iso_format() -> &'static [FormatItem<'static>] {
         )
         .expect("invalid time format")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations::setup_test_databases;
+
+    // Ensures the tag writer records which item each tag application belongs
+    // to. `find_tags` counts distinct `tags_items.item_id`, so a writer that
+    // left the column at its default would silently collapse every tag to one
+    // item; this is the only place the value is produced.
+    #[tokio::test]
+    async fn tag_writer_records_the_item_id() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES (7, 'sha_seven', 'md5_seven', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'tagger')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (1, 0)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        let tags = vec![
+            TagEntry {
+                namespace: "ns".to_string(),
+                name: "cat".to_string(),
+                confidence: 0.9,
+            },
+            TagEntry {
+                namespace: "ns".to_string(),
+                name: "dog".to_string(),
+                confidence: 0.5,
+            },
+        ];
+        write_tags_output(&mut *conn, 1, "tagger", "sha_seven", &tags, &[])
+            .await
+            .unwrap();
+
+        // Every written row carries the owning item, matching item_data.
+        let mismatched: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM tags_items
+            JOIN item_data ON item_data.id = tags_items.item_data_id
+            WHERE tags_items.item_id <> item_data.item_id
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(mismatched.0, 0, "item_id must match the owning item_data");
+
+        let rows: (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT item_id) FROM tags_items")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(rows, (2, 1), "two tags, both on item 7");
+        let item_id: (i64,) = sqlx::query_as("SELECT DISTINCT item_id FROM tags_items")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(item_id.0, 7);
+    }
 }

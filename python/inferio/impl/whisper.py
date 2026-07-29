@@ -5,7 +5,12 @@ from typing import Iterable, List, Sequence, Tuple, Type
 
 import numpy as np
 
-from inferio.impl.utils import clear_cache, deserialize_array, get_device
+from inferio.impl.utils import (
+    clear_cache,
+    deserialize_array,
+    get_device,
+    select_ct2_compute_type,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -13,11 +18,17 @@ class FasterWhisperModel(InferenceModel):
     def __init__(
         self,
         model_name: str,
+        compute_type: str | None = None,
         init_args: dict = {},
         inf_args: dict = {},
     ):
         self.model_name: str = model_name
-        self.init_args = init_args
+        self.init_args = dict(init_args)
+        # A compute_type in init_args used to TypeError against the hardcoded
+        # kwarg below; treat it as the explicit override instead.
+        self.compute_type: str | None = compute_type or self.init_args.pop(
+            "compute_type", None
+        )
         self.inf_args = inf_args
         self._model_loaded: bool = False
 
@@ -39,7 +50,9 @@ class FasterWhisperModel(InferenceModel):
             model_size_or_path=self.model_name,
             device="auto",
             # device_index=[i for i in range(len(self.devices))],
-            compute_type="float16",
+            compute_type=select_ct2_compute_type(
+                "float16", explicit=self.compute_type
+            ),
             # num_workers=len(self.devices),
             **self.init_args,
         )

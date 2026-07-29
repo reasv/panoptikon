@@ -214,7 +214,12 @@ pub(crate) fn set_job_inference_context(context: JobInferenceContext) -> Result<
 }
 
 pub(crate) fn job_inference_context() -> &'static JobInferenceContext {
-    JOB_INFERENCE_CONTEXT
-        .get()
-        .expect("job inference context not initialized")
+    try_job_inference_context().expect("job inference context not initialized")
+}
+
+/// For callers that must tolerate an uninitialized context (background tasks
+/// spawned by the job queue, which also runs in tests where no inference
+/// endpoint exists).
+pub(crate) fn try_job_inference_context() -> Option<&'static JobInferenceContext> {
+    JOB_INFERENCE_CONTEXT.get()
 }

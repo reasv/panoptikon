@@ -22,7 +22,8 @@ use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::jobs::queue::{
     BatchDedup, JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs,
-    cancel_running_job, enqueue_job, enqueue_jobs_unless_tagged, get_queue_status,
+    cancel_running_job, enqueue_db_maintenance, enqueue_job, enqueue_jobs_with_dedup,
+    get_queue_status,
 };
 
 #[derive(Deserialize, IntoParams)]
@@ -50,6 +51,23 @@ pub(crate) struct LogIdQuery {
 pub(crate) struct QueueCancelQuery {
     /// List of Queue IDs to cancel
     queue_ids: Vec<i64>,
+    /// Run deferred DB maintenance after this cancel
+    #[param(nullable, default = true)]
+    run_maintenance: Option<bool>,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct CancelRunningQuery {
+    /// Run deferred DB maintenance after this cancel
+    #[param(nullable, default = true)]
+    run_maintenance: Option<bool>,
+}
+
+/// The queue takes the inverse: the flag suppresses the maintenance job this
+/// cancel's boundary would otherwise synthesize (owed work is kept either way).
+fn suppress_maintenance(run_maintenance: Option<bool>) -> bool {
+    !run_maintenance.unwrap_or(true)
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -242,6 +260,45 @@ pub(crate) async fn enqueue_update_folders(
 }
 
 #[utoipa::path(
+    post,
+    operation_id = "enqueue_db_maintenance",
+    path = "/api/jobs/maintenance",
+    tag = "jobs",
+    summary = "Run database maintenance",
+    description = "Enqueues a database maintenance job for the selected database: rebuild the tag \
+        item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space \
+        (the space reclaim is skipped unless the database actually holds enough free pages to be \
+        worth rewriting). Runs at the back of the queue, after everything already queued. \
+        If a maintenance job for this database is already queued, that job is upgraded to do all \
+        of the above and returned instead of adding a second one. Responds 409 only when a \
+        maintenance job for this database is already running, since a pass in flight may already \
+        have decided what to skip; retry once it finishes.",
+    params(DbQueryParams),
+    responses(
+        (status = 202, description = "Enqueued (or upgraded) database maintenance job", body = JobModel),
+        (status = 409, description = "A maintenance job for this database is already running", body = crate::api_error::ErrorBody)
+    )
+)]
+pub(crate) async fn enqueue_maintenance(
+    conn: DbConnection<ReadOnly>,
+) -> Result<(StatusCode, Json<JobModel>), ApiError> {
+    // 409 rather than a 200 "skipped" body: unlike the cron and reconcile
+    // triggers this route's success body is a JobModel, and there is no job to
+    // report when the request adds nothing. Reachable only for a *running*
+    // pass — a queued one is upgraded and returned, so the promise this
+    // endpoint makes ("this will recount") is kept.
+    let job = enqueue_db_maintenance(&conn.index_db, &conn.user_data_db)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "A maintenance job for this database is already running.",
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[utoipa::path(
     delete,
     operation_id = "cancel_queued",
     path = "/api/jobs/queue",
@@ -255,7 +312,11 @@ pub(crate) async fn enqueue_update_folders(
 pub(crate) async fn cancel_queued(
     Query(query): Query<QueueCancelQuery>,
 ) -> Result<Json<QueueCancelResponse>, ApiError> {
-    let cancelled = cancel_queued_jobs(query.queue_ids).await?;
+    let cancelled = cancel_queued_jobs(
+        query.queue_ids,
+        suppress_maintenance(query.run_maintenance),
+    )
+    .await?;
     if cancelled.is_empty() {
         return Err(ApiError::not_found("No matching queued jobs found."));
     }
@@ -270,12 +331,15 @@ pub(crate) async fn cancel_queued(
     path = "/api/jobs/cancel",
     tag = "jobs",
     summary = "Cancel the currently running job",
+    params(CancelRunningQuery),
     responses(
         (status = 200, description = "Running job cancelled", body = CancelResponse)
     )
 )]
-pub(crate) async fn cancel_current_job() -> Result<Json<CancelResponse>, ApiError> {
-    let cancelled = cancel_running_job().await?;
+pub(crate) async fn cancel_current_job(
+    Query(query): Query<CancelRunningQuery>,
+) -> Result<Json<CancelResponse>, ApiError> {
+    let cancelled = cancel_running_job(suppress_maintenance(query.run_maintenance)).await?;
     let job_id = cancelled.ok_or_else(|| ApiError::not_found("No job is currently running."))?;
     Ok(Json(CancelResponse {
         detail: format!("Job {job_id} cancelled."),
@@ -693,11 +757,11 @@ async fn enqueue_reconcile_deduped(index_db: &str, user_data_db: &str) -> Result
         tag: RECONCILE_JOB_TAG.to_string(),
         index_db: index_db.to_string(),
     };
-    match enqueue_jobs_unless_tagged(vec![request], Some(dedup)).await? {
-        Some(_) => Ok("Reconcile job enqueued.".to_string()),
-        None => {
-            Ok("A reconcile job for this database is already queued or running.".to_string())
-        }
+    let result = enqueue_jobs_with_dedup(vec![request], vec![dedup]).await?;
+    if result.was_skipped(index_db) {
+        Ok("A reconcile job for this database is already queued or running.".to_string())
+    } else {
+        Ok("Reconcile job enqueued.".to_string())
     }
 }
 

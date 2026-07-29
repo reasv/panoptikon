@@ -47,6 +47,7 @@ impl Modify for JsonValueSchema {
         crate::api::jobs::enqueue_update_folders,
         crate::api::jobs::cancel_queued,
         crate::api::jobs::cancel_current_job,
+        crate::api::jobs::enqueue_maintenance,
         crate::api::jobs::get_folders,
         crate::api::jobs::get_scan_history,
         crate::api::jobs::delete_scan_data,

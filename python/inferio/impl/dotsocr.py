@@ -2,7 +2,14 @@ from typing import List, Sequence
 from PIL import Image as PILImage
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
-from inferio.impl.utils import load_image_from_buffer
+from inferio.impl.utils import (
+    clear_cache,
+    cuda_capability,
+    get_device,
+    load_image_from_buffer,
+    run_with_oom_retry,
+    select_dtype,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -15,6 +22,7 @@ class DotsOCRModel(InferenceModel):
         model_name: str = "rednote-hilab/dots.ocr",
         prompt: str = DEFAULT_OCR_PROMPT,
         gpu: bool = True,
+        dtype: str | None = None,
         enable_batching: bool = True,
         batch_size: int = 4,
         max_new_tokens: int = 128,
@@ -25,6 +33,7 @@ class DotsOCRModel(InferenceModel):
         self.model_name = model_name
         self.prompt = prompt
         self.gpu = gpu
+        self.dtype = dtype
         self.enable_batching = enable_batching
         self.batch_size = batch_size
         self._model_loaded = False
@@ -44,12 +53,34 @@ class DotsOCRModel(InferenceModel):
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
 
-        use_gpu = self.gpu and torch.cuda.is_available()
+        # get_device() may drop CUDA devices the torch build has no
+        # kernels for; use_gpu must follow its verdict, or device_map
+        # would place the model on a GPU the guard rejected.
+        dev = (
+            get_device()[0]
+            if self.gpu and torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        use_gpu = dev.type == "cuda"
+
+        # Backstop for the registry's min_compute_capability floor: a clear
+        # refusal instead of an opaque CUDA error from bf16/FA2 kernels.
+        if use_gpu:
+            cap = cuda_capability(dev)
+            if cap is not None and cap < (8, 0):
+                raise RuntimeError(
+                    "dots.ocr requires an NVIDIA GPU with compute "
+                    "capability >= 8.0 (Ampere) for bfloat16 + "
+                    f"FlashAttention 2; detected {cap[0]}.{cap[1]}. "
+                    "Use another OCR model on this GPU."
+                )
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=select_dtype(
+                dev, "bf16", explicit=self.dtype, logger=logger
+            ),
             attn_implementation="flash_attention_2",
             device_map="auto" if use_gpu else None,
         )
@@ -67,24 +98,26 @@ class DotsOCRModel(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        
-        all_outputs = []
+
         images = [load_image_from_buffer(inp.file) for inp in inputs]
 
+        # OOM halving replaces the old broad per-chunk fallback; non-OOM
+        # errors now surface to the dispatcher's per-request fallback.
         if self.enable_batching and len(images) > 1:
-            for i in range(0, len(images), self.batch_size):
-                batch = images[i:i + self.batch_size]
-                try:
-                    all_outputs.extend(self._predict_batch(batch))
-                except Exception as e:
-                    logger.error(f"Batch processing failed for a chunk: {e}. Falling back to individual processing for this chunk.")
-                    for image in batch:
-                        all_outputs.append(self._predict_single(image))
-        else:
-            for image in images:
-                all_outputs.append(self._predict_single(image))
-
-        return all_outputs
+            return run_with_oom_retry(
+                self._predict_batch,
+                images,
+                initial_chunk_size=self.batch_size,
+                logger=logger,
+            )
+        # chunk size 1 so a single-input OOM raises the classified
+        # batch-1 error here too, not a raw torch one.
+        return run_with_oom_retry(
+            lambda chunk: [self._predict_single(img) for img in chunk],
+            images,
+            initial_chunk_size=1,
+            logger=logger,
+        )
 
     def _create_messages(self, image: PILImage.Image):
         return [
@@ -169,11 +202,9 @@ class DotsOCRModel(InferenceModel):
 
     def unload(self) -> None:
         if self._model_loaded:
-            import torch
-
             del self.model
             del self.processor
-            torch.cuda.empty_cache()
+            clear_cache()
             self._model_loaded = False
 
 IMPL_CLASS = DotsOCRModel

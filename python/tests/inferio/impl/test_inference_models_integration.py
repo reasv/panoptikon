@@ -377,8 +377,11 @@ def test_florence2_runs_on_cuda(model_cache_env):
     from inferio.impl.florence2 import Florence2
     from inferio.inferio_types import PredictionInput
 
+    # The community mirror is what the shipped registry uses; the original
+    # microsoft/ repo's processor config is incompatible with transformers'
+    # native florence2 support (BartTokenizerFast has no image_token).
     model = Florence2(
-        model_name="microsoft/Florence-2-large-ft",
+        model_name="florence-community/Florence-2-large-ft",
         task_prompt="<CAPTION>",
         enable_batch=False,
         max_output=64,

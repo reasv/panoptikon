@@ -38,10 +38,11 @@ use crate::{
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
-        open_index_db_read,
+        open_index_db_read, open_index_db_read_no_user_data,
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
     },
+    jobs::queue::ChangeSummary,
     jobs::timing::PhaseTimer,
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
@@ -64,17 +65,57 @@ impl Default for ScanOptions {
 }
 
 pub(crate) struct RescanResult {
-    // Only read by tests; production callers ignore the result.
+    // Only read by tests; production callers ignore the scan ids.
     #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
+    /// What the scan changed, for the queue's deferred maintenance boundary.
+    pub summary: ChangeSummary,
 }
 
 pub(crate) struct FolderUpdateResult {
-    // Only read by tests; production callers ignore the result.
+    // Only read by tests; production callers ignore these.
     #[allow(dead_code)]
     pub included_added: Vec<String>,
     #[allow(dead_code)]
     pub scan_ids: Vec<i64>,
+    /// What the update changed, for the queue's deferred maintenance boundary.
+    pub summary: ChangeSummary,
+}
+
+/// Rows written by a folder scan, aggregated over every scanned root. Any of
+/// them being non-zero means the DB changed and maintenance is owed.
+#[derive(Default, Clone, Copy)]
+struct ScanTotals {
+    new_items: i64,
+    /// Files whose contents did not change. They are *not* free: every one of
+    /// them still gets an `UPDATE files SET scan_id …`, so a rescan that finds
+    /// nothing new still grows the WAL and still owes a checkpoint.
+    unchanged_files: i64,
+    new_files: i64,
+    modified_files: i64,
+    marked_unavailable: i64,
+    /// Thumbnail/frame/blurhash rows written for already-indexed content.
+    backfilled_visuals: i64,
+}
+
+impl ScanTotals {
+    fn wrote_data(self) -> bool {
+        self.new_items > 0
+            || self.unchanged_files > 0
+            || self.new_files > 0
+            || self.modified_files > 0
+            || self.marked_unavailable > 0
+            || self.backfilled_visuals > 0
+    }
+
+    fn add(&mut self, stats: &FolderStats) {
+        self.new_items += stats.new_items;
+        self.unchanged_files += stats.unchanged_files;
+        self.new_files += stats.new_files;
+        self.modified_files += stats.modified_files;
+        self.marked_unavailable += stats.marked_unavailable;
+        self.backfilled_visuals += stats.backfilled_visuals;
+    }
 }
 
 pub(crate) struct FileScanService {
@@ -112,8 +153,11 @@ impl FileScanService {
 
     pub(crate) async fn rescan_folders(&self) -> ApiResult<RescanResult> {
         let config = self.config_store.load(&self.index_db)?;
+        // The embedded update's changes are this job's changes: it no longer
+        // runs maintenance of its own, so its summary has to travel up.
+        let mut summary = ChangeSummary::default();
         if is_resync_needed(&self.index_db, &self.user_data_db, &config).await? {
-            let _ = self.run_folder_update().await?;
+            summary.or_with(self.run_folder_update().await?.summary);
         }
 
         let mut conn = open_index_db_read(&self.index_db, &self.user_data_db).await?;
@@ -121,7 +165,7 @@ impl FileScanService {
         let excluded_folders = get_folders_from_database(&mut conn, false).await?;
         drop(conn);
 
-        let scan_ids = execute_folder_scan(
+        let (scan_ids, totals) = execute_folder_scan(
             &self.index_db,
             &self.user_data_db,
             &config,
@@ -162,14 +206,22 @@ impl FileScanService {
         })
         .await?;
 
-        let vacuum = unavailable_files_deleted > 0
+        let deleted_data = unavailable_files_deleted > 0
             || rule_files_deleted > 0
             || orphan_items_deleted > 0
             || orphan_frames_deleted > 0
             || orphan_thumbnails_deleted > 0;
-        run_post_job_maintenance(&self.index_db, vacuum).await;
+        // Maintenance is no longer run here: the queue defers it to the job
+        // boundary, where consecutive jobs on the same DB share one pass.
+        summary.or_with(ChangeSummary {
+            wrote_data: totals.wrote_data() || deleted_data,
+            deleted_data,
+            // Adding files cannot change a tag count; removing items can, via
+            // the cascade into `tags_items`.
+            tags_changed: deleted_data,
+        });
 
-        Ok(RescanResult { scan_ids })
+        Ok(RescanResult { scan_ids, summary })
     }
 
     pub(crate) async fn run_folder_update(&self) -> ApiResult<FolderUpdateResult> {
@@ -253,7 +305,7 @@ impl FileScanService {
             }
         }
 
-        let scan_ids = execute_folder_scan(
+        let (scan_ids, totals) = execute_folder_scan(
             &self.index_db,
             &self.user_data_db,
             &config,
@@ -302,18 +354,26 @@ impl FileScanService {
         })
         .await?;
 
-        let vacuum = unavailable_files_deleted > 0
+        let deleted_data = unavailable_files_deleted > 0
             || excluded_folder_files_deleted > 0
             || orphan_files_deleted > 0
             || rule_files_deleted > 0
             || orphan_items_deleted > 0
             || orphan_frames_deleted > 0
             || orphan_thumbnails_deleted > 0;
-        run_post_job_maintenance(&self.index_db, vacuum).await;
+        // See `rescan_folders`: reported, not run, so the job boundary can
+        // batch it.
+        let summary = ChangeSummary {
+            wrote_data: totals.wrote_data() || deleted_data,
+            deleted_data,
+            // See `rescan_folders`: only the deletions reach `tags_items`.
+            tags_changed: deleted_data,
+        };
 
         Ok(FolderUpdateResult {
             included_added,
             scan_ids,
+            summary,
         })
     }
 }
@@ -336,15 +396,52 @@ pub(crate) async fn is_resync_needed(
     Ok(current_included != new_included || current_excluded != new_excluded)
 }
 
-/// Post-job VACUUM/ANALYZE/checkpoint. Failures are logged but never fail the
-/// job: the job's own work has already been committed at this point.
-pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
-    if vacuum {
+/// Free-page share above which rewriting the whole database is worth it. This
+/// is the primary signal: the cost of a VACUUM scales with the file, so the
+/// payoff has to as well.
+const VACUUM_FREE_RATIO: f64 = 0.10;
+/// Floor under the ratio (`AND`, not `OR`): on a small database 10% is a
+/// handful of pages, and rewriting it buys nothing. ~10 MB at the 4 KiB
+/// default page size.
+const VACUUM_FREE_PAGES_FLOOR: i64 = 2_500;
+/// Free-page count that justifies a VACUUM on its own, for the databases where
+/// 10% is never reached but gigabytes are still reclaimable (~1 GB at 4 KiB
+/// pages).
+const VACUUM_FREE_PAGES_ABSOLUTE: i64 = 250_000;
+
+/// Post-job VACUUM/recount/ANALYZE/checkpoint. Failures are logged but never
+/// fail the job: the job's own work has already been committed at this point.
+///
+/// `vacuum` means "something was deleted"; whether that is worth a multi-minute
+/// rewrite of a multi-GB file is decided from the actual free-page counts.
+///
+/// `tags_changed` is the owed flag the boundary recorded; the durable marker
+/// stands in for everything that flag cannot know (writes committed by a job
+/// that was then killed, and the continuous scan, which is not a queue job and
+/// has no boundary). Either one runs the recount.
+pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool, tags_changed: bool) {
+    // Boxed: opening a connection is a large future, and this one sits inside
+    // the job queue's `execute_job` state machine, which is stack-allocated
+    // before the task is spawned.
+    if vacuum && Box::pin(vacuum_is_worthwhile(index_db)).await {
         if let Err(err) =
             call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Vacuum { reply }).await
         {
             tracing::error!(error = ?err, index_db, "failed to vacuum index database");
         }
+    }
+    // Before ANALYZE, so the statistics are sampled from the updated table.
+    // Gated, unlike ANALYZE and the checkpoint: this is a full rebuild of
+    // every `tags.item_count` and the only step whose cost scales with the
+    // size of the tag data. A drain of pure no-deletion rescans now skips it
+    // entirely. The recount clears the marker in its own transaction.
+    if (tags_changed || Box::pin(tags_are_dirty(index_db)).await)
+        && let Err(err) = call_index_db_writer(index_db, |reply| {
+            IndexDbWriterMessage::RecountTagItems { reply }
+        })
+        .await
+    {
+        tracing::error!(error = ?err, index_db, "failed to recount tag item counts");
     }
     if let Err(err) =
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Analyze { reply }).await
@@ -360,6 +457,78 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool) {
     }
 }
 
+/// The durable tags-dirty marker: "something changed `tags_items` since the
+/// last successful recount". Read on a plain read connection — this runs
+/// inside the maintenance job, which is serialized against every other job and
+/// pauses the continuous scan, so there is nothing to race.
+///
+/// A failed read answers "yes", which is the pre-gate behavior: recounting
+/// when it was not needed costs one rebuild, while skipping when it was needed
+/// leaves the counts (and the autocomplete ordering they drive) wrong.
+async fn tags_are_dirty(index_db: &str) -> bool {
+    let mut conn = match open_index_db_read_no_user_data(index_db).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not read the tags-dirty marker; recounting");
+            return true;
+        }
+    };
+    match crate::db::maintenance_state::read_tags_dirty(&mut conn).await {
+        Ok(dirty) => dirty,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not read the tags-dirty marker; recounting");
+            true
+        }
+    }
+}
+
+/// True when either the index or the attached storage database carries enough
+/// free pages to be worth reclaiming. Both are checked because the writer's
+/// VACUUM rewrites both, and the blobs that dominate the file size live in
+/// `storage`. A failed measurement answers "yes" — that is the behavior every
+/// caller had before the gate existed.
+async fn vacuum_is_worthwhile(index_db: &str) -> bool {
+    let mut conn = match open_index_db_read_no_user_data(index_db).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(error = ?err, index_db, "could not measure free pages; vacuuming");
+            return true;
+        }
+    };
+    for (schema, free_sql, pages_sql) in [
+        ("main", "PRAGMA main.freelist_count", "PRAGMA main.page_count"),
+        (
+            "storage",
+            "PRAGMA storage.freelist_count",
+            "PRAGMA storage.page_count",
+        ),
+    ] {
+        let free: i64 = match sqlx::query_scalar(free_sql).fetch_one(&mut conn).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, index_db, schema, "free page query failed");
+                return true;
+            }
+        };
+        let pages: i64 = match sqlx::query_scalar(pages_sql).fetch_one(&mut conn).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, index_db, schema, "page count query failed");
+                return true;
+            }
+        };
+        let ratio_worthwhile = pages > 0
+            && (free as f64) / (pages as f64) >= VACUUM_FREE_RATIO
+            && free >= VACUUM_FREE_PAGES_FLOOR;
+        if ratio_worthwhile || free >= VACUUM_FREE_PAGES_ABSOLUTE {
+            tracing::debug!(index_db, schema, free, pages, "vacuum gate passed");
+            return true;
+        }
+    }
+    tracing::info!(index_db, "skipping VACUUM: too few free pages to reclaim");
+    false
+}
+
 async fn execute_folder_scan(
     index_db: &str,
     user_data_db: &str,
@@ -367,7 +536,7 @@ async fn execute_folder_scan(
     included_folders: &[String],
     excluded_folders: &[String],
     options: ScanOptions,
-) -> ApiResult<Vec<i64>> {
+) -> ApiResult<(Vec<i64>, ScanTotals)> {
     let mut conn = open_index_db_read(index_db, user_data_db).await?;
     let mut all_included = Vec::new();
     for folder in included_folders {
@@ -401,6 +570,7 @@ async fn execute_folder_scan(
 
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
+    let mut totals = ScanTotals::default();
 
     for folder in starting_points {
         let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -427,6 +597,7 @@ async fn execute_folder_scan(
             options,
         )
         .await?;
+        totals.add(&stats);
 
         call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateFileScan {
             scan_id,
@@ -450,7 +621,7 @@ async fn execute_folder_scan(
         .await?;
     }
 
-    Ok(scan_ids)
+    Ok((scan_ids, totals))
 }
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
@@ -472,6 +643,8 @@ struct FolderStats {
     new_files: i64,
     modified_files: i64,
     marked_unavailable: i64,
+    /// Not persisted on the scan row; only feeds [`ScanTotals::wrote_data`].
+    backfilled_visuals: i64,
     errors: i64,
     total_available: i64,
     false_changes: i64,
@@ -501,6 +674,7 @@ impl FolderStats {
             new_files: 0,
             modified_files: 0,
             marked_unavailable: 0,
+            backfilled_visuals: 0,
             errors: 0,
             total_available: 0,
             false_changes: 0,
@@ -988,9 +1162,15 @@ impl ScanContext {
                 .await
                 .unwrap_or(false);
 
+        // Counted whether or not the individual stores succeed: an attempted
+        // write is enough for the WAL to have grown, which is what the
+        // boundary's `wrote_data` flag is about.
+        let mut wrote_visuals = false;
+
         // Storage failures for backfilled visuals are logged and skipped so a
         // single bad file cannot abort the scan; the next scan retries them.
         if !backfill.thumbnails.is_empty() && !already_stored {
+            wrote_visuals = true;
             if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreThumbnails {
                     sha256: backfill.sha256.clone(),
@@ -1010,6 +1190,7 @@ impl ScanContext {
             .await
             .unwrap_or(false);
         if !backfill.extracted_frames.is_empty() && !frames_stored {
+            wrote_visuals = true;
             if let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
                     sha256: backfill.sha256.clone(),
@@ -1025,6 +1206,7 @@ impl ScanContext {
         }
 
         if let Some(blurhash) = &backfill.blurhash {
+            wrote_visuals = true;
             if let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::SetBlurhash {
                     sha256: backfill.sha256.clone(),
@@ -1035,6 +1217,10 @@ impl ScanContext {
             {
                 tracing::error!(error = ?err, "failed to set blurhash");
             }
+        }
+
+        if wrote_visuals {
+            self.stats.backfilled_visuals += 1;
         }
     }
 
@@ -3017,6 +3203,152 @@ mod tests {
         format!("testdb_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
+    // The VACUUM gate decides from a measurement (`PRAGMA freelist_count` vs
+    // `page_count`, on `main` and the attached `storage`), and that
+    // measurement had no coverage anywhere: a freshly migrated database must
+    // not be rewritten, a heavily deleted one must be, and the full
+    // maintenance pass must survive a real database end to end.
+    #[tokio::test]
+    async fn vacuum_gate_follows_the_free_page_counts() {
+        let _test_env = test_data_dir();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        assert!(
+            !vacuum_is_worthwhile(&index_db).await,
+            "a freshly migrated database has nothing worth reclaiming"
+        );
+
+        // Thousands of pages of payload, then deleted: with auto_vacuum off
+        // the pages stay on the freelist until a VACUUM reclaims them, which
+        // clears both the 2,500-page floor and the 10% ratio.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE vacuum_gate_scratch (payload BLOB)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let payload = vec![0_u8; 8192];
+            for _ in 0..3_000 {
+                sqlx::query("INSERT INTO vacuum_gate_scratch (payload) VALUES (?)")
+                    .bind(payload.as_slice())
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query("DELETE FROM vacuum_gate_scratch")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vacuum_is_worthwhile(&index_db).await,
+            "thousands of freed pages must pass the gate"
+        );
+
+        // The pass never reports failure, so this is the only way a broken
+        // step shows up at all — and the reclaimed pages prove the VACUUM
+        // really ran.
+        run_post_job_maintenance(&index_db, true, true).await;
+        assert!(
+            !vacuum_is_worthwhile(&index_db).await,
+            "the VACUUM should have reclaimed the freed pages"
+        );
+    }
+
+    // The recount is the one maintenance step that is gated, and both halves
+    // of the gate matter: the owed flag is what a job that knows it wrote tags
+    // passes in, and the durable marker is what covers everything the flags
+    // cannot survive (a killed job, the continuous scan). `tags.item_count` is
+    // the observable: the recount rewrites it, so a deliberately wrong value
+    // that survives a pass proves the pass skipped it.
+    #[tokio::test]
+    async fn the_recount_runs_only_for_the_flag_or_the_marker() {
+        let _test_env = test_data_dir();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // One tagged item, written directly: this test is about the gate, not
+        // about the writer paths that set the marker.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            for statement in [
+                "INSERT INTO items (sha256, md5, type, time_added) \
+                 VALUES ('sha-gate', 'md5-gate', 'image/png', '2026-01-01')",
+                "INSERT INTO setters (name) VALUES ('gate/tagger')",
+                "INSERT INTO item_data \
+                     (item_id, job_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+                 SELECT items.id, NULL, setters.id, 'tags', 0, 1, 0 FROM items, setters",
+                "INSERT INTO tags (namespace, name) VALUES ('general', 'gate-tag')",
+                "INSERT INTO tags_items (item_data_id, tag_id, confidence, item_id) \
+                 SELECT item_data.id, tags.id, 1.0, item_data.item_id FROM item_data, tags",
+            ] {
+                sqlx::query(statement)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
+            }
+        }
+        async fn item_count(index_db: &str) -> i64 {
+            let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
+            sqlx::query_scalar("SELECT item_count FROM tags WHERE name = 'gate-tag'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        }
+
+        // The migration seeds the marker dirty, so the first pass recounts
+        // even though nothing told it to — the property that heals counts a
+        // process death took the owed flags with.
+        assert_eq!(item_count(&index_db).await, 0, "inserted, never counted");
+        run_post_job_maintenance(&index_db, false, false).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            1,
+            "the durable marker alone must run the recount"
+        );
+
+        // The recount cleared the marker, so an identical pass now skips it.
+        assert!(
+            !tags_are_dirty(&index_db).await,
+            "a successful recount must clear the marker"
+        );
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE tags SET item_count = 99 WHERE name = 'gate-tag'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        run_post_job_maintenance(&index_db, false, false).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            99,
+            "neither flag nor marker: the recount must not run"
+        );
+
+        // The owed flag runs it without any marker.
+        run_post_job_maintenance(&index_db, false, true).await;
+        assert_eq!(
+            item_count(&index_db).await,
+            1,
+            "the owed tags_changed flag must run the recount"
+        );
+    }
+
     // Folder validity gates which configured folders get scanned: missing
     // paths, non-directories, and empty directories are all skipped (the
     // empty-dir skip matches Python, which never scanned empty folders).
@@ -3168,7 +3500,12 @@ LIMIT 1
             .await
             .unwrap();
         drop(write_conn);
-        service.rescan_folders().await.unwrap();
+        let result = service.rescan_folders().await.unwrap();
+        // A backfilling rescan writes, even though nothing is new or modified.
+        assert!(
+            result.summary.wrote_data,
+            "a backfilled blurhash is a write the boundary owes maintenance for"
+        );
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
@@ -3192,7 +3529,19 @@ LIMIT 1
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        service.rescan_folders().await.unwrap();
+        let result = service.rescan_folders().await.unwrap();
+        // Nothing new, nothing modified, nothing backfilled — and still a
+        // write, because every unchanged file gets an `UPDATE files SET
+        // scan_id`. This is the nightly-no-change-rescan case: dropping it
+        // from `wrote_data` costs the WAL checkpoint on a 500k-file library.
+        assert!(
+            result.summary.wrote_data,
+            "an all-unchanged rescan still rewrites every file row"
+        );
+        assert!(
+            !result.summary.deleted_data,
+            "an all-unchanged rescan deletes nothing"
+        );
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let (unchanged, new_files, modified, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
@@ -3231,6 +3580,43 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(item_count.0, 1);
+    }
+
+    // The other half of the `wrote_data` contract: a scan that touches no file
+    // at all must report nothing, so an idle cron pass over a database with no
+    // configured folders never schedules a maintenance job.
+    #[tokio::test]
+    async fn empty_folder_set_scan_reports_no_changes() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let config = SystemConfig::default();
+        assert!(config.included_folders.is_empty());
+        store.save(&index_db, &config).unwrap();
+
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        let result = service.rescan_folders().await.unwrap();
+        assert!(
+            result.scan_ids.is_empty(),
+            "no folders means no scans: {:?}",
+            result.scan_ids
+        );
+        assert!(
+            !result.summary.wrote_data && !result.summary.deleted_data,
+            "a scan that saw no files owes no maintenance"
+        );
     }
 
     #[test]

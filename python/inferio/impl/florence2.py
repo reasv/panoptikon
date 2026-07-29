@@ -7,9 +7,12 @@ from PIL import Image as PILImage
 from inferio.impl.utils import (
     clean_whitespace,
     clear_cache,
+    cuda_capability,
     get_device,
     load_image_from_buffer,
     print_resource_usage,
+    run_with_oom_retry,
+    select_dtype,
 )
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
@@ -28,6 +31,7 @@ class Florence2(InferenceModel):
         task_prompt: str,
         text_input: str | None = None,
         flash_attention: bool = False,
+        dtype: str | None = None,
         max_output: int = 1024,
         num_beams: int = 3,
         do_sample: bool = False,
@@ -38,6 +42,7 @@ class Florence2(InferenceModel):
         self.task_prompt: str = task_prompt
         self.text_input: str | None = text_input
         self.flash_attention: bool = flash_attention
+        self.dtype: str | None = dtype
         self.max_output: int = max_output
         self.num_beams: int = num_beams
         self.init_args = init_args
@@ -65,13 +70,20 @@ class Florence2(InferenceModel):
         self.devices = get_device()
         self._device = self.devices[0]
 
-        # Prefer fp16 on CUDA, otherwise use fp32 for CPU (and avoid half on CPU)
-        if str(self._device).startswith("cuda"):
-            self._dtype = torch.float16
-        else:
-            self._dtype = torch.float32
+        self._dtype = select_dtype(
+            self._device, "fp16", explicit=self.dtype, logger=logger
+        )
 
         attn_impl = "flash_attention_2" if self.flash_attention else "sdpa"
+        if attn_impl == "flash_attention_2":
+            cap = cuda_capability(self._device)
+            if cap is not None and cap < (8, 0):
+                logger.warning(
+                    "flash_attention_2 needs compute capability 8.0+ "
+                    "(detected %d.%d); using sdpa.",
+                    *cap,
+                )
+                attn_impl = "sdpa"
 
         # Community models are native in transformers; no trust_remote_code required.
         self.model = (
@@ -117,7 +129,16 @@ class Florence2(InferenceModel):
         if self.enable_batch:
             results = self.batch_predict(prompt, image_inputs)
         else:
-            results = [self.single_predict(prompt, img) for img in image_inputs]
+            # chunk size 1 so a single-input OOM raises the classified
+            # batch-1 error here too, not a raw torch one.
+            results = run_with_oom_retry(
+                lambda chunk: [
+                    self.single_predict(prompt, img) for img in chunk
+                ],
+                image_inputs,
+                initial_chunk_size=1,
+                logger=logger,
+            )
 
         assert len(results) == len(image_inputs), "Mismatch in input and output."
 
@@ -158,6 +179,13 @@ class Florence2(InferenceModel):
         return out
 
     def batch_predict(self, prompt: str, image_inputs: List[PILImage.Image]) -> List[str]:
+        return run_with_oom_retry(
+            lambda chunk: self._predict_chunk(prompt, list(chunk)),
+            image_inputs,
+            logger=logger,
+        )
+
+    def _predict_chunk(self, prompt: str, image_inputs: List[PILImage.Image]) -> List[str]:
         import torch
 
         assert self.processor is not None

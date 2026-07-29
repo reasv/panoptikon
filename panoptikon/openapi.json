@@ -2123,6 +2123,21 @@
         ],
         "summary": "Cancel the currently running job",
         "operationId": "cancel_current_job",
+        "parameters": [
+          {
+            "name": "run_maintenance",
+            "in": "query",
+            "description": "Run deferred DB maintenance after this cancel",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": true
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Running job cancelled",
@@ -2953,6 +2968,64 @@
         }
       }
     },
+    "/api/jobs/maintenance": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Run database maintenance",
+        "description": "Enqueues a database maintenance job for the selected database: rebuild the tag item counts, refresh query statistics, truncate the write-ahead log, and reclaim free space (the space reclaim is skipped unless the database actually holds enough free pages to be worth rewriting). Runs at the back of the queue, after everything already queued. If a maintenance job for this database is already queued, that job is upgraded to do all of the above and returned instead of adding a second one. Responds 409 only when a maintenance job for this database is already running, since a pass in flight may already have decided what to skip; retry once it finishes.",
+        "operationId": "enqueue_db_maintenance",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Enqueued (or upgraded) database maintenance job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobModel"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A maintenance job for this database is already running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/jobs/quants": {
       "get": {
         "tags": [
@@ -3155,6 +3228,19 @@
                 "type": "integer",
                 "format": "int64"
               }
+            }
+          },
+          {
+            "name": "run_maintenance",
+            "in": "query",
+            "description": "Run deferred DB maintenance after this cancel",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": true
             }
           }
         ],
@@ -4476,7 +4562,7 @@
           "search"
         ],
         "summary": "Search tag names for autocompletion",
-        "description": "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nThe tags are returned in descending order of the number of items tagged.",
+        "description": "Given a string, finds tags whose names contain the string.\nMeant to be used for autocompletion in the search bar.\nThe `limit` parameter can be used to control the number of tags to return.\nReturns a list of tuples, where each tuple contains the namespace, name, \nand the number of unique items tagged with the tag.\nMatching is a plain substring test, and every character of the string is \nmatched literally (`%` and `_` are not wildcards), so there is no notion of \na closer or weaker match. When more tags match than `limit` allows, the most-used ones \nare returned: results are both selected and ordered by the number of items \ntagged, descending, with ties broken by namespace then name.\nThe count is refreshed after every completed job rather than computed live, \nso a tag added since the last one reports 0 and sorts last. Which tags match \nis never affected.",
         "operationId": "get_tags",
         "parameters": [
           {
@@ -6266,8 +6352,10 @@
           "folder_update",
           "job_data_deletion",
           "vector_quant_reconcile",
+          "db_maintenance",
           "test_sleep",
-          "test_panic"
+          "test_panic",
+          "test_report"
         ]
       },
       "LogRecord": {

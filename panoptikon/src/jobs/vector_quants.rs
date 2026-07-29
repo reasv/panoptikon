@@ -14,7 +14,7 @@ use crate::db::vector_quants::{
     BACKFILL_CHUNK_ROWS, DELETE_CHUNK_ROWS, DesiredState, RECONCILE_JOB_TAG, ReconcileWork,
     SpaceBuild, analyze, compute_mean_artifact, load_desired_state, load_snapshot, plan_data,
 };
-use crate::jobs::queue::{BatchDedup, JobRequest, JobType, enqueue_jobs_unless_tagged};
+use crate::jobs::queue::{BatchDedup, JobRequest, JobType, enqueue_jobs_with_dedup};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -306,11 +306,12 @@ pub(crate) async fn check_and_schedule(index_db: &str, user_data_db: &str) {
                 tag: RECONCILE_JOB_TAG.to_string(),
                 index_db: index_db.to_string(),
             };
-            match enqueue_jobs_unless_tagged(vec![request], Some(dedup)).await {
-                Ok(Some(_)) => {
+            match enqueue_jobs_with_dedup(vec![request], vec![dedup]).await {
+                // Single DB, skip-if-tagged: a conflict skips the one request.
+                Ok(result) if !result.was_skipped(index_db) => {
                     tracing::info!(index_db, "vector quant reconcile job enqueued");
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(err) => {
                     tracing::error!(index_db, error = ?err, "failed to enqueue vector quant reconcile");
                 }

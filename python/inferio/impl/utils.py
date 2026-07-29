@@ -21,12 +21,66 @@ def get_device():
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
-            return [torch.device(f"cuda:{i}") for i in range(num_gpus)]
-        return [torch.device("cuda")]
+            devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+        else:
+            devices = [torch.device("cuda")]
+        devices = _drop_uncovered_cuda_devices(devices)
+        if devices:
+            return devices
+        return [torch.device("cpu")]
     elif torch.backends.mps.is_available():  # Apple Silicon (M1/M2)
         return [torch.device("mps")]
     else:
         return [torch.device("cpu")]
+
+
+def _drop_uncovered_cuda_devices(devices: list) -> list:
+    """Filter out GPUs this torch build has no kernels for.
+
+    Cubins are forward-compatible within a major version (an sm_60 kernel
+    runs on sm_61), so a device (major, minor) is covered when the build's
+    arch list has an sm_ entry with the same major and minor <= the
+    device's. Skipped under ROCm (arch entries are gfx strings) and when
+    the arch list is empty. A no-op on cu128 (kernels reach sm_50); this
+    is the safety net for the cu13x transition, which drops old majors,
+    and the correct guard for the genuine "no kernel image" failure class.
+    """
+    import torch
+
+    if getattr(torch.version, "hip", None):
+        return devices
+    floors: dict = {}
+    for arch in torch.cuda.get_arch_list():
+        match = re.fullmatch(r"sm_(\d{2,3})[a-z]?", arch)
+        if not match:
+            continue  # compute_* PTX entries and anything unrecognised
+        num = match.group(1)
+        major, minor = int(num[:-1]), int(num[-1])
+        floors[major] = min(minor, floors.get(major, minor))
+    if not floors:
+        return devices
+
+    log = logging.getLogger(__name__)
+    kept = []
+    for dev in devices:
+        major, minor = torch.cuda.get_device_capability(dev)
+        if major in floors and floors[major] <= minor:
+            kept.append(dev)
+        else:
+            log.warning(
+                "Dropping GPU %s: compute capability %d.%d has no kernels "
+                "in this torch build (archs: %s).",
+                dev,
+                major,
+                minor,
+                ", ".join(torch.cuda.get_arch_list()),
+            )
+    if not kept:
+        log.error(
+            "No installed CUDA kernels cover any available GPU; "
+            "falling back to CPU."
+        )
+    return kept
 
 
 def clear_cache() -> None:
@@ -41,6 +95,222 @@ def clear_cache() -> None:
         torch.cuda.empty_cache()
     elif hasattr(torch, "mps") and torch.backends.mps.is_available():
         torch.mps.empty_cache()
+
+
+def cuda_capability(device) -> "tuple[int, int] | None":
+    """CUDA compute capability (major, minor) of `device`.
+
+    None for CPU/MPS, and for ROCm/HIP builds, where the reported numbers
+    are HIP versions and must not be compared against CUDA capabilities.
+    """
+    import torch
+
+    if getattr(device, "type", None) != "cuda" or getattr(
+        torch.version, "hip", None
+    ):
+        return None
+    return torch.cuda.get_device_capability(device)
+
+
+_PRECISION_NAMES = {
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "fp32": "fp32",
+    "float32": "fp32",
+}
+
+
+def _precision_to_dtype(name: str):
+    import torch
+
+    canonical = _PRECISION_NAMES.get(str(name).lower())
+    if canonical is None:
+        raise ValueError(
+            f"Unknown precision {name!r}; expected one of "
+            f"{sorted(set(_PRECISION_NAMES))}"
+        )
+    return {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[canonical]
+
+
+def select_dtype(
+    device,
+    preferred: str,
+    explicit: str | None = None,
+    logger: logging.Logger | None = None,
+) -> "torch.dtype":
+    """Negotiate a load dtype for `device`.
+
+    `preferred` is the model's best-case precision ("bf16"/"fp16"/"fp32");
+    `explicit` is a user-configured override that wins verbatim. bf16 wants
+    tensor-core support (sm_80+); below that the fallback is fp32, never
+    fp16 — fp16 lacks bf16's exponent range, so a silent step down can
+    produce inf/NaN in bf16-trained weights. fp16 runs on every CUDA arch
+    we ship kernels for, so it is honoured as-is.
+    """
+    import torch
+
+    log = logger or logging.getLogger(__name__)
+    if explicit is not None:
+        dtype = _precision_to_dtype(explicit)
+        cap = cuda_capability(device)
+        if dtype is torch.bfloat16 and cap is not None and cap < (8, 0):
+            log.warning(
+                "Precision %r configured but GPU capability %d.%d is below "
+                "8.0; bf16 has no tensor-core path here and may fail per-op.",
+                explicit,
+                *cap,
+            )
+        return dtype
+
+    want = _precision_to_dtype(preferred)
+    if getattr(device, "type", None) != "cuda":
+        if want is not torch.float32:
+            log.info(
+                "Precision %r requested but device is %s; using fp32.",
+                preferred,
+                getattr(device, "type", device),
+            )
+        return torch.float32
+    if want is torch.bfloat16:
+        if getattr(torch.version, "hip", None):
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            log.info("bf16 unsupported on this ROCm device; using fp32.")
+            return torch.float32
+        cap = cuda_capability(device)
+        if cap is not None and cap < (8, 0):
+            log.info(
+                "bf16 requested but GPU capability %d.%d is below 8.0; "
+                "using fp32 (not fp16: narrower exponent range).",
+                *cap,
+            )
+            return torch.float32
+    return want
+
+
+def select_ct2_compute_type(
+    preferred: str = "float16",
+    explicit: str | None = None,
+    logger: logging.Logger | None = None,
+) -> str:
+    """Pick a CTranslate2 compute type the device actually supports.
+
+    Queries ctranslate2.get_supported_compute_types instead of hardcoding a
+    compute-capability threshold, because CT2 raises rather than degrades
+    when an explicitly named type is unsupported (float16 needs CC >= 7.0).
+    Any probe failure falls back to float32, which is always supported —
+    this also covers ROCm, where torch reports CUDA available but CT2 has
+    no HIP backend.
+    """
+    log = logger or logging.getLogger(__name__)
+    if explicit is not None:
+        return explicit
+    try:
+        import ctranslate2
+        import torch
+
+        kind = "cuda" if torch.cuda.is_available() else "cpu"
+        supported = set(ctranslate2.get_supported_compute_types(kind))
+    except Exception as err:
+        log.warning(
+            "CT2 compute-type probe failed (%s); using float32.", err
+        )
+        return "float32"
+    for candidate in (preferred, "float16", "float32"):
+        if candidate in supported:
+            if candidate != preferred:
+                log.info(
+                    "CT2 compute type %r unsupported on %s; using %r.",
+                    preferred,
+                    kind,
+                    candidate,
+                )
+            return candidate
+    log.warning(
+        "No supported CT2 compute type among %r on %s; using float32.",
+        (preferred, "float16", "float32"),
+        kind,
+    )
+    return "float32"
+
+OOM_BATCH1_PREFIX = "INFERENCE_OOM_BATCH_SIZE_1:"
+
+
+class InferenceOOMError(RuntimeError):
+    """Out of GPU memory on a single input after cache-clearing retries.
+
+    str() starts with OOM_BATCH1_PREFIX: the worker's error frame carries
+    only the message string, so the prefix is what the orchestrator (and
+    future dispatch-side classification) can recognise the condition by.
+    """
+
+
+def run_with_oom_retry(
+    process_chunk,
+    items,
+    *,
+    initial_chunk_size: int | None = None,
+    oom_exceptions=None,
+    logger: logging.Logger | None = None,
+) -> list:
+    """Run `process_chunk` over `items`, halving the chunk size on CUDA OOM.
+
+    `process_chunk(chunk)` must return exactly len(chunk) results; results
+    are concatenated in input order. On OOM the torch cache is cleared and
+    the same position is retried at half the size — never re-grown within
+    a call, since the dispatcher forms fresh full batches on the next
+    request anyway. An OOM with a single item raises InferenceOOMError;
+    any other exception propagates untouched.
+
+    `oom_exceptions` overrides the caught types (used by torch-free tests).
+    """
+    log = logger or logging.getLogger(__name__)
+    if oom_exceptions is None:
+        import torch
+
+        # Canonical spelling: torch.cuda.OutOfMemoryError; it is the same
+        # class as torch.OutOfMemoryError in both shipped torch generations.
+        oom_exceptions = (torch.cuda.OutOfMemoryError,)
+
+    items = list(items)
+    if not items:
+        return []
+    chunk_size = max(1, min(initial_chunk_size or len(items), len(items)))
+    results: list = []
+    pos = 0
+    while pos < len(items):
+        chunk = items[pos : pos + chunk_size]
+        try:
+            out = list(process_chunk(chunk))
+        except oom_exceptions as err:
+            clear_cache()
+            if len(chunk) == 1:
+                raise InferenceOOMError(
+                    f"{OOM_BATCH1_PREFIX} out of GPU memory on a single "
+                    f"input: {err}"
+                ) from err
+            chunk_size = max(1, len(chunk) // 2)
+            log.warning(
+                "GPU OOM on a chunk of %d inputs; retrying at %d.",
+                len(chunk),
+                chunk_size,
+            )
+            continue
+        if len(out) != len(chunk):
+            raise RuntimeError(
+                f"process_chunk returned {len(out)} results for "
+                f"{len(chunk)} inputs"
+            )
+        results.extend(out)
+        pos += len(chunk)
+    return results
+
 
 def mcut_threshold(probs: np.ndarray) -> float:
     """

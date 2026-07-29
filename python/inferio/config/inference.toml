@@ -188,6 +188,9 @@ config.do_sample = true
 config.temperature = 0.7
 config.top_p = 0.9
 metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is required for this model!)"
+# bf16 + FlashAttention 2 both need Ampere (sm_80); the gateway marks the
+# model unavailable on older GPUs and jobs refuse to start it.
+metadata.min_compute_capability = 8.0
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
