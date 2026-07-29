@@ -129,7 +129,16 @@ class Florence2(InferenceModel):
         if self.enable_batch:
             results = self.batch_predict(prompt, image_inputs)
         else:
-            results = [self.single_predict(prompt, img) for img in image_inputs]
+            # chunk size 1 so a single-input OOM raises the classified
+            # batch-1 error here too, not a raw torch one.
+            results = run_with_oom_retry(
+                lambda chunk: [
+                    self.single_predict(prompt, img) for img in chunk
+                ],
+                image_inputs,
+                initial_chunk_size=1,
+                logger=logger,
+            )
 
         assert len(results) == len(image_inputs), "Mismatch in input and output."
 

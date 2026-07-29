@@ -53,8 +53,15 @@ class DotsOCRModel(InferenceModel):
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
 
-        use_gpu = self.gpu and torch.cuda.is_available()
-        dev = get_device()[0] if use_gpu else torch.device("cpu")
+        # get_device() may drop CUDA devices the torch build has no
+        # kernels for; use_gpu must follow its verdict, or device_map
+        # would place the model on a GPU the guard rejected.
+        dev = (
+            get_device()[0]
+            if self.gpu and torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        use_gpu = dev.type == "cuda"
 
         # Backstop for the registry's min_compute_capability floor: a clear
         # refusal instead of an opaque CUDA error from bf16/FA2 kernels.
@@ -103,7 +110,14 @@ class DotsOCRModel(InferenceModel):
                 initial_chunk_size=self.batch_size,
                 logger=logger,
             )
-        return [self._predict_single(image) for image in images]
+        # chunk size 1 so a single-input OOM raises the classified
+        # batch-1 error here too, not a raw torch one.
+        return run_with_oom_retry(
+            lambda chunk: [self._predict_single(img) for img in chunk],
+            images,
+            initial_chunk_size=1,
+            logger=logger,
+        )
 
     def _create_messages(self, image: PILImage.Image):
         return [

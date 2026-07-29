@@ -5,6 +5,7 @@ from typing import List, Sequence, Type
 import numpy as np
 from PIL import Image as PILImage
 from inferio.impl.utils import (
+    InferenceOOMError,
     clean_whitespace,
     clear_cache,
     get_device,
@@ -141,6 +142,10 @@ class EasyOCRModel(InferenceModel):
                     image_inputs,
                     logger=logger,
                 )
+            except InferenceOOMError:
+                # A single input still OOMs after halving; individual
+                # processing would just OOM again unclassified.
+                raise
             except Exception as e:
                 # Fall back to individual processing if batched processing fails
                 logger.error(f"Batch processing failed with error: {e}. Falling back to individual processing.")
