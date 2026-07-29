@@ -14,6 +14,16 @@ on:
     # Weekly Monday 05:17 UTC
     - cron: "17 5 * * 1"
   workflow_dispatch:
+    inputs:
+      update:
+        description: "Also run the flake.lock/pin update job (opens a PR)"
+        type: boolean
+        default: false
+  # Packaging paths only, deliberately: Rust/Cargo/desktop changes do not run
+  # this workflow. Packaging breakage from core changes is caught by the
+  # weekly schedule or a manual dispatch, keeping nix CI off the hot path.
+  # "ui" (the submodule gitlink) stays in so the light `check` job catches a
+  # stale ui-pin.json on every ui bump.
   pull_request:
     paths:
       - "**.nix"
@@ -23,11 +33,6 @@ on:
       - "contrib/package/common/**"
       - "contrib/nixos/**"
       - "config/server/nixos.toml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "panoptikon/Cargo.toml"
-      - "panoptikon/src/**"
-      - "panoptikon-desktop/**"
       - "ui"
       - "scripts/sync-nix-ui-pin.py"
       - "scripts/generate-hicolor-icons.sh"
@@ -43,11 +48,6 @@ on:
       - "contrib/package/common/**"
       - "contrib/nixos/**"
       - "config/server/nixos.toml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "panoptikon/Cargo.toml"
-      - "panoptikon/src/**"
-      - "panoptikon-desktop/**"
       - "ui"
       - "scripts/sync-nix-ui-pin.py"
       - "scripts/generate-hicolor-icons.sh"
@@ -58,12 +58,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: nix-${{ github.workflow }}-${{ github.ref }}
+  # event_name in the group so a push to master cannot cancel an in-flight
+  # scheduled update run (both resolve to refs/heads/master otherwise).
+  group: nix-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Light and fast: flake formatting + UI pin drift. Runs on every matching
+  # push (including ui gitlink bumps) and PR.
   check:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,9 +82,10 @@ jobs:
       - name: UI pin check (rev + source hash)
         run: python3 scripts/sync-nix-ui-pin.py --check
 
-  # Light package/cli smokes (no QEMU).
+  # Package/cli smokes (no QEMU). PRs and manual dispatch only — pushes run
+  # just the light `check` job so master pushes stay off the heavy matrix.
   packages:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -110,8 +115,9 @@ jobs:
           nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
 
   # NixOS VM smokes (KVM when DETERMINATE_NIX_KVM=1 from the installer).
+  # Same gating as `packages`: PRs and manual dispatch only.
   nixos:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -146,7 +152,7 @@ jobs:
           nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
 
   update:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update)
     runs-on: ubuntu-latest
     # Serialize maintenance so concurrent schedule+dispatch do not race.
     concurrency:
