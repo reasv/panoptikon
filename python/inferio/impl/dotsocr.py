@@ -4,6 +4,7 @@ from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 from inferio.impl.utils import (
     clear_cache,
+    cuda_capability,
     get_device,
     load_image_from_buffer,
     run_with_oom_retry,
@@ -54,6 +55,18 @@ class DotsOCRModel(InferenceModel):
 
         use_gpu = self.gpu and torch.cuda.is_available()
         dev = get_device()[0] if use_gpu else torch.device("cpu")
+
+        # Backstop for the registry's min_compute_capability floor: a clear
+        # refusal instead of an opaque CUDA error from bf16/FA2 kernels.
+        if use_gpu:
+            cap = cuda_capability(dev)
+            if cap is not None and cap < (8, 0):
+                raise RuntimeError(
+                    "dots.ocr requires an NVIDIA GPU with compute "
+                    "capability >= 8.0 (Ampere) for bfloat16 + "
+                    f"FlashAttention 2; detected {cap[0]}.{cap[1]}. "
+                    "Use another OCR model on this GPU."
+                )
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,

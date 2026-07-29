@@ -94,6 +94,10 @@ pub(crate) struct ModelMetadata {
     pub default_threshold: Option<f64>,
     pub input_mime_types: Vec<String>,
     pub skip_processed_items: bool,
+    /// Set when the serving inference host marked the model unavailable
+    /// (e.g. the GPU misses the model's `min_compute_capability` floor);
+    /// jobs bail before loading instead of failing with a CUDA error.
+    pub unavailable_reason: Option<String>,
     // Informational metadata mirrored from the inference server's config.
     #[allow(dead_code)]
     pub name: Option<String>,
@@ -257,6 +261,15 @@ async fn run_extraction_job_inner(
     }
 
     let model = load_model_metadata(inference_id).await?;
+    // The /metadata availability overlay reflects the *serving* host's
+    // GPUs (a remote inference server reports its own), so this covers
+    // UI-, API-, and cron-triggered jobs with a clear message instead of
+    // a CUDA error mid-load.
+    if let Some(reason) = &model.unavailable_reason {
+        return Err(ApiError::bad_request(format!(
+            "Model {inference_id} is not available on this system: {reason}"
+        )));
+    }
     let defaults = resolve_job_defaults(&config, &model, job.batch_size, job.threshold);
 
     let context = job_inference_context();
@@ -1105,6 +1118,22 @@ pub(crate) fn resolve_model_metadata(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let unavailable_reason = if merged
+        .get("unavailable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some(
+            merged
+                .get("unavailable_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("marked unavailable by the inference server")
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     let name = merged
         .get("name")
         .and_then(Value::as_str)
@@ -1130,6 +1159,7 @@ pub(crate) fn resolve_model_metadata(
         default_threshold,
         input_mime_types,
         skip_processed_items,
+        unavailable_reason,
         name,
         description,
         link,
@@ -1364,5 +1394,43 @@ mod tests {
             batch_unload_is_current(batch_load_generation()),
             "an unload captured after that load is valid again"
         );
+    }
+
+    // The /metadata availability overlay must reach the job layer: an id
+    // carrying `unavailable` resolves with its reason (falling back to a
+    // generic one), and untouched ids resolve with none.
+    #[test]
+    fn resolve_model_metadata_picks_up_unavailable_reason() {
+        let metadata = serde_json::json!({
+            "doctr": {
+                "group_metadata": {
+                    "input_spec": {"handler": "image_frames", "opts": {}}
+                },
+                "inference_ids": {
+                    "dots_ocr": {
+                        "unavailable": true,
+                        "unavailable_reason": "Requires an NVIDIA GPU with \
+                         compute capability >= 8.0 (detected: 6.1)"
+                    },
+                    "bare_flag": {"unavailable": true},
+                    "open_model": {"description": "fine"}
+                }
+            }
+        });
+        let gated = resolve_model_metadata(&metadata, "doctr/dots_ocr").unwrap();
+        assert!(
+            gated
+                .unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains(">= 8.0")
+        );
+        let bare = resolve_model_metadata(&metadata, "doctr/bare_flag").unwrap();
+        assert_eq!(
+            bare.unavailable_reason.as_deref(),
+            Some("marked unavailable by the inference server")
+        );
+        let open = resolve_model_metadata(&metadata, "doctr/open_model").unwrap();
+        assert_eq!(open.unavailable_reason, None);
     }
 }
