@@ -28,16 +28,14 @@ Usage:
   scripts/sync-nix-ui-pin.py --check --ref HEAD   # check committed tip
   scripts/sync-nix-ui-pin.py --allow-offline-hash # permit local git archive
 
-Hooks (git config core.hooksPath scripts/git-hooks) — maintainers only:
-  pre-commit   — nix fmt; full pin --check (sync+stage on mismatch)
-  pre-push     — --check --ref HEAD (tip being pushed, not dirty worktree)
-  post-commit  — safety net: follow-up pin commit if still drifted
-  post-merge   — sync pin into working tree after pull; ask to commit
+The pin is release-time state: run this once before tagging a release
+(day-to-day ui submodule bumps need no pin action; master is not an
+installable source, so the pin may drift between releases harmlessly).
 
 There is no npmDepsHash (importNpmLock). Pin is only rev + source NAR hash.
 
-Flake consumers only need a tree where pin matches the gitlink; they do not
-run these hooks. See contrib/package/nix/README.md ("Flake consumers").
+Flake consumers only need a tree where the pin matches the gitlink — true at
+release tags. See contrib/package/nix/README.md ("Flake consumers").
 """
 
 from __future__ import annotations
@@ -85,12 +83,12 @@ def run(
 def ui_submodule_rev(ref: str | None = None) -> str:
     """Rev recorded for the ui submodule.
 
-    When *ref* is set (e.g. ``HEAD``), resolve ``{ref}:ui`` only — used by
-    pre-push so the **committed tip** is validated, not a dirty worktree.
+    When *ref* is set (e.g. ``HEAD`` or a release tag), resolve ``{ref}:ui``
+    only, so the **committed tip** is validated rather than a dirty worktree.
 
-    Without *ref*, prefer the **index** gitlink (`git rev-parse :ui`) so
-    pre-commit sees a staged submodule bump before it is committed. Do not
-    use `git ls-tree :0` — that is not a valid tree-ish on current Git.
+    Without *ref*, prefer the **index** gitlink (`git rev-parse :ui`) so a
+    staged submodule bump is seen before it is committed. Do not use
+    `git ls-tree :0` — that is not a valid tree-ish on current Git.
     """
     if ref:
         try:
@@ -385,7 +383,7 @@ def main() -> int:
         metavar="REF",
         default=None,
         help="resolve ui gitlink and pin from this git ref (e.g. HEAD) "
-        "instead of the worktree/index; for pre-push tip validation",
+        "instead of the worktree/index; validates a committed tip",
     )
     ap.add_argument(
         "--allow-offline-hash",

@@ -57,20 +57,21 @@ Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
 
 | Trigger | Action |
 | --- | --- |
-| Push (nix/packaging paths or the `ui` gitlink) | flake alejandra check + UI pin check only (fast) |
+| Push (nix/packaging paths) | flake alejandra format check only (fast) |
 | PR (same paths) / plain `workflow_dispatch` | the above plus the full package/desktop/NixOS VM smoke matrix |
 | `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
 
-There are **no scheduled runs**: only tagged releases are installable, so the
-lock/pin update job is run on demand (typically before cutting a release),
-never on a bot cadence.
+There are **no scheduled runs and no per-push pin checks**: only tagged
+releases are installable, so the UI pin and flake.lock must be correct **at
+release tags only** (see the release checklist below). Between releases they
+may go stale harmlessly — master is not an installable source.
 
 Path filters cover packaging inputs only: `contrib/package/{nix,common}/**`,
-`contrib/nixos/**`, the flake, `config/server/nixos.toml`, the `ui` gitlink,
-UI pin scripts, and `scripts/generate-hicolor-icons.sh`. **Rust/Cargo/desktop
-sources deliberately do not trigger this workflow** — core development stays
-off the nix matrix; packaging breakage from core changes surfaces via a
-manual dispatch (run one before cutting a release).
+`contrib/nixos/**`, the flake, `config/server/nixos.toml`, UI pin scripts,
+and `scripts/generate-hicolor-icons.sh`. **Rust/Cargo/desktop/ui sources
+deliberately do not trigger this workflow** — core development stays off the
+nix matrix; packaging breakage from core changes surfaces via a manual
+dispatch (run one before cutting a release).
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI
@@ -113,27 +114,26 @@ uses `ui-pin.json` → `fetchFromGitHub` for the UI. As long as reasv (or your
 tracking branch) ships a matching pin, your flake builds without you touching
 packaging.
 
-Local **git hooks are for maintainers** who commit in this repo; they do not
-run on your machine when you only evaluate a flake input.
+### Release checklist (the only recurring pin maintenance)
 
-### Local maintainer hooks (keep the pin from ever going stale)
+The UI pin is **release-time state**. Day-to-day `ui` submodule bumps need no
+pin action at all; the pin may drift freely between releases because master
+is not an installable source. Once, **before tagging a release**:
 
 ```bash
-git config core.hooksPath scripts/git-hooks
+python3 scripts/sync-nix-ui-pin.py          # refresh rev + hash from the ui gitlink
+python3 scripts/sync-nix-ui-pin.py --check  # verify
+git add contrib/package/nix/panoptikon/ui-pin.json
+git commit -m "Sync nix UI pin for release"
 ```
+
+or dispatch the `nix` workflow with `update` ticked and merge the PR it opens
+(that also refreshes `flake.lock`). Then tag. A tag with a stale pin ships a
+nix package whose UI does not match the release — that is the only failure
+mode this guards.
 
 There is **no npmDepsHash** in the pin (npm → `importNpmLock` on the UI
 lockfile). The pin is only `{ rev, hash }` for `fetchFromGitHub`.
-
-| Hook | Role |
-| --- | --- |
-| **pre-commit** | `nix fmt` staged `*.nix` (if nix present). Full pin **rev + NAR hash** `--check` whenever a `ui` gitlink exists; on failure **sync, stage, re-check** — commit aborts on failure (needs network to GitHub). |
-| **pre-push** | `sync-nix-ui-pin.py --check --ref HEAD` (committed tip, not dirty worktree); **push aborts** if pin is wrong or worktree disagrees with HEAD. |
-| **post-commit** | Safety net after `--no-verify`: if pin still drifts, sync and open a follow-up pin commit. |
-| **post-merge** | After pull/merge, sync pin into the **working tree** and print the commit command (no auto-commit on merge). |
-
-CI also runs `--check` on nix/`ui` paths. Together: local commit → local push →
-CI should never land a broken pin if hooks are enabled and CI is required.
 
 ### UI pin (submodule → `ui-pin.json`)
 
@@ -158,19 +158,9 @@ CI). Offline `git archive` is only allowed with `--allow-offline-hash` (do not
 push offline-only pins; they can diverge from GitHub).
 
 **Source of truth for the pin:** the monorepo `ui` submodule gitlink
-(`git rev-parse HEAD:ui` / staged `:ui`). **Submodule bumps are always manual.**
-With hooks enabled, **pre-commit** rewrites and stages `ui-pin.json` into the
-same commit when the gitlink moves (or aborts). **post-commit** only runs if
-that was skipped. Without hooks:
-
-```bash
-# After moving ui/ to the desired commit and staging the gitlink:
-python3 scripts/sync-nix-ui-pin.py
-git add contrib/package/nix/panoptikon/ui-pin.json
-git commit   # include both ui and pin (or rely on pre-commit)
-
-python3 scripts/sync-nix-ui-pin.py --check
-```
+(`git rev-parse HEAD:ui` / staged `:ui`). **Submodule bumps are always manual**
+and do not require touching the pin — sync happens once per release (see the
+release checklist above).
 
 Do **not** run `git submodule update --remote` from automation or CI.
 

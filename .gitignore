@@ -172,8 +172,6 @@ cython_debug/
 !/scripts/generate-nix-dev-config.py
 !/scripts/sync-nix-ui-pin.py
 !/scripts/generate-hicolor-icons.sh
-!/scripts/git-hooks/
-!/scripts/git-hooks/**
 .vscode/
 
 .DS_Store

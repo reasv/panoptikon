@@ -1,12 +1,13 @@
 # Nix packaging: format/pin checks, package smokes, NixOS VMs, manual lock/pin PR.
 #
 # The `ui` git submodule is NEVER updated by automation — only maintainers bump
-# it. CI only realigns ui-pin.json (rev + source NAR hash) to the current gitlink.
-# npm deps use importNpmLock (package-lock.json); not part of the pin.
+# it. Automation only realigns ui-pin.json (rev + source NAR hash) to the
+# current gitlink. npm deps use importNpmLock (package-lock.json); not pinned.
 #
-# No scheduled runs by design: only tagged releases are installable, so the
-# flake.lock/pin update job runs on demand (dispatch with `update`), typically
-# before cutting a release — not on a bot cadence.
+# No scheduled runs and no per-push pin checks by design: only tagged releases
+# are installable, so the pin must be correct at release tags only. Run the
+# dispatch `update` job (or scripts/sync-nix-ui-pin.py) before tagging; between
+# releases the pin may go stale harmlessly.
 #
 # Uses cache.nixos.org only (no Magic Nix Cache / GHA cache proxy).
 # Package install checks and NixOS VMs run as separate matrices so a slow VM
@@ -20,11 +21,10 @@ on:
         description: "Also run the flake.lock/pin update job (opens a PR)"
         type: boolean
         default: false
-  # Packaging paths only, deliberately: Rust/Cargo/desktop changes do not run
-  # this workflow. Packaging breakage from core changes is caught by a manual
-  # dispatch (run one before cutting a release), keeping nix CI off the hot
-  # path. "ui" (the submodule gitlink) stays in so the light `check` job
-  # catches a stale ui-pin.json on every ui bump.
+  # Packaging paths only, deliberately: Rust/Cargo/desktop/ui changes do not
+  # run this workflow. Packaging breakage from core changes is caught by a
+  # manual dispatch (run one before cutting a release), keeping nix CI off
+  # the hot path.
   pull_request:
     paths:
       - "**.nix"
@@ -34,10 +34,8 @@ on:
       - "contrib/package/common/**"
       - "contrib/nixos/**"
       - "config/server/nixos.toml"
-      - "ui"
       - "scripts/sync-nix-ui-pin.py"
       - "scripts/generate-hicolor-icons.sh"
-      - "scripts/git-hooks/**"
       - ".github/workflows/nix.yml"
   push:
     branches: [master, main, "dev/**"]
@@ -49,10 +47,8 @@ on:
       - "contrib/package/common/**"
       - "contrib/nixos/**"
       - "config/server/nixos.toml"
-      - "ui"
       - "scripts/sync-nix-ui-pin.py"
       - "scripts/generate-hicolor-icons.sh"
-      - "scripts/git-hooks/**"
       - ".github/workflows/nix.yml"
 
 permissions:
@@ -65,8 +61,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Light and fast: flake formatting + UI pin drift. Runs on every matching
-  # push (including ui gitlink bumps) and PR.
+  # Light and fast: flake formatting. The UI pin is NOT checked here — it is
+  # release-time state (see the update job / release checklist), and between
+  # releases it may legitimately be stale since master is not installable.
   check:
     if: "!(github.event_name == 'workflow_dispatch' && inputs.update)"
     runs-on: ubuntu-latest
@@ -79,9 +76,6 @@ jobs:
 
       - name: Flake formatter check (alejandra via nix)
         run: nix build .#checks.x86_64-linux.alejandra -L
-
-      - name: UI pin check (rev + source hash)
-        run: python3 scripts/sync-nix-ui-pin.py --check
 
   # Package/cli smokes (no QEMU). PRs and manual dispatch only — pushes run
   # just the light `check` job so master pushes stay off the heavy matrix.

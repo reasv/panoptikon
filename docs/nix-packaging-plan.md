@@ -32,7 +32,6 @@
 | `contrib/nixos/tests/panoptikon.nix` | Parameterized VMs |
 | `contrib/package/common/` | Cross-package install payloads (`share/`, …) |
 | `scripts/sync-nix-ui-pin.py` | Pin sync / check (pure Python NAR; no nix) |
-| `scripts/git-hooks/` | pin enforce (pre-commit/pre-push) + post-commit/merge safety nets |
 | `scripts/generate-hicolor-icons.sh` | Regenerate icons from logo SVG |
 | `.github/workflows/nix.yml` | CI matrix + weekly lock/pin PR |
 

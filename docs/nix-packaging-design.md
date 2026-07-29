@@ -50,7 +50,6 @@ config/server/nixos.toml
 scripts/sync-nix-ui-pin.py
 scripts/generate-hicolor-icons.sh
 scripts/generate-nix-dev-config.py
-scripts/git-hooks/         # pre-commit (nix fmt + pin), pre-push, post-commit/merge
 .github/workflows/nix.yml  # format, pin check, package/VM matrix, weekly lock/pin PR
 ```
 
@@ -117,16 +116,15 @@ Both config GPU flags true → assert on default packages only.
 ## Formatting and automation
 
 - **Formatter:** alejandra only via `nix fmt` / flake `formatter` (not a host binary).
-- **Local hooks** (`scripts/git-hooks/`, enable with `core.hooksPath`):
-  - **pre-commit** — `nix fmt` + full pin rev/hash `--check` (sync/stage on fail; honors `PANOPTIKON_HOOK_SKIP`)
-  - **pre-push** — pin `--check --ref HEAD` (committed tip; abort if broken)
-  - **post-commit** — safety net pin follow-up after `--no-verify`
-  - **post-merge** — sync pin into working tree after pull/merge
+- **Pin maintenance is release-time only** (no git hooks, no per-push pin
+  check): only tagged releases are installable, so `sync-nix-ui-pin.py` runs
+  once before tagging; the pin may drift between releases harmlessly.
 - **GitHub Actions** (`.github/workflows/nix.yml`):
-  - PR/push: flake alejandra + pin check; **packages** matrix (install/cli); **nixos** matrix (VMs)
-  - Weekly / manual: `nix flake update`, pin sync (to **current** gitlink only), `nix fmt`, **pre-PR light smokes** (pin/alejandra/cli/install), open PR (`GITHUB_TOKEN` does not re-trigger matrix)
+  - Push (packaging paths): flake alejandra check only
+  - PR (packaging paths) / plain dispatch: alejandra + **packages** matrix (install/cli) + **nixos** matrix (VMs)
+  - Dispatch with `update`: `nix flake update`, pin sync (to **current** gitlink only), `nix fmt`, **pre-PR light smokes** (pin/alejandra/cli/install), open PR (`GITHUB_TOKEN` does not re-trigger matrix). No scheduled runs.
   - `cache.nixos.org` only (no Magic Nix Cache); `nix-installer-action@v22`, `checkout@v6`
-  - Path filters include package/common, seed TOML, Rust sources, Cargo lock, icon generator
+  - Path filters cover packaging inputs only (no Rust/Cargo/desktop/ui sources)
 
 ## Tests
 
@@ -143,5 +141,5 @@ Both config GPU flags true → assert on default packages only.
 2. `github:` consumers build without submodule contents (UI via pin).
 3. Package version tracks Cargo.toml as the repo version changes.
 4. GPU C2 package/module rules as specified.
-5. Pin stays aligned with submodule via sync script / hook / CI.
+5. Pin aligned with the submodule at release tags via the sync script.
 6. Desktop package exposes a menu entry and hicolor icons.
