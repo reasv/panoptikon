@@ -69,6 +69,8 @@ const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
 pub struct InferioState {
     pub manager: Arc<ModelManager>,
     pub registry: Arc<StdMutex<RegistryCache>>,
+    /// Probed once at startup; drives the `/metadata` availability overlay.
+    pub compute_caps: super::capability::HostComputeCaps,
 }
 
 impl InferioState {
@@ -151,7 +153,11 @@ impl InferioState {
             },
             Arc::clone(&registry),
         );
-        Ok(Arc::new(Self { manager, registry }))
+        Ok(Arc::new(Self {
+            manager,
+            registry,
+            compute_caps: super::capability::HostComputeCaps::probe(),
+        }))
     }
 
     /// Resolve external-input declarations from this local Inferio registry.
@@ -556,7 +562,11 @@ async fn get_cached_models(State(state): State<Arc<InferioState>>) -> Json<JsonV
 async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<JsonValue>, ApiError> {
     let snapshot = state.registry.lock().unwrap().get();
     match snapshot {
-        Ok(registry) => Ok(Json(registry.metadata_json())),
+        Ok(registry) => {
+            let mut body = registry.metadata_json();
+            super::capability::overlay_metadata(&mut body, &state.compute_caps);
+            Ok(Json(body))
+        }
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "failed to load inference registry");
             Err(ApiError::internal("Failed to load inference metadata"))
@@ -1026,7 +1036,12 @@ metadata.description = "echo fixture"
             },
             Arc::clone(&registry),
         );
-        let state = Arc::new(InferioState { manager, registry });
+        let state = Arc::new(InferioState {
+            manager,
+            registry,
+            // Tests must not depend on the host's GPUs.
+            compute_caps: super::super::capability::HostComputeCaps::unknown(),
+        });
         let app = Router::new().nest_service("/api/inference", router(Arc::clone(&state)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
