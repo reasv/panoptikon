@@ -3,7 +3,22 @@
 What actually restricts Panoptikon to newer NVIDIA hardware, and how the
 inference stack should behave when a GPU is old, small, or both. Findings
 verified 2026-07-25 against the dev venv (`torch 2.7.1+cu128`, Windows,
-RTX 5090). Plan only — nothing in the plan sections is implemented.
+RTX 5090).
+
+> **Status 2026-07-29**: runtime items 1–4 are IMPLEMENTED (dtype
+> negotiation via `select_dtype`/`select_ct2_compute_type` in
+> `python/inferio/impl/utils.py`, `get_device` arch-list guard, per-model
+> `min_compute_capability` floor with an nvidia-smi probe +
+> `/api/inference/metadata` overlay in `panoptikon/src/inferio/capability.rs`
+> + job fail-fast + UI badges, and batch-level OOM halving via
+> `run_with_oom_retry` with the classified `INFERENCE_OOM_BATCH_SIZE_1:`
+> batch-1 error). The incidental md_tagger/md_captioner dead branches were
+> deleted (accelerate was never a declared dependency, so the branch was
+> doubly dead). Items 5–9, the setup-side re-probe, and the Desktop
+> inference tab remain unimplemented. Still unverified on hardware: CT2's
+> behaviour at CC < 7.0 (the mapper now asks
+> `ctranslate2.get_supported_compute_types` instead of guessing) and
+> bf16→fp32 stepping on sm_75.
 
 > **Revised 2026-07-25** after PR #19 (host tool discovery + ROCm 7.2,
 > merged at `492f87c`) landed on several of these surfaces. ROCm is no
