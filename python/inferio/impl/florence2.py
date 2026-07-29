@@ -7,9 +7,11 @@ from PIL import Image as PILImage
 from inferio.impl.utils import (
     clean_whitespace,
     clear_cache,
+    cuda_capability,
     get_device,
     load_image_from_buffer,
     print_resource_usage,
+    select_dtype,
 )
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
@@ -28,6 +30,7 @@ class Florence2(InferenceModel):
         task_prompt: str,
         text_input: str | None = None,
         flash_attention: bool = False,
+        dtype: str | None = None,
         max_output: int = 1024,
         num_beams: int = 3,
         do_sample: bool = False,
@@ -38,6 +41,7 @@ class Florence2(InferenceModel):
         self.task_prompt: str = task_prompt
         self.text_input: str | None = text_input
         self.flash_attention: bool = flash_attention
+        self.dtype: str | None = dtype
         self.max_output: int = max_output
         self.num_beams: int = num_beams
         self.init_args = init_args
@@ -65,13 +69,20 @@ class Florence2(InferenceModel):
         self.devices = get_device()
         self._device = self.devices[0]
 
-        # Prefer fp16 on CUDA, otherwise use fp32 for CPU (and avoid half on CPU)
-        if str(self._device).startswith("cuda"):
-            self._dtype = torch.float16
-        else:
-            self._dtype = torch.float32
+        self._dtype = select_dtype(
+            self._device, "fp16", explicit=self.dtype, logger=logger
+        )
 
         attn_impl = "flash_attention_2" if self.flash_attention else "sdpa"
+        if attn_impl == "flash_attention_2":
+            cap = cuda_capability(self._device)
+            if cap is not None and cap < (8, 0):
+                logger.warning(
+                    "flash_attention_2 needs compute capability 8.0+ "
+                    "(detected %d.%d); using sdpa.",
+                    *cap,
+                )
+                attn_impl = "sdpa"
 
         # Community models are native in transformers; no trust_remote_code required.
         self.model = (

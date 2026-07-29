@@ -2,7 +2,7 @@ from typing import List, Sequence
 from PIL import Image as PILImage
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
-from inferio.impl.utils import load_image_from_buffer
+from inferio.impl.utils import get_device, load_image_from_buffer, select_dtype
 import logging
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ class DotsOCRModel(InferenceModel):
         model_name: str = "rednote-hilab/dots.ocr",
         prompt: str = DEFAULT_OCR_PROMPT,
         gpu: bool = True,
+        dtype: str | None = None,
         enable_batching: bool = True,
         batch_size: int = 4,
         max_new_tokens: int = 128,
@@ -25,6 +26,7 @@ class DotsOCRModel(InferenceModel):
         self.model_name = model_name
         self.prompt = prompt
         self.gpu = gpu
+        self.dtype = dtype
         self.enable_batching = enable_batching
         self.batch_size = batch_size
         self._model_loaded = False
@@ -45,11 +47,14 @@ class DotsOCRModel(InferenceModel):
         from transformers import AutoModelForCausalLM, AutoProcessor
 
         use_gpu = self.gpu and torch.cuda.is_available()
+        dev = get_device()[0] if use_gpu else torch.device("cpu")
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=select_dtype(
+                dev, "bf16", explicit=self.dtype, logger=logger
+            ),
             attn_implementation="flash_attention_2",
             device_map="auto" if use_gpu else None,
         )
