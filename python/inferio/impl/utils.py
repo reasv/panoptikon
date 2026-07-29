@@ -21,12 +21,66 @@ def get_device():
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
-            return [torch.device(f"cuda:{i}") for i in range(num_gpus)]
-        return [torch.device("cuda")]
+            devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+        else:
+            devices = [torch.device("cuda")]
+        devices = _drop_uncovered_cuda_devices(devices)
+        if devices:
+            return devices
+        return [torch.device("cpu")]
     elif torch.backends.mps.is_available():  # Apple Silicon (M1/M2)
         return [torch.device("mps")]
     else:
         return [torch.device("cpu")]
+
+
+def _drop_uncovered_cuda_devices(devices: list) -> list:
+    """Filter out GPUs this torch build has no kernels for.
+
+    Cubins are forward-compatible within a major version (an sm_60 kernel
+    runs on sm_61), so a device (major, minor) is covered when the build's
+    arch list has an sm_ entry with the same major and minor <= the
+    device's. Skipped under ROCm (arch entries are gfx strings) and when
+    the arch list is empty. A no-op on cu128 (kernels reach sm_50); this
+    is the safety net for the cu13x transition, which drops old majors,
+    and the correct guard for the genuine "no kernel image" failure class.
+    """
+    import torch
+
+    if getattr(torch.version, "hip", None):
+        return devices
+    floors: dict = {}
+    for arch in torch.cuda.get_arch_list():
+        match = re.fullmatch(r"sm_(\d{2,3})[a-z]?", arch)
+        if not match:
+            continue  # compute_* PTX entries and anything unrecognised
+        num = match.group(1)
+        major, minor = int(num[:-1]), int(num[-1])
+        floors[major] = min(minor, floors.get(major, minor))
+    if not floors:
+        return devices
+
+    log = logging.getLogger(__name__)
+    kept = []
+    for dev in devices:
+        major, minor = torch.cuda.get_device_capability(dev)
+        if major in floors and floors[major] <= minor:
+            kept.append(dev)
+        else:
+            log.warning(
+                "Dropping GPU %s: compute capability %d.%d has no kernels "
+                "in this torch build (archs: %s).",
+                dev,
+                major,
+                minor,
+                ", ".join(torch.cuda.get_arch_list()),
+            )
+    if not kept:
+        log.error(
+            "No installed CUDA kernels cover any available GPU; "
+            "falling back to CPU."
+        )
+    return kept
 
 
 def clear_cache() -> None:
