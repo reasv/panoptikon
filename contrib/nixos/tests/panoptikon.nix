@@ -130,35 +130,7 @@ in {
         timeout=120,
     )
 
-    # Live accelerator diagnostics (service sets PANOPTIKON_ACCELERATOR).
-    # Use absolute ExecStart binary (also available as panoptikon on PATH via systemPackages).
-    report = machine.succeed(
-        f"'{exe}' --root /var/lib/panoptikon "
-        "--config /var/lib/panoptikon/config/server/default.toml accelerator"
-    )
-    assert "accelerator backend: ${effective}" in report, report
-    ${
-      if expectCpu
-      then ''
-        assert "using CPU" in report, report
-        assert "warning:" not in report, report
-      ''
-      else ''
-        # GPU backend line present; device names optional in VMs without HW.
-        assert "GPU devices:" in report, report
-      ''
-    }
-
-    # Startup log line (journald).
-    machine.wait_until_succeeds(
-        "journalctl -u panoptikon.service -b --no-pager | grep -q 'accelerator backend'",
-        timeout=60,
-    )
-    journal = machine.succeed(
-        "journalctl -u panoptikon.service -b --no-pager"
-    )
-    # Default tracing fmt layer (DefaultFields) quotes string fields:
-    # backend="cuda". Nix interpolates ${effective} before Python sees this.
-    assert 'backend="${effective}"' in journal, journal
+    # TODO: assert the live `panoptikon accelerator` report and its startup
+    # journald log line once the accelerator CLI subcommand ships on master.
   '';
 }
