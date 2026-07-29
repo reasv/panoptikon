@@ -16,6 +16,23 @@ permissions:
   contents: write
 
 jobs:
+  # Nix packaging safety net: a release tag must carry a ui-pin.json that
+  # matches its ui gitlink, or the nix package built from that tag ships a
+  # UI that does not match the release. Deliberately independent — nothing
+  # `needs` this job, so a stale pin flags the run red without blocking any
+  # binary artifact. Fix: python3 scripts/sync-nix-ui-pin.py, commit, re-tag.
+  nix-pin-check:
+    name: Nix UI pin check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Verify ui-pin.json matches the tagged ui gitlink
+        run: python3 scripts/sync-nix-ui-pin.py --check --ref HEAD
+
   build:
     name: Build (${{ matrix.label }})
     runs-on: ${{ matrix.os }}

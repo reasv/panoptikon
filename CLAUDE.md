@@ -37,3 +37,24 @@ When adding or changing a setting, classify it:
 Per-DB `config.toml` is serialized from `SystemConfig::default()` at creation,
 and serde defaults fill absent keys at load, so a newly added key is
 functionally correct for existing databases without any migration.
+
+# Release preparation
+
+- Only tagged `vX.Y.Z` releases are installable; master is never an
+  installable source. This includes the Nix flake: consumers pin release
+  tags, so Nix state on master may be stale between releases by design.
+- Before tagging a release, sync the Nix UI pin to the `ui` submodule
+  gitlink and commit it if it changed:
+
+  ```
+  python3 scripts/sync-nix-ui-pin.py
+  python3 scripts/sync-nix-ui-pin.py --check
+  git add contrib/package/nix/panoptikon/ui-pin.json
+  ```
+
+  This is a release-time step only — routine `ui` submodule bumps never
+  require it. The tag-triggered release workflow runs a non-blocking
+  `nix-pin-check` job that goes red if this was skipped (it does not gate
+  the binary artifacts); fix by syncing, committing, and re-tagging.
+  Details: `docs/desktop-release.md` and `contrib/package/nix/README.md`
+  ("Release checklist").
