@@ -78,34 +78,19 @@ class MoondreamTagger(InferenceModel):
             return
         
         from transformers import AutoModelForCausalLM
-        
-        # Check if accelerate is installed
-        try:
-            import accelerate
-            ACCELERATE_AVAILABLE = True
-        except ImportError:
-            ACCELERATE_AVAILABLE = False
 
         self.devices = get_device()
         device = self.devices[0]
 
-        if ACCELERATE_AVAILABLE and device == "cuda":
-            # Optimized loading for GPU using accelerate
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_repo,
-                revision=self.model_revision,
-                trust_remote_code=True,
-                device_map={"": "cuda"},
-                **self.init_args,
-            ).eval()
-        else:
-            # Fallback loading (standard PyTorch)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_repo,
-                revision=self.model_revision,
-                trust_remote_code=True,
-                **self.init_args,
-            ).to(device).eval()
+        # An accelerate device_map branch used to sit here, but it was
+        # doubly dead: it compared a torch.device to the string "cuda"
+        # (always False) and accelerate is not a declared dependency.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_repo,
+            revision=self.model_revision,
+            trust_remote_code=True,
+            **self.init_args,
+        ).to(device).eval()
         logger.debug(f"Model {self.model_repo} loaded.")
         logger.debug(f"Compiling model...")
         self.model.compile()

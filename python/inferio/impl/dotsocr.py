@@ -2,7 +2,12 @@ from typing import List, Sequence
 from PIL import Image as PILImage
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
-from inferio.impl.utils import get_device, load_image_from_buffer, select_dtype
+from inferio.impl.utils import (
+    clear_cache,
+    get_device,
+    load_image_from_buffer,
+    select_dtype,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -174,11 +179,9 @@ class DotsOCRModel(InferenceModel):
 
     def unload(self) -> None:
         if self._model_loaded:
-            import torch
-
             del self.model
             del self.processor
-            torch.cuda.empty_cache()
+            clear_cache()
             self._model_loaded = False
 
 IMPL_CLASS = DotsOCRModel
