@@ -444,7 +444,7 @@ def main() -> int:
 
         if not errors:
             if not args.quiet:
-                print(f"checking source hash for {rev[:12]} …")
+                print(f"checking source hash for {rev[:12]} ...")
             try:
                 content_hash = compute_source_hash(rev, allow_offline=allow_offline)
             except SystemExit as e:
@@ -466,7 +466,7 @@ def main() -> int:
         return 0
 
     if not args.quiet:
-        print(f"hashing UI tree at {rev[:12]} …")
+        print(f"hashing UI tree at {rev[:12]} ...")
     content_hash = compute_source_hash(rev, allow_offline=allow_offline)
     new_pin = {"rev": rev, "hash": content_hash}
 
@@ -475,9 +475,9 @@ def main() -> int:
         if not args.quiet:
             print(f"wrote {PIN_PATH.relative_to(REPO)}")
             if pin.get("rev") != rev:
-                print(f"  rev → {rev}")
+                print(f"  rev -> {rev}")
             if pin.get("hash") != content_hash:
-                print(f"  hash → {content_hash}")
+                print(f"  hash -> {content_hash}")
             extras = set(pin.keys()) - set(PIN_KEYS)
             if extras:
                 print(f"  dropped keys: {sorted(extras)}")
@@ -485,7 +485,7 @@ def main() -> int:
         print(f"pin already at {rev[:12]}")
 
     if not args.quiet:
-        print(f"ok: ui → {rev}")
+        print(f"ok: ui -> {rev}")
     return 0
 
 
