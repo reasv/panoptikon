@@ -14,7 +14,11 @@ RTX 5090).
 > `run_with_oom_retry` with the classified `INFERENCE_OOM_BATCH_SIZE_1:`
 > batch-1 error). The incidental md_tagger/md_captioner dead branches were
 > deleted (accelerate was never a declared dependency, so the branch was
-> doubly dead). Items 5–9, the setup-side re-probe, and the Desktop
+> doubly dead). Items 5–8 now have a concrete design —
+> `batch-calibration-design.md` (2026-07-30), which supersedes their
+> sketches below (cost-model calibration instead of learned batch sizes,
+> auto-with-cap UX, per-GPU-instance VRAM budgets) — but are not
+> implemented. Item 9, the setup-side re-probe, and the Desktop
 > inference tab remain unimplemented. Still unverified on hardware: CT2's
 > behaviour at CC < 7.0 (the mapper now asks
 > `ctranslate2.get_supported_compute_types` instead of guessing) and
