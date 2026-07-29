@@ -2,7 +2,7 @@
 
 Layout follows [copyparty](https://github.com/9001/copyparty): packages under
 `contrib/package/nix/`, NixOS module under `contrib/nixos/`, thin root
-`flake.nix`. Spec: `docs/superpowers/specs/2026-07-27-nix-contrib-redesign.md`.
+`flake.nix`. Spec: [`docs/nix-packaging-design.md`](../../../docs/nix-packaging-design.md).
 
 ## Runtime contract
 
@@ -23,7 +23,7 @@ Layout follows [copyparty](https://github.com/9001/copyparty): packages under
 | Default packages | `nixpkgs.config.cudaSupport` / `rocmSupport` (not both) |
 | Forced packages | `panoptikon-cpu` / `-cuda` / `-rocm` (ignore config) |
 | Service GPU | `services.panoptikon.gpu` (`null` = follow config) |
-| Accelerator report | `panoptikon accelerator` (backend always; GPU names optional) |
+| Accelerator report | `panoptikon accelerator` (backend always; GPU names optional; CLI not yet on master) |
 
 Do not put `/nix/store/...` tool paths into TOML.
 
@@ -57,12 +57,16 @@ Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
 
 | Trigger | Action |
 | --- | --- |
-| PR / push (nix + packaging-related paths) | flake alejandra check, UI pin check, full package/desktop/NixOS VM smoke matrix |
-| Weekly schedule + `workflow_dispatch` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| Push (nix/packaging paths or the `ui` gitlink) | flake alejandra check + UI pin check only (fast) |
+| PR (same paths) / `workflow_dispatch` | the above plus the full package/desktop/NixOS VM smoke matrix |
+| Weekly schedule / `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
 
-Path filters include `contrib/package/{nix,common}/**`, the flake, UI pin scripts,
-`config/server/nixos.toml`, Rust/`Cargo.*` inputs used by install/VM asserts,
-and `scripts/generate-hicolor-icons.sh`.
+Path filters cover packaging inputs only: `contrib/package/{nix,common}/**`,
+`contrib/nixos/**`, the flake, `config/server/nixos.toml`, the `ui` gitlink,
+UI pin scripts, and `scripts/generate-hicolor-icons.sh`. **Rust/Cargo/desktop
+sources deliberately do not trigger this workflow** — core development stays
+off the nix matrix; packaging breakage from core changes surfaces via the
+weekly run or a manual dispatch.
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI

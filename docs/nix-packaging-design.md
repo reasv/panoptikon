@@ -1,8 +1,7 @@
 # Nix packaging redesign (contrib layout, C2 GPU model)
 
 Date: 2026-07-27  
-Status: **implemented** — live contract: [`contrib/package/nix/README.md`](../../../contrib/package/nix/README.md)  
-Supersedes: [`2026-07-16-nix-flake-design.md`](./2026-07-16-nix-flake-design.md)  
+Status: **implemented** — live contract: [`contrib/package/nix/README.md`](../contrib/package/nix/README.md)  
 Inspired by: [copyparty](https://github.com/9001/copyparty) (`contrib/package/nix`, thin flake, overlay-first).
 
 ## Goals

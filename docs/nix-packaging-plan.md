@@ -1,7 +1,7 @@
 # Nix contrib redesign Implementation Plan
 
-> **Status: implemented.** Live docs: [`contrib/package/nix/README.md`](../../../contrib/package/nix/README.md).  
-> Spec: [`2026-07-27-nix-contrib-redesign.md`](../specs/2026-07-27-nix-contrib-redesign.md).
+> **Status: implemented.** Live docs: [`contrib/package/nix/README.md`](../contrib/package/nix/README.md).  
+> Spec: [`nix-packaging-design.md`](./nix-packaging-design.md).
 
 **Goal:** Packaging under `contrib/`, C2 GPU model, UI pin for `github:` consumers, desktop menu/icons, tests.
 
