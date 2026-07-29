@@ -58,15 +58,19 @@ Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
 | Trigger | Action |
 | --- | --- |
 | Push (nix/packaging paths or the `ui` gitlink) | flake alejandra check + UI pin check only (fast) |
-| PR (same paths) / `workflow_dispatch` | the above plus the full package/desktop/NixOS VM smoke matrix |
-| Weekly schedule / `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| PR (same paths) / plain `workflow_dispatch` | the above plus the full package/desktop/NixOS VM smoke matrix |
+| `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+
+There are **no scheduled runs**: only tagged releases are installable, so the
+lock/pin update job is run on demand (typically before cutting a release),
+never on a bot cadence.
 
 Path filters cover packaging inputs only: `contrib/package/{nix,common}/**`,
 `contrib/nixos/**`, the flake, `config/server/nixos.toml`, the `ui` gitlink,
 UI pin scripts, and `scripts/generate-hicolor-icons.sh`. **Rust/Cargo/desktop
 sources deliberately do not trigger this workflow** — core development stays
-off the nix matrix; packaging breakage from core changes surfaces via the
-weekly run or a manual dispatch.
+off the nix matrix; packaging breakage from core changes surfaces via a
+manual dispatch (run one before cutting a release).
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI
@@ -74,7 +78,7 @@ per job (no shared GHA binary cache); first-run wall time can be long. Installer
 is pinned (`nix-installer-action@v22`). Package/VM checks run as a **parallel
 matrix**.
 
-**Weekly PR and `GITHUB_TOKEN`:** PRs opened with the default `GITHUB_TOKEN` do
+**Update PR and `GITHUB_TOKEN`:** PRs opened with the default `GITHUB_TOKEN` do
 **not** re-trigger `pull_request`/`push` workflows (GitHub recursion guard). The
 update job therefore runs pin + light package smokes **before** opening the PR.
 Full package/VM matrix is not auto-run on that PR; re-run the workflow after
@@ -86,13 +90,16 @@ already recorded.
 
 ### Flake consumers (you do **not** need a PR for normal builds)
 
-If your flake only **consumes** panoptikon:
+If your flake only **consumes** panoptikon, **pin a release tag**:
 
 ```nix
-inputs.panoptikon.url = "github:reasv/panoptikon"; # or a tag / commit
+# Only tagged releases are supported for installation. master is the
+# development branch: it is NOT stable, and running it can leave your
+# databases in a state the next release cannot migrate cleanly.
+inputs.panoptikon.url = "github:reasv/panoptikon/v0.1.8"; # first tag with nix packaging
 ```
 
-then:
+Update by bumping the tag, not by re-locking master. Then:
 
 | Upstream change | What you do |
 | --- | --- |

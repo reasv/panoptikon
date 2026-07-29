@@ -128,9 +128,15 @@ Prebuilt binaries are planned; until they arrive you build from source.
 Packaging lives under `contrib/` (flake, packages, NixOS module). See
 [`contrib/package/nix/README.md`](contrib/package/nix/README.md).
 
+**Install only tagged releases** (pin the flake input to a release tag, e.g.
+`github:reasv/panoptikon/v0.1.8`). master is the development branch — not
+stable, and running it can leave your databases in a state the next release
+cannot migrate cleanly.
+
 ```bash
-nix build .#panoptikon
-# NixOS: import inputs.panoptikon.nixosModules.default and the overlay
+nix build .#panoptikon   # from a checkout (development)
+# NixOS: import inputs.panoptikon.nixosModules.default and the overlay,
+# with the input pinned to a release tag
 ```
 
 ### Prerequisites
