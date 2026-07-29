@@ -563,6 +563,32 @@ def test_unknown_request_type_is_unsupported(worker: WorkerProcess) -> None:
     assert resp["id"] == 3
 
 
+def test_oom_error_frame_preserves_prefix(worker: WorkerProcess) -> None:
+    # Expected behavior: an impl raising the classified batch-1 OOM error
+    # (see inferio.impl.utils.OOM_BATCH1_PREFIX) surfaces it as an error
+    # frame whose message starts with the literal prefix, verbatim — the
+    # contract future dispatch-side OOM classification relies on — and the
+    # worker survives for further requests.
+    worker.send(handshake_msg(req_id=1, impl_class="oom_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(
+        {"type": "predict", "id": 4, "inputs": [{"data": {}, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "error"
+    assert resp["id"] == 4
+    assert resp["message"].startswith("INFERENCE_OOM_BATCH_SIZE_1:")
+
+    worker.send({"type": "unload", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
 def test_broken_module_does_not_prevent_discovery(
     worker: WorkerProcess,
 ) -> None:

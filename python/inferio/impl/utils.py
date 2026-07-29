@@ -239,6 +239,79 @@ def select_ct2_compute_type(
     )
     return "float32"
 
+OOM_BATCH1_PREFIX = "INFERENCE_OOM_BATCH_SIZE_1:"
+
+
+class InferenceOOMError(RuntimeError):
+    """Out of GPU memory on a single input after cache-clearing retries.
+
+    str() starts with OOM_BATCH1_PREFIX: the worker's error frame carries
+    only the message string, so the prefix is what the orchestrator (and
+    future dispatch-side classification) can recognise the condition by.
+    """
+
+
+def run_with_oom_retry(
+    process_chunk,
+    items,
+    *,
+    initial_chunk_size: int | None = None,
+    oom_exceptions=None,
+    logger: logging.Logger | None = None,
+) -> list:
+    """Run `process_chunk` over `items`, halving the chunk size on CUDA OOM.
+
+    `process_chunk(chunk)` must return exactly len(chunk) results; results
+    are concatenated in input order. On OOM the torch cache is cleared and
+    the same position is retried at half the size — never re-grown within
+    a call, since the dispatcher forms fresh full batches on the next
+    request anyway. An OOM with a single item raises InferenceOOMError;
+    any other exception propagates untouched.
+
+    `oom_exceptions` overrides the caught types (used by torch-free tests).
+    """
+    log = logger or logging.getLogger(__name__)
+    if oom_exceptions is None:
+        import torch
+
+        # Canonical spelling: torch.cuda.OutOfMemoryError; it is the same
+        # class as torch.OutOfMemoryError in both shipped torch generations.
+        oom_exceptions = (torch.cuda.OutOfMemoryError,)
+
+    items = list(items)
+    if not items:
+        return []
+    chunk_size = max(1, min(initial_chunk_size or len(items), len(items)))
+    results: list = []
+    pos = 0
+    while pos < len(items):
+        chunk = items[pos : pos + chunk_size]
+        try:
+            out = list(process_chunk(chunk))
+        except oom_exceptions as err:
+            clear_cache()
+            if len(chunk) == 1:
+                raise InferenceOOMError(
+                    f"{OOM_BATCH1_PREFIX} out of GPU memory on a single "
+                    f"input: {err}"
+                ) from err
+            chunk_size = max(1, len(chunk) // 2)
+            log.warning(
+                "GPU OOM on a chunk of %d inputs; retrying at %d.",
+                len(chunk),
+                chunk_size,
+            )
+            continue
+        if len(out) != len(chunk):
+            raise RuntimeError(
+                f"process_chunk returned {len(out)} results for "
+                f"{len(chunk)} inputs"
+            )
+        results.extend(out)
+        pos += len(chunk)
+    return results
+
+
 def mcut_threshold(probs: np.ndarray) -> float:
     """
     Maximum Cut Thresholding (MCut)
