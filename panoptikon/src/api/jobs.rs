@@ -474,13 +474,24 @@ pub(crate) async fn update_config(
             .collect::<Vec<_>>(),
     )
     .await?;
-    // Reject invalid [vector_quants] at save time; the load-time paths
-    // treat an invalid section as empty, which would silently remove
-    // profiles.
-    if let Some(quants) = &config.vector_quants
-        && let Err(message) = crate::db::vector_quants::resolve_desired_strict(quants)
-    {
-        return Err(ApiError::bad_request(message));
+    // Normalize retired quantizer kinds into the section that gets SAVED —
+    // the load path already reads `binary` as `int8`, so rewriting the file
+    // is what makes it converge and stops the load-time warning; rejecting
+    // it here instead would 400 every unrelated settings save on a DB whose
+    // section predates the int8 remap. Genuinely invalid sections are still
+    // rejected at save time: the load-time paths treat them as inert, which
+    // would silently strand the profiles.
+    let mut config = config;
+    if let Some(quants) = &mut config.vector_quants {
+        if crate::db::vector_quants::normalize_retired(quants) {
+            tracing::info!(
+                index_db = %conn.index_db,
+                "normalized retired 'binary' vector quant profiles to 'int8' in the saved config"
+            );
+        }
+        if let Err(message) = crate::db::vector_quants::resolve_desired(quants) {
+            return Err(ApiError::bad_request(message));
+        }
     }
     let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;

@@ -93,24 +93,30 @@ pub(crate) struct DesiredState {
     pub default_name: Option<String>,
 }
 
+/// Rewrites retired quantizer kinds to their successors in place: `binary`
+/// becomes `int8` (and the binary-only `centered` flag is cleared). Returns
+/// whether anything changed. The config-commit path runs this before
+/// validating and saving, so a legacy section converges to `int8` *in the
+/// file* at the first settings save — after which the load-path mapping in
+/// [`resolve_desired`] has nothing left to warn about. Rejecting the retired
+/// kind there instead would break every unrelated settings save on a DB
+/// whose section predates the remap (the UI round-trips the full config).
+pub(crate) fn normalize_retired(config: &mut VectorQuantsConfig) -> bool {
+    let mut changed = false;
+    for profile in &mut config.profiles {
+        if profile.quantizer == QUANTIZER_BINARY_RETIRED {
+            profile.quantizer = QUANTIZER_INT8.to_string();
+            profile.centered = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Validates and normalizes the desired state, mapping the retired `binary`
 /// quantizer to int8. Returns a user-addressable message on invalid config;
 /// load-time callers log and treat the section as no work.
 pub(crate) fn resolve_desired(config: &VectorQuantsConfig) -> Result<DesiredState, String> {
-    resolve_desired_inner(config, false)
-}
-
-/// The config-commit path: same validation, but `binary` is a hard error
-/// instead of a silent remap, so a user editing the TOML is told the recipe
-/// is gone rather than watching their profile quietly change kind.
-pub(crate) fn resolve_desired_strict(config: &VectorQuantsConfig) -> Result<DesiredState, String> {
-    resolve_desired_inner(config, true)
-}
-
-fn resolve_desired_inner(
-    config: &VectorQuantsConfig,
-    strict: bool,
-) -> Result<DesiredState, String> {
     let mut names = HashSet::new();
     let mut profiles = Vec::with_capacity(config.profiles.len());
     let mut retired_seen = false;
@@ -124,16 +130,11 @@ fn resolve_desired_inner(
         }
         match profile.quantizer.as_str() {
             QUANTIZER_INT8 => {}
-            QUANTIZER_BINARY_RETIRED if !strict => {
+            QUANTIZER_BINARY_RETIRED => {
                 // Migration path: the profile keeps its name, the quantizer
                 // change is a recipe change, and the existing reconcile
                 // machinery resets the pairs and rebuilds them as int8.
                 retired_seen = true;
-            }
-            QUANTIZER_BINARY_RETIRED => {
-                return Err(format!(
-                    "Quantizer 'binary' is retired for profile '{name}'; use 'int8'"
-                ));
             }
             other => {
                 return Err(format!(
@@ -147,9 +148,14 @@ fn resolve_desired_inner(
         });
     }
     if retired_seen {
+        // Repeats at every load until the file is rewritten — deliberately
+        // informational in tone: the mapping alone triggers no work (a
+        // rebuild happens only when actual coverage disagrees, and the one
+        // recipe-change rebuild already ran at the first post-remap
+        // reconcile).
         tracing::warn!(
-            "[vector_quants] lists the retired 'binary' quantizer; reading it as 'int8'. \
-             The affected profiles rebuild once, then search on int8 codes."
+            "config.toml still lists the retired 'binary' quantizer; reading it as 'int8'. \
+             No rebuild is pending; the section is rewritten at the next settings save."
         );
     }
     let default_name = match (&config.default, profiles.is_empty()) {
@@ -2978,11 +2984,19 @@ mod tests {
         })
         .expect("retired quantizer maps to int8");
         assert_eq!(state.profiles[0].quantizer, "int8");
-        // The commit path refuses the same config outright.
-        assert!(
-            resolve_desired_strict(&config(vec!["default"], Some("default"))).is_ok(),
-            "int8 is accepted on commit"
-        );
+        // The commit path rewrites the same section in place before saving,
+        // so the file converges to int8 at the first settings save.
+        let mut committed = VectorQuantsConfig {
+            default: Some("default".to_string()),
+            profiles: vec![VectorQuantProfileConfig {
+                name: "default".to_string(),
+                quantizer: "binary".to_string(),
+                centered: true,
+            }],
+        };
+        assert!(normalize_retired(&mut committed), "the save rewrites binary");
+        assert_eq!(committed.profiles[0].quantizer, "int8");
+        assert!(!committed.profiles[0].centered);
 
         sync_metadata(conn, state.clone()).await.expect("sync");
         let profile = &load_profiles(conn).await.expect("profiles")[0];
@@ -3111,24 +3125,30 @@ mod tests {
         );
         assert!(resolve_desired(&config(vec![], None)).is_ok(), "opt-out");
 
-        // The retired quantizer: mapped on load, rejected on commit. A typo
-        // is an error on both paths — load_desired_state turns that into
-        // "inert", which is what keeps a slip of the finger from deleting
-        // every quant row.
+        // The retired quantizer: mapped on load, rewritten in place on
+        // commit (`normalize_retired`). A typo is an error on both paths —
+        // load_desired_state turns that into "inert", which is what keeps a
+        // slip of the finger from deleting every quant row.
         let mut retired = config(vec!["a"], Some("a"));
         retired.profiles[0].quantizer = "binary".to_string();
         assert_eq!(
             resolve_desired(&retired).expect("mapped").profiles[0].quantizer,
             "int8"
         );
+        assert!(normalize_retired(&mut retired), "commit rewrites binary");
+        assert_eq!(retired.profiles[0].quantizer, "int8");
         assert!(
-            resolve_desired_strict(&retired).is_err(),
-            "committing 'binary' must be rejected, not silently remapped"
+            !normalize_retired(&mut retired),
+            "normalization is idempotent"
         );
         let mut bad = config(vec!["a"], Some("a"));
         bad.profiles[0].quantizer = "in8".to_string();
         assert!(resolve_desired(&bad).is_err(), "typos stay errors");
-        assert!(resolve_desired_strict(&bad).is_err());
+        assert!(
+            !normalize_retired(&mut bad),
+            "unknown kinds are not rewritten; they fail validation instead"
+        );
+        assert!(resolve_desired(&bad).is_err());
     }
 
     // The built-in default (the day-1 desired state for every DB without a

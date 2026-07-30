@@ -102,9 +102,15 @@ introduction was. `binary` is retired as a quantizer kind:
 - the built-in default profile is now `quantizer = "int8"`, so every DB
   without a `[vector_quants]` section gets int8 at the next reconcile;
 - a user's TOML that still says `quantizer = "binary"` is **mapped to int8**
-  on the load path (with a warning) so the profile keeps its name and its
-  identity; the config-**commit** path rejects `"binary"` outright with
-  "retired; use int8", so a hand-edit is told rather than silently changed;
+  on the load path (with a warning, repeated until the file changes) so the
+  profile keeps its name and its identity; the config-**commit** path
+  **rewrites** the retired kind into the section it saves
+  (`normalize_retired`), so the file converges to `int8` at the first
+  settings save and the warning stops. (An earlier revision rejected
+  `"binary"` at commit instead — that broke every unrelated settings save
+  on a DB whose section predated the remap, since the UI round-trips the
+  full config.) Unknown quantizer strings are still rejected at commit and
+  inert at load;
 - the `centered` TOML field still deserializes (back-compat) and is ignored.
 
 Either way the quantizer string and the options JSON (`{"scheme":"gsym"}`,
