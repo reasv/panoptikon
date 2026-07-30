@@ -20,7 +20,8 @@
 //! limit        = min(total × cap_fraction,           # server lever, default off
 //!                   total − external × (1 + margin)) # desktop lever, default on
 //! headroom     = limit − Σ charge(w) − Σ load_reservations
-//! grant        = min(headroom share, ramp step, priced window content)
+//! grant        = min(headroom share, ramp step, slope × knee_units,
+//!                    priced window content)
 //! ```
 //!
 //! Note `charge`: a grant's MB figure is the *envelope over `reserved_at_load`*
@@ -31,8 +32,13 @@
 //! contention floor forever. One window is in flight per replica, so the netting
 //! is per replica.
 //!
-//! (The `slope × knee_units` term of the `grant` min-rule arrives with
-//! throughput-knee capture in step 4.)
+//! The `slope × knee_units` term is applied on the **unit** side rather than
+//! the MB side (see [`admitted_units`]): the two are the same constraint —
+//! post-fit the grant's MB figure is `units × slope` — and the unit-side min
+//! needs no fit to be in force, so a knee still binds on a model that is
+//! still pre-fit. "Ideal is bounded": some models stop gaining (or lose)
+//! throughput past a batch size long before memory runs out, and admitting
+//! past that point buys nothing and risks the WDDM spill regime.
 //!
 //! **One currency: driver MB.** A resident is charged its process-level
 //! `base` (context + workspaces + weights) *plus* allocator pool growth since
@@ -75,7 +81,7 @@
 //! deflation, ramp position, outstanding grants — is deliberately never
 //! persisted.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -124,6 +130,54 @@ pub const RATCHET_FACTOR: u64 = 2;
 
 /// Minimum high-water samples before a fit is attempted at all.
 pub const MIN_FIT_SAMPLES: usize = 3;
+
+/// Fraction of the best observed throughput a batch size must still reach to
+/// count as "on the plateau". The knee is the **smallest** size that does:
+/// past it, doubling the batch buys less than 10% more units/sec, which is
+/// not worth the memory it costs (nor the risk of the WDDM spill regime).
+///
+/// Tunable; 0.9 is the design's "stopped improving" made concrete.
+pub const KNEE_RATIO: f64 = 0.9;
+
+/// Throughput observations required before a knee may cap anything, and the
+/// number of distinct batch-size buckets they must span.
+///
+/// Both gates matter and they are not interchangeable: twelve samples all at
+/// one batch size say nothing at all about the *shape* of the curve, and
+/// three buckets holding one noisy sample each say nothing about where it
+/// bends. A knee is a permanent cap in practice (see [`fit_knee`]), so the
+/// gate before the first one is the whole quality control.
+pub const MIN_KNEE_SAMPLES: usize = 12;
+pub const MIN_KNEE_BUCKETS: usize = 3;
+
+/// Fraction of its window's **granted unit budget** a batch must have
+/// actually carried before its throughput counts towards the knee.
+///
+/// The knee is a statement about how fast this model runs *at a batch size*,
+/// so only batches that were free to reach that size may describe it. A
+/// dispatch window's last batch is whatever units were left over, a
+/// user-capped window packs to the cap, and a squeezed one packs to a
+/// contention share — all three land in low size buckets at whatever rate
+/// small batches happen to run at, and none of them is evidence that the
+/// model *stops gaining* past there. Feeding them in is how a knee walks
+/// itself down to one unit: every refit pulls the median of the low buckets
+/// up, the best-bucket reference decays with the ring, and the cap ratchets
+/// downward until it is absorbing (see [`fit_knee`]'s historical anchor,
+/// which closes the other half of that loop).
+///
+/// 0.8 rather than 1.0 because a batch is packed to whole items: a 64-unit
+/// budget filled with 3 items of 20 units is a full batch by every meaning
+/// that matters here. Note what this does *not* exclude — a batch that
+/// filled a **deflated** grant. That grant's budget is the deflated one, so
+/// the batch is full by this rule and is admitted at its (small) size, which
+/// is honest data about running at that size.
+pub const FULL_BATCH_RATIO: f64 = 0.8;
+
+/// Bounded ring of throughput observations behind the knee fit. Runtime-only
+/// — the design persists the fitted *result* (`knee_units`), not the
+/// observations, unlike the high-water ring the cost fit is recomputed from.
+/// Eviction doubles as recency aging.
+const KNEE_RING: usize = 128;
 
 /// Local clean high-water samples that **confirm** a fit for margin
 /// purposes. Below this the model's effective margin is widened by
@@ -322,6 +376,22 @@ pub struct FitSample {
     pub delta_mb: u64,
 }
 
+/// One throughput observation: a batch's size in units against the rate it
+/// ran at.
+///
+/// **units/sec, not items/sec** — the design is explicit that heterogeneous
+/// batches make items/sec noisy for `sum` models, where one 8000×6000 scan
+/// and 63 thumbnails are the same item count and nothing like the same work.
+///
+/// Runtime-only: the local store persists the fitted `knee_units`, not the
+/// series behind it (unlike [`FitSample`], where a robust fit genuinely
+/// cannot be resumed from aggregates).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThroughputSample {
+    units: u64,
+    units_per_sec: f64,
+}
+
 /// The fitted cost model for one (model, board) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSnapshot {
@@ -363,6 +433,16 @@ struct GrantCharge {
     /// its demand signal would stay frozen at its grant-time value and keep
     /// diluting its neighbours' contention shares after its own work landed.
     requests: usize,
+    /// The per-batch unit budget this window was granted — everything the
+    /// ramp, the ratchet, the knee, the contention share and the window's own
+    /// content had already said by the time it was dispatched.
+    ///
+    /// Carried so that the settling ingest can tell a batch that *spent* its
+    /// budget from a window tail, a capped batch or a squeezed one
+    /// ([`FULL_BATCH_RATIO`]). Nothing else may be reconstructed after the
+    /// fact: by settle time the ramp has moved, the anchor has moved, and a
+    /// recomputed budget would describe the next window rather than this one.
+    unit_budget: u64,
 }
 
 /// One requester's slice of a board's headroom, plus the contention floor it
@@ -605,7 +685,24 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// With no local measurement yet (`anchor == 0`) the ceiling is off and the
 /// plain geometric ramp governs, which is what a fresh install does even
 /// with a shipped profile: profiles govern pricing, not growth.
-fn admitted_units(entry: &WorkerEntry, anchor: u64) -> u64 {
+///
+/// `knee` is the throughput knee ([`fit_knee`]), and it is a **pure
+/// additional min**: "ideal is bounded" by throughput as well as by memory,
+/// so a batch size past which units/sec stops improving is not admitted even
+/// when the board has room. Three properties of where it is applied:
+///
+/// - it can only shrink a budget, never grow one — it is a `min`, applied
+///   after the anchor's floor, so a knee below the ratchet anchor genuinely
+///   caps below a size this machine has measured. That is the intended
+///   direction: the anchor says a batch that big *fits*, never that it is
+///   worth running;
+/// - it is applied **before** deflation, so a deflating worker keeps halving
+///   from the capped budget down to a single unit. The knee is a ceiling and
+///   deflation is a floor-ward correction; neither may hold the other up;
+/// - it is on the unit side rather than the design's `slope × knee_units` MB
+///   term. Identical post-fit (the grant's MB figure is `units × slope`) and
+///   strictly better pre-fit, where there is no slope to express it in.
+fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
     let seed = entry.seed_units.max(1);
     let factor = 1u64
         .checked_shl(entry.effective_ramp_step(anchor))
@@ -615,6 +712,10 @@ fn admitted_units(entry: &WorkerEntry, anchor: u64) -> u64 {
         ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
     } else {
         ramped
+    };
+    let bounded = match knee {
+        Some(knee) if knee > 0 => bounded.min(knee),
+        _ => bounded,
     };
     // Deflation may shrink below the seed, all the way to a single unit: the
     // seed is the ramp's *starting* point and the contention floor, not a
@@ -694,14 +795,53 @@ struct ModelCalibration {
     /// a local profile brought back from a previous run. The confirmation
     /// gate for margin widening, and persisted for exactly that reason.
     local_samples: u32,
-    /// Throughput knee from a profile. Parsed and round-tripped from step 1c;
-    /// nothing fits or enforces it until step 4.
+    /// `(units, units/sec)` for clean, priceable, warm-pool, budget-spending
+    /// batches: the series [`fit_knee`] bends. Bounded by [`KNEE_RING`] and
+    /// runtime-only.
+    throughput: VecDeque<ThroughputSample>,
+    /// The best bucket median this model has *ever* shown here, as
+    /// `(log2 bucket, units/sec)` — the reference the [`KNEE_RATIO`]
+    /// threshold is taken against, alongside the live ring's own best.
+    ///
+    /// The ring ages by eviction, so its best decays: once the knee caps the
+    /// budget, the fastest sizes stop being run and the peak that *defined*
+    /// the knee falls out of the window. Re-fitting against the decayed peak
+    /// would then find a lower plateau start, cap harder, decay further —
+    /// a descent with no bottom but `knee_units = 1`, and no way back up
+    /// because [`MIN_KNEE_BUCKETS`] can never be met again inside a cap that
+    /// tight. Anchoring the threshold to the historical peak makes the knee
+    /// what its doc comment already claims: sticky, and a frontier that only
+    /// ever moves outward.
+    ///
+    /// Runtime-only, like the ring behind it: a new run re-earns its peak
+    /// from the ramp on the way up, and the persisted `knee_units` caps it
+    /// meanwhile.
+    knee_best: Option<(u32, f64)>,
+    /// The throughput knee in force: the largest batch size worth admitting,
+    /// whatever memory would allow. Either fitted here from
+    /// [`Self::throughput`] or seeded from a profile — **including a shipped
+    /// one**, which is the one authority a foreign profile has beyond
+    /// pricing. A knee is a throughput hint, not a growth authority: it can
+    /// only ever make a grant smaller (see [`admitted_units`]), and capping
+    /// is the safe direction, so there is nothing to protect a fresh install
+    /// from by ignoring it. (Contrast the ratchet anchor, which *grows*
+    /// budgets and is therefore local-only.)
     knee_units: Option<u64>,
-    /// `(anchor, fit version)` as last handed to the calibration store. The
-    /// write policy is "the ratchet anchor advanced or the fit meaningfully
-    /// changed" — and `FitSnapshot::version` only moves when the refit
-    /// actually differed, so comparing these two numbers *is* that policy.
-    persisted: Option<(u64, u64)>,
+    /// This knee was fitted here, from this machine's own observations, and
+    /// may therefore travel back into the local store. A seeded one may not:
+    /// writing a baseline's knee out under our own generator stamp would
+    /// launder it into local provenance, exactly as with the fit. The store
+    /// preserves whatever knee an entry already carries when an update
+    /// brings none, so this never erases a knee we wrote in a previous run.
+    knee_is_local: bool,
+    /// `(anchor, fit version, locally fitted knee)` as last handed to the
+    /// calibration store. The write policy is "the ratchet anchor advanced or
+    /// the fit meaningfully changed" — and `FitSnapshot::version` only moves
+    /// when the refit actually differed, so comparing these numbers *is* that
+    /// policy. The knee joins them because it is persisted state that moves
+    /// on its own schedule; it is quantized to a bucket edge, so any change
+    /// at all is a material one.
+    persisted: Option<(u64, u64, Option<u64>)>,
 }
 
 /// The freshest free-memory reading for a board, and where it came from.
@@ -917,6 +1057,8 @@ impl VramLedger {
                 inference_id,
                 epoch: cost.epoch,
                 gpu_name: &board_name,
+                unit: cost.unit.as_str(),
+                aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
                 // The worker reports its torch build on the load response,
                 // which by definition has not landed yet; the store falls
                 // back across torch builds for this tier.
@@ -1041,6 +1183,11 @@ impl VramLedger {
                 inference_id,
                 epoch: cost.epoch,
                 gpu_name: &board_name,
+                // The dimension in force *now*. A stored profile measured
+                // under another one prices a different quantity, so it must
+                // not match — see `CalibrationProfile::matches_key`.
+                unit: cost.unit.as_str(),
+                aggregation: aggregation.as_str(),
                 torch: report.torch_version.as_deref(),
                 dtype: report.dtype.as_deref(),
             })
@@ -1210,7 +1357,20 @@ impl VramLedger {
         };
         let cal = state.calibration.entry(key.clone()).or_default();
         cal.seeded = true;
-        cal.knee_units = seed.knee_units;
+        // A profile's knee is adopted only where this machine has not fitted
+        // one. Seeding normally runs before any local evidence exists, but it
+        // is reachable afterwards — a registration that returned early before
+        // reaching here leaves `seeded` false while the pair's calibration
+        // goes on accumulating — and both directions of the unguarded
+        // assignment are wrong: it would overwrite a measured local knee with
+        // a stranger's, and (because `knee_is_local` would stay true) launder
+        // the stranger's number into local provenance on the next write.
+        if !cal.knee_is_local {
+            cal.knee_units = seed.knee_units;
+            // Explicit rather than implied by the branch: a seeded knee is a
+            // foreign measurement and may never travel back out.
+            cal.knee_is_local = false;
+        }
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
                 slope_mb_per_unit: seed.slope_mb_per_unit,
@@ -1253,9 +1413,12 @@ impl VramLedger {
             // Nothing has moved since the file was written, so the write
             // policy must not immediately write it back. The version recorded
             // is the one actually in force, which is 0 when no fit was
-            // adopted.
+            // adopted. The knee recorded is `None` because a seeded knee is
+            // never *written* (`knee_is_local` stays false until this machine
+            // fits one), and the two sides of the comparison have to describe
+            // the same quantity.
             let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
-            cal.persisted = Some((cal.max_units_measured, in_force));
+            cal.persisted = Some((cal.max_units_measured, in_force, None));
         }
         tracing::debug!(
             model = %inference_id,
@@ -1317,9 +1480,13 @@ impl VramLedger {
             return None;
         }
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
-        let current = (cal.max_units_measured, fit_version);
+        // Only a knee this machine fitted travels, for the same reason only a
+        // local fit does. Quantized to a bucket edge, so "changed at all" and
+        // "changed materially" are the same test.
+        let knee = cal.knee_units.filter(|_| cal.knee_is_local);
+        let current = (cal.max_units_measured, fit_version, knee);
         if cal.persisted.is_some_and(|persisted| {
-            persisted.1 == current.1 && persisted.0 >= current.0
+            persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
         }) {
             return None;
         }
@@ -1339,7 +1506,7 @@ impl VramLedger {
             slope_mb_per_unit: fit.map(|fit| fit.slope_mb_per_unit).unwrap_or(0.0),
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
-            knee_units: cal.knee_units,
+            knee_units: knee,
             max_units_measured: cal.max_units_measured,
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),
@@ -1536,6 +1703,18 @@ impl VramLedger {
             .unwrap_or(0)
     }
 
+    /// The throughput knee in force for this replica's model on this board,
+    /// fitted or seeded. `None` — no cap — until one is known, which is the
+    /// pre-step-4 behaviour and the permanent behaviour of a model whose
+    /// curve never bends inside the range the ramp explores.
+    fn knee_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
+        state
+            .calibration
+            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+            .and_then(|cal| cal.knee_units)
+            .filter(|knee| *knee > 0)
+    }
+
     fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {
         state
             .calibration
@@ -1592,7 +1771,15 @@ impl VramLedger {
             .map(|(_, entry)| entry)
             .collect();
         let appetite = |entry: &WorkerEntry| -> f64 {
-            let anchor = Self::anchor_locked(state, entry);
+            // The design's appetite term is `slope × knee_units`: what this
+            // model can actually *use*, which is the calibrated batch size
+            // bounded by both the evidence (the anchor) and the throughput
+            // knee. A model capped at its knee must not claim a share of the
+            // board sized for a batch it will never be admitted for.
+            let anchor = match Self::knee_locked(state, entry) {
+                Some(knee) => Self::anchor_locked(state, entry).min(knee),
+                None => Self::anchor_locked(state, entry),
+            };
             match Self::pricing_fit_locked(state, entry) {
                 Some(fit) if anchor > 0 => (fit.slope_mb_per_unit * anchor as f64).max(1.0),
                 // Pre-fit: weight by base, the only size signal available.
@@ -1720,9 +1907,16 @@ impl VramLedger {
         let Some(entry) = state.workers.get(&worker) else {
             return 1;
         };
-        admitted_units(entry, Self::anchor_locked(&state, entry))
-            .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
-            .max(1)
+        // The knee caps the *batch*, not the window: a window is still
+        // several admitted batches deep, which is what gives bucketing
+        // material and amortizes the round trip.
+        admitted_units(
+            entry,
+            Self::anchor_locked(&state, entry),
+            Self::knee_locked(&state, entry),
+        )
+        .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
+        .max(1)
     }
 
     /// Reserve headroom for one window and hand back the grant.
@@ -1761,7 +1955,7 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
             let fit = Self::pricing_fit_locked(&state, entry);
-            let wanted = admitted_units(entry, anchor)
+            let wanted = admitted_units(entry, anchor, Self::knee_locked(&state, entry))
                 .min(window_units.max(1))
                 .max(1);
             let mut units = wanted;
@@ -1826,6 +2020,7 @@ impl VramLedger {
                 GrantCharge {
                     mb,
                     requests: window_requests,
+                    unit_budget,
                 },
             );
         Some(GrantToken {
@@ -1884,6 +2079,8 @@ impl VramLedger {
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }
+        // What this window's batches were free to reach; see [`FULL_BATCH_RATIO`].
+        let granted_units = charge.map(|charge| charge.unit_budget);
         // The idle clock the trim path reads starts here, not at the moment the
         // grant map happens to be empty: a replica working through a queue is
         // grantless between every pair of windows, and that is not idleness.
@@ -1900,7 +2097,7 @@ impl VramLedger {
         if !matches!(outcome, WindowOutcome::Responded { oom: false }) {
             entry.fit_version_sent = 0;
         }
-        let ingested = Self::ingest_locked(&mut state, worker);
+        let ingested = Self::ingest_locked(&mut state, worker, granted_units);
         if let WindowOutcome::Responded { oom } = outcome {
             let negative = ingested.negative || oom;
             // Read *after* the ingest: this window's own high-water batches have
@@ -1919,6 +2116,7 @@ impl VramLedger {
             }
         }
         Self::refit_locked(&mut state, worker);
+        Self::refit_knee_locked(&mut state, worker);
         // No store, no write policy: without a store there is nothing to hand
         // an update to, and evaluating it anyway would move `cal.persisted`
         // to describe a write that can never happen.
@@ -1929,7 +2127,25 @@ impl VramLedger {
     }
 
     /// Drain this worker's new telemetry into the ledger by watermark.
-    fn ingest_locked(state: &mut LedgerState, worker: WorkerId) -> Ingested {
+    ///
+    /// `granted_units` is the settling window's own per-batch unit budget, and
+    /// it gates the **throughput ring only** ([`FULL_BATCH_RATIO`]): the cost
+    /// fit and the ratchet take every clean high-water batch regardless, since
+    /// a small batch's envelope is a perfectly good point on the memory curve.
+    /// `None` — an ingest with no window behind it — admits no throughput
+    /// sample at all, because there is nothing to call a batch full against.
+    ///
+    /// One approximation, and it errs the safe way: an ingest can also pick up
+    /// batches an *aborted* window left above the watermark, which ran under
+    /// that window's budget rather than this one's. Since a settle only ever
+    /// follows the ramp forward, the budget in hand is the same or larger, so
+    /// a stale batch is at worst under-admitted — never a small batch let in
+    /// under a large budget.
+    fn ingest_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        granted_units: Option<u64>,
+    ) -> Ingested {
         let Some(entry) = state.workers.get(&worker) else {
             return Ingested::default();
         };
@@ -2016,7 +2232,14 @@ impl VramLedger {
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut transients: Vec<(u64, u64)> = Vec::new();
+        let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
+        // The smallest batch this window counts as having spent its budget.
+        // `None` when there is no window to measure against, which admits
+        // nothing.
+        let full_batch = granted_units.map(|budget| {
+            ((budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1)
+        });
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -2036,10 +2259,58 @@ impl VramLedger {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
-            let high_water = matches!(
-                (measurement.peak_reserved_mb, measurement.reserved_before_mb),
-                (Some(peak), Some(before)) if peak > before
-            );
+            // Three states, not two: a measurement that carries no allocator
+            // reading at all says nothing about the pool either way, and must
+            // not be read as "warm" (see the warm-pool exclusion below).
+            let grew_pool = match (measurement.peak_reserved_mb, measurement.reserved_before_mb) {
+                (Some(peak), Some(before)) => Some(peak > before),
+                _ => None,
+            };
+            let high_water = grew_pool == Some(true);
+            let warm = grew_pool == Some(false);
+            // Throughput for the knee, in units/sec. Five exclusions, and the
+            // last two are the interesting ones:
+            //
+            // - negative samples never get here (the `continue` above): a
+            //   batch that OOMed or spilled to system RAM measures the
+            //   failure, not the curve;
+            // - an unpriceable batch — no `units`, because the impl
+            //   sub-batched inside `predict`, or because the request carried
+            //   no grant at all (the compat path) — has no x coordinate to
+            //   bucket by;
+            // - a batch with **no allocator reading** is excluded rather than
+            //   assumed warm. A host whose torch reports no memory statistics
+            //   would otherwise contribute its entire stream to the knee ring
+            //   as if the pool were known to be steady, and a knee is a
+            //   permanent cap fitted from exactly that ring;
+            // - a **pool-growing** batch is excluded, unlike in the cost fit,
+            //   where it is the only kind that counts. A high-water batch
+            //   pays `cudaMalloc` for the pool it grows, which is the one-off
+            //   cost of *reaching* that size rather than the cost of running
+            //   at it — and since every ramp step is high-water by
+            //   construction, including them would bend the curve downward
+            //   with size and manufacture a knee out of allocator behaviour.
+            //   Warm-pool batches are the steady state the knee is about, and
+            //   every size the ramp holds for more than one window produces
+            //   them. The corollary is a rate, not a hole: a variable-shape
+            //   model (`sum`, `max-times-count`) whose every window is a new
+            //   high-water mark fills the knee ring slowly by design, and its
+            //   curve is described by the sizes it *repeats*;
+            // - a batch that did not spend its window's granted budget
+            //   ([`FULL_BATCH_RATIO`]): a tail, a capped batch, a squeezed
+            //   one. It ran at a small size because there was nothing more to
+            //   run, which is not evidence about the size.
+            if warm
+                && let (Some(units), Some(duration_ms), Some(full_batch)) =
+                    (units, measurement.duration_ms, full_batch)
+                && duration_ms > 0.0
+                && units >= full_batch
+            {
+                throughput.push(ThroughputSample {
+                    units,
+                    units_per_sec: units as f64 * 1000.0 / duration_ms,
+                });
+            }
             if high_water {
                 // Only pool-growing batches carry envelope information: the
                 // caching allocator never returns blocks between batches, so
@@ -2095,6 +2366,12 @@ impl VramLedger {
                 cal.transients.pop_front();
             }
         }
+        for sample in throughput {
+            cal.throughput.push_back(sample);
+            while cal.throughput.len() > KNEE_RING {
+                cal.throughput.pop_front();
+            }
+        }
         // The ratchet counts only *local* clean high-water batches.
         cal.max_units_measured = cal.max_units_measured.max(anchor);
         // And so does the confirmation gate: every sample counted here was
@@ -2105,12 +2382,21 @@ impl VramLedger {
         // Only *high-water* windows count, so a workload that never grows the
         // pool never confirms anything: a user-capped model, or one whose
         // queue is always shallower than its current budget, runs every batch
-        // on a warm pool, contributes zero samples here, and stays under the
-        // widened margin indefinitely. That is deliberate — the widening is
-        // exactly right for a fit nothing on this machine has tested — and it
-        // stops being a dead end in step 2, where the periodic `empty_cache`
-        // trim gives even a steady-state workload fresh high-water windows to
-        // learn from.
+        // on a warm pool and contributes zero samples here.
+        //
+        // A **knee-capped** worker is the sharp case, and it is accepted
+        // behaviour rather than an oversight. Once the knee pins the budget
+        // the ramp stops climbing, so the pool grows exactly once — the first
+        // batch at the capped size — and produces roughly one sample. On a
+        // box running a single model, with nothing to compete for the board
+        // and therefore nothing to trim it, `local_samples` can sit below
+        // [`LOCAL_CONFIRMATION_SAMPLES`] indefinitely and that model's
+        // effective margin stays widened for good. The direction is the
+        // conservative one (a widened margin only ever asks for *less* of the
+        // board, and can neither stall the ramp nor block the knee), and on
+        // any busier box it resolves on its own: step 2's idle-resident trim
+        // and the worker's reactive `empty_cache()` shrink both drop the pool,
+        // and the regrowth that follows is a fresh high-water window.
         cal.local_samples = cal
             .local_samples
             .saturating_add(high_water_samples.min(u32::MAX as usize) as u32);
@@ -2155,6 +2441,71 @@ impl VramLedger {
             // be persisted as local evidence.
             cal.fit_is_local = true;
         }
+    }
+
+    /// Re-fit the throughput knee from this model's observation ring.
+    ///
+    /// A knee is only ever **replaced**, never withdrawn: once one is in
+    /// force the ramp stops admitting sizes past it, so the largest bucket
+    /// the ring can hold is the knee's own and [`fit_knee`]'s frontier guard
+    /// declines to answer from then on. Treating that silence as "no knee"
+    /// would uncap the budget, re-explore, re-fit, re-cap — an oscillation
+    /// driven entirely by the cap's own effect on the evidence. The knee is
+    /// therefore sticky within a run, which is why the gate in front of the
+    /// first one is deliberately not thin.
+    ///
+    /// Sticky in the downward direction too, and that half takes two
+    /// mechanisms rather than one. Only budget-spending batches reach the
+    /// ring at all ([`FULL_BATCH_RATIO`]), so the low buckets are not filled
+    /// by tails and squeezes; and the threshold is taken against the
+    /// **historical** peak rather than the surviving ring's
+    /// ([`ModelCalibration::knee_best`]), so an aged-out peak cannot pull the
+    /// plateau start down behind it. Without both, a replacement knee is
+    /// systematically lower than the one it replaces and the cap walks itself
+    /// to a single unit.
+    fn refit_knee_locked(state: &mut LedgerState, worker: WorkerId) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let inference_id = entry.inference_id.clone();
+        let gpu = entry.gpu.clone();
+        let Some(cal) = state.calibration.get(&key) else {
+            return;
+        };
+        let samples: Vec<ThroughputSample> = cal.throughput.iter().copied().collect();
+        let floor = cal.knee_best.map(|(_, rate)| rate).unwrap_or(0.0);
+        let Some(fit) = fit_knee(&samples, floor) else {
+            return;
+        };
+        let previous = cal.knee_units;
+        let unchanged = cal.knee_units == fit.knee_units && cal.knee_is_local;
+        let Some(cal) = state.calibration.get_mut(&key) else {
+            return;
+        };
+        // The anchor moves *before* the knee decision short-circuits: a refit
+        // that produced no knee (or the same one) still witnessed this ring's
+        // peak, and that is the number later fits are held to.
+        if fit.best.1 > floor {
+            cal.knee_best = Some(fit.best);
+        }
+        let Some(knee) = fit.knee_units else {
+            return;
+        };
+        if unchanged {
+            return;
+        }
+        cal.knee_units = Some(knee);
+        cal.knee_is_local = true;
+        tracing::debug!(
+            model = %inference_id,
+            gpu = %gpu,
+            knee_units = knee,
+            previous = ?previous,
+            observations = samples.len(),
+            "fitted a throughput knee; batches larger than this are no longer \
+             admitted however much memory is free"
+        );
     }
 
     /// The fit snapshot to attach to the next request frame, or `None` when
@@ -2338,6 +2689,7 @@ impl VramLedger {
                             .calibration
                             .get(&(entry.inference_id.clone(), entry.gpu.clone()));
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
+                        let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -2352,8 +2704,13 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor),
+                            unit_budget: admitted_units(entry, anchor, knee),
                             max_units_measured: anchor,
+                            knee_units: knee,
+                            knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
+                            throughput_samples: cal
+                                .map(|cal| cal.throughput.len())
+                                .unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
                             effective_margin: self.effective_margin_locked(&state, entry),
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {
@@ -2495,13 +2852,39 @@ impl VramLedger {
     /// Ingest every registered worker's telemetry without touching the ramp,
     /// so a test can set up footprints and free readings independently of
     /// window accounting.
+    ///
+    /// No window means no granted budget, so nothing here can reach the
+    /// throughput ring; tests that feed the knee go through a real grant.
     #[cfg(test)]
     fn ingest_all_for_test(&self) {
         let mut state = self.lock();
         let ids: Vec<WorkerId> = state.workers.keys().copied().collect();
         for id in ids {
-            let _ = Self::ingest_locked(&mut state, id);
+            let _ = Self::ingest_locked(&mut state, id, None);
         }
+    }
+
+    /// Install a knee without fitting one, and the historical peak behind a
+    /// fitted one, so a test about what a knee *does* need not first
+    /// construct the curve that produces it (which the fit's own tests do).
+    #[cfg(test)]
+    fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
+        let mut state = self.lock();
+        let cal = state
+            .calibration
+            .entry((inference_id.to_owned(), gpu.to_owned()))
+            .or_default();
+        cal.knee_units = Some(knee);
+        cal.knee_is_local = true;
+    }
+
+    /// The runtime-only historical peak the knee threshold is anchored to.
+    #[cfg(test)]
+    fn knee_best_for_test(&self, inference_id: &str, gpu: &str) -> Option<(u32, f64)> {
+        self.lock()
+            .calibration
+            .get(&(inference_id.to_owned(), gpu.to_owned()))
+            .and_then(|cal| cal.knee_best)
     }
 
     /// Age this replica's two trim clocks — the idle-quiet-period stamp and
@@ -2763,6 +3146,126 @@ fn robust_fit(samples: &[FitSample]) -> Option<FitSnapshot> {
     })
 }
 
+/// Which log2 bucket a batch size falls in. Buckets are the natural x axis
+/// here because the ramp itself is geometric: sizes arrive as `seed × 2^k`,
+/// so a linear binning would leave every bucket but one empty, and a
+/// per-size grouping would have one sample per group at exactly the sizes
+/// that matter most.
+fn size_bucket(units: u64) -> u32 {
+    units.max(1).ilog2()
+}
+
+/// What one knee fit read off the observation ring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KneeFit {
+    /// The knee, quantized to the top of its bucket. `None` when the curve
+    /// has one but it sits at the frontier, where capping is premature.
+    knee_units: Option<u64>,
+    /// The ring's own best bucket median, `(bucket, units/sec)` — a candidate
+    /// for [`ModelCalibration::knee_best`] whether or not a knee came out.
+    best: (u32, f64),
+}
+
+/// Fit the throughput knee: the smallest batch size at which the model is
+/// already within [`KNEE_RATIO`] of the best units/sec it has ever shown.
+///
+/// The curve is summarized as a **median per log2 bucket**. A median rather
+/// than a mean because a single batch that raced a compositor redraw is a
+/// factor-of-two outlier and there is no reason to let it move a permanent
+/// cap; buckets rather than raw sizes because the ramp produces geometric
+/// sizes and because `sum`-dimension models never repeat an exact unit count.
+///
+/// `floor_rate` is the best bucket median this model has shown **in any
+/// earlier fit** (0.0 when there is none). "The best it has ever shown" is
+/// meant literally, and the live ring is a poor witness to it: it ages by
+/// eviction, and a knee that is doing its job removes the very sizes that set
+/// the peak. Taking the threshold against `max(ring best, floor_rate)` is
+/// what keeps a knee from ratcheting itself downward — see
+/// [`ModelCalibration::knee_best`].
+///
+/// Three gates, all of which must pass before a knee may cap anything:
+///
+/// - [`MIN_KNEE_SAMPLES`] observations in total, and
+/// - across at least [`MIN_KNEE_BUCKETS`] distinct buckets — twelve samples
+///   at one size describe a point, not a curve;
+/// - **the frontier guard**: the knee bucket may not be the largest bucket
+///   tried. A bend at the edge of the explored range is not a bend, it is the
+///   edge: the ramp simply has not been past it yet, and freezing the budget
+///   at "the biggest thing tried so far" would stop the exploration that
+///   would have shown the curve still climbing — permanently, since the cap
+///   removes its own counter-evidence.
+///
+/// The design phrases the guard on the *best* bucket; applying it to the
+/// **knee** bucket is an implementation decision, and it is the same rule
+/// with the same justification — never cap at a size nothing was measured
+/// past. It is also the version that survives real data: on hardware the
+/// largest bucket is a hair above its predecessor essentially always, so
+/// requiring the best bucket to be interior would mean no knee is ever
+/// fitted. Where the best bucket *is* the frontier and nothing earlier comes
+/// within [`KNEE_RATIO`] of it — a curve still genuinely climbing — the knee
+/// bucket is the frontier too and this guard declines anyway.
+///
+/// The knee is returned as the **top of its bucket** rather than as a
+/// measured size: every size in that bucket was folded into one median, so
+/// every size in it is equally supported by the evidence, and quantizing
+/// keeps the cap from creeping downwards as the ring ages. It also makes
+/// "the knee changed materially" trivially decidable for the write policy —
+/// any change is at least a factor of two.
+fn fit_knee(samples: &[ThroughputSample], floor_rate: f64) -> Option<KneeFit> {
+    let mut buckets: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+    for sample in samples {
+        if !sample.units_per_sec.is_finite() || sample.units_per_sec <= 0.0 {
+            continue;
+        }
+        buckets
+            .entry(size_bucket(sample.units))
+            .or_default()
+            .push(sample.units_per_sec);
+    }
+    if buckets.values().map(Vec::len).sum::<usize>() < MIN_KNEE_SAMPLES
+        || buckets.len() < MIN_KNEE_BUCKETS
+    {
+        return None;
+    }
+    let medians: Vec<(u32, f64)> = buckets
+        .iter_mut()
+        .map(|(bucket, rates)| (*bucket, median(rates).unwrap_or(0.0)))
+        .collect();
+    // Which bucket carries the peak is reported but never *used*: the
+    // threshold is a rate, and the guard below is on the knee bucket. So this
+    // is a plain maximum over the rates, ties going to whichever bucket
+    // `max_by` lands on.
+    let best = medians
+        .iter()
+        .copied()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))?;
+    // Every rate that reached a bucket is finite and positive, so a
+    // non-positive reference means the medians are degenerate rather than NaN.
+    let reference = if floor_rate.is_finite() {
+        best.1.max(floor_rate)
+    } else {
+        best.1
+    };
+    if reference <= 0.0 {
+        return None;
+    }
+    let largest = medians.last()?.0;
+    let threshold = reference * KNEE_RATIO;
+    let knee = medians
+        .iter()
+        .find(|(_, rate)| *rate >= threshold)
+        .map(|(bucket, _)| *bucket)
+        // `knee < largest <= 63`, so the shift is at most 63 and cannot
+        // overflow. Nothing reaching the threshold at all is the same answer
+        // as the frontier guard's: this ring does not describe a plateau.
+        .filter(|knee| *knee < largest)
+        .map(|knee| (1u64 << (knee + 1)) - 1);
+    Some(KneeFit {
+        knee_units: knee,
+        best,
+    })
+}
+
 fn median(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -2841,6 +3344,15 @@ pub struct LedgerWorkerHealth {
     pub unit_budget: u64,
     /// Ratchet anchor: largest locally measured clean high-water batch.
     pub max_units_measured: u64,
+    /// Throughput knee: the largest batch size worth admitting, whatever
+    /// memory allows. `None` until one is fitted or seeded from a profile.
+    pub knee_units: Option<u64>,
+    /// Whether that knee was fitted on this machine (as opposed to seeded
+    /// from a profile, which may cap but never travels back to the store).
+    pub knee_is_local: bool,
+    /// Warm-pool throughput observations behind the knee fit. Runtime-only:
+    /// the store persists the fitted knee, not the series.
+    pub throughput_samples: usize,
     /// Local clean high-water samples behind this model's fit, including any
     /// a local calibration profile restored. Below
     /// `LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.
@@ -2881,6 +3393,20 @@ mod tests {
             epoch: 1,
             seed_units: Some(seed),
             degraded: false,
+        }
+    }
+
+    /// The store query a replica registered with [`item_cost`] produces, as
+    /// [`loaded`] keys it.
+    fn item_query(inference_id: &str) -> ProfileQuery<'_> {
+        ProfileQuery {
+            inference_id,
+            epoch: 1,
+            gpu_name: "TEST 9000",
+            unit: "item",
+            aggregation: "count",
+            torch: Some("2.7.1+cu128"),
+            dtype: Some("fp16"),
         }
     }
 
@@ -4328,13 +4854,7 @@ mod tests {
         // The store really would answer now — that is the whole hazard.
         assert!(
             store
-                .lookup(&ProfileQuery {
-                    inference_id: "g/a",
-                    epoch: 1,
-                    gpu_name: "TEST 9000",
-                    torch: Some("2.7.1+cu128"),
-                    dtype: Some("fp16"),
-                })
+                .lookup(&item_query("g/a"))
                 .is_some(),
             "this run's own profile is on disk"
         );
@@ -5531,6 +6051,797 @@ mod tests {
             "the older reading must not re-charge the released slack"
         );
         assert_eq!(ledger.health()[0].workers[0].reserved_mb, Some(0));
+    }
+
+    // ------------------------------------------------------------------
+    // Throughput knee (step 4)
+    // ------------------------------------------------------------------
+
+    /// `count` observations of one batch size running at `units_per_sec`.
+    fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
+        vec![
+            ThroughputSample {
+                units,
+                units_per_sec,
+            };
+            count
+        ]
+    }
+
+    fn curve(points: &[(u64, f64)], each: usize) -> Vec<ThroughputSample> {
+        points
+            .iter()
+            .flat_map(|(units, rate_)| rate(*units, *rate_, each))
+            .collect()
+    }
+
+    /// [`fit_knee`] with no historical anchor, reduced to the knee itself —
+    /// what a first fit on a fresh ring sees.
+    fn knee_of(samples: &[ThroughputSample]) -> Option<u64> {
+        fit_knee(samples, 0.0).and_then(|fit| fit.knee_units)
+    }
+
+    /// A **warm-pool** batch: the pool did not grow, so this reaches the
+    /// throughput series and never the cost fit.
+    fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
+        BatchMeasurement {
+            items: Some(units),
+            units: Some(units),
+            reserved_before_mb: Some(1000),
+            peak_reserved_mb: Some(1000),
+            allocated_before_mb: Some(10),
+            peak_allocated_mb: Some(20),
+            duration_ms: Some(units as f64 * 1000.0 / units_per_sec),
+            oom: false,
+            throughput_collapse: false,
+        }
+    }
+
+    /// One clean window reporting warm-pool batches at the given rates.
+    ///
+    /// The window asks for exactly as much as its largest batch carries, which
+    /// is what a real dispatcher does with a queue of that depth — and what
+    /// makes those batches *full* ones ([`FULL_BATCH_RATIO`]), so their
+    /// throughput describes the size rather than describing a tail. Batches
+    /// listed below that size are the tails, and are excluded.
+    fn warm_window(handle: &TelemetryHandle, admission: &Admission, batches: &[(u64, f64)]) {
+        let window = batches.iter().map(|(units, _)| *units).max().unwrap_or(1);
+        let token = admission
+            .request_grant(window, None, 1, 0)
+            .expect("granted");
+        handle.lock().unwrap().record_measurements(
+            batches
+                .iter()
+                .map(|(units, rate_)| warm_batch(*units, *rate_))
+                .collect(),
+        );
+        token.finish(WindowOutcome::Responded { oom: false });
+    }
+
+    /// A flat curve means batching buys nothing, so the knee is the smallest
+    /// bucket tried — which is the correct reading, not a degenerate one.
+    #[test]
+    fn a_flat_throughput_curve_knees_at_the_smallest_bucket() {
+        let samples = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
+        assert_eq!(
+            knee_of(&samples),
+            Some(7),
+            "the top of bucket 2 (units 4..=7)"
+        );
+    }
+
+    /// The shape the knee exists for: throughput climbs, then flattens. The
+    /// knee is where the plateau *starts*, not where the samples stop.
+    #[test]
+    fn a_plateau_knees_at_its_start() {
+        let samples = curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4);
+        assert_eq!(
+            knee_of(&samples),
+            Some(31),
+            "bucket 4 (units 16..=31) is already within 90% of the best"
+        );
+    }
+
+    /// The frontier guard. A curve still climbing at the largest size tried
+    /// has no knee *yet*: capping there would freeze the ramp at whatever it
+    /// happened to have reached and remove the evidence that would have shown
+    /// the curve still climbing.
+    #[test]
+    fn a_curve_still_climbing_at_the_frontier_has_no_knee() {
+        let samples = curve(&[(4, 100.0), (8, 200.0), (16, 400.0), (32, 800.0)], 4);
+        assert_eq!(knee_of(&samples), None);
+    }
+
+    /// Both minimum-sample gates, each shown binding on its own.
+    #[test]
+    fn a_thin_series_never_knees() {
+        let thin = curve(&[(4, 100.0), (8, 100.0), (16, 100.0)], 3);
+        assert_eq!(thin.len(), 9);
+        assert_eq!(knee_of(&thin), None, "9 observations is under the gate");
+
+        let narrow = curve(&[(4, 100.0), (8, 100.0)], 8);
+        assert_eq!(narrow.len(), 16);
+        assert_eq!(
+            knee_of(&narrow),
+            None,
+            "16 observations across 2 buckets describe a point, not a curve"
+        );
+
+        // The same series, one bucket wider, does answer.
+        let wide = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
+        assert_eq!(knee_of(&wide), Some(7));
+    }
+
+    /// Which measurements reach the throughput series: warm-pool, priceable,
+    /// non-negative ones and nothing else.
+    #[test]
+    fn only_clean_priceable_warm_batches_reach_the_knee_series() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle.lock().unwrap().record_measurements(vec![
+            // A pool-growing batch: the cost fit's only input, and excluded
+            // here — it pays cudaMalloc for the size it is reaching.
+            measurement(8, 0, 100),
+            // An OOM and a WDDM spill: they measure the failure, not the curve.
+            BatchMeasurement {
+                oom: true,
+                ..warm_batch(8, 500.0)
+            },
+            BatchMeasurement {
+                throughput_collapse: true,
+                ..warm_batch(8, 10.0)
+            },
+            // Unpriceable: the impl sub-batched inside `predict`, or the
+            // request carried no grant at all.
+            BatchMeasurement {
+                units: None,
+                ..warm_batch(8, 500.0)
+            },
+            // No timing at all.
+            BatchMeasurement {
+                duration_ms: None,
+                ..warm_batch(8, 500.0)
+            },
+            // No allocator reading at all: a degraded host, where "the pool
+            // did not grow" is an assumption rather than a measurement.
+            BatchMeasurement {
+                peak_reserved_mb: None,
+                reserved_before_mb: None,
+                ..warm_batch(8, 500.0)
+            },
+            // Half a reading is no reading either.
+            BatchMeasurement {
+                reserved_before_mb: None,
+                ..warm_batch(8, 500.0)
+            },
+            // The one that counts.
+            warm_batch(8, 500.0),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: false });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            1,
+            "seven of the eight measurements are excluded, each for its own reason"
+        );
+    }
+
+    /// End to end: warm windows fit a knee, the knee caps the grant, and it
+    /// travels to the store as local evidence.
+    #[test]
+    fn a_fitted_knee_caps_the_grant_and_is_persisted() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        // One high-water window, so the entry has local evidence to be
+        // written with at all (the write policy's `local_samples > 0` guard).
+        measured_window(&handle, &admission, 64);
+        assert_eq!(ledger.health()[0].workers[0].knee_units, None);
+
+        // A flat curve across four buckets: 16 observations, best at the
+        // smallest, frontier well past it.
+        for units in [8u64, 16, 32, 64] {
+            warm_window(
+                &handle,
+                &admission,
+                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+            );
+        }
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.knee_units, Some(15), "the top of bucket 3 (8..=15)");
+        assert!(worker.knee_is_local);
+        assert_eq!(worker.throughput_samples, 16);
+        assert_eq!(
+            worker.unit_budget, 15,
+            "the knee caps the seed-and-anchor budget of 64"
+        );
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 15);
+        drop(token);
+
+        assert_eq!(
+            admission.window_target_units(),
+            15 * WINDOW_DEPTH_MULTIPLIER,
+            "the knee caps the batch, not the window's depth in batches"
+        );
+
+        let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.knee_units, Some(15), "a locally fitted knee is written");
+
+        // A settle that changes nothing writes nothing more: the knee is one
+        // more evidence trigger, not a per-window write.
+        let written = profiles.updates.lock().unwrap().len();
+        clean_window(&admission);
+        assert_eq!(profiles.updates.lock().unwrap().len(), written);
+    }
+
+    /// A knee is a ceiling; deflation is a floor-ward correction. Neither may
+    /// hold the other up — a worker that just OOMed keeps halving from the
+    /// capped budget, and the backstop is never blocked by the knee.
+    #[test]
+    fn deflation_still_halves_below_the_knee() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: Some(16),
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 0,
+                local_samples: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(
+            token.grant().unit_budget,
+            16,
+            "a shipped knee may cap: it is a throughput hint, and capping is \
+             the safe direction"
+        );
+        assert_eq!(token.grant().mb, 160, "and the MB side follows the units");
+        token.finish(WindowOutcome::Responded { oom: true });
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 8, "deflation halves under the knee");
+        token.finish(WindowOutcome::Responded { oom: true });
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 4);
+        drop(token);
+
+        // Recovery is unaffected too.
+        for _ in 0..(2 * CLEAN_WINDOWS_TO_RESTORE) {
+            clean_window(&admission);
+        }
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 16, "back to the knee, never past it");
+    }
+
+    /// A seeded knee caps, but is never written back out under our own
+    /// generator stamp — the same laundering rule the fit follows. The store
+    /// keeps whatever knee the entry already carried.
+    #[test]
+    fn a_seeded_knee_is_never_laundered_into_local_provenance() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: Some(16),
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 0,
+                local_samples: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+
+        measured_window(&handle, &admission, 4);
+        let update = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(update.max_units_measured, 4, "local evidence does travel");
+        assert_eq!(
+            update.knee_units, None,
+            "but a knee this machine did not measure does not"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(16),
+            "while still capping every window"
+        );
+        assert!(!ledger.health()[0].workers[0].knee_is_local);
+    }
+
+    /// The full round trip through the real store: a knee fitted in one run
+    /// is on disk, seeds the next one, and caps its very first window.
+    #[test]
+    fn a_persisted_knee_seeds_the_next_run() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: Vec::new(),
+                local_path: root.path().join("inferio/calibration.toml"),
+            },
+            StoreEnv {
+                platform: "windows".to_owned(),
+                backend: "cuda".to_owned(),
+                generator: "panoptikon test".to_owned(),
+            },
+            Duration::ZERO,
+        );
+        let ledger = VramLedger::for_test_with(
+            &[(BOARD, "TEST 9000", 100_000)],
+            no_margin(),
+            Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
+        );
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        measured_window(&handle, &admission, 64);
+        for units in [8u64, 16, 32, 64] {
+            warm_window(
+                &handle,
+                &admission,
+                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        let seed = store
+            .lookup(&item_query("g/a"))
+            .expect("this run's own profile is on disk");
+        assert_eq!(seed.knee_units, Some(15), "the knee round-trips through TOML");
+
+        // A fresh ledger over the same store: the next run.
+        let next = VramLedger::for_test_with(
+            &[(BOARD, "TEST 9000", 100_000)],
+            no_margin(),
+            Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
+        );
+        let handle = loaded(Some(1000), Some(0));
+        let admission = next
+            .register_worker("g/a", item_cost(64), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        next.ingest_all_for_test();
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(
+            token.grant().unit_budget,
+            15,
+            "the seeded knee caps the first window of the next run"
+        );
+    }
+
+    /// Log2 bucketing at its edges, including the two sizes a batch can never
+    /// actually be.
+    #[test]
+    fn size_buckets_are_defined_at_the_edges() {
+        assert_eq!(
+            size_bucket(0),
+            0,
+            "a zero-unit batch is impossible, and clamps rather than panicking \
+             on ilog2(0)"
+        );
+        assert_eq!(size_bucket(1), 0, "the smallest real batch");
+        assert_eq!(size_bucket(2), 1);
+        assert_eq!(size_bucket(3), 1, "bucket 1 is 2..=3");
+        assert_eq!(size_bucket(4), 2);
+        assert_eq!(size_bucket(u64::MAX), 63, "and the top does not overflow");
+    }
+
+    /// What reaches the knee ring is decided by the window's own granted
+    /// budget, not by the batch's size in the abstract.
+    #[test]
+    fn only_budget_spending_batches_teach_the_knee() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(16), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        // Budget 16, so a full batch is 13 units or more (0.8 × 16 = 12.8,
+        // rounded up: a batch is packed in whole items).
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 16);
+        handle.lock().unwrap().record_measurements(vec![
+            warm_batch(16, 100.0),
+            warm_batch(13, 96.0),
+            // The window's tail: it ran small because the queue ran out.
+            warm_batch(12, 90.0),
+            warm_batch(1, 20.0),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            2,
+            "the two batches that spent the budget, and neither tail"
+        );
+
+        // A user-capped window. The cap is applied by the worker at pack
+        // time, so the ledger's budget is untouched and every batch in the
+        // window falls short of it — which is exactly why the cap must not
+        // teach the knee that this model stops gaining at the cap.
+        let token = admission.request_grant(u64::MAX, Some(4), 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 16);
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(4, 95.0)]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            2,
+            "a capped batch says nothing about the size the model was free to run"
+        );
+
+        // A deflated grant is the opposite case: the budget itself is small,
+        // a batch that fills it *is* full, and how fast this model runs at
+        // that size is honest data.
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .unwrap()
+            .finish(WindowOutcome::Responded { oom: true });
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 8, "halved by the deflation");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(8, 70.0)]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            3,
+            "a full batch on a deflated grant is admitted at its deflated size"
+        );
+    }
+
+    /// The descent this rule exists to prevent: once a knee caps the budget,
+    /// every window is a full batch at the cap plus tails below it. If the
+    /// tails reached the ring they would fill the low buckets, the reference
+    /// rate would decay with the ring, and each refit would cap harder than
+    /// the last — an absorbing walk down to a single unit.
+    #[test]
+    fn the_knee_does_not_ratchet_downward_under_its_own_cap() {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(32), &handle)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+
+        // A curve that climbs and then plateaus: bucket 3 (8..=15) is already
+        // within 90% of the best, bucket 2 is not.
+        for (units, rate_) in [(4u64, 80.0), (8, 95.0), (16, 99.0), (32, 100.0)] {
+            warm_window(
+                &handle,
+                &admission,
+                &[(units, rate_), (units, rate_), (units, rate_), (units, rate_)],
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 15);
+        assert_eq!(
+            ledger.knee_best_for_test("g/a", BOARD),
+            Some((5, 100.0)),
+            "and the peak that defined it is remembered"
+        );
+
+        // Steady state under the cap, long enough that the ring (128) turns
+        // over and the sizes above the knee age out of it entirely.
+        for _ in 0..120 {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            assert_eq!(token.grant().unit_budget, 15);
+            handle.lock().unwrap().record_measurements(vec![
+                warm_batch(15, 95.0),
+                warm_batch(11, 92.0),
+                warm_batch(6, 85.0),
+                warm_batch(3, 70.0),
+                warm_batch(1, 40.0),
+            ]);
+            token.finish(WindowOutcome::Responded { oom: false });
+        }
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.throughput_samples,
+            KNEE_RING,
+            "one admitted sample per window, and the ring is full"
+        );
+        assert_eq!(
+            worker.knee_units,
+            Some(15),
+            "120 refits later the knee has not moved a bucket"
+        );
+        assert_eq!(worker.unit_budget, 15);
+    }
+
+    /// The other half of the same guarantee, on the fit itself: the threshold
+    /// is taken against the best this model has *ever* shown, not against
+    /// whatever survives in the ring.
+    #[test]
+    fn the_historical_peak_holds_the_knee_threshold_up() {
+        // The ring a capped worker is left with: the peak has aged out and
+        // what remains is a nearly flat run of sizes at and below the cap.
+        let aged = curve(&[(2, 88.0), (4, 92.0), (8, 95.0)], 4);
+        assert_eq!(
+            knee_of(&aged),
+            Some(3),
+            "read on its own this ring knees two buckets lower"
+        );
+        assert_eq!(
+            fit_knee(&aged, 100.0).and_then(|fit| fit.knee_units),
+            Some(7),
+            "held to the peak the model actually reached, the plateau starts later"
+        );
+        assert_eq!(
+            fit_knee(&aged, 120.0).and_then(|fit| fit.knee_units),
+            None,
+            "and far enough below it, this ring describes no plateau at all"
+        );
+        assert_eq!(
+            fit_knee(&aged, 120.0).unwrap().best,
+            (3, 95.0),
+            "the ring's own best is reported either way, so the anchor can only rise"
+        );
+    }
+
+    /// Which bucket carries the peak is not part of the answer: the threshold
+    /// is a rate, and the guard is on the knee bucket.
+    #[test]
+    fn a_noisy_plateau_knees_at_the_smallest_adequate_bucket() {
+        // Four buckets within ±5% of each other, the maximum sitting in the
+        // middle of the range rather than at either end.
+        let noisy = curve(&[(4, 98.0), (8, 100.0), (16, 102.0), (32, 99.0)], 4);
+        assert_eq!(
+            knee_of(&noisy),
+            Some(7),
+            "every bucket is within 90% of the best, so the smallest one wins"
+        );
+
+        // The ratio rule at its boundary.
+        let at = curve(&[(4, 100.0 * KNEE_RATIO), (8, 100.0), (16, 100.0)], 4);
+        assert_eq!(
+            knee_of(&at),
+            Some(7),
+            "a bucket exactly at the ratio is on the plateau"
+        );
+        let under = curve(&[(4, 89.0), (8, 100.0), (16, 100.0)], 4);
+        assert_eq!(
+            knee_of(&under),
+            Some(15),
+            "0.89 of the best is not, so the knee is the next bucket up"
+        );
+    }
+
+    /// A seed may prime a knee, never overwrite one this machine measured —
+    /// and a knee it does prime stays foreign, so it is never written back
+    /// out under our own generator stamp.
+    #[test]
+    fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        for units in [8u64, 16, 32, 64] {
+            warm_window(
+                &handle,
+                &admission,
+                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+        assert!(ledger.health()[0].workers[0].knee_is_local);
+
+        // Seeding again over live local state. The `seeded` flag is cleared by
+        // hand because the paths that reach here — a registration that
+        // returned early before seeding, leaving the flag unset while the
+        // pair went on measuring — are not reproducible from the public API.
+        let key = ("g/a".to_owned(), BOARD.to_owned());
+        {
+            let mut state = ledger.lock();
+            state.calibration.get_mut(&key).unwrap().seeded = false;
+            VramLedger::seed_calibration_locked(
+                &mut state,
+                &key,
+                true,
+                Some(ProfileSeed {
+                    base_mb: 1000,
+                    slope_mb_per_unit: 10.0,
+                    residual_mb: 0.0,
+                    samples: 20,
+                    knee_units: Some(1),
+                    local: false,
+                    fit_is_local: false,
+                    exact_torch: true,
+                    max_units_measured: 0,
+                    local_samples: 0,
+                    ring: Vec::new(),
+                }),
+                "g/a",
+                BOARD,
+            );
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.knee_units,
+            Some(15),
+            "a stranger's knee does not displace a measured one"
+        );
+        assert!(
+            worker.knee_is_local,
+            "and the local provenance survives the attempt"
+        );
+
+        // With no local knee to protect, the same seed is adopted — and stays
+        // foreign, which is what keeps it out of the local store.
+        let other = loaded(Some(1000), Some(0));
+        let _second = ledger
+            .register_worker("g/b", item_cost(64), &other)
+            .unwrap();
+        {
+            let mut state = ledger.lock();
+            let key = ("g/b".to_owned(), BOARD.to_owned());
+            VramLedger::seed_calibration_locked(
+                &mut state,
+                &key,
+                true,
+                Some(ProfileSeed {
+                    base_mb: 1000,
+                    slope_mb_per_unit: 10.0,
+                    residual_mb: 0.0,
+                    samples: 20,
+                    knee_units: Some(16),
+                    local: false,
+                    fit_is_local: false,
+                    exact_torch: true,
+                    max_units_measured: 0,
+                    local_samples: 0,
+                    ring: Vec::new(),
+                }),
+                "g/b",
+                BOARD,
+            );
+        }
+        let health = ledger.health();
+        let seeded = health[0]
+            .workers
+            .iter()
+            .find(|worker| worker.inference_id == "g/b")
+            .expect("registered");
+        assert_eq!(seeded.knee_units, Some(16), "adopted where there was none");
+        assert!(!seeded.knee_is_local, "and never laundered into local provenance");
+    }
+
+    /// A knee-capped model must not claim a share of the board sized for a
+    /// batch it will never be admitted for: the appetite is
+    /// `slope × min(anchor, knee)`.
+    #[test]
+    fn a_knee_shrinks_the_models_contention_appetite() {
+        let ledger = ledger(10_000, no_margin());
+        let a_handle = loaded(Some(1000), Some(0));
+        let b_handle = loaded(Some(1000), Some(0));
+        // Seed 1, so the contention floor (one seed batch) is 1000 MiB and
+        // leaves the appetite split room to be the binding constraint.
+        let a = ledger
+            .register_worker("g/a", item_cost(1), &a_handle)
+            .unwrap();
+        let b = ledger
+            .register_worker("g/b", item_cost(1), &b_handle)
+            .unwrap();
+        push_memory(&a_handle, 8000, 0);
+        push_memory(&b_handle, 8000, 0);
+        // Both fitted at 1000 MiB/unit, both with a ratchet anchor of 16:
+        // identical appetites, so the headroom of 8000 splits evenly.
+        for units in [4u64, 8, 16] {
+            let window = |handle: &TelemetryHandle, admission: &Admission| {
+                let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+                handle
+                    .lock()
+                    .unwrap()
+                    .record_measurements(vec![measurement(units, 0, 1000 * units)]);
+                token.finish(WindowOutcome::Responded { oom: false });
+            };
+            window(&a_handle, &a);
+            window(&b_handle, &b);
+        }
+        assert_eq!(ledger.headroom_mb(BOARD), 8000);
+
+        a.note_demand(4);
+        b.note_demand(4);
+        let even = {
+            let token = a.request_grant(u64::MAX, None, 4, 0).unwrap();
+            let mb = token.grant().mb;
+            drop(token);
+            mb
+        };
+        assert_eq!(even, 4000, "half the headroom, and 4 units of the 1000 slope");
+
+        // A knee at 7 units: `a` can only use 7 of the 16 it has measured.
+        ledger.set_knee_for_test("g/a", BOARD, 7);
+        a.note_demand(4);
+        b.note_demand(4);
+        let capped = {
+            let token = a.request_grant(u64::MAX, None, 4, 0).unwrap();
+            let mb = token.grant().mb;
+            drop(token);
+            mb
+        };
+        assert!(
+            capped < even,
+            "the appetite is now 7000 against b's 16000, not 16000 against 16000 \
+             (got {capped} against {even})"
+        );
+        assert_eq!(capped, 2000, "8000 × 7/23 = 2434 MiB, i.e. 2 whole units");
+    }
+
+    /// The smallest knee there is. Nothing downstream may divide by it, floor
+    /// to zero on it, or panic on it.
+    #[test]
+    fn a_knee_at_the_smallest_bucket_still_grants_whole_units() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        // A flat curve over the three smallest buckets: batching buys
+        // nothing, so the knee is bucket 0 and one unit is the whole answer.
+        for units in [1u64, 2, 4] {
+            warm_window(
+                &handle,
+                &admission,
+                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+            );
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.knee_units, Some(1), "the top of bucket 0 is 1");
+        assert_eq!(worker.unit_budget, 1);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 1, "never zero: a batch is at least one item");
+        drop(token);
+        assert_eq!(
+            admission.window_target_units(),
+            WINDOW_DEPTH_MULTIPLIER,
+            "and the window is still several batches deep"
+        );
     }
 
     #[test]

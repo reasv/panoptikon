@@ -6684,6 +6684,8 @@
           "clean_windows",
           "unit_budget",
           "max_units_measured",
+          "knee_is_local",
+          "throughput_samples",
           "local_samples",
           "effective_margin"
         ],
@@ -6747,6 +6749,19 @@
           "inference_id": {
             "type": "string"
           },
+          "knee_is_local": {
+            "type": "boolean",
+            "description": "Whether that knee was fitted on this machine (as opposed to seeded\nfrom a profile, which may cap but never travels back to the store)."
+          },
+          "knee_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Throughput knee: the largest batch size worth admitting, whatever\nmemory allows. `None` until one is fitted or seeded from a profile.",
+            "minimum": 0
+          },
           "local_samples": {
             "type": "integer",
             "format": "int32",
@@ -6789,6 +6804,11 @@
           "seed_units": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "throughput_samples": {
+            "type": "integer",
+            "description": "Warm-pool throughput observations behind the knee fit. Runtime-only:\nthe store persists the fitted knee, not the series.",
             "minimum": 0
           },
           "unit_budget": {

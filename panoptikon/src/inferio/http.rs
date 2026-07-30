@@ -1730,7 +1730,7 @@ metadata.cost.unit = "none"
             slope_mb_per_unit: 0.79,
             residual_mb: 96.0,
             samples: 38,
-            knee_units: None,
+            knee_units: Some(512),
             max_units_measured: 1024,
             local_samples: 12,
             ring: Vec::new(),
@@ -1751,6 +1751,7 @@ metadata.cost.unit = "none"
         assert_eq!(calibrated["samples"], json!(38));
         assert_eq!(calibrated["local_samples"], json!(12));
         assert_eq!(calibrated["max_units_measured"], json!(1024));
+        assert_eq!(calibrated["knee_units"], json!(512));
         // The registry metadata itself is untouched.
         assert_eq!(
             metadata["echo"]["inference_ids"]["test"]["description"],

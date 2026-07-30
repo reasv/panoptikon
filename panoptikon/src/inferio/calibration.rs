@@ -78,7 +78,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use super::cost::{CostDimension, DEFAULT_EPOCH};
+use super::cost::{CostAggregation, CostDimension, DEFAULT_EPOCH};
 use super::ledger::FitSample;
 use super::registry::Registry;
 
@@ -134,7 +134,17 @@ pub struct CalibrationProfile {
     pub torch: String,
     /// Negotiated dtype actually in use (`fp16` | `bf16` | `fp32`).
     pub dtype: String,
-    /// Denormalized from the model's metadata, for readability only.
+    /// The model's cost dimension when this entry was measured — and part of
+    /// the key, not decoration.
+    ///
+    /// Everything below is denominated in these: `slope_mb_per_unit`,
+    /// `knee_units`, `max_units_measured` and the sample ring are all counts
+    /// of *this* unit combined *this* way. Reclassifying a model (step 5 moved
+    /// tclip's qwen3 ids from `item`/`count` to `token`/`max-times-count`)
+    /// therefore invalidates every number in the entry, by a factor nobody can
+    /// compute. `epoch` is the deliberate lever for that and a maintainer is
+    /// expected to bump it; matching on the dimension as well is the backstop
+    /// for when they forget, and it costs nothing when they do not.
     #[serde(default)]
     pub unit: String,
     #[serde(default)]
@@ -206,10 +216,18 @@ fn is_zero_u32(value: &u32) -> bool {
 
 impl CalibrationProfile {
     /// The key tuple, minus `torch` (which has its own fallback tier).
-    fn matches_key(&self, inference_id: &str, epoch: u32, gpu: &str, env: &StoreEnv) -> bool {
-        self.inference_id == inference_id
-            && self.epoch == epoch
-            && self.gpu == gpu
+    ///
+    /// The **cost dimension** is part of it: an entry measured in items is not
+    /// a profile of a model that now counts tokens, whatever else matches. A
+    /// mismatch is silent by design — the row keeps sitting in the file,
+    /// matching nothing, exactly as a stale-epoch row does, and gets rewritten
+    /// as a fresh entry the first time the model produces local evidence.
+    fn matches_key(&self, query: &ProfileQuery<'_>, env: &StoreEnv) -> bool {
+        self.inference_id == query.inference_id
+            && self.epoch == query.epoch
+            && self.gpu == query.gpu_name
+            && self.unit == query.unit
+            && self.aggregation == query.aggregation
             && self.platform == env.platform
             && self.backend == env.backend
     }
@@ -226,10 +244,18 @@ impl CalibrationProfile {
 
     /// Every field of the key an entry is stored under — what makes two
     /// entries the *same* entry for merge purposes.
+    ///
+    /// Must agree with [`Self::matches_key`] on what a key is, including the
+    /// cost dimension: merging across a reclassification would take the
+    /// maximum of an anchor counted in items and one counted in tokens, and
+    /// then keep the loser's knee through the `or`. Two rows that cannot match
+    /// the same query must not merge into one.
     fn same_entry(&self, other: &Self) -> bool {
         self.inference_id == other.inference_id
             && self.epoch == other.epoch
             && self.gpu == other.gpu
+            && self.unit == other.unit
+            && self.aggregation == other.aggregation
             && self.platform == other.platform
             && self.backend == other.backend
             && self.torch == other.torch
@@ -330,6 +356,12 @@ pub struct ProfileQuery<'a> {
     pub epoch: u32,
     /// GPU **model name** (the profile keyspace), not the board UUID.
     pub gpu_name: &'a str,
+    /// The model's cost dimension as resolved from its metadata **now**
+    /// (`CostUnit::as_str` / `CostAggregation::as_str`). Entries measured in
+    /// any other denomination are ignored: their slope, knee, anchor and ring
+    /// all count something else.
+    pub unit: &'a str,
+    pub aggregation: &'a str,
     /// `None` before a load: the worker reports its torch build on the load
     /// response, and a load reservation is priced before that response
     /// exists.
@@ -637,8 +669,7 @@ impl CalibrationStore {
         let mut found: Vec<Candidate<'a>> = Vec::new();
         for (profiles, local) in [(&state.local, true), (&state.shipped, false)] {
             for (rank, profile) in profiles.iter().enumerate() {
-                if !profile.matches_key(query.inference_id, query.epoch, query.gpu_name, &self.env)
-                {
+                if !profile.matches_key(query, &self.env) {
                     continue;
                 }
                 if let Some(dtype) = query.dtype {
@@ -690,13 +721,15 @@ impl CalibrationStore {
         &self,
         state: &StoreState,
         inference_id: &str,
-        epoch: u32,
+        cost: &CostDimension,
         gpu_name: &str,
     ) -> Option<KnownProfile> {
         let query = ProfileQuery {
             inference_id,
-            epoch,
+            epoch: cost.epoch,
             gpu_name,
+            unit: cost.unit.as_str(),
+            aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
             torch: None,
             dtype: None,
         };
@@ -731,6 +764,7 @@ impl CalibrationStore {
             samples: best.profile.samples,
             local_samples: best.profile.local_samples,
             max_units_measured: best.profile.max_units_measured,
+            knee_units: best.profile.knee_units,
         })
     }
 
@@ -810,6 +844,13 @@ impl CalibrationStore {
                     profile.max_units_measured =
                         profile.max_units_measured.max(slot.max_units_measured);
                     profile.local_samples = profile.local_samples.max(slot.local_samples);
+                    // A knee the ledger did not send is a knee it did not
+                    // *fit this run*, not a knee that was withdrawn: the
+                    // write policy sends one only when this machine measured
+                    // it, so an update carrying `None` must leave a knee an
+                    // earlier run wrote exactly where it is. A freshly fitted
+                    // one still wins — it is `Some` and `or` keeps it.
+                    profile.knee_units = profile.knee_units.or(slot.knee_units);
                     if profile.slope_mb_per_unit <= 0.0 && profile.samples == 0 {
                         // This update carries no locally derived fit (the
                         // ledger's write policy omits the fit fields while
@@ -819,7 +860,6 @@ impl CalibrationStore {
                         profile.slope_mb_per_unit = slot.slope_mb_per_unit;
                         profile.residual_mb = slot.residual_mb;
                         profile.samples = slot.samples;
-                        profile.knee_units = profile.knee_units.or(slot.knee_units);
                     }
                     if profile.sample_units.is_empty() {
                         profile.sample_units = std::mem::take(&mut slot.sample_units);
@@ -1039,6 +1079,8 @@ pub struct KnownProfile {
     pub samples: u32,
     pub local_samples: u32,
     pub max_units_measured: u64,
+    /// Throughput knee, when this entry carries one.
+    pub knee_units: Option<u64>,
 }
 
 /// Inject a read-only `calibration` object into every priced inference id of
@@ -1097,7 +1139,7 @@ pub fn overlay_metadata(
             if !cost.scales() {
                 continue;
             }
-            let known = store.best_known_locked(&state, &full, cost.epoch, gpu_name);
+            let known = store.best_known_locked(&state, &full, &cost, gpu_name);
             let value = match known {
                 Some(known) => json!({
                     "status": if known.local { "local" } else { "baseline" },
@@ -1108,6 +1150,12 @@ pub fn overlay_metadata(
                     "samples": known.samples,
                     "local_samples": known.local_samples,
                     "max_units_measured": known.max_units_measured,
+                    // `null` when this entry has no knee, which is a real
+                    // and common state (the curve never bent inside the
+                    // range the ramp explored). Omitting the key instead
+                    // would make "no knee" and "an older server" the same
+                    // reading.
+                    "knee_units": known.knee_units,
                 }),
                 None => json!({
                     "status": "uncalibrated",
@@ -1381,6 +1429,8 @@ mod tests {
             inference_id,
             epoch: 1,
             gpu_name: GPU,
+            unit: "item",
+            aggregation: "count",
             torch,
             dtype,
         }
@@ -1605,6 +1655,51 @@ sample_reserved_mb = [80, 160]
             "the entry is still there for epoch 1"
         );
         assert_eq!(store.local_entries().len(), 1, "and was never deleted");
+    }
+
+    /// Reclassifying a model self-invalidates its stored profiles even when
+    /// nobody bumped the epoch: everything measurable in an entry is
+    /// denominated in the unit and aggregation it was measured under.
+    #[test]
+    fn a_reclassified_model_matches_none_of_its_old_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        // Measured under the old (item, count) reading of this model.
+        store.record(update("tclip/qwen3", "bf16", 0.79));
+        let old = query("tclip/qwen3", Some("2.7.1+cu128"), Some("bf16"));
+        let new = ProfileQuery {
+            unit: "token",
+            aggregation: "max-times-count",
+            ..old
+        };
+        assert!(store.lookup(&old).is_some(), "the entry is there");
+        assert!(
+            store.lookup(&new).is_none(),
+            "and prices nothing for a model that now counts tokens"
+        );
+        assert!(
+            store.expected_base_mb(&new).is_none(),
+            "including the load-reservation tier, whose key is looser but not \
+             looser about this"
+        );
+
+        // A write under the new dimension is a new entry, not a merge: the two
+        // anchors count different things and `max` of them is meaningless.
+        let mut reclassified = update("tclip/qwen3", "bf16", 1.5);
+        reclassified.unit = "token";
+        reclassified.aggregation = "max-times-count";
+        reclassified.knee_units = Some(4096);
+        store.record(reclassified);
+        let entries = store.local_entries();
+        assert_eq!(entries.len(), 2, "the stale row lingers, ignored");
+        let seeded = store.lookup(&new).expect("the new one answers");
+        assert_eq!(seeded.slope_mb_per_unit, 1.5);
+        assert_eq!(seeded.knee_units, Some(4096));
+        assert_eq!(
+            store.lookup(&old).map(|seed| seed.slope_mb_per_unit),
+            Some(0.79),
+            "and the old one is untouched rather than overwritten"
+        );
     }
 
     /// Corrupt or future-schema files are ignored with a warning, never
@@ -1866,7 +1961,10 @@ sample_reserved_mb = [80, 160]
     fn metadata_overlay_reports_the_best_known_profile() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
-        store.record(update("clip/vit", "fp16", 0.79));
+        store.record(ProfileUpdate {
+            knee_units: Some(512),
+            ..update("clip/vit", "fp16", 0.79)
+        });
         let (registry, _dir) = registry_with(
             r#"
 [group.clip]
@@ -1891,6 +1989,12 @@ metadata.cost.unit = "none"
         assert_eq!(calibrated["base_mb"], json!(4321));
         assert_eq!(calibrated["local_samples"], json!(12));
         assert_eq!(calibrated["max_units_measured"], json!(1024));
+        assert_eq!(calibrated["knee_units"], json!(512));
+        assert_eq!(
+            body["clip"]["inference_ids"]["other"]["calibration"]["knee_units"],
+            JsonValue::Null,
+            "an uncalibrated model has no knee to report, and never a zero"
+        );
         assert_eq!(
             body["clip"]["inference_ids"]["other"]["calibration"]["status"],
             json!("uncalibrated")
@@ -2059,6 +2163,31 @@ metadata.cost.unit = "none"
         let entries = store.local_entries();
         assert!((entries[0].slope_mb_per_unit - 1.5).abs() < 1e-9);
         assert_eq!(entries[0].samples, 40);
+
+        // The knee merges the same way, and for the same reason as the
+        // anchor: the ledger sends one only when *this* machine fitted it, so
+        // an update carrying `None` is "nothing new to say", never "the knee
+        // is gone". The erase would otherwise hide in an update that carries
+        // a fit, which skips the fitless branch above entirely.
+        store.record(ProfileUpdate {
+            knee_units: Some(15),
+            ..update("clip/vit", "fp16", 1.5)
+        });
+        store.record(update("clip/vit", "fp16", 2.0));
+        assert_eq!(
+            store.local_entries()[0].knee_units,
+            Some(15),
+            "a persisted knee survives updates that carry none"
+        );
+        store.record(ProfileUpdate {
+            knee_units: Some(31),
+            ..update("clip/vit", "fp16", 2.0)
+        });
+        assert_eq!(
+            store.local_entries()[0].knee_units,
+            Some(31),
+            "and a freshly fitted one replaces it"
+        );
     }
 
     /// Deleting a shipped file is noticed even when it was not the newest
