@@ -14,7 +14,15 @@ load-phase reservations, universal worker→GPU pinning, free-intercept
 fit); fifth review pass the same day (persisted ratchet state, local-store
 write policy, pre-fit WDDM comparator, dtype-unknown load reservations,
 concrete per-DB migration mechanics). Supersedes the one-line itemization
-in that document. Not yet implemented.
+in that document.
+
+**Status**: rollout steps 1a (worker-side memory sensing on the `load` and
+`predict` responses) and 1b (the per-GPU ledger, grants and fit snapshots on
+request frames, load reservations, the worker's packing harness and defensive
+clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) are
+implemented. The calibration store — persistence of the ratchet anchor, the
+sample ring and the fit, plus shipped-baseline lookup — is step 1c and is not.
+Steps 2–5 are not started.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -230,20 +238,25 @@ Under auto:
   value — capped jobs are the exception under auto, so mixed-cap queues
   are rare and the partition costs nothing — and the worker enforces the
   cap at pack time as an **item-count constraint**, never converted to
-  units.
+  units. A capped window is *also* bounded in items, at the same batch
+  depth the unit budget uses: the cap makes the worker's batches small
+  regardless of the budget, so an unbounded capped window would become
+  thousands of one-item batches — one measurement and one driver query
+  each, overflowing the telemetry ring and deferring the grant's
+  re-evaluation for minutes.
 
 ## Grant sizing and packing
 
 Orchestrator, per GPU, when dispatching a window:
 
 ```
-footprint(w) = base(w) + max(0, reserved(w) − reserved_at_load(w))
-                                                 # driver currency, ≥ base
+growth(w)    = max(0, reserved(w) − reserved_at_load(w))
+footprint(w) = base(w) + growth(w)      # driver currency, ≥ base
+charge(w)    = footprint(w) + max(0, Σ grants(w) − growth(w))
 external  = max(0, total − free − Σ footprint(our workers))
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-headroom  = limit − Σ footprint(residents) − Σ load_reservations
-                  − Σ outstanding_grants
+headroom  = limit − Σ charge(residents) − Σ load_reservations
 grant     = min(headroom share, ramp step, slope × knee_units,
                 priced content of the window itself)
 ```
@@ -269,6 +282,15 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   the MB side is the contention share held while that step is measured.
   Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
   conversion is undefined exactly when it is needed most.
+- **A grant and the pool it grows are the same memory, charged once.** Post-fit
+  a grant's MB figure is the envelope over `reserved_at_load` the window may
+  reach — exactly what the footprint's growth term already counts once the pool
+  has grown into it. Summing footprints and grants board-wide would double-charge
+  every busy resident's working set: on a 6 GB card a model with a 2.4 GB working
+  set would be charged 4.8 GB over its base, which declares the board full,
+  collapses that model's own next share to the contention floor, and never
+  recovers. One window is in flight per replica, so the honest charge is per
+  replica: `footprint + max(0, Σ grants − pool growth)`.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -331,7 +353,11 @@ grant     = min(headroom share, ramp step, slope × knee_units,
 - **Ramp**: until the fit has enough samples, grants ramp geometrically
   (seed, ×2 per clean window) instead of jumping to the predicted
   ceiling, measuring each step. A too-low seed costs a logarithmic number
-  of windows, which is why seeds don't need per-GPU tuning.
+  of windows, which is why seeds don't need per-GPU tuning. A step is earned
+  only by a window that actually **produced** a high-water measurement, not by
+  the mere absence of bad news: a model whose batches all run on a warm pool
+  reports nothing about a bigger batch's cost, and doubling per window
+  regardless would walk the budget to its ceiling on hope alone.
 - **Extrapolation ratchet**: the ramp never ends by handing control to
   extrapolation. Even after the fit converges, a grant's unit budget
   never exceeds ~2× the largest *locally measured* clean high-water
@@ -350,7 +376,12 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   logarithmic and one-time" argument silently becomes "per restart" on
   desktops. A persisted anchor still enters every window through the
   defensive clamp against live free memory, and deflation state remains
-  runtime-only.
+  runtime-only. The anchor floors the ramp **exponent**, not merely the
+  budget: a replica resuming at a surviving anchor runs its windows on an
+  already-grown pool, which produces no high-water sample, so if its
+  earned doublings had to walk back up to the anchor first they never
+  would — the budget would pin at the anchor and the ratchet's own 2×
+  ceiling would be unreachable.
 
 Worker, per batch within its window:
 
@@ -388,6 +419,19 @@ Worker, per batch within its window:
   `empty_cache()` events are therefore calibration opportunities, not
   just hygiene. Robust two-parameter fit; retain scatter (sample count,
   residual) as confidence.
+- **A batch is only priceable when the impl ran the batch it was given.**
+  Several shipped impls sub-batch inside `predict` — `run_with_oom_retry`
+  with an `initial_chunk_size`, florence2's chunk of 1, easyOCR's per-image
+  loop while `enable_batching = false` — so the peaks the harness measures
+  can describe a fraction of the units it packed. Reporting the packed
+  figure anyway biases the fitted slope low by exactly that fraction, and a
+  low slope is over-admission, the failure this whole design exists to
+  prevent. So the harness reports `units` only when the executed GPU batch
+  matches the planned one, omits it otherwise (an unpriced measurement never
+  reaches the fit), and treats an absorbed halving inside the impl as a
+  negative sample. An impl whose own batching is switched off is not granted
+  at all — it is `none`-class for calibration until re-enabled, which is
+  another reason easyOCR's `enable_batching = false` stopgap has to go.
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
   holds it — so when the grant falls materially below `memory_reserved()`
@@ -412,7 +456,17 @@ Worker, per batch within its window:
   moved) and deflates that worker's grants; N consecutive clean windows
   restore them — deflation must be recoverable, or one external spike
   degrades a worker until respawn. Deflation is runtime state,
-  deliberately not persisted across restarts.
+  deliberately not persisted across restarts. It may shrink a worker below its
+  seed, down to a single unit: the seed is where the ramp *starts*, not a promise
+  to a worker that just OOMed; the real floor is at pack time (a batch is never
+  smaller than one item).
+- **A negative sample deflates and is then discarded.** It never enters the fit
+  and never advances the ratchet anchor. Its `peak_reserved` is whatever the
+  allocator managed before it gave up — an *under*-statement of the batch's real
+  cost — so fitting it drags the slope down, which is over-admission produced by
+  the very signal meant to prevent it; and anchoring on it would enshrine the
+  failing batch size as the measured-clean floor the ramp resumes at, so
+  deflation could never take hold.
 - **WDDM synthetic negative sample**: on Windows the OOM signal is
   unreliable by construction — driver sysmem fallback (default on since
   ~536) lets an over-budget allocation succeed by spilling to system
@@ -426,8 +480,16 @@ Worker, per batch within its window:
   collapse ratio relative to the prior step is a spill — without this
   the ramp, the riskiest phase (especially under a wrong shipped
   profile), would be exactly the window the signal cannot cover. No new
-  machinery — it reuses the timing and the deflation mechanism. Collapse
-  threshold: implementation detail, tune empirically. Corollary at
+  machinery — it reuses the timing and the deflation mechanism. The
+  comparison is only valid **upward**: a batch is compared to the previous
+  pool-growing batch only when it is an upward-or-equal step in units, so a
+  window's small tail batch — inherently slower per unit, since fixed
+  per-call overhead is amortized over less work — is never mistaken for a
+  spill. A flagged batch does not become the new comparator (a persistent
+  spill must not normalise itself), but the comparator ages out after a run
+  of non-comparable batches so a stale reference cannot flag forever.
+  Collapse threshold and that run length: implementation detail, tune
+  empirically. Corollary at
   batch 1: a single over-budget item "goes through anyway" and on WDDM
   it does not fail as it would under Package 1's batch-1-OOM rule — it
   silently runs slow, once. Accepted: `slice_settings` bounds decoded
@@ -531,7 +593,9 @@ aggregation  = "count"
 
 base_mb           = 4321               # load footprint (process-level, see Base measurement)
 base_method       = "nvml"             # nvml | free_delta | alloc_delta
-slope_kb_per_unit = 812.5              # marginal cost, fitted on reserved deltas
+slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
+                                       # on reserved deltas (same field name and
+                                       # currency as the wire `fit` snapshot)
 knee_units        = 512                # optional: throughput stopped improving here
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin

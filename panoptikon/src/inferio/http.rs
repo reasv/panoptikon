@@ -155,6 +155,9 @@ impl InferioState {
                     always_warm: local.prewarm.always_warm.clone(),
                 },
                 gpus: host.inventory,
+                // Step 2 adds `[inference_local.vram]`; until then every
+                // board runs on the defaults (margin 0.10 on, cap off).
+                vram: super::ledger::VramBudget::default(),
             },
             Arc::clone(&registry),
         );
@@ -1044,6 +1047,7 @@ metadata.description = "echo fixture"
                 prewarm,
                 // Tests must not depend on the host's GPUs.
                 gpus: super::super::gpu::GpuInventory::unknown(),
+                vram: super::super::ledger::VramBudget::default(),
             },
             Arc::clone(&registry),
         );
@@ -1372,8 +1376,13 @@ metadata.description = "batch size reporter"
         assert_eq!(model.replicas.free, 1, "idle model: replica in the pool");
         assert_eq!(model.queue_depth, 0);
         assert_eq!(
-            model.last_effective_cap, None,
+            model.last_grant_units, None,
             "no window dispatched yet -> null on the wire"
+        );
+        assert_eq!(model.last_window_items, None);
+        assert!(
+            health.vram.is_empty(),
+            "an unknown GPU inventory means an empty ledger and no admission"
         );
 
         // Standalone (subcommand) mounting: bare /health, same handler.

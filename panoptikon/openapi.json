@@ -5957,6 +5957,40 @@
           }
         }
       },
+      "FitHealth": {
+        "type": "object",
+        "description": "The fitted cost model in `GET /health`.",
+        "required": [
+          "slope_mb_per_unit",
+          "intercept_mb",
+          "residual_mb",
+          "samples",
+          "transient_samples"
+        ],
+        "properties": {
+          "intercept_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "residual_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "slope_mb_per_unit": {
+            "type": "number",
+            "format": "double"
+          },
+          "transient_samples": {
+            "type": "integer",
+            "description": "Warm-pool transients retained as the diagnostic/validation series.\nNever used for admission.",
+            "minimum": 0
+          }
+        }
+      },
       "FolderValidation": {
         "type": "object",
         "required": [
@@ -6021,6 +6055,117 @@
           }
         }
       },
+      "GpuBudgetHealth": {
+        "type": "object",
+        "description": "One board's ledger state in `GET /health`.",
+        "required": [
+          "gpu_uuid",
+          "gpu_name",
+          "total_mb",
+          "external_mb",
+          "external_known",
+          "limit_mb",
+          "headroom_mb",
+          "charges_mb",
+          "footprints_mb",
+          "load_reservations_mb",
+          "grants_mb",
+          "grants_outstanding",
+          "margin",
+          "workers"
+        ],
+        "properties": {
+          "cap_fraction": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "charges_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the residents actually cost the board: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This — not\n`footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a\npost-fit grant is denominated in the same memory the footprint's\npool-growth term already counts, so the two overlap per worker.",
+            "minimum": 0
+          },
+          "external_known": {
+            "type": "boolean",
+            "description": "False when no free-memory reading is known yet, in which case\n`external_mb` is 0 by assumption rather than by measurement."
+          },
+          "external_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.",
+            "minimum": 0
+          },
+          "external_sample_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "external_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which driver answered the freshest free reading (`\"nvml\"`, `\"torch\"`,\nor `\"nvidia-smi\"` for a ledger-side staleness refresh)."
+          },
+          "footprints_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gpu_name": {
+            "type": "string"
+          },
+          "gpu_uuid": {
+            "type": "string"
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "headroom_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "limit_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The admission budget: `min(total × cap_fraction, total − external ×\n(1 + margin))`.",
+            "minimum": 0
+          },
+          "load_reservations_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "margin": {
+            "type": "number",
+            "format": "double"
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "workers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerWorkerHealth"
+            }
+          }
+        }
+      },
       "GpuInfo": {
         "type": "object",
         "description": "One visible NVIDIA board.",
@@ -6081,7 +6226,8 @@
           "model_count",
           "models",
           "prewarm",
-          "gpus"
+          "gpus",
+          "vram"
         ],
         "properties": {
           "gpus": {
@@ -6118,6 +6264,13 @@
           "status": {
             "type": "string",
             "description": "`\"ok\"` normally, `\"shutting_down\"` once shutdown has begun."
+          },
+          "vram": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuBudgetHealth"
+            },
+            "description": "Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and\ndeflation state and the fitted cost model (batch-calibration step 1b).\nEmpty on a host with no GPU inventory, where nothing is admitted and\nevery model takes the unpriced dispatch path."
           }
         }
       },
@@ -6512,6 +6665,124 @@
           "test_panic",
           "test_report"
         ]
+      },
+      "LedgerWorkerHealth": {
+        "type": "object",
+        "description": "One resident replica's ledger state.",
+        "required": [
+          "inference_id",
+          "footprint_mb",
+          "charge_mb",
+          "grants_outstanding",
+          "grants_mb",
+          "pending_requests",
+          "seed_units",
+          "ramp_step",
+          "deflation",
+          "clean_windows",
+          "unit_budget",
+          "max_units_measured"
+        ],
+        "properties": {
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "charge_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`footprint + max(0, grants − pool growth)`: what this replica charges the\nboard right now, grant overlap netted out.",
+            "minimum": 0
+          },
+          "clean_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive clean windows since the last negative sample.",
+            "minimum": 0
+          },
+          "deflation": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Halvings currently applied by OOM / throughput-collapse deflation.",
+            "minimum": 0
+          },
+          "fit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FitHealth"
+              }
+            ]
+          },
+          "footprint_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`base + max(0, reserved − reserved_at_load)`: this resident's footprint.",
+            "minimum": 0
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inference_id": {
+            "type": "string"
+          },
+          "max_units_measured": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratchet anchor: largest locally measured clean high-water batch.",
+            "minimum": 0
+          },
+          "pending_requests": {
+            "type": "integer",
+            "description": "Demand signal behind the contention split.",
+            "minimum": 0
+          },
+          "ramp_step": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Doublings earned by clean windows.",
+            "minimum": 0
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "unit_budget": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The ramp+ratchet-bounded unit budget as of this snapshot.",
+            "minimum": 0
+          }
+        }
       },
       "LogRecord": {
         "type": "object",
@@ -7525,13 +7796,22 @@
           "inference_id": {
             "type": "string"
           },
-          "last_effective_cap": {
+          "last_grant_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unit budget of the grant on the most recently dispatched window;\n`null` until a window carries one (nothing dispatched yet, or this\nmodel is on the unpriced path — see `dispatch.rs`).",
+            "minimum": 0
+          },
+          "last_window_items": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Effective cap of the most recently dispatched window (design §6);\n`null` until the first window dispatches.",
+            "description": "Inputs in the most recently dispatched window; `null` until the first\nwindow dispatches. This is what a user cap bounds on the unpriced path.",
             "minimum": 0
           },
           "queue_depth": {

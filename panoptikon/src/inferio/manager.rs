@@ -66,9 +66,12 @@ use tokio::task::JoinHandle;
 
 use super::cost::CostDimension;
 use super::dispatch::{
-    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher,
+    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
 };
 use super::gpu::{GpuInfo, GpuInventory};
+use super::ledger::{
+    Admission, BaseProfileLookup, GpuBudgetHealth, LoadReservation, VramBudget, VramLedger,
+};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
 use super::worker::{
@@ -80,18 +83,24 @@ use super::worker::{
 pub struct ManagerConfig {
     /// How worker processes are spawned (python, impl dirs, env, deadlines).
     pub spawn: WorkerSpawnConfig,
-    /// Server-wide default batch cap, applied when neither the drain window
-    /// nor the registry expresses an opinion (replaces `MAX_COMBINED_BATCH`).
+    /// Fixed batch size for the **unpriced** dispatch path (`none`-class
+    /// models, CPU/MPS hosts, hosts with no GPU inventory), used when the
+    /// registry declares no `default_batch_size`. Priced models are sized by
+    /// the VRAM ledger instead — this is no longer a safety cap.
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
     /// Visible GPUs, probed once at startup. Universal worker→GPU pinning
-    /// resolves every replica's `CUDA_VISIBLE_DEVICES` against this, and
-    /// step 1b's per-GPU ledger is keyed by these UUIDs. Unknown on hosts
-    /// with no nvidia-smi, which keeps today's unpinned behaviour.
+    /// resolves every replica's `CUDA_VISIBLE_DEVICES` against this, and the
+    /// per-GPU ledger is keyed by these UUIDs. Unknown on hosts with no
+    /// nvidia-smi, which keeps today's unpinned behaviour.
     pub gpus: GpuInventory,
+    /// VRAM admission limits (`[inference_local.vram]`). Step 2 adds the
+    /// config plumbing, including per-board-UUID overrides; until then every
+    /// board runs on the defaults (margin 0.10 on, `cap_fraction` off).
+    pub vram: VramBudget,
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -117,6 +126,11 @@ pub struct HealthReport {
     /// Visible GPUs by board UUID (batch-calibration step 1a); empty when
     /// the host has no GPU inventory, in which case workers are not pinned.
     pub gpus: Vec<GpuInfo>,
+    /// Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and
+    /// deflation state and the fitted cost model (batch-calibration step 1b).
+    /// Empty on a host with no GPU inventory, where nothing is admitted and
+    /// every model takes the unpriced dispatch path.
+    pub vram: Vec<GpuBudgetHealth>,
 }
 
 /// One loaded model in the [`HealthReport`].
@@ -134,9 +148,13 @@ pub struct ModelHealth {
     pub queue_depth: usize,
     /// Windows currently executing on replicas.
     pub in_flight_windows: usize,
-    /// Effective cap of the most recently dispatched window (design §6);
-    /// `null` until the first window dispatches.
-    pub last_effective_cap: Option<u32>,
+    /// Unit budget of the grant on the most recently dispatched window;
+    /// `null` until a window carries one (nothing dispatched yet, or this
+    /// model is on the unpriced path — see `dispatch.rs`).
+    pub last_grant_units: Option<u64>,
+    /// Inputs in the most recently dispatched window; `null` until the first
+    /// window dispatches. This is what a user cap bounds on the unpriced path.
+    pub last_window_items: Option<u32>,
     /// Predict requests ever queued on this model's dispatcher.
     pub total_predict_requests: u64,
     /// Windows ever dispatched to a replica.
@@ -591,6 +609,9 @@ impl CacheState {
 /// record about it.
 struct SpawnedModel {
     workers: Vec<Worker>,
+    /// One per worker, in the same order: `Some` when the replica landed on a
+    /// board the ledger knows and the model's cost dimension scales.
+    admissions: Vec<Option<Admission>>,
     registry_default_batch: Option<u32>,
     impl_class: String,
     /// Whether any replica's resolved pin matched the prewarm pool's, i.e.
@@ -704,6 +725,11 @@ pub struct ModelManager {
     /// Prewarm pool (design §8): one parked warm worker per impl class.
     /// Its own mutex, never held together with `state`.
     prewarm: Arc<PrewarmPool>,
+    /// Per-GPU VRAM budget arbiter (batch-calibration step 1b). Its own
+    /// mutex, never held together with `state`; every operation on it is
+    /// synchronous bounded arithmetic, so it is safe to touch from the
+    /// dispatcher's hot path.
+    ledger: Arc<VramLedger>,
     /// Serializes the slow spawn+load phase, mirroring Python's manager-wide
     /// lock held for the whole `load_model` (see module docs).
     load_lock: TokioMutex<()>,
@@ -719,11 +745,17 @@ impl ModelManager {
         // replica resolves to, or the pool's workers could never be claimed
         // (claim eligibility is pin equality — see `spawn_model`).
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
+        // The ledger's board set comes from the same one-shot probe the pins
+        // do, so a grant's board key and a worker's `CUDA_VISIBLE_DEVICES`
+        // can never describe different hardware. `None` profiles: the
+        // calibration store (and its shipped baselines) is step 1c.
+        let ledger = VramLedger::new(&cfg.gpus, cfg.vram, None::<Arc<dyn BaseProfileLookup>>);
         let manager = Arc::new(Self {
             cfg,
             registry,
             state: StdMutex::new(ManagerState::default()),
             prewarm,
+            ledger,
             load_lock: TokioMutex::new(()),
             weak: OnceLock::new(),
             sweeper: StdMutex::new(None),
@@ -883,9 +915,10 @@ impl ModelManager {
     /// and released before the state lock (the two are never held together).
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
-        // Pool snapshot before the state lock: the two mutexes are never
-        // held together.
+        // Pool and ledger snapshots before the state lock: none of these
+        // mutexes are ever held together.
         let prewarm = self.prewarm.health();
+        let vram = self.ledger.health();
         let state = self.state.lock().unwrap();
         let mut models: Vec<ModelHealth> = state
             .models
@@ -902,10 +935,14 @@ impl ModelManager {
                     },
                     queue_depth: stats.queue_len.load(Relaxed),
                     in_flight_windows: stats.in_flight_windows.load(Relaxed),
-                    last_effective_cap: match stats.last_effective_cap.load(Relaxed) {
-                        // 0 = no window dispatched yet (real caps are >= 1).
+                    last_grant_units: match stats.last_grant_units.load(Relaxed) {
+                        // 0 = no grant yet (real budgets are >= 1).
                         0 => None,
-                        cap => Some(cap),
+                        units => Some(units),
+                    },
+                    last_window_items: match stats.last_window_items.load(Relaxed) {
+                        0 => None,
+                        items => Some(items),
                     },
                     total_predict_requests: stats.total_predict_requests.load(Relaxed),
                     total_batches: stats.total_batches.load(Relaxed),
@@ -937,6 +974,7 @@ impl ModelManager {
                 .gpus()
                 .map(<[GpuInfo]>::to_vec)
                 .unwrap_or_default(),
+            vram,
         }
     }
 
@@ -1110,6 +1148,7 @@ impl ModelManager {
         spawn_pin.release_locked(&mut state.cache);
         let SpawnedModel {
             workers,
+            admissions,
             registry_default_batch,
             impl_class,
             claim_eligible,
@@ -1134,6 +1173,10 @@ impl ModelManager {
             // shutdown() (which re-checks after taking load_lock) awaits
             // the graceful stops instead of abandoning them on a detached
             // task.
+            // Dropping `admissions` here is what un-charges the replicas in
+            // the ledger — a set that was never registered as a model must
+            // not keep holding its footprint.
+            drop(admissions);
             let discard = tokio::spawn(async move {
                 futures_util::future::join_all(workers.into_iter().map(Worker::shutdown)).await;
             });
@@ -1157,15 +1200,26 @@ impl ModelManager {
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
-            registry_default_batch,
-            server_default_batch: self.cfg.default_max_batch,
+            cost,
+            // The registry's `default_batch_size` keeps exactly one job: the
+            // fixed window size of the unpriced path. Priced models are sized
+            // by the ledger.
+            unpriced_window_items: registry_default_batch
+                .unwrap_or(self.cfg.default_max_batch),
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
             stats: Arc::clone(&stats),
             unload_grace: self.cfg.spawn.deadlines.unload_grace,
         };
-        // The dispatcher owns the whole WorkerSet (design §8): every
-        // replica serves the one shared FIFO queue behind this sender.
-        let task = tokio::spawn(run_dispatcher(context, workers, rx));
+        // The dispatcher owns the whole WorkerSet (design §8): every replica
+        // serves the one shared FIFO queue behind this sender, and carries
+        // its ledger handle so window sizing and grants are per replica (two
+        // replicas can sit on boards with different headroom).
+        let replicas: Vec<Replica> = workers
+            .into_iter()
+            .zip(admissions)
+            .map(|(worker, admission)| Replica { worker, admission })
+            .collect();
+        let task = tokio::spawn(run_dispatcher(context, replicas, rx));
         let sender = if pin_for_predict {
             state.cache.pin(inference_id);
             let guard = PinGuard::adopt(
@@ -1277,6 +1331,24 @@ impl ModelManager {
             // to one of those would violate its pin.
             None => None,
         };
+        // Load reservations (design: "A load in progress is a reservation
+        // too"). Charged here — under the manager's load lock, before any
+        // worker is spawned, so a window granted to a *different* model
+        // during this multi-second load cannot collide with the incoming
+        // weights. `dtype` is unknown on a first load (Package-1 negotiation
+        // resolves during it), which is why the ledger reserves at its most
+        // conservative tier in that case. Released when these guards drop,
+        // which happens on every exit path including a cancelled future.
+        //
+        // `cost` goes in because a model that will never be granted a window is
+        // not worth reserving for: the ledger answers `None` for the
+        // `none`-class, and likewise for a model whose earlier load in this run
+        // reported no device footprint at all.
+        let _load_reservations: Vec<LoadReservation> = device_pins
+            .iter()
+            .flatten()
+            .filter_map(|pin| self.ledger.reserve_load(inference_id, cost, pin, None))
+            .collect();
         let spawns: Vec<_> = device_pins
             .iter()
             .enumerate()
@@ -1317,6 +1389,7 @@ impl ModelManager {
             })
             .collect();
         let mut workers: Vec<Worker> = Vec::with_capacity(replica_count);
+        let mut admissions: Vec<Option<Admission>> = Vec::with_capacity(replica_count);
         let mut first_error: Option<anyhow::Error> = None;
         for result in futures_util::future::join_all(spawns).await {
             match result {
@@ -1327,6 +1400,18 @@ impl ModelManager {
                         device = device_pins[replica].as_deref().unwrap_or("<unpinned>"),
                         "replica loaded"
                     );
+                    // Register with the ledger now that the load response has
+                    // landed: the board identity, the measured base and the
+                    // pool size at load all come from it, and the board the
+                    // *worker* reports is the authoritative one. `None` means
+                    // this replica gets no admission (a `none`-class model, a
+                    // worker with no GPU, a board outside the inventory) and
+                    // its dispatcher takes the unpriced path.
+                    admissions.push(self.ledger.register_worker(
+                        inference_id,
+                        cost,
+                        &worker.telemetry(),
+                    ));
                     workers.push(worker);
                 }
                 Err(err) => {
@@ -1337,12 +1422,15 @@ impl ModelManager {
             }
         }
         if let Some(err) = first_error {
-            // Whole-set load atomicity: kill the replicas that did come up.
+            // Whole-set load atomicity: kill the replicas that did come up
+            // and un-charge them (dropping the admissions).
+            drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
         Ok(SpawnedModel {
             workers,
+            admissions,
             registry_default_batch,
             impl_class: spec.impl_class,
             claim_eligible: claim_replica.is_some(),
@@ -1818,6 +1906,7 @@ config.replicas = 2
                 always_warm: Vec::new(),
             },
             gpus,
+            vram: VramBudget::default(),
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -3168,9 +3257,13 @@ config.replicas = 2
         assert_eq!(model.replicas.total, 1, "echo has a single-replica set");
         assert_eq!(model.queue_depth, 0, "nothing left queued");
         assert_eq!(
-            model.last_effective_cap,
-            Some(32),
-            "no explicit or registry opinion -> server default"
+            model.last_window_items,
+            Some(1),
+            "one single-input request formed the window"
+        );
+        assert_eq!(
+            model.last_grant_units, None,
+            "an unknown GPU inventory means the unpriced path: no grant"
         );
         assert_eq!(model.total_predict_requests, 1);
         assert_eq!(model.total_batches, 1);
@@ -3237,13 +3330,15 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The Phase 2 cap is observable (design §10: "health endpoint exposes
-    /// it"): after traffic where every request carries max_batch=2, the
-    /// last dispatched window was capped at 2 and health reports exactly
-    /// that — not the server default of 32. Six singles capped at 2 need
-    /// at least 3 windows, which total_batches must reflect.
+    /// The user cap is observable (design §10: "health endpoint exposes
+    /// it"): after traffic where every request carries max_batch=2, no
+    /// dispatched window held more than 2 inputs. This is the rewrite of the
+    /// old `last_effective_cap` assertion — the cap now bounds the window
+    /// itself (unpriced path) or the worker's packed batches (priced path),
+    /// never a max-over-caps rule. Six singles capped at 2 need at least 3
+    /// windows, which total_batches must reflect.
     #[tokio::test]
-    async fn health_reports_last_effective_cap_from_capped_traffic() {
+    async fn health_reports_the_capped_window_size() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
@@ -3279,10 +3374,9 @@ config.replicas = 2
             .iter()
             .find(|model| model.inference_id == "batch/test")
             .expect("model loaded");
-        assert_eq!(
-            model.last_effective_cap,
-            Some(2),
-            "every window carried the explicit cap of 2"
+        assert!(
+            model.last_window_items.expect("a window dispatched") <= 2,
+            "the user cap still bounds windows through the new path"
         );
         assert_eq!(model.total_predict_requests, 6);
         assert!(

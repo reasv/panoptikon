@@ -46,6 +46,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
 
@@ -54,8 +55,9 @@ use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_p
 const PROTOCOL_VERSION: u64 = 2;
 
 /// Max frame size (512 MiB). Either side treats a larger declared length as
-/// a fatal protocol error.
-const MAX_FRAME_BYTES: usize = 0x2000_0000;
+/// a fatal protocol error. `pub(super)` because the dispatcher's window
+/// payload bound is derived from it.
+pub(super) const MAX_FRAME_BYTES: usize = 0x2000_0000;
 
 /// Bounds for the per-worker stderr tail ring buffer kept for error reports.
 const STDERR_TAIL_MAX_LINES: usize = 50;
@@ -184,18 +186,32 @@ pub struct LoadReport {
     pub memory: Option<MemorySample>,
 }
 
-/// One GPU batch the worker actually ran, from a `predict` response.
+/// One GPU batch the worker actually ran, from a `predict` response (or an
+/// `error` reply — a window that failed part-way still measured what ran).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchMeasurement {
-    /// Inputs in the batch. Deliberately *not* cost-dimension units: only
-    /// the step-1b packing harness sees decoded inputs, so a dimension-priced
-    /// `units` field joins this map then (protocol doc, "Memory sensing").
+    /// Inputs in the batch. Deliberately *not* cost-dimension units.
     pub items: Option<u64>,
+    /// The batch's size in the model's declared cost dimension, as the
+    /// packing harness priced it. Absent when the request carried no grant:
+    /// without a declared dimension the worker has nothing to price in, and
+    /// the ledger's fit only regresses against this.
+    pub units: Option<u64>,
     pub reserved_before_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
     pub allocated_before_mb: Option<u64>,
     pub peak_allocated_mb: Option<u64>,
+    /// Wall time of `instance.predict(batch)` only — the harness prices units
+    /// outside the timed section so the throughput comparator sees GPU work.
     pub duration_ms: Option<f64>,
+    /// The batch raised an out-of-memory condition: a negative sample for the
+    /// ledger's deflation path.
+    pub oom: bool,
+    /// A pool-growing batch whose units/sec cratered against the previous
+    /// one. On WDDM the driver's sysmem fallback turns over-admission into a
+    /// silent throughput collapse instead of an OOM, so this is the synthetic
+    /// negative sample that stands in for the exception that never fires.
+    pub throughput_collapse: bool,
 }
 
 /// A telemetry reading plus when it was recorded. The ledger has to be able
@@ -209,7 +225,9 @@ pub struct Timestamped<T> {
 }
 
 impl<T> Timestamped<T> {
-    fn now(value: T) -> Self {
+    /// Stamp a reading with the current instant. `pub(super)` so the ledger's
+    /// tests can build telemetry fixtures without a live worker.
+    pub(super) fn now(value: T) -> Self {
         Self {
             captured_at: Instant::now(),
             value,
@@ -255,17 +273,24 @@ pub struct WorkerTelemetry {
 }
 
 impl WorkerTelemetry {
-    /// Ring capacity. A window is a few hundred ms at worst, so 64 covers
-    /// seconds of history — enough for a fit to draw several samples per
-    /// read while the memory cost stays a fixed handful of KB per replica.
-    pub const RING: usize = 64;
+    /// Ring capacity.
+    ///
+    /// The ledger reads by watermark once per settled window, and one window
+    /// with a deep grant can be *many* GPU batches — a `max-times-count` model
+    /// bucketing a 64-item window into batches of two produces 32 measurements
+    /// from a single frame, and the packing harness reports one entry per batch.
+    /// 64 left almost no margin above that; 256 covers several such windows even
+    /// if a settle is delayed, at a few tens of KB per replica. Overflow is not
+    /// silent either way (`ingest_locked` names the gap), but the point is for it
+    /// not to happen.
+    pub const RING: usize = 256;
 
     /// Append the measurements of one `predict`, stamping each with the next
     /// sequence number. Every measurement gets its own entry: a request that
     /// the step-1b harness splits into several GPU batches is several fit
     /// samples, and collapsing them (as last-write-wins did) throws away
     /// exactly the varied batch sizes the cost model is fitted on.
-    fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
+    pub(super) fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
         for measurement in batches {
             self.recorded += 1;
             self.measurements.push_back(BatchSample {
@@ -632,10 +657,43 @@ impl Worker {
         Arc::clone(&self.telemetry)
     }
 
+    /// Record the optional memory-sensing fields of a `predict` reply.
+    ///
+    /// Runs for `ok` **and** `error` frames: a window that failed part-way
+    /// still measured whatever ran before the failure, and an out-of-memory
+    /// batch is precisely the negative sample the ledger most needs.
+    fn record_telemetry(&self, payload: &[(Value, Value)]) {
+        let measurements = BatchMeasurement::parse_list(map_get(payload, "measurements"));
+        let sample = MemorySample::parse(map_get(payload, "memory"));
+        if sample.is_none() && measurements.is_empty() {
+            return;
+        }
+        if let Ok(mut telemetry) = self.telemetry.lock() {
+            if let Some(sample) = sample {
+                telemetry.memory = Some(Timestamped::now(sample));
+            }
+            telemetry.record_measurements(measurements);
+        }
+    }
+
     /// Send `predict` with the given inputs and return one output per input,
     /// in order. No deadline in v1 (models take arbitrarily long); to cancel,
     /// drop the future and `kill()` the worker.
-    pub async fn predict(&mut self, inputs: &[WorkerInput]) -> Result<Vec<WorkerOutput>> {
+    ///
+    /// `grant` is the window's memory grant (protocol doc, "Memory grants").
+    /// With one, the worker's packing harness splits the inputs into several
+    /// GPU batches within the budget and reports one measurement per batch;
+    /// without one, the whole array goes to a single `instance.predict` call,
+    /// which is the permanent compatibility path for `none`-class models,
+    /// CPU/MPS hosts and any host with no GPU inventory. `fit` rides along
+    /// only when the fitted cost model moved since the last frame to this
+    /// worker.
+    pub async fn predict(
+        &mut self,
+        inputs: &[WorkerInput],
+        grant: Option<&Grant>,
+        fit: Option<&FitSnapshot>,
+    ) -> Result<Vec<WorkerOutput>> {
         let entries = inputs
             .iter()
             .map(|input| {
@@ -655,12 +713,15 @@ impl Worker {
                 ])
             })
             .collect();
+        let mut fields = vec![(Value::from("inputs"), Value::Array(entries))];
+        if let Some(grant) = grant {
+            fields.push((Value::from("grant"), encode_grant(grant)));
+        }
+        if let Some(fit) = fit {
+            fields.push((Value::from("fit"), encode_fit(fit)));
+        }
         let mut payload = self
-            .roundtrip(
-                "predict",
-                vec![(Value::from("inputs"), Value::Array(entries))],
-                None,
-            )
+            .roundtrip("predict", fields, None)
             .await
             .with_context(|| format!("predict failed for inferio worker {}", self.label))?;
         let outputs = match take_field(&mut payload, "outputs") {
@@ -673,19 +734,7 @@ impl Worker {
                     .await);
             }
         };
-        // Memory sensing rides on the same frame (protocol doc): record the
-        // fresh sample and whatever batches the worker measured. Recorded
-        // only — admission is step 1b.
-        let measurements = BatchMeasurement::parse_list(map_get(&payload, "measurements"));
-        let sample = MemorySample::parse(map_get(&payload, "memory"));
-        if sample.is_some() || !measurements.is_empty() {
-            if let Ok(mut telemetry) = self.telemetry.lock() {
-                if let Some(sample) = sample {
-                    telemetry.memory = Some(Timestamped::now(sample));
-                }
-                telemetry.record_measurements(measurements);
-            }
-        }
+        self.record_telemetry(&payload);
         // A count mismatch would silently mis-route outputs once the
         // dispatcher splits batches per request; the worker cannot be
         // trusted after it.
@@ -923,6 +972,9 @@ impl Worker {
                 // is still in sync and the worker stays alive (protocol doc,
                 // `error` semantics).
                 self.in_flight = false;
+                // Telemetry on an error frame is advisory but valuable: the
+                // batch that failed is the negative sample the ledger wants.
+                self.record_telemetry(&map);
                 let message = map_get(&map, "message")
                     .and_then(Value::as_str)
                     .unwrap_or("<worker sent an error frame without a message>")
@@ -1179,15 +1231,62 @@ impl BatchMeasurement {
                 };
                 Some(Self {
                     items: field_u64(map, "items"),
+                    units: field_u64(map, "units"),
                     reserved_before_mb: field_u64(map, "reserved_before_mb"),
                     peak_reserved_mb: field_u64(map, "peak_reserved_mb"),
                     allocated_before_mb: field_u64(map, "allocated_before_mb"),
                     peak_allocated_mb: field_u64(map, "peak_allocated_mb"),
                     duration_ms: field_f64(map, "duration_ms"),
+                    oom: field_bool(map, "oom"),
+                    throughput_collapse: field_bool(map, "throughput_collapse"),
                 })
             })
             .collect()
     }
+}
+
+/// Absent or non-boolean reads as `false`: these flags mean "the worker
+/// observed this", so silence is never a signal.
+fn field_bool(map: &[(Value, Value)], key: &str) -> bool {
+    matches!(map_get(map, key), Some(Value::Boolean(true)))
+}
+
+/// The `grant` map on a `predict` request frame (protocol doc, "Memory
+/// grants").
+fn encode_grant(grant: &Grant) -> Value {
+    Value::Map(vec![
+        (Value::from("unit_budget"), Value::from(grant.unit_budget)),
+        (Value::from("mb"), Value::from(grant.mb)),
+        (Value::from("unit"), Value::from(grant.unit.as_str())),
+        (
+            Value::from("aggregation"),
+            Value::from(grant.aggregation.as_str()),
+        ),
+        (
+            Value::from("user_cap_items"),
+            grant
+                .user_cap_items
+                .map(|cap| Value::from(u64::from(cap)))
+                .unwrap_or(Value::Nil),
+        ),
+    ])
+}
+
+/// The `fit` map on a `predict` request frame; sent only when the fitted cost
+/// model moved since the last frame to that worker.
+fn encode_fit(fit: &FitSnapshot) -> Value {
+    Value::Map(vec![
+        (
+            Value::from("slope_mb_per_unit"),
+            Value::F64(fit.slope_mb_per_unit),
+        ),
+        (Value::from("intercept_mb"), Value::F64(fit.intercept_mb)),
+        (Value::from("residual_mb"), Value::F64(fit.residual_mb)),
+        (
+            Value::from("samples"),
+            Value::from(fit.samples as u64),
+        ),
+    ])
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
@@ -1276,21 +1375,23 @@ fn rmpv_to_json(value: &Value) -> Result<JsonValue> {
     })
 }
 
+/// Spawn plumbing shared by the worker's own tests and the dispatcher's,
+/// which needs real worker subprocesses to drive a granted window end to end.
 #[cfg(test)]
-mod tests {
+pub(super) mod testing {
     use super::*;
     use serde_json::json;
     use std::path::Path;
 
     /// Repo root = CARGO_MANIFEST_DIR/.. (the panoptikon crate lives one level
     /// below the workspace root).
-    fn workspace_root() -> PathBuf {
+    pub(crate) fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
     }
 
     /// Test interpreter default: the managed venv (`python/.venv`) if
     /// present, else the legacy root `.venv` (pre-restructure installs).
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
+    pub(crate) fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
         let managed = root.join("python/.venv").join(rel);
         if managed.is_file() {
             managed
@@ -1304,7 +1405,7 @@ mod tests {
     /// subprocess must resolve the python/-layout package itself), NO_CUDNN so
     /// startup never probes CUDA paths (which would import torch), and the
     /// test fixture impl dir.
-    fn test_spawn_config() -> WorkerSpawnConfig {
+    pub(crate) fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
         // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
         // python with msgpack works), e.g. running the suite under WSL
@@ -1331,7 +1432,7 @@ mod tests {
         }
     }
 
-    fn spec(impl_class: &str) -> SpawnSpec {
+    pub(crate) fn spec(impl_class: &str) -> SpawnSpec {
         SpawnSpec {
             impl_class: impl_class.to_owned(),
             config_kwargs: json!({}),
@@ -1340,6 +1441,13 @@ mod tests {
             env_remove: Vec::new(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::testing::*;
+    use serde_json::json;
 
     /// Full happy path against a real worker subprocess: spawn+handshake
     /// resolves the echo_test fixture impl, load succeeds, a mixed predict
@@ -1370,7 +1478,7 @@ mod tests {
                 file: Some(vec![0x00, 0x01, 0xfe, 0xff]),
             },
         ];
-        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        let outputs = worker.predict(&inputs, None, None).await.expect("predict ok");
         assert_eq!(outputs.len(), 2, "one output per input, in order");
         assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": data})));
         assert_eq!(
@@ -1380,6 +1488,182 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
+    }
+
+    /// End to end over the real protocol: a `predict` carrying a **grant**
+    /// makes the worker's packing harness split the window into GPU batches
+    /// inside the unit budget, report one measurement per batch (with the
+    /// dimension-priced `units`), and still answer one output per input in
+    /// the original order.
+    ///
+    /// The batchsize fixture reports the batch size it was actually handed,
+    /// so this asserts the packing happened in the *worker* rather than being
+    /// inferred from telemetry alone.
+    #[tokio::test]
+    async fn a_grant_makes_the_worker_pack_gpu_batches() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/batch", &spec("batchsize_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let telemetry = worker.telemetry();
+
+        let inputs: Vec<WorkerInput> = (0..5)
+            .map(|index| WorkerInput {
+                data: Some(json!(index)),
+                file: None,
+            })
+            .collect();
+        let grant = Grant {
+            unit_budget: 2,
+            mb: 1024,
+            unit: super::super::cost::CostUnit::Item,
+            aggregation: super::super::cost::CostAggregation::Count,
+            user_cap_items: None,
+        };
+        let outputs = worker
+            .predict(&inputs, Some(&grant), None)
+            .await
+            .expect("granted predict");
+        assert_eq!(outputs.len(), 5, "one output per input");
+        let sizes: Vec<u64> = outputs
+            .iter()
+            .map(|output| match output {
+                WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
+                other => panic!("unexpected output {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![2, 2, 2, 2, 1],
+            "the window was packed into batches of 2, 2, 1 inside the grant"
+        );
+
+        let measurements: Vec<BatchMeasurement> = telemetry
+            .lock()
+            .unwrap()
+            .measurements()
+            .map(|sample| sample.measurement.clone())
+            .collect();
+        assert_eq!(measurements.len(), 3, "one measurement per GPU batch");
+        assert_eq!(
+            measurements
+                .iter()
+                .map(|batch| batch.items)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(2), Some(1)]
+        );
+        assert_eq!(
+            measurements
+                .iter()
+                .map(|batch| batch.units)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(2), Some(1)],
+            "item/count prices one unit per item"
+        );
+        assert!(
+            measurements.iter().all(|batch| !batch.oom
+                && !batch.throughput_collapse
+                && batch.duration_ms.is_some()),
+            "clean batches, each individually timed: {measurements:?}"
+        );
+
+        // The user cap is an item-count constraint at pack time.
+        let capped = Grant {
+            unit_budget: 8,
+            user_cap_items: Some(1),
+            ..grant
+        };
+        let outputs = worker
+            .predict(&inputs, Some(&capped), None)
+            .await
+            .expect("capped predict");
+        assert!(
+            outputs.iter().all(|output| match output {
+                WorkerOutput::Json(value) => value["batch"].as_u64() == Some(1),
+                _ => false,
+            }),
+            "a cap of 1 item overrides a unit budget of 8: {outputs:?}"
+        );
+
+        worker.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// The negative-sample path end to end: a granted window whose *second*
+    /// GPU batch OOMs fails as a whole (per-request semantics unchanged, the
+    /// worker stays alive) but still reports both measurements on the error
+    /// frame, the failing one flagged `oom`, and its message carries the
+    /// whole-window OOM prefix the ledger classifies on.
+    #[tokio::test]
+    async fn a_granted_window_reports_its_oom_batch_on_the_error_frame() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(
+            &cfg,
+            "test/oomsecond",
+            &spec("oom_second_batch_test"),
+            None,
+        )
+        .await
+        .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let telemetry = worker.telemetry();
+
+        let inputs: Vec<WorkerInput> = (0..4)
+            .map(|index| WorkerInput {
+                data: Some(json!(index)),
+                file: None,
+            })
+            .collect();
+        let grant = Grant {
+            unit_budget: 2,
+            mb: 1024,
+            unit: super::super::cost::CostUnit::Item,
+            aggregation: super::super::cost::CostAggregation::Count,
+            user_cap_items: None,
+        };
+        let err = worker
+            .predict(&inputs, Some(&grant), None)
+            .await
+            .expect_err("the second batch OOMs, so the window fails");
+        let worker_err = err
+            .downcast_ref::<WorkerError>()
+            .expect("a per-request failure: the worker survives it");
+        assert!(
+            worker_err.message.contains("INFERENCE_OOM_WINDOW:"),
+            "the whole-window OOM signal: {}",
+            worker_err.message
+        );
+        assert!(
+            super::super::ledger::message_reports_oom(&worker_err.message),
+            "and the ledger classifies it as a negative sample"
+        );
+
+        let measurements: Vec<BatchMeasurement> = telemetry
+            .lock()
+            .unwrap()
+            .measurements()
+            .map(|sample| sample.measurement.clone())
+            .collect();
+        assert_eq!(
+            measurements.len(),
+            2,
+            "telemetry is recorded from error frames too: {measurements:?}"
+        );
+        assert!(!measurements[0].oom, "the batch that ran was clean");
+        assert_eq!(measurements[0].units, Some(2), "and priced");
+        assert!(measurements[1].oom, "the batch that failed is the negative");
+        assert_eq!(
+            measurements[1].units, None,
+            "a failed batch is never priced: its peaks stop where the call gave \
+             up, so pricing it would feed the fit an under-stated cost"
+        );
+
+        // The worker survived: a smaller window still succeeds... except this
+        // fixture is now permanently past its first batch, so assert only
+        // liveness, which is the contract that matters.
+        worker.ping().await.expect("the worker is still serviceable");
+        worker.shutdown().await.expect("graceful shutdown");
     }
 
     /// A handshake naming an impl_class no fixture module provides must fail
@@ -1427,7 +1711,7 @@ mod tests {
             .predict(&[WorkerInput {
                 data: Some(json!("x")),
                 file: None,
-            }])
+            }], None, None)
             .await
             .expect_err("predict before load must fail");
         let worker_err = err
@@ -1464,7 +1748,7 @@ mod tests {
             .predict(&[WorkerInput {
                 data: Some(json!(1)),
                 file: None,
-            }])
+            }], None, None)
             .await
             .expect_err("predict against a dead worker must fail");
         assert!(
@@ -1507,7 +1791,7 @@ mod tests {
                 file: None,
             },
         ];
-        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        let outputs = worker.predict(&inputs, None, None).await.expect("predict ok");
         assert_eq!(
             outputs,
             vec![
@@ -1555,14 +1839,14 @@ mod tests {
             file: None,
         }];
         let outputs = worker
-            .predict(&input)
+            .predict(&input, None, None)
             .await
             .expect("predict succeeds despite stderr garbage");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
 
         // A follow-up predict proves the worker (and its stderr pipe) is
         // still fully serviceable.
-        let outputs = worker.predict(&input).await.expect("second predict");
+        let outputs = worker.predict(&input, None, None).await.expect("second predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
 
         // The forwarder drains asynchronously; poll for the marker line
@@ -1626,7 +1910,7 @@ mod tests {
             .predict(&[WorkerInput {
                 data: Some(data.clone()),
                 file: None,
-            }])
+            }], None, None)
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": data}))]);
@@ -1662,7 +1946,7 @@ mod tests {
             .predict(&[WorkerInput {
                 data: Some(json!(1)),
                 file: None,
-            }])
+            }], None, None)
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
@@ -1724,7 +2008,7 @@ mod tests {
             .predict(&[WorkerInput {
                 data: Some(json!(1)),
                 file: None,
-            }])
+            }], None, None)
             .await
             .expect_err("predict before configure must fail");
         let worker_err = err

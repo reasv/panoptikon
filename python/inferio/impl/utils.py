@@ -280,6 +280,55 @@ class InferenceOOMError(RuntimeError):
     """
 
 
+_oom_retry_generation = 0
+_last_oom_retry: "tuple[int, int, int] | None" = None
+_total_oom_halvings = 0
+
+
+def total_oom_halvings() -> int:
+    """Halvings this process has performed across *every* call, monotonically.
+
+    `last_oom_retry` describes the most recent call only, and several impls
+    call `run_with_oom_retry` more than once per `predict` (CLIP and
+    nemotron-embed-vl run a text pass and an image pass). Reading only the last
+    call's record loses an out-of-memory condition absorbed by an earlier one —
+    exactly the sample the orchestrator's deflation path exists for. The worker
+    harness diffs this counter across the whole `predict` call instead, so any
+    halving anywhere inside it flags the batch
+    (docs/inferio-worker-protocol.md, "Memory sensing").
+
+    Monotonic and never reset: a diff across a bracketed call is what callers
+    want, and resetting it would race with anything else reading it.
+    """
+    return _total_oom_halvings
+
+
+def last_oom_retry():
+    """What the most recent `run_with_oom_retry` call actually executed.
+
+    `(generation, largest_chunk_executed, halvings_performed)`, or None when
+    no call has recorded anything yet in this process.
+
+    The worker's packing harness reads this through `sys.modules` (it must
+    not import this package) to answer one question about the batch it just
+    handed to `predict`: *did the impl run the batch it was given?* If not,
+    the batch is unpriceable — the allocator peaks describe a fraction of the
+    packed units, and reporting the packed figure would bias the fitted slope
+    low, i.e. towards over-admission
+    (docs/inferio-worker-protocol.md, "Memory sensing").
+
+    `generation` counts calls, and is what makes the reading unambiguous: an
+    impl that sub-batches on one GPU batch and not the next would otherwise
+    leave the harness reading a stale record as if it described the new
+    batch. The harness compares the generation before and after `predict` and
+    trusts the record only when it moved.
+
+    One worker process serves exactly one model, so "the last call in this
+    process" is that model's behaviour.
+    """
+    return _last_oom_retry
+
+
 def run_with_oom_retry(
     process_chunk,
     items,
@@ -297,9 +346,23 @@ def run_with_oom_retry(
     request anyway. An OOM with a single item raises InferenceOOMError;
     any other exception propagates untouched.
 
+    Every call records what it actually executed for `last_oom_retry` — the
+    largest chunk that ran and how many halvings it took to get there. The
+    record is reset at entry so a failed or empty call cannot leave the
+    previous one's numbers standing. Halvings additionally accumulate in the
+    process-total `total_oom_halvings`, which is what survives a second call
+    within the same `predict`.
+
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """
+    global _oom_retry_generation, _last_oom_retry, _total_oom_halvings
+
     log = logger or logging.getLogger(__name__)
+    _oom_retry_generation += 1
+    generation = _oom_retry_generation
+    largest = 0
+    halvings = 0
+    _last_oom_retry = (generation, largest, halvings)
     if oom_exceptions is None:
         import torch
 
@@ -325,6 +388,9 @@ def run_with_oom_retry(
                     f"input: {err}"
                 ) from err
             chunk_size = max(1, len(chunk) // 2)
+            halvings += 1
+            _total_oom_halvings += 1
+            _last_oom_retry = (generation, largest, halvings)
             log.warning(
                 "GPU OOM on a chunk of %d inputs; retrying at %d.",
                 len(chunk),
@@ -336,6 +402,8 @@ def run_with_oom_retry(
                 f"process_chunk returned {len(out)} results for "
                 f"{len(chunk)} inputs"
             )
+        largest = max(largest, len(chunk))
+        _last_oom_retry = (generation, largest, halvings)
         results.extend(out)
         pos += len(chunk)
     return results

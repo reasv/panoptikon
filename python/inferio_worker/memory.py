@@ -465,6 +465,17 @@ def _free_mb(source: str | None = None) -> tuple[int | None, str | None]:
     return (free_mb, resolved)
 
 
+def free_total_mb() -> tuple[int | None, int | None, str | None]:
+    """Public `(free_mb, total_mb, source)` reading for this worker's GPU.
+
+    The packing harness's defensive clamp needs a *live* reading before every
+    GPU batch (docs/batch-calibration-design.md: freshness is per-batch in the
+    shrink direction), and it must come from the same single source everything
+    else here uses or the comparison against the grant is meaningless.
+    """
+    return _free_total_mb()
+
+
 # ---------------------------------------------------------------------------
 # Base measurement (tiered; design "Base measurement")
 # ---------------------------------------------------------------------------
@@ -751,14 +762,26 @@ def begin_batch() -> dict[str, Any]:
     }
 
 
-def finish_batch(state: dict[str, Any], items: int) -> dict[str, Any]:
-    """Predict-response payload: a fresh sample plus one measurement entry.
+def measure_batch(
+    state: dict[str, Any],
+    items: int,
+    units: int | None = None,
+    oom: bool = False,
+    throughput_collapse: bool = False,
+) -> dict[str, Any]:
+    """One measurement map for the batch bracketed by `state` (never raises).
 
-    Step 1a measures the whole `predict` call as one batch; the field is an
-    array because the packing harness (step 1b) reports one entry per GPU
-    batch. `items` is a plain input count, not cost-dimension units — only
-    the packing harness decodes inputs, so a dimension-priced `units` key
-    joins the measurement then (protocol doc, "Memory sensing").
+    `items` is a plain input count; `units` is the same batch priced in the
+    model's declared cost dimension, which only the packing harness can know
+    (it is the side that sees decoded inputs) and which is what the
+    orchestrator's cost fit regresses against. `oom` and
+    `throughput_collapse` are the negative-sample flags — see the protocol
+    doc's "Memory sensing".
+
+    `duration_ms` covers only what the caller bracketed. The harness brackets
+    `instance.predict(batch)` alone, deliberately: unit pricing (image-header
+    reads, byte counts) happens before the bracket so the throughput-collapse
+    comparator sees GPU throughput rather than CPU decode noise.
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
@@ -768,7 +791,7 @@ def finish_batch(state: dict[str, Any], items: int) -> dict[str, Any]:
             if isinstance(started, float)
             else None
         )
-        measurement = {
+        measurement: dict[str, Any] = {
             "items": items,
             "reserved_before_mb": state.get("reserved_before_mb"),
             "peak_reserved_mb": peak_reserved,
@@ -776,7 +799,40 @@ def finish_batch(state: dict[str, Any], items: int) -> dict[str, Any]:
             "peak_allocated_mb": peak_allocated,
             "duration_ms": duration_ms,
         }
-        payload: dict[str, Any] = {"measurements": [measurement]}
+        if units is not None:
+            measurement["units"] = units
+        if oom:
+            measurement["oom"] = True
+        if throughput_collapse:
+            measurement["throughput_collapse"] = True
+        return measurement
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("batch measurement failed: %s", exc)
+        # The peaks are what failed to read; the flags were already decided by
+        # the caller and are the negative samples the orchestrator's deflation
+        # path runs on. Dropping them here would silently discard an OOM
+        # because an allocator query happened to raise.
+        minimal: dict[str, Any] = {"items": items}
+        if oom:
+            minimal["oom"] = True
+        if throughput_collapse:
+            minimal["throughput_collapse"] = True
+        return minimal
+
+
+def finish_batch(state: dict[str, Any], items: int) -> dict[str, Any]:
+    """Predict-response payload for a **grantless** window: a fresh sample
+    plus one measurement covering the whole `instance.predict` call.
+
+    This is the compatibility path (`none`-class models, CPU/MPS hosts, hosts
+    with no GPU inventory, an orchestrator that sends no grant): the window is
+    the GPU batch, so there is exactly one measurement and no `units` — with
+    no grant there is no declared cost dimension to price in. The packing
+    harness reports one entry per GPU batch instead, which is why the wire
+    field is an array in both cases.
+    """
+    try:
+        payload: dict[str, Any] = {"measurements": [measure_batch(state, items)]}
         sample = device_memory_sample()
         if sample is not None:
             payload["memory"] = sample

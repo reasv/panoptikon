@@ -671,6 +671,7 @@ config.devices = ["3"]
             sweep_interval: Duration::from_secs(60),
             prewarm,
             gpus,
+            vram: crate::inferio::ledger::VramBudget::default(),
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),

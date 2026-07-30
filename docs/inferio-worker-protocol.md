@@ -8,8 +8,11 @@ runs the impl's optional `prepare()` classmethod (heavy dependency imports,
 no weights). Version bumped so a stale harness fails loudly at handshake.
 
 2026-07-30: optional memory-sensing fields on the `load` and `predict`
-responses (see "Memory sensing" below). Strictly additive — an older worker
-simply omits them and an older orchestrator ignores them — so the version
+responses (see "Memory sensing" below), and the optional `grant`/`fit` fields
+on the `predict` *request* that drive the worker's packing harness (see
+"Memory grants" below). Strictly additive in both directions — an older
+worker ignores the request fields and omits the response ones, an older
+orchestrator sends neither and ignores whatever comes back — so the version
 stays 2.
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
@@ -65,7 +68,7 @@ continues (does not exit).
 | `prewarm` | — | Calls the impl's optional `prepare()` classmethod (imports heavy deps, must not load weights or touch the GPU allocator; default absent = no-op → plain `ok`). Allowed only between `handshake` and `configure`; idempotent. Errors are per-request (`error` reply, worker stays alive and still usable — a failed prepare just means the later `load` pays the imports). |
 | `configure` | `inference_id` (str, "group/name", for logs), `config` (map — resolved kwargs for the impl `__init__`) | Instantiates `impl_class(**config)`. Exactly once per worker, before `load`; a second `configure`, or `load`/`predict` before it, is a per-request `error`. |
 | `load` | — | Calls `instance.load()`. Requires prior `configure`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
-| `predict` | `inputs`: array of maps `{ "data": <any msgpack value or nil>, "file": <bin or nil> }` | Calls `instance.predict(...)` with the inputs converted to `PredictionInput(data, file)` equivalents, in order. Requires a prior successful `load`; without one, reply `error` (the orchestrator always loads first — this is a sanity check, not a feature). |
+| `predict` | `inputs`: array of maps `{ "data": <any msgpack value or nil>, "file": <bin or nil> }`, plus the optional `grant`/`fit` maps below | Calls `instance.predict(...)` with the inputs converted to `PredictionInput(data, file)` equivalents, in order. Requires a prior successful `load`; without one, reply `error` (the orchestrator always loads first — this is a sanity check, not a feature). **Without a `grant`** the whole `inputs` array goes to one `instance.predict` call, which is the pre-1b behaviour and the permanent compatibility path. **With a `grant`** the worker's packing harness splits `inputs` into several GPU batches within the granted budget and reports one measurement per batch. |
 | `unload` | — | Calls `instance.unload()` if an instance was configured+loaded, replies `ok`, flushes, then exits 0. Valid in every state (a parked prewarmed worker is dismissed the same way). |
 | `ping` | — | Liveness. Reply `ok`. |
 
@@ -80,6 +83,64 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
+
+### Memory grants (optional `predict` request fields)
+
+Added for batch calibration step 1b. The orchestrator is the budget arbiter
+(it is the only component that sees every claimant on a GPU), so it decides
+how much memory a window may use and the worker only *mechanises* that
+decision. Both fields are optional; a worker that does not understand them
+ignores them per the unknown-key rule and behaves exactly as before.
+
+`grant` — the window's memory reservation, **dual-denominated**:
+
+| key | meaning |
+|---|---|
+| `unit_budget` | how many cost-dimension units one GPU batch may contain. The packing currency; the worker prices its decoded inputs in the declared `unit` and packs greedily up to this number |
+| `mb` | the MB the orchestrator has reserved out of the board's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory has fallen below it, the batch is shrunk proportionally (shrink-only; the grant is never exceeded) |
+| `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
+| `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
+| `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
+
+`fit` — a snapshot of the orchestrator's fitted cost model, sent only when it
+changed since the last frame this worker is known to have **received** (it is
+pricing information, not per-window state). A window that failed or was aborted
+may never have delivered its frame at all — and its per-request retries carry no
+snapshot — so the orchestrator re-attaches the current snapshot to that worker's
+next window. Re-sending an unchanged snapshot is harmless by construction: it is
+advisory, and applying it twice is applying it once:
+
+| key | meaning |
+|---|---|
+| `slope_mb_per_unit` | marginal driver MB per unit |
+| `intercept_mb` | free intercept of the fit; diagnostic only |
+| `residual_mb` | fit scatter (confidence) |
+| `samples` | how many high-water samples the fit is built on |
+
+**`fit` is advisory in v1.** The worker's defensive clamp compares live free
+memory against `grant.mb` and scales the unit budget by that ratio; it does
+**not** consume `slope_mb_per_unit` to convert MB into units. So a worker may
+log the snapshot, expose it for diagnostics, or ignore it entirely — nothing on
+the worker side changes behaviour based on it, and a worker that drops it is
+still fully conformant. The field exists because the orchestrator already knows
+the numbers and the channel is free; a slope-driven clamp is a later option,
+not a current contract.
+
+**Impls that sub-batch internally are not granted.** If the instance carries a
+falsy `enable_batching` (or `enable_batch`) attribute, the worker ignores any
+`grant` on the frame and takes the grantless compatibility path: the whole
+window goes to one `instance.predict` call and no `units` are reported. Such an
+impl decides its own GPU batch shape inside `predict`, so a granted batch's
+size would not describe the allocator peaks that were measured — it is
+`none`-class for calibration purposes until batching is re-enabled.
+
+A worker with a `grant` **must** still return exactly one output per input,
+in the original input order: bucketed packing reorders items internally
+(`max-times-count` models pack similarly-sized neighbours together), and the
+orchestrator splits outputs back per request by position.
+
+A batch is never smaller than one item. A single item over budget goes
+through alone; `run_with_oom_retry` inside the impl remains the backstop.
 
 `ok` payloads:
 
@@ -158,23 +219,82 @@ A measurement map describes one GPU batch the worker actually ran:
 
 | key | meaning |
 |---|---|
-| `items` | number of inputs in the batch — a plain count, which is all the worker can know without the packing harness |
+| `items` | number of inputs in the batch — a plain count |
+| `units` | the batch's size in the model's declared cost dimension, as the packing harness priced it (`sum` of per-item units, `max × count`, or the item count). **Reported only when the batch ran to completion and the executed GPU batch matches the planned batch** — see below |
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it |
-| `duration_ms` | wall time of the batch |
+| `duration_ms` | wall time of `instance.predict(batch)` |
+| `oom` | `true` when this batch raised an out-of-memory condition the harness observed, **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally |
+| `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself |
+
+**`units` is reported only when the batch ran to completion and the executed
+GPU batch matches the planned batch.** The number exists so the orchestrator can
+regress allocator peaks against batch size, which requires the peaks and the size
+to describe the same work. Several shipped impls sub-batch *inside* `predict` —
+`run_with_oom_retry` with an `initial_chunk_size`, a per-image loop when the
+impl's own batching is off, a hard-coded chunk of 1 — so the harness cannot
+assume the batch it handed over is the batch the allocator saw. When the harness
+can tell that the impl executed something smaller (it observes
+`run_with_oom_retry`'s record of the largest chunk it actually ran), it **omits
+`units` entirely**: the batch is unpriceable, and an unpriceable batch must never
+reach the fit, because a `units` figure larger than the work behind the peaks
+biases the fitted slope low and biases admission high. Two shapes of that record
+are both unpriceable: a largest chunk *smaller* than the planned batch, and a
+record that moved for this batch while reporting that **nothing** ran through the
+helper (the impl consulted it, executed zero items there, and did the work by
+another route — easyOCR's `readtext` fallback). A record that did not move at all
+is different: the impl never consulted the helper for this batch, which is no
+information, and the batch stays priceable. When the record shows the loop halved
+at least once, the measurement additionally carries `oom: true` — the impl
+absorbed an out-of-memory condition the orchestrator would otherwise never hear
+about.
+
+**A batch that failed is never priced.** Whatever the failure was — an
+out-of-memory error, an assertion inside the impl, a processor that rejected an
+input, an output-count mismatch — the allocator peaks describe however far the
+call got before it gave up, which *understates* the cost of the batch that was
+packed. So a measurement for a failed batch carries `items` and its peaks but no
+`units`, on every failure path: an under-stated peak entering the fit as a clean
+high-water sample would drag the fitted slope low, i.e. produce over-admission
+out of a failure. The `oom` flag still rides the measurement and still drives
+deflation, which is the part of a failed batch that *is* information.
+
+Absent `units` is also the normal case for a request that carried no `grant`:
+without a declared cost dimension the worker has nothing to price in.
 
 `items` is deliberately *not* cost-dimension units: decoded pixels, tokens
-and audio-seconds are known only where the inputs are decoded, so a `units`
-key (priced in the model's declared cost dimension) arrives together with the
-packing harness in step 1b of `docs/batch-calibration-design.md`. Until then
-a consumer that needs units must derive them itself; `items` is exact for the
-`item`/`count` class and nothing else.
+and audio-seconds are known only where the inputs are decoded. `items` is
+exact for the `item`/`count` class and nothing else; `units` is the priced
+figure and is what the cost fit regresses against.
+
+`duration_ms` covers the `instance.predict(batch)` call only — the harness's
+own per-item unit pricing (image-header reads, byte counts) happens **before**
+the timed section, deliberately, so the throughput-collapse comparator sees
+GPU throughput rather than CPU decode noise. Decode *inside* the impl is
+still inside the timing; nothing outside the impl can separate it.
 
 The worker resets torch's peak counters before each measured batch, so peaks
 are per-batch rather than cumulative. A worker that packs one request frame
-into several GPU batches reports one entry per batch; today it reports a
-single entry covering the whole `predict` call, which is why the field is an
-array from the start.
+into several GPU batches reports one entry per batch; a request with no
+`grant` reports a single entry covering the whole `predict` call, which is why
+the field is an array in both cases.
+
+### Memory sensing on `error` frames
+
+An `error` reply to `predict` may carry the same optional `memory` and
+`measurements` fields. A window that failed part-way through still measured
+whatever ran before the failure, and an out-of-memory batch is precisely the
+sample the orchestrator most needs. The error semantics are unchanged (the
+request failed, the worker stays alive); the fields are advisory telemetry.
+
+A whole-batch out-of-memory condition the harness could not recover from is
+additionally recognisable from the error *message*, which the orchestrator
+classifies without parsing anything structured:
+
+- `INFERENCE_OOM_BATCH_SIZE_1:` — a single input could not run (the
+  pre-existing `InferenceOOMError` from `inferio.impl.utils`);
+- `INFERENCE_OOM_WINDOW:` — a packed batch of more than one item raised an
+  out-of-memory error that escaped the impl's own halving loop.
 
 ## Lifecycle and timeouts (orchestrator side)
 

@@ -122,6 +122,64 @@ fn query() -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// One board's live memory occupancy, from the ledger's staleness refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuMemory {
+    pub uuid: String,
+    pub total_mb: u64,
+    pub free_mb: u64,
+}
+
+/// Live free/total memory for every visible board, in **one** `nvidia-smi`
+/// call so per-board readings can never be stitched from different moments.
+///
+/// Used by the VRAM ledger when the freshest worker-reported sample has aged
+/// past its threshold (docs/batch-calibration-design.md: samples arrive only
+/// on response frames, so an idle board's picture goes stale). `None` on any
+/// failure — no nvidia-smi, timeout, unparseable row — in which case the
+/// ledger keeps the stale reading, which the worker's per-batch shrink clamp
+/// makes safe. Runs off the hot path (`spawn_blocking`), never inline.
+pub fn query_memory() -> Option<Vec<GpuMemory>> {
+    let smi = find_nvidia_smi()?;
+    let mut cmd = Command::new(smi);
+    cmd.args([
+        "--query-gpu=uuid,memory.total,memory.free",
+        "--format=csv,noheader,nounits",
+    ]);
+    let output = output_with_timeout(cmd, Duration::from_secs(5))?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_memory(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// One board per line, `uuid, total, free`. Any unparseable row makes the
+/// whole reading unknown: a partial memory picture would silently price some
+/// boards' external usage as zero, which is exactly the phantom headroom the
+/// ledger's clamps exist to prevent.
+fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
+    let mut boards = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(',');
+        let uuid = fields.next()?.trim().to_owned();
+        let total_mb = fields.next()?.trim().parse::<u64>().ok()?;
+        let free_mb = fields.next()?.trim().parse::<u64>().ok()?;
+        if fields.next().is_some() || !is_uuid_pin(&uuid) {
+            return None;
+        }
+        boards.push(GpuMemory {
+            uuid,
+            total_mb,
+            free_mb,
+        });
+    }
+    if boards.is_empty() { None } else { Some(boards) }
+}
+
 /// Turn probe output plus the ambient `CUDA_VISIBLE_DEVICES` into both
 /// views. Pure, so tests drive it without a GPU and without mutating the
 /// process environment.
@@ -404,6 +462,43 @@ mod tests {
 
     const TWO_BOARDS: &str = "0, GPU-1a2b, NVIDIA GeForce RTX 5090, 32607, 12.0\n\
                               1, GPU-3c4d, NVIDIA RTX A2000, 6138, 8.6\n";
+
+    /// The ledger's staleness refresh reads one coherent snapshot; a single
+    /// unparseable row makes the whole reading unknown rather than pricing
+    /// some board's external usage as zero.
+    #[test]
+    fn parses_a_memory_snapshot() {
+        let boards = parse_memory(
+            "GPU-1a2b, 32607, 21000\nGPU-3c4d, 6138, 512\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            boards,
+            vec![
+                GpuMemory {
+                    uuid: "GPU-1a2b".into(),
+                    total_mb: 32607,
+                    free_mb: 21000,
+                },
+                GpuMemory {
+                    uuid: "GPU-3c4d".into(),
+                    total_mb: 6138,
+                    free_mb: 512,
+                },
+            ]
+        );
+        assert!(parse_memory("").is_none());
+        assert!(parse_memory("N/A, N/A, N/A\n").is_none());
+        assert!(
+            parse_memory("GPU-1a2b, 32607, 21000\nGPU-3c4d, [N/A], 512\n").is_none(),
+            "one bad row makes the whole snapshot unknown"
+        );
+        assert!(parse_memory("GPU-1a2b, 32607\n").is_none(), "missing column");
+        assert!(
+            parse_memory("0, 32607, 21000\n").is_none(),
+            "a non-UUID identity cannot key a ledger"
+        );
+    }
 
     #[test]
     fn parses_nvidia_smi_inventory() {

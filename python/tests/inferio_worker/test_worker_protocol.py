@@ -589,6 +589,155 @@ def test_oom_error_frame_preserves_prefix(worker: WorkerProcess) -> None:
     assert worker.wait() == 0
 
 
+def test_an_internally_subbatching_impl_reports_no_units(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory sensing"):
+    # this fixture uses the real run_with_oom_retry with initial_chunk_size=1,
+    # so the GPU batch the allocator saw is one item however many the harness
+    # packed. The harness observes that through the helper's own record and
+    # omits `units` — an unpriceable batch must never reach the cost fit, since
+    # a units figure larger than the work behind the peaks biases the fitted
+    # slope low, i.e. towards over-admission.
+    worker.send(handshake_msg(req_id=1, impl_class="subbatching_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 4,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    # The impl really did run one item at a time, and still answered in order.
+    assert resp["outputs"] == [{"chunk": 1}] * 4
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, "the harness packed one batch of 4"
+    assert measurements[0]["items"] == 4
+    assert "units" not in measurements[0], measurements[0]
+    assert measurements[0].get("oom") is None, "no halvings happened"
+
+    worker.send({"type": "unload", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_an_error_frame_carries_the_measurements_of_a_failed_window(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory sensing on
+    # `error` frames"): the granted window is packed into two batches; the first
+    # runs and is measured, the second raises a bare driver-shaped OOM. The
+    # window fails as a whole — the protocol has no per-input error — but the
+    # error frame still carries both measurements, the failing one flagged
+    # `oom`, and the message carries INFERENCE_OOM_WINDOW so the orchestrator
+    # can classify it from the string alone. The failed batch is *unpriced*: its
+    # peaks stop wherever the call gave up, and pricing it would enter an
+    # under-stated cost into the cost fit, i.e. over-admit.
+    worker.send(handshake_msg(req_id=1, impl_class="oom_second_batch_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 2,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "error", resp
+    assert resp["id"] == 4
+    assert resp["message"].startswith("INFERENCE_OOM_WINDOW:"), resp["message"]
+    measurements = resp["measurements"]
+    assert len(measurements) == 2, measurements
+    assert [m["items"] for m in measurements] == [2, 2]
+    assert measurements[0].get("oom") is None, "the first batch ran fine"
+    assert measurements[1]["oom"] is True, "the second is the negative sample"
+    assert "units" not in measurements[1], "a failed batch is never priced"
+
+    # The worker survives a window failure: the request failed, not the process.
+    worker.send({"type": "ping", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "unload", "id": 6})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_an_impl_with_batching_off_ignores_the_grant(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory grants"): an
+    # impl carrying a falsy `enable_batching` decides its own GPU batch shape
+    # inside predict, so the worker ignores the grant entirely and takes the
+    # grantless compatibility path — the whole window in one predict call, one
+    # measurement for the call, and NO cost-dimension `units`. Reporting units
+    # for a batch the impl re-split would bias the orchestrator's fitted slope
+    # low, i.e. towards over-admission.
+    worker.send(handshake_msg(req_id=1, impl_class="nobatching_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 1,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    assert resp["outputs"] == [{"batch": 4}] * 4, (
+        "the grant's unit budget of 1 was ignored: one predict call, whole window"
+    )
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, measurements
+    assert measurements[0]["items"] == 4
+    assert "units" not in measurements[0], (
+        "the grantless path prices nothing"
+    )
+
+    worker.send({"type": "unload", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
 MEMORY_SAMPLE_KEYS = (
     "free_mb",
     "total_mb",

@@ -239,7 +239,14 @@ config.languages  = ["en"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
 # The batched CRAFT detector needs uniform dims and pays max-size × batch —
-# the known OOM trap `enable_batching = false` currently works around.
+# the known OOM trap `enable_batching = false` currently works around. The
+# packing harness (step 1b) now buckets max-times-count models largest-first,
+# which is the mechanism meant to retire this flag; flipping it is deliberately
+# left to the rollout's acceptance test (docs/batch-calibration-design.md,
+# rollout item 1: bucketed easyOCR re-batching **under realistic core
+# pipelining**), because window depth — and therefore how much material the
+# bucketer gets — is what decides whether it holds, and that cannot be
+# asserted from a unit test.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
