@@ -183,9 +183,13 @@ written in the UUID form CUDA accepts directly
 (`CUDA_VISIBLE_DEVICES=GPU-…`), so the pin shares the budget keyspace's
 identity and device-index instability never enters (ROCm may need the
 index form plus a spawn-time index→UUID mapping; cuda-first as
-everywhere). Default placement keeps today's behaviour — first usable
-GPU; headroom-based placement across cards is a natural later upgrade
-once ledgers exist, not v1. The impl-side multi-device path
+everywhere). Default placement is the **highest-compute-capability board**
+(ties broken by the lowest nvidia-smi index), which is rough parity with
+what an unpinned worker got before: torch's default device order is
+`FASTEST_FIRST`, so "no pin, impls run on `devices[0]`" already meant the
+fastest board rather than the first one on the bus. Headroom-based
+placement across cards is a natural later upgrade once ledgers exist, not
+v1. The impl-side multi-device path
 (`get_device()` returning several devices) drops out of the supported
 envelope: a worker sees exactly one GPU, and every report (base,
 reserved, memory samples) lands on exactly one ledger.
@@ -449,12 +453,25 @@ phantom headroom. Measurement is tiered:
 1. **NVML per-process** (`nvmlDeviceGetComputeRunningProcesses`, own
    PID's `usedGpuMemory`) — exact and pollution-free; reliable on Linux
    including the CUDA Docker image under the nvidia runtime
-   (`nvidia-ml-py`, pure-Python dependency).
-2. Where NVML reports N/A — **Windows WDDM** — fall back to the
-   `mem_get_info` free-delta around load, clamped to ≥ the
-   allocated-delta. It is a one-shot sample: a reading implausibly larger
-   than allocated means another process moved during the load window →
-   fall back to allocated + a fixed context estimate.
+   (`nvidia-ml-py`, pure-Python dependency). NVML reports *host* PIDs, so a
+   container without `--pid=host` never finds itself in the list and
+   degrades to tier 2 (logged once).
+2. Where NVML reports N/A — **Windows WDDM** — or where our PID is not in
+   its list, fall back to the free-memory delta around load, used only when
+   it is ≥ the allocated-delta. Below that the allocated-delta wins, and
+   what gets reported is then the allocated-delta **plus a fixed context
+   estimate** — the same formula as the implausible-reading fallback below,
+   since one `base_method` value cannot name two different quantities. It
+   is a one-shot sample: a reading implausibly
+   larger than the *reserved* delta plus a context/workspace allowance
+   means another process moved during the load window → fall back to
+   allocated + a fixed context estimate. (Pool overshoot inside the load
+   itself is legitimate, which is why the plausibility test is against
+   reserved rather than allocated.) The free reading must come from the
+   same source (NVML or `mem_get_info`) on both sides of the window — the
+   two disagree by GBs on Windows — and the tier applies only to a process
+   that demonstrably allocated on the device; one that never did reports
+   no base at all rather than a base of 0.
 3. The `max_memory_allocated` delta around load is always recorded as the
    floor.
 
@@ -493,7 +510,10 @@ encouraged to leave `margin` alone.
 ### File format
 
 Human-readable TOML, one array-of-tables; the same file format for shipped
-baselines and locally generated data.
+baselines and locally generated data. Every `*_mb` quantity in the store (and
+on the worker wire) is **MiB** — mebibytes, 1024², the unit `nvidia-smi
+--format=nounits` and torch's memory statistics both speak — never decimal
+megabytes.
 
 ```toml
 schema = 1
@@ -726,8 +746,8 @@ script, not a subsystem.
   the non-local-profile confirmation sample count, and the
   extrapolation-ratchet factor (default 2×).
 - Placement policy on multi-GPU hosts: v1 pins every worker but keeps
-  today's placement (first usable GPU, or the registry's explicit
-  `devices` pins). Headroom-based placement — put the next load on the
+  today's placement (the fastest board by compute capability, or the
+  registry's explicit `devices` pins). Headroom-based placement — put the next load on the
   card whose ledger has the most room — is the natural follow-up once
   ledgers exist.
 - ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but

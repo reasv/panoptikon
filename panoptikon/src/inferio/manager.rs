@@ -55,7 +55,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Timelike};
@@ -64,12 +64,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use super::cost::CostDimension;
 use super::dispatch::{
     DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher,
 };
+use super::gpu::{GpuInfo, GpuInventory};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
-use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput, WorkerSpawnConfig};
+use super::worker::{
+    LoadReport, MemorySample, TelemetryHandle, Worker, WorkerError, WorkerInput, WorkerOutput,
+    WorkerSpawnConfig,
+};
 
 /// Manager configuration.
 pub struct ManagerConfig {
@@ -82,6 +87,11 @@ pub struct ManagerConfig {
     pub sweep_interval: Duration,
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
+    /// Visible GPUs, probed once at startup. Universal worker→GPU pinning
+    /// resolves every replica's `CUDA_VISIBLE_DEVICES` against this, and
+    /// step 1b's per-GPU ledger is keyed by these UUIDs. Unknown on hosts
+    /// with no nvidia-smi, which keeps today's unpinned behaviour.
+    pub gpus: GpuInventory,
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -104,6 +114,9 @@ pub struct HealthReport {
     /// entry per impl class held (state "warm" | "spawning" |
     /// "failed_prepare").
     pub prewarm: PrewarmHealth,
+    /// Visible GPUs by board UUID (batch-calibration step 1a); empty when
+    /// the host has no GPU inventory, in which case workers are not pinned.
+    pub gpus: Vec<GpuInfo>,
 }
 
 /// One loaded model in the [`HealthReport`].
@@ -128,6 +141,13 @@ pub struct ModelHealth {
     pub total_predict_requests: u64,
     /// Windows ever dispatched to a replica.
     pub total_batches: u64,
+    /// Cost dimension resolved from registry metadata at load time
+    /// (batch-calibration step 1a).
+    pub cost: CostHealth,
+    /// One entry per replica: which GPU it sits on and the freshest memory
+    /// sensing it reported. This is the raw material step 1b's per-GPU
+    /// ledger is built from.
+    pub replicas_detail: Vec<ReplicaTelemetryHealth>,
 }
 
 /// Replica occupancy of one model's WorkerSet.
@@ -135,6 +155,155 @@ pub struct ModelHealth {
 pub struct ReplicaHealth {
     pub total: usize,
     pub free: usize,
+}
+
+/// A model's cost dimension, as resolved from `metadata.cost`.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CostHealth {
+    /// `item` | `pixel` | `token` | `audio-second` | `none`.
+    pub unit: String,
+    /// `count` | `sum` | `max-times-count`; absent for the `none` class.
+    pub aggregation: Option<String>,
+    pub epoch: u32,
+    /// First-touch batch before calibration; absent for the `none` class.
+    pub seed_units: Option<u32>,
+    /// True when the registry declared nothing usable and the conservative
+    /// `(item, count)` fallback is in force.
+    pub degraded: bool,
+}
+
+impl From<CostDimension> for CostHealth {
+    fn from(cost: CostDimension) -> Self {
+        Self {
+            unit: cost.unit.as_str().to_owned(),
+            aggregation: cost.aggregation.map(|value| value.as_str().to_owned()),
+            epoch: cost.epoch,
+            seed_units: cost.seed_units,
+            degraded: cost.degraded,
+        }
+    }
+}
+
+/// Per-replica GPU placement plus its freshest memory report. Every field
+/// after `gpu` is `null` until the worker reports it (no torch, CPU/MPS
+/// host, or no predict yet).
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReplicaTelemetryHealth {
+    /// Resolved `CUDA_VISIBLE_DEVICES` pin the worker was *spawned* with — a
+    /// board UUID when the GPU inventory is known.
+    pub gpu: Option<String>,
+    /// The board the worker itself reports being on, which is what step 1b's
+    /// ledger keys by: the pin above can be an index, absent, or a UUID CUDA
+    /// reordered, and only the worker can see what it actually got.
+    pub gpu_uuid: Option<String>,
+    pub gpu_name: Option<String>,
+    /// The worker venv's torch, part of the calibration profile key.
+    pub torch_version: Option<String>,
+    /// Process-level load footprint and how it was measured.
+    pub base_mb: Option<u64>,
+    pub base_method: Option<String>,
+    pub reserved_at_load_mb: Option<u64>,
+    /// Negotiated load precision, part of the calibration profile key.
+    pub dtype: Option<String>,
+    /// Freshest device sample, and how long ago it was recorded.
+    pub free_mb: Option<u64>,
+    pub total_mb: Option<u64>,
+    /// Which driver reported `free_mb`/`total_mb` (`"nvml"` | `"torch"`); the
+    /// two disagree by gigabytes, so a reader comparing samples needs it.
+    pub free_source: Option<String>,
+    pub reserved_mb: Option<u64>,
+    pub allocated_mb: Option<u64>,
+    pub memory_age_ms: Option<u64>,
+    /// Measurements this replica has reported since it loaded, including any
+    /// the bounded ring has since evicted.
+    pub measurements_recorded: u64,
+    /// The tail of the measurement ring, oldest first — a sample of what 1b's
+    /// cost fit consumes, not the whole ring (health is a status page).
+    pub recent_batches: Vec<BatchHealth>,
+}
+
+/// One measured GPU batch in [`ReplicaTelemetryHealth`].
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchHealth {
+    /// Per-worker sequence number; strictly increasing, gaps mean the ring
+    /// evicted samples between reads.
+    pub seq: u64,
+    pub age_ms: u64,
+    /// Inputs in the batch (not cost-dimension units — see the worker
+    /// protocol's "Memory sensing").
+    pub items: Option<u64>,
+    pub reserved_before_mb: Option<u64>,
+    pub peak_reserved_mb: Option<u64>,
+    pub allocated_before_mb: Option<u64>,
+    pub peak_allocated_mb: Option<u64>,
+    pub duration_ms: Option<f64>,
+}
+
+impl ReplicaTelemetryHealth {
+    /// How many ring entries `/health` shows per replica.
+    const RECENT_BATCHES: usize = 4;
+
+    fn snapshot(handle: &TelemetryHandle) -> Self {
+        let mut telemetry = match handle.lock() {
+            Ok(telemetry) => telemetry.clone(),
+            // A poisoned telemetry mutex must not take the health endpoint
+            // down; it is advisory data.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let now = Instant::now();
+        let age_ms = |captured_at: Instant| {
+            now.saturating_duration_since(captured_at).as_millis() as u64
+        };
+        // The load report's own timestamp is kept in the telemetry for 1b
+        // (a base measured long ago on a busy board is a weaker prior);
+        // health only needs the values.
+        let load = telemetry
+            .load
+            .take()
+            .map_or_else(LoadReport::default, |stamped| stamped.value);
+        let (memory, memory_age_ms) = match telemetry.memory.take() {
+            Some(stamped) => (stamped.value, Some(age_ms(stamped.captured_at))),
+            None => (MemorySample::default(), None),
+        };
+        let measurements_recorded = telemetry.recorded_measurements();
+        let gpu = telemetry.gpu.take();
+        // Read the ring without draining it: 1b's ledger is the other reader
+        // and consumes by watermark (see `WorkerTelemetry::measurements`).
+        let mut recent: Vec<BatchHealth> = telemetry
+            .measurements()
+            .rev()
+            .take(Self::RECENT_BATCHES)
+            .map(|sample| BatchHealth {
+                seq: sample.seq,
+                age_ms: age_ms(sample.captured_at),
+                items: sample.measurement.items,
+                reserved_before_mb: sample.measurement.reserved_before_mb,
+                peak_reserved_mb: sample.measurement.peak_reserved_mb,
+                allocated_before_mb: sample.measurement.allocated_before_mb,
+                peak_allocated_mb: sample.measurement.peak_allocated_mb,
+                duration_ms: sample.measurement.duration_ms,
+            })
+            .collect();
+        recent.reverse();
+        Self {
+            gpu,
+            gpu_uuid: load.gpu_uuid,
+            gpu_name: load.gpu_name,
+            torch_version: load.torch_version,
+            base_mb: load.base_mb,
+            base_method: load.base_method,
+            reserved_at_load_mb: load.reserved_at_load_mb,
+            dtype: load.dtype,
+            free_mb: memory.free_mb,
+            total_mb: memory.total_mb,
+            free_source: memory.free_source,
+            reserved_mb: memory.reserved_mb,
+            allocated_mb: memory.allocated_mb,
+            memory_age_ms,
+            measurements_recorded,
+            recent_batches: recent,
+        }
+    }
 }
 
 /// Per-cache-key entry expiration. `Never` is Python's `datetime.max`.
@@ -418,6 +587,18 @@ impl CacheState {
     }
 }
 
+/// A freshly spawned WorkerSet plus everything the model entry needs to
+/// record about it.
+struct SpawnedModel {
+    workers: Vec<Worker>,
+    registry_default_batch: Option<u32>,
+    impl_class: String,
+    /// Whether any replica's resolved pin matched the prewarm pool's, i.e.
+    /// whether keeping a warm worker for this class can ever pay off.
+    claim_eligible: bool,
+    cost: CostDimension,
+}
+
 /// A loaded model: the dispatcher queue plus the task owning its WorkerSet.
 struct ModelHandle {
     tx: mpsc::UnboundedSender<DispatchMsg>,
@@ -428,6 +609,13 @@ struct ModelHandle {
     /// Health counters shared with the dispatcher task (design §7): the
     /// dispatcher writes, `health()` reads — Relaxed atomics, no locking.
     stats: Arc<ModelStats>,
+    /// Cost dimension resolved from registry metadata when this entry loaded
+    /// (batch-calibration step 1a). Resolved at load, not per request, so a
+    /// running model keeps the dimension it was priced with.
+    cost: CostDimension,
+    /// One telemetry handle per replica, shared with the workers the
+    /// dispatcher owns. Step 1b's ledger reads these.
+    telemetry: Vec<TelemetryHandle>,
 }
 
 #[derive(Default)]
@@ -527,7 +715,10 @@ pub struct ModelManager {
 impl ModelManager {
     pub fn new(cfg: ManagerConfig, registry: Arc<StdMutex<RegistryCache>>) -> Arc<Self> {
         let sweep_interval = cfg.sweep_interval;
-        let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone());
+        // Pooled workers are pinned to the same default GPU an unpinned
+        // replica resolves to, or the pool's workers could never be claimed
+        // (claim eligibility is pin equality — see `spawn_model`).
+        let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
         let manager = Arc::new(Self {
             cfg,
             registry,
@@ -718,6 +909,12 @@ impl ModelManager {
                     },
                     total_predict_requests: stats.total_predict_requests.load(Relaxed),
                     total_batches: stats.total_batches.load(Relaxed),
+                    cost: handle.cost.into(),
+                    replicas_detail: handle
+                        .telemetry
+                        .iter()
+                        .map(ReplicaTelemetryHealth::snapshot)
+                        .collect(),
                 }
             })
             .collect();
@@ -734,6 +931,12 @@ impl ModelManager {
             model_count: models.len(),
             models,
             prewarm,
+            gpus: self
+                .cfg
+                .gpus
+                .gpus()
+                .map(<[GpuInfo]>::to_vec)
+                .unwrap_or_default(),
         }
     }
 
@@ -905,7 +1108,13 @@ impl ModelManager {
         // Release the spawn pin under the same lock as the bookkeeping
         // below so the sweeper cannot expire the fresh entry in between.
         spawn_pin.release_locked(&mut state.cache);
-        let (workers, registry_default_batch, impl_class, claim_eligible) = match spawn_result {
+        let SpawnedModel {
+            workers,
+            registry_default_batch,
+            impl_class,
+            claim_eligible,
+            cost,
+        } = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 // Python removes the requesting cache key's entry and
@@ -941,6 +1150,10 @@ impl ModelManager {
         let stats = Arc::new(ModelStats::default());
         stats.replicas_total.store(workers.len(), Relaxed);
         stats.replicas_free.store(workers.len(), Relaxed);
+        // Grab the telemetry handles before the dispatcher takes the workers:
+        // the manager is the budget arbiter, so it keeps its own read path
+        // into every replica's memory reports.
+        let telemetry: Vec<TelemetryHandle> = workers.iter().map(Worker::telemetry).collect();
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
@@ -971,6 +1184,8 @@ impl ModelManager {
                 task,
                 generation,
                 stats,
+                cost,
+                telemetry,
             },
         );
         drop(state);
@@ -1000,39 +1215,69 @@ impl ModelManager {
     /// workers are always born on current config). Errors carry the
     /// worker's traceback/stderr context from `Worker`.
     ///
-    /// Prewarm claim (design §8): at most one replica — the first with no
-    /// device pin, since pooled workers are spawned unpinned — is served
-    /// from the pool's parked worker for the impl class, if one is alive
-    /// (the pool pings before handing it over). The claimed worker skips
-    /// spawn + handshake + heavy imports and only needs `configure` +
-    /// `load`; the remaining replicas fresh-spawn as before.
-    async fn spawn_model(
-        &self,
-        inference_id: &str,
-    ) -> Result<(Vec<Worker>, Option<u32>, String, bool)> {
-        let (spec, registry_default_batch) = {
+    /// Universal worker→GPU pinning (batch-calibration design, "Every worker
+    /// is pinned to exactly one GPU"): the registry has no GPU knowledge, so
+    /// each replica's pin — including the "no pin" default — is resolved
+    /// here against the probed inventory, normally to a board UUID. An
+    /// unknown inventory resolves to exactly what the registry said
+    /// (including `None`), i.e. today's behaviour.
+    ///
+    /// Prewarm claim (design §8): at most one replica is served from the
+    /// pool's parked worker for the impl class, if one is alive (the pool
+    /// pings before handing it over). Eligibility is **pin equality**: a
+    /// pooled worker sits on the default GPU, so it can serve any replica
+    /// whose resolved pin is that same GPU (both-`None` on an unknown
+    /// inventory included). The claimed worker skips spawn + handshake +
+    /// heavy imports and only needs `configure` + `load`; the remaining
+    /// replicas fresh-spawn as before.
+    async fn spawn_model(&self, inference_id: &str) -> Result<SpawnedModel> {
+        let (spec, registry_default_batch, cost) = {
             let mut registry = self.registry.lock().unwrap();
             let snapshot = registry
                 .get()
                 .context("failed to load the inference registry")?;
             let spec = snapshot.spawn_spec(inference_id)?;
-            (spec, registry_default_batch(&snapshot, inference_id))
+            (
+                spec,
+                registry_default_batch(&snapshot, inference_id),
+                CostDimension::resolve(&snapshot, inference_id),
+            )
         };
+        tracing::debug!(
+            model = %inference_id,
+            unit = cost.unit.as_str(),
+            aggregation = cost.aggregation.map(|value| value.as_str()),
+            epoch = cost.epoch,
+            seed_units = cost.seed_units,
+            priced = cost.scales(),
+            degraded = cost.degraded,
+            "resolved cost dimension"
+        );
         let replica_count = spec.device_pins.len();
+        let device_pins: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.resolve_pin(pin.as_deref()))
+            .collect();
         // A prewarmed process was spawned before this model's just-in-time
         // external inputs were resolved. Models with explicit worker env
         // must therefore use a fresh process.
+        let pool_pin = self.cfg.gpus.default_pin();
         let claim_replica = (spec.env.is_empty() && spec.env_remove.is_empty())
-            .then(|| spec.device_pins.iter().position(Option::is_none))
+            .then(|| device_pins.iter().position(|pin| *pin == pool_pin))
             .flatten();
         let mut claimed = match claim_replica {
-            Some(_) => self.prewarm.claim(&spec.impl_class).await,
-            // Every replica is device-pinned; a pooled worker (spawned
-            // without CUDA_VISIBLE_DEVICES) would violate the pin.
+            Some(_) => {
+                self.prewarm
+                    .claim(&spec.impl_class, pool_pin.as_deref())
+                    .await
+            }
+            // Either this model needs explicit worker env, or every replica
+            // sits on a GPU other than the pool's — handing a pooled worker
+            // to one of those would violate its pin.
             None => None,
         };
-        let spawns: Vec<_> = spec
-            .device_pins
+        let spawns: Vec<_> = device_pins
             .iter()
             .enumerate()
             .map(|(replica, device)| {
@@ -1076,14 +1321,12 @@ impl ModelManager {
         for result in futures_util::future::join_all(spawns).await {
             match result {
                 Ok((replica, worker)) => {
-                    if replica_count > 1 {
-                        tracing::debug!(
-                            model = %inference_id,
-                            replica,
-                            device = spec.device_pins[replica].as_deref().unwrap_or("<unpinned>"),
-                            "replica loaded"
-                        );
-                    }
+                    tracing::debug!(
+                        model = %inference_id,
+                        replica,
+                        device = device_pins[replica].as_deref().unwrap_or("<unpinned>"),
+                        "replica loaded"
+                    );
                     workers.push(worker);
                 }
                 Err(err) => {
@@ -1098,12 +1341,13 @@ impl ModelManager {
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
-        Ok((
+        Ok(SpawnedModel {
             workers,
             registry_default_batch,
-            spec.impl_class,
-            claim_replica.is_some(),
-        ))
+            impl_class: spec.impl_class,
+            claim_eligible: claim_replica.is_some(),
+            cost,
+        })
     }
 
     /// Bind a claimed prewarmed worker to the concrete model. A
@@ -1487,7 +1731,17 @@ config.impl_class = "does_not_exist"
 [group.device]
 config.impl_class = "device_test"
 config.devices = ["3", "7"]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.epoch = 4
+metadata.cost.seed_units = 1000000
 [group.device.inference_ids.test]
+
+# Same fixture with no devices pin: the universal-pinning path (resolved to
+# the default board's UUID when a GPU inventory is known).
+[group.devplain]
+config.impl_class = "device_test"
+[group.devplain.inference_ids.test]
 
 [group.slowpair]
 config.impl_class = "slow_test"
@@ -1505,6 +1759,9 @@ config.replicas = 2
         _registry_dir: tempfile::TempDir,
     }
 
+    /// Default setup: unknown GPU inventory, i.e. exactly the pre-pinning
+    /// behaviour (no `CUDA_VISIBLE_DEVICES` unless the registry pins one).
+    /// [`test_manager_with_gpus`] covers resolved pinning.
     fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
         test_manager_with_deadlines(
             sweep_interval,
@@ -1517,6 +1774,29 @@ config.replicas = 2
         sweep_interval: Duration,
         default_max_batch: u32,
         deadlines: WorkerDeadlines,
+    ) -> TestSetup {
+        test_manager_full(
+            sweep_interval,
+            default_max_batch,
+            deadlines,
+            GpuInventory::unknown(),
+        )
+    }
+
+    fn test_manager_with_gpus(gpus: GpuInventory) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            gpus,
+        )
+    }
+
+    fn test_manager_full(
+        sweep_interval: Duration,
+        default_max_batch: u32,
+        deadlines: WorkerDeadlines,
+        gpus: GpuInventory,
     ) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
@@ -1537,6 +1817,7 @@ config.replicas = 2
                 lazy: false,
                 always_warm: Vec::new(),
             },
+            gpus,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -2308,6 +2589,11 @@ config.replicas = 2
     /// merge) must be answered by BOTH pins, proving the set has exactly
     /// the two replicas and the dispatcher actually spreads windows across
     /// them.
+    ///
+    /// This is also the **unknown-inventory passthrough** case for
+    /// universal pinning: with no GPU inventory (every non-CUDA host, and
+    /// every host without nvidia-smi) the registry's raw index strings reach
+    /// the child unchanged, exactly as before pinning existed.
     #[tokio::test]
     async fn multi_replica_devices_serve_shared_queue() {
         let setup = test_manager(Duration::from_secs(60), 32);
@@ -2346,6 +2632,246 @@ config.replicas = 2
             devices,
             std::collections::BTreeSet::from(["3".to_string(), "7".to_string()]),
             "both configured device pins served requests (and no third replica exists)"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Inventory for the pinning tests: two boards whose indices (0 and 3)
+    /// cover both the default-placement and the index-mapping paths. Equal
+    /// compute capability, so the default pin is decided by index (board 0).
+    fn test_gpus() -> GpuInventory {
+        GpuInventory::known(vec![
+            GpuInfo {
+                index: 0,
+                uuid: "GPU-0000".into(),
+                name: "Test GPU 0".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+            },
+            GpuInfo {
+                index: 3,
+                uuid: "GPU-3333".into(),
+                name: "Test GPU 3".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+            },
+        ])
+    }
+
+    /// Universal pinning (batch-calibration design): a replica the registry
+    /// left unpinned is spawned on the default board *by UUID*, not left
+    /// seeing every device. The fixture echoes its CUDA_VISIBLE_DEVICES, so
+    /// the reported value is the proof.
+    #[tokio::test]
+    async fn unpinned_replica_is_pinned_to_the_default_gpu() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = &setup.manager;
+
+        let outputs = manager
+            .predict(
+                "devplain/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict on the pinned replica");
+        assert_eq!(
+            reported_device(&outputs[0]),
+            "GPU-0000",
+            "an unpinned replica resolves to the default board's UUID"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// An explicit index pin (`devices = ["3", "7"]`) is mapped to that
+    /// board's UUID so the ledger key is stable across reboots; an index no
+    /// board reports (7 here) passes through unchanged rather than being
+    /// guessed at.
+    #[tokio::test]
+    async fn index_device_pins_map_to_board_uuids() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load spawns both replicas");
+
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "device/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        None,
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        let mut devices = std::collections::BTreeSet::new();
+        for task in tasks {
+            let outputs = task.await.unwrap().expect("predict on a pinned replica");
+            devices.insert(reported_device(&outputs[0]));
+        }
+        assert_eq!(
+            devices,
+            std::collections::BTreeSet::from(["GPU-3333".to_string(), "7".to_string()]),
+            "index 3 became its UUID; the invisible index 7 passed through"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// `/health` carries the batch-calibration bookkeeping: the resolved
+    /// cost dimension per model (declared for the `device` group, degraded
+    /// for `echo`, which declares nothing), the GPU inventory, and one
+    /// telemetry row per replica carrying its resolved pin. The memory
+    /// fields stay null here — the fixtures have no torch, which is exactly
+    /// the old-worker tolerance the wire contract promises.
+    #[tokio::test]
+    async fn health_reports_cost_dimension_gpus_and_replica_pins() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = &setup.manager;
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load");
+        manager
+            .load_model("echo/test", "k", 10, -1, None)
+            .await
+            .expect("load");
+
+        let health = manager.health();
+        assert_eq!(
+            health.gpus.iter().map(|gpu| gpu.uuid.as_str()).collect::<Vec<_>>(),
+            vec!["GPU-0000", "GPU-3333"],
+            "the inventory is reported by board UUID"
+        );
+
+        let device = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "device/test")
+            .expect("device model in health");
+        assert_eq!(device.cost.unit, "pixel");
+        assert_eq!(device.cost.aggregation.as_deref(), Some("sum"));
+        assert_eq!(device.cost.epoch, 4);
+        assert_eq!(device.cost.seed_units, Some(1_000_000));
+        assert!(!device.cost.degraded);
+        let mut pins: Vec<Option<&str>> = device
+            .replicas_detail
+            .iter()
+            .map(|replica| replica.gpu.as_deref())
+            .collect();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![Some("7"), Some("GPU-3333")],
+            "every replica records the GPU it sits on"
+        );
+        assert!(
+            device
+                .replicas_detail
+                .iter()
+                .all(|replica| replica.base_mb.is_none()
+                    && replica.dtype.is_none()
+                    && replica.reserved_mb.is_none()
+                    // The reported identity is absent too: only a worker with
+                    // a live CUDA device can name its board, and the spawn pin
+                    // above is deliberately not copied into it.
+                    && replica.gpu_uuid.is_none()
+                    && replica.torch_version.is_none()),
+            "a torch-less worker reports no memory, and that is not an error: {:?}",
+            device.replicas_detail
+        );
+
+        let echo = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "echo/test")
+            .expect("echo model in health");
+        assert_eq!(echo.cost.unit, "item", "undeclared degrades to item/count");
+        assert_eq!(echo.cost.aggregation.as_deref(), Some("count"));
+        assert!(echo.cost.degraded);
+
+        manager.shutdown().await;
+    }
+
+    /// A predict must record the measurement plumbing even with no torch in
+    /// the worker: the harness always times the call and counts its inputs,
+    /// so every batch lands in the telemetry ring (sequence-numbered, oldest
+    /// first) while the memory columns stay null. Two predicts must produce
+    /// two retained samples — the cost fit needs the set, not the last one.
+    #[tokio::test]
+    async fn predict_records_batch_measurements_without_torch() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        manager
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1)), data_input(json!(2))],
+            )
+            .await
+            .expect("predict");
+        manager
+            .predict("echo/test", "k", 10, -1, None, None, vec![data_input(json!(3))])
+            .await
+            .expect("second predict");
+
+        let health = manager.health();
+        let replica = &health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "echo/test")
+            .expect("echo model in health")
+            .replicas_detail[0];
+        assert_eq!(
+            replica.measurements_recorded, 2,
+            "both predicts were retained, not overwritten: {replica:?}"
+        );
+        assert_eq!(
+            replica
+                .recent_batches
+                .iter()
+                .map(|batch| (batch.seq, batch.items))
+                .collect::<Vec<_>>(),
+            vec![(1, Some(2)), (2, Some(1))],
+            "oldest first, with the input counts the worker reported: {replica:?}"
+        );
+        assert!(
+            replica
+                .recent_batches
+                .iter()
+                .all(|batch| batch.duration_ms.is_some_and(|ms| ms >= 0.0)),
+            "every batch was timed: {replica:?}"
+        );
+        assert!(
+            replica
+                .recent_batches
+                .iter()
+                .all(|batch| batch.peak_reserved_mb.is_none())
+                && replica.free_mb.is_none()
+                && replica.gpu.is_none(),
+            "no torch and no GPU inventory means no memory numbers: {replica:?}"
         );
 
         manager.shutdown().await;

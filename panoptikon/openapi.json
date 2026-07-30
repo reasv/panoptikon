@@ -4733,6 +4733,75 @@
           }
         }
       },
+      "BatchHealth": {
+        "type": "object",
+        "description": "One measured GPU batch in [`ReplicaTelemetryHealth`].",
+        "required": [
+          "seq",
+          "age_ms"
+        ],
+        "properties": {
+          "age_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "allocated_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Inputs in the batch (not cost-dimension units — see the worker\nprotocol's \"Memory sensing\").",
+            "minimum": 0
+          },
+          "peak_allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "peak_reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-worker sequence number; strictly increasing, gaps mean the ring\nevicted samples between reads.",
+            "minimum": 0
+          }
+        }
+      },
       "BinaryBlob": {
         "type": "string",
         "format": "binary",
@@ -5072,6 +5141,46 @@
           "watcher_fallback": {
             "type": "boolean",
             "description": "True when `mode` is `watcher` but the OS watcher could not be started,\nso polling is standing in for it. The usual cause is the system's limit\non watched paths being too low for the size of the watched tree."
+          }
+        }
+      },
+      "CostHealth": {
+        "type": "object",
+        "description": "A model's cost dimension, as resolved from `metadata.cost`.",
+        "required": [
+          "unit",
+          "epoch",
+          "degraded"
+        ],
+        "properties": {
+          "aggregation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`count` | `sum` | `max-times-count`; absent for the `none` class."
+          },
+          "degraded": {
+            "type": "boolean",
+            "description": "True when the registry declared nothing usable and the conservative\n`(item, count)` fallback is in force."
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "First-touch batch before calibration; absent for the `none` class.",
+            "minimum": 0
+          },
+          "unit": {
+            "type": "string",
+            "description": "`item` | `pixel` | `token` | `audio-second` | `none`."
           }
         }
       },
@@ -5912,6 +6021,44 @@
           }
         }
       },
+      "GpuInfo": {
+        "type": "object",
+        "description": "One visible NVIDIA board.",
+        "required": [
+          "index",
+          "uuid",
+          "name",
+          "total_mb"
+        ],
+        "properties": {
+          "compute_cap": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per board here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this board (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the board is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model."
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "nvidia-smi enumeration index. Useful only for resolving registry\n`devices = [\"3\"]` pins into a UUID; never an identity.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Marketing name, e.g. `NVIDIA GeForce RTX 5090`; the cost-profile key."
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "uuid": {
+            "type": "string",
+            "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`."
+          }
+        }
+      },
       "HasUnprocessedData": {
         "type": "object",
         "required": [
@@ -5933,9 +6080,17 @@
           "registry_ok",
           "model_count",
           "models",
-          "prewarm"
+          "prewarm",
+          "gpus"
         ],
         "properties": {
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuInfo"
+            },
+            "description": "Visible GPUs by board UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+          },
           "model_count": {
             "type": "integer",
             "description": "Number of loaded models (== `models.len()`).",
@@ -7340,7 +7495,9 @@
           "queue_depth",
           "in_flight_windows",
           "total_predict_requests",
-          "total_batches"
+          "total_batches",
+          "cost",
+          "replicas_detail"
         ],
         "properties": {
           "cache_keys": {
@@ -7349,6 +7506,10 @@
               "type": "string"
             },
             "description": "Cache keys currently referencing the model, sorted."
+          },
+          "cost": {
+            "$ref": "#/components/schemas/CostHealth",
+            "description": "Cost dimension resolved from registry metadata at load time\n(batch-calibration step 1a)."
           },
           "generation": {
             "type": "integer",
@@ -7381,6 +7542,13 @@
           "replicas": {
             "$ref": "#/components/schemas/ReplicaHealth",
             "description": "WorkerSet occupancy: `free < total` means replicas are running\nwindows right now."
+          },
+          "replicas_detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicaTelemetryHealth"
+            },
+            "description": "One entry per replica: which GPU it sits on and the freshest memory\nsensing it reported. This is the raw material step 1b's per-GPU\nledger is built from."
           },
           "total_batches": {
             "type": "integer",
@@ -8103,6 +8271,134 @@
           },
           "total": {
             "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ReplicaTelemetryHealth": {
+        "type": "object",
+        "description": "Per-replica GPU placement plus its freshest memory report. Every field\nafter `gpu` is `null` until the worker reports it (no torch, CPU/MPS\nhost, or no predict yet).",
+        "required": [
+          "measurements_recorded",
+          "recent_batches"
+        ],
+        "properties": {
+          "allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Process-level load footprint and how it was measured.",
+            "minimum": 0
+          },
+          "base_method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dtype": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Negotiated load precision, part of the calibration profile key."
+          },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Freshest device sample, and how long ago it was recorded.",
+            "minimum": 0
+          },
+          "free_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which driver reported `free_mb`/`total_mb` (`\"nvml\"` | `\"torch\"`); the\ntwo disagree by gigabytes, so a reader comparing samples needs it."
+          },
+          "gpu": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Resolved `CUDA_VISIBLE_DEVICES` pin the worker was *spawned* with — a\nboard UUID when the GPU inventory is known."
+          },
+          "gpu_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gpu_uuid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The board the worker itself reports being on, which is what step 1b's\nledger keys by: the pin above can be an index, absent, or a UUID CUDA\nreordered, and only the worker can see what it actually got."
+          },
+          "measurements_recorded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Measurements this replica has reported since it loaded, including any\nthe bounded ring has since evicted.",
+            "minimum": 0
+          },
+          "memory_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "recent_batches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchHealth"
+            },
+            "description": "The tail of the measurement ring, oldest first — a sample of what 1b's\ncost fit consumes, not the whole ring (health is a status page)."
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "torch_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The worker venv's torch, part of the calibration profile key."
+          },
+          "total_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
             "minimum": 0
           }
         }

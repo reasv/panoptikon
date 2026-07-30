@@ -138,6 +138,23 @@ def _precision_to_dtype(name: str):
     }[canonical]
 
 
+_last_selected_dtype = None
+
+
+def last_selected_dtype():
+    """The dtype the most recent `select_dtype` call returned, or None.
+
+    Calibration profiles are keyed by the *negotiated* dtype, and the
+    worker harness has to report it on the load response
+    (docs/inferio-worker-protocol.md, "Memory sensing") without knowing
+    which impl attribute — if any — holds it. Each worker process loads
+    exactly one model, so "the last decision in this process" is that
+    model's dtype. Read through `sys.modules` by the harness, which must
+    not import this package.
+    """
+    return _last_selected_dtype
+
+
 def select_dtype(
     device,
     preferred: str,
@@ -153,6 +170,18 @@ def select_dtype(
     produce inf/NaN in bf16-trained weights. fp16 runs on every CUDA arch
     we ship kernels for, so it is honoured as-is.
     """
+    dtype = _select_dtype(device, preferred, explicit, logger)
+    global _last_selected_dtype
+    _last_selected_dtype = dtype
+    return dtype
+
+
+def _select_dtype(
+    device,
+    preferred: str,
+    explicit: str | None = None,
+    logger: logging.Logger | None = None,
+) -> "torch.dtype":
     import torch
 
     log = logger or logging.getLogger(__name__)

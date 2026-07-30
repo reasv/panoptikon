@@ -37,7 +37,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmpv::Value;
@@ -137,6 +137,172 @@ pub enum WorkerOutput {
     Json(JsonValue),
 }
 
+/// One instant's view of the worker's GPU memory, as reported on `load` and
+/// `predict` responses (protocol doc, "Memory sensing"). Every field is
+/// optional: a worker with no torch, no CUDA or no NVML reports what it can
+/// and omits the rest, and absent always means "unknown" — never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySample {
+    pub free_mb: Option<u64>,
+    pub total_mb: Option<u64>,
+    /// Which driver `free_mb`/`total_mb` came from: `"nvml"` or `"torch"`
+    /// (`mem_get_info`). The two disagree by gigabytes on the same board —
+    /// NVML sees the whole board, `mem_get_info` the calling context's view —
+    /// so any consumer that differences two samples, or subtracts our own
+    /// footprint from `free_mb` to price *other* processes, must first check
+    /// that this matches. `None` when the worker could not read either.
+    pub free_source: Option<String>,
+    /// Caching-allocator pool size (`torch.cuda.memory_reserved`).
+    pub reserved_mb: Option<u64>,
+    /// Live tensor bytes (`torch.cuda.memory_allocated`).
+    pub allocated_mb: Option<u64>,
+}
+
+/// What the `load` response reports about the model's footprint. `base_mb`
+/// is the worker's whole-*process* device footprint (context + workspaces +
+/// weights), which is the currency the ledger charges residents in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadReport {
+    pub base_mb: Option<u64>,
+    /// `"nvml"` | `"free_delta"` | `"alloc_delta"` — provenance for the
+    /// calibration profile, kept as the worker sent it.
+    pub base_method: Option<String>,
+    pub reserved_at_load_mb: Option<u64>,
+    /// Negotiated load precision (`"fp16"`/`"bf16"`/`"fp32"`); part of the
+    /// profile key. `None` when nothing negotiated one.
+    pub dtype: Option<String>,
+    /// The board the worker's CUDA device 0 *actually* resolved to, as the
+    /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
+    /// be an index, absent, or a UUID CUDA reordered — is the authoritative
+    /// ledger identity for step 1b.
+    pub gpu_uuid: Option<String>,
+    /// That board's name per torch; part of the profile key.
+    pub gpu_name: Option<String>,
+    /// `torch.__version__`, part of the profile key and knowable only in the
+    /// worker (the orchestrator does not know its venv's torch).
+    pub torch_version: Option<String>,
+    pub memory: Option<MemorySample>,
+}
+
+/// One GPU batch the worker actually ran, from a `predict` response.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BatchMeasurement {
+    /// Inputs in the batch. Deliberately *not* cost-dimension units: only
+    /// the step-1b packing harness sees decoded inputs, so a dimension-priced
+    /// `units` field joins this map then (protocol doc, "Memory sensing").
+    pub items: Option<u64>,
+    pub reserved_before_mb: Option<u64>,
+    pub peak_reserved_mb: Option<u64>,
+    pub allocated_before_mb: Option<u64>,
+    pub peak_allocated_mb: Option<u64>,
+    pub duration_ms: Option<f64>,
+}
+
+/// A telemetry reading plus when it was recorded. The ledger has to be able
+/// to tell a fresh measurement from one taken before another process moved
+/// on the same board, and 1a is where the clock has to start being kept —
+/// timestamps cannot be reconstructed after the fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timestamped<T> {
+    pub captured_at: Instant,
+    pub value: T,
+}
+
+impl<T> Timestamped<T> {
+    fn now(value: T) -> Self {
+        Self {
+            captured_at: Instant::now(),
+            value,
+        }
+    }
+}
+
+/// One recorded batch measurement: the reading, when it arrived, and a
+/// per-worker sequence number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSample {
+    /// Strictly increasing per worker, starting at 1, and never reused —
+    /// including across ring evictions, which is what makes a gap
+    /// detectable.
+    pub seq: u64,
+    pub captured_at: Instant,
+    pub measurement: BatchMeasurement,
+}
+
+/// Everything a worker has told us about its memory, plus the GPU it was
+/// pinned to at spawn. Shared by `Arc` with whoever owns the [`Worker`]
+/// (the dispatcher task, after a load), because the budget arbiter is the
+/// manager, not the dispatcher: the manager keeps a clone of this handle per
+/// replica and reads it without disturbing anything.
+///
+/// Step 1a only records. The ledger that consumes these (grants, cost fits,
+/// eviction) is step 1b.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTelemetry {
+    /// Resolved `CUDA_VISIBLE_DEVICES` pin: a `GPU-…` board UUID once the
+    /// inventory is known, else whatever the registry asked for, else
+    /// `None` on hosts with no GPU inventory. Never changes after spawn.
+    /// Kept beside the worker-reported [`LoadReport::gpu_uuid`], which is the
+    /// identity the ledger keys on — the two can differ (an index pin, an
+    /// unknown inventory, a MIG instance).
+    pub gpu: Option<String>,
+    pub load: Option<Timestamped<LoadReport>>,
+    /// Freshest sample, from whichever response carried one last.
+    pub memory: Option<Timestamped<MemorySample>>,
+    /// Bounded ring of the most recent measurements, oldest first.
+    measurements: VecDeque<BatchSample>,
+    recorded: u64,
+}
+
+impl WorkerTelemetry {
+    /// Ring capacity. A window is a few hundred ms at worst, so 64 covers
+    /// seconds of history — enough for a fit to draw several samples per
+    /// read while the memory cost stays a fixed handful of KB per replica.
+    pub const RING: usize = 64;
+
+    /// Append the measurements of one `predict`, stamping each with the next
+    /// sequence number. Every measurement gets its own entry: a request that
+    /// the step-1b harness splits into several GPU batches is several fit
+    /// samples, and collapsing them (as last-write-wins did) throws away
+    /// exactly the varied batch sizes the cost model is fitted on.
+    fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
+        for measurement in batches {
+            self.recorded += 1;
+            self.measurements.push_back(BatchSample {
+                seq: self.recorded,
+                captured_at: Instant::now(),
+                measurement,
+            });
+            while self.measurements.len() > Self::RING {
+                self.measurements.pop_front();
+            }
+        }
+    }
+
+    /// The retained measurements, oldest first. **Non-draining**: several
+    /// readers coexist (today `/health`, in 1b the ledger's cost fit), so
+    /// nobody may consume on another's behalf.
+    ///
+    /// The intended 1b consumption pattern is a *watermark*, not a drain:
+    /// remember the last `seq` fitted and take everything above it. That
+    /// makes ring overflow visible instead of silent — if the oldest retained
+    /// `seq` is already above the watermark, samples were dropped between
+    /// reads (the reader is too slow, or the window rate too high) and the
+    /// fit knows its sample set has a hole rather than assuming continuity.
+    pub fn measurements(&self) -> impl DoubleEndedIterator<Item = &BatchSample> {
+        self.measurements.iter()
+    }
+
+    /// How many measurements this worker has ever reported, including ones
+    /// the ring has since evicted.
+    pub fn recorded_measurements(&self) -> u64 {
+        self.recorded
+    }
+}
+
+/// Shared handle to one worker's [`WorkerTelemetry`].
+pub type TelemetryHandle = Arc<Mutex<WorkerTelemetry>>;
+
 /// A per-request failure reported by a live worker (`error` frame). The
 /// worker remains serviceable after this — do not respawn on it.
 #[derive(Debug)]
@@ -200,6 +366,8 @@ pub struct Worker {
     stderr: Arc<Mutex<StderrTail>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     _job_guard: JobGuard,
+    /// Memory sensing shared with the manager (see [`WorkerTelemetry`]).
+    telemetry: TelemetryHandle,
     deadlines: WorkerDeadlines,
     /// Request ids are strictly increasing per worker (sanity checking only,
     /// per the protocol doc).
@@ -217,6 +385,8 @@ impl Worker {
     /// Spawn `python -m inferio_worker` per the protocol's spawn contract
     /// (INFERIO_WORKER=1, PYTHONPATH prepend, CUDA_VISIBLE_DEVICES when a
     /// device pin is given, PYTHONHOME removed, inherited env otherwise)
+    /// — `device` is the *resolved* pin, normally a `GPU-…` board UUID
+    /// (`gpu.rs`); this layer only writes what it is handed —
     /// and perform the v2
     /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
     /// no instantiation — within the handshake deadline. On any failure the
@@ -306,6 +476,10 @@ impl Worker {
             stderr: tail,
             stderr_task: Some(stderr_task),
             _job_guard: job_guard,
+            telemetry: Arc::new(Mutex::new(WorkerTelemetry {
+                gpu: device.clone(),
+                ..WorkerTelemetry::default()
+            })),
             deadlines: cfg.deadlines,
             next_id: 1,
             in_flight: false,
@@ -419,12 +593,43 @@ impl Worker {
     /// Send `load` and await `ok` within the load deadline. Requires a
     /// prior successful `configure`. Idempotent on the worker side (the
     /// impl's own load() guard).
+    ///
+    /// The response may carry the base measurement and a memory sample
+    /// (protocol doc, "Memory sensing"); both are recorded in the shared
+    /// [`WorkerTelemetry`] and acted on by nobody yet. A worker that reports
+    /// nothing (no torch, CPU/MPS host, remote-API impl) leaves the
+    /// telemetry untouched.
     pub async fn load(&mut self) -> Result<()> {
         let deadline = self.deadlines.load;
-        self.roundtrip("load", Vec::new(), Some(deadline))
+        let payload = self
+            .roundtrip("load", Vec::new(), Some(deadline))
             .await
-            .map(|_| ())
-            .with_context(|| format!("load failed for inferio worker {}", self.label))
+            .with_context(|| format!("load failed for inferio worker {}", self.label))?;
+        if let Some(report) = LoadReport::parse(&payload) {
+            tracing::debug!(
+                worker = %self.label,
+                base_mb = report.base_mb,
+                base_method = report.base_method.as_deref(),
+                dtype = report.dtype.as_deref(),
+                gpu_uuid = report.gpu_uuid.as_deref(),
+                gpu_name = report.gpu_name.as_deref(),
+                torch = report.torch_version.as_deref(),
+                "worker reported its load footprint"
+            );
+            if let Ok(mut telemetry) = self.telemetry.lock() {
+                if let Some(sample) = report.memory.clone() {
+                    telemetry.memory = Some(Timestamped::now(sample));
+                }
+                telemetry.load = Some(Timestamped::now(report));
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared memory-sensing handle for this worker, for the manager to keep
+    /// alongside the replica after the dispatcher takes ownership.
+    pub fn telemetry(&self) -> TelemetryHandle {
+        Arc::clone(&self.telemetry)
     }
 
     /// Send `predict` with the given inputs and return one output per input,
@@ -468,6 +673,19 @@ impl Worker {
                     .await);
             }
         };
+        // Memory sensing rides on the same frame (protocol doc): record the
+        // fresh sample and whatever batches the worker measured. Recorded
+        // only — admission is step 1b.
+        let measurements = BatchMeasurement::parse_list(map_get(&payload, "measurements"));
+        let sample = MemorySample::parse(map_get(&payload, "memory"));
+        if sample.is_some() || !measurements.is_empty() {
+            if let Ok(mut telemetry) = self.telemetry.lock() {
+                if let Some(sample) = sample {
+                    telemetry.memory = Some(Timestamped::now(sample));
+                }
+                telemetry.record_measurements(measurements);
+            }
+        }
         // A count mismatch would silently mis-route outputs once the
         // dispatcher splits batches per request; the worker cannot be
         // trusted after it.
@@ -877,6 +1095,99 @@ async fn read_frame(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
     let value = rmpv::decode::read_value(&mut payload.as_slice())
         .context("frame payload is not valid msgpack")?;
     Ok(value)
+}
+
+/// Whole-MiB field: msgpack integers as sent, floats rounded (a worker that
+/// ever switches to fractional MB must not silently read as absent).
+/// Negative or non-finite values are treated as unknown.
+fn field_u64(map: &[(Value, Value)], key: &str) -> Option<u64> {
+    match map_get(map, key)? {
+        Value::Integer(int) => int.as_u64(),
+        Value::F32(float) => float_to_u64(f64::from(*float)),
+        Value::F64(float) => float_to_u64(*float),
+        _ => None,
+    }
+}
+
+fn float_to_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some(value.round() as u64)
+}
+
+fn field_f64(map: &[(Value, Value)], key: &str) -> Option<f64> {
+    match map_get(map, key)? {
+        Value::F32(float) => Some(f64::from(*float)),
+        Value::F64(float) => Some(*float),
+        Value::Integer(int) => int.as_f64(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn field_string(map: &[(Value, Value)], key: &str) -> Option<String> {
+    map_get(map, key)?.as_str().map(str::to_owned)
+}
+
+impl MemorySample {
+    /// `None` when the field is absent or not a map, or when every value in
+    /// it is nil — an all-unknown sample carries no information.
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        let Value::Map(map) = value? else {
+            return None;
+        };
+        let sample = Self {
+            free_mb: field_u64(map, "free_mb"),
+            total_mb: field_u64(map, "total_mb"),
+            free_source: field_string(map, "free_source"),
+            reserved_mb: field_u64(map, "reserved_mb"),
+            allocated_mb: field_u64(map, "allocated_mb"),
+        };
+        (sample != Self::default()).then_some(sample)
+    }
+}
+
+impl LoadReport {
+    /// `None` when the response carried no memory-sensing fields at all,
+    /// which is how an older worker (or one with no torch) answers.
+    fn parse(payload: &[(Value, Value)]) -> Option<Self> {
+        let report = Self {
+            base_mb: field_u64(payload, "base_mb"),
+            base_method: field_string(payload, "base_method"),
+            reserved_at_load_mb: field_u64(payload, "reserved_at_load_mb"),
+            dtype: field_string(payload, "dtype"),
+            gpu_uuid: field_string(payload, "gpu_uuid"),
+            gpu_name: field_string(payload, "gpu_name"),
+            torch_version: field_string(payload, "torch_version"),
+            memory: MemorySample::parse(map_get(payload, "memory")),
+        };
+        (report != Self::default()).then_some(report)
+    }
+}
+
+impl BatchMeasurement {
+    fn parse_list(value: Option<&Value>) -> Vec<Self> {
+        let Some(Value::Array(entries)) = value else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let Value::Map(map) = entry else {
+                    return None;
+                };
+                Some(Self {
+                    items: field_u64(map, "items"),
+                    reserved_before_mb: field_u64(map, "reserved_before_mb"),
+                    peak_reserved_mb: field_u64(map, "peak_reserved_mb"),
+                    allocated_before_mb: field_u64(map, "allocated_before_mb"),
+                    peak_allocated_mb: field_u64(map, "peak_allocated_mb"),
+                    duration_ms: field_f64(map, "duration_ms"),
+                })
+            })
+            .collect()
+    }
 }
 
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
@@ -1466,6 +1777,153 @@ mod tests {
         assert!(
             err.downcast_ref::<WorkerError>().is_none(),
             "version mismatch is a fatal supervision error, not a worker error frame"
+        );
+    }
+
+    fn measurement(items: u64) -> BatchMeasurement {
+        BatchMeasurement {
+            items: Some(items),
+            ..BatchMeasurement::default()
+        }
+    }
+
+    /// Every measurement is kept, not just the last response's: the cost fit
+    /// in step 1b is fitted on a *set* of (units, peak) points, so the
+    /// telemetry is a bounded ring with per-worker sequence numbers rather
+    /// than a last-write-wins slot. Sequence numbers keep climbing across
+    /// ring evictions, which is what lets a watermark reader notice it lost
+    /// samples instead of assuming continuity.
+    #[test]
+    fn successive_predicts_retain_every_measurement() {
+        let mut telemetry = WorkerTelemetry::default();
+        for items in 1..=3 {
+            telemetry.record_measurements(vec![measurement(items)]);
+        }
+        assert_eq!(telemetry.recorded_measurements(), 3);
+        assert_eq!(
+            telemetry
+                .measurements()
+                .map(|sample| (sample.seq, sample.measurement.items))
+                .collect::<Vec<_>>(),
+            vec![(1, Some(1)), (2, Some(2)), (3, Some(3))],
+            "oldest first, one entry per measurement"
+        );
+
+        // One response carrying several GPU batches (the step-1b packing
+        // harness) contributes one sample each.
+        telemetry.record_measurements(vec![measurement(10), measurement(11)]);
+        assert_eq!(telemetry.recorded_measurements(), 5);
+        assert_eq!(
+            telemetry.measurements().next_back().map(|s| s.seq),
+            Some(5)
+        );
+
+        // Overflow: the ring is bounded, the counter is not.
+        for items in 0..WorkerTelemetry::RING as u64 {
+            telemetry.record_measurements(vec![measurement(items)]);
+        }
+        assert_eq!(telemetry.measurements().count(), WorkerTelemetry::RING);
+        assert_eq!(
+            telemetry.recorded_measurements(),
+            5 + WorkerTelemetry::RING as u64
+        );
+        let oldest = telemetry.measurements().next().expect("ring is full").seq;
+        assert!(
+            oldest > 1,
+            "the oldest retained seq moved past 1, so a stale watermark is \
+             detectable as a gap"
+        );
+        assert_eq!(
+            telemetry.measurements().next_back().map(|s| s.seq),
+            Some(telemetry.recorded_measurements()),
+            "the newest sample's seq is the running count"
+        );
+    }
+
+    /// The worker is a separate process and its response map is untrusted
+    /// input: a wrong type, a negative count or a nil where a map belongs
+    /// must read as "unknown", never as a wrong number and never as a
+    /// protocol failure (the load itself succeeded).
+    #[test]
+    fn load_report_parse_tolerates_wrong_types() {
+        let garbage = vec![
+            (Value::from("base_mb"), Value::from("4321")),
+            (Value::from("base_method"), Value::from(7i64)),
+            (Value::from("reserved_at_load_mb"), Value::from(-5i64)),
+            (Value::from("dtype"), Value::from(2.5f64)),
+            (Value::from("gpu_uuid"), Value::Nil),
+            (Value::from("memory"), Value::Nil),
+        ];
+        assert_eq!(
+            LoadReport::parse(&garbage),
+            None,
+            "nothing usable is the same as an older worker reporting nothing"
+        );
+
+        // memory as an array (not a map) is ignored while the good fields
+        // around it survive.
+        let mixed = vec![
+            (Value::from("base_mb"), Value::from(4321u64)),
+            (Value::from("base_method"), Value::from("nvml")),
+            (
+                Value::from("memory"),
+                Value::Array(vec![Value::from(1u64), Value::from(2u64)]),
+            ),
+            (Value::from("gpu_uuid"), Value::from("GPU-1a2b")),
+            (Value::from("gpu_name"), Value::from(42i64)),
+            (Value::from("torch_version"), Value::from("2.7.1+cu128")),
+        ];
+        let report = LoadReport::parse(&mixed).expect("the good fields are kept");
+        assert_eq!(report.base_mb, Some(4321));
+        assert_eq!(report.base_method.as_deref(), Some("nvml"));
+        assert_eq!(report.memory, None);
+        assert_eq!(report.gpu_uuid.as_deref(), Some("GPU-1a2b"));
+        assert_eq!(report.gpu_name, None, "a non-string name is unknown");
+        assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
+
+        // A whole-MiB float (a worker that ever switches to fractional MB)
+        // rounds rather than reading as absent; a negative one is unknown.
+        let floats = vec![
+            (Value::from("base_mb"), Value::from(1536.4f64)),
+            (Value::from("reserved_at_load_mb"), Value::from(-1.0f64)),
+        ];
+        let report = LoadReport::parse(&floats).expect("float base is usable");
+        assert_eq!(report.base_mb, Some(1536));
+        assert_eq!(report.reserved_at_load_mb, None);
+    }
+
+    /// The measurement array is per-batch data from the same untrusted
+    /// source: entries that are not maps are skipped, not fatal, and a
+    /// non-array field yields no measurements at all.
+    #[test]
+    fn measurement_list_skips_non_map_entries() {
+        let list = Value::Array(vec![
+            Value::Nil,
+            Value::from(7i64),
+            Value::Map(vec![
+                (Value::from("items"), Value::from(8u64)),
+                (Value::from("peak_reserved_mb"), Value::from(1200u64)),
+                (Value::from("duration_ms"), Value::from(12.5f64)),
+            ]),
+            Value::Array(vec![Value::from("items")]),
+            Value::Map(vec![(Value::from("items"), Value::from("eight"))]),
+        ]);
+        let measurements = BatchMeasurement::parse_list(Some(&list));
+        assert_eq!(measurements.len(), 2, "only the two maps became entries");
+        assert_eq!(measurements[0].items, Some(8));
+        assert_eq!(measurements[0].peak_reserved_mb, Some(1200));
+        assert_eq!(measurements[0].duration_ms, Some(12.5));
+        assert_eq!(
+            measurements[1],
+            BatchMeasurement::default(),
+            "a map with only unusable values is an all-unknown measurement"
+        );
+
+        assert!(BatchMeasurement::parse_list(None).is_empty());
+        assert!(BatchMeasurement::parse_list(Some(&Value::Nil)).is_empty());
+        assert!(
+            BatchMeasurement::parse_list(Some(&Value::from("measurements"))).is_empty(),
+            "a non-array field is no measurements, not a panic"
         );
     }
 }

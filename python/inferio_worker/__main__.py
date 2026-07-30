@@ -143,7 +143,7 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
-    from inferio_worker import protocol
+    from inferio_worker import memory, protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
     impl_cls = _handshake(proto_in, proto_out)
@@ -226,11 +226,19 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 )
                 continue
             try:
+                # Memory sensing (docs/batch-calibration-design.md "Base
+                # measurement"): bracket the load so the orchestrator gets
+                # the process-level footprint it charges this worker for.
+                # Every field is optional — `finish_load` returns {} when
+                # nothing could be measured (no torch, CPU/MPS, no NVML).
+                before = memory.begin_load()
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
                 instance.load()
                 loaded = True
-                _send_ok(proto_out, req_id)
+                _send_ok(
+                    proto_out, req_id, **memory.finish_load(before, instance)
+                )
             except Exception as e:
                 logger.error(
                     "%s - load failed: %s", inference_id, e, exc_info=True
@@ -257,8 +265,19 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     prediction_input_from_frame(entry)
                     for entry in msg.get("inputs") or []
                 ]
+                batch = memory.begin_batch()
                 outputs = list(instance.predict(inputs))
-                _send_ok(proto_out, req_id, outputs=outputs)
+                # One measurement for the whole call in step 1a; the
+                # packing harness (step 1b) will report one per GPU batch,
+                # which is why the wire field is a list. What we can count
+                # here is inputs, not cost-dimension units — units need the
+                # decoded inputs the packing harness will own.
+                _send_ok(
+                    proto_out,
+                    req_id,
+                    outputs=outputs,
+                    **memory.finish_batch(batch, items=len(inputs)),
+                )
             except Exception as e:
                 # Includes serialization failures from write_frame (bad
                 # output type, oversized response): packing happens before

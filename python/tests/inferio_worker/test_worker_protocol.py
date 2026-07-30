@@ -589,6 +589,89 @@ def test_oom_error_frame_preserves_prefix(worker: WorkerProcess) -> None:
     assert worker.wait() == 0
 
 
+MEMORY_SAMPLE_KEYS = (
+    "free_mb",
+    "total_mb",
+    "free_source",
+    "reserved_mb",
+    "allocated_mb",
+)
+
+
+def test_load_memory_fields_are_optional(worker: WorkerProcess) -> None:
+    # Expected behavior: the memory-sensing fields on the load response are
+    # optional (docs/inferio-worker-protocol.md "Memory sensing"). The echo
+    # fixture never imports torch, so the worker has no allocator to measure
+    # and reports no base/dtype at all — the load reply is a plain ok, and a
+    # consumer sees "unknown", never a wrong number. Whatever it does report
+    # must have the declared type.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 3
+    assert resp.get("base_mb") is None, resp
+    assert resp.get("base_method") is None, resp
+    assert resp.get("reserved_at_load_mb") is None, resp
+    assert resp.get("dtype") is None, resp
+    # No torch in the fixture, so no board identity and no torch version
+    # either — all three are worker-only knowledge and all three are absent
+    # rather than guessed.
+    assert resp.get("gpu_uuid") is None, resp
+    assert resp.get("gpu_name") is None, resp
+    assert resp.get("torch_version") is None, resp
+    sample = resp.get("memory")
+    if sample is not None:  # only on a host with NVML available
+        assert set(sample) == set(MEMORY_SAMPLE_KEYS)
+
+
+def test_predict_reports_one_measurement_per_call(worker: WorkerProcess) -> None:
+    # Expected behavior: `measurements` is always reported (the input count
+    # and wall time need no torch), one entry per GPU batch — one for the
+    # whole call today. The measured count is `items`, deliberately not
+    # cost-dimension `units`: only the step-1b packing harness sees decoded
+    # inputs. The memory columns are None on a torch-less worker, which is
+    # exactly the degradation the wire contract promises.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": 1, "file": None}, {"data": 2, "file": None}]
+    worker.send({"type": "predict", "id": 4, "inputs": inputs})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": 1}, {"echo": 2}]
+
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, measurements
+    measurement = measurements[0]
+    assert measurement["items"] == 2
+    assert isinstance(measurement["duration_ms"], float)
+    assert measurement["duration_ms"] >= 0.0
+    for key in (
+        "reserved_before_mb",
+        "peak_reserved_mb",
+        "allocated_before_mb",
+        "peak_allocated_mb",
+    ):
+        assert measurement[key] is None, measurement
+
+    # A second predict re-measures from scratch rather than accumulating.
+    worker.send(
+        {"type": "predict", "id": 5, "inputs": [{"data": 3, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["measurements"][0]["items"] == 1
+
+
 def test_broken_module_does_not_prevent_discovery(
     worker: WorkerProcess,
 ) -> None:

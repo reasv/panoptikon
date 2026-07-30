@@ -18,6 +18,7 @@ import torch
 from inferio.impl.utils import (
     cuda_capability,
     get_device,
+    last_selected_dtype,
     select_ct2_compute_type,
     select_dtype,
 )
@@ -112,6 +113,22 @@ class TestSelectDtype:
                 torch.cuda, "is_bf16_supported", return_value=False
             ):
                 assert select_dtype(CUDA, "bf16") is torch.float32
+
+    def test_last_decision_is_recorded_for_the_worker(self):
+        # The worker harness reports the *negotiated* dtype on the load
+        # response (it is part of the calibration profile key) and reads it
+        # from here when the impl exposes no attribute of its own. Each
+        # worker process loads exactly one model, so the last decision is
+        # that model's dtype.
+        with _patch_hip(None), _patch_cap(8, 0):
+            got = select_dtype(CUDA, "bf16")
+        assert last_selected_dtype() is got is torch.bfloat16
+        assert select_dtype(CPU, "fp16") is torch.float32
+        assert last_selected_dtype() is torch.float32
+        # A rejected precision must not overwrite the last good decision.
+        with pytest.raises(ValueError):
+            select_dtype(CPU, "int8")
+        assert last_selected_dtype() is torch.float32
 
 
 class TestGetDeviceCapabilityGuard:

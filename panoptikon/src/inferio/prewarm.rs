@@ -34,6 +34,12 @@
 //!   failed `prepare()` is per-request and non-fatal — the worker is parked
 //!   anyway (health state `failed_prepare`) and a later claim just pays the
 //!   imports at `load`.
+//! - GPU pin: since every worker is pinned to exactly one board
+//!   (docs/batch-calibration-design.md), pooled workers are spawned on the
+//!   *default* board — the same one an unpinned replica resolves to — and
+//!   the pin is recorded in the slot so `claim` can require pin equality.
+//!   Without that the pool would either hand out workers that violate a
+//!   replica's pin or hold workers nobody can ever claim.
 //!
 //! Locking: the pool has its own mutex, never held together with the
 //! manager's state mutex, and never across await. Warm workers spawn on
@@ -49,6 +55,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use super::gpu::GpuInventory;
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerSpawnConfig};
 use crate::db::extraction_log::get_search_embedding_setters;
@@ -106,6 +113,11 @@ enum Slot {
     Parked {
         worker: Worker,
         failed_prepare: bool,
+        /// The `CUDA_VISIBLE_DEVICES` pin this process was spawned with —
+        /// the default GPU's UUID when the inventory is known. A claim is
+        /// only valid for a replica whose resolved pin is the same, so the
+        /// pin has to be recorded rather than assumed.
+        pin: Option<String>,
     },
 }
 
@@ -124,15 +136,23 @@ struct PoolState {
 pub struct PrewarmPool {
     cfg: PrewarmConfig,
     spawn: WorkerSpawnConfig,
+    /// Probed GPUs; the pool spawns its workers on the default board so a
+    /// claim can satisfy an unpinned replica (see [`Slot::Parked::pin`]).
+    gpus: GpuInventory,
     state: StdMutex<PoolState>,
     weak: std::sync::OnceLock<Weak<PrewarmPool>>,
 }
 
 impl PrewarmPool {
-    pub(crate) fn new(spawn: WorkerSpawnConfig, cfg: PrewarmConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        spawn: WorkerSpawnConfig,
+        cfg: PrewarmConfig,
+        gpus: GpuInventory,
+    ) -> Arc<Self> {
         let pool = Arc::new(Self {
             cfg,
             spawn,
+            gpus,
             state: StdMutex::new(PoolState::default()),
             weak: std::sync::OnceLock::new(),
         });
@@ -174,6 +194,9 @@ impl PrewarmPool {
             weak,
             self.spawn.clone(),
             impl_class.to_owned(),
+            // Universal pinning: an unpinned replica resolves to this same
+            // board, so a worker warmed here is claimable for it.
+            self.gpus.default_pin(),
         ));
         state.tasks.push(task);
     }
@@ -193,20 +216,44 @@ impl PrewarmPool {
     /// discards the worker and returns None — the caller falls back to a
     /// fresh spawn. A `Spawning` slot is left alone (the warm-up lands in
     /// the pool for next time).
-    pub(crate) async fn claim(&self, impl_class: &str) -> Option<Worker> {
+    ///
+    /// `wanted_pin` is the resolved `CUDA_VISIBLE_DEVICES` value of the
+    /// replica being filled. The claim only happens when the parked worker
+    /// was spawned with exactly that pin: handing a worker pinned to board A
+    /// to a replica that must run on board B would put its footprint on the
+    /// wrong ledger (and on the wrong GPU). A mismatch leaves the worker
+    /// parked for a replica that can use it.
+    pub(crate) async fn claim(
+        &self,
+        impl_class: &str,
+        wanted_pin: Option<&str>,
+    ) -> Option<Worker> {
         if !self.cfg.enabled {
             return None;
         }
         let slot = {
             let mut state = self.state.lock().unwrap();
             match state.slots.get(impl_class) {
-                Some(Slot::Parked { .. }) => state.slots.remove(impl_class),
+                Some(Slot::Parked { pin, .. }) if pin.as_deref() == wanted_pin => {
+                    state.slots.remove(impl_class)
+                }
+                Some(Slot::Parked { pin, .. }) => {
+                    tracing::debug!(
+                        impl_class,
+                        parked_pin = pin.as_deref().unwrap_or("<unpinned>"),
+                        wanted_pin = wanted_pin.unwrap_or("<unpinned>"),
+                        "parked worker sits on a different GPU than the replica needs; \
+                         leaving it parked"
+                    );
+                    None
+                }
                 _ => None,
             }
         };
         let Some(Slot::Parked {
             mut worker,
             failed_prepare,
+            ..
         }) = slot
         else {
             return None;
@@ -310,6 +357,7 @@ impl PrewarmPool {
         let Some(Slot::Parked {
             mut worker,
             failed_prepare,
+            pin,
         }) = slot
         else {
             return false;
@@ -320,6 +368,7 @@ impl PrewarmPool {
             Slot::Parked {
                 worker,
                 failed_prepare,
+                pin,
             },
         );
         true
@@ -331,9 +380,14 @@ impl PrewarmPool {
 /// per the design — the imports just weren't saved; the claim still skips
 /// process start + handshake. Fatal failures (spawn error, protocol
 /// violation, death) drop the slot so a later ensure_warm retries.
-async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, impl_class: String) {
+async fn warm_worker_task(
+    pool: Weak<PrewarmPool>,
+    spawn: WorkerSpawnConfig,
+    impl_class: String,
+    pin: Option<String>,
+) {
     let outcome = async {
-        let mut worker = Worker::spawn(&spawn, &impl_class, None).await?;
+        let mut worker = Worker::spawn(&spawn, &impl_class, pin.clone()).await?;
         let failed_prepare = match worker.prewarm().await {
             Ok(()) => false,
             Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
@@ -364,12 +418,18 @@ async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, imp
                 if state.shutting_down {
                     Some(worker)
                 } else {
-                    tracing::info!(impl_class = %impl_class, failed_prepare, "prewarmed worker parked");
+                    tracing::info!(
+                        impl_class = %impl_class,
+                        failed_prepare,
+                        device = pin.as_deref().unwrap_or("<unpinned>"),
+                        "prewarmed worker parked"
+                    );
                     state.slots.insert(
                         impl_class.clone(),
                         Slot::Parked {
                             worker,
                             failed_prepare,
+                            pin,
                         },
                     );
                     None
@@ -579,6 +639,13 @@ config.impl_class = "prepare_test"
 [group.coldgrp]
 config.impl_class = "echo_test"
 [group.coldgrp.inference_ids.model]
+
+# Same family as `prep`, but pinned to a board the pool's worker is not on:
+# the claim must be refused on pin inequality.
+[group.pinned]
+config.impl_class = "prepare_test"
+config.devices = ["3"]
+[group.pinned.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -586,7 +653,13 @@ config.impl_class = "echo_test"
         _registry_dir: tempfile::TempDir,
     }
 
+    /// Pool tests default to an unknown GPU inventory (no pinning, exactly
+    /// like a CPU host); [`test_manager_with_gpus`] covers the pinned pool.
     fn test_manager(prewarm: PrewarmConfig) -> TestSetup {
+        test_manager_with_gpus(prewarm, GpuInventory::unknown())
+    }
+
+    fn test_manager_with_gpus(prewarm: PrewarmConfig, gpus: GpuInventory) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
@@ -597,6 +670,7 @@ config.impl_class = "echo_test"
             default_max_batch: 32,
             sweep_interval: Duration::from_secs(60),
             prewarm,
+            gpus,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -888,6 +962,137 @@ config.impl_class = "echo_test"
             manager.prewarm_pool().health().warm.is_empty(),
             "the failed-prepare slot was consumed by the claim (lazy off)"
         );
+
+        manager.shutdown().await;
+    }
+
+    /// Inventory whose default board is GPU-0000, with a second board an
+    /// explicit `devices = ["3"]` pin resolves to.
+    fn test_gpus() -> GpuInventory {
+        GpuInventory::known(vec![
+            crate::inferio::gpu::GpuInfo {
+                index: 0,
+                uuid: "GPU-0000".into(),
+                name: "Test GPU 0".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+            },
+            crate::inferio::gpu::GpuInfo {
+                index: 3,
+                uuid: "GPU-3333".into(),
+                name: "Test GPU 3".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+            },
+        ])
+    }
+
+    /// Pinned pool, matching pin: with a known GPU inventory the pool warms
+    /// its worker on the default board, which is exactly where an unpinned
+    /// replica now lands — so the claim still happens (prepared:true). This
+    /// is the collision the design flagged: a pool that kept spawning
+    /// unpinned workers would hold workers no pinned replica could claim.
+    #[tokio::test]
+    async fn pinned_pool_worker_is_claimable_by_an_unpinned_replica() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict auto-loads via the claimed worker");
+        assert!(
+            reported_prepared(&outputs),
+            "the pooled worker sits on the same board the replica resolves to, so it is claimable"
+        );
+        assert!(
+            manager.prewarm_pool().health().warm.is_empty(),
+            "the claim consumed the slot"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A claimed worker keeps the pin it was *spawned* with (in the pool),
+    /// and step 1b's ledger reads a replica's GPU off its telemetry — so the
+    /// claim path must not leave that blank. It matters here specifically
+    /// because a claimed replica never goes through `Worker::spawn` at load
+    /// time: there is no second chance to record the pin.
+    #[tokio::test]
+    async fn claimed_pool_worker_records_the_replica_pin() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+        let outputs = manager
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict auto-loads via the claimed worker");
+        assert!(reported_prepared(&outputs), "the claim must have happened");
+
+        let health = manager.health();
+        let replica = &health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "prep/test")
+            .expect("claimed model in health")
+            .replicas_detail[0];
+        assert_eq!(
+            replica.gpu.as_deref(),
+            Some("GPU-0000"),
+            "the claimed pool worker records the replica's pin: {replica:?}"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Pin inequality refuses the claim: the pooled worker is on the default
+    /// board, the model's replica is pinned to another one, so the load
+    /// fresh-spawns (prepared:false) and the warm worker stays parked for a
+    /// replica that can actually use it. Handing it over would put the
+    /// model's footprint on the wrong GPU and the wrong ledger.
+    #[tokio::test]
+    async fn claim_is_refused_when_the_parked_worker_sits_on_another_gpu() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "pinned/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict loads a fresh worker on the pinned board");
+        assert!(
+            !reported_prepared(&outputs),
+            "a worker parked on another board must not be claimed"
+        );
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
 
         manager.shutdown().await;
     }

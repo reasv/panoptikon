@@ -140,6 +140,10 @@ impl InferioState {
             cwd: None,
             deadlines,
         };
+        // One nvidia-smi call answers both hardware questions: which boards
+        // exist (worker→GPU pinning, the per-GPU ledger) and what they can
+        // do (the /metadata availability overlay). Probed once at startup.
+        let host = super::gpu::probe();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -150,13 +154,14 @@ impl InferioState {
                     lazy: local.prewarm.lazy,
                     always_warm: local.prewarm.always_warm.clone(),
                 },
+                gpus: host.inventory,
             },
             Arc::clone(&registry),
         );
         Ok(Arc::new(Self {
             manager,
             registry,
-            compute_caps: super::capability::HostComputeCaps::probe(),
+            compute_caps: host.caps,
         }))
     }
 
@@ -756,6 +761,10 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
         HealthReport,
         super::manager::ModelHealth,
         super::manager::ReplicaHealth,
+        super::manager::CostHealth,
+        super::manager::ReplicaTelemetryHealth,
+        super::manager::BatchHealth,
+        super::gpu::GpuInfo,
         super::prewarm::PrewarmHealth,
         super::prewarm::PrewarmWorkerHealth
     ))
@@ -1033,6 +1042,8 @@ metadata.description = "echo fixture"
                 default_max_batch: 32,
                 sweep_interval: Duration::from_secs(60),
                 prewarm,
+                // Tests must not depend on the host's GPUs.
+                gpus: super::super::gpu::GpuInventory::unknown(),
             },
             Arc::clone(&registry),
         );

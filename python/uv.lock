@@ -891,6 +891,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-ml-py"
+version = "13.610.43"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/b5/a8fbc356f768fa5c9cfd646668fd7d34bf55bdd1c6e20754642a64d930d4/nvidia_ml_py-13.610.43.tar.gz", hash = "sha256:65437eb73d68d0c62c931ca4d45038472faff03bd0b8729abba4b899f70d60f2", size = 52109, upload-time = "2026-06-01T18:54:08.829Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/45/caa600acfab94560807a20a64b5830d2cd3c3202b7f1328644d70b7d6bd8/nvidia_ml_py-13.610.43-py3-none-any.whl", hash = "sha256:f13c72698edef492f985cc225f14faafe68ae065a2e407f45bdf6f4b9b43fde8", size = 53163, upload-time = "2026-06-01T18:54:07.704Z" },
+]
+
+[[package]]
 name = "nvidia-nccl-cu12"
 version = "2.26.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1080,6 +1089,7 @@ dependencies = [
     { name = "msgpack" },
     { name = "nodejs-wheel" },
     { name = "numpy" },
+    { name = "nvidia-ml-py" },
     { name = "pandas" },
     { name = "pillow" },
     { name = "psutil" },
@@ -1142,6 +1152,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "nvidia-cublas-cu12", marker = "(sys_platform == 'linux' and extra == 'cu128') or (sys_platform == 'win32' and extra == 'cu128')", specifier = ">=12.1.3.1" },
     { name = "nvidia-cudnn-cu12", marker = "(sys_platform == 'linux' and extra == 'cu128') or (sys_platform == 'win32' and extra == 'cu128')", specifier = ">=9.1.0.70" },
+    { name = "nvidia-ml-py", specifier = ">=12.535" },
     { name = "pandas", specifier = ">=2.2.3,<3" },
     { name = "pillow", specifier = ">=10.4.0,<11" },
     { name = "psutil", specifier = ">=7.0.0" },

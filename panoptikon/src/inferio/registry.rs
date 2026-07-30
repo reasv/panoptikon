@@ -52,6 +52,20 @@
 //!   (explicit beats silent), validated per id at load time against the
 //!   merged config so the error names the offending inference id.
 //!
+//! What a `devices` **index** means (batch-calibration step 1a): indices are
+//! interpreted in **NVML/nvidia-smi order** — PCI-bus-stable, the order
+//! `nvidia-smi -L` prints — and are mapped to that board's UUID at spawn
+//! (`gpu.rs`), so a pin means the same physical card across reboots and the
+//! ledger key never moves. They are *not* CUDA-runtime indices, which depend
+//! on `CUDA_DEVICE_ORDER` (default `FASTEST_FIRST`) and can name a different
+//! board than the same number does here. A `GPU-…`/`MIG-…` UUID in `devices`
+//! bypasses the mapping and is passed to `CUDA_VISIBLE_DEVICES` verbatim,
+//! which is the unambiguous form to write. When the GPU inventory is unknown
+//! (no nvidia-smi: CPU/MPS/ROCm hosts, or an ambient `CUDA_VISIBLE_DEVICES`
+//! that names indices) the string is passed through raw exactly as it was
+//! before pinning existed — no mapping, no new environment variables, no
+//! behaviour change on those hosts.
+//!
 //! JSON object key order IS semantic here: Python dicts preserve insertion
 //! order, FastAPI serializes `/metadata` in that order, and the web UI
 //! renders model-group tabs and model rows in that key order (the registry
