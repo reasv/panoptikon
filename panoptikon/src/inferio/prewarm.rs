@@ -672,6 +672,9 @@ config.devices = ["3"]
             prewarm,
             gpus,
             vram: crate::inferio::ledger::VramBudget::default(),
+            // No calibration store: these tests never touch the ledger's
+            // profile paths, and a store would put a file write in their way.
+            calibration: None,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),

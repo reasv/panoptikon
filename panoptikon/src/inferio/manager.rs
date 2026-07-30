@@ -69,8 +69,9 @@ use super::dispatch::{
     DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
 };
 use super::gpu::{GpuInfo, GpuInventory};
+use super::calibration::CalibrationProfiles;
 use super::ledger::{
-    Admission, BaseProfileLookup, GpuBudgetHealth, LoadReservation, VramBudget, VramLedger,
+    Admission, GpuBudgetHealth, LoadReservation, VramBudget, VramLedger,
 };
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
@@ -101,6 +102,11 @@ pub struct ManagerConfig {
     /// config plumbing, including per-board-UUID overrides; until then every
     /// board runs on the defaults (margin 0.10 on, `cap_fraction` off).
     pub vram: VramBudget,
+    /// The calibration store: shipped baselines and the local generated
+    /// profile file. `None` leaves the ledger unprimed and unpersisted,
+    /// which is exactly the pre-store behaviour (tests, and any embedder
+    /// that does not want a file).
+    pub calibration: Option<Arc<dyn CalibrationProfiles>>,
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -747,9 +753,10 @@ impl ModelManager {
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
         // The ledger's board set comes from the same one-shot probe the pins
         // do, so a grant's board key and a worker's `CUDA_VISIBLE_DEVICES`
-        // can never describe different hardware. `None` profiles: the
-        // calibration store (and its shipped baselines) is step 1c.
-        let ledger = VramLedger::new(&cfg.gpus, cfg.vram, None::<Arc<dyn BaseProfileLookup>>);
+        // can never describe different hardware. The calibration store primes
+        // it (fit, expected base, and — from local profiles only — the
+        // ratchet anchor) and receives its updates.
+        let ledger = VramLedger::new(&cfg.gpus, cfg.vram, cfg.calibration.clone());
         let manager = Arc::new(Self {
             cfg,
             registry,
@@ -1028,6 +1035,12 @@ impl ModelManager {
             }
         };
         tokio::join!(drain, self.prewarm.shutdown());
+        // Last: the calibration a window earned seconds before the quit is
+        // still sitting behind the store's write debounce, and losing it
+        // would silently mean re-ramping on the next run.
+        if let Some(calibration) = self.cfg.calibration.clone() {
+            let _ = tokio::task::spawn_blocking(move || calibration.flush()).await;
+        }
     }
 
     /// Called by a dispatcher task after a fatal worker death: drop the
@@ -1868,6 +1881,7 @@ config.replicas = 2
             default_max_batch,
             deadlines,
             GpuInventory::unknown(),
+            None,
         )
     }
 
@@ -1877,6 +1891,17 @@ config.replicas = 2
             32,
             WorkerDeadlines::default(),
             gpus,
+            None,
+        )
+    }
+
+    fn test_manager_with_calibration(calibration: Arc<dyn CalibrationProfiles>) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            GpuInventory::unknown(),
+            Some(calibration),
         )
     }
 
@@ -1885,6 +1910,7 @@ config.replicas = 2
         default_max_batch: u32,
         deadlines: WorkerDeadlines,
         gpus: GpuInventory,
+        calibration: Option<Arc<dyn CalibrationProfiles>>,
     ) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
@@ -1907,6 +1933,9 @@ config.replicas = 2
             },
             gpus,
             vram: VramBudget::default(),
+            // Usually no calibration store: these tests assert manager
+            // semantics, and a store would make them write a profile file.
+            calibration,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -2445,6 +2474,76 @@ config.replicas = 2
         );
 
         manager.shutdown().await;
+    }
+
+    /// Shutdown flushes the calibration store. A window that landed inside
+    /// the write debounce is exactly the desktop case — quitting a few
+    /// seconds after a ramp step — and losing it would silently mean
+    /// re-ramping on the next run.
+    #[tokio::test]
+    async fn shutdown_flushes_the_calibration_store() {
+        use super::super::calibration::{CalibrationStore, ProfileUpdate, StoreEnv, StorePaths};
+        use super::super::ledger::FitSample;
+
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("inferio/calibration.toml");
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: Vec::new(),
+                local_path: path.clone(),
+            },
+            StoreEnv {
+                platform: "linux".to_owned(),
+                backend: "cuda".to_owned(),
+                generator: "panoptikon test".to_owned(),
+            },
+            Duration::from_secs(3600),
+        );
+        let setup = test_manager_with_calibration(Arc::clone(&store) as Arc<dyn CalibrationProfiles>);
+        let update = |slope: f64| ProfileUpdate {
+            inference_id: "echo/test".to_owned(),
+            epoch: 1,
+            gpu_name: "TEST 9000".to_owned(),
+            torch: "2.7.1+cu128".to_owned(),
+            dtype: "fp16".to_owned(),
+            unit: "item",
+            aggregation: "count",
+            base_mb: 1000,
+            base_method: Some("nvml".to_owned()),
+            slope_mb_per_unit: slope,
+            residual_mb: 0.0,
+            samples: 3,
+            knee_units: None,
+            max_units_measured: 16,
+            local_samples: 3,
+            ring: vec![FitSample {
+                units: 16,
+                delta_mb: 160,
+            }],
+        };
+
+        // The first update has no previous write to wait behind, so it lands
+        // on its own and primes the debounce.
+        store.record(update(0.25));
+        let mut waited = Duration::ZERO;
+        while !path.exists() && waited < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+        assert!(path.exists(), "the first update reaches disk");
+
+        // The second is an hour behind the debounce — only a flush saves it.
+        store.record(update(0.75));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !fs::read_to_string(&path).unwrap().contains("0.75"),
+            "still waiting out the debounce"
+        );
+        setup.manager.shutdown().await;
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("0.75"),
+            "the quit flushed what the debounce was holding"
+        );
     }
 
     /// Graceful manager shutdown: workers are unloaded via the graceful

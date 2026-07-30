@@ -6681,7 +6681,9 @@
           "deflation",
           "clean_windows",
           "unit_budget",
-          "max_units_measured"
+          "max_units_measured",
+          "local_samples",
+          "effective_margin"
         ],
         "properties": {
           "base_mb": {
@@ -6710,6 +6712,11 @@
             "description": "Halvings currently applied by OOM / throughput-collapse deflation.",
             "minimum": 0
           },
+          "effective_margin": {
+            "type": "number",
+            "format": "double",
+            "description": "The margin this model's windows are actually priced under: the\nboard's configured margin, widened while the fit is unconfirmed or\nscattered."
+          },
           "fit": {
             "oneOf": [
               {
@@ -6737,6 +6744,12 @@
           },
           "inference_id": {
             "type": "string"
+          },
+          "local_samples": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Local clean high-water samples behind this model's fit, including any\na local calibration profile restored. Below\n`LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.",
+            "minimum": 0
           },
           "max_units_measured": {
             "type": "integer",

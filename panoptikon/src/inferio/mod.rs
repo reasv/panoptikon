@@ -10,11 +10,13 @@
 //! `/api/inference` when `[inference_local].enabled` (or via the `inferio`
 //! subcommand). Hardware awareness sits alongside: `capability` (compute
 //! capability floors, GPU-compatibility package 1), `gpu` (board identities
-//! and worker→GPU pinning), `cost` (per-model cost dimensions) and `ledger`
-//! (the per-GPU VRAM budget that grants every dispatch window its memory) —
-//! the last three are batch calibration
+//! and worker→GPU pinning), `cost` (per-model cost dimensions), `ledger`
+//! (the per-GPU VRAM budget that grants every dispatch window its memory)
+//! and `calibration` (the profile store those budgets are primed from and
+//! persisted to) — the last four are batch calibration
 //! (docs/batch-calibration-design.md).
 
+pub mod calibration;
 pub mod capability;
 pub mod cost;
 pub mod dispatch;

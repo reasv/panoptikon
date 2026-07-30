@@ -339,10 +339,22 @@ impl GpuInventory {
     /// so on a host whose fastest board has no kernels the impl-side filter
     /// falls back to CPU instead of silently using another board.
     pub fn default_pin(&self) -> Option<String> {
-        let gpus = self.0.as_deref()?;
-        gpus.iter()
+        self.default_board().map(|gpu| gpu.uuid.clone())
+    }
+
+    /// The default board's **model name** — the calibration keyspace, which
+    /// is per silicon rather than per instance. `None` on an unknown host,
+    /// where the `/metadata` calibration overlay is omitted entirely rather
+    /// than answering for a board it cannot name.
+    pub fn default_board_name(&self) -> Option<String> {
+        self.default_board().map(|gpu| gpu.name.clone())
+    }
+
+    fn default_board(&self) -> Option<&GpuInfo> {
+        self.0
+            .as_deref()?
+            .iter()
             .min_by_key(|gpu| (std::cmp::Reverse(gpu.cap_tenths()), gpu.index))
-            .map(|gpu| gpu.uuid.clone())
     }
 
     /// Resolve one replica's registry pin into the `CUDA_VISIBLE_DEVICES`

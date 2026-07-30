@@ -59,10 +59,21 @@
 //! back later; dispatch never waits for it and uses the stale value
 //! meanwhile.
 //!
-//! Step 1b keeps ramp, deflation, ratchet anchor and fit samples in memory
-//! only. Persistence (the local calibration store, the ratchet anchor and
-//! the sample ring surviving restarts) is step 1c; [`BaseProfileLookup`] is
-//! the seam its profile lookups plug into.
+//! **Profiles prime, they never grow.** A matched calibration profile seeds
+//! the fit (pricing), the expected `base` (load reservations) and the knee —
+//! and, *only when it was generated locally*, the ratchet anchor and the
+//! sample ring behind that fit. A shipped baseline confers no local
+//! authority, so a fresh install ramps from the seed even with a perfect
+//! profile, and until [`LOCAL_CONFIRMATION_SAMPLES`] local high-water
+//! samples have confirmed it every grant is priced against a widened margin
+//! ([`VramLedger::effective_margin_locked`]).
+//!
+//! Persistence runs the other way through the same seam
+//! ([`CalibrationProfiles`]): whenever the ratchet anchor advances or the fit
+//! meaningfully moves, the settling window hands the store an update. The
+//! store debounces and writes off the dispatch path. Runtime state —
+//! deflation, ramp position, outstanding grants — is deliberately never
+//! persisted.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
@@ -70,6 +81,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::GpuInventory;
 use super::worker::TelemetryHandle;
@@ -113,6 +125,51 @@ pub const RATCHET_FACTOR: u64 = 2;
 /// Minimum high-water samples before a fit is attempted at all.
 pub const MIN_FIT_SAMPLES: usize = 3;
 
+/// Local clean high-water samples that **confirm** a fit for margin
+/// purposes. Below this the model's effective margin is widened by
+/// [`UNCONFIRMED_MARGIN_BONUS`].
+///
+/// The design states the rule for foreign fits ("any profile not generated
+/// locally — shipped, or fallback-matched — is used with a widened effective
+/// margin until a few local clean samples confirm it"); this implementation
+/// applies the same gate to a *thin local* fit, which is the same kind of
+/// uncertainty measured the same way. It costs nothing to do so: pre-fit
+/// there is no slope, and the widening only ever narrows the MB share, never
+/// the ramp — which counts local samples anyway.
+pub const LOCAL_CONFIRMATION_SAMPLES: u32 = 5;
+
+/// How much an unconfirmed fit widens that model's effective margin, as an
+/// **additive** bonus on top of the configured one. A foreign measurement is
+/// a good prior, never ground truth: the driver version is deliberately not
+/// in the profile key and `base` is driver currency.
+///
+/// Additive rather than multiplicative for two reasons. A multiplier
+/// vanishes exactly where the widening is most needed — a user who set
+/// `margin = 0` (a headless box, a card the ledger has to itself) would get
+/// `0 × 1.5 = 0` and no protection at all for an unconfirmed profile — and
+/// it makes the widening scale with a number that expresses something else
+/// entirely (how much *external* usage is expected to fluctuate).
+pub const UNCONFIRMED_MARGIN_BONUS: f64 = 0.15;
+
+/// Ceiling on the residual's contribution to the effective margin. Scatter
+/// is measured relative to the model's own `base`, so a model whose fit is
+/// wildly inconsistent widens by at most this much rather than driving the
+/// margin to the clamp on its own.
+pub const MAX_RESIDUAL_MARGIN: f64 = 0.25;
+
+/// Overall clamp on the **increment** a widening may add to the configured
+/// margin (the design's "clamped to a maximum factor"). Beyond this the board
+/// would be declared full for a model whose measurements are merely
+/// uncertain, which starves it instead of protecting it.
+///
+/// The clamp is on the increment and never on the configured margin itself:
+/// a user who asks for `margin = 0.9` gets 0.9 (they are describing their own
+/// machine's external usage, which the ledger has no standing to overrule),
+/// and clamping the *total* would both silently ignore that and — since
+/// `f64::clamp` panics when `min > max` — take the process down on the first
+/// `/health` request.
+pub const MAX_MARGIN_INCREMENT: f64 = 0.4;
+
 /// Window depth: a window is this many admitted GPU batches' worth of units,
 /// so `max-times-count` bucketing has material and the request/response
 /// round trip amortizes. The design's range is 2–4×; 3 is the middle. The
@@ -137,9 +194,12 @@ const MAX_RAMP_STEP: u32 = 32;
 
 /// Two composable admission limits, from `[inference_local.vram]`.
 ///
-/// Step 2 adds the config plumbing (per-server defaults with per-board-UUID
-/// overrides); step 1b constructs this from [`Default`] in `ManagerConfig`,
-/// which is where those config values will land.
+/// Constructed from [`Default`] in `ManagerConfig` today; step 2 adds the
+/// config plumbing (per-server defaults with per-board-UUID overrides) that
+/// fills it from the user's file. Everything downstream already treats these
+/// as *arbitrary user numbers* rather than as the defaults — a margin of 0
+/// or of 0.9 has to behave sensibly the day the plumbing lands, which is why
+/// margin widening is additive and clamps only its own increment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VramBudget {
     /// Margin over genuinely external usage. Our own workers are never
@@ -159,43 +219,12 @@ impl Default for VramBudget {
     }
 }
 
-/// Where the expected base of an as-yet-unmeasured load comes from.
-///
-/// The seam step 1c fills in: local calibration store → shipped baseline →
-/// the conservative constant. Step 1b ships only the in-memory
-/// "remembered from this run" map, so the default (absent) lookup answers
-/// nothing and every first load reserves [`CONSERVATIVE_BASE_MB`].
-///
-/// TODO(step 1c): this key tuple is deliberately provisional. The store's real
-/// lookup key is `(inference_id, epoch, gpu, platform, backend, torch, dtype)`
-/// with a fallback hierarchy on the torch string, and profiles are keyed by GPU
-/// **model name** while budgets are keyed by board UUID — so `expected_base_mb`
-/// grows into a struct argument and the caller starts passing the model's
-/// `epoch` and the board's name rather than 1b's `(inference_id, gpu_name,
-/// dtype)`. Reshaping it now would be guessing at the store's shape before the
-/// store exists.
-pub trait BaseProfileLookup: Send + Sync {
-    /// Expected `base_mb` for a model about to load on a board, or `None`.
-    ///
-    /// `dtype` is `None` on a first-ever load: Package-1 dtype negotiation
-    /// resolves *during* the load, so the profile key is incomplete exactly
-    /// when the reservation is needed. An implementation must then answer
-    /// with the most conservative plausible dtype's base (fp32) or `None` —
-    /// never a guess at fp16, which under-reserves ~2×.
-    fn expected_base_mb(
-        &self,
-        inference_id: &str,
-        gpu_name: &str,
-        dtype: Option<&str>,
-    ) -> Option<u64>;
-}
-
 /// One high-water fit sample: batch units against the driver-currency pool
 /// growth over `reserved_at_load` it produced.
 ///
-/// Serde-able for step 1c: the local calibration store persists a bounded ring
-/// of these, because a robust fit cannot be resumed from aggregates alone (and
-/// ring eviction doubles as recency aging).
+/// Serde-able because the local calibration store persists a bounded ring of
+/// these (as two parallel TOML arrays): a robust fit cannot be resumed from
+/// aggregates alone, and ring eviction doubles as recency aging.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSample {
     pub units: u64,
@@ -250,11 +279,32 @@ struct WorkerEntry {
     inference_id: String,
     /// Board UUID this replica's footprint and grants are charged to.
     gpu: String,
+    /// The board's **model name** — the calibration keyspace, which is per
+    /// silicon rather than per instance (two identical cards share one
+    /// profile and carry separate budgets).
+    gpu_name: String,
     /// The replica's shared telemetry, read by watermark on every window
     /// completion (never drained — `/health` reads it too).
     telemetry: TelemetryHandle,
     unit: CostUnit,
     aggregation: CostAggregation,
+    /// `metadata.cost.epoch`: part of the profile key, and the deliberate
+    /// invalidation lever for an impl whose memory behaviour changed without
+    /// moving any other key component.
+    epoch: u32,
+    /// The cost dimension was missing or unparseable and this replica runs on
+    /// the conservative `(item, count)` fallback. Treated exactly like an
+    /// unconfirmed profile for margin purposes — and permanently, since a
+    /// missing declaration is never confirmed by measurement.
+    degraded: bool,
+    /// The rest of the profile key, from the load response. `None` (either
+    /// of them) means this replica cannot be keyed and its calibration is
+    /// never persisted — an unkeyed entry could not be read back safely.
+    torch: Option<String>,
+    dtype: Option<String>,
+    /// `nvml` | `free_delta` | `alloc_delta`: provenance for `base_mb`,
+    /// carried into the profile.
+    base_method: Option<String>,
     seed_units: u64,
     /// Recorded **once** per worker registration: `Worker::load`'s report is
     /// last-write-wins in the telemetry, so a repeat `load` (idempotent on
@@ -487,8 +537,32 @@ struct ModelCalibration {
     /// the diagnostic floor and validation series, never admission input.
     transients: VecDeque<(u64, u64)>,
     fit: Option<FitSnapshot>,
+    /// This fit is **this machine's own, under this software environment**:
+    /// either computed here from this run's sample ring, or seeded from a
+    /// local profile matched on the exact torch string. Only such a fit may
+    /// be written back into the local store — writing a shipped baseline's
+    /// slope (or one measured under another torch build) back out under our
+    /// own generator stamp would launder a foreign measurement into local
+    /// provenance, and `/metadata` would then report it as this machine's own.
+    fit_is_local: bool,
     /// Largest locally measured clean high-water batch, in units.
     max_units_measured: u64,
+    /// The calibration store has already been consulted for this pair. A
+    /// second replica of the same model on the same board must not re-seed:
+    /// the state it would overwrite is this run's own measurements.
+    seeded: bool,
+    /// Local clean high-water samples behind this fit, *including* the ones
+    /// a local profile brought back from a previous run. The confirmation
+    /// gate for margin widening, and persisted for exactly that reason.
+    local_samples: u32,
+    /// Throughput knee from a profile. Parsed and round-tripped from step 1c;
+    /// nothing fits or enforces it until step 4.
+    knee_units: Option<u64>,
+    /// `(anchor, fit version)` as last handed to the calibration store. The
+    /// write policy is "the ratchet anchor advanced or the fit meaningfully
+    /// changed" — and `FitSnapshot::version` only moves when the refit
+    /// actually differed, so comparing these two numbers *is* that policy.
+    persisted: Option<(u64, u64)>,
 }
 
 /// The freshest free-memory reading for a board, and where it came from.
@@ -559,9 +633,12 @@ impl LedgerState {
 /// A per-GPU VRAM ledger over the probed board inventory.
 pub struct VramLedger {
     budget: VramBudget,
-    /// Profile lookup for load reservations; `None` until step 1c wires the
-    /// calibration store in.
-    profiles: Option<Arc<dyn BaseProfileLookup>>,
+    /// The calibration store: load-reservation bases, fit/anchor seeding at
+    /// registration, and the persistence side of the write policy. `None` on
+    /// a host with no store configured, which is the pre-1c behaviour (every
+    /// first load reserves the conservative constant and nothing survives a
+    /// restart).
+    profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
     /// Whether a stale external sample triggers a live `nvidia-smi` refresh.
     /// Always on in production; the ledger's own unit tests turn it off so
@@ -576,7 +653,7 @@ impl VramLedger {
     pub fn new(
         inventory: &GpuInventory,
         budget: VramBudget,
-        profiles: Option<Arc<dyn BaseProfileLookup>>,
+        profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
         let gpus = inventory
             .gpus()
@@ -626,8 +703,18 @@ impl VramLedger {
     ///
     /// Loads are serialized by the manager's load lock, but dispatch is not:
     /// without this charge, windows granted to *other* models during a
-    /// multi-second load collide with the incoming weights. Resolution order
-    /// is this-run-remembered → [`BaseProfileLookup`] → [`CONSERVATIVE_BASE_MB`].
+    /// multi-second load collide with the incoming weights. The expected base
+    /// is the **larger** of what this run already measured for this (model,
+    /// board) and what the calibration store knows, falling back to
+    /// [`CONSERVATIVE_BASE_MB`] when neither answers.
+    ///
+    /// Taking the max rather than ranking the two sources is deliberate. They
+    /// are measurements of the same thing (a local profile *is* a persisted
+    /// remembered base), they disagree only when one of them is stale or
+    /// foreign, and the design is explicit about which direction of error is
+    /// cheap: "over-reserving is cheap: loads are serialized, the reservation
+    /// lives only for the seconds the load takes... Under-reserving is not
+    /// cheap — that is a collision with incoming weights."
     ///
     /// Returns `None` — no charge at all — in three cases:
     ///
@@ -655,30 +742,64 @@ impl VramLedger {
         if !cost.scales() {
             return None;
         }
-        let (id, expected, headroom) = {
-            let mut state = self.lock();
+        let key = (inference_id.to_owned(), gpu.to_owned());
+        let no_footprint = || {
+            tracing::debug!(
+                model = %inference_id,
+                gpu = %gpu,
+                "a previous load of this model on this board reported no \
+                 device footprint; not reserving anything for it"
+            );
+            None
+        };
+        // Everything the store needs is snapshotted under a *short* lock and
+        // the lock is then dropped, exactly as `register_worker` does: the
+        // store stats (and may parse) files, and holding the ledger lock
+        // across that would put file I/O on the critical path of every
+        // concurrent grant request.
+        let (board_name, dtype, remembered) = {
+            let state = self.lock();
             let board_name = state.gpus.get(gpu).map(|board| board.name.clone())?;
-            let key = (inference_id.to_owned(), gpu.to_owned());
             let dtype = dtype
                 .map(str::to_owned)
                 .or_else(|| state.remembered_dtypes.get(&key).cloned());
             let remembered = state.remembered_bases.get(&key).copied();
+            (board_name, dtype, remembered)
+        };
+        if matches!(remembered, Some(None)) {
+            return no_footprint();
+        }
+        let from_profile = self.profiles.as_ref().and_then(|profiles| {
+            profiles.expected_base_mb(&ProfileQuery {
+                inference_id,
+                epoch: cost.epoch,
+                gpu_name: &board_name,
+                // The worker reports its torch build on the load response,
+                // which by definition has not landed yet; the store falls
+                // back across torch builds for this tier.
+                torch: None,
+                dtype: dtype.as_deref(),
+            })
+        });
+        let (id, expected, headroom) = {
+            let mut state = self.lock();
+            // Re-read both facts under the retaken lock. A load that finished
+            // while the store was being consulted may have taught us this pair
+            // puts nothing on the device — reserving against it would squeeze
+            // its neighbours for memory it does not allocate — or taught us a
+            // measured base, which is the number we would rather charge.
+            let remembered = state.remembered_bases.get(&key).copied();
             if matches!(remembered, Some(None)) {
-                tracing::debug!(
-                    model = %inference_id,
-                    gpu = %gpu,
-                    "a previous load of this model on this board reported no \
-                     device footprint; not reserving anything for it"
-                );
+                return no_footprint();
+            }
+            if !state.gpus.contains_key(gpu) {
                 return None;
             }
             let expected = remembered
                 .flatten()
-                .or_else(|| {
-                    self.profiles.as_ref().and_then(|profiles| {
-                        profiles.expected_base_mb(inference_id, &board_name, dtype.as_deref())
-                    })
-                })
+                .into_iter()
+                .chain(from_profile)
+                .max()
                 .unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
             let id = state.next_id();
@@ -750,16 +871,38 @@ impl VramLedger {
         let loaded_at = stamped.captured_at;
         let report = stamped.value;
         let gpu = report.gpu_uuid.clone()?;
+        // The board's *model name* — the profile keyspace. Taken from the
+        // inventory rather than from the worker's `gpu_name`, so every
+        // profile this host writes is keyed by the same string nvidia-smi
+        // prints, whatever torch calls the card.
+        let board_name = {
+            let state = self.lock();
+            match state.gpus.get(&gpu) {
+                Some(board) => board.name.clone(),
+                None => {
+                    tracing::debug!(
+                        model = %inference_id,
+                        gpu = %gpu,
+                        "the worker reports a board the GPU inventory does not list; \
+                         dispatching this model without VRAM admission"
+                    );
+                    return None;
+                }
+            }
+        };
+        // Consulted **outside** the ledger lock: the store stats (and may
+        // parse) files, and blocking every concurrent grant request behind
+        // that would put file I/O on the dispatch path by the back door.
+        let seed = self.profiles.as_ref().and_then(|profiles| {
+            profiles.lookup(&ProfileQuery {
+                inference_id,
+                epoch: cost.epoch,
+                gpu_name: &board_name,
+                torch: report.torch_version.as_deref(),
+                dtype: report.dtype.as_deref(),
+            })
+        });
         let mut state = self.lock();
-        if !state.gpus.contains_key(&gpu) {
-            tracing::debug!(
-                model = %inference_id,
-                gpu = %gpu,
-                "the worker reports a board the GPU inventory does not list; \
-                 dispatching this model without VRAM admission"
-            );
-            return None;
-        }
         let key = (inference_id.to_owned(), gpu.clone());
         // Record-once semantics, and never downgrade: a later load that reports
         // no base at all (an unmeasurable reload, a claimed prewarmed worker)
@@ -771,7 +914,7 @@ impl VramLedger {
             state.remembered_bases.insert(key.clone(), report.base_mb);
         }
         if let Some(dtype) = report.dtype.clone() {
-            state.remembered_dtypes.insert(key, dtype);
+            state.remembered_dtypes.insert(key.clone(), dtype);
         }
         // The load response carries a memory sample, and it is the *only*
         // reading this board may have for a while: samples otherwise arrive on
@@ -783,15 +926,29 @@ impl VramLedger {
                 Self::record_free_locked(&mut state, &gpu, free, source, loaded_at);
             }
         }
+        Self::seed_calibration_locked(
+            &mut state,
+            &key,
+            self.profiles.is_some(),
+            seed,
+            inference_id,
+            &gpu,
+        );
         let id = state.next_id();
         state.workers.insert(
             id,
             WorkerEntry {
                 inference_id: inference_id.to_owned(),
                 gpu,
+                gpu_name: board_name,
                 telemetry: Arc::clone(telemetry),
                 unit: cost.unit,
                 aggregation,
+                epoch: cost.epoch,
+                degraded: cost.degraded,
+                torch: report.torch_version.clone(),
+                dtype: report.dtype.clone(),
+                base_method: report.base_method.clone(),
                 seed_units,
                 base_mb: report.base_mb,
                 base_recorded: report.base_mb.is_some(),
@@ -819,6 +976,228 @@ impl VramLedger {
     /// owned — the same lifetime as the aborted windows themselves.
     fn forget_worker(&self, worker: WorkerId) {
         self.lock().workers.remove(&worker);
+    }
+
+    // ------------------------------------------------------------------
+    // Calibration store: seeding and persistence
+    // ------------------------------------------------------------------
+
+    /// Prime a (model, board)'s calibration from a matched profile, once.
+    ///
+    /// What a profile may confer and what it may not is the crux of the whole
+    /// design:
+    ///
+    /// - **Pricing** — the fit — always. That is what a profile is for: it
+    ///   prices mixed compositions against live free memory from the first
+    ///   window instead of after a dozen.
+    /// - **Growth** — the ratchet anchor and the sample ring — only when the
+    ///   profile is **local**. "The ratchet counts only local samples, so a
+    ///   fresh install ramps from seed even with a shipped profile: profiles
+    ///   govern pricing, `base` accounting, and the knee cap — not growth."
+    ///   Handing a stranger's anchor to a fresh install would let the first
+    ///   window ask for a batch nothing on this machine has ever run.
+    /// - **Confidence** — `local_samples` — likewise only when local, *and*
+    ///   only when the match was on the exact torch string. A local profile
+    ///   reached through the `major.minor` fallback tier was measured on a
+    ///   different torch build than the one now running, so its anchor and
+    ///   ring are still this machine's own evidence (the silicon did not
+    ///   change) but its *confirmation* is not: the machine re-earns those
+    ///   samples under the new build, and until it does the model runs under
+    ///   the widened margin. That is the same rule the design states for
+    ///   shipped profiles, applied to the one other way a foreign software
+    ///   environment gets in.
+    ///
+    /// Seeding happens once per (model, board) per run — and the flag is set
+    /// on the first **attempt**, not on the first match. Setting it only on a
+    /// match is how a re-seed duplicates the ring: this run writes its own
+    /// profile, a TTL unload drops the replica, the reload looks the model up
+    /// again, and now the store *does* answer — with the very samples still
+    /// sitting in memory, which then get appended a second time, evicting
+    /// older distinct samples and making the persisted evidence a lie.
+    ///
+    /// The corollary: a first attempt that could not be *keyed* — the load
+    /// report arrived without a torch version or a negotiated dtype, so
+    /// [`CalibrationProfiles::lookup`] refused the incomplete key — still
+    /// consumes the pair's one seed attempt, and a later replica that does
+    /// report both will not be seeded. That is deliberate and harmless: a
+    /// worker reports these consistently (they are properties of the venv and
+    /// of Package-1 negotiation, not of the individual load), so the two cases
+    /// in practice are "every load of this model keys" and "none of them do".
+    /// The cost of being wrong is one run priced from scratch; the cost of
+    /// re-attempting would be the duplicated ring above, on every reload.
+    fn seed_calibration_locked(
+        state: &mut LedgerState,
+        key: &(String, String),
+        attempted: bool,
+        seed: Option<ProfileSeed>,
+        inference_id: &str,
+        gpu: &str,
+    ) {
+        if !attempted || state.calibration.get(key).is_some_and(|cal| cal.seeded) {
+            return;
+        }
+        let Some(seed) = seed else {
+            // The store was consulted and had nothing (or the key was
+            // incomplete). Still an attempt: whatever this run measures from
+            // here is the only truth for this pair, and a later reload must
+            // not re-import it on top of itself.
+            state.calibration.entry(key.clone()).or_default().seeded = true;
+            return;
+        };
+        // A profile confers confirmation only when this machine measured it
+        // under the software environment now running.
+        let confirms = seed.local && seed.exact_torch;
+        let adopt_fit = state
+            .calibration
+            .get(key)
+            .is_none_or(|cal| cal.fit.is_none())
+            && seed.slope_mb_per_unit > 0.0;
+        // Only a fit that is actually adopted spends a version number: an
+        // unspent one would leave `persisted` pointing at a version nothing
+        // holds, and the first settled window would write the file back
+        // unchanged.
+        let version = if adopt_fit {
+            state.next_fit_version += 1;
+            state.next_fit_version
+        } else {
+            0
+        };
+        let cal = state.calibration.entry(key.clone()).or_default();
+        cal.seeded = true;
+        cal.knee_units = seed.knee_units;
+        if adopt_fit {
+            cal.fit = Some(FitSnapshot {
+                slope_mb_per_unit: seed.slope_mb_per_unit,
+                // The intercept is diagnostic only (admission uses the
+                // slope), which is why the design's file format has no field
+                // for it. A local profile's sample ring reproduces it exactly
+                // on the first refit; a shipped one never had one to share.
+                intercept_mb: 0.0,
+                residual_mb: seed.residual_mb,
+                samples: seed.samples,
+                version,
+            });
+            // Whose fit this is decides whether it may ever travel back into
+            // the local store (see `pending_update_locked`). A **shipped**
+            // baseline's slope must not: writing it out under our generator
+            // stamp would launder a foreign measurement into local
+            // provenance. Nor may a local one reached through the
+            // `major.minor` fallback tier, which was measured under a
+            // different torch build than the one now running — the same rule
+            // `confirms` applies to the confirmation count, for the same
+            // reason. What remains is a fit this machine measured under this
+            // environment, already sitting in the file under our stamp.
+            //
+            // `fit_is_local` rather than `local` because the two can differ: a
+            // local entry with no fit of its own borrows one from a shipped
+            // baseline in the same lookup.
+            cal.fit_is_local = seed.fit_is_local && seed.exact_torch;
+        }
+        if seed.local {
+            cal.max_units_measured = cal.max_units_measured.max(seed.max_units_measured);
+            for sample in seed.ring {
+                cal.samples.push_back(sample);
+                while cal.samples.len() > FIT_RING {
+                    cal.samples.pop_front();
+                }
+            }
+            if confirms {
+                cal.local_samples = cal.local_samples.max(seed.local_samples);
+            }
+            // Nothing has moved since the file was written, so the write
+            // policy must not immediately write it back. The version recorded
+            // is the one actually in force, which is 0 when no fit was
+            // adopted.
+            let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
+            cal.persisted = Some((cal.max_units_measured, in_force));
+        }
+        tracing::debug!(
+            model = %inference_id,
+            gpu = %gpu,
+            local = seed.local,
+            fit_is_local = seed.fit_is_local,
+            exact_torch = seed.exact_torch,
+            confirms,
+            slope_mb_per_unit = seed.slope_mb_per_unit,
+            samples = seed.samples,
+            local_samples = seed.local_samples,
+            max_units_measured = seed.max_units_measured,
+            "seeded calibration from a stored profile"
+        );
+    }
+
+    /// The write policy, evaluated once per settled window: hand the store an
+    /// update when the ratchet anchor advanced or the fit meaningfully
+    /// changed — never per batch, and never for state that carries no local
+    /// evidence.
+    ///
+    /// Four guards, each load-bearing:
+    ///
+    /// - `torch`/`dtype` must be known, or the entry could not be keyed (and
+    ///   an unkeyed entry can never be read back);
+    /// - `base_mb` must be known, or the profile would claim a base of 0 and
+    ///   later suppress a real load reservation;
+    /// - `local_samples > 0`, so a shipped baseline is never copied into the
+    ///   local store as if this machine had measured it — that would silently
+    ///   confirm it and drop its widened margin on the next run;
+    /// - something must actually have changed since the last write.
+    ///
+    /// The **fit fields are separate** from all of that. Anchor, ring and
+    /// local sample count are local evidence the moment `local_samples > 0`,
+    /// but the fit currently in force may still be a seeded one (the very
+    /// first local sample can advance the anchor several windows before
+    /// [`MIN_FIT_SAMPLES`] produces a refit). Writing that fit back out under
+    /// our own generator stamp would launder a shipped baseline into local
+    /// provenance and make `/metadata` claim this machine measured it, so
+    /// until a local refit lands the update carries no fit at all —
+    /// slope 0, residual 0, 0 samples, which is precisely what the store's
+    /// reader treats as "no fit here".
+    fn pending_update_locked(state: &mut LedgerState, worker: WorkerId) -> Option<ProfileUpdate> {
+        let entry = state.workers.get(&worker)?;
+        let torch = entry.torch.clone()?;
+        let dtype = entry.dtype.clone()?;
+        let base_mb = entry.base_mb?;
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let identity = (
+            entry.inference_id.clone(),
+            entry.epoch,
+            entry.gpu_name.clone(),
+            entry.unit.as_str(),
+            entry.aggregation.as_str(),
+            entry.base_method.clone(),
+        );
+        let cal = state.calibration.get_mut(&key)?;
+        if cal.local_samples == 0 {
+            return None;
+        }
+        let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
+        let current = (cal.max_units_measured, fit_version);
+        if cal.persisted.is_some_and(|persisted| {
+            persisted.1 == current.1 && persisted.0 >= current.0
+        }) {
+            return None;
+        }
+        cal.persisted = Some(current);
+        // Only a locally derived fit travels; see the note above.
+        let fit = cal.fit.filter(|_| cal.fit_is_local);
+        Some(ProfileUpdate {
+            inference_id: identity.0,
+            epoch: identity.1,
+            gpu_name: identity.2,
+            torch,
+            dtype,
+            unit: identity.3,
+            aggregation: identity.4,
+            base_mb,
+            base_method: identity.5,
+            slope_mb_per_unit: fit.map(|fit| fit.slope_mb_per_unit).unwrap_or(0.0),
+            residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
+            samples: fit.map(|fit| fit.samples).unwrap_or(0),
+            knee_units: cal.knee_units,
+            max_units_measured: cal.max_units_measured,
+            local_samples: cal.local_samples,
+            ring: cal.samples.iter().copied().collect(),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -904,6 +1283,14 @@ impl VramLedger {
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
+        self.limit_with_margin_locked(state, gpu, self.budget.margin.max(0.0))
+    }
+
+    /// `limit` under a specific margin — the board's configured one for the
+    /// board-wide view (`/health`, load reservations), or one *widened* by
+    /// fit confidence when pricing a particular model's window (see
+    /// [`Self::effective_margin_locked`]).
+    fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
         let Some(board) = state.gpus.get(gpu) else {
             return 0;
         };
@@ -911,7 +1298,6 @@ impl VramLedger {
         let external = Self::external_locked(state, gpu).unwrap_or(0);
         // The desktop lever, on by default: only genuinely external usage is
         // margin-inflated. Our own residents are measured, not guessed.
-        let margin = self.budget.margin.max(0.0);
         let inflated = ((external as f64) * (1.0 + margin)).ceil().max(0.0) as u64;
         let mut limit = total.saturating_sub(inflated);
         // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on
@@ -925,14 +1311,68 @@ impl VramLedger {
     }
 
     fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
+        self.headroom_with_margin_locked(state, gpu, self.budget.margin.max(0.0))
+    }
+
+    fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
         let reservations = state
             .gpus
             .get(gpu)
             .map(|board| board.load_reservations.values().copied().sum::<u64>())
             .unwrap_or(0);
-        self.limit_locked(state, gpu).saturating_sub(
+        self.limit_with_margin_locked(state, gpu, margin).saturating_sub(
             Self::charges_locked(state, gpu).saturating_add(reservations),
         )
+    }
+
+    /// The margin one model's windows are priced under: the board's
+    /// configured margin, **widened** while its cost model is not yet
+    /// trustworthy (the design's "fit confidence widens margins
+    /// automatically").
+    ///
+    /// Two independent reasons to widen, both bounded:
+    ///
+    /// - **Unconfirmed** — fewer than [`LOCAL_CONFIRMATION_SAMPLES`] local
+    ///   clean high-water samples stand behind this fit. That covers every
+    ///   shipped or fallback-matched profile on a fresh install (they seed
+    ///   `local_samples = 0` by construction) and, deliberately, a thin local
+    ///   fit as well. A **degraded** cost dimension — no parseable
+    ///   `metadata.cost` declaration — is unconfirmable rather than
+    ///   unconfirmed, so it widens permanently.
+    /// - **Scatter** — the fit's residual as a fraction of the model's own
+    ///   base, clamped at [`MAX_RESIDUAL_MARGIN`]. Residual is a *median*
+    ///   absolute deviation, so this responds to genuine model error and
+    ///   shrugs off a single contaminated sample.
+    ///
+    /// Both are **additive increments** on the configured margin, and it is
+    /// their sum — never the total — that is clamped, at
+    /// [`MAX_MARGIN_INCREMENT`]. So the configured margin always survives
+    /// intact (`margin = 0.9` stays 0.9), the result never falls below it,
+    /// and `margin = 0` still buys the unconfirmed bonus rather than
+    /// multiplying it away. Note what widening does *not* do: it cannot make
+    /// a grant bigger, and on a headless board (external ≈ 0) it has nothing
+    /// to bite on — which is fine, because growth there is governed by the
+    /// ramp and the ratchet, and both count local samples only.
+    fn effective_margin_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
+        // `f64::max` returns the non-NaN operand, so a garbage configured
+        // margin lands on 0.0 here exactly as it does in `limit_locked`
+        // rather than turning every number below into a NaN.
+        let base = self.budget.margin.max(0.0);
+        let cal = state
+            .calibration
+            .get(&(entry.inference_id.clone(), entry.gpu.clone()));
+        let confirmed = cal.is_some_and(|cal| cal.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
+        let mut increment = if entry.degraded || !confirmed {
+            UNCONFIRMED_MARGIN_BONUS
+        } else {
+            0.0
+        };
+        if let (Some(fit), Some(base_mb)) = (cal.and_then(|cal| cal.fit), entry.base_mb) {
+            if base_mb > 0 && fit.residual_mb.is_finite() {
+                increment += (fit.residual_mb / base_mb as f64).clamp(0.0, MAX_RESIDUAL_MARGIN);
+            }
+        }
+        base + increment.clamp(0.0, MAX_MARGIN_INCREMENT)
     }
 
     fn anchor_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
@@ -1048,7 +1488,15 @@ impl VramLedger {
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.pending_requests = window_requests.saturating_add(queued_behind);
         }
-        let headroom = self.headroom_locked(&state, &gpu);
+        // The headroom this window is priced against is the *requesting
+        // model's*: an unconfirmed or scattered fit sees a widened margin, so
+        // it asks for less of a board it may be mispricing. Every other
+        // worker's charge is unaffected — their footprints are measured.
+        let margin = {
+            let entry = state.workers.get(&worker)?;
+            self.effective_margin_locked(&state, entry)
+        };
+        let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
         let share = self.share_locked(&state, worker, headroom);
         let (mut unit_budget, mut mb, unit, aggregation) = {
             let entry = state.workers.get(&worker)?;
@@ -1122,9 +1570,24 @@ impl VramLedger {
     /// advances either way, the fit and the ratchet take the samples (they are
     /// real measurements), and the clean/negative bookkeeping is skipped.
     fn settle(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) {
+        let update = self.settle_locked(worker, grant_id, outcome);
+        // Handed over **after** the ledger lock is released: the store takes
+        // its own lock and may schedule a write, and no ledger operation
+        // should ever wait behind either.
+        if let (Some(update), Some(profiles)) = (update, self.profiles.as_ref()) {
+            profiles.record(update);
+        }
+    }
+
+    fn settle_locked(
+        &self,
+        worker: WorkerId,
+        grant_id: u64,
+        outcome: WindowOutcome,
+    ) -> Option<ProfileUpdate> {
         let mut state = self.lock();
         let Some(entry) = state.workers.get_mut(&worker) else {
-            return;
+            return None;
         };
         // Demand: this window's own requests are done with, whatever happened
         // to them. Without this a busy replica's demand signal stays frozen at
@@ -1164,6 +1627,13 @@ impl VramLedger {
             }
         }
         Self::refit_locked(&mut state, worker);
+        // No store, no write policy: without a store there is nothing to hand
+        // an update to, and evaluating it anyway would move `cal.persisted`
+        // to describe a write that can never happen.
+        if self.profiles.is_none() {
+            return None;
+        }
+        Self::pending_update_locked(&mut state, worker)
     }
 
     /// Drain this worker's new telemetry into the ledger by watermark.
@@ -1319,6 +1789,23 @@ impl VramLedger {
         }
         // The ratchet counts only *local* clean high-water batches.
         cal.max_units_measured = cal.max_units_measured.max(anchor);
+        // And so does the confirmation gate: every sample counted here was
+        // measured on this machine, which is exactly what confirms a profile
+        // this machine did not produce (and what is persisted so the next run
+        // does not start over).
+        //
+        // Only *high-water* windows count, so a workload that never grows the
+        // pool never confirms anything: a user-capped model, or one whose
+        // queue is always shallower than its current budget, runs every batch
+        // on a warm pool, contributes zero samples here, and stays under the
+        // widened margin indefinitely. That is deliberate — the widening is
+        // exactly right for a fit nothing on this machine has tested — and it
+        // stops being a dead end in step 2, where the periodic `empty_cache`
+        // trim gives even a steady-state workload fresh high-water windows to
+        // learn from.
+        cal.local_samples = cal
+            .local_samples
+            .saturating_add(high_water_samples.min(u32::MAX as usize) as u32);
         Ingested {
             negative,
             high_water_samples,
@@ -1356,6 +1843,9 @@ impl VramLedger {
         fit.version = state.next_fit_version;
         if let Some(cal) = state.calibration.get_mut(&key) {
             cal.fit = Some(fit);
+            // Computed from this machine's own ring: from here on the fit may
+            // be persisted as local evidence.
+            cal.fit_is_local = true;
         }
     }
 
@@ -1489,6 +1979,8 @@ impl VramLedger {
                             clean_windows: entry.clean_windows,
                             unit_budget: admitted_units(entry, anchor),
                             max_units_measured: anchor,
+                            local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
+                            effective_margin: self.effective_margin_locked(&state, entry),
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {
                                 slope_mb_per_unit: fit.slope_mb_per_unit,
                                 intercept_mb: fit.intercept_mb,
@@ -1534,22 +2026,21 @@ impl VramLedger {
     }
 
     // ------------------------------------------------------------------
-    // Calibration state (step 1c seam)
+    // Calibration state (test inspection)
     // ------------------------------------------------------------------
 
-    /// Everything the local calibration store will have to persist for one
-    /// (model, board): the ratchet anchor, the high-water sample ring and the
-    /// fit. Read-only — step 1c owns the writing side (atomic TOML rewrite when
-    /// the anchor advances or the fit meaningfully changes).
+    /// One (model, board)'s calibration, for assertions: the ratchet anchor,
+    /// the high-water sample ring and the fit.
     ///
-    /// TODO(step 1c): the store's entries are keyed per **GPU model name** plus
-    /// the environment tuple, not per board UUID as the ledger is, because a
-    /// profile is a property of the silicon and is shareable across identical
-    /// cards while budgets are per instance. Mapping board UUID → profile key
-    /// happens on the store side, when the store exists.
-    // Consumed by this module's tests today; step 1c's calibration store is the
-    // real caller, and its shape is what this exists to pin down now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test scaffolding, honestly labelled. It was written to pin down the
+    /// shape step 1c would persist; the store now exists and persistence goes
+    /// through [`ProfileUpdate`] instead, which carries the profile *key*
+    /// (GPU model name plus the environment tuple) this shape has no room
+    /// for — the ledger is keyed per board UUID because budgets are per
+    /// instance, while a profile is a property of the silicon. Routing the
+    /// write policy through here would mean re-deriving that key twice, so
+    /// what remains is an inspection accessor.
+    #[cfg(test)]
     pub(crate) fn calibration_state(
         &self,
         inference_id: &str,
@@ -1578,6 +2069,17 @@ impl VramLedger {
     /// path end to end.
     #[cfg(test)]
     pub(super) fn for_test(boards: &[(&str, &str, u64)], budget: VramBudget) -> Arc<Self> {
+        Self::for_test_with(boards, budget, None)
+    }
+
+    /// [`Self::for_test`] plus a calibration store, for the seeding and
+    /// persistence paths.
+    #[cfg(test)]
+    fn for_test_with(
+        boards: &[(&str, &str, u64)],
+        budget: VramBudget,
+        profiles: Option<Arc<dyn CalibrationProfiles>>,
+    ) -> Arc<Self> {
         let gpus = boards
             .iter()
             .map(|(uuid, name, total_mb)| {
@@ -1597,7 +2099,7 @@ impl VramLedger {
             .collect();
         Arc::new(Self {
             budget,
-            profiles: None,
+            profiles,
             state: StdMutex::new(LedgerState {
                 gpus,
                 ..LedgerState::default()
@@ -1625,12 +2127,15 @@ impl VramLedger {
     }
 }
 
-/// One (model, board)'s calibration state, in the shape step 1c persists.
+/// One (model, board)'s calibration state, as the ledger's own tests read it.
 ///
 /// Local-authority fields only: the ratchet anchor and the sample ring are
 /// deliberately local-store-only (a foreign measurement cannot confer them),
 /// and runtime state — deflation, ramp position, outstanding grants — is
-/// deliberately never persisted.
+/// deliberately never persisted. The store's `CalibrationProfile` is the real
+/// on-disk shape; the serde derives here only keep a test able to assert that
+/// this trio survives a round trip at all.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationState {
     pub inference_id: String,
@@ -1909,6 +2414,14 @@ pub struct LedgerWorkerHealth {
     pub unit_budget: u64,
     /// Ratchet anchor: largest locally measured clean high-water batch.
     pub max_units_measured: u64,
+    /// Local clean high-water samples behind this model's fit, including any
+    /// a local calibration profile restored. Below
+    /// `LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.
+    pub local_samples: u32,
+    /// The margin this model's windows are actually priced under: the
+    /// board's configured margin, widened while the fit is unconfirmed or
+    /// scattered.
+    pub effective_margin: f64,
     pub fit: Option<FitHealth>,
 }
 
@@ -1927,6 +2440,7 @@ pub struct FitHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inferio::calibration::{CalibrationStore, StoreEnv, StorePaths};
     use crate::inferio::worker::{
         BatchMeasurement, LoadReport, MemorySample, Timestamped, WorkerTelemetry,
     };
@@ -1944,13 +2458,18 @@ mod tests {
     }
 
     /// A telemetry handle already carrying a load report, as a real replica
-    /// has by the time the ledger registers it.
+    /// has by the time the ledger registers it — including the environment
+    /// half of the calibration key (torch build, negotiated dtype, base
+    /// provenance), which only the worker can know.
     fn loaded(base_mb: Option<u64>, reserved_at_load: Option<u64>) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
             base_mb,
+            base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
             gpu_uuid: Some(BOARD.to_owned()),
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
         }));
         Arc::new(StdMutex::new(telemetry))
@@ -1958,6 +2477,51 @@ mod tests {
 
     fn ledger(total_mb: u64, budget: VramBudget) -> Arc<VramLedger> {
         VramLedger::for_test(&[(BOARD, "TEST 9000", total_mb)], budget)
+    }
+
+    fn ledger_with(
+        total_mb: u64,
+        budget: VramBudget,
+        profiles: &Arc<FakeProfiles>,
+    ) -> Arc<VramLedger> {
+        VramLedger::for_test_with(
+            &[(BOARD, "TEST 9000", total_mb)],
+            budget,
+            Some(Arc::clone(profiles) as Arc<dyn CalibrationProfiles>),
+        )
+    }
+
+    /// A calibration store stand-in: fixed answers, recorded questions.
+    #[derive(Default)]
+    struct FakeProfiles {
+        base: Option<u64>,
+        seed: Option<ProfileSeed>,
+        /// `(inference_id, epoch, gpu_name, torch, dtype)` per
+        /// `expected_base_mb` call — the load-reservation tier, where the key
+        /// is deliberately incomplete.
+        queries: StdMutex<Vec<(String, u32, String, Option<String>, Option<String>)>>,
+        updates: StdMutex<Vec<ProfileUpdate>>,
+    }
+
+    impl CalibrationProfiles for FakeProfiles {
+        fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
+            self.queries.lock().unwrap().push((
+                query.inference_id.to_owned(),
+                query.epoch,
+                query.gpu_name.to_owned(),
+                query.torch.map(str::to_owned),
+                query.dtype.map(str::to_owned),
+            ));
+            self.base
+        }
+
+        fn lookup(&self, _query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
+            self.seed.clone()
+        }
+
+        fn record(&self, update: ProfileUpdate) {
+            self.updates.lock().unwrap().push(update);
+        }
     }
 
     fn no_margin() -> VramBudget {
@@ -2770,49 +3334,685 @@ mod tests {
         assert!(ledger.reserve_load("g/a", item_cost(4), "GPU-nope", None).is_none());
     }
 
-    /// The profile-lookup seam step 1c fills in is consulted between the
-    /// remembered map and the conservative constant, and a first-ever load
-    /// hands it no dtype (negotiation resolves during the load).
+    /// The calibration store supplies the expected base of a load nothing
+    /// has measured yet, and a first-ever load hands it no dtype and no torch
+    /// build (both resolve *during* the load) — which is exactly why the
+    /// store's answer for that tier is the most conservative one it has.
     #[test]
     fn profile_lookup_supplies_the_expected_base() {
-        struct Fixed(u64);
-        impl BaseProfileLookup for Fixed {
-            fn expected_base_mb(
-                &self,
-                inference_id: &str,
-                gpu_name: &str,
-                dtype: Option<&str>,
-            ) -> Option<u64> {
-                assert_eq!(inference_id, "g/a");
-                assert_eq!(gpu_name, "TEST 9000");
-                assert_eq!(dtype, None, "a first-ever load has no negotiated dtype");
-                Some(self.0)
-            }
-        }
-        let ledger = Arc::new(VramLedger {
-            budget: no_margin(),
-            profiles: Some(Arc::new(Fixed(777))),
-            state: StdMutex::new(LedgerState {
-                gpus: [(
-                    BOARD.to_owned(),
-                    GpuLedger {
-                        name: "TEST 9000".to_owned(),
-                        total_mb: 10_000,
-                        free: None,
-                        seen_authoritative_free: false,
-                        load_reservations: HashMap::new(),
-                        refreshing: false,
-                        last_refresh_failed_at: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                ..LedgerState::default()
-            }),
-            probe_external: false,
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(777),
+            ..FakeProfiles::default()
         });
+        let ledger = ledger_with(10_000, no_margin(), &profiles);
         let _reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
         assert_eq!(ledger.headroom_mb(BOARD), 10_000 - 777);
+        let queries = profiles.queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].0, "g/a");
+        assert_eq!(queries[0].1, 1, "the model's epoch is part of the key");
+        assert_eq!(queries[0].2, "TEST 9000", "the board's model name, not its UUID");
+        assert_eq!(queries[0].3, None, "no torch build before the load response");
+        assert_eq!(queries[0].4, None, "and no negotiated dtype on a first load");
+    }
+
+    /// Two sources describe the same quantity — this run's measured base and
+    /// the stored profile's — so the reservation takes the larger. The design
+    /// is explicit that over-reserving a load is cheap and under-reserving is
+    /// a collision with incoming weights.
+    #[test]
+    fn the_load_reservation_takes_the_more_conservative_base() {
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(5000),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(20_000, no_margin(), &profiles);
+        let handle = loaded(Some(1234), Some(0));
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            5000,
+            "the profile's larger base wins over this run's measurement"
+        );
+        drop(reservation);
+
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(100),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(20_000, no_margin(), &profiles);
+        let handle = loaded(Some(1234), Some(0));
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let _reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            1234,
+            "and this run's measurement wins over a smaller stored one"
+        );
+    }
+
+    /// A **shipped** profile primes pricing and nothing else: the first
+    /// window is priced through its slope, but the unit budget is still the
+    /// seed and the ratchet anchor is still zero. "Profiles govern pricing,
+    /// `base` accounting and the knee cap — not growth."
+    #[test]
+    fn a_shipped_profile_seeds_the_fit_but_not_the_ramp() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: None,
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                // A shipped baseline cannot carry these at all — the store
+                // strips them on import — but a fake that offers them anyway
+                // proves the ledger refuses them on `local` alone.
+                max_units_measured: 4096,
+                local_samples: 99,
+                ring: vec![FitSample {
+                    units: 4096,
+                    delta_mb: 40_960,
+                }],
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.max_units_measured, 0,
+            "a foreign anchor is never adopted: a fresh install ramps from seed"
+        );
+        assert_eq!(worker.local_samples, 0, "and confers no local confirmation");
+        assert!(
+            (worker.fit.as_ref().unwrap().slope_mb_per_unit - 10.0).abs() < 1e-9,
+            "but its fit prices the very first window"
+        );
+        assert_eq!(
+            ledger.calibration_state("g/a", BOARD).unwrap().samples.len(),
+            0,
+            "and its samples are not this machine's evidence"
+        );
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 4, "the seed, not the foreign anchor");
+        assert_eq!(token.grant().mb, 40, "4 units priced at the profile's slope");
+    }
+
+    /// A **local** profile is this machine's own evidence, so it resumes the
+    /// measured range: the anchor floors the ramp and the sample ring comes
+    /// back, which is what keeps "the ramp cost is logarithmic and one-time"
+    /// from silently becoming "per restart" on a desktop.
+    #[test]
+    fn a_local_profile_resumes_the_measured_range() {
+        let ring: Vec<FitSample> = (1..=6)
+            .map(|k| FitSample {
+                units: k * 8,
+                delta_mb: 10 * k * 8,
+            })
+            .collect();
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 6,
+                knee_units: None,
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 64,
+                local_samples: 6,
+                ring: ring.clone(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+
+        let state = ledger.calibration_state("g/a", BOARD).expect("seeded");
+        assert_eq!(state.max_units_measured, 64, "the anchor survived the restart");
+        assert_eq!(state.samples, ring, "and so did the ring the fit runs on");
+        assert_eq!(ledger.health()[0].workers[0].local_samples, 6);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(
+            token.grant().unit_budget,
+            64,
+            "resumes at the measured range instead of re-ramping from the seed"
+        );
+    }
+
+    /// A second replica of the same model on the same board must not re-seed:
+    /// what it would overwrite is this run's own measurements.
+    #[test]
+    fn seeding_happens_once_per_model_and_board() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 6,
+                knee_units: None,
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 64,
+                local_samples: 6,
+                ring: vec![FitSample {
+                    units: 64,
+                    delta_mb: 640,
+                }],
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let first = loaded(Some(1000), Some(0));
+        let _a = ledger.register_worker("g/a", item_cost(4), &first).unwrap();
+        let second = loaded(Some(1000), Some(0));
+        let _b = ledger.register_worker("g/a", item_cost(4), &second).unwrap();
+        assert_eq!(
+            ledger.calibration_state("g/a", BOARD).unwrap().samples.len(),
+            1,
+            "the ring was restored once, not once per replica"
+        );
+    }
+
+    /// An unconfirmed fit — every shipped or fallback-matched profile on a
+    /// fresh install, and a thin local one — is priced under a widened
+    /// margin, and the widening drops the moment this machine has confirmed
+    /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean high-water samples.
+    #[test]
+    fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
+        // Two identical boards, identical residents, identical external
+        // usage — differing only in whether this machine has confirmed the
+        // model's cost. Comparing grants across the *arrival* of a fit would
+        // compare two different things (pre-fit the MB side is the whole
+        // contention share; post-fit it is the batch's actual price), so the
+        // confirmed side is seeded by a local profile that carries no slope.
+        let grant_mb = |confirmed: bool| -> (u64, f64) {
+            let profiles = Arc::new(FakeProfiles {
+                seed: confirmed.then(|| ProfileSeed {
+                    base_mb: 1000,
+                    // No slope: this profile confers confirmation, not a fit,
+                    // so both sides stay pre-fit and only the margin differs.
+                    slope_mb_per_unit: 0.0,
+                    residual_mb: 0.0,
+                    samples: 0,
+                    knee_units: None,
+                    local: true,
+                    fit_is_local: false,
+                    exact_torch: true,
+                    max_units_measured: 0,
+                    local_samples: LOCAL_CONFIRMATION_SAMPLES,
+                    ring: Vec::new(),
+                }),
+                ..FakeProfiles::default()
+            });
+            let ledger = ledger_with(100_000, VramBudget::default(), &profiles);
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle)
+                .unwrap();
+            // Something else holds 49 GB, so the margin has something to
+            // bite on at all.
+            push_memory(&handle, 50_000, 0);
+            ledger.ingest_all_for_test();
+            let margin = ledger.health()[0].workers[0].effective_margin;
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            (token.grant().mb, margin)
+        };
+        let (unconfirmed_mb, unconfirmed_margin) = grant_mb(false);
+        let (confirmed_mb, confirmed_margin) = grant_mb(true);
+        assert_eq!(
+            unconfirmed_margin,
+            DEFAULT_MARGIN + UNCONFIRMED_MARGIN_BONUS,
+            "nothing local stands behind this model yet"
+        );
+        assert_eq!(confirmed_margin, DEFAULT_MARGIN);
+        assert!(
+            confirmed_mb > unconfirmed_mb,
+            "the widened margin costs the unconfirmed model headroom: \
+             {unconfirmed_mb} vs {confirmed_mb}"
+        );
+
+        // And confirmation is earned by local evidence alone: five clean
+        // high-water windows drop the widening.
+        let ledger = ledger(100_000, VramBudget::default());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 50_000, 0);
+        for units in [4, 8, 16, 32] {
+            measured_window(&handle, &admission, units);
+            assert_eq!(
+                ledger.health()[0].workers[0].effective_margin,
+                DEFAULT_MARGIN + UNCONFIRMED_MARGIN_BONUS,
+                "still under the confirmation count"
+            );
+        }
+        measured_window(&handle, &admission, 64);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.local_samples, LOCAL_CONFIRMATION_SAMPLES);
+        assert_eq!(
+            worker.effective_margin, DEFAULT_MARGIN,
+            "confirmed by local evidence, so the widening drops"
+        );
+    }
+
+    /// A degraded cost dimension — no parseable `metadata.cost` — widens the
+    /// same way, and permanently: a missing declaration is unconfirmable, not
+    /// merely unconfirmed.
+    #[test]
+    fn a_degraded_cost_dimension_widens_the_margin_permanently() {
+        let ledger = ledger(100_000, VramBudget::default());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", CostDimension::fallback(), &handle)
+            .unwrap();
+        push_memory(&handle, 50_000, 0);
+        for units in [4, 8, 16, 32, 64] {
+            measured_window(&handle, &admission, units);
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert!(worker.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
+        assert_eq!(
+            worker.effective_margin,
+            DEFAULT_MARGIN + UNCONFIRMED_MARGIN_BONUS,
+            "local samples cannot confirm a dimension that was never declared"
+        );
+    }
+
+    /// Scatter widens too, proportionally to the model's own base and
+    /// clamped — the design's "residual_mb ... inflates that model's
+    /// effective margin, clamped to a maximum factor".
+    #[test]
+    fn a_scattered_fit_widens_the_margin() {
+        let ledger = ledger(100_000, VramBudget::default());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 50_000, 0);
+        // A systematically scattered high-water series: residual ~150 MB
+        // against a 1000 MB base.
+        let series: Vec<BatchMeasurement> = (1..=8u64)
+            .map(|k| {
+                measurement(
+                    k * 8,
+                    0,
+                    10 * k * 8 + if k.is_multiple_of(2) { 300 } else { 0 },
+                )
+            })
+            .collect();
+        handle.lock().unwrap().record_measurements(series);
+        clean_window(&admission);
+        let worker = &ledger.health()[0].workers[0];
+        let residual = worker.fit.as_ref().unwrap().residual_mb;
+        assert!(residual > 50.0, "the series really is scattered: {residual}");
+        assert!(
+            worker.effective_margin > DEFAULT_MARGIN,
+            "and that scatter reaches the margin: {}",
+            worker.effective_margin
+        );
+        assert!(
+            worker.effective_margin <= DEFAULT_MARGIN + MAX_MARGIN_INCREMENT,
+            "clamped: {}",
+            worker.effective_margin
+        );
+    }
+
+    /// The widening is **additive**, and only its own increment is clamped:
+    /// a configured margin survives whatever the user wrote — including
+    /// values the old multiplicative clamp could not express without
+    /// panicking (`f64::clamp` with `min > max`) — and `margin = 0` still
+    /// buys the unconfirmed bonus instead of multiplying it away.
+    #[test]
+    fn margin_widening_is_additive_and_never_clamps_the_configured_margin() {
+        // A margin far above the old 0.5 total clamp, exercised through both
+        // paths that read it: `/health` and a real grant request.
+        let ledger = ledger(
+            100_000,
+            VramBudget {
+                margin: 0.9,
+                cap_fraction: None,
+            },
+        );
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.effective_margin,
+            0.9 + UNCONFIRMED_MARGIN_BONUS,
+            "the user's margin is honoured whole and widened on top"
+        );
+        assert!(
+            admission.request_grant(u64::MAX, None, 1, 0).is_some(),
+            "and pricing a window under it does not panic"
+        );
+
+        // Zero is the other end: a multiplicative widening would leave an
+        // unconfirmed model with no protection at all.
+        let unmargined = self::ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = unmargined
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        unmargined.ingest_all_for_test();
+        assert_eq!(
+            unmargined.health()[0].workers[0].effective_margin,
+            UNCONFIRMED_MARGIN_BONUS,
+            "margin = 0 still widens for an unconfirmed fit"
+        );
+    }
+
+    /// The write policy: a settled window persists only when the ratchet
+    /// anchor advanced or the fit meaningfully changed — never per window,
+    /// and never before this machine has measured anything of its own.
+    #[test]
+    fn the_write_policy_fires_on_evidence_not_per_window() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+
+        // Windows that measure nothing teach nothing, so they persist
+        // nothing.
+        for _ in 0..5 {
+            clean_window(&admission);
+        }
+        assert!(
+            profiles.updates.lock().unwrap().is_empty(),
+            "no local evidence yet, so nothing is written"
+        );
+
+        // Every measured window advances the anchor, so every one of them is
+        // a write.
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let written = profiles.updates.lock().unwrap().len();
+        assert_eq!(written, 3, "one per anchor advance");
+        let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.inference_id, "g/a");
+        assert_eq!(last.gpu_name, "TEST 9000", "keyed by GPU model name");
+        assert_eq!(last.torch, "2.7.1+cu128");
+        assert_eq!(last.dtype, "fp16");
+        assert_eq!(last.epoch, 1);
+        assert_eq!(last.unit, "item");
+        assert_eq!(last.aggregation, "count");
+        assert_eq!(last.base_mb, 1000);
+        assert_eq!(last.base_method.as_deref(), Some("nvml"));
+        assert_eq!(last.max_units_measured, 16);
+        assert_eq!(last.local_samples, 3);
+        assert_eq!(last.ring.len(), 3, "the ring rides along so a restart refits");
+
+        // More clean windows that measure nothing again change nothing.
+        for _ in 0..5 {
+            clean_window(&admission);
+        }
+        assert_eq!(
+            profiles.updates.lock().unwrap().len(),
+            written,
+            "a settle with no anchor advance and no fit change writes nothing"
+        );
+
+        // A window whose batch is *smaller* than the anchor does not advance
+        // it — but it does move the fit, which is the other half of the
+        // policy.
+        measured_window(&handle, &admission, 8);
+        let updates = profiles.updates.lock().unwrap();
+        assert_eq!(updates.len(), written + 1, "the refit is a reason to write");
+        assert_eq!(updates.last().unwrap().max_units_measured, 16);
+        assert_eq!(updates.last().unwrap().local_samples, 4);
+    }
+
+    /// A **local** profile matched through the `major.minor` fallback tier
+    /// restores this machine's own anchor and ring — the silicon did not
+    /// change — but confers no *confirmation*: the software environment did,
+    /// so the machine re-earns those samples under the new torch build and
+    /// runs widened until it has.
+    #[test]
+    fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 6,
+                knee_units: None,
+                local: true,
+                fit_is_local: true,
+                // The store fell back across torch builds to find this.
+                exact_torch: false,
+                max_units_measured: 64,
+                local_samples: 6,
+                ring: vec![FitSample {
+                    units: 64,
+                    delta_mb: 740,
+                }],
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, VramBudget::default(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 50_000, 0);
+        ledger.ingest_all_for_test();
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.max_units_measured, 64,
+            "the anchor is this machine's own measurement whatever torch built it"
+        );
+        assert_eq!(
+            worker.local_samples, 0,
+            "but a different torch build confirms nothing"
+        );
+        assert_eq!(
+            worker.effective_margin,
+            DEFAULT_MARGIN + UNCONFIRMED_MARGIN_BONUS,
+            "so it runs widened until this build has confirmed it"
+        );
+
+        // And confirmation is re-earned locally, exactly as on a fresh
+        // install with a shipped baseline.
+        for units in [64, 128, 256, 512, 1024] {
+            measured_window(&handle, &admission, units);
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert!(worker.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
+        assert_eq!(worker.effective_margin, DEFAULT_MARGIN);
+    }
+
+    /// A TTL unload and reload must not re-import the ring this run just
+    /// wrote: the seed flag is set on the first lookup **attempt**, not on
+    /// the first match, so the store's answer — which is now this run's own
+    /// evidence — is never appended onto itself.
+    #[test]
+    fn a_reload_resumes_a_written_profile_without_duplicating_its_ring() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: Vec::new(),
+                local_path: root.path().join("inferio/calibration.toml"),
+            },
+            StoreEnv {
+                platform: "windows".to_owned(),
+                backend: "cuda".to_owned(),
+                generator: "panoptikon test".to_owned(),
+            },
+            Duration::ZERO,
+        );
+        let ledger = VramLedger::for_test_with(
+            &[(BOARD, "TEST 9000", 100_000)],
+            no_margin(),
+            Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
+        );
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let before = ledger.calibration_state("g/a", BOARD).expect("measured");
+        assert_eq!(before.samples.len(), 3);
+        assert_eq!(before.max_units_measured, 16);
+        // The store really would answer now — that is the whole hazard.
+        assert!(
+            store
+                .lookup(&ProfileQuery {
+                    inference_id: "g/a",
+                    epoch: 1,
+                    gpu_name: "TEST 9000",
+                    torch: Some("2.7.1+cu128"),
+                    dtype: Some("fp16"),
+                })
+                .is_some(),
+            "this run's own profile is on disk"
+        );
+
+        // TTL unload, then the same model loads again on the same board.
+        drop(admission);
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        let after = ledger.calibration_state("g/a", BOARD).expect("still there");
+        assert_eq!(
+            after.samples, before.samples,
+            "the persisted ring was not appended onto the live one"
+        );
+        assert_eq!(
+            after.max_units_measured, 16,
+            "and the anchor resumes rather than doubling back"
+        );
+    }
+
+    /// A seeded fit is never written back into the local store stamped with
+    /// our generator: anchor, ring and local sample count are this machine's
+    /// evidence from the first sample, but the *fit* is only local once a
+    /// local refit has produced it.
+    #[test]
+    fn a_seeded_fit_is_never_laundered_into_local_provenance() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 3.5,
+                residual_mb: 42.0,
+                samples: 20,
+                knee_units: None,
+                // A shipped baseline: pricing, nothing else.
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 0,
+                local_samples: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+
+        // One local sample: the anchor advanced, so the entry is written —
+        // but the fit in force is still the baseline's.
+        measured_window(&handle, &admission, 4);
+        let first = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(first.max_units_measured, 4);
+        assert_eq!(first.local_samples, 1);
+        assert!(!first.ring.is_empty(), "the ring is local evidence and travels");
+        assert_eq!(
+            (first.slope_mb_per_unit, first.residual_mb, first.samples),
+            (0.0, 0.0, 0),
+            "no fit fields for a fit this machine did not compute"
+        );
+
+        // MIN_FIT_SAMPLES local samples produce a local refit, and that one
+        // does travel.
+        measured_window(&handle, &admission, 8);
+        measured_window(&handle, &admission, 16);
+        let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            last.slope_mb_per_unit > 0.0,
+            "the local refit's values are written: {last:?}"
+        );
+        assert_eq!(last.samples, MIN_FIT_SAMPLES);
+    }
+
+    /// A worker the store could not key — no torch build, no negotiated
+    /// dtype, or no measured base — is never persisted: an unkeyed entry
+    /// could not be read back, and a profile claiming a base of 0 would
+    /// suppress a real load reservation later.
+    #[test]
+    fn an_unkeyable_worker_is_never_persisted() {
+        for report in [
+            LoadReport {
+                base_mb: Some(1000),
+                reserved_at_load_mb: Some(0),
+                gpu_uuid: Some(BOARD.to_owned()),
+                dtype: Some("fp16".to_owned()),
+                ..LoadReport::default()
+            },
+            LoadReport {
+                base_mb: Some(1000),
+                reserved_at_load_mb: Some(0),
+                gpu_uuid: Some(BOARD.to_owned()),
+                torch_version: Some("2.7.1+cu128".to_owned()),
+                ..LoadReport::default()
+            },
+            LoadReport {
+                reserved_at_load_mb: Some(0),
+                gpu_uuid: Some(BOARD.to_owned()),
+                torch_version: Some("2.7.1+cu128".to_owned()),
+                dtype: Some("fp16".to_owned()),
+                ..LoadReport::default()
+            },
+        ] {
+            let profiles = Arc::new(FakeProfiles::default());
+            let ledger = ledger_with(100_000, no_margin(), &profiles);
+            let mut telemetry = WorkerTelemetry::default();
+            telemetry.load = Some(Timestamped::now(report));
+            let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle)
+                .unwrap();
+            push_memory(&handle, 90_000, 0);
+            measured_window(&handle, &admission, 4);
+            assert!(
+                profiles.updates.lock().unwrap().is_empty(),
+                "an incomplete profile key is never written"
+            );
+        }
     }
 
     /// `none`-class models, workers with no GPU at all, and boards outside

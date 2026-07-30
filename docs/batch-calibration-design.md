@@ -17,12 +17,15 @@ concrete per-DB migration mechanics). Supersedes the one-line itemization
 in that document.
 
 **Status**: rollout steps 1a (worker-side memory sensing on the `load` and
-`predict` responses) and 1b (the per-GPU ledger, grants and fit snapshots on
+`predict` responses), 1b (the per-GPU ledger, grants and fit snapshots on
 request frames, load reservations, the worker's packing harness and defensive
-clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) are
-implemented. The calibration store — persistence of the ratchet anchor, the
-sample ring and the fit, plus shipped-baseline lookup — is step 1c and is not.
-Steps 2–5 are not started.
+clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) and
+1c (the calibration store: the local TOML round trip for the ratchet anchor,
+the sample ring and the fit, shipped-baseline lookup with the torch fallback
+hierarchy, non-local-profile margin widening, and the `/api/inference/metadata`
+calibration overlay) are implemented. `knee_units` is parsed and persisted but
+not yet fitted, and no shipped baselines exist yet — both are step 4. Steps
+2–5 are otherwise not started.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -347,7 +350,12 @@ grant     = min(headroom share, ramp step, slope × knee_units,
 - **Fit confidence widens margins automatically**: `residual_mb` (and
   non-local-profile status — any shipped or fallback-matched entry not
   yet locally confirmed, see Lookup) inflate that model's effective
-  margin, clamped to a maximum factor. Safety never depends on a human reading a
+  margin, clamped to a maximum. Both inflations are **additive
+  increments** on the configured margin and it is their sum that is
+  clamped, never the total: the user's own number survives whatever they
+  set it to (including 0.9), and a configured margin of 0 — a headless
+  box — still gets the unconfirmed-profile widening rather than
+  multiplying it away. Safety never depends on a human reading a
   Desktop label; the future tab's "verified" badge is presentation on
   top of the same number.
 - **Ramp**: until the fit has enough samples, grants ramp geometrically
@@ -712,9 +720,17 @@ The current single number splits three ways:
    by request-level concerns (payload bytes in flight — the existing
    byte-budget pipelining — and keeping the server fed), not by the cap
    and not by guessing GPU batches.
-3. **Calibration seed** — inferio-side resolution order: local profile →
-   shipped profile → `metadata.cost.seed_units` → global conservative
-   constant.
+3. **Calibration seed** — inferio-side, and *not* a single resolution
+   order, because the seed and the profile answer different questions.
+   The seed batch size is `metadata.cost.seed_units`, falling back to the
+   global conservative constant; a profile never supplies it. What a
+   profile supplies is where the ramp *starts from*: a **local** profile's
+   ratchet anchor is restored and acts as a floor on the budget (and on
+   the ramp exponent), so the first window after a restart resumes at the
+   largest batch this machine has actually measured rather than at the
+   seed. A **shipped** profile deliberately does not — it prices the
+   window (slope, `base`, the knee cap) but confers no growth, so a fresh
+   install still ramps from the seed even with a baseline present.
 
 Schema/plumbing (verified): `CronJob.batch_size`, model-config
 `default_batch_size`, and job-request `batch_size` are already

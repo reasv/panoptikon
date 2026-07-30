@@ -71,6 +71,13 @@ pub struct InferioState {
     pub registry: Arc<StdMutex<RegistryCache>>,
     /// Probed once at startup; drives the `/metadata` availability overlay.
     pub compute_caps: super::capability::HostComputeCaps,
+    /// Calibration profiles (shipped baselines + the local store), for the
+    /// `/metadata` calibration overlay. The ledger holds the same store.
+    pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
+    /// Model name of the board a model would load on by default — the one
+    /// board the calibration overlay can answer for unambiguously. `None` on
+    /// a host with no GPU inventory, where the overlay is omitted entirely.
+    pub default_gpu_name: Option<String>,
 }
 
 impl InferioState {
@@ -103,6 +110,9 @@ impl InferioState {
                 config_dirs: local.config_dirs.clone(),
             }
         };
+        // Shipped calibration baselines live in a `calibration/` subdirectory
+        // of each registry dir (the registry loader itself never recurses).
+        let registry_dirs = registry_config.config_dirs.clone();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(registry_config)));
 
         let mut deadlines = WorkerDeadlines::default();
@@ -119,23 +129,26 @@ impl InferioState {
             deadlines.terminate_grace = Duration::from_secs(secs);
         }
 
+        // Worker env follows the wheels actually installed (the setup
+        // sentinel), not a re-probe of the hardware: config `auto` on a
+        // host with /opt/rocm must not inject HIP paths into a venv that
+        // was deliberately synced as cpu/cuda. Config resolution remains
+        // the fallback for user-managed interpreters and legacy venvs,
+        // which have no sentinel. The same answer is the `backend`
+        // component of every calibration profile key — a profile measured
+        // against ROCm wheels says nothing about a CUDA build.
+        let accelerator = if local.python.is_some() {
+            crate::setup::effective_accelerator(local.python_env.accelerator)
+        } else {
+            crate::setup::installed_accelerator().unwrap_or_else(|| {
+                crate::setup::effective_accelerator(local.python_env.accelerator)
+            })
+        };
         let spawn = WorkerSpawnConfig {
             python: local.resolved_python(),
             impl_dirs: local.resolved_impl_dirs(),
             pythonpath: local.resolved_pythonpath(),
-            // Worker env follows the wheels actually installed (the setup
-            // sentinel), not a re-probe of the hardware: config `auto` on a
-            // host with /opt/rocm must not inject HIP paths into a venv that
-            // was deliberately synced as cpu/cuda. Config resolution remains
-            // the fallback for user-managed interpreters and legacy venvs,
-            // which have no sentinel.
-            env: crate::accelerator_env::worker_env(if local.python.is_some() {
-                crate::setup::effective_accelerator(local.python_env.accelerator)
-            } else {
-                crate::setup::installed_accelerator().unwrap_or_else(|| {
-                    crate::setup::effective_accelerator(local.python_env.accelerator)
-                })
-            }),
+            env: crate::accelerator_env::worker_env(accelerator),
             env_remove: Vec::new(),
             cwd: None,
             deadlines,
@@ -144,6 +157,23 @@ impl InferioState {
         // exist (worker→GPU pinning, the per-GPU ledger) and what they can
         // do (the /metadata availability overlay). Probed once at startup.
         let host = super::gpu::probe();
+        // The calibration store: shipped baselines beside the registry, the
+        // generated file in the data folder. The environment half of every
+        // profile key is resolved once, here — it cannot change while the
+        // process runs, and a caller that got it wrong would mis-key every
+        // profile it wrote.
+        let calibration = super::calibration::CalibrationStore::new(
+            super::calibration::StorePaths::beside_registry(
+                &registry_dirs,
+                &crate::config::runtime().data_folder,
+            ),
+            super::calibration::StoreEnv {
+                platform: super::calibration::StoreEnv::platform_name(),
+                backend: accelerator_backend(accelerator).to_owned(),
+                generator: format!("panoptikon {}", crate::resources::VERSION),
+            },
+        );
+        let default_gpu_name = host.inventory.default_board_name();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -158,6 +188,7 @@ impl InferioState {
                 // Step 2 adds `[inference_local.vram]`; until then every
                 // board runs on the defaults (margin 0.10 on, cap off).
                 vram: super::ledger::VramBudget::default(),
+                calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),
         );
@@ -165,6 +196,8 @@ impl InferioState {
             manager,
             registry,
             compute_caps: host.caps,
+            calibration: Some(calibration),
+            default_gpu_name,
         }))
     }
 
@@ -177,6 +210,26 @@ impl InferioState {
             .unwrap()
             .get()
             .and_then(|registry| registry.external_inputs_json())
+    }
+}
+
+/// The `backend` component of a calibration profile key: which torch build
+/// the measurements were taken against. `Auto` reaching this point means
+/// resolution failed outright (a validation error), and `cpu` is the label
+/// that promises the least.
+///
+/// macOS/MPS lands on `cpu` too, for the same reason and with the same
+/// consequence: the accelerator enum has no MPS variant, so an Apple-silicon
+/// host keys its profiles as `cpu`. Harmless today — a worker that reports no
+/// CUDA/ROCm board never registers with the ledger, so nothing on such a host
+/// is ever priced, seeded or persisted — but the day MPS gets admission it
+/// needs its own label here, or a Mac's measurements and a CPU-wheel box's
+/// would share one key and describe different silicon.
+fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
+    match accelerator {
+        crate::config::Accelerator::Cuda => "cuda",
+        crate::config::Accelerator::Rocm => "rocm",
+        crate::config::Accelerator::Cpu | crate::config::Accelerator::Auto => "cpu",
     }
 }
 
@@ -573,6 +626,17 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
         Ok(registry) => {
             let mut body = registry.metadata_json();
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
+            // Additive and read-only, exactly like the availability overlay
+            // above: what the calibration store knows about each priced model
+            // on the board it would load on.
+            if let Some(store) = state.calibration.as_ref() {
+                super::calibration::overlay_metadata(
+                    &mut body,
+                    store,
+                    &registry,
+                    state.default_gpu_name.as_deref(),
+                );
+            }
             Ok(Json(body))
         }
         Err(err) => {
@@ -784,6 +848,10 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// The board the test fixture's calibration overlay answers for. Tests
+    /// must never depend on the host's GPUs, so the fixture names one.
+    const TEST_GPU: &str = "TEST 9000";
 
     // ------------------------------------------------------------------
     // Response-encoding parity (pure): everything encode_output_response
@@ -1039,6 +1107,21 @@ metadata.description = "echo fixture"
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
             config_dirs: vec![dir.path().to_path_buf()],
         })));
+        // A calibration store rooted in the test's own temp dir: no shipped
+        // baselines, an empty local file, and no debounce so a recorded
+        // profile is visible to `/metadata` immediately.
+        let calibration = super::super::calibration::CalibrationStore::with_debounce(
+            super::super::calibration::StorePaths::beside_registry(
+                &[dir.path().to_path_buf()],
+                &dir.path().join("data"),
+            ),
+            super::super::calibration::StoreEnv {
+                platform: "windows".to_owned(),
+                backend: "cuda".to_owned(),
+                generator: "panoptikon test".to_owned(),
+            },
+            Duration::ZERO,
+        );
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn: test_spawn_config(),
@@ -1048,6 +1131,7 @@ metadata.description = "echo fixture"
                 // Tests must not depend on the host's GPUs.
                 gpus: super::super::gpu::GpuInventory::unknown(),
                 vram: super::super::ledger::VramBudget::default(),
+                calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),
         );
@@ -1056,6 +1140,10 @@ metadata.description = "echo fixture"
             registry,
             // Tests must not depend on the host's GPUs.
             compute_caps: super::super::capability::HostComputeCaps::unknown(),
+            calibration: Some(calibration),
+            // ...but the calibration overlay needs *a* board to answer for,
+            // so the fixture names one.
+            default_gpu_name: Some(TEST_GPU.to_owned()),
         });
         let app = Router::new().nest_service("/api/inference", router(Arc::clone(&state)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1578,6 +1666,80 @@ config.impl_class = "echo_test"
             .get()
             .expect("empty registry loads");
         assert!(registry.groups.is_empty());
+        state.manager.shutdown().await;
+    }
+
+    /// `/metadata` carries the calibration overlay: what the store knows
+    /// about each priced model on the board it would load on. Additive and
+    /// read-only, exactly like the Package-1 availability overlay — and
+    /// absent for a `none`-class model, which is never priced at all.
+    #[tokio::test]
+    async fn metadata_carries_the_calibration_overlay() {
+        use super::super::calibration::{CalibrationProfiles, ProfileUpdate};
+
+        let (state, base_url, _registry_dir) = spawn_test_server_with_registry(
+            r#"
+[group.echo]
+config.impl_class = "echo_test"
+[group.echo.metadata.cost]
+unit = "item"
+aggregation = "count"
+epoch = 1
+seed_units = 8
+
+[group.echo.inference_ids.test]
+metadata.description = "echo fixture"
+
+[group.echo.inference_ids.remote]
+metadata.cost.unit = "none"
+"#,
+        )
+        .await;
+        state.calibration.as_ref().unwrap().record(ProfileUpdate {
+            inference_id: "echo/test".to_owned(),
+            epoch: 1,
+            gpu_name: TEST_GPU.to_owned(),
+            torch: "2.7.1+cu128".to_owned(),
+            dtype: "fp16".to_owned(),
+            unit: "item",
+            aggregation: "count",
+            base_mb: 4321,
+            base_method: Some("nvml".to_owned()),
+            slope_mb_per_unit: 0.79,
+            residual_mb: 96.0,
+            samples: 38,
+            knee_units: None,
+            max_units_measured: 1024,
+            local_samples: 12,
+            ring: Vec::new(),
+        });
+
+        let metadata: JsonValue = reqwest::get(format!("{base_url}/api/inference/metadata"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let calibrated = &metadata["echo"]["inference_ids"]["test"]["calibration"];
+        assert_eq!(calibrated["status"], json!("local"));
+        assert_eq!(calibrated["gpu"], json!(TEST_GPU));
+        assert_eq!(calibrated["dtype"], json!("fp16"));
+        assert_eq!(calibrated["base_mb"], json!(4321));
+        assert_eq!(calibrated["slope_mb_per_unit"], json!(0.79));
+        assert_eq!(calibrated["samples"], json!(38));
+        assert_eq!(calibrated["local_samples"], json!(12));
+        assert_eq!(calibrated["max_units_measured"], json!(1024));
+        // The registry metadata itself is untouched.
+        assert_eq!(
+            metadata["echo"]["inference_ids"]["test"]["description"],
+            json!("echo fixture")
+        );
+        assert!(
+            metadata["echo"]["inference_ids"]["remote"]
+                .get("calibration")
+                .is_none(),
+            "a none-class model is never priced, so it is never calibrated"
+        );
         state.manager.shutdown().await;
     }
 }
