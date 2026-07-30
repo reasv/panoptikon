@@ -396,13 +396,19 @@ async fn resolve_vector_quant(
 
 /// Whether the filter is asking for a quant profile at all.
 ///
-/// **Release policy: a bare `auto` resolves to exact.** Measured on the
-/// `default` index 2026-07-21 (harness: `pql::explain_plan`), the two-stage
-/// scorer is a win only on the RRF-composed search shape and a loss
-/// everywhere else — `similar_to` t2t went 12.8s → 55s, i2i 0.68s → 1.7s,
-/// pure semantic search 0.60s → 1.55s. Until the coarse pass stops being a
-/// row-at-a-time join (see docs/vector-quant-measurements.md), `auto` must
-/// not silently choose it.
+/// **Release policy: a bare `auto` resolves to exact.** Re-affirmed
+/// 2026-07-30 after the two-stage scorer's execution was fixed
+/// (docs/or-composition-penalty.md §8 step 3) — the blocker moved from
+/// latency to recall. Measured on the `default` index (tools/quant-recall,
+/// explicit `index: "quant"`): binary-quant recall is clean for the
+/// CLIP-family (clip/clap/similar_to overlap@100 ≥ 0.978) but broken for
+/// mpnet text at the default k (overlap@50 as low as 0.245, overlap@10 down
+/// to 0.700 — the exact top-10 isn't in the coarse top-10k), and the paths
+/// where recall IS clean have no measured latency win at current data sizes
+/// (clip 90k is a tie; `similar_to`'s quant execution was deliberately not
+/// restructured). Revisit when a no-rerank int8 profile passes the recall
+/// bar (overlap@100 ≥ 0.99 on mpnet) — that is the path where `auto` could
+/// claim the measured 2x composed-search win without recall loss.
 ///
 /// An explicit `variant` under `auto` stays a strict selection, exactly like
 /// `quant`: naming a profile is an opt-in, and the sync validator already
