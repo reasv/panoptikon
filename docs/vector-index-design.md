@@ -7,6 +7,18 @@ TOML desired-state, reconcile job, artifacts in v1). Not implemented.
 Companion to `docs/search-cache-design.md` (the cache amortizes scan
 cost; this design shrinks it).
 
+> **CURRENT STATE: `docs/vector-int8-quant.md` (2026-07-30).** The codec is
+> int8 global-symmetric absmax, scored in a **single pass** — the binary
+> quantizer and the whole two-stage coarse/rescore scorer described below
+> are deleted, `k` is deprecated and ignored, and bare `auto` resolves to
+> the default quant profile again. The storage-state half of this document
+> (profiles, coverage, artifacts, revisions, the reconcile job, the inline
+> hook, `auto` fallback) is still accurate and still the reference; the
+> codec and execution halves are not. One exception on the storage side:
+> `embedding_quants` is no longer `WITHOUT ROWID` (see the int8 doc's
+> "Storage layout" section and the 20260730150000 migration). Read the int8
+> doc first.
+
 > **Superseded in part by `docs/vector-quant-measurements.md` (2026-07-21).**
 > The implemented two-stage scorer was benchmarked for the first time and is
 > slower than exact on every query shape except the RRF `or` composition, so
@@ -214,6 +226,12 @@ CREATE TABLE embedding_quants (
     PRIMARY KEY (id, profile_id)
 ) WITHOUT ROWID;
 ```
+
+> `WITHOUT ROWID` was a mistake and is gone as of the 20260730150000
+> migration: the key became `UNIQUE (id, profile_id)` on an ordinary rowid
+> table. It was survivable for binary's 96–128 byte payloads and fatal for
+> int8's 768–1024 byte ones. See "Storage layout" in
+> `docs/vector-int8-quant.md`.
 
 Plain tables: the entire existing cascade-cleanup story applies
 unchanged (embedding deleted → quants gone; profile dropped → its rows

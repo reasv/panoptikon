@@ -20,6 +20,9 @@ pub(crate) mod storage;
 pub(crate) mod system_config;
 pub(crate) mod tags;
 pub(crate) mod vector_quants;
+// TEMPORARY VERIFICATION HARNESS (int8 remap review) — remove with the file.
+#[cfg(test)]
+pub(crate) mod vq_int8_verify_harness;
 
 #[allow(unused_imports)] // For the future DB delete/rename/restore flow.
 pub(crate) use connection::invalidate_read_pools;

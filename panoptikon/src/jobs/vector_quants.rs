@@ -12,7 +12,7 @@ use crate::api_error::ApiError;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::vector_quants::{
     BACKFILL_CHUNK_ROWS, DELETE_CHUNK_ROWS, DesiredState, RECONCILE_JOB_TAG, ReconcileWork,
-    SpaceBuild, analyze, compute_mean_artifact, load_desired_state, load_snapshot, plan_data,
+    SpaceBuild, analyze, compute_int8_scale_artifact, load_desired_state, load_snapshot, plan_data,
 };
 use crate::jobs::queue::{BatchDedup, JobRequest, JobType, enqueue_jobs_with_dedup};
 
@@ -155,7 +155,8 @@ async fn build_space(index_db: &str, profile_id: i64, build: &SpaceBuild) -> Api
     if !build.resume {
         let artifact = if build.needs_artifact {
             let mut conn = crate::db::open_index_db_read_no_user_data(index_db).await?;
-            let artifact = compute_mean_artifact(&mut conn, &build.setter_ids, build.dim).await?;
+            let artifact =
+                compute_int8_scale_artifact(&mut conn, &build.setter_ids, build.dim).await?;
             match artifact {
                 Some(artifact) => Some(artifact),
                 // Vectors vanished since the plan was computed; nothing to do.

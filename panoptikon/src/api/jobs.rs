@@ -478,7 +478,7 @@ pub(crate) async fn update_config(
     // treat an invalid section as empty, which would silently remove
     // profiles.
     if let Some(quants) = &config.vector_quants
-        && let Err(message) = crate::db::vector_quants::resolve_desired(quants)
+        && let Err(message) = crate::db::vector_quants::resolve_desired_strict(quants)
     {
         return Err(ApiError::bad_request(message));
     }
@@ -694,7 +694,7 @@ pub(crate) async fn enqueue_vector_quant_reconcile(
     path = "/api/jobs/quants/rebuild",
     tag = "jobs",
     summary = "Rebuild a quant profile's artifact for an embedding space",
-    description = "Marks the embedding space containing the given setter for rebuild under the given profile (artifact recomputed at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — artifact recomputation reshuffles coarse order and is never background-silent.",
+    description = "Marks the embedding space containing the given setter for rebuild under the given profile (the int8 scale is recomputed and every code rewritten at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — a recomputed scale invalidates every code already stored for the space, so search results move; that is never background-silent.",
     params(DbQueryParams),
     request_body(content = VectorQuantRebuildRequest, description = "The profile and setter to rebuild"),
     responses(

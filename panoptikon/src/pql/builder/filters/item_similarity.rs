@@ -14,7 +14,6 @@ use super::FilterCompiler;
 use super::embedding_types::{
     DistanceAggregation, DistanceFunction, IndexMode, QuantResolved, default_k,
 };
-use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct SourceArgs {
@@ -124,9 +123,9 @@ pub(crate) struct SimilarityArgs {
     /// brute-forces full-precision vectors; `quant` demands a quant profile
     /// and errors when it isn't ready. `ann` is reserved.
     ///
-    /// Under a quant profile both sides of the similarity self-join use
-    /// binary quants for the coarse pass, and `order_rank` is a rank, not a
-    /// raw distance.
+    /// Under a quant profile both sides of the similarity self-join read
+    /// int8 codes; `order_rank` has exactly the same semantics as under
+    /// `exact`.
     #[serde(default)]
     pub index: IndexMode,
     /// Selects a specific quant profile by name (requires quant/auto index
@@ -134,9 +133,8 @@ pub(crate) struct SimilarityArgs {
     /// this model is a validation error, not a silent fallback.
     #[serde(default)]
     pub variant: Option<String>,
-    /// The exactness horizon: the coarse-top-k candidates re-scored with
-    /// full-precision distances. Ignored by `exact`. Keep it fixed across a
-    /// pagination session.
+    /// Deprecated: ignored. Reserved for a future ANN index mode (top-k
+    /// retrieval depth).
     #[serde(default = "default_k")]
     pub k: i64,
     #[serde(skip)]
@@ -403,20 +401,21 @@ impl SimilarTo {
             Expr::col((ItemData::Table, ItemData::DataType)),
             Alias::new("data_type"),
         );
-        if matches!(join, SimVectorJoin::Embeddings) {
-            if let Some(src_text) = &args.src_text {
-                if src_text.confidence_weight != 0.0 {
-                    query.expr_as(
-                        Expr::col((ExtractedText::Table, ExtractedText::Confidence)),
-                        Alias::new("confidence"),
-                    );
-                }
-                if src_text.language_confidence_weight != 0.0 {
-                    query.expr_as(
-                        Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence)),
-                        Alias::new("language_confidence"),
-                    );
-                }
+        // Confidence columns come from the source text, not from the vector
+        // payload, so both payloads carry them: the quant path applies the
+        // same confidence weighting as the exact path.
+        if let Some(src_text) = &args.src_text {
+            if src_text.confidence_weight != 0.0 {
+                query.expr_as(
+                    Expr::col((ExtractedText::Table, ExtractedText::Confidence)),
+                    Alias::new("confidence"),
+                );
+            }
+            if src_text.language_confidence_weight != 0.0 {
+                query.expr_as(
+                    Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence)),
+                    Alias::new("language_confidence"),
+                );
             }
         }
 
@@ -495,9 +494,13 @@ impl SimilarTo {
         (select, other_ctx)
     }
 
-    /// The full-precision self-join rank aggregate, including confidence
-    /// weighting.
-    fn exact_rank_column(&self) -> Expr {
+    /// The self-join rank aggregate, including confidence weighting. `quant`
+    /// swaps the vector payload for its int8 codes — the payload columns
+    /// carry them under the same `embedding` alias, and `vec_int8` marks the
+    /// BLOBs as int8 (sqlite-vec would otherwise read them as float32). The
+    /// join shape is untouched by design: restructuring it regressed this
+    /// filter 7x (docs/or-composition-penalty.md §7).
+    fn rank_column(&self, quant: bool) -> Expr {
         let args = &self.similar_to;
         let other_alias = Alias::new("other_embeddings");
         let main_alias = Alias::new("main_embeddings");
@@ -505,11 +508,16 @@ impl SimilarTo {
             DistanceFunction::L2 => "vec_distance_L2",
             DistanceFunction::Cosine => "vec_distance_cosine",
         };
+        let payload = |alias: &Alias| -> Expr {
+            let column = Expr::col((alias.clone(), Alias::new("embedding")));
+            if quant {
+                Func::cust("vec_int8").arg(column).into()
+            } else {
+                column
+            }
+        };
         let vec_distance: Expr = Func::cust(distance_func)
-            .args([
-                Expr::col((main_alias.clone(), Alias::new("embedding"))),
-                Expr::col((other_alias.clone(), Alias::new("embedding"))),
-            ])
+            .args([payload(&main_alias), payload(&other_alias)])
             .into();
         let mut rank_column = match args.distance_aggregation {
             DistanceAggregation::Max => vec_distance.clone().max(),
@@ -572,29 +580,6 @@ impl SimilarTo {
         rank_column
     }
 
-    /// The weight-free coarse proxy: aggregated Hamming distance between
-    /// both sides' binary quants. Stored quants are plain BLOBs, which
-    /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
-    fn coarse_rank_column(&self) -> Expr {
-        let other_alias = Alias::new("other_embeddings");
-        let main_alias = Alias::new("main_embeddings");
-        let hamming: Expr = Func::cust("vec_distance_hamming")
-            .args([
-                Func::cust("vec_bit")
-                    .arg(Expr::col((main_alias.clone(), Alias::new("embedding"))))
-                    .into(),
-                Func::cust("vec_bit")
-                    .arg(Expr::col((other_alias.clone(), Alias::new("embedding"))))
-                    .into(),
-            ])
-            .into();
-        match self.similar_to.distance_aggregation {
-            DistanceAggregation::Max => hamming.max(),
-            DistanceAggregation::Avg => hamming.avg(),
-            DistanceAggregation::Min => hamming.min(),
-        }
-    }
-
     fn register_outputs(&self, state: &mut QueryState, cte: &CteRef) {
         if let Some(alias) = &self.sort.select_as {
             state.extra_columns.push(ExtraColumn {
@@ -650,80 +635,24 @@ impl FilterCompiler for SimilarTo {
             return Ok(cte);
         }
 
-        if let Some(quant) = &args._quant {
-            let coarse_collection = self.vector_collection(
-                context,
-                state,
-                &SimVectorJoin::Quants {
-                    profile_id: quant.profile_id,
-                },
-            );
-            let unqquant_cte = create_cte(
-                state,
-                format!("unqquant_{cte_name}"),
-                coarse_collection,
-            );
-            let (coarse, _) = self.distance_select(
-                state,
-                &unqquant_cte,
-                Some((self.coarse_rank_column(), COARSE_DIST)),
-            );
-
-            let k = args.k;
-            let (merge, merge_context) =
-                assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
-                let exact_collection =
-                    self.vector_collection(context, state, &SimVectorJoin::Embeddings);
-                let unqemb_cte = create_cte(
-                    state,
-                    format!("unqemb_{cte_name}"),
-                    exact_collection,
-                );
-                let (mut head, _) = self.distance_select(
-                    state,
-                    &unqemb_cte,
-                    Some((self.exact_rank_column(), EXACT_DIST)),
-                );
-                let other_alias = Alias::new("other_embeddings");
-                let ranked_alias = Alias::new(ranked.name.as_str());
-                let mut join_cond = Expr::col((ranked_alias.clone(), Alias::new("file_id")))
-                    .equals((other_alias.clone(), Alias::new("file_id")));
-                if state.item_data_query {
-                    join_cond = join_cond.and(
-                        Expr::col((ranked_alias.clone(), Alias::new("data_id")))
-                            .equals((other_alias.clone(), Alias::new("data_id"))),
-                    );
-                }
-                head.join(JoinType::InnerJoin, ranked_alias.clone(), join_cond);
-                head.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
-                head
-            });
-
-            // The merge selects only from CTEs, so no base tables are
-            // visible to the final query; its context is the ranked CTE in
-            // its FROM scope.
-            let (merge, context_for_wrap, joined_tables) = apply_sort_bounds(
-                state,
-                merge,
-                merge_context,
-                &cte_name,
-                &self.sort,
-                JoinedTables::default(),
-            );
-            let cte = wrap_query(state, merge, &context_for_wrap, cte_name, &joined_tables);
-            state.cte_counter += 1;
-            self.register_outputs(state, &cte);
-            return Ok(cte);
-        }
-
-        let exact_collection = self.vector_collection(context, state, &SimVectorJoin::Embeddings);
-        let unqemb_cte = create_cte(
-            state,
-            format!("unqemb_{cte_name}"),
-            exact_collection,
-        );
+        // Exact and quant differ only in the vector payload the collection
+        // CTE carries (full-precision embeddings vs int8 codes) and the
+        // distance that reads it. The join shape is deliberately identical
+        // (docs/or-composition-penalty.md §7, docs/vector-int8-quant.md).
+        let vector_join = match &args._quant {
+            Some(quant) => SimVectorJoin::Quants {
+                profile_id: quant.profile_id,
+            },
+            None => SimVectorJoin::Embeddings,
+        };
+        let collection = self.vector_collection(context, state, &vector_join);
+        let unqemb_cte = create_cte(state, format!("unqemb_{cte_name}"), collection);
         let (mut distance_select, other_ctx) = self.distance_select(state, &unqemb_cte, None);
-        add_rank_column_expr(&mut distance_select, &self.sort, self.exact_rank_column())?;
+        add_rank_column_expr(
+            &mut distance_select,
+            &self.sort,
+            self.rank_column(args._quant.is_some()),
+        )?;
 
         let (distance_select, context_for_wrap, joined_tables) = apply_sort_bounds(
             state,

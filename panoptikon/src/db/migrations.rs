@@ -254,6 +254,15 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
     Ok(())
 }
 
+/// Applies the index migrator to an arbitrary index database file, exactly
+/// as a gateway start would. Test/verification-harness only: the shipped
+/// paths all go through [`migrate_databases_on_disk`], which derives its
+/// paths from the runtime config.
+#[cfg(test)]
+pub(crate) async fn migrate_index_db_file(path: &Path) -> Result<()> {
+    migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await
+}
+
 /// Marks a freshly created database as being at the alembic head. init.sql
 /// creates `alembic_version` empty; the Python server's alembic decides what
 /// to run from that table, so left empty it would attempt the initial

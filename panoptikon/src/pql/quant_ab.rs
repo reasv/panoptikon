@@ -1,14 +1,19 @@
-//! Golden A/B result dump for the quant scorer (docs/or-composition-penalty.md
-//! §8 step 3).
+//! Golden A/B result dump for the quant scorer (docs/vector-int8-quant.md,
+//! docs/or-composition-penalty.md §8).
 //!
-//! Restructuring the two-stage quant pipeline's *execution* (fix B on the
-//! coarse pass, ranked-driven pinned head) must not move a single row: the
-//! merge assigns a total `order_rank`, so every quant query's result is
-//! required to be bit-identical before and after. This harness compiles a
-//! fixed set of quant queries through the real compiler, runs them against a
-//! populated snapshot, and dumps the full result of each in order — one file
-//! per case. Run it on the unmodified tree, keep the dump, run it again after
-//! the change, and `diff -r` the two directories.
+//! This harness compiles a fixed set of `index: "quant"` queries through the
+//! real compiler, runs them against a populated snapshot, and dumps the full
+//! result of each in order — one file per case. Run it on the unmodified
+//! tree, keep the dump, run it again after a change, and `diff -r` the two
+//! directories.
+//!
+//! **Dumps taken before the int8 remap are not comparable.** They are binary
+//! two-stage orderings; the quant mode now scores int8 codes in a single
+//! pass, so a byte comparison against them is meaningless by design, not a
+//! regression. The harness's ongoing role is (a) exact-vs-quant overlap
+//! dumps — run a case twice, once with `index: "quant"` and once with
+//! `index: "exact"`, and compare the orderings — and (b) determinism and
+//! byte-identity checks across *future* refactors of the quant execution.
 //!
 //! Ignored by default: it needs a populated database with a ready quant
 //! profile, which only the user has.
@@ -343,8 +348,9 @@ async fn quant_ab_dump() {
         image_case(&image, "AVG", 10000, serde_json::json!({})),
     )
     .await;
-    // k below the candidate count: the tail (coarse-only) rows must still
-    // land after every head row, in coarse order.
+    // A small `k`: deprecated and ignored since the int8 remap, so this case
+    // must now be identical to `img_min_k10000`. Kept as the regression
+    // guard for that.
     dump_case(
         &mut conn,
         &dir,
@@ -359,8 +365,8 @@ async fn quant_ab_dump() {
         composed_case(&image, &path_match, &text_match, 10000),
     )
     .await;
-    // Weighted head aggregate (SUM(d*w)/SUM(w)) plus the xmodal setter
-    // widening and the src_text LEFT JOINs.
+    // Weighted aggregate (SUM(d*w)/SUM(w)) plus the xmodal setter widening
+    // and the src_text LEFT JOINs.
     dump_case(
         &mut conn,
         &dir,

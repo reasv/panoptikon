@@ -35,9 +35,12 @@ pub(crate) struct JobSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub(crate) struct VectorQuantProfileConfig {
     pub name: String,
-    /// 'binary' in v1; 'int8' is a reserved future recipe slot.
+    /// `int8` (global-symmetric absmax, docs/vector-int8-quant.md). `binary`
+    /// is retired: the load path maps it to `int8` (which triggers a
+    /// recipe-change rebuild), the config-commit path rejects it.
     pub quantizer: String,
-    /// Mean-center vectors before binarization (per embedding space).
+    /// Deprecated: ignored since the int8 remap. Kept deserializable so
+    /// existing `[vector_quants]` sections still parse.
     #[serde(default)]
     pub centered: bool,
 }
@@ -60,8 +63,8 @@ impl VectorQuantsConfig {
             default: Some("default".to_string()),
             profiles: vec![VectorQuantProfileConfig {
                 name: "default".to_string(),
-                quantizer: "binary".to_string(),
-                centered: true,
+                quantizer: "int8".to_string(),
+                centered: false,
             }],
         }
     }

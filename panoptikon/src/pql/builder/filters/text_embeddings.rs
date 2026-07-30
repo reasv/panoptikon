@@ -12,13 +12,8 @@ use super::super::{
 };
 use super::FilterCompiler;
 use super::embedding_types::{DistanceAggregation, IndexMode, QuantResolved, default_k};
-use super::exact::{
-    assemble_exact_fixb, confidence_weight_expr, grouped_over_materialized_distance,
-};
+use super::exact::{assemble_exact_fixb, confidence_weight_expr};
 use super::item_similarity::SourceArgs;
-use super::quant::{
-    COARSE_DIST, COARSE_RANK, COARSE_ROW_DIST, EXACT_DIST, HEAD_ROW_DIST, assemble_two_stage,
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct EmbedArgs {
@@ -82,9 +77,8 @@ pub(crate) struct SemanticTextArgs {
     /// brute-forces full-precision vectors; `quant` demands a quant profile
     /// and errors when it isn't ready. `ann` is reserved.
     ///
-    /// Under a quant profile the displayed head order is always re-scored
-    /// against full-precision vectors (see `k`), and `order_rank` is a rank,
-    /// not a raw distance.
+    /// A quant profile scores int8 codes in a single pass; `order_rank` has
+    /// exactly the same semantics as under `exact`.
     #[serde(default)]
     pub index: IndexMode,
     /// Selects a specific quant profile by name (requires quant/auto index
@@ -92,9 +86,8 @@ pub(crate) struct SemanticTextArgs {
     /// this model is a validation error, not a silent fallback.
     #[serde(default)]
     pub variant: Option<String>,
-    /// The exactness horizon: the coarse-top-k candidates re-scored with
-    /// full-precision distances. Ignored by `exact`. Keep it fixed across a
-    /// pagination session.
+    /// Deprecated: ignored. Reserved for a future ANN index mode (top-k
+    /// retrieval depth).
     #[serde(default = "default_k")]
     pub k: i64,
     #[serde(skip)]
@@ -168,54 +161,6 @@ struct TextCriteria {
     weights_used: bool,
 }
 
-/// How a candidate skeleton reaches its context.
-enum Drive {
-    /// Context-driven: plain INNER JOINs, planner free to pick the order.
-    /// Used by the count path, the exact path, and the quant coarse pass.
-    Free,
-    /// Ranked-driven head: the same joins rendered as `CROSS JOIN`s with
-    /// their conditions in `WHERE`, restricted to `crank <= k`.
-    ///
-    /// `CROSS JOIN` is SQLite's join-order pin. Without it the planner drives
-    /// the head from the vector tables over the *whole* setter and probes the
-    /// ranked CTE, so every full-precision vector is read even though only
-    /// `k` of them are needed — the execution bug measured in
-    /// docs/or-composition-penalty.md §6. sea-query drops any `ON` given to a
-    /// cross join, hence the conditions move to `WHERE`; that is also what
-    /// keeps the pin intact.
-    Pinned { k: i64 },
-}
-
-/// Adds one link of a skeleton's join chain, as an INNER JOIN or as an
-/// order-pinning CROSS JOIN with the condition restated in `WHERE`.
-fn add_chain_join<R>(
-    query: &mut sea_query::SelectStatement,
-    drive: &Drive,
-    table: R,
-    alias: Option<&Alias>,
-    condition: Cond,
-) where
-    R: sea_query::IntoTableRef,
-{
-    let pinned = matches!(drive, Drive::Pinned { .. });
-    let join = if pinned {
-        JoinType::CrossJoin
-    } else {
-        JoinType::InnerJoin
-    };
-    match alias {
-        Some(alias) => {
-            query.join_as(join, table, alias.clone(), condition.clone());
-        }
-        None => {
-            query.join(join, table, condition.clone());
-        }
-    }
-    if pinned {
-        query.cond_where(condition);
-    }
-}
-
 impl SemanticTextSearch {
     fn criteria(&self) -> TextCriteria {
         let args = &self.text_embeddings;
@@ -281,17 +226,17 @@ impl SemanticTextSearch {
     /// Adds the vector payload join keyed on the embedding's item_data row.
     fn join_vector_table(
         query: &mut sea_query::SelectStatement,
-        drive: &Drive,
         vec_data: &Alias,
         join: &TextVectorJoin,
     ) {
         match join {
             TextVectorJoin::Embeddings => {
-                let cond = Cond::all().add(
+                query.join(
+                    JoinType::InnerJoin,
+                    Embeddings::Table,
                     Expr::col((Embeddings::Table, Embeddings::Id))
                         .equals((vec_data.clone(), ItemData::Id)),
                 );
-                add_chain_join(query, drive, Embeddings::Table, None, cond);
             }
             TextVectorJoin::Quants { profile_id } => {
                 let quant_cond = Cond::all()
@@ -303,25 +248,20 @@ impl SemanticTextSearch {
                         Expr::col((EmbeddingQuants::Table, EmbeddingQuants::ProfileId))
                             .eq(*profile_id),
                     );
-                add_chain_join(query, drive, EmbeddingQuants::Table, None, quant_cond);
+                query.join(JoinType::InnerJoin, EmbeddingQuants::Table, quant_cond);
             }
         }
     }
 
     /// Candidate skeleton for text-entity queries: the context's own text
-    /// rows joined to the embeddings derived from them.
-    ///
-    /// Under `Drive::Pinned` the chain is pinned exactly as written —
-    /// context → text_data (PK) → text_setters (PK) → extracted_text (PK) →
-    /// vec_data (`source_id`) → vec_setters → payload — so the head probes
-    /// only the `crank <= k` candidates.
+    /// rows joined to the embeddings derived from them. Only the payload
+    /// join differs between index modes, so membership is identical.
     fn text_entity_skeleton(
         &self,
         context: &CteRef,
         state: &QueryState,
         join: &TextVectorJoin,
         criteria: &TextCriteria,
-        drive: &Drive,
     ) -> sea_query::SelectStatement {
         let args = &self.text_embeddings;
         let text_data = Alias::new("text_data");
@@ -330,47 +270,31 @@ impl SemanticTextSearch {
         let vec_setters = Alias::new("vec_setters");
 
         let mut query = select_std_from_cte(context, state);
-        if let Drive::Pinned { k } = drive {
-            query.and_where(Expr::col(context.column_ref(COARSE_RANK)).lte(*k));
-        }
-        add_chain_join(
-            &mut query,
-            drive,
+        query.join_as(
+            JoinType::InnerJoin,
             ItemData::Table,
-            Some(&text_data),
-            Cond::all().add(
-                Expr::col((text_data.clone(), ItemData::Id)).equals(context.column_ref("data_id")),
-            ),
+            text_data.clone(),
+            Expr::col((text_data.clone(), ItemData::Id)).equals(context.column_ref("data_id")),
         );
-        add_chain_join(
-            &mut query,
-            drive,
+        query.join_as(
+            JoinType::InnerJoin,
             Setters::Table,
-            Some(&text_setters),
-            Cond::all().add(
-                Expr::col((text_setters.clone(), Setters::Id))
-                    .equals((text_data.clone(), ItemData::SetterId)),
-            ),
+            text_setters.clone(),
+            Expr::col((text_setters.clone(), Setters::Id))
+                .equals((text_data.clone(), ItemData::SetterId)),
         );
-        add_chain_join(
-            &mut query,
-            drive,
+        query.join(
+            JoinType::InnerJoin,
             ExtractedText::Table,
-            None,
-            Cond::all().add(
-                Expr::col((ExtractedText::Table, ExtractedText::Id))
-                    .equals(context.column_ref("data_id")),
-            ),
+            Expr::col((ExtractedText::Table, ExtractedText::Id))
+                .equals(context.column_ref("data_id")),
         );
-        add_chain_join(
-            &mut query,
-            drive,
+        query.join_as(
+            JoinType::InnerJoin,
             ItemData::Table,
-            Some(&vec_data),
-            Cond::all().add(
-                Expr::col((vec_data.clone(), ItemData::SourceId))
-                    .equals((ExtractedText::Table, ExtractedText::Id)),
-            ),
+            vec_data.clone(),
+            Expr::col((vec_data.clone(), ItemData::SourceId))
+                .equals((ExtractedText::Table, ExtractedText::Id)),
         );
         let vec_join = Cond::all()
             .add(
@@ -378,14 +302,13 @@ impl SemanticTextSearch {
                     .equals((vec_data.clone(), ItemData::SetterId)),
             )
             .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
-        add_chain_join(
-            &mut query,
-            drive,
+        query.join_as(
+            JoinType::InnerJoin,
             Setters::Table,
-            Some(&vec_setters),
+            vec_setters.clone(),
             vec_join,
         );
-        Self::join_vector_table(&mut query, drive, &vec_data, join);
+        Self::join_vector_table(&mut query, &vec_data, join);
 
         for condition in &criteria.conditions {
             query.and_where(condition.clone());
@@ -395,21 +318,13 @@ impl SemanticTextSearch {
 
     /// Candidate skeleton for file/item queries: the context's items joined
     /// to their text-embedding rows (and, when criteria or weights need it,
-    /// the source text).
-    ///
-    /// Under `Drive::Pinned` the vector chain is reordered to resolve the
-    /// setter first: `name` → `id` is one index probe, and it turns the
-    /// `item_data` lookup into a covering `(item_id, setter_id)` probe instead
-    /// of "every data row of the item, then filter by setter". The
-    /// `vec_setters` condition may reference `vec_data`, joined after it,
-    /// because a pinned link's condition lives in `WHERE`, not `ON`.
+    /// the source text). Only the payload join differs between index modes.
     fn file_skeleton(
         &self,
         context: &CteRef,
         state: &QueryState,
         join: &TextVectorJoin,
         criteria: &TextCriteria,
-        drive: &Drive,
     ) -> sea_query::SelectStatement {
         let args = &self.text_embeddings;
         let text_data = Alias::new("text_data");
@@ -418,10 +333,10 @@ impl SemanticTextSearch {
         let vec_setters = Alias::new("vec_setters");
 
         let mut query = select_std_from_cte(context, state);
-        if let Drive::Pinned { k } = drive {
-            query.and_where(Expr::col(context.column_ref(COARSE_RANK)).lte(*k));
-        }
-        let vec_data_cond = Cond::all().add(
+        query.join_as(
+            JoinType::InnerJoin,
+            ItemData::Table,
+            vec_data.clone(),
             Expr::col((vec_data.clone(), ItemData::ItemId)).equals(context.column_ref("item_id")),
         );
         let vec_setters_cond = Cond::all()
@@ -430,69 +345,34 @@ impl SemanticTextSearch {
                     .equals((vec_data.clone(), ItemData::SetterId)),
             )
             .add(Expr::col((vec_setters.clone(), Setters::Name)).eq(args.model.clone()));
-        if matches!(drive, Drive::Pinned { .. }) {
-            add_chain_join(
-                &mut query,
-                drive,
-                Setters::Table,
-                Some(&vec_setters),
-                vec_setters_cond,
-            );
-            add_chain_join(
-                &mut query,
-                drive,
-                ItemData::Table,
-                Some(&vec_data),
-                vec_data_cond,
-            );
-        } else {
-            add_chain_join(
-                &mut query,
-                drive,
-                ItemData::Table,
-                Some(&vec_data),
-                vec_data_cond,
-            );
-            add_chain_join(
-                &mut query,
-                drive,
-                Setters::Table,
-                Some(&vec_setters),
-                vec_setters_cond,
-            );
-        }
-        Self::join_vector_table(&mut query, drive, &vec_data, join);
+        query.join_as(
+            JoinType::InnerJoin,
+            Setters::Table,
+            vec_setters.clone(),
+            vec_setters_cond,
+        );
+        Self::join_vector_table(&mut query, &vec_data, join);
 
         if !criteria.conditions.is_empty() || criteria.weights_used {
-            add_chain_join(
-                &mut query,
-                drive,
+            query.join_as(
+                JoinType::InnerJoin,
                 ItemData::Table,
-                Some(&text_data),
-                Cond::all().add(
-                    Expr::col((text_data.clone(), ItemData::Id))
-                        .equals((vec_data.clone(), ItemData::SourceId)),
-                ),
+                text_data.clone(),
+                Expr::col((text_data.clone(), ItemData::Id))
+                    .equals((vec_data.clone(), ItemData::SourceId)),
             );
-            add_chain_join(
-                &mut query,
-                drive,
+            query.join_as(
+                JoinType::InnerJoin,
                 Setters::Table,
-                Some(&text_setters),
-                Cond::all().add(
-                    Expr::col((text_setters.clone(), Setters::Id))
-                        .equals((text_data.clone(), ItemData::SetterId)),
-                ),
+                text_setters.clone(),
+                Expr::col((text_setters.clone(), Setters::Id))
+                    .equals((text_data.clone(), ItemData::SetterId)),
             );
-            add_chain_join(
-                &mut query,
-                drive,
+            query.join(
+                JoinType::InnerJoin,
                 ExtractedText::Table,
-                None,
-                Cond::all().add(
-                    Expr::col((ExtractedText::Table, ExtractedText::Id))
-                        .equals((text_data.clone(), ItemData::Id)),
-                ),
+                Expr::col((ExtractedText::Table, ExtractedText::Id))
+                    .equals((text_data.clone(), ItemData::Id)),
             );
         }
         for condition in &criteria.conditions {
@@ -520,18 +400,17 @@ impl SemanticTextSearch {
             .and_then(confidence_weight_expr)
     }
 
-    /// The per-row coarse proxy: Hamming distance over binary quants. Never
-    /// confidence-weighted — the coarse ordering is a weight-free
-    /// approximation by design.
+    /// The per-row distance over int8 codes — the same distance function as
+    /// the exact path, on the quantized payload (docs/vector-int8-quant.md).
     /// Stored quants and the bound parameter are plain BLOBs, which
-    /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
-    fn coarse_distance_expr(&self, query_quant: &[u8]) -> Expr {
-        Func::cust("vec_distance_hamming")
+    /// sqlite-vec would read as float32 — `vec_int8` marks them as int8.
+    fn quant_distance_expr(&self, query_quant: &[u8]) -> Expr {
+        Func::cust("vec_distance_L2")
             .args([
-                Func::cust("vec_bit")
+                Func::cust("vec_int8")
                     .arg(Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Quant)))
                     .into(),
-                Func::cust("vec_bit")
+                Func::cust("vec_int8")
                     .arg(Expr::val(query_quant.to_vec()))
                     .into(),
             ])
@@ -568,92 +447,19 @@ impl FilterCompiler for SemanticTextSearch {
         let criteria = self.criteria();
         let text_entity = state.item_data_query && matches!(state.entity, EntityType::Text);
 
-        let skeleton = |state: &QueryState, ctx: &CteRef, join: &TextVectorJoin, drive: &Drive| {
+        let skeleton = |state: &QueryState, ctx: &CteRef, join: &TextVectorJoin| {
             if text_entity {
-                self.text_entity_skeleton(ctx, state, join, &criteria, drive)
+                self.text_entity_skeleton(ctx, state, join, &criteria)
             } else {
-                self.file_skeleton(ctx, state, join, &criteria, drive)
+                self.file_skeleton(ctx, state, join, &criteria)
             }
         };
-
-        if let Some(quant) = args._quant.as_ref().filter(|_| !state.is_count_query) {
-            let query_quant = quant
-                .query_quant
-                .as_ref()
-                .ok_or_else(|| PqlError::invalid("text_embeddings missing query quant"))?;
-
-            // Fix B on the coarse pass: the per-row Hamming distance is
-            // evaluated in `qdist_{cte}` and only its 8-byte result reaches
-            // the coarse GROUP BY sorter, never the quant blob.
-            let coarse_skeleton = skeleton(
-                state,
-                context,
-                &TextVectorJoin::Quants {
-                    profile_id: quant.profile_id,
-                },
-                &Drive::Free,
-            );
-            let coarse = {
-                let grouped = grouped_over_materialized_distance(
-                    state,
-                    format!("qdist_{cte_name}"),
-                    COARSE_ROW_DIST,
-                    coarse_skeleton,
-                    self.coarse_distance_expr(query_quant),
-                    None,
-                    args.distance_aggregation,
-                );
-                let mut coarse = grouped.select;
-                coarse.expr_as(grouped.aggregate, Alias::new(COARSE_DIST));
-                coarse
-            };
-
-            let k = args.k;
-            let (merge, merge_context) =
-                assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
-                    // Ranked-driven, order-pinned head with its distance (and
-                    // confidence weights) materialized in `hdist_{cte}`.
-                    let head_skeleton = skeleton(
-                        state,
-                        ranked,
-                        &TextVectorJoin::Embeddings,
-                        &Drive::Pinned { k },
-                    );
-                    let grouped = grouped_over_materialized_distance(
-                        state,
-                        format!("hdist_{cte_name}"),
-                        HEAD_ROW_DIST,
-                        head_skeleton,
-                        self.exact_distance_expr(embedding),
-                        self.confidence_weight(),
-                        args.distance_aggregation,
-                    );
-                    let mut head = grouped.select;
-                    head.expr_as(grouped.aggregate, Alias::new(EXACT_DIST));
-                    head
-                });
-
-            // The merge selects only from CTEs, so no base tables are
-            // visible to the final query; its context is the ranked CTE in
-            // its FROM scope.
-            let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
-                state,
-                merge,
-                merge_context,
-                &cte_name,
-                &self.sort,
-                JoinedTables::default(),
-            );
-            let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);
-            state.cte_counter += 1;
-            self.register_outputs(state, &cte);
-            return Ok(cte);
-        }
 
         if state.is_count_query {
             // Membership only — no distance is computed, so the fix-B
             // restructuring below would add a pointless materialization.
-            let mut query = skeleton(state, context, &TextVectorJoin::Embeddings, &Drive::Free);
+            // Identical in every index mode, so counts never consult quants.
+            let mut query = skeleton(state, context, &TextVectorJoin::Embeddings);
             apply_group_by(&mut query, get_std_group_by(context, state));
             // The text-entity shape joins `extracted_text` without an alias
             // (and on the same condition add_inner_joins would use); the
@@ -669,15 +475,41 @@ impl FilterCompiler for SemanticTextSearch {
             return Ok(cte);
         }
 
+        // Exact and quant differ only in the vector payload: the skeleton's
+        // join and the blob the distance function reads. Everything after
+        // this is shared, so `order_rank` means the same thing in both
+        // modes (docs/vector-int8-quant.md).
+        let (skeleton, distance) = match &args._quant {
+            Some(quant) => {
+                let query_quant = quant
+                    .query_quant
+                    .as_ref()
+                    .ok_or_else(|| PqlError::invalid("text_embeddings missing query quant"))?;
+                (
+                    skeleton(
+                        state,
+                        context,
+                        &TextVectorJoin::Quants {
+                            profile_id: quant.profile_id,
+                        },
+                    ),
+                    self.quant_distance_expr(query_quant),
+                )
+            }
+            None => (
+                skeleton(state, context, &TextVectorJoin::Embeddings),
+                self.exact_distance_expr(embedding),
+            ),
+        };
+
         // Fix B (docs/or-composition-penalty.md §5): the distance is
         // evaluated in a materialized CTE so the GROUP BY sorter never
-        // carries the embedding blob.
-        let skeleton = skeleton(state, context, &TextVectorJoin::Embeddings, &Drive::Free);
+        // carries the vector blob.
         let (query, dist_cte) = assemble_exact_fixb(
             state,
             &cte_name,
             skeleton,
-            self.exact_distance_expr(embedding),
+            distance,
             self.confidence_weight(),
             args.distance_aggregation,
             &self.sort,
@@ -771,85 +603,66 @@ mod tests {
         filter
     }
 
-    /// Both quant passes must aggregate over a `MATERIALIZED` per-row
-    /// distance CTE, and the head must be driven from `ranked` with a
-    /// `CROSS JOIN`-pinned order (docs/or-composition-penalty.md §5b).
-    /// Materialization is load-bearing: without it the flattener inlines the
-    /// distance back into the aggregate and the blob rides the GROUP BY
-    /// sorter again. The pin is load-bearing too: without it the planner
-    /// drives the head from the vector tables over the whole setter.
+    /// The quant arm is the exact arm with a swapped payload: one fix-B
+    /// `MATERIALIZED dist_{cte}` CTE over `embedding_quants` scored with
+    /// `vec_int8`, and no trace of the deleted two-stage machinery
+    /// (docs/vector-int8-quant.md).
     #[test]
-    fn semantic_text_quant_materializes_distances_and_pins_head() {
+    fn semantic_text_quant_is_single_pass_over_int8_codes() {
         let filter = quant_filter();
         let mut state = build_base_state(EntityType::File, false);
         let context = build_begin_cte(&mut state);
         let sql = normalized_sql(&filter, &mut state, &context);
 
         assert!(
-            sql.contains(r#""qdist_n0_SemanticTextSearch" AS MATERIALIZED"#),
-            "coarse distance is not materialized: {sql}"
+            sql.contains(r#""dist_n0_SemanticTextSearch" AS MATERIALIZED"#),
+            "quant distance is not materialized: {sql}"
         );
         assert!(
-            sql.contains(r#"MIN("qdist_n0_SemanticTextSearch"."qd") AS "cdist""#),
-            "coarse aggregate does not read the materialized distance: {sql}"
+            sql.contains(r#"MIN("dist_n0_SemanticTextSearch"."d")"#),
+            "quant aggregate does not read the materialized distance: {sql}"
         );
         assert!(
-            sql.contains(r#""hdist_n0_SemanticTextSearch" AS MATERIALIZED"#),
-            "head distance is not materialized: {sql}"
+            sql.contains(r#"vec_distance_L2(vec_int8("embedding_quants"."quant"), vec_int8("#),
+            "quant distance is not an int8 distance over the quant payload: {sql}"
         );
         assert!(
-            sql.contains(r#"MIN("hdist_n0_SemanticTextSearch"."hd") AS "edist""#),
-            "head aggregate does not read the materialized distance: {sql}"
+            sql.contains(r#"INNER JOIN "embedding_quants""#),
+            "quant arm does not join the quant payload: {sql}"
         );
-        // Setter first, then the covering (item_id, setter_id) probe.
+        for gone in ["ranked_n0", "head_n0", "coarse_n0", "qdist_n0", "hdist_n0"] {
+            assert!(!sql.contains(gone), "two-stage CTE {gone} survives: {sql}");
+        }
         assert!(
-            sql.contains(concat!(
-                r#"FROM "ranked_n0_SemanticTextSearch""#,
-                r#" CROSS JOIN "setters" AS "vec_setters""#,
-                r#" CROSS JOIN "item_data" AS "vec_data""#,
-                r#" CROSS JOIN "embeddings""#
-            )),
-            "file-shaped head is not ranked-driven with a pinned join order: {sql}"
-        );
-        assert!(
-            sql.contains(r#""vec_data"."item_id" = "ranked_n0_SemanticTextSearch"."item_id""#),
-            "head does not join vec_data straight to ranked: {sql}"
+            !sql.contains("CROSS JOIN"),
+            "the deleted head pin chain survives: {sql}"
         );
     }
 
-    /// The text-entity shape gets the same treatment, driven from the
-    /// context's own `data_id`.
+    /// The text-entity shape gets the same treatment, with `data_id` still
+    /// part of the group key.
     #[test]
-    fn semantic_text_entity_quant_materializes_distances_and_pins_head() {
+    fn semantic_text_entity_quant_is_single_pass_over_int8_codes() {
         let filter = quant_filter();
         let mut state = build_base_state(EntityType::Text, false);
         let context = build_begin_cte(&mut state);
         let sql = normalized_sql(&filter, &mut state, &context);
 
         assert!(
-            sql.contains(r#""qdist_n0_SemanticTextSearch" AS MATERIALIZED"#),
-            "coarse distance is not materialized: {sql}"
+            sql.contains(r#""dist_n0_SemanticTextSearch" AS MATERIALIZED"#),
+            "quant distance is not materialized: {sql}"
         );
         assert!(
-            sql.contains(r#""hdist_n0_SemanticTextSearch" AS MATERIALIZED"#),
-            "head distance is not materialized: {sql}"
+            sql.contains(r#"vec_distance_L2(vec_int8("embedding_quants"."quant"), vec_int8("#),
+            "quant distance is not an int8 distance over the quant payload: {sql}"
         );
         assert!(
-            sql.contains(concat!(
-                r#"FROM "ranked_n0_SemanticTextSearch""#,
-                r#" CROSS JOIN "item_data" AS "text_data""#,
-                r#" CROSS JOIN "setters" AS "text_setters""#,
-                r#" CROSS JOIN "extracted_text""#,
-                r#" CROSS JOIN "item_data" AS "vec_data""#,
-                r#" CROSS JOIN "setters" AS "vec_setters""#,
-                r#" CROSS JOIN "embeddings""#
-            )),
-            "text-entity head is not ranked-driven with a pinned join order: {sql}"
+            sql.contains(r#"GROUP BY "dist_n0_SemanticTextSearch"."data_id""#),
+            "quant lost data_id from the group key: {sql}"
         );
-        // data_id is part of the group key in the item_data shape.
         assert!(
-            sql.contains(r#"GROUP BY "hdist_n0_SemanticTextSearch"."data_id""#),
-            "head lost data_id from the group key: {sql}"
+            !sql.contains("CROSS JOIN"),
+            "the deleted head pin chain survives: {sql}"
         );
     }
 

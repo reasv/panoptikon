@@ -3099,7 +3099,7 @@
           "jobs"
         ],
         "summary": "Rebuild a quant profile's artifact for an embedding space",
-        "description": "Marks the embedding space containing the given setter for rebuild under the given profile (artifact recomputed at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — artifact recomputation reshuffles coarse order and is never background-silent.",
+        "description": "Marks the embedding space containing the given setter for rebuild under the given profile (the int8 scale is recomputed and every code rewritten at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — a recomputed scale invalidates every code already stored for the space, so search results move; that is never background-silent.",
         "operationId": "rebuild_vector_quant_pair",
         "parameters": [
           {
@@ -8772,12 +8772,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nA quant profile scores int8 codes in a single pass; `order_rank` has\nexactly the same semantics as under `exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -8850,12 +8850,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nA quant profile scores int8 codes in a single pass; `order_rank` has\nexactly the same semantics as under `exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -8975,12 +8975,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile both sides of the similarity self-join use\nbinary quants for the coarse pass, and `order_rank` is a rank, not a\nraw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile both sides of the similarity self-join read\nint8 codes; `order_rank` has exactly the same semantics as under\n`exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -9456,14 +9456,14 @@
         "properties": {
           "centered": {
             "type": "boolean",
-            "description": "Mean-center vectors before binarization (per embedding space)."
+            "description": "Deprecated: ignored since the int8 remap. Kept deserializable so\nexisting `[vector_quants]` sections still parse."
           },
           "name": {
             "type": "string"
           },
           "quantizer": {
             "type": "string",
-            "description": "'binary' in v1; 'int8' is a reserved future recipe slot."
+            "description": "`int8` (global-symmetric absmax, docs/vector-int8-quant.md). `binary`\nis retired: the load path maps it to `int8` (which triggers a\nrecipe-change rebuild), the config-commit path rejects it."
           }
         }
       },
@@ -9472,16 +9472,12 @@
         "required": [
           "name",
           "quantizer",
-          "centered",
           "state",
           "is_default",
           "size_bytes",
           "setters"
         ],
         "properties": {
-          "centered": {
-            "type": "boolean"
-          },
           "is_default": {
             "type": "boolean"
           },

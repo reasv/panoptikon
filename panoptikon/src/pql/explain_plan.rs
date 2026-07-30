@@ -224,13 +224,11 @@ async fn load_fixture(conn: &mut SqliteConnection) -> Fixture {
     .get("n");
     println!("chosen model={model} profile_id={profile_id} vectors={vectors}");
 
-    let query_quant = crate::db::vector_quants::compute_query_quant(
-        &mut *conn,
-        &embedding,
-        artifact.as_deref(),
-    )
-    .await
-    .expect("query quant");
+    let scale = artifact
+        .as_deref()
+        .and_then(crate::db::vector_quants::artifact_scale)
+        .expect("a ready pair carries an int8 scale artifact");
+    let query_quant = crate::db::vector_quants::compute_query_quant(&embedding, scale);
 
     Fixture {
         model,
@@ -778,6 +776,13 @@ async fn explain_plan_or_decomposition() {
 
 /// Re-races exact vs quant on the composed RRF `or` shape after giving
 /// *both* paths the sorter fix (docs/or-composition-penalty.md §5 fix B).
+///
+/// **Historical.** Its quant SQL is hand-inlined *binary two-stage* output,
+/// captured before the int8 remap (docs/vector-int8-quant.md) deleted that
+/// scorer. It still runs — the strings are self-contained and binary quant
+/// rows may still exist in an un-reconciled DB — but it no longer describes
+/// what the compiler emits. `explain_plan_exact_vs_quant` (which renders
+/// through the real compiler) is the one to use for current numbers.
 ///
 /// The question this answers: quantization's one measured win was the
 /// composed shape, and that win turned out to be the exact path's

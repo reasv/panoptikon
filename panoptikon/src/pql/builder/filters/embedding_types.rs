@@ -57,17 +57,18 @@ pub(crate) enum IndexMode {
     Ann,
 }
 
-/// The default exactness horizon: the coarse-top-k candidates re-scored with
-/// full-precision distances. A quality floor — page geometry only ever
-/// raises it (client policy), never shrinks it.
+/// The `k` argument's default. Deprecated and ignored since the int8 remap
+/// (docs/vector-int8-quant.md): there is no rescoring head to size. Kept as
+/// the serde default so the argument stays accepted, reserved for a future
+/// ANN mode's retrieval depth.
 pub(crate) fn default_k() -> i64 {
     10_000
 }
 
 /// Quant resolution computed at preprocess time: the profile to join quants
-/// from and (for query-embedding filters) the query vector centered against
-/// the pair's artifact and binarized — by the same SQL functions the write
-/// path uses, so bit order is definitionally consistent.
+/// from and (for query-embedding filters) the query vector quantized with
+/// the pair's frozen int8 scale — by the same Rust codec the write path
+/// uses, so the codes are byte-compatible by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QuantResolved {
     pub profile_id: i64,

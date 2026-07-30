@@ -9,7 +9,6 @@ mod match_path;
 mod match_tags;
 mod match_text;
 mod processed_by;
-mod quant;
 mod text_embeddings;
 
 use super::{CteRef, QueryState};
