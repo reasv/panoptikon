@@ -6,8 +6,10 @@ admission, footprint recording, VRAM-aware behaviour). Decided 2026-07-30;
 revised the same day after design review (grant ledger, dispatcher window
 rule, profile-key fallback, tiered base measurement); second review pass the
 same day (envelope fit, pool-aware ledger + idle-resident trim, grant dual
-denomination, reset and residual questions settled). Supersedes the
-one-line itemization in that document. Not yet implemented.
+denomination, reset and residual questions settled); third review pass the
+same day (WDDM throughput-collapse signal, extrapolation ratchet,
+non-local-profile margins, dispatcher pricing declared estimate-only).
+Supersedes the one-line itemization in that document. Not yet implemented.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -105,6 +107,11 @@ Notes:
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.
+- A resident `none`-class worker with no torch allocator (faster_whisper /
+  CT2) reports ~0 `memory_reserved`, so its real VRAM lands in the
+  ledger's `external` term — margin-inflated but safe. This is the
+  intended accounting, not phantom headroom, until CT2 footprint
+  recording exists (see Open questions).
 
 ## Where each piece runs
 
@@ -181,6 +188,17 @@ Under auto:
   queue to the first free replica) and keeps the failure blast radius
   small (a window is the unit of fallback and of fatal-error loss). There
   is no time bound anywhere: `predict` keeps its no-deadline semantics.
+- **Dispatcher-side unit counts are estimates, and safety never depends
+  on them.** Window sizing and grant pricing need per-item units before
+  any worker has decoded anything: `pixel` models use image-header
+  dimensions (parsed at dispatch, or forwarded by core, which already
+  knows post-slicing dims); `token` models use a bytes-per-token
+  heuristic (the dispatcher cannot tokenize); `max-times-count` window
+  depth uses the sum-of-units approximation (true max×count is undefined
+  before the worker buckets). Mis-estimates only mis-size windows — an
+  over-estimate yields a larger grant still clamped by headroom, an
+  under-estimate yields more GPU batches per window — because the worker
+  packs within the grant using exact post-decode counts.
 - **The user cap travels per request.** Windows are partitioned by cap
   value — capped jobs are the exception under auto, so mixed-cap queues
   are rare and the partition costs nothing — and the worker enforces the
@@ -226,9 +244,10 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   genuinely external usage — sibling workers are never margin-inflated.
   Samples arrive only on response frames, so after a long idle gap the
   first window prices `external` from a stale sample; the shrink clamp
-  makes that safe, and the orchestrator may refresh via NVML (the
+  makes that safe, and the orchestrator refreshes via NVML (the
   Package-1 probe machinery) when the freshest sample exceeds an age
-  threshold — an accuracy option, not a safety requirement.
+  threshold — in scope for v1, since the probe machinery already exists;
+  an accuracy measure, not a safety requirement.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
@@ -239,14 +258,27 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   invariant is never violated — bottoming out at the one-item minimum at
   pack time.
 - **Fit confidence widens margins automatically**: `residual_mb` (and
-  fallback-matched-profile status) inflate that model's effective margin,
-  clamped to a maximum factor. Safety never depends on a human reading a
+  non-local-profile status — any shipped or fallback-matched entry not
+  yet locally confirmed, see Lookup) inflate that model's effective
+  margin, clamped to a maximum factor. Safety never depends on a human reading a
   Desktop label; the future tab's "verified" badge is presentation on
   top of the same number.
 - **Ramp**: until the fit has enough samples, grants ramp geometrically
   (seed, ×2 per clean window) instead of jumping to the predicted
   ceiling, measuring each step. A too-low seed costs a logarithmic number
   of windows, which is why seeds don't need per-GPU tuning.
+- **Extrapolation ratchet**: the ramp never ends by handing control to
+  extrapolation. Even after the fit converges, a grant's unit budget
+  never exceeds ~2× the largest *locally measured* clean high-water
+  batch; the measured range extends itself geometrically under real
+  load. The fitted model's job is pricing mixed compositions and
+  re-evaluating against live free memory — never predicting far beyond
+  evidence, which is exactly where nonlinear effects (allocator
+  behaviour, attention memory, workspace growth) break linearity, and
+  where WDDM gives no clean failure (see Backstop). The ratchet counts
+  only local samples, so a fresh install ramps from seed even with a
+  shipped profile: profiles govern pricing, `base` accounting, and the
+  knee cap — not growth.
 
 Worker, per batch within its window:
 
@@ -302,7 +334,19 @@ Worker, per batch within its window:
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows
   restore them — deflation must be recoverable, or one external spike
-  degrades a worker until respawn.
+  degrades a worker until respawn. Deflation is runtime state,
+  deliberately not persisted across restarts.
+- **WDDM synthetic negative sample**: on Windows the OOM signal is
+  unreliable by construction — driver sysmem fallback (default on since
+  ~536) lets an over-budget allocation succeed by spilling to system
+  RAM, so over-admission usually manifests as a silent throughput
+  collapse, never an exception, and the OOM path above would simply not
+  fire. The worker already times every batch for knee capture; a
+  pool-growing batch whose units/sec craters far below the fitted
+  throughput curve is therefore recorded as a synthetic negative sample
+  feeding the same deflation path. No new machinery — it reuses the
+  timing and the deflation mechanism. Collapse threshold: implementation
+  detail, tune empirically.
 
 The only timing assumption left: external usage doesn't swing by more
 than the margin within one window. The backstop covers the exceptions.
@@ -396,11 +440,19 @@ torch, dtype)`.
 exact torch string → same torch `major.minor` ignoring the local version
 tag (`backend` already encodes the CUDA/ROCm family) → no match. The full
 string stays in the file as provenance; `epoch` remains the deliberate
-invalidation lever. A fallback-matched profile is used with a widened
-effective margin until local samples confirm it. Without this, every
-torch patch bump would orphan the entire shipped-baseline set, and
-volunteers on different patch versions would produce disjoint,
-never-matching entries.
+invalidation lever. Without the hierarchy, every torch patch bump would
+orphan the entire shipped-baseline set, and volunteers on different
+patch versions would produce disjoint, never-matching entries.
+
+**Any profile not generated locally — shipped baselines included, even
+on an exact tuple match — is used with a widened effective margin until
+a few local clean samples confirm it.** Driver version is deliberately
+not in the key, and `base` is driver-currency, so a foreign measurement
+is a good prior, never ground truth; fallback-matching is just the
+least-confident case of this one rule. The cost is a conservative first
+few windows on a fresh install (confirmation is a sample-count gate,
+and local samples accrue on every ramp step), largely masked by the
+ramp, which governs growth regardless (see the extrapolation ratchet).
 
 ### Layering and lifecycle
 
@@ -516,8 +568,11 @@ script, not a subsystem.
   `empty_cache()` hysteresis (deflate ratio, consecutive-window count),
   the clean-window count N that restores a deflated grant, the window
   depth multiplier (2–4×), the widened-margin factor for
-  fallback-matched profiles, the `residual_mb` margin-widening clamp,
-  and the squeeze threshold that triggers an idle-resident trim.
+  non-local profiles, the `residual_mb` margin-widening clamp, the
+  squeeze threshold that triggers an idle-resident trim, the
+  throughput-collapse ratio behind the WDDM synthetic negative sample,
+  the non-local-profile confirmation sample count, and the
+  extrapolation-ratchet factor (default 2×).
 - ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
   are untested here by design; the design is backend-agnostic on paper,
   cuda first in practice.
