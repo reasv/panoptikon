@@ -15,6 +15,7 @@ mod jobs;
 mod logging;
 mod host_paths;
 mod accelerator_env;
+mod accelerator_report;
 mod media_tools;
 mod openapi;
 mod policy;
@@ -97,6 +98,10 @@ enum Command {
         #[arg(long)]
         if_needed: bool,
     },
+    /// Print the resolved inference accelerator (cpu/cuda/rocm/…) and any
+    /// GPU names. CPU is reported without warning; GPU backends warn only
+    /// when no device name can be detected.
+    Accelerator,
     /// Download and install the latest release, replacing this executable.
     /// Checks GitHub every time (ignoring the startup-check throttle).
     Update {
@@ -197,11 +202,17 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await;
         }
+        Some(Command::Accelerator) => {
+            accelerator_report::print_report(&settings);
+            return Ok(());
+        }
         Some(Command::Update { yes }) => {
             return update::run_update_command(crate::resources::VERSION, yes).await;
         }
         None => {}
     }
+
+    accelerator_report::log_report(&settings);
 
     // Server path only (Setup/Inferio/Update returned above). Fire-and-forget a
     // best-effort, throttled check for a newer release; it prints a banner if
@@ -694,6 +705,7 @@ async fn inferio_main(
         .unwrap_or(settings.server.port);
     let listen_addr = format!("{}:{}", settings.server.host, port);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    accelerator_report::log_report(&settings);
     tracing::info!(address = %listen_addr, "inference service listening (inferio mode)");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
