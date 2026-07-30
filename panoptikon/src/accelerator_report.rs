@@ -542,6 +542,38 @@ mod tests {
     }
 
     #[test]
+    fn format_text_rocm_lists_only_selected_stack_devices() {
+        let stacks = vec![
+            GpuStackPresence {
+                stack: "amd-rocm",
+                backend: Accelerator::Rocm,
+                devices: vec![GpuDevice {
+                    stack: "amd-rocm",
+                    name: "Radeon RX 7900 XTX".into(),
+                }],
+                evidence: "test".into(),
+            },
+            // Unrelated stack should not appear under selected ROCm devices.
+            GpuStackPresence {
+                stack: "nvidia",
+                backend: Accelerator::Cuda,
+                devices: vec![GpuDevice {
+                    stack: "nvidia",
+                    name: "Should Not Appear".into(),
+                }],
+                evidence: "test".into(),
+            },
+        ];
+        let report = assemble_report(Accelerator::Rocm, BackendSource::EnvPin, stacks);
+        let text = report.format_text();
+        assert!(text.contains("backend: rocm"), "{text}");
+        assert!(text.contains("[amd-rocm] Radeon RX 7900 XTX"), "{text}");
+        assert!(!text.contains("Should Not Appear"), "{text}");
+        assert!(!text.contains("using CPU"), "{text}");
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
     fn cuda_without_devices_warns() {
         let report = assemble_report(Accelerator::Cuda, BackendSource::EnvPin, empty_stacks());
         assert_eq!(report.backend, Accelerator::Cuda);

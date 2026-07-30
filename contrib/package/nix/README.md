@@ -23,7 +23,7 @@ Layout follows [copyparty](https://github.com/9001/copyparty): packages under
 | Default packages | `nixpkgs.config.cudaSupport` / `rocmSupport` (not both) |
 | Forced packages | `panoptikon-cpu` / `-cuda` / `-rocm` (ignore config) |
 | Service GPU | `services.panoptikon.gpu` (`null` = follow config) |
-| Accelerator report | `panoptikon accelerator` (backend always; GPU names optional; CLI not yet on master) |
+| Accelerator report | `panoptikon accelerator` (backend always; GPU names optional) |
 
 Do not put `/nix/store/...` tool paths into TOML.
 
