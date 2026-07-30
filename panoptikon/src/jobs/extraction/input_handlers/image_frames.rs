@@ -715,4 +715,24 @@ mod tests {
         assert!(!err.is_input_media());
         assert!(err.detail().contains("open") || err.detail().contains("gif"));
     }
+
+    #[tokio::test]
+    async fn still_image_missing_file_is_not_soft_fail() {
+        let item = JobInputData {
+            path: "/nonexistent/path/missing.png".into(),
+            sha256: "sha".into(),
+            item_type: "image/png".into(),
+            width: Some(64),
+            height: Some(64),
+            ..Default::default()
+        };
+        let err = load_base_frames("unused_index", &item)
+            .await
+            .expect_err("missing still image must fail");
+        assert!(
+            !err.is_input_media(),
+            "I/O must not soft-fail as input_media: {}",
+            err.detail()
+        );
+    }
 }
