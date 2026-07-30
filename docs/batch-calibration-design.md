@@ -4,7 +4,9 @@ Package 2 of the GPU compatibility work: the concrete design for items 5–8
 of `gpu-compatibility-design.md` (self-calibrating batch size, pixel-budget
 admission, footprint recording, VRAM-aware behaviour). Decided 2026-07-30;
 revised the same day after design review (grant ledger, dispatcher window
-rule, profile-key fallback, tiered base measurement). Supersedes the
+rule, profile-key fallback, tiered base measurement); second review pass the
+same day (envelope fit, pool-aware ledger + idle-resident trim, grant dual
+denomination, reset and residual questions settled). Supersedes the
 one-line itemization in that document. Not yet implemented.
 
 ## Core decision: learn a cost model, not a max batch size
@@ -141,7 +143,11 @@ measurements and memory samples ride on response frames, and the load
 response carries the base measurement. A worker-initiated query channel
 ("ask the scheduler for the current budget mid-window") was considered
 and rejected: it complicates the protocol for a grow-direction freshness
-win the grant model already bounds (see the staleness note below).
+win the grant model already bounds (see the staleness note below). One
+addition ships in v1 and is compatible with that rejection: an
+**orchestrator-initiated trim message** (see Reactive shrink below) — a
+new message type on the existing request/response channel, same direction
+as `load`; only worker-initiated queries were rejected.
 
 Two keyspaces, deliberately different:
 
@@ -189,13 +195,26 @@ Orchestrator, per GPU, when dispatching a window:
 external  = total − free − Σ reserved(our workers, latest reports)
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-headroom  = limit − Σ base(residents) − Σ outstanding_grants
+hold(w)   = max(base(w), last reported reserved(w))
+headroom  = limit − Σ hold(residents) − Σ outstanding_grants
 grant     = min(headroom share, ramp step, slope × knee_units,
                 priced content of the window itself)
 ```
 
-- `base` counts against the limit for **every resident, always** —
-  residency changes who has already paid it, not whether it counts.
+- Residents are charged at `hold = max(base, last-reported reserved)`,
+  **not** at `base`. Releasing a grant returns nothing physically — the
+  caching allocator keeps the memory until `empty_cache()` — so a ledger
+  that charges idle residents only `base` hands their retained pools out
+  again to neighbours, who then hit the defensive clamp forever. `base`
+  is the floor of the charge for every resident, always — residency
+  changes who has already paid it, not whether it counts.
+- **A grant is dual-denominated**: an MB reservation (the ledger
+  currency) and a unit budget (the packing currency). Post-fit the unit
+  budget derives from the MB side via the slope; pre-fit there is no
+  slope, so the unit budget is the ramp value (`seed_units × 2^k`) and
+  the MB side is the contention share held while that step is measured.
+  Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
+  conversion is undefined exactly when it is needed most.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -205,11 +224,25 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   own `memory_reserved` per response, so the orchestrator separates our
   usage from the world's and the margin multiplier applies only to
   genuinely external usage — sibling workers are never margin-inflated.
+  Samples arrive only on response frames, so after a long idle gap the
+  first window prices `external` from a stale sample; the shrink clamp
+  makes that safe, and the orchestrator may refresh via NVML (the
+  Package-1 probe machinery) when the freshest sample exceeds an age
+  threshold — an accuracy option, not a safety requirement.
 - **Contention policy** when several models are hungry at once: demand
-  first (queue depth; an idle model holds only its `base`), then split by
+  first (queue depth; an idle model consumes no new grants, though it
+  holds its pool until trimmed — see Reactive shrink), then split by
   calibrated appetite `slope × knee_units`, falling back to `base`
   weighting before calibration, with a floor of one seed batch per worker
-  so nothing starves to zero.
+  so nothing starves to zero. When even the floors oversubscribe
+  headroom they shrink pro-rata — grants are reservations and the ledger
+  invariant is never violated — bottoming out at the one-item minimum at
+  pack time.
+- **Fit confidence widens margins automatically**: `residual_mb` (and
+  fallback-matched-profile status) inflate that model's effective margin,
+  clamped to a maximum factor. Safety never depends on a human reading a
+  Desktop label; the future tab's "verified" badge is presentation on
+  top of the same number.
 - **Ramp**: until the fit has enough samples, grants ramp geometrically
   (seed, ×2 per clean window) instead of jumping to the predicted
   ceiling, measuring each step. A too-low seed costs a logarithmic number
@@ -217,31 +250,54 @@ grant     = min(headroom share, ramp step, slope × knee_units,
 
 Worker, per batch within its window:
 
-- Convert the grant to units with the current cost fit and pack (bucketed
-  for `max-times-count`) up to it; a batch is never smaller than one
-  item — a single item over budget goes through anyway (the backstop
-  catches it if it truly cannot run; Package 1 already decided batch-1
-  OOM = item fails, job continues).
+- Pack up to the grant's unit budget (bucketed for `max-times-count`);
+  a batch is never smaller than one item — a single item over budget
+  goes through anyway (the backstop catches it if it truly cannot run;
+  Package 1 already decided batch-1 OOM = item fails, job continues).
+  Bucketed packing reorders items; the worker restores input order
+  before replying, since the dispatcher splits outputs back per request
+  by position.
 - **Defensive clamp, shrink-only**: before each batch, check live
   `mem_get_info` and pack smaller if the world moved; never exceed the
   grant. Freshness is therefore per-batch in the shrink direction and
   per-window in the grow direction — staleness can only *under*-size
   (memory freed mid-window is not seen until the next window's grant), a
   throughput nibble bounded by window depth, never a safety issue.
-- **Measurement**: `max_memory_reserved()` and `max_memory_allocated()`
-  deltas around each batch + reset, paired with batch units. The fit runs
-  orchestrator-side on the **reserved** series — that is the currency the
-  driver (and therefore the budget) sees; allocator fragmentation and
-  library workspaces make `allocated` a systematic underestimate, not
-  scatter. `allocated` is retained as a diagnostic floor. Robust
-  two-parameter fit; retain scatter (sample count, residual) as
-  confidence.
+- **Measurement**: the fit runs orchestrator-side in **reserved**
+  currency — that is what the driver (and therefore the budget) sees;
+  allocator fragmentation and library workspaces make `allocated` a
+  systematic underestimate, not scatter. But reserved is an **envelope,
+  not a per-batch delta**: the caching allocator never returns blocks
+  between batches, so once the pool covers the working set a repeat
+  batch grows reserved by zero, and a delta series drags the fitted
+  slope toward zero — over-admission, the exact failure this design
+  exists to prevent. Only **high-water batches** — those that grow the
+  pool: every geometric ramp step, and regrowth after `empty_cache()` —
+  contribute reserved samples, regressing `peak_reserved − base`
+  against batch units. Warm-pool batches contribute the allocated
+  transient (`peak_allocated − allocated_before`, which has no caching
+  hysteresis) as the diagnostic floor and validation series.
+  `empty_cache()` events are therefore calibration opportunities, not
+  just hygiene. Robust two-parameter fit; retain scatter (sample count,
+  residual) as confidence.
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
   holds it — so when the grant falls materially below `memory_reserved()`
   (hysteresis: e.g. below 80% of pool for 2 consecutive windows), call
   `empty_cache()` between batches. Exact thresholds: implementation
   detail, tune empirically.
+- **Trim for idle residents**: the reactive-shrink path only runs in
+  workers that are receiving windows — an idle resident gets no frames,
+  so its retained pool would squeeze its neighbours indefinitely. When
+  the ledger sees a hungry worker constrained by an idle resident's
+  `reserved − base` slack, the orchestrator sends that resident a trim
+  request; the worker calls `empty_cache()` and replies with a fresh
+  memory sample. Trim is not unload: it releases only pool slack —
+  weights, live tensors, and the CUDA context stay, so the model remains
+  resident at a cost of milliseconds plus re-`cudaMalloc` as the pool
+  regrows — whereas unload (item-8 eviction) frees `base` too at full
+  reload cost. Trim when budgets are tight; evict when even the bases
+  don't fit.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows
@@ -405,10 +461,19 @@ Schema/plumbing (verified): `CronJob.batch_size`, model-config
 
 Migration and surface changes:
 
-- One-time reset of the stored last-used defaults (`default_batch_size` in
-  per-model system config) to `None`. Cron rows are **not** reset: their
-  numbers survive as caps, which is honest — Package 1's halving already
-  made them ceilings in practice.
+- One-time migration nulls **both** the stored last-used defaults
+  (`default_batch_size` in per-model system config) **and** cron rows'
+  `batch_size` to `None` (= auto). The two are not symmetric — a default
+  is only "last selected" and changes nothing until a user manually runs
+  a job, while nulling a cron row silently changes what runs unattended
+  on the user's machine — but auto is the better setting for the vast
+  majority even in cron, re-selecting auto by hand is awkward, and the
+  user base is small; the rare intentional cap is re-entered once. Cron
+  rows themselves are preserved — only the batch number is cleared.
+  Mechanically: an in-place edit through the existing comment-preserving
+  config editor, guarded by a one-time stamp recorded in the per-DB
+  database (not the TOML), so a number the user enters afterwards is
+  never wiped by a re-run.
 - Cron model config must accept and persist "auto" (`None`) — it already
   can; the UI must offer it.
 - The Desktop "new database" wizard drops its batch-size control entirely.
@@ -425,9 +490,11 @@ Migration and surface changes:
    `max-times-count`) **under realistic core pipelining** is the
    acceptance test.
 2. Budget config (margin + cap, per-UUID overrides) and the reactive
-   shrink path with `empty_cache()` hysteresis.
-3. Core/UI: auto/cap rename, wizard removal, last-used reset migration,
-   cron "auto".
+   shrink path with `empty_cache()` hysteresis, plus the idle-resident
+   trim message.
+3. Core/UI: auto/cap rename, wizard removal, the stamped one-time
+   migration (last-used defaults + cron rows → auto), cron "auto" in the
+   UI.
 4. Throughput-knee capture — fitted in units/sec (heterogeneous batches
    make items/sec noisy for `sum` models) with a minimum-sample gate
    before the knee may cap grants; shipped-baseline directory wiring
@@ -448,11 +515,9 @@ script, not a subsystem.
 - Tuning constants bundled as "implementation detail, tune empirically":
   `empty_cache()` hysteresis (deflate ratio, consecutive-window count),
   the clean-window count N that restores a deflated grant, the window
-  depth multiplier (2–4×), and the widened-margin factor for
-  fallback-matched profiles.
-- Whether `residual_mb` should widen the effective margin automatically
-  (high-scatter models get more headroom) or just gate "verified" labels
-  in the future Desktop tab.
+  depth multiplier (2–4×), the widened-margin factor for
+  fallback-matched profiles, the `residual_mb` margin-widening clamp,
+  and the squeeze threshold that triggers an idle-resident trim.
 - ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
   are untested here by design; the design is backend-agnostic on paper,
   cuda first in practice.
