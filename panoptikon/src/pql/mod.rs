@@ -6,6 +6,8 @@ mod explain_plan;
 mod fts_probe;
 pub(crate) mod model;
 pub(crate) mod preprocess;
+#[cfg(test)]
+mod quant_ab;
 pub(crate) mod utils;
 
 pub(crate) use builder::{Pagination, PqlBuilderResult, build_query, build_query_preprocessed};

@@ -8,15 +8,19 @@ use crate::pql::preprocess::PqlError;
 use super::super::{
     BaseTable, CteRef, EmbeddingQuants, Embeddings, ExtraColumn, ExtractedText, ItemData, Items,
     JoinedTables, OrderByFilter, QueryState, Setters, apply_group_by, apply_sort_bounds,
-    get_std_group_by, wrap_query,
+    get_std_group_by, select_std_from_cte, wrap_query,
 };
 use super::FilterCompiler;
 use super::embedding_types::{
     DistanceAggregation, DistanceFunction, IndexMode, QuantResolved, default_k,
 };
-use super::exact::{assemble_exact_fixb, confidence_weight_expr, rank_aggregate};
+use super::exact::{
+    assemble_exact_fixb, confidence_weight_expr, grouped_over_materialized_distance,
+};
 use super::item_similarity::SourceArgs;
-use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
+use super::quant::{
+    COARSE_DIST, COARSE_RANK, COARSE_ROW_DIST, EXACT_DIST, HEAD_ROW_DIST, assemble_two_stage,
+};
 use super::text_embeddings::EmbedArgs;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -146,13 +150,6 @@ impl SemanticImageSearch {
         state: &QueryState,
         join: &ImageVectorJoin,
     ) -> (sea_query::SelectStatement, bool) {
-        let args = &self.image_embeddings;
-        let mut model_cond = Expr::col((Setters::Table, Setters::Name)).eq(args.model.clone());
-        if args.clip_xmodal {
-            model_cond = model_cond
-                .or(Expr::col((Setters::Table, Setters::Name)).eq(format!("t{}", args.model)));
-        }
-
         let mut query = Query::select();
         query.from(Items::Table);
         query.join(
@@ -165,7 +162,7 @@ impl SemanticImageSearch {
                 Expr::col((Setters::Table, Setters::Id))
                     .equals((ItemData::Table, ItemData::SetterId)),
             )
-            .add(model_cond);
+            .add(self.model_cond());
         query.join(JoinType::InnerJoin, Setters::Table, setter_cond);
         match join {
             ImageVectorJoin::Embeddings => {
@@ -190,6 +187,89 @@ impl SemanticImageSearch {
             }
         }
 
+        let join_text = self.apply_src_text(&mut query);
+
+        query.join(
+            JoinType::LeftJoin,
+            Alias::new(context.name.as_str()),
+            Expr::col(context.column_ref("item_id")).equals((Items::Table, Items::Id)),
+        );
+        query.and_where(Expr::col(context.column_ref("item_id")).is_not_null());
+
+        query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
+        query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
+        if state.item_data_query {
+            query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
+        }
+
+        (query, join_text)
+    }
+
+    /// The head's candidate skeleton, driven from the coarse `ranked` CTE.
+    ///
+    /// Left to its own devices the planner drives the head from `item_data`
+    /// over the *whole* setter — 690k probes of a table whose rows are 3 KB,
+    /// so 1–2 per page — and treats `ranked` as the inner loop. That is the
+    /// execution bug measured in docs/or-composition-penalty.md §6: the
+    /// coarse pass buys nothing if the head reads every vector anyway.
+    /// `CROSS JOIN` is SQLite's join-order pin, so this shape forces
+    /// ranked → setters (name → id) → item_data (covering
+    /// `(item_id, setter_id)`) → embeddings and probes exactly the
+    /// `crank <= k` candidates. The join conditions live in `WHERE` because
+    /// sea-query drops any `ON` given to a cross join — which is also what
+    /// keeps the pin, since a `CROSS JOIN ... ON` would still be one.
+    ///
+    /// Membership matches `candidate_skeleton`'s embeddings arm: `items` is
+    /// dropped (it carried no filter, and `item_data.item_id` joins
+    /// `ranked.item_id` directly), and the same `src_text` LEFT JOINs and
+    /// criteria hang off the pinned chain.
+    fn pinned_head_skeleton(
+        &self,
+        ranked: &CteRef,
+        state: &QueryState,
+        k: i64,
+    ) -> sea_query::SelectStatement {
+        let mut query = select_std_from_cte(ranked, state);
+        query.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
+        query.join(JoinType::CrossJoin, Setters::Table, Cond::all());
+        query.join(JoinType::CrossJoin, ItemData::Table, Cond::all());
+        query.join(JoinType::CrossJoin, Embeddings::Table, Cond::all());
+        query.and_where(self.model_cond());
+        query.and_where(
+            Expr::col((ItemData::Table, ItemData::ItemId)).equals(ranked.column_ref("item_id")),
+        );
+        query.and_where(
+            Expr::col((ItemData::Table, ItemData::SetterId)).equals((Setters::Table, Setters::Id)),
+        );
+        query.and_where(
+            Expr::col((Embeddings::Table, Embeddings::Id)).equals((ItemData::Table, ItemData::Id)),
+        );
+        // Whether an unaliased `extracted_text` join was added is irrelevant
+        // here: the head's output is consumed through CTEs only, so no base
+        // table is ever visible to the final query.
+        self.apply_src_text(&mut query);
+        query
+    }
+
+    /// The setter-name condition: this filter's image model, widened to its
+    /// `t`-prefixed text sibling under `clip_xmodal`.
+    fn model_cond(&self) -> Expr {
+        let args = &self.image_embeddings;
+        let mut model_cond = Expr::col((Setters::Table, Setters::Name)).eq(args.model.clone());
+        if args.clip_xmodal {
+            model_cond = model_cond
+                .or(Expr::col((Setters::Table, Setters::Name)).eq(format!("t{}", args.model)));
+        }
+        model_cond
+    }
+
+    /// The `src_text` LEFT JOINs and criteria, shared by every skeleton
+    /// shape. Written against the unaliased `item_data` join, so the caller
+    /// must have joined it already. Returns whether the unaliased
+    /// `extracted_text` join was added (the count path has to declare it to
+    /// the final query).
+    fn apply_src_text(&self, query: &mut sea_query::SelectStatement) -> bool {
+        let args = &self.image_embeddings;
         let src_setters = Alias::new("src_setters");
         let src_item_data = Alias::new("src_item_data");
         let mut join_text = false;
@@ -287,21 +367,7 @@ impl SemanticImageSearch {
             cond = cond.add(and_cond);
             query.and_where(cond.into());
         }
-
-        query.join(
-            JoinType::LeftJoin,
-            Alias::new(context.name.as_str()),
-            Expr::col(context.column_ref("item_id")).equals((Items::Table, Items::Id)),
-        );
-        query.and_where(Expr::col(context.column_ref("item_id")).is_not_null());
-
-        query.expr_as(context.column_expr("item_id"), Alias::new("item_id"));
-        query.expr_as(context.column_expr("file_id"), Alias::new("file_id"));
-        if state.item_data_query {
-            query.expr_as(context.column_expr("data_id"), Alias::new("data_id"));
-        }
-
-        (query, join_text)
+        join_text
     }
 
     /// The per-row full-precision distance (references the `embeddings`
@@ -327,24 +393,13 @@ impl SemanticImageSearch {
             .and_then(confidence_weight_expr)
     }
 
-    /// The full-precision rank aggregate, including confidence weighting.
-    /// Aggregates over the blob directly — only safe where the plan cannot
-    /// meet a GROUP BY sorter fed by this expression; the exact path uses
-    /// `assemble_exact_fixb` instead (docs/or-composition-penalty.md §5).
-    fn exact_rank_column(&self, embedding: &[u8]) -> Expr {
-        rank_aggregate(
-            self.exact_distance_expr(embedding),
-            self.confidence_weight(),
-            self.image_embeddings.distance_aggregation,
-        )
-    }
-
-    /// The weight-free coarse proxy: plain aggregated Hamming distance over
-    /// binary quants (part of the bounded approximation by design).
+    /// The per-row coarse proxy: Hamming distance over binary quants. Never
+    /// confidence-weighted — the coarse ordering is a weight-free
+    /// approximation by design.
     /// Stored quants and the bound parameter are plain BLOBs, which
     /// sqlite-vec would read as float32 — vec_bit marks them as bit vectors.
-    fn coarse_rank_column(&self, query_quant: &[u8]) -> Expr {
-        let hamming: Expr = Func::cust("vec_distance_hamming")
+    fn coarse_distance_expr(&self, query_quant: &[u8]) -> Expr {
+        Func::cust("vec_distance_hamming")
             .args([
                 Func::cust("vec_bit")
                     .arg(Expr::col((EmbeddingQuants::Table, EmbeddingQuants::Quant)))
@@ -353,12 +408,7 @@ impl SemanticImageSearch {
                     .arg(Expr::val(query_quant.to_vec()))
                     .into(),
             ])
-            .into();
-        match self.image_embeddings.distance_aggregation {
-            DistanceAggregation::Max => hamming.max(),
-            DistanceAggregation::Avg => hamming.avg(),
-            DistanceAggregation::Min => hamming.min(),
-        }
+            .into()
     }
 
     fn register_outputs(&self, state: &mut QueryState, cte: &CteRef) {
@@ -415,24 +465,48 @@ impl FilterCompiler for SemanticImageSearch {
                 .as_ref()
                 .ok_or_else(|| PqlError::invalid("image_embeddings missing query quant"))?;
 
-            let (mut coarse, _) = self.candidate_skeleton(
+            // Fix B on the coarse pass: the per-row Hamming distance is
+            // evaluated in `qdist_{cte}` and only its 8-byte result reaches
+            // the coarse GROUP BY sorter, never the quant blob.
+            let (coarse_skeleton, _) = self.candidate_skeleton(
                 context,
                 state,
                 &ImageVectorJoin::Quants {
                     profile_id: quant.profile_id,
                 },
             );
-            apply_group_by(&mut coarse, get_std_group_by(context, state));
-            coarse.expr_as(self.coarse_rank_column(query_quant), Alias::new(COARSE_DIST));
+            let coarse = {
+                let grouped = grouped_over_materialized_distance(
+                    state,
+                    format!("qdist_{cte_name}"),
+                    COARSE_ROW_DIST,
+                    coarse_skeleton,
+                    self.coarse_distance_expr(query_quant),
+                    None,
+                    args.distance_aggregation,
+                );
+                let mut coarse = grouped.select;
+                coarse.expr_as(grouped.aggregate, Alias::new(COARSE_DIST));
+                coarse
+            };
 
             let k = args.k;
             let (merge, merge_context) =
                 assemble_two_stage(state, &cte_name, coarse, &self.sort, |state, ranked| {
-                    let (mut head, _) =
-                        self.candidate_skeleton(ranked, state, &ImageVectorJoin::Embeddings);
-                    head.and_where(Expr::col(ranked.column_ref(COARSE_RANK)).lte(k));
-                    apply_group_by(&mut head, get_std_group_by(ranked, state));
-                    head.expr_as(self.exact_rank_column(embedding), Alias::new(EXACT_DIST));
+                    // Ranked-driven, order-pinned head with its distance (and
+                    // confidence weights) materialized in `hdist_{cte}`.
+                    let head_skeleton = self.pinned_head_skeleton(ranked, state, k);
+                    let grouped = grouped_over_materialized_distance(
+                        state,
+                        format!("hdist_{cte_name}"),
+                        HEAD_ROW_DIST,
+                        head_skeleton,
+                        self.exact_distance_expr(embedding),
+                        self.confidence_weight(),
+                        args.distance_aggregation,
+                    );
+                    let mut head = grouped.select;
+                    head.expr_as(grouped.aggregate, Alias::new(EXACT_DIST));
                     head
                 });
 
@@ -534,6 +608,123 @@ mod tests {
         let context = build_begin_cte(&mut state);
         let sql = render_filter_sql(&filter, &mut state, &context);
         assert!(sql.contains("embeddings"));
+    }
+
+    /// The rendered SQL with runs of whitespace collapsed: sea-query emits
+    /// `AS  MATERIALIZED` with a double space, and the shape assertions below
+    /// should read like the SQL they describe.
+    fn normalized_sql(
+        filter: &SemanticImageSearch,
+        state: &mut QueryState,
+        context: &CteRef,
+    ) -> String {
+        render_filter_sql(filter, state, context)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn quant_filter(extra: serde_json::Value) -> SemanticImageSearch {
+        let mut args = json!({ "query": "hello", "model": "clip/test", "index": "quant" });
+        let obj = args.as_object_mut().expect("args object");
+        for (key, value) in extra.as_object().expect("extra object") {
+            obj.insert(key.clone(), value.clone());
+        }
+        let mut filter: SemanticImageSearch =
+            serde_json::from_value(json!({ "image_embeddings": args }))
+                .expect("semantic image filter");
+        filter.image_embeddings._embedding = Some(vec![0, 0, 0, 0]);
+        filter.image_embeddings._distance_func_override = Some(DistanceFunction::Cosine);
+        filter.image_embeddings._quant = Some(QuantResolved {
+            profile_id: 1,
+            query_quant: Some(vec![0, 0, 0, 0]),
+        });
+        filter
+    }
+
+    /// Both quant passes must aggregate over a `MATERIALIZED` per-row
+    /// distance CTE, and the head must be driven from `ranked` with a
+    /// `CROSS JOIN`-pinned order (docs/or-composition-penalty.md §5b).
+    /// Materialization is load-bearing: without it the flattener inlines the
+    /// distance back into the aggregate and the blob rides the GROUP BY
+    /// sorter again. The pin is load-bearing too: without it the planner
+    /// drives the head from `item_data` over the whole setter.
+    #[test]
+    fn semantic_image_quant_materializes_distances_and_pins_head() {
+        let filter = quant_filter(json!({}));
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = normalized_sql(&filter, &mut state, &context);
+
+        assert!(
+            sql.contains(r#""qdist_n0_SemanticImageSearch" AS MATERIALIZED"#),
+            "coarse distance is not materialized: {sql}"
+        );
+        assert!(
+            sql.contains(r#"MIN("qdist_n0_SemanticImageSearch"."qd") AS "cdist""#),
+            "coarse aggregate does not read the materialized distance: {sql}"
+        );
+        assert!(
+            sql.contains(r#""hdist_n0_SemanticImageSearch" AS MATERIALIZED"#),
+            "head distance is not materialized: {sql}"
+        );
+        assert!(
+            sql.contains(r#"MIN("hdist_n0_SemanticImageSearch"."hd") AS "edist""#),
+            "head aggregate does not read the materialized distance: {sql}"
+        );
+        // The head's FROM is the ranked CTE, and every table after it is
+        // cross-joined so SQLite may not reorder the probe.
+        assert!(
+            sql.contains(concat!(
+                r#"FROM "ranked_n0_SemanticImageSearch""#,
+                r#" CROSS JOIN "setters" CROSS JOIN "item_data" CROSS JOIN "embeddings""#
+            )),
+            "head is not ranked-driven with a pinned join order: {sql}"
+        );
+        // `items` is gone from the head: it carried no filter.
+        assert!(
+            sql.contains(r#""item_data"."item_id" = "ranked_n0_SemanticImageSearch"."item_id""#),
+            "head does not join item_data straight to ranked: {sql}"
+        );
+    }
+
+    /// The weighted head keeps the confidence-weighted aggregate, now over
+    /// materialized per-row distance *and* weight columns.
+    #[test]
+    fn semantic_image_quant_head_carries_confidence_weights() {
+        let filter = quant_filter(json!({
+            "clip_xmodal": true,
+            "src_text": { "confidence_weight": 0.5, "language_confidence_weight": 0.5 }
+        }));
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = normalized_sql(&filter, &mut state, &context);
+
+        assert!(
+            sql.contains(
+                r#"SUM("hdist_n0_SemanticImageSearch"."hd" * "hdist_n0_SemanticImageSearch"."w")"#
+            ),
+            "head lost the confidence-weighted aggregate: {sql}"
+        );
+        // The xmodal setter widening and the src_text joins survive the pin.
+        assert!(
+            sql.contains(r#""setters"."name" = 'tclip/test'"#),
+            "head lost the xmodal setter widening: {sql}"
+        );
+        assert!(
+            sql.contains(r#"LEFT JOIN "extracted_text""#),
+            "head lost the src_text join: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_image_quant_runs_full_query() {
+        run_full_pql_query(
+            QueryElement::SemanticImageSearch(quant_filter(json!({}))),
+            EntityType::File,
+        )
+        .await
+        .expect("semantic image quant query");
     }
 
     #[tokio::test]

@@ -79,12 +79,63 @@ pub(super) fn rank_aggregate(
     }
 }
 
-/// Assembles the fixed exact scorer: the (un-grouped) candidate skeleton,
-/// extended with per-row distance and weight columns, becomes a
-/// `MATERIALIZED` `dist_{cte_name}` CTE, and the returned select runs the
-/// GROUP BY aggregation over it. Membership and aggregate inputs are
-/// identical to aggregating over the skeleton directly — only where the
-/// distance is evaluated moves.
+/// A grouped aggregation over a materialized per-row distance.
+pub(super) struct GroupedDistance {
+    /// The standard-columns select over the dist CTE, already grouped by the
+    /// standard group key. The caller appends `aggregate` under whatever
+    /// alias its stage names the distance column.
+    pub(super) select: SelectStatement,
+    /// The aggregate over the materialized distance — confidence-weighted
+    /// when weights apply, plain MIN/MAX/AVG otherwise.
+    pub(super) aggregate: Expr,
+    /// The materialized CTE, which is `select`'s only context (the table its
+    /// standard columns resolve against).
+    pub(super) cte: CteRef,
+}
+
+/// Moves the distance out of the aggregate: `skeleton` gains `distance` (and
+/// the per-row confidence `weight`) as plain columns and becomes a
+/// `MATERIALIZED` CTE named `cte_name`, and the returned select aggregates
+/// over that CTE instead of over the base tables. Membership and aggregate
+/// inputs are identical to aggregating over the skeleton directly — only
+/// where the distance is evaluated moves.
+///
+/// Both vector scoring stages that can meet a GROUP BY sorter use this: the
+/// exact path (`assemble_exact_fixb`) and both passes of the two-stage quant
+/// scorer (`filters::quant`).
+pub(super) fn grouped_over_materialized_distance(
+    state: &mut QueryState,
+    cte_name: String,
+    dist_column: &str,
+    mut skeleton: SelectStatement,
+    distance: Expr,
+    weight: Option<Expr>,
+    aggregation: DistanceAggregation,
+) -> GroupedDistance {
+    skeleton.expr_as(distance, Alias::new(dist_column));
+    let weighted = weight.is_some();
+    if let Some(weight) = weight {
+        skeleton.expr_as(weight, Alias::new(WEIGHT));
+    }
+    let cte = create_materialized_cte(state, cte_name, skeleton);
+
+    let mut select = select_std_from_cte(&cte, state);
+    apply_group_by(&mut select, get_std_group_by(&cte, state));
+    let aggregate = rank_aggregate(
+        cte.column_expr(dist_column),
+        weighted.then(|| cte.column_expr(WEIGHT)),
+        aggregation,
+    );
+    GroupedDistance {
+        select,
+        aggregate,
+        cte,
+    }
+}
+
+/// Assembles the fixed exact scorer: the candidate skeleton's distance goes
+/// into a `MATERIALIZED` `dist_{cte_name}` CTE and the returned select runs
+/// the GROUP BY aggregation over it as the filter's rank column.
 ///
 /// The returned select reads exclusively from the dist CTE, so no base
 /// tables are visible to the final query anymore; the dist CTE ref is the
@@ -93,26 +144,22 @@ pub(super) fn rank_aggregate(
 pub(super) fn assemble_exact_fixb(
     state: &mut QueryState,
     cte_name: &str,
-    mut skeleton: SelectStatement,
+    skeleton: SelectStatement,
     distance: Expr,
     weight: Option<Expr>,
     aggregation: DistanceAggregation,
     sort: &SortableOptions,
 ) -> Result<(SelectStatement, CteRef), PqlError> {
-    skeleton.expr_as(distance, Alias::new(DIST));
-    let weighted = weight.is_some();
-    if let Some(weight) = weight {
-        skeleton.expr_as(weight, Alias::new(WEIGHT));
-    }
-    let dist_cte = create_materialized_cte(state, format!("dist_{cte_name}"), skeleton);
-
-    let mut query = select_std_from_cte(&dist_cte, state);
-    apply_group_by(&mut query, get_std_group_by(&dist_cte, state));
-    let rank = rank_aggregate(
-        dist_cte.column_expr(DIST),
-        weighted.then(|| dist_cte.column_expr(WEIGHT)),
+    let grouped = grouped_over_materialized_distance(
+        state,
+        format!("dist_{cte_name}"),
+        DIST,
+        skeleton,
+        distance,
+        weight,
         aggregation,
     );
-    add_rank_column_expr(&mut query, sort, rank)?;
-    Ok((query, dist_cte))
+    let mut query = grouped.select;
+    add_rank_column_expr(&mut query, sort, grouped.aggregate)?;
+    Ok((query, grouped.cte))
 }

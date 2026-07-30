@@ -17,6 +17,16 @@
 //! Nothing is truncated: membership, counts, and downstream composition are
 //! untouched. If the candidate set is ≤ k items the head covers everything
 //! and the result is bit-identical to exact search.
+//!
+//! Both scoring passes are aggregations over a `vec_distance_*` call, so both
+//! sit in the GROUP BY-sorter trap of docs/or-composition-penalty.md §5 and
+//! both go through `exact::grouped_over_materialized_distance`: the coarse
+//! pass evaluates its per-row Hamming distance in `qdist_{cte}`, the head its
+//! per-row full-precision distance in `hdist_{cte}`, and only the 8-byte
+//! result reaches the sorter. On top of that the head is driven *from* the
+//! ranked CTE with a `CROSS JOIN`-pinned join order, so it probes only the
+//! `crank <= k` candidates instead of the whole setter (§5b, §6): those two
+//! changes together took the composed mpnet query from 3.7–4.0s to 1.39–1.48s.
 
 use sea_query::{
     Alias, Asterisk, Expr, ExprTrait, JoinType, NullOrdering, Order, Query, SelectStatement,
@@ -33,13 +43,24 @@ pub(super) const COARSE_DIST: &str = "cdist";
 pub(super) const COARSE_RANK: &str = "crank";
 /// Column alias for the exact aggregate in the head CTE.
 pub(super) const EXACT_DIST: &str = "edist";
+/// Column alias for the *per-row* Hamming distance in the coarse pass's
+/// materialized distance CTE (`qdist_{cte}`).
+pub(super) const COARSE_ROW_DIST: &str = "qd";
+/// Column alias for the *per-row* full-precision distance in the head's
+/// materialized distance CTE (`hdist_{cte}`).
+pub(super) const HEAD_ROW_DIST: &str = "hd";
 
 /// Assembles the coarse → ranked → head → merge CTE chain. `coarse` must be
 /// a grouped select producing the standard columns plus `cdist`;
 /// `build_head` receives the ranked CTE (standard columns + `cdist` +
 /// `crank`) to use as its candidate context and must produce a grouped
 /// select with the standard columns plus `edist`, restricted to
-/// `crank <= k`. Returns the merge select (standard columns + `order_rank`)
+/// `crank <= k`. Either may read from CTEs of its own: `build_head` runs
+/// after `ranked_{cte}` is registered and before `head_{cte}` is, so any CTE
+/// it creates (the head's `hdist_{cte}`) lands between them in the WITH
+/// clause — where it can both see `ranked` and be seen by `head`. The
+/// coarse's own `qdist_{cte}` must likewise be created by the caller
+/// *before* calling this. Returns the merge select (standard columns + `order_rank`)
 /// plus the ranked CTE ref, which is the merge's context (the final
 /// assembly joins base tables against the context's columns, so it must be
 /// a table in the merge's FROM scope) — pass it to `apply_sort_bounds` +
