@@ -38,6 +38,16 @@ Per-DB `config.toml` is serialized from `SystemConfig::default()` at creation,
 and serde defaults fill absent keys at load, so a newly added key is
 functionally correct for existing databases without any migration.
 
+**Retiring or renaming a setting value** (per-DB or server TOML) must be done
+by an active migration that rewrites the stored config at upgrade time —
+never by shipping only a load-time alias that waits for the user to re-save,
+and never by making the commit path reject the old value (the UI round-trips
+the full config, so a reject breaks every unrelated settings save). A
+load-time alias is acceptable only as a safety net layered on top of the
+migration. (Learned from the 2026-07-30 int8 quant remap: `quantizer =
+"binary"` was aliased at load and rejected at commit — the reject 400'd
+unrelated saves, and the alias warned on every load forever.)
+
 # Release preparation
 
 - Only tagged `vX.Y.Z` releases are installable; master is never an
