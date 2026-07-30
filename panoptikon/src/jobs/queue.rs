@@ -918,12 +918,15 @@ async fn cancel_running_job_inner(
 /// cascaded deletes. Maintenance jobs never owe maintenance.
 fn pessimistic_summary(job: &Job) -> ChangeSummary {
     match &job.job_type {
-        // Writes only the quant tables, which recount/ANALYZE/VACUUM do not
-        // serve. It never ran post-job maintenance before the boundary existed
-        // and must not start owing it now — an aborted reconcile scheduling a
-        // full ANALYZE over a 10 GB index is exactly the starvation this
-        // design set out to avoid.
-        JobType::VectorQuantReconcile => ChangeSummary::default(),
+        // An aborted reconcile may already have committed backfill chunks
+        // (fresh statistics-less `embedding_quants` rows) or delete chunks,
+        // so it owes the same maintenance a completed one reports. The
+        // recount stays off: nothing here touches `tags_items`.
+        JobType::VectorQuantReconcile => ChangeSummary {
+            wrote_data: true,
+            deleted_data: true,
+            tags_changed: false,
+        },
         // The test stand-in declares in its tag what it changes, so a
         // cancelled one owes exactly what a completed one would have reported.
         // That makes it a usable substitute for the job types whose real
@@ -1479,8 +1482,10 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             let result = service.rescan_folders().await;
             guard.resume().await;
             let result = result.map_err(|err| format!("{err:?}"))?;
-            vector_quants::finishing_phase(&job.index_db).await;
-            Ok(JobSuccess::from_summary(result.summary))
+            let quant = vector_quants::finishing_phase(&job.index_db).await;
+            let mut summary = result.summary;
+            summary.or_with(quant);
+            Ok(JobSuccess::from_summary(summary))
         }
         JobType::FolderUpdate => {
             let guard = continuous_scan::pause_for_job_guarded(&job.index_db)
@@ -1490,8 +1495,10 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             let result = service.run_folder_update().await;
             guard.resume().await;
             let result = result.map_err(|err| format!("{err:?}"))?;
-            vector_quants::finishing_phase(&job.index_db).await;
-            Ok(JobSuccess::from_summary(result.summary))
+            let quant = vector_quants::finishing_phase(&job.index_db).await;
+            let mut summary = result.summary;
+            summary.or_with(quant);
+            Ok(JobSuccess::from_summary(summary))
         }
         JobType::DataExtraction => {
             if let Some(stubbed) = Box::pin(extraction_stub(&job)).await {
@@ -1500,14 +1507,18 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             let outcome = extraction::run_extraction_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
-            vector_quants::finishing_phase(&job.index_db).await;
-            Ok(JobSuccess::from_extraction(outcome))
+            let quant = vector_quants::finishing_phase(&job.index_db).await;
+            let mut success = JobSuccess::from_extraction(outcome);
+            success.summary.or_with(quant);
+            Ok(success)
         }
         JobType::DataDeletion => {
             let summary = extraction::run_data_deletion_job(job.clone())
                 .await
                 .map_err(|err| format!("{err}"))?;
-            vector_quants::finishing_phase(&job.index_db).await;
+            let quant = vector_quants::finishing_phase(&job.index_db).await;
+            let mut summary = summary;
+            summary.or_with(quant);
             Ok(JobSuccess::from_summary(summary))
         }
         JobType::JobDataDeletion => {
@@ -1523,25 +1534,32 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             .await;
             guard.resume().await;
             let deleted = deleted.map_err(|err| format!("{err:?}"))?;
-            vector_quants::finishing_phase(&job.index_db).await;
-            Ok(JobSuccess::from_summary(ChangeSummary {
+            let quant = vector_quants::finishing_phase(&job.index_db).await;
+            let mut summary = ChangeSummary {
                 wrote_data: false,
                 deleted_data: deleted > 0,
                 // Deleting a job's data removes its `item_data` rows, and
                 // `tags_items` hangs off those.
                 tags_changed: deleted > 0,
-            }))
+            };
+            summary.or_with(quant);
+            Ok(JobSuccess::from_summary(summary))
         }
         JobType::VectorQuantReconcile => {
             // No continuous-scan pause: the reconcile touches only quant
             // tables and serializes with extraction via the job queue
             // itself; continuous scan writes no embeddings.
-            crate::jobs::vector_quants::run_reconcile(&job.index_db)
+            let summary = crate::jobs::vector_quants::run_reconcile(&job.index_db)
                 .await
                 .map_err(|err| format!("{err:?}"))?;
-            // Reports nothing: the reconcile never ran post-job maintenance
-            // and its quant tables are outside what recount/ANALYZE serve.
-            Ok(JobSuccess::from_summary(ChangeSummary::default()))
+            // Reports what it changed: a rebuild fills `embedding_quants`
+            // with rows the planner has no statistics for, and without the
+            // deferred ANALYZE the quant distance CTE is driven from the
+            // whole quant table — measured on the production index, that
+            // mis-plan consumed int8's entire win. (The pre-int8 belief
+            // that "quant tables are outside what ANALYZE serves" was
+            // wrong the moment the table got big enough to mis-plan.)
+            Ok(JobSuccess::from_summary(summary))
         }
         JobType::DbMaintenance => {
             // Never fails: this is the same contract the maintenance pass has
@@ -3204,12 +3222,20 @@ mod tests {
             },
             "a partially completed extraction really did write item data"
         );
-        // The reconcile writes only quant tables and never ran post-job
-        // maintenance; cancelling it must not start scheduling one.
+        // A cancelled reconcile may already have committed backfill chunks —
+        // fresh, statistics-less `embedding_quants` rows — or delete chunks,
+        // so it owes the ANALYZE a completed run reports (measured: without
+        // it the planner mis-drives the quant join and int8's entire win
+        // disappears — docs/vector-int8-quant.md §3a). It never touches
+        // `tags_items`, so the recount stays off.
         assert_eq!(
             pessimistic_summary(&queued_job(JobType::VectorQuantReconcile, None)),
-            ChangeSummary::default(),
-            "the reconcile owes no maintenance, even when it is cancelled"
+            ChangeSummary {
+                wrote_data: true,
+                deleted_data: true,
+                tags_changed: false
+            },
+            "a cancelled reconcile owes maintenance for its committed chunks"
         );
     }
 

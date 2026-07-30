@@ -192,6 +192,21 @@ The general rule, since the original schema got it backwards: **`WITHOUT
 ROWID` is for narrow key-only tables. A table that exists to carry a payload
 must be a rowid table.**
 
+**A rebuild is not done until the deferred ANALYZE has run.** Found in
+production on 2026-07-31, the first live requant: the rebuilt table had no
+`sqlite_stat1` rows, and the planner drove the quant distance CTE *from*
+`embedding_quants` via `embedding_quants_profile_rev_id (profile_id=?)` —
+scanning every model's 1.45M rows and probing `item_data`/`setters` to
+filter down to the one setter's 90k — instead of setters → item_data →
+unique-index probe. Measured on the live index, that mis-plan consumed the
+entire int8 win (composed clip: int8 0.58s vs exact 0.57s; with statistics,
+0.45s vs 0.65s). The reconcile job used to report an empty change summary
+("quant tables are outside what ANALYZE serves" — a pre-int8 belief), so a
+standalone requant never owed the deferred `DbMaintenance` pass. It now
+reports `wrote_data`/`deleted_data` for the work it actually did, and the
+batch-job finishing phase folds the inline reconcile's summary into the
+parent job's, so the ANALYZE follows the rebuild in every path.
+
 ## 4. The evaluation this rests on
 
 Offline evaluation, production data:
