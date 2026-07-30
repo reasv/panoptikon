@@ -671,7 +671,7 @@ config.devices = ["3"]
             sweep_interval: Duration::from_secs(60),
             prewarm,
             gpus,
-            vram: crate::inferio::ledger::VramBudget::default(),
+            vram: crate::inferio::ledger::VramBudgets::default(),
             // No calibration store: these tests never touch the ledger's
             // profile paths, and a store would put a file write in their way.
             calibration: None,

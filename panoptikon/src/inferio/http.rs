@@ -185,9 +185,7 @@ impl InferioState {
                     always_warm: local.prewarm.always_warm.clone(),
                 },
                 gpus: host.inventory,
-                // Step 2 adds `[inference_local.vram]`; until then every
-                // board runs on the defaults (margin 0.10 on, cap off).
-                vram: super::ledger::VramBudget::default(),
+                vram: vram_budgets(&local.vram),
                 calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),
@@ -211,6 +209,30 @@ impl InferioState {
             .get()
             .and_then(|registry| registry.external_inputs_json())
     }
+}
+
+/// `[inference_local.vram]` → the ledger's budget table.
+///
+/// One shape change across the seam: the config expresses a per-board override
+/// as "fields that may be absent, meaning inherit", while the ledger wants a
+/// resolved [`VramBudget`] per board. Resolving here rather than in the ledger
+/// keeps the inheritance rule in one place — `VramConfig::for_board` — and
+/// keeps the ledger's hot path a plain map lookup.
+fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudgets {
+    let (margin, cap_fraction) = (config.margin, config.cap_fraction);
+    let mut budgets =
+        super::ledger::VramBudgets::uniform(super::ledger::VramBudget { margin, cap_fraction });
+    for uuid in config.gpu.keys() {
+        let (margin, cap_fraction) = config.for_board(uuid);
+        budgets = budgets.with_board(
+            uuid.clone(),
+            super::ledger::VramBudget {
+                margin,
+                cap_fraction,
+            },
+        );
+    }
+    budgets
 }
 
 /// The `backend` component of a calibration profile key: which torch build
@@ -1130,7 +1152,7 @@ metadata.description = "echo fixture"
                 prewarm,
                 // Tests must not depend on the host's GPUs.
                 gpus: super::super::gpu::GpuInventory::unknown(),
-                vram: super::super::ledger::VramBudget::default(),
+                vram: super::super::ledger::VramBudgets::default(),
                 calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),

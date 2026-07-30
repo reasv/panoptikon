@@ -70,6 +70,23 @@ const STDERR_JOIN_GRACE: Duration = Duration::from_secs(1);
 /// How long a fatal path waits for the killed child to be reaped.
 const FATAL_REAP_GRACE: Duration = Duration::from_secs(5);
 
+/// Deadline for a `trim` (protocol doc, "Lifecycle and timeouts").
+///
+/// A trim is best-effort hygiene and must never hold a dispatcher for minutes,
+/// but the operation it performs is `cudaFree` over every block in the
+/// allocator pool — which on a multi-gigabyte pool, on a busy board, under
+/// WDDM, is not the milliseconds an idle `empty_cache()` costs. Timing out is
+/// **fatal** (the worker is unresponsive and the stream would desynchronize),
+/// so this budget has to be long enough that a slow-but-healthy release is
+/// never mistaken for a wedged process; a minute is far beyond any plausible
+/// pool teardown and still bounded.
+///
+/// Deliberately **not** floored by the configured handshake deadline: that
+/// deadline is about spawn liveness — how long a fresh process may take to
+/// answer a trivial frame — and an operator who tightened it to 5 s was
+/// describing startup, not a `cudaFree` of a big pool.
+const TRIM_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Lifecycle deadlines from the protocol doc ("Lifecycle and timeouts").
 /// `predict` deliberately has no deadline in v1: models take arbitrarily
 /// long, and cancellation means killing the worker.
@@ -212,6 +229,18 @@ pub struct BatchMeasurement {
     /// silent throughput collapse instead of an OOM, so this is the synthetic
     /// negative sample that stands in for the exception that never fires.
     pub throughput_collapse: bool,
+    //
+    // The protocol's `trimmed` flag (protocol doc, "Measurements") is
+    // deliberately **not** parsed into a field here. It marks the first
+    // measurement of a window whose reactive shrink released the pool first,
+    // and the ledger's answer to such a sample is to take it exactly as it
+    // comes: a post-`empty_cache()` regrowth batch is a high-water batch, which
+    // is precisely the kind the fit wants, and knowing it followed a release
+    // would not change how it is priced (see the high-water branch of
+    // `VramLedger::ingest_locked`, which spells out why). It stays on the wire
+    // as operator-facing provenance — it explains an otherwise surprising
+    // pool-growth spike in a log — and a field nothing reads would only invite
+    // someone to give it a meaning the ledger does not have.
 }
 
 /// A telemetry reading plus when it was recorded. The ledger has to be able
@@ -771,6 +800,29 @@ impl Worker {
             .collect()
     }
 
+    /// Send `trim` — release the caching allocator's unused pool
+    /// (`empty_cache()`), keeping weights, live tensors and the CUDA context —
+    /// and record the fresh memory sample the reply carries.
+    ///
+    /// The orchestrator sends this to an **idle** resident whose retained pool
+    /// is squeezing a neighbour (docs/batch-calibration-design.md, "Trim for
+    /// idle residents"). It is hygiene, not work: a worker that cannot trim
+    /// (no torch, no live CUDA) replies `ok` with nothing, an older worker
+    /// replies with a per-request `error` and stays alive, and both are fine.
+    ///
+    /// Recording the sample is the point of the round trip as far as the
+    /// ledger is concerned: it is how the released slack stops being charged
+    /// to a resident that will not run another window for a while.
+    pub async fn trim(&mut self) -> Result<()> {
+        let deadline = TRIM_DEADLINE;
+        let payload = self
+            .roundtrip("trim", Vec::new(), Some(deadline))
+            .await
+            .with_context(|| format!("trim failed for inferio worker {}", self.label))?;
+        self.record_telemetry(&payload);
+        Ok(())
+    }
+
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
     /// deadline (an unbounded liveness probe would be useless). The prewarm
     /// pool pings a parked worker before claiming it (protocol doc: it may
@@ -903,7 +955,8 @@ impl Worker {
         }
         if self.in_flight {
             return Err(self
-                .fatal(
+                .fatal_request(
+                    request_type,
                     "a previous request future was dropped mid-flight; the stream is desynchronized"
                         .to_owned(),
                 )
@@ -939,7 +992,10 @@ impl Worker {
             Ok(value) => value,
             Err(err) => {
                 return Err(self
-                    .fatal(format!("{request_type} request failed: {err:#}"))
+                    .fatal_request(
+                        request_type,
+                        format!("{request_type} request failed: {err:#}"),
+                    )
                     .await);
             }
         };
@@ -947,7 +1003,7 @@ impl Worker {
             Value::Map(map) => map,
             other => {
                 return Err(self
-                    .fatal(format!("response frame is not a map: {other}"))
+                    .fatal_request(request_type, format!("response frame is not a map: {other}"))
                     .await);
             }
         };
@@ -957,9 +1013,10 @@ impl Worker {
         let resp_id = map_get(&map, "id").and_then(Value::as_u64);
         if resp_id != Some(id) {
             return Err(self
-                .fatal(format!(
-                    "response id {resp_id:?} does not match request id {id}"
-                ))
+                .fatal_request(
+                    request_type,
+                    format!("response id {resp_id:?} does not match request id {id}"),
+                )
                 .await);
         }
         match resp_type.as_deref() {
@@ -990,9 +1047,34 @@ impl Worker {
                 }))
             }
             other => Err(self
-                .fatal(format!("unexpected response frame type {other:?}"))
+                .fatal_request(
+                    request_type,
+                    format!("unexpected response frame type {other:?}"),
+                )
                 .await),
         }
+    }
+
+    /// [`Self::fatal`], plus the one thing the request type is needed for:
+    /// naming a `trim` as the cause of a teardown before it happens.
+    ///
+    /// Every other request type is something a caller asked for, so a model
+    /// dying on one has an obvious cause in the logs right above it. A trim is
+    /// the exception — nobody asked for it, it is memory hygiene the
+    /// orchestrator sent on its own initiative to an *idle* resident — so
+    /// without this line an operator sees a model die with no request of
+    /// theirs anywhere near it. Logged before the teardown so it precedes the
+    /// death, whatever the reap does to ordering.
+    async fn fatal_request(&mut self, request_type: &str, why: String) -> anyhow::Error {
+        if request_type == "trim" {
+            tracing::warn!(
+                worker = %self.label,
+                "an idle-resident trim (allocator-pool hygiene, not work) failed \
+                 fatally and is about to take this worker down with it; the model \
+                 will have to be reloaded. Cause: {why}"
+            );
+        }
+        self.fatal(why).await
     }
 
     /// Poison the worker after an unrecoverable failure: kill, reap, drain
@@ -1488,6 +1570,39 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
+    }
+
+    /// `trim` round trip over the real protocol: the worker answers `ok`,
+    /// stays configured and loaded, and serves the next `predict` normally.
+    ///
+    /// The fixture impls never import torch, so there is no pool to release
+    /// and the reply carries no memory sample — which is the *point* of the
+    /// assertion here: a trim on a worker that cannot trim is a plain success,
+    /// not an error path, so the orchestrator never has to know in advance
+    /// which residents are trimmable. The stream staying in sync (the predict
+    /// below) is what proves the response frame was consumed correctly.
+    #[tokio::test]
+    async fn a_trim_is_answered_and_leaves_the_worker_serving() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        worker.trim().await.expect("trim is answered with ok");
+        worker.trim().await.expect("trim is idempotent");
+
+        let inputs = [WorkerInput {
+            data: Some(json!("still here")),
+            file: None,
+        }];
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("the worker still serves predicts after a trim");
+        assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": "still here"})));
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
     }
 
     /// End to end over the real protocol: a `predict` carrying a **grant**

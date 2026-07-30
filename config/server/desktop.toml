@@ -29,6 +29,28 @@ enabled = true
 # This ${VAR} bridge only expands as a live line, so it does not track defaults.
 accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 
+# How much of each GPU the inference orchestrator may admit work into. Two
+# composable limits; when both are set the budget is the min. The header below
+# is live and the table deliberately empty: an empty table freezes nothing —
+# every absent key tracks its built-in default across upgrades — while giving
+# the keys a section to belong to. Uncommenting a bare `margin = …` with no
+# header above it would otherwise land it in whichever table precedes this one.
+[inference_local.vram]
+# Margin over OTHER processes' VRAM usage (our own workers are measured, never
+# inflated): usable = total - other_used * (1 + margin). Default 0.10, on.
+# margin = 0.10
+# Hard ceiling as a fraction of the board's total VRAM; the server lever for
+# partitioning one card between services. Default: off.
+# cap_fraction = 0.90
+
+# Per-GPU-instance overrides, keyed by board UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every board.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
+
 [rulesets.allow_all]
 allow_all = true
 

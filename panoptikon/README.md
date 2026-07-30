@@ -318,12 +318,18 @@ parameters for inference paths just as it did for the proxy.
 orchestrator observability: top-level `status` ("ok"/"shutting_down"),
 `shutting_down`, `registry_ok`, `model_count`, and a `models` array with, per
 loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
-{total, free}`, `queue_depth`, `in_flight_windows`, `last_effective_cap`
-(null until the first window dispatches), `total_predict_requests`, and
-`total_batches`, plus a `prewarm` section `{enabled, lazy, warm:
-[{impl_class, state}]}` where `state` is `"warm"`, `"spawning"`, or
-`"failed_prepare"`. When local inference is disabled the path proxies
-upstream like any other inference route (a Python upstream 404s it).
+{total, free}`, `queue_depth`, `in_flight_windows`, `last_grant_units` and
+`last_window_items` (null until the first window dispatches),
+`total_predict_requests`, and `total_batches`, plus a `prewarm` section
+`{enabled, lazy, warm: [{impl_class, state}]}` where `state` is `"warm"`,
+`"spawning"`, or `"failed_prepare"`. When local inference is disabled the path
+proxies upstream like any other inference route (a Python upstream 404s it).
+
+One reading that can look odd: `replicas.free` may briefly dip with
+`in_flight_windows` still at 0. That is a replica away answering a `trim` —
+the orchestrator asking an idle model to hand back its allocator pool (see
+VRAM budgets above). It is hygiene, not work, so it moves neither the window
+counters nor `total_batches`.
 
 ### Prewarming
 
@@ -375,10 +381,46 @@ enabled = true
 # lazy = true             # keep one warm worker per class after each load
 # always_warm = []        # impl classes warmed unconditionally at startup
 
+# [inference_local.vram]  # per-GPU admission budget (see below)
+# margin = 0.10           # headroom over OTHER processes' VRAM usage
+# cap_fraction = 0.90     # hard ceiling as a fraction of total VRAM (off by default)
+
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25           # per-board override; absent keys inherit
+
 # [inference_local.python_env]  # managed venv policy (`panoptikon setup`)
 # accelerator = "auto"    # "auto" | "cuda" | "rocm" | "cpu"
 # auto_setup = true       # run setup at startup when python/.venv is missing
 ```
+
+#### VRAM budgets (`[inference_local.vram]`)
+
+Batch sizes for local inference are chosen automatically: the orchestrator
+keeps a per-GPU ledger of what every worker holds, fits a memory cost model
+per model from its own measurements, and sizes each batch against live free
+memory. These two settings say how much of a board it may use. When both are
+set, the admission budget is the smaller:
+
+- **`margin`** (default `0.10`, on) — headroom over what *other* processes on
+  the board are using: `usable = total − other_used × (1 + margin)`. This is
+  the desktop lever: it keeps a game, a browser, or the compositor from being
+  pushed out. Our own workers are never inflated by it — their footprints are
+  measured, not guessed — so on a headless server, where other usage is ~0, it
+  costs nothing.
+- **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
+  board's total VRAM. This is the server lever, for partitioning one card
+  between services. If you set it, leave `margin` alone.
+
+Overrides are per **GPU instance**, keyed by board UUID (`nvidia-smi -L`
+prints them), not by card model and never by CUDA device index — an index is
+not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Two identical
+cards therefore share their calibration data but can carry different budgets,
+which is the point: the one driving your monitors wants a bigger margin than
+its twin. An omitted key in an override inherits the section default.
+
+`GET /api/inference/health` reports each board's `margin`, `cap_fraction`,
+`limit_mb` and `headroom_mb`, which is the fastest way to check that an
+override was picked up.
 
 ### The managed Python environment (`panoptikon setup`)
 

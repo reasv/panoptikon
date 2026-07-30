@@ -71,7 +71,7 @@ use super::dispatch::{
 use super::gpu::{GpuInfo, GpuInventory};
 use super::calibration::CalibrationProfiles;
 use super::ledger::{
-    Admission, GpuBudgetHealth, LoadReservation, VramBudget, VramLedger,
+    Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger,
 };
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
@@ -98,10 +98,10 @@ pub struct ManagerConfig {
     /// per-GPU ledger is keyed by these UUIDs. Unknown on hosts with no
     /// nvidia-smi, which keeps today's unpinned behaviour.
     pub gpus: GpuInventory,
-    /// VRAM admission limits (`[inference_local.vram]`). Step 2 adds the
-    /// config plumbing, including per-board-UUID overrides; until then every
-    /// board runs on the defaults (margin 0.10 on, `cap_fraction` off).
-    pub vram: VramBudget,
+    /// VRAM admission limits (`[inference_local.vram]`): the server default
+    /// plus per-board-UUID overrides. Defaults are margin 0.10 on,
+    /// `cap_fraction` off.
+    pub vram: VramBudgets,
     /// The calibration store: shipped baselines and the local generated
     /// profile file. `None` leaves the ledger unprimed and unpersisted,
     /// which is exactly the pre-store behaviour (tests, and any embedder
@@ -756,7 +756,7 @@ impl ModelManager {
         // can never describe different hardware. The calibration store primes
         // it (fit, expected base, and — from local profiles only — the
         // ratchet anchor) and receives its updates.
-        let ledger = VramLedger::new(&cfg.gpus, cfg.vram, cfg.calibration.clone());
+        let ledger = VramLedger::new(&cfg.gpus, cfg.vram.clone(), cfg.calibration.clone());
         let manager = Arc::new(Self {
             cfg,
             registry,
@@ -867,6 +867,11 @@ impl ModelManager {
         // `finally`); dropping explicitly keeps the restore at completion
         // time, and cancellation at `reply_rx.await` runs the same Drop.
         drop(pin);
+        // A window just settled, which is when the ledger's contention picture
+        // is freshest — and this window's own grant request is what may have
+        // flagged an idle neighbour. Waiting for the sweep tick would delay
+        // relief by up to `sweep_interval`.
+        self.deliver_pending_trims();
         result
     }
 
@@ -1078,6 +1083,38 @@ impl ModelManager {
         let unloads = state.cache.expire(Local::now());
         for id in unloads {
             Self::begin_unload(&mut state, &id);
+        }
+        drop(state);
+        self.deliver_pending_trims();
+    }
+
+    /// Route the ledger's idle-resident trim requests to the dispatchers that
+    /// own those replicas (docs/batch-calibration-design.md, "Trim for idle
+    /// residents").
+    ///
+    /// The ledger is the only component that sees a squeezed worker and its
+    /// idle neighbour's pool slack at once, but it cannot call a worker —
+    /// dispatchers own workers. So it raises a signal and this drains it. Two
+    /// callers, deliberately: the sweep tick guarantees delivery on an
+    /// otherwise quiet server, and the predict path makes it prompt on a busy
+    /// one (the drain costs one uncontended lock and a `Vec::is_empty` when
+    /// there is nothing to do, which is the normal case).
+    ///
+    /// A model that is no longer in `state.models` — unloaded, mid-teardown,
+    /// respawned under a new generation — simply gets no message: the entry is
+    /// removed before its dispatcher is told to shut down, so the lookup here
+    /// *is* the generation guard, and a stale send would land on a closed
+    /// channel regardless.
+    fn deliver_pending_trims(&self) {
+        let trims = self.ledger.take_pending_trims();
+        if trims.is_empty() {
+            return;
+        }
+        let state = self.state.lock().unwrap();
+        for trim in trims {
+            if let Some(handle) = state.models.get(&trim.inference_id) {
+                let _ = handle.tx.send(DispatchMsg::Trim(trim.worker));
+            }
         }
     }
 
@@ -1932,7 +1969,7 @@ config.replicas = 2
                 always_warm: Vec::new(),
             },
             gpus,
-            vram: VramBudget::default(),
+            vram: VramBudgets::default(),
             // Usually no calibration store: these tests assert manager
             // semantics, and a store would make them write a profile file.
             calibration,

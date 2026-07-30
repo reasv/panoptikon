@@ -230,6 +230,18 @@ pub(crate) struct WindowBounds {
 /// Messages accepted by a model's dispatcher task.
 pub(crate) enum DispatchMsg {
     Predict(DispatchRequest),
+    /// The ledger wants one of this model's replicas to release its allocator
+    /// pool (`Worker::trim`). Carries the ledger's replica id
+    /// ([`Admission::worker_id`]) — a model can have several replicas and only
+    /// one of them is the idle resident holding the slack.
+    ///
+    /// Best-effort and never queued: it is only acted on if that replica is in
+    /// the free pool when the message is processed. A **busy** replica is
+    /// skipped by design — it is not idle, so it is not what this exists for,
+    /// its own reactive-shrink path covers it, and a trim between the frames
+    /// of an in-flight window is not something the one-request-at-a-time
+    /// protocol allows anyway.
+    Trim(u64),
     /// Graceful unload: fail anything still queued, then run the worker's
     /// unload -> terminate -> kill ladder and exit the task.
     Shutdown,
@@ -430,6 +442,10 @@ enum End {
 /// Outcome of dispatching one window.
 enum BatchOutcome {
     Continue,
+    /// A [`DispatchMsg::Trim`] finished (successfully or not) — no window ran,
+    /// so the replica returns to the free pool without touching the window
+    /// counters.
+    Trimmed,
     Fatal(String),
 }
 
@@ -566,12 +582,21 @@ pub(crate) async fn run_dispatcher(
                     ctx.stats.queue_len.store(queue.len(), Relaxed);
                     ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
                 }
+                Some(DispatchMsg::Trim(worker_id)) => {
+                    try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
+                }
             },
             Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
                 match finished {
                     Ok((replica, BatchOutcome::Continue)) => {
                         free.push(replica);
                         ctx.stats.in_flight_windows.fetch_sub(1, Relaxed);
+                        ctx.stats.replicas_free.store(free.len(), Relaxed);
+                    }
+                    Ok((replica, BatchOutcome::Trimmed)) => {
+                        // No window ran, so `in_flight_windows` was never
+                        // incremented for this task and must not be decremented.
+                        free.push(replica);
                         ctx.stats.replicas_free.store(free.len(), Relaxed);
                     }
                     Ok((replica, BatchOutcome::Fatal(message))) => {
@@ -599,6 +624,9 @@ pub(crate) async fn run_dispatcher(
                     queue.push_back(enqueue(request, &ctx.cost));
                     ctx.stats.queue_len.store(queue.len(), Relaxed);
                     ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+                }
+                Ok(DispatchMsg::Trim(worker_id)) => {
+                    try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
                 }
                 Ok(DispatchMsg::Shutdown) => break 'main End::Graceful,
                 Err(_) => break,
@@ -632,7 +660,9 @@ pub(crate) async fn run_dispatcher(
             let drain = async {
                 while let Some(finished) = in_flight.join_next().await {
                     match finished {
-                        Ok((replica, BatchOutcome::Continue)) => free.push(replica),
+                        Ok((replica, BatchOutcome::Continue | BatchOutcome::Trimmed)) => {
+                            free.push(replica)
+                        }
                         Ok((replica, BatchOutcome::Fatal(message))) => {
                             tracing::warn!(
                                 model = %ctx.inference_id,
@@ -701,6 +731,79 @@ pub(crate) async fn run_dispatcher(
                 manager.handle_worker_death(&ctx.inference_id, ctx.generation);
             }
         }
+    }
+}
+
+/// Act on a [`DispatchMsg::Trim`], or decline it.
+///
+/// Three ways to decline, all of them silent and all of them correct:
+///
+/// - **the replica is not free** — it is running a window, so it is not the
+///   idle resident the ledger meant, its own reactive-shrink path covers it,
+///   and the one-request-at-a-time protocol has no room for a trim mid-window
+///   anyway;
+/// - **this model has work queued** — the replica is about to be busy for the
+///   same reasons, and spending its next ten seconds on hygiene would delay
+///   real work. (At the select point the queue is empty by construction — the
+///   dispatch loop above runs until the queue or the free pool is exhausted —
+///   so this only bites on the post-select drain);
+/// - **no such replica here** — the ledger id belongs to a replica this
+///   dispatcher no longer owns (a respawn, a model mid-teardown).
+///
+/// The ledger re-flags a still-squeezing resident after its debounce, so a
+/// declined trim costs a delay, never the outcome.
+fn try_trim(
+    ctx: &DispatcherContext,
+    free: &mut Vec<Replica>,
+    in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
+    worker_id: u64,
+    queue_len: usize,
+) {
+    if queue_len > 0 {
+        return;
+    }
+    let Some(position) = free.iter().position(|replica| {
+        replica
+            .admission
+            .as_ref()
+            .is_some_and(|admission| admission.worker_id() == worker_id)
+    }) else {
+        return;
+    };
+    let replica = free.remove(position);
+    ctx.stats.replicas_free.store(free.len(), Relaxed);
+    let inference_id = ctx.inference_id.clone();
+    in_flight.spawn(async move { run_trim(&inference_id, replica).await });
+}
+
+/// Ask one idle replica to release its allocator pool and fold the fresh
+/// memory sample back into the ledger.
+///
+/// A per-request `error` — an older worker that does not know the message
+/// type, or an impl whose torch cannot answer — is not a failure of anything:
+/// the trim was hygiene, the worker is alive, and the replica goes back in the
+/// pool. A *fatal* error is different and is treated exactly as a fatal
+/// predict: the response stream is desynchronized or the process is gone, and
+/// there is nothing left to reuse.
+async fn run_trim(inference_id: &str, mut replica: Replica) -> (Replica, BatchOutcome) {
+    match replica.worker.trim().await {
+        Ok(()) => {
+            // The sample the reply carried is in the shared telemetry; this is
+            // what makes the ledger stop charging the released slack to a
+            // resident that will not run a window for a while.
+            if let Some(admission) = &replica.admission {
+                admission.note_trimmed();
+            }
+            (replica, BatchOutcome::Trimmed)
+        }
+        Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
+            tracing::debug!(
+                model = %inference_id,
+                "this replica declined to release its allocator pool: {err:#}"
+            );
+            (replica, BatchOutcome::Trimmed)
+        }
+        Err(err) => (replica, BatchOutcome::Fatal(format!("{err:#}"))),
     }
 }
 
@@ -1390,7 +1493,25 @@ mod tests {
         impl_class: &str,
         cost: CostDimension,
     ) -> Replica {
-        let cfg = super::super::worker::testing::test_spawn_config();
+        priced_replica_with(ledger, impl_class, cost, false).await
+    }
+
+    /// [`priced_replica`], with the option of shadowing the real harness with
+    /// the fake that answers `trim` with a per-request `error`.
+    async fn priced_replica_with(
+        ledger: &Arc<VramLedger>,
+        impl_class: &str,
+        cost: CostDimension,
+        refuses_trim: bool,
+    ) -> Replica {
+        let mut cfg = super::super::worker::testing::test_spawn_config();
+        if refuses_trim {
+            cfg.pythonpath.insert(
+                0,
+                super::super::worker::testing::workspace_root()
+                    .join("python/tests/inferio_worker/fake_trim_error_harness"),
+            );
+        }
         let mut worker = Worker::spawn_configured(
             &cfg,
             "test/batch",
@@ -1537,6 +1658,194 @@ mod tests {
             "seed_units=2 -> batches of 2, 2, 1"
         );
         assert_eq!(stats.last_grant_units.load(Relaxed), 2);
+
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+    }
+
+    /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it, and
+    /// the replica goes back into the pool and keeps serving.
+    ///
+    /// The delivery itself is the assertion that matters: if the message had
+    /// been sent to a replica that was *not* free, or if the reply frame had
+    /// not been consumed, the worker's stream would be desynchronized and the
+    /// predict below would fail fatally rather than answer. A trim id nobody
+    /// owns is separately checked to be a silent no-op — the ledger's ids
+    /// outlive respawns and teardowns, so a stale one is normal traffic.
+    #[tokio::test]
+    async fn a_trim_reaches_a_free_replica_and_it_keeps_serving() {
+        let cost = item_cost(4);
+        let ledger = VramLedger::for_test(
+            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            VramBudget {
+                margin: 0.0,
+                cap_fraction: None,
+            },
+        );
+        let replica = priced_replica(&ledger, "echo_test", cost).await;
+        let worker_id = replica
+            .admission
+            .as_ref()
+            .expect("priced")
+            .worker_id();
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+
+        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
+        // A trim for a replica this dispatcher does not own is dropped, not
+        // an error and not a panic.
+        tx.send(DispatchMsg::Trim(worker_id.wrapping_add(9999)))
+            .expect("queued");
+
+        let (reply, answer) = oneshot::channel();
+        tx.send(DispatchMsg::Predict(DispatchRequest {
+            inputs: vec![WorkerInput {
+                data: Some(json!("after the trim")),
+                file: None,
+            }],
+            max_batch: None,
+            reply,
+        }))
+        .expect("queued");
+        let outputs = answer
+            .await
+            .expect("the dispatcher replied")
+            .expect("predict succeeded after a trim");
+        assert_eq!(
+            outputs[0],
+            WorkerOutput::Json(json!({"echo": "after the trim"})),
+            "the replica returned to the free pool with its stream in sync"
+        );
+        assert_eq!(
+            stats.in_flight_windows.load(Relaxed),
+            0,
+            "a trim is not a window and must not move the window counters"
+        );
+        assert_eq!(
+            stats.total_batches.load(Relaxed),
+            1,
+            "one window, not two: the trim did not count as a dispatch"
+        );
+
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+    }
+
+    /// A replica that is *busy* is not trimmed. It is not the idle resident
+    /// the ledger meant, its own reactive-shrink path covers it, and the
+    /// one-request-at-a-time protocol has no room for a trim between the
+    /// frames of an in-flight window — attempting one would desynchronize the
+    /// stream and kill the model.
+    ///
+    /// Message order is what makes this deterministic rather than racy: the
+    /// dispatcher processes the channel in order and forms windows at the top
+    /// of every loop iteration, so by the time the `Trim` is read, the predict
+    /// ahead of it has already moved the only replica out of the free pool.
+    #[tokio::test]
+    async fn a_trim_for_a_busy_replica_is_declined() {
+        let cost = item_cost(4);
+        let ledger = VramLedger::for_test(
+            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            VramBudget {
+                margin: 0.0,
+                cap_fraction: None,
+            },
+        );
+        let replica = priced_replica(&ledger, "slow_test", cost).await;
+        let worker_id = replica
+            .admission
+            .as_ref()
+            .expect("priced")
+            .worker_id();
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+
+        let (reply, answer) = oneshot::channel();
+        tx.send(DispatchMsg::Predict(DispatchRequest {
+            inputs: vec![WorkerInput {
+                data: Some(json!("slow")),
+                file: None,
+            }],
+            max_batch: None,
+            reply,
+        }))
+        .expect("queued");
+        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
+
+        answer
+            .await
+            .expect("the dispatcher replied")
+            .expect("the in-flight window was undisturbed by the trim");
+
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+    }
+
+    /// A worker that answers `trim` with a per-request `error` costs nothing.
+    ///
+    /// This is not hypothetical: an older harness, from before the request type
+    /// existed, replies exactly this way to an unknown `type` — which is why
+    /// adding `trim` needed no protocol version bump. The exchange completed,
+    /// the stream is in sync, and the trim was hygiene nobody was waiting on,
+    /// so the replica must go straight back into the free pool and keep
+    /// serving. (Only a *fatal* error may cost a replica; the fake here
+    /// deliberately produces the non-fatal kind.)
+    #[tokio::test]
+    async fn a_worker_that_refuses_to_trim_keeps_serving() {
+        let cost = item_cost(4);
+        let ledger = VramLedger::for_test(
+            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            VramBudget {
+                margin: 0.0,
+                cap_fraction: None,
+            },
+        );
+        let replica = priced_replica_with(&ledger, "echo_test", cost, true).await;
+        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+
+        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
+
+        let (reply, answer) = oneshot::channel();
+        tx.send(DispatchMsg::Predict(DispatchRequest {
+            inputs: vec![WorkerInput {
+                data: Some(json!("after the refusal")),
+                file: None,
+            }],
+            max_batch: None,
+            reply,
+        }))
+        .expect("queued");
+        let outputs = answer
+            .await
+            .expect("the dispatcher replied")
+            .expect("a refused trim must not fail the model");
+        assert_eq!(
+            outputs[0],
+            WorkerOutput::Json(json!({"echo": "after the refusal"})),
+            "the replica came back to the pool with its stream in sync"
+        );
+        assert_eq!(
+            stats.total_batches.load(Relaxed),
+            1,
+            "the refused trim was not a window"
+        );
 
         tx.send(DispatchMsg::Shutdown).expect("shutdown");
         dispatcher.await.expect("dispatcher exits");

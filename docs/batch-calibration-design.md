@@ -23,9 +23,12 @@ clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) and
 1c (the calibration store: the local TOML round trip for the ratchet anchor,
 the sample ring and the fit, shipped-baseline lookup with the torch fallback
 hierarchy, non-local-profile margin widening, and the `/api/inference/metadata`
-calibration overlay) are implemented. `knee_units` is parsed and persisted but
+calibration overlay) are implemented. Step 2 (budget configuration with per-board-UUID
+overrides, the worker's reactive `empty_cache()` shrink with hysteresis, and
+the orchestrator-initiated idle-resident `trim` message) is implemented.
+`knee_units` is parsed and persisted but
 not yet fitted, and no shipped baselines exist yet — both are step 4. Steps
-2–5 are otherwise not started.
+3–5 are not started.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -442,10 +445,18 @@ Worker, per batch within its window:
   another reason easyOCR's `enable_batching = false` stopgap has to go.
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
-  holds it — so when the grant falls materially below `memory_reserved()`
-  (hysteresis: e.g. below 80% of pool for 2 consecutive windows), call
-  `empty_cache()` between batches. Exact thresholds: implementation
-  detail, tune empirically.
+  holds it — so when the grant falls materially below the pool's
+  **releasable slack** (`memory_reserved() − memory_allocated()`, the
+  blocks no live tensor sits in, which is all an `empty_cache()` can
+  return), call `empty_cache()` between batches. Hysteresis: e.g. the
+  grant below 80% of that slack for 2 consecutive windows. Slack, not
+  `memory_reserved()`: the grant is an *incremental* activation
+  reservation while the pool includes the weights, so comparing the two
+  compares different quantities and is true on any calibrated model
+  essentially always — the trigger would fire every other window and tear
+  down pools with nothing spare in them. Against slack the rule is
+  self-limiting too, since a release leaves none. Exact thresholds:
+  implementation detail, tune empirically.
 - **Trim for idle residents**: the reactive-shrink path only runs in
   workers that are receiving windows — an idle resident gets no frames,
   so its retained pool would squeeze its neighbours indefinitely. When
@@ -453,7 +464,12 @@ Worker, per batch within its window:
   pool slack (`reserved − reserved_at_load`, the growth term of its
   footprint), the orchestrator sends that resident a trim
   request; the worker calls `empty_cache()` and replies with a fresh
-  memory sample. Trim is not unload: it releases only pool slack —
+  memory sample. **Idle means "has held no grant for a few seconds"**, not
+  "holds none at this instant": one window is in flight per replica, so a
+  replica draining a queue is grantless between every pair of windows, and
+  trimming it there would cost it a re-`cudaMalloc` of a working set it is
+  about to need again — thousands of times a minute. Trim is not unload:
+  it releases only pool slack —
   weights, live tensors, and the CUDA context stay, so the model remains
   resident at a cost of milliseconds plus re-`cudaMalloc` as the pool
   regrows — whereas unload (item-8 eviction) frees `base` too at full

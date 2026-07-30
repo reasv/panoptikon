@@ -103,6 +103,38 @@ _last_growth: "tuple[int, float] | None" = None
 # `_last_growth` was set.
 _non_comparable_streak = 0
 
+# Reactive shrink (docs/batch-calibration-design.md, "Reactive shrink").
+#
+# Grants shrink as external usage rises, but freeing our tensors gives nothing
+# back — the caching allocator holds the pool — so a worker whose grant has
+# fallen well below the **releasable slack** it is sitting on is squeezing its
+# neighbours for memory it is not using. `empty_cache()` between batches is the
+# only way to return it.
+#
+# The comparison is against `reserved - allocated`, never `reserved` itself.
+# `reserved` includes the model's weights, which no `empty_cache()` can hand
+# back: comparing an *incremental* activation grant against the whole pool is
+# comparing two different quantities, and on any calibrated model the grant is
+# smaller essentially always — so the trigger would fire every other window,
+# tear down a pool that had nothing spare in it, and (through `note_trimmed`)
+# permanently reset the WDDM throughput comparator that depends on consecutive
+# comparable batches. Against slack the rule is also self-limiting: after a
+# release slack is ~0, so the very next window cannot re-trigger.
+#
+# Both constants are tunable ("Exact thresholds: implementation detail, tune
+# empirically"). The ratio is the design's own example: a window needing less
+# than 80% of the slack lying around is a material gap, not rounding. The
+# window count is the hysteresis — one window below the line can be a transient
+# (a small tail window, a momentary external spike), and paying a full pool
+# teardown for it would cost more throughput than the freed memory buys anyone.
+SHRINK_RATIO = 0.8
+SHRINK_WINDOWS = 2
+
+# Consecutive granted windows whose grant was below `SHRINK_RATIO` × the
+# releasable slack. Module-level like the comparator: one model per worker
+# process, so this is that model's history.
+_under_grant_windows = 0
+
 
 class WindowFailure(Exception):
     """A packed batch failed. Carries what ran before it.
@@ -128,14 +160,118 @@ class WindowFailure(Exception):
 def reset_comparator() -> None:
     """Forget the cross-window throughput comparator.
 
-    Called by the tests, and the hook step 2's reactive-shrink path needs:
-    after an `empty_cache()` the pool regrows from nothing, so the next
-    pool-growing batch's units/sec is not comparable to anything measured
-    against a warm pool.
+    Called by the tests, and by both `empty_cache()` paths (the reactive shrink
+    below and the orchestrator's `trim`): after an `empty_cache()` the pool
+    regrows from nothing, so the next pool-growing batch's units/sec is not
+    comparable to anything measured against a warm pool. Comparing across the
+    event would flag a perfectly healthy regrowth batch as a WDDM memory spill
+    and deflate the worker for it.
     """
     global _last_growth, _non_comparable_streak
     _last_growth = None
     _non_comparable_streak = 0
+
+
+def reset_shrink_state() -> None:
+    """Forget the reactive-shrink hysteresis. For tests, and after a trim.
+
+    An orchestrator-initiated trim has already released the pool, so the
+    consecutive-window count that was building towards doing it ourselves is
+    stale evidence about a pool that no longer exists.
+    """
+    global _under_grant_windows
+    _under_grant_windows = 0
+
+
+def note_trimmed() -> None:
+    """Everything a completed `empty_cache()` invalidates, in one place.
+
+    Called by the worker's `trim` arm and by the reactive shrink below, so the
+    two paths can never drift apart on what an `empty_cache()` means.
+    """
+    reset_comparator()
+    reset_shrink_state()
+
+
+def maybe_shrink(grant_mb: int | None) -> bool:
+    """Release the pool when the grant is well below its **releasable slack**.
+
+    Called once per granted window, **before its first batch** — which is
+    "between batches" in the only sense the design's rule can mean for a
+    worker: it is the one moment in a window's life when nothing is in flight,
+    the grant for the work about to run is known, and the pool can be torn down
+    without racing an allocation. Doing it mid-window instead would mean
+    tearing down a pool the very next batch is about to rebuild.
+
+    Slack is `memory_reserved() - memory_allocated()`: the blocks the caching
+    allocator is holding that no live tensor sits in, which is exactly and only
+    what an `empty_cache()` can give back. Comparing the grant against
+    `memory_reserved()` instead would compare an incremental activation
+    reservation against a total that includes the weights — a mismatch that is
+    true nearly always and would fire the trigger on healthy workers (see the
+    module constants above).
+
+    Two hysteresis conditions: there must be slack at all, and the grant must
+    be below [`SHRINK_RATIO`] of it for [`SHRINK_WINDOWS`] consecutive windows.
+    A window that does not meet the second resets the count — recovery is
+    immediate, because the whole point is to react to a world that moved and it
+    can move back.
+
+    Returns whether `empty_cache()` actually ran, which the caller reports as
+    `trimmed` on the window's first measurement.
+    """
+    global _under_grant_windows
+    if not grant_mb or grant_mb <= 0:
+        # No MB reservation to compare against (a pre-1b orchestrator, or a
+        # contention share that rounded to nothing). Not evidence of a squeeze.
+        _under_grant_windows = 0
+        return False
+    reserved_mb, allocated_mb = memory.pool_stats_mb()
+    if reserved_mb is None or allocated_mb is None:
+        # No live CUDA of ours: nothing to measure and nothing to release.
+        _under_grant_windows = 0
+        return False
+    slack_mb = max(0, reserved_mb - allocated_mb)
+    if slack_mb <= 0:
+        # The pool is fully occupied by live tensors. An `empty_cache()` would
+        # return nothing at all, so a grant "below the pool" says nothing here.
+        _under_grant_windows = 0
+        return False
+    if grant_mb >= SHRINK_RATIO * slack_mb:
+        _under_grant_windows = 0
+        return False
+    _under_grant_windows += 1
+    if _under_grant_windows < SHRINK_WINDOWS:
+        logger.debug(
+            "this window's %d MiB grant is below %.0f%% of the %d MiB of "
+            "releasable slack in the %d MiB pool (%d/%d consecutive windows "
+            "before releasing it)",
+            grant_mb,
+            SHRINK_RATIO * 100,
+            slack_mb,
+            reserved_mb,
+            _under_grant_windows,
+            SHRINK_WINDOWS,
+        )
+        return False
+    if not memory.empty_cache():
+        # Nothing of ours on the device after all; do not keep counting.
+        _under_grant_windows = 0
+        return False
+    logger.info(
+        "grant fell to %d MiB against %d MiB of releasable slack (a %d MiB "
+        "allocator pool) for %d consecutive windows; released the pool "
+        "(empty_cache) so the memory returns to the board",
+        grant_mb,
+        slack_mb,
+        reserved_mb,
+        _under_grant_windows,
+    )
+    # The pool regrows from here, which makes the next batches high-water
+    # batches — fresh calibration material — and makes the previous window's
+    # throughput an invalid comparator.
+    note_trimmed()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -544,12 +680,27 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
     cap_items = grant.get("user_cap_items")
     cap_items = int(cap_items) if isinstance(cap_items, int) else None
 
+    # Reactive shrink, before anything else in the window: the one point where
+    # no batch is in flight and the grant for the work about to run is known.
+    trimmed = maybe_shrink(grant_mb)
+
     # Pricing happens once, up front, OUTSIDE every timed section.
     units = price_inputs(inputs, unit)
 
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
     pending = list(range(len(inputs)))
+
+    def record(measurement: dict[str, Any]) -> dict[str, Any]:
+        """Append a measurement, stamping the window's first one if the pool
+        was released before it (protocol doc, `trimmed`). It rides the first
+        measurement whatever that turns out to be — including a failed batch,
+        which is exactly when knowing the pool had just been torn down matters.
+        """
+        if trimmed and not measurements:
+            measurement["trimmed"] = True
+        measurements.append(measurement)
+        return measurement
 
     while pending:
         # Re-plan per batch: the defensive clamp can shrink the budget
@@ -577,7 +728,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             # by a failure. The `oom` flag still rides the measurement, and that
             # is what deflation consumes.
             _, absorbed = _batch_shape(retry_before, len(batch), halvings_before)
-            measurements.append(
+            record(
                 memory.measure_batch(
                     state,
                     items=len(batch),
@@ -602,7 +753,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             )
             # Unpriced for the same reason as every other failure path: the
             # batch did not complete, so its peaks under-state its cost.
-            measurements.append(memory.measure_batch(state, items=len(batch)))
+            record(memory.measure_batch(state, items=len(batch)))
             raise WindowFailure(str(exc), measurements, exc) from exc
 
         # Did the impl run the batch it was handed? Several shipped impls
@@ -635,7 +786,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                 len(batch),
             )
         _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
-        measurements.append(measurement)
+        record(measurement)
 
         # Restore input order: bucketed packing reorders items, and the
         # dispatcher splits outputs back per request by position.

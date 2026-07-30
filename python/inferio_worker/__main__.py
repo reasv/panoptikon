@@ -367,6 +367,40 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             logger.info("Unloaded; exiting.")
             return EXIT_OK
 
+        elif mtype == "trim":
+            # Orchestrator-initiated pool release (protocol doc, "Reactive
+            # shrink and trim"). Trim is NOT unload: `empty_cache()` returns
+            # only the caching allocator's unused blocks, so weights, live
+            # tensors and the CUDA context stay and the model is still
+            # resident — it just pays a re-`cudaMalloc` as its pool regrows.
+            #
+            # Valid in every state and never an error: a worker with no live
+            # CUDA (no torch, CPU/MPS host, remote API, a parked prewarmed
+            # worker with no instance) has no pool to release, and "there was
+            # nothing to free" is a successful trim.
+            from inferio_worker import packing
+
+            released = memory.empty_cache()
+            if released:
+                # The pool regrows from here, so the throughput comparator's
+                # reference rate is stale and the reactive-shrink hysteresis is
+                # counting towards something that has already happened.
+                #
+                # Only when it actually ran: on a worker with no live CUDA the
+                # trim was a no-op, and resetting the comparator for it would
+                # let a stream of trims to an idle-but-torchless resident keep
+                # discarding a signal about batches that really did happen.
+                packing.note_trimmed()
+                logger.info("%s - released the allocator pool on request", inference_id)
+            trim_payload: dict[str, Any] = {}
+            sample = memory.device_memory_sample()
+            if sample is not None:
+                # Taken AFTER the release, so `reserved_mb` is the pool size
+                # the orchestrator should charge from now on — which is the
+                # whole point of the round trip.
+                trim_payload["memory"] = sample
+            _send_ok(proto_out, req_id, **trim_payload)
+
         elif mtype == "ping":
             _send_ok(proto_out, req_id)
 

@@ -15,6 +15,12 @@ worker ignores the request fields and omits the response ones, an older
 orchestrator sends neither and ignores whatever comes back — so the version
 stays 2.
 
+2026-07-30 (step 2): the `trim` request type (see "Trim" below) and the
+optional `trimmed` flag on a measurement. Also additive: an older worker
+answers an unknown `type` with a per-request `error` and stays alive, which
+is exactly how a trim to a worker that cannot do one should behave, so the
+version still stays 2.
+
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
 Both implementations MUST follow this document exactly; change the document
@@ -69,6 +75,7 @@ continues (does not exit).
 | `configure` | `inference_id` (str, "group/name", for logs), `config` (map — resolved kwargs for the impl `__init__`) | Instantiates `impl_class(**config)`. Exactly once per worker, before `load`; a second `configure`, or `load`/`predict` before it, is a per-request `error`. |
 | `load` | — | Calls `instance.load()`. Requires prior `configure`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
 | `predict` | `inputs`: array of maps `{ "data": <any msgpack value or nil>, "file": <bin or nil> }`, plus the optional `grant`/`fit` maps below | Calls `instance.predict(...)` with the inputs converted to `PredictionInput(data, file)` equivalents, in order. Requires a prior successful `load`; without one, reply `error` (the orchestrator always loads first — this is a sanity check, not a feature). **Without a `grant`** the whole `inputs` array goes to one `instance.predict` call, which is the pre-1b behaviour and the permanent compatibility path. **With a `grant`** the worker's packing harness splits `inputs` into several GPU batches within the granted budget and reports one measurement per batch. |
+| `trim` | — | Release the caching allocator's **unused pool** (`torch.cuda.empty_cache()`), keeping weights, live tensors and the CUDA context. Valid in every state; a worker with no live CUDA does nothing and still replies `ok`. Reply carries a fresh memory sample (below). Never an error path: a trim that could not measure anything is still an `ok`. |
 | `unload` | — | Calls `instance.unload()` if an instance was configured+loaded, replies `ok`, flushes, then exits 0. Valid in every state (a parked prewarmed worker is dismissed the same way). |
 | `ping` | — | Liveness. Reply `ok`. |
 
@@ -147,6 +154,10 @@ through alone; `run_with_oom_retry` inside the impl remains the backstop.
 - `handshake` → `protocol_version` (int): the version the worker speaks.
   v2 workers echo 2; the orchestrator kills workers that answer anything else.
 - `configure`, `prewarm`, `unload`, `ping` → no extra fields.
+- `trim` → optional `memory`: a memory sample taken **after** the
+  `empty_cache()`, so its `reserved_mb` is the pool size the orchestrator
+  should charge from now on. Absent when the worker could measure nothing
+  (no torch, no live CUDA) — which is also when the trim itself was a no-op.
 - `load` → no required fields, plus the optional memory-sensing fields below.
 - `predict` → `outputs`: array, one entry per input, in order. Each entry is
   either msgpack `bin` (bytes output, e.g. serialized numpy) or any other
@@ -226,6 +237,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `duration_ms` | wall time of `instance.predict(batch)` |
 | `oom` | `true` when this batch raised an out-of-memory condition the harness observed, **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself |
+| `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
 
 **`units` is reported only when the batch ran to completion and the executed
 GPU batch matches the planned batch.** The number exists so the orchestrator can
@@ -296,6 +308,52 @@ classifies without parsing anything structured:
 - `INFERENCE_OOM_WINDOW:` — a packed batch of more than one item raised an
   out-of-memory error that escaped the impl's own halving loop.
 
+### Reactive shrink and trim
+
+Releasing tensors does not give memory back: torch's caching allocator keeps
+the pool. So when the board gets tight, *something* has to call
+`empty_cache()`. There are two triggers, and they differ only in who notices
+(docs/batch-calibration-design.md, "Reactive shrink" and "Trim for idle
+residents"):
+
+- **Reactive shrink** is the worker's own, and needs no protocol at all. Before
+  a granted window's first batch the worker compares `grant.mb` against its
+  live **releasable slack** — `memory_reserved() - memory_allocated()`, the
+  blocks the caching allocator holds that no live tensor sits in, which is
+  exactly and only what an `empty_cache()` can give back. When the grant has
+  fallen materially below that slack for two consecutive windows it calls
+  `empty_cache()` there — between batches, never inside one — and flags the
+  window's first measurement `trimmed`. The comparison is deliberately *not*
+  against `memory_reserved()`: the grant is an incremental activation
+  reservation while the pool includes the weights, so that comparison is true
+  nearly always and would tear down healthy pools every other window. Against
+  slack the rule is also self-limiting — after a release there is no slack, so
+  the next window cannot re-trigger. This only ever fires in a worker that is
+  *receiving* windows.
+- **Trim** is the orchestrator's, for a resident that is receiving none. An
+  idle worker's retained pool squeezes its neighbours indefinitely and it will
+  never notice, so the orchestrator sends it a `trim` request. It is a message
+  on the existing request/response channel, in the same direction as `load`;
+  the rejected proposal was a *worker*-initiated query channel, which this is
+  not.
+
+Trim is not unload. It releases only pool slack — weights, live tensors and
+the CUDA context stay, so the model remains resident at a cost of milliseconds
+plus re-`cudaMalloc` as the pool regrows. Unload frees `base` too, at full
+reload cost.
+
+Both events are **calibration opportunities**, not just hygiene: the batches
+that regrow the pool afterwards are high-water batches, which are the only
+ones the cost fit accepts. Both therefore also reset the worker's
+throughput-collapse comparator — a post-`empty_cache()` batch is legitimately
+slower than one on a warm pool, and comparing across the event would
+manufacture a spurious `throughput_collapse`.
+
+The orchestrator sends `trim` only to a replica it believes is **idle** — no
+window in flight, no demand behind it, and none for the last few seconds. A
+busy replica has its own shrink path and ignores or defers the request; one
+window is in flight per worker either way, so a trim never races a batch.
+
 ## Lifecycle and timeouts (orchestrator side)
 
 - Spawn → send `handshake` → response deadline (config, default 30 s).
@@ -303,6 +361,13 @@ classifies without parsing anything structured:
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
+- `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a
+  `cudaFree` over every block in the allocator pool, which on a multi-gigabyte
+  pool under a busy driver is not the milliseconds an idle `empty_cache()`
+  costs — so the budget has to be well clear of a slow-but-healthy release
+  while still bounding a best-effort hygiene message. It is deliberately not
+  lowered by a smaller configured handshake deadline: that one is about spawn
+  liveness, not about freeing a big pool.
 - Graceful stop: `unload` → wait (config, default 10 s) for `ok` + process
   exit; on timeout the worker is hard-terminated immediately, reaped within
   the terminate grace (config, default 5 s), and killed again as a last

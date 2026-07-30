@@ -43,6 +43,7 @@ class FakeCuda:
         self.peak_reserved = 0
         self.peak_allocated = 0
         self.reset_calls = 0
+        self.empty_cache_calls = 0
         self.initialized = initialized
         self.uuid = "1a2b3c4d-0000-0000-0000-000000000000"
         self.name = "Fake GPU 5090"
@@ -76,6 +77,13 @@ class FakeCuda:
         self.reset_calls += 1
         self.peak_reserved = self.reserved
         self.peak_allocated = self.allocated
+
+    def empty_cache(self):
+        """Return the pool blocks no live tensor is using, as torch does."""
+        self.empty_cache_calls += 1
+        self.free += self.reserved - self.allocated
+        self.reserved = self.allocated
+        self.peak_reserved = max(self.peak_reserved, self.reserved)
 
     # Test helper: pretend a load or a batch allocated `mb`.
     def allocate(self, mb, reserved_mb=None):
@@ -590,3 +598,33 @@ def test_helpers_never_raise_on_hostile_torch() -> None:
         assert memory.finish_load(before, object()) == {}
         payload = memory.finish_batch(memory.begin_batch(), items=3)
         assert payload["measurements"][0]["items"] == 3
+
+
+def test_empty_cache_releases_the_pool_only_when_cuda_is_live(fake_torch) -> None:
+    """The only way our process gives VRAM back to the board short of exiting:
+    freeing tensors leaves the caching allocator holding the blocks."""
+    fake_torch.allocate(400, reserved_mb=1000)
+    fake_torch.allocated = 0  # the batch's tensors are gone; the pool is not
+    assert memory.empty_cache() is True
+    assert fake_torch.empty_cache_calls == 1
+    assert fake_torch.reserved == 0, "the pool went back to the driver"
+
+    # An uninitialized CUDA device is the case this gate exists for: calling
+    # `empty_cache` there would CREATE the 300-600 MB context this module
+    # exists to avoid creating, on a host that was never going to use the GPU.
+    fake_torch.initialized = False
+    assert memory.empty_cache() is False
+    assert fake_torch.empty_cache_calls == 1, "not even attempted"
+
+
+def test_empty_cache_is_false_without_torch(no_torch) -> None:
+    assert memory.empty_cache() is False
+
+
+def test_empty_cache_never_raises() -> None:
+    class Exploding:
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+
+    with isolated(SimpleNamespace(cuda=Exploding())):
+        assert memory.empty_cache() is False

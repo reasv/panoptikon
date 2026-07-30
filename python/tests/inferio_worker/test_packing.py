@@ -37,6 +37,7 @@ class FakeCuda:
         self.allocated = 0
         self.peak_reserved = 0
         self.peak_allocated = 0
+        self.empty_cache_calls = 0
 
     def is_available(self):
         return True
@@ -63,6 +64,18 @@ class FakeCuda:
         self.peak_reserved = self.reserved
         self.peak_allocated = self.allocated
 
+    def empty_cache(self):
+        """Release the pool blocks no live tensor is using.
+
+        The real allocator returns `reserved - allocated`; a test that wants
+        the whole pool released zeroes `allocated` first (which is what a
+        window boundary looks like in reality — the impl's tensors are gone,
+        the pool that held them is not).
+        """
+        self.empty_cache_calls += 1
+        self.reserved = self.allocated
+        self.peak_reserved = max(self.peak_reserved, self.reserved)
+
     def grow_pool(self, mb):
         """Pretend a batch grew the caching-allocator pool by `mb`."""
         self.reserved += mb * MIB
@@ -73,10 +86,11 @@ class FakeCuda:
 
 @pytest.fixture(autouse=True)
 def clean_state():
-    """Every test starts with no cross-window throughput comparator."""
-    packing.reset_comparator()
+    """Every test starts with no cross-window throughput comparator and no
+    accumulated reactive-shrink hysteresis."""
+    packing.note_trimmed()
     yield
-    packing.reset_comparator()
+    packing.note_trimmed()
 
 
 class FakeOomRetryUtils:
@@ -718,3 +732,161 @@ def test_a_window_with_no_grant_never_reaches_the_harness():
     payload = memory.finish_batch(state, items=7)
     assert payload["measurements"][0]["items"] == 7
     assert "units" not in payload["measurements"][0]
+
+
+# ---------------------------------------------------------------------------
+# Reactive shrink (step 2)
+# ---------------------------------------------------------------------------
+
+
+def idle_impl():
+    """An impl that runs a batch without growing the allocator pool."""
+    return SimpleNamespace(predict=lambda inputs: [None] * len(inputs))
+
+
+def test_reactive_shrink_needs_two_consecutive_under_grant_windows(fake_torch):
+    """A grant that has fallen well below the pool means we are holding memory
+    the ledger has already taken away from us — and freeing tensors gives none
+    of it back, so `empty_cache()` is the only lever. The two-window
+    hysteresis is what keeps a momentary dip from costing a full pool
+    teardown."""
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * 1000
+
+    first = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert "trimmed" not in first["measurements"][0]
+
+    second = packing.run_window(impl, items(2), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert fake_torch.reserved == 0, "the pool went back to the driver"
+    assert second["measurements"][0]["trimmed"] is True
+    assert "trimmed" not in second["measurements"][1], (
+        "the flag rides the window's FIRST measurement only — it describes an "
+        "event that happened once, before the window's first batch"
+    )
+    assert packing._under_grant_windows == 0, "the count starts over after a release"
+
+
+def test_a_grant_back_above_the_pool_resets_the_shrink_hysteresis(fake_torch):
+    """Recovery is immediate: the whole point is reacting to a world that
+    moved, and it can move back."""
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    impl = idle_impl()
+
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert packing._under_grant_windows == 1
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=900))
+    assert packing._under_grant_windows == 0, "800 <= 900: no squeeze"
+    assert fake_torch.empty_cache_calls == 0
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert fake_torch.empty_cache_calls == 0, "the count restarted from zero"
+
+
+def test_a_shrink_resets_the_throughput_comparator(fake_torch):
+    """Post-`empty_cache()` batches regrow the pool from nothing and are
+    legitimately slower than warm-pool ones. Comparing across the event would
+    flag a healthy regrowth batch as a WDDM memory spill and deflate the
+    worker for it."""
+
+    def growing(inputs):
+        fake_torch.grow_pool(500)
+        return [None] * len(inputs)
+
+    packing.run_window(SimpleNamespace(predict=growing), items(1), grant(unit_budget=1))
+    assert packing._last_growth is not None, "the comparator is primed"
+
+    fake_torch.allocated = 0
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * 500
+    packing.run_window(impl, items(1), squeezed)
+    assert packing._last_growth is not None, "still just counting"
+    packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert packing._last_growth is None, "the released pool retired the comparator"
+
+
+def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
+    """Two non-signals that must not accumulate towards a release: a grant
+    with no MB reservation (a pre-1b orchestrator, or a contention share that
+    rounded to nothing) and a worker holding no pool at all."""
+    impl = idle_impl()
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    for _ in range(4):
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
+    assert fake_torch.empty_cache_calls == 0
+    assert packing._under_grant_windows == 0
+
+    fake_torch.reserved = 0
+    for _ in range(4):
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert fake_torch.empty_cache_calls == 0
+    assert packing._under_grant_windows == 0
+
+
+def test_a_worker_without_torch_never_shrinks():
+    """No live CUDA, no pool of ours, nothing to release — and crucially no
+    attempt to create a context in order to find that out."""
+    assert packing.maybe_shrink(1) is False
+    assert packing._under_grant_windows == 0
+
+
+def test_the_shrink_compares_the_grant_against_slack_not_the_whole_pool(fake_torch):
+    """The grant is an *incremental* activation reservation; `memory_reserved()`
+    is the whole pool, weights included. Comparing the two would be comparing
+    different quantities — and on any calibrated model the grant is the smaller
+    one essentially always, so the trigger would fire every other window,
+    release a pool with nothing spare in it, and (via `note_trimmed`)
+    permanently discard the WDDM throughput comparator, which needs consecutive
+    comparable batches to say anything at all.
+
+    Only `reserved - allocated` can actually be handed back, so that is what a
+    window's grant is measured against.
+    """
+    # A loaded model: a 3000 MiB pool of which 2400 MiB is live weights.
+    fake_torch.reserved = 3000 * MIB
+    fake_torch.allocated = 2400 * MIB
+    impl = idle_impl()
+    # A window granted 600 MiB against 600 MiB of releasable slack: it wants
+    # essentially everything that could be freed, so freeing it buys nobody
+    # anything. Under the old rule (600 < 0.8 * 3000) this fired on window 2.
+    steady = grant(unit_budget=1, mb=600)
+    for _ in range(6):
+        packing.run_window(impl, items(1), steady)
+    assert fake_torch.empty_cache_calls == 0, (
+        "a pool that is nearly all weights is not slack the worker is hoarding"
+    )
+    assert packing._under_grant_windows == 0
+    assert fake_torch.reserved == 3000 * MIB, "and the weights were never dropped"
+
+
+def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
+    """The other half of the same rule: when the pool really is holding blocks
+    this window has no use for, two consecutive windows still release it — and
+    then cannot immediately re-trigger, because the slack is gone."""
+    fake_torch.reserved = 3000 * MIB
+    fake_torch.allocated = 2400 * MIB
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * (3000 - 2400)
+
+    first = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert "trimmed" not in first["measurements"][0]
+
+    second = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert second["measurements"][0]["trimmed"] is True
+    assert fake_torch.reserved == 2400 * MIB, (
+        "the free blocks went back to the driver; the weights stayed"
+    )
+
+    # Self-limiting: post-release there is no slack left, so the next window
+    # cannot start counting towards another teardown.
+    packing.run_window(impl, items(1), squeezed)
+    packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert packing._under_grant_windows == 0

@@ -397,6 +397,50 @@ def device_memory_sample() -> dict[str, Any] | None:
     return sample
 
 
+def pool_stats_mb() -> tuple[int | None, int | None]:
+    """`(reserved_mb, allocated_mb)` for our allocator, or `(None, None)`.
+
+    Separate from [`device_memory_sample`] because the reactive shrink needs
+    only these two numbers once per window: the sample additionally reads
+    free/total memory, which on an NVML host is a driver query, and there is
+    no reason to pay for one to answer a question about our own allocator.
+
+    Both numbers, not just the pool size, because the only thing an
+    `empty_cache()` can actually hand back is `reserved - allocated`: the
+    blocks no live tensor sits in. Weights are `allocated`, so a decision made
+    on `reserved` alone would read a model's own weights as releasable slack.
+    """
+    reserved, allocated, _, _ = _allocator_stats()
+    return (reserved, allocated)
+
+
+def empty_cache() -> bool:
+    """Release the caching allocator's unused pool. Returns whether it ran.
+
+    Freeing tensors gives nothing back to the driver — torch's caching
+    allocator keeps the blocks — so this is the *only* way our process returns
+    VRAM to the board short of exiting. Both step-2 paths end here: the
+    worker's own reactive shrink between batches, and the orchestrator's
+    `trim` request to an idle resident (docs/batch-calibration-design.md,
+    "Reactive shrink" and "Trim for idle residents").
+
+    Gated on a live CUDA context exactly like every other torch path in this
+    module: `torch.cuda.empty_cache()` on a process that never initialized CUDA
+    would create the 300-600 MB context this module exists to avoid creating.
+    False therefore means "nothing of ours is on the device", which is also the
+    correct answer to "was there a pool to release".
+    """
+    torch = _torch_cuda()
+    if torch is None:
+        return False
+    try:
+        torch.cuda.empty_cache()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("empty_cache failed: %s", exc)
+        return False
+    return True
+
+
 def _reset_peaks() -> None:
     torch = _torch_cuda()
     if torch is None:

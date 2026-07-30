@@ -16,6 +16,7 @@ does not inherit).
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 import subprocess
@@ -838,3 +839,100 @@ def test_broken_module_does_not_prevent_discovery(
     assert worker.recv()["type"] == "ok"
     assert worker.wait() == 0
     assert "broken_impl" in worker.stderr_text
+
+
+def test_trim_is_ok_in_every_state_and_leaves_the_worker_serving(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (protocol doc, "Reactive shrink and trim"): `trim` is
+    # valid in every state and is never an error path. A parked worker with no
+    # instance, and a loaded one whose impl never imported torch, both have no
+    # allocator pool to release — and "there was nothing to free" is a
+    # successful trim, which is what lets the orchestrator send one without
+    # first knowing which residents are trimmable. The fixture impls are
+    # exactly that case, so no `memory` sample comes back.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+
+    # Before configure: valid, and does not disturb the state machine.
+    worker.send({"type": "trim", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 2
+
+    worker.send(configure_msg(req_id=3))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "trim", "id": 5})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 5
+    # No torch in the fixture impl -> no pool, no sample. Absent, never zero:
+    # a fabricated 0 would tell the ledger this worker holds nothing when the
+    # truth is that we cannot see what it holds.
+    assert "memory" not in resp
+
+    # Idempotent, and the stream is still in sync afterwards.
+    worker.send({"type": "trim", "id": 6})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {
+            "type": "predict",
+            "id": 7,
+            "inputs": [{"data": {"text": "after trim"}, "file": None}],
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": {"text": "after trim"}}]
+
+    worker.send({"type": "unload", "id": 8})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
+    """`note_trimmed()` runs only when `empty_cache()` actually released.
+
+    It exists to invalidate two pieces of cross-window state that a real pool
+    teardown makes meaningless: the throughput comparator (a post-release batch
+    regrows the pool and is legitimately slower than a warm-pool one) and the
+    reactive-shrink hysteresis. A worker with no live CUDA released nothing, so
+    neither is stale — and discarding the comparator anyway would let a stream
+    of trims to an idle-but-torchless resident keep throwing away the WDDM
+    over-admission signal, which needs consecutive comparable batches to exist.
+
+    Driven in-process rather than as a subprocess for the obvious reason: the
+    assertion is about module state the harness holds, which no frame reports.
+    """
+    from inferio_worker import __main__ as harness
+    from inferio_worker import packing
+
+    def frames(*messages: dict) -> io.BytesIO:
+        buffer = io.BytesIO()
+        for message in messages:
+            payload = msgpack.packb(message, use_bin_type=True)
+            buffer.write(struct.pack("<I", len(payload)) + payload)
+        buffer.seek(0)
+        return buffer
+
+    packing._last_growth = (4096, 123.0)
+    packing._under_grant_windows = 1
+    try:
+        proto_in = frames(
+            handshake_msg(req_id=1),
+            {"type": "trim", "id": 2},
+            {"type": "unload", "id": 3},
+        )
+        proto_out = io.BytesIO()
+        assert harness._serve(proto_in, proto_out) == 0
+        assert packing._last_growth == (4096, 123.0), (
+            "a trim that freed nothing must not retire the comparator"
+        )
+        assert packing._under_grant_windows == 1, (
+            "nor reset the hysteresis that is counting towards a real release"
+        )
+    finally:
+        packing.note_trimmed()

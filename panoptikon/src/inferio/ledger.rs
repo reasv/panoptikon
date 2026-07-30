@@ -178,6 +178,43 @@ pub const MAX_MARGIN_INCREMENT: f64 = 0.4;
 /// replica) and keeps a fatal error's blast radius one window wide.
 pub const WINDOW_DEPTH_MULTIPLIER: u64 = 3;
 
+/// Pool slack (`reserved − reserved_at_load`) an **idle** resident must be
+/// holding before it is worth asking it to `empty_cache()`
+/// (docs/batch-calibration-design.md, "Trim for idle residents"). Below this
+/// the trim buys a squeezed neighbour less than one seed batch and costs the
+/// resident a re-`cudaMalloc` of its whole working set on its next window, so
+/// it is not a trade worth making. Tunable; 256 MiB is one
+/// [`SEED_BATCH_FLOOR_MB`] worth of headroom.
+pub const TRIM_SLACK_MB: u64 = 256;
+
+/// Minimum interval between two trims of the same replica. A trim is cheap
+/// but not free — the pool regrows with fresh `cudaMalloc`s — and a board that
+/// stays contended would otherwise flag the same idle resident on every single
+/// grant request. Tunable; 30 s is long enough that a resident which went idle
+/// for good is trimmed once and left alone, and short enough that a genuine
+/// squeeze is relieved within a couple of windows.
+pub const TRIM_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// How long a resident must have held **no** grant before it counts as idle
+/// for trim purposes.
+///
+/// "Holds no grant right now" is true of every replica between two windows of
+/// a continuous stream — a model chewing through a scan queue is momentarily
+/// grantless thousands of times a minute, and trimming it there costs it a
+/// re-`cudaMalloc` of its whole working set for a pool it is about to need
+/// again. The trim is meant for a resident that has *stopped*, so the state
+/// that matters is "has held nothing for a while", not "holds nothing at this
+/// instant". Tunable; 5 s is far longer than any inter-window gap and far
+/// shorter than [`TRIM_DEBOUNCE`], so it costs a genuinely idle resident
+/// nothing.
+pub const IDLE_BEFORE_TRIM: Duration = Duration::from_secs(5);
+
+/// Cap on undelivered trim requests. The manager drains these on its sweep
+/// tick and on the predict path, so the queue is normally empty; the cap only
+/// bounds an embedder that never drains at all (the debounce already bounds
+/// the rate to one per replica per [`TRIM_DEBOUNCE`]).
+const MAX_PENDING_TRIMS: usize = 32;
+
 /// Bounded ring of high-water samples the fit is recomputed from. A robust
 /// fit cannot be resumed from aggregates, and ring eviction doubles as
 /// recency aging (samples from a since-changed driver fall out).
@@ -192,14 +229,13 @@ const TRANSIENT_RING: usize = 32;
 /// into a meaningless number. The ratchet binds long before this.
 const MAX_RAMP_STEP: u32 = 32;
 
-/// Two composable admission limits, from `[inference_local.vram]`.
+/// Two composable admission limits for **one board**, from
+/// `[inference_local.vram]`.
 ///
-/// Constructed from [`Default`] in `ManagerConfig` today; step 2 adds the
-/// config plumbing (per-server defaults with per-board-UUID overrides) that
-/// fills it from the user's file. Everything downstream already treats these
-/// as *arbitrary user numbers* rather than as the defaults — a margin of 0
-/// or of 0.9 has to behave sensibly the day the plumbing lands, which is why
-/// margin widening is additive and clamps only its own increment.
+/// Everything downstream treats these as *arbitrary user numbers* rather than
+/// as the defaults — a margin of 0 or of 0.9 has to behave sensibly — which is
+/// why margin widening is additive and clamps only its own increment, and why
+/// `cap_fraction` is NaN-guarded at every use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VramBudget {
     /// Margin over genuinely external usage. Our own workers are never
@@ -216,6 +252,61 @@ impl Default for VramBudget {
             margin: DEFAULT_MARGIN,
             cap_fraction: None,
         }
+    }
+}
+
+/// The server's budget settings: a default plus **per-GPU-instance**
+/// overrides.
+///
+/// Budgets are keyed by board UUID rather than by GPU model, deliberately and
+/// unlike calibration profiles: a profile describes silicon and is shareable
+/// between two identical cards, while a budget describes *this host's* use of
+/// *this board* — the one driving the monitors wants a bigger margin than its
+/// twin in the second slot. The CUDA device index is never an identity here;
+/// it is not stable across reboots or `CUDA_VISIBLE_DEVICES` changes.
+///
+/// Lookup is case-insensitive on the UUID (NVML prints lower-case hex; a user
+/// pasting an upper-case copy should not silently get the server default) and
+/// otherwise exact — see `config::VramConfig::for_board`, which resolves the
+/// same way one layer up.
+#[derive(Debug, Clone, Default)]
+pub struct VramBudgets {
+    pub default: VramBudget,
+    per_board: HashMap<String, VramBudget>,
+}
+
+impl VramBudgets {
+    /// One budget for every board — the shape every host had before
+    /// `[inference_local.vram]` existed, and what the ledger's own tests use.
+    pub fn uniform(budget: VramBudget) -> Self {
+        Self {
+            default: budget,
+            per_board: HashMap::new(),
+        }
+    }
+
+    /// Add (or replace) one board's override.
+    pub fn with_board(mut self, uuid: impl Into<String>, budget: VramBudget) -> Self {
+        self.per_board.insert(uuid.into(), budget);
+        self
+    }
+
+    /// The budget in force for one board.
+    pub fn for_board(&self, uuid: &str) -> VramBudget {
+        if let Some(budget) = self.per_board.get(uuid) {
+            return *budget;
+        }
+        self.per_board
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(uuid))
+            .map(|(_, budget)| *budget)
+            .unwrap_or(self.default)
+    }
+}
+
+impl From<VramBudget> for VramBudgets {
+    fn from(budget: VramBudget) -> Self {
+        Self::uniform(budget)
     }
 }
 
@@ -274,6 +365,37 @@ struct GrantCharge {
     requests: usize,
 }
 
+/// One requester's slice of a board's headroom, plus the contention floor it
+/// was measured against. The floor is what makes "this window was squeezed"
+/// answerable pre-fit, where there is no slope to convert MB into units with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Share {
+    mb: u64,
+    floor: u64,
+    /// Every hungry worker's floor, summed — what the board would owe if all
+    /// of them were served their guaranteed minimum at once.
+    ///
+    /// Carried out alongside the slice because "my share landed at my floor"
+    /// is on its own an ambiguous signal: on a wide-open board a lopsided
+    /// appetite split lands the small claimant at its floor while tens of GB
+    /// go unused, which is the split working, not a squeeze. Comparing this
+    /// against the headroom is what distinguishes the two — the floor binds
+    /// *because the board is full* only when the floors do not all fit.
+    floor_sum: u64,
+}
+
+/// The ledger's request that one idle resident release its allocator pool.
+///
+/// Carries the routing information and nothing else: the ledger knows which
+/// *replica* should be trimmed, the manager knows which dispatcher owns that
+/// model, and the dispatcher knows whether that replica is free right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimRequest {
+    pub inference_id: String,
+    /// Ledger-side replica id; matches [`Admission::worker_id`].
+    pub worker: u64,
+}
+
 /// Everything the ledger knows about one resident replica.
 struct WorkerEntry {
     inference_id: String,
@@ -314,6 +436,13 @@ struct WorkerEntry {
     reserved_at_load_mb: Option<u64>,
     /// Freshest allocator pool size, from the last response's memory sample.
     reserved_mb: Option<u64>,
+    /// When the sample that produced [`Self::reserved_mb`] was captured. The
+    /// trim path folds a sample it did not itself cause to be taken (a worker
+    /// that could measure nothing replies without one, leaving the *pre*-trim
+    /// reading in telemetry), so it needs to be able to tell a genuinely fresh
+    /// post-trim reading from the one already charged. Mirrors the freshness
+    /// guard `record_free_locked` applies to the board's free reading.
+    reserved_seen_at: Option<Instant>,
     /// Outstanding grants: id → its charge.
     grants: HashMap<u64, GrantCharge>,
     /// Demand signal: how many requests this replica's dispatcher had in
@@ -332,6 +461,16 @@ struct WorkerEntry {
     fit_watermark: u64,
     /// Fit version last forwarded to this worker on a request frame.
     fit_version_sent: u64,
+    /// When this replica was last *flagged* for an idle-resident trim (not
+    /// when the trim landed — the ledger never hears about delivery, and
+    /// debouncing on the flag is what stops the same resident being queued
+    /// again on the very next grant request).
+    last_trim_at: Option<Instant>,
+    /// When this replica last *settled* a grant. `None` = it has never held
+    /// one, which is the quietest state there is. Read by the trim path to
+    /// answer "has held no grant for [`IDLE_BEFORE_TRIM`]" rather than the
+    /// much weaker "holds none at this instant".
+    last_grant_settled_at: Option<Instant>,
 }
 
 impl WorkerEntry {
@@ -619,6 +758,10 @@ struct LedgerState {
     /// Negotiated dtype per (inference_id, board UUID), so a second load of
     /// the same model consults the right profile key.
     remembered_dtypes: HashMap<(String, String), String>,
+    /// Idle residents the ledger wants trimmed, waiting for the manager to
+    /// route them to their dispatchers. The ledger cannot call a worker
+    /// itself — dispatchers own workers — so this is a signal, not an action.
+    pending_trims: Vec<TrimRequest>,
     next_id: u64,
     next_fit_version: u64,
 }
@@ -632,7 +775,7 @@ impl LedgerState {
 
 /// A per-GPU VRAM ledger over the probed board inventory.
 pub struct VramLedger {
-    budget: VramBudget,
+    budgets: VramBudgets,
     /// The calibration store: load-reservation bases, fit/anchor seeding at
     /// registration, and the persistence side of the write policy. `None` on
     /// a host with no store configured, which is the pre-1c behaviour (every
@@ -652,7 +795,7 @@ impl VramLedger {
     /// then takes the unpriced dispatch path, exactly as before 1b.
     pub fn new(
         inventory: &GpuInventory,
-        budget: VramBudget,
+        budgets: VramBudgets,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
         let gpus = inventory
@@ -675,7 +818,7 @@ impl VramLedger {
             })
             .collect();
         Arc::new(Self {
-            budget,
+            budgets,
             profiles,
             state: StdMutex::new(LedgerState {
                 gpus,
@@ -954,6 +1097,7 @@ impl VramLedger {
                 base_recorded: report.base_mb.is_some(),
                 reserved_at_load_mb: report.reserved_at_load_mb,
                 reserved_mb: report.reserved_at_load_mb,
+                reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,
                 ramp_step: 0,
@@ -961,6 +1105,8 @@ impl VramLedger {
                 clean_windows: 0,
                 fit_watermark: 0,
                 fit_version_sent: 0,
+                last_trim_at: None,
+                last_grant_settled_at: None,
             },
         );
         drop(state);
@@ -1283,7 +1429,7 @@ impl VramLedger {
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.limit_with_margin_locked(state, gpu, self.budget.margin.max(0.0))
+        self.limit_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin.max(0.0))
     }
 
     /// `limit` under a specific margin — the board's configured one for the
@@ -1302,16 +1448,22 @@ impl VramLedger {
         let mut limit = total.saturating_sub(inflated);
         // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on
         // a NaN returns the NaN, `as u64` on it saturates to 0, and the board
-        // would silently admit nothing at all. Config plumbing (step 2) is where
-        // such a value could arrive from.
-        if let Some(fraction) = self.budget.cap_fraction.filter(|fraction| fraction.is_finite()) {
+        // would silently admit nothing at all. `Settings::validate` rejects such
+        // a value at config load, so this is defence in depth for an embedder
+        // that builds a ledger without going through it.
+        if let Some(fraction) = self
+            .budgets
+            .for_board(gpu)
+            .cap_fraction
+            .filter(|fraction| fraction.is_finite())
+        {
             limit = limit.min((total as f64 * fraction.clamp(0.0, 1.0)).floor() as u64);
         }
         limit
     }
 
     fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.headroom_with_margin_locked(state, gpu, self.budget.margin.max(0.0))
+        self.headroom_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin.max(0.0))
     }
 
     fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
@@ -1356,8 +1508,9 @@ impl VramLedger {
     fn effective_margin_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         // `f64::max` returns the non-NaN operand, so a garbage configured
         // margin lands on 0.0 here exactly as it does in `limit_locked`
-        // rather than turning every number below into a NaN.
-        let base = self.budget.margin.max(0.0);
+        // rather than turning every number below into a NaN. The margin is
+        // this *board's* — budgets are per instance.
+        let base = self.budgets.for_board(&entry.gpu).margin.max(0.0);
         let cal = state
             .calibration
             .get(&(entry.inference_id.clone(), entry.gpu.clone()));
@@ -1390,6 +1543,23 @@ impl VramLedger {
             .and_then(|cal| cal.fit)
     }
 
+    /// [`Self::fit_locked`], but only when the fit can actually **price**
+    /// something.
+    ///
+    /// Every admission use of a fit divides or multiplies by its slope, so a
+    /// slope of zero (or worse) is not a usable fit at all: it would price a
+    /// contention floor at 1 MiB, an appetite at the `max(1.0)` clamp, and an
+    /// affordable unit count at infinity. "There is no slope" is exactly the
+    /// pre-fit case, and the pre-fit code is what should run — one filter, in
+    /// one place, so the three call sites cannot disagree about it.
+    ///
+    /// `robust_fit` and the profile seeder both refuse a non-positive slope
+    /// today, so this is a guard rather than a live path; `/health` deliberately
+    /// keeps reporting whatever is stored, degenerate or not.
+    fn pricing_fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {
+        Self::fit_locked(state, entry).filter(|fit| fit.slope_mb_per_unit > 0.0)
+    }
+
     /// Contention split: **demand first** (a model with an empty queue gets
     /// no new grants), then appetite-weighted shares — `slope × ratchet
     /// anchor` once calibrated, `base` weighting before — with a floor of one
@@ -1403,9 +1573,13 @@ impl VramLedger {
     /// it again as a claimant charges it twice: once against the pool and once
     /// against the requester's share. (One window is in flight per replica, so
     /// "holds a grant" and "is busy" are the same state.)
-    fn share_locked(&self, state: &LedgerState, worker: WorkerId, headroom: u64) -> u64 {
+    fn share_locked(&self, state: &LedgerState, worker: WorkerId, headroom: u64) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
-            return 0;
+            return Share {
+                mb: 0,
+                floor: 0,
+                floor_sum: 0,
+            };
         };
         let hungry: Vec<&WorkerEntry> = state
             .workers
@@ -1417,25 +1591,34 @@ impl VramLedger {
             })
             .map(|(_, entry)| entry)
             .collect();
-        if hungry.len() <= 1 {
-            return headroom;
-        }
         let appetite = |entry: &WorkerEntry| -> f64 {
             let anchor = Self::anchor_locked(state, entry);
-            match Self::fit_locked(state, entry) {
+            match Self::pricing_fit_locked(state, entry) {
                 Some(fit) if anchor > 0 => (fit.slope_mb_per_unit * anchor as f64).max(1.0),
                 // Pre-fit: weight by base, the only size signal available.
                 _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
             }
         };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
-            match Self::fit_locked(state, entry) {
+            match Self::pricing_fit_locked(state, entry) {
                 Some(fit) => {
                     ((fit.slope_mb_per_unit * entry.seed_units as f64).ceil() as u64).max(1)
                 }
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
+        // Sole claimant: the whole headroom, but the floor is still reported —
+        // it is what "this replica got squeezed" is measured against, and a
+        // board can be tight with exactly one hungry worker on it (that is
+        // precisely the idle-resident case the trim exists for).
+        if hungry.len() <= 1 {
+            let floor = floor_mb(requesting);
+            return Share {
+                mb: headroom,
+                floor,
+                floor_sum: floor,
+            };
+        }
         let total_appetite: f64 = hungry.iter().map(|entry| appetite(entry)).sum();
         let mut share = if total_appetite > 0.0 {
             ((headroom as f64) * appetite(requesting) / total_appetite).floor() as u64
@@ -1448,7 +1631,83 @@ impl VramLedger {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
         share = share.max(floor);
-        share.min(headroom)
+        Share {
+            mb: share.min(headroom),
+            floor,
+            floor_sum,
+        }
+    }
+
+    /// Flag idle residents on `gpu` that are holding pool slack, because a
+    /// hungry worker on the same board just came up short
+    /// (docs/batch-calibration-design.md, "Trim for idle residents").
+    ///
+    /// The reactive-shrink path only runs in workers that are *receiving*
+    /// windows; an idle resident gets no frames, so its retained pool would
+    /// squeeze its neighbours indefinitely and it would never notice. The
+    /// ledger notices — it is the only component that sees both sides — but it
+    /// cannot call a worker (dispatchers own workers), so it queues a signal
+    /// the manager routes.
+    ///
+    /// "Idle" is `no outstanding grant for [`IDLE_BEFORE_TRIM`], and no pending
+    /// requests`. The quiet period is the load-bearing half: one window is in
+    /// flight per replica, so a replica draining a queue holds no grant between
+    /// every pair of windows, and "holds none right now" would call it idle
+    /// thousands of times a minute — each one costing it a re-`cudaMalloc` of a
+    /// working set it is about to need again. A busy replica is deliberately
+    /// never flagged for the same reasons: its own reactive-shrink path covers
+    /// it, and a trim mid-window would race a batch.
+    ///
+    /// A **prewarm-parked** worker cannot be flagged at all, and by
+    /// construction rather than by a rule here: candidates come from
+    /// `state.workers`, which only [`VramLedger::register_worker`] populates,
+    /// and a parked worker has no model bound (no `configure`, no `load`, no
+    /// footprint) so it is never registered. The manager's delivery side is
+    /// closed the same way — it routes by `inference_id` through its loaded-
+    /// model table, which parked workers are equally absent from. There is
+    /// nothing to trim on one regardless: it holds imports, not an allocator
+    /// pool.
+    fn flag_trims_locked(state: &mut LedgerState, gpu: &str, requester: WorkerId) {
+        if state.pending_trims.len() >= MAX_PENDING_TRIMS {
+            return;
+        }
+        let candidates: Vec<(WorkerId, String, u64)> = state
+            .workers
+            .iter()
+            .filter(|(id, entry)| {
+                **id != requester
+                    && entry.gpu == gpu
+                    && entry.grants.is_empty()
+                    && entry.pending_requests == 0
+                    && entry
+                        .last_grant_settled_at
+                        .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM)
+                    && entry.pool_growth_mb() >= TRIM_SLACK_MB
+                    && entry
+                        .last_trim_at
+                        .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE)
+            })
+            .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
+            .collect();
+        for (id, inference_id, slack_mb) in candidates {
+            if state.pending_trims.len() >= MAX_PENDING_TRIMS {
+                break;
+            }
+            if let Some(entry) = state.workers.get_mut(&id) {
+                entry.last_trim_at = Some(Instant::now());
+            }
+            tracing::debug!(
+                model = %inference_id,
+                gpu = %gpu,
+                slack_mb,
+                "an idle resident is holding allocator pool slack while a \
+                 neighbour's window was squeezed; asking it to release the pool"
+            );
+            state.pending_trims.push(TrimRequest {
+                inference_id,
+                worker: id,
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1498,28 +1757,56 @@ impl VramLedger {
         };
         let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
         let share = self.share_locked(&state, worker, headroom);
-        let (mut unit_budget, mut mb, unit, aggregation) = {
+        let (mut unit_budget, mut mb, unit, aggregation, squeezed) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
-            let fit = Self::fit_locked(&state, entry);
-            let mut units = admitted_units(entry, anchor)
+            let fit = Self::pricing_fit_locked(&state, entry);
+            let wanted = admitted_units(entry, anchor)
                 .min(window_units.max(1))
                 .max(1);
-            let mut mb = share;
-            if let Some(fit) = fit {
-                if fit.slope_mb_per_unit > 0.0 {
-                    // Post-fit the unit budget derives from the MB side via
-                    // the slope; pre-fit there is no slope, so the ramp value
-                    // *is* the unit budget and `share` is simply the
-                    // contention share held while that step is measured.
-                    let affordable =
-                        ((share as f64) / fit.slope_mb_per_unit).floor().max(1.0) as u64;
-                    units = units.min(affordable).max(1);
-                    mb = ((units as f64) * fit.slope_mb_per_unit).ceil() as u64;
-                }
-            }
-            (units, mb, entry.unit, entry.aggregation)
+            let mut units = wanted;
+            let mut mb = share.mb;
+            // Whether *memory* is what held this window back, as opposed to
+            // the ramp, the ratchet or simply the amount of work in hand. Only
+            // the first is worth trimming a neighbour for: the other two are
+            // the design working as intended and no amount of freed pool would
+            // change them.
+            //
+            // `fit` is a *pricing* fit (see `pricing_fit_locked`), so a
+            // degenerate one is `None` here and the pre-fit branch runs — which
+            // is what keeps it from falling between the two and leaving
+            // `squeezed` stuck at false forever, silently disabling the trim
+            // for that model.
+            let squeezed = if let Some(fit) = fit {
+                // Post-fit the unit budget derives from the MB side via the
+                // slope; pre-fit there is no slope, so the ramp value *is* the
+                // unit budget and `share` is simply the contention share held
+                // while that step is measured.
+                let affordable = ((share.mb as f64) / fit.slope_mb_per_unit)
+                    .floor()
+                    .max(1.0) as u64;
+                let squeezed = affordable < wanted;
+                units = units.min(affordable).max(1);
+                mb = ((units as f64) * fit.slope_mb_per_unit).ceil() as u64;
+                squeezed
+            } else {
+                // Pre-fit there is nothing to convert MB into units with, so
+                // the only visible squeeze is the contention floor. But a share
+                // sitting *at* its floor is not by itself evidence: an
+                // appetite-weighted split on a wide-open board routinely lands a
+                // small claimant below its floor and clamps it back up, and
+                // flagging that would ask a neighbour to tear down its pool
+                // while tens of gigabytes go unused. The floor is only binding
+                // *because the board is full* when the floors themselves do not
+                // all fit in the headroom — which is precisely the pro-rata
+                // shrink condition `share_locked` applies above.
+                share.mb <= share.floor && headroom < share.floor_sum
+            };
+            (units, mb, entry.unit, entry.aggregation, squeezed)
         };
+        if squeezed {
+            Self::flag_trims_locked(&mut state, &gpu, worker);
+        }
         // The unit budget always admits at least one unit: a batch is never
         // smaller than one item, and a grant that admitted zero would stall the
         // queue instead of making slow progress. The **MB** side carries no
@@ -1527,7 +1814,7 @@ impl VramLedger {
         // charged nothing, which is honest; pretending it reserved 1 MiB would
         // only make the ledger's arithmetic lie in the safe-looking direction.
         unit_budget = unit_budget.max(1);
-        mb = mb.min(share);
+        mb = mb.min(share.mb);
         let grant_id = state.next_id();
         state
             .workers
@@ -1597,6 +1884,11 @@ impl VramLedger {
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }
+        // The idle clock the trim path reads starts here, not at the moment the
+        // grant map happens to be empty: a replica working through a queue is
+        // grantless between every pair of windows, and that is not idleness.
+        // Stamped on every outcome — an aborted window still had the pool.
+        entry.last_grant_settled_at = Some(Instant::now());
         // Any outcome other than a clean response means the fit snapshot this
         // window carried may never have been applied: the frame can have failed
         // undelivered, and the per-request fallback retries carry no snapshot at
@@ -1710,6 +2002,7 @@ impl VramLedger {
             if let Some(reserved) = stamped.value.reserved_mb {
                 if let Some(entry) = state.workers.get_mut(&worker) {
                     entry.reserved_mb = Some(reserved);
+                    entry.reserved_seen_at = Some(stamped.captured_at);
                 }
             }
             if let (Some(free), Some(source)) =
@@ -1753,6 +2046,21 @@ impl VramLedger {
                 // a warm-pool repeat grows reserved by zero and a delta
                 // series would drag the fitted slope toward zero — which is
                 // over-admission, the exact failure this design prevents.
+                //
+                // Post-`empty_cache()` regrowth (step 2's reactive shrink and
+                // the idle-resident trim) lands here too, and that is the
+                // point: those batches grow the pool from near nothing, which
+                // is what gives a steady-state workload fresh high-water
+                // samples at all. The formula is unchanged — `peak_reserved −
+                // reserved_at_load`, per the design, never a per-batch delta.
+                // One narrow consequence to know about: a load whose pool
+                // overshot its weights leaves `reserved_at_load` above what
+                // the pool settles at after a trim, so a small regrowth batch
+                // can price at (or saturate to) zero. It is a minority of
+                // samples against a Theil-Sen fit, and it errs by adding
+                // scatter — which widens the margin — rather than by claiming
+                // a batch was cheaper than it was.
+
                 if let (Some(units), Some(peak), Some(at_load)) =
                     (units, measurement.peak_reserved_mb, reserved_at_load)
                 {
@@ -1864,6 +2172,73 @@ impl VramLedger {
             entry.fit_version_sent = fit.version;
         }
         Some(fit)
+    }
+
+    // ------------------------------------------------------------------
+    // Idle-resident trim
+    // ------------------------------------------------------------------
+
+    /// Take everything the ledger wants trimmed. Empty in the normal case, so
+    /// callers on hot paths pay one uncontended lock and a `Vec::is_empty`.
+    pub fn take_pending_trims(&self) -> Vec<TrimRequest> {
+        let mut state = self.lock();
+        if state.pending_trims.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut state.pending_trims)
+    }
+
+    /// Fold a trimmed replica's fresh memory sample into the ledger.
+    ///
+    /// A trim releases pool slack, which is the growth term of that resident's
+    /// footprint — the whole reason for asking. But samples normally reach the
+    /// ledger through [`Self::ingest_locked`], which runs when a *window*
+    /// settles, and a trimmed resident is idle by definition: without this the
+    /// freed memory would stay charged until that model happened to run again,
+    /// i.e. exactly as long as the squeeze it was meant to relieve.
+    ///
+    /// Deliberately not an ingest: no measurements are read, no watermark
+    /// moves, no ramp or deflation bookkeeping happens. A trim is not a window.
+    ///
+    /// Both halves of the sample are **freshness-guarded**, because the sample
+    /// this reads is not necessarily the trim's own. A worker that could
+    /// measure nothing — no torch, no live CUDA, an older harness answering the
+    /// unknown type — replies `ok` without one, leaving whatever the last
+    /// *predict* put in telemetry, and that reading describes the pool as it
+    /// was **before** the release. Charging it as the post-trim figure would
+    /// undo the very fold this exists to perform, quietly and with no way to
+    /// tell from the outside. The free half has always had this guard (see
+    /// [`Self::record_free_locked`]); this is the pool half's.
+    fn note_trimmed(&self, worker: WorkerId) {
+        let mut state = self.lock();
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let gpu = entry.gpu.clone();
+        let telemetry = Arc::clone(&entry.telemetry);
+        let seen_at = entry.reserved_seen_at;
+        let memory = {
+            let telemetry = match telemetry.lock() {
+                Ok(telemetry) => telemetry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            telemetry.memory.clone()
+        };
+        let Some(stamped) = memory else {
+            return;
+        };
+        let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
+        if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher) {
+            if let Some(entry) = state.workers.get_mut(&worker) {
+                entry.reserved_mb = Some(reserved);
+                entry.reserved_seen_at = Some(stamped.captured_at);
+            }
+        }
+        if let (Some(free), Some(source)) =
+            (stamped.value.free_mb, stamped.value.free_source.clone())
+        {
+            Self::record_free_locked(&mut state, &gpu, free, source, stamped.captured_at);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2015,8 +2390,8 @@ impl VramLedger {
                         .iter()
                         .map(|worker| worker.grants_outstanding)
                         .sum(),
-                    margin: self.budget.margin,
-                    cap_fraction: self.budget.cap_fraction,
+                    margin: self.budgets.for_board(uuid).margin,
+                    cap_fraction: self.budgets.for_board(uuid).cap_fraction,
                     workers,
                 }
             })
@@ -2068,8 +2443,11 @@ impl VramLedger {
     /// the dispatcher's tests need a real [`Admission`] to drive the priced
     /// path end to end.
     #[cfg(test)]
-    pub(super) fn for_test(boards: &[(&str, &str, u64)], budget: VramBudget) -> Arc<Self> {
-        Self::for_test_with(boards, budget, None)
+    pub(super) fn for_test(
+        boards: &[(&str, &str, u64)],
+        budgets: impl Into<VramBudgets>,
+    ) -> Arc<Self> {
+        Self::for_test_with(boards, budgets, None)
     }
 
     /// [`Self::for_test`] plus a calibration store, for the seeding and
@@ -2077,7 +2455,7 @@ impl VramLedger {
     #[cfg(test)]
     fn for_test_with(
         boards: &[(&str, &str, u64)],
-        budget: VramBudget,
+        budgets: impl Into<VramBudgets>,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
         let gpus = boards
@@ -2098,7 +2476,7 @@ impl VramLedger {
             })
             .collect();
         Arc::new(Self {
-            budget,
+            budgets: budgets.into(),
             profiles,
             state: StdMutex::new(LedgerState {
                 gpus,
@@ -2124,6 +2502,41 @@ impl VramLedger {
         for id in ids {
             let _ = Self::ingest_locked(&mut state, id);
         }
+    }
+
+    /// Age this replica's two trim clocks — the idle-quiet-period stamp and
+    /// the per-replica debounce — by `by`.
+    ///
+    /// Both are wall-clock hysteresis measured in seconds, and a test that
+    /// waited them out for real would add those seconds to every CI run for
+    /// nothing. Moving the stamps backwards is exactly equivalent to time
+    /// passing, and there is no injectable clock in this ledger to do it more
+    /// elegantly.
+    #[cfg(test)]
+    fn age_trim_clocks_for_test(&self, worker: WorkerId, by: Duration) {
+        let mut state = self.lock();
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return;
+        };
+        let back = |at: Option<Instant>| at.and_then(|at| at.checked_sub(by));
+        entry.last_grant_settled_at = back(entry.last_grant_settled_at);
+        entry.last_trim_at = back(entry.last_trim_at);
+    }
+
+    /// Install a fit snapshot directly, bypassing both routes a real one
+    /// takes.
+    ///
+    /// `robust_fit` and the profile seeder each refuse a non-positive slope, so
+    /// a degenerate fit is not reachable from data today — which is precisely
+    /// why the code that has to survive one needs a test that can build one.
+    #[cfg(test)]
+    fn install_fit_for_test(&self, inference_id: &str, gpu: &str, fit: FitSnapshot) {
+        let mut state = self.lock();
+        state
+            .calibration
+            .entry((inference_id.to_owned(), gpu.to_owned()))
+            .or_default()
+            .fit = Some(fit);
     }
 }
 
@@ -2222,6 +2635,20 @@ pub struct Admission {
 }
 
 impl Admission {
+    /// This replica's ledger id, which is what a [`TrimRequest`] names. The
+    /// dispatcher matches it against its own replicas to find the one being
+    /// asked to release its pool.
+    pub fn worker_id(&self) -> u64 {
+        self.worker
+    }
+
+    /// Record that this replica just answered a `trim`: its fresh memory
+    /// sample is already in the shared telemetry, and this is what makes the
+    /// ledger see the released slack (see [`VramLedger::note_trimmed`]).
+    pub fn note_trimmed(&self) {
+        self.ledger.note_trimmed(self.worker);
+    }
+
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
     pub fn window_target_units(&self) -> u64 {
         self.ledger.window_target_units(self.worker)
@@ -2468,6 +2895,21 @@ mod tests {
             base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
             gpu_uuid: Some(BOARD.to_owned()),
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            dtype: Some("fp16".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// [`loaded`] for a named board, so a test can put replicas on two cards.
+    fn loaded_on(board: &str, base_mb: Option<u64>, reserved_at_load: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb,
+            base_method: base_mb.map(|_| "nvml".to_owned()),
+            reserved_at_load_mb: reserved_at_load,
+            gpu_uuid: Some(board.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
@@ -4503,6 +4945,592 @@ mod tests {
             2,
             "the window's own three are done; the queue behind it is still demand"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2: per-board budgets and the idle-resident trim
+    // ------------------------------------------------------------------
+
+    /// Budgets are keyed by GPU **instance**, not by GPU model: two identical
+    /// boards in one host share their calibration profile and can still carry
+    /// completely different admission limits. This is the whole reason
+    /// `[inference_local.vram.gpu."GPU-…"]` exists — the card driving the
+    /// monitors wants a bigger margin than its twin in the second slot.
+    #[test]
+    fn budgets_resolve_per_board() {
+        const A: &str = "GPU-aaaa";
+        const B: &str = "GPU-bbbb";
+        let budgets = VramBudgets::uniform(VramBudget {
+            margin: 0.0,
+            cap_fraction: None,
+        })
+        .with_board(
+            B,
+            VramBudget {
+                margin: 0.0,
+                cap_fraction: Some(0.5),
+            },
+        );
+        let ledger = VramLedger::for_test(
+            &[(A, "TEST 9000", 10_000), (B, "TEST 9000", 10_000)],
+            budgets,
+        );
+        let on_a = loaded_on(A, Some(1000), Some(0));
+        let on_b = loaded_on(B, Some(1000), Some(0));
+        let _a = ledger.register_worker("g/a", item_cost(4), &on_a).unwrap();
+        let _b = ledger.register_worker("g/b", item_cost(4), &on_b).unwrap();
+        push_memory(&on_a, 9000, 0);
+        push_memory(&on_b, 9000, 0);
+        ledger.ingest_all_for_test();
+
+        let boards = ledger.health();
+        let a = boards.iter().find(|board| board.gpu_uuid == A).unwrap();
+        let b = boards.iter().find(|board| board.gpu_uuid == B).unwrap();
+        // Both boards: external = 10000 - 9000 - 1000 = 0, margin 0.
+        assert_eq!(a.limit_mb, 10_000, "no cap on this board");
+        assert_eq!(b.limit_mb, 5000, "the per-board cap_fraction binds");
+        assert_eq!(a.cap_fraction, None);
+        assert_eq!(b.cap_fraction, Some(0.5));
+        assert_eq!(a.headroom_mb, 9000);
+        assert_eq!(b.headroom_mb, 4000);
+    }
+
+    /// And the margin half of the same rule, which additionally has to reach
+    /// the *per-model* effective margin — a board's configured margin is the
+    /// base every widening is added to, so getting it from the wrong board
+    /// would mis-price every window on the card.
+    #[test]
+    fn per_board_margins_reach_the_effective_margin() {
+        const A: &str = "GPU-aaaa";
+        const B: &str = "GPU-bbbb";
+        let budgets = VramBudgets::uniform(VramBudget {
+            margin: 0.0,
+            cap_fraction: None,
+        })
+        .with_board(
+            B,
+            VramBudget {
+                margin: 0.5,
+                cap_fraction: None,
+            },
+        );
+        let ledger = VramLedger::for_test(
+            &[(A, "TEST 9000", 10_000), (B, "TEST 9000", 10_000)],
+            budgets,
+        );
+        let on_a = loaded_on(A, Some(1000), Some(0));
+        let on_b = loaded_on(B, Some(1000), Some(0));
+        let _a = ledger.register_worker("g/a", item_cost(4), &on_a).unwrap();
+        let _b = ledger.register_worker("g/b", item_cost(4), &on_b).unwrap();
+        // external = 10000 - 5000 - 1000 = 4000 on both boards.
+        push_memory(&on_a, 5000, 0);
+        push_memory(&on_b, 5000, 0);
+        ledger.ingest_all_for_test();
+
+        let boards = ledger.health();
+        let a = boards.iter().find(|board| board.gpu_uuid == A).unwrap();
+        let b = boards.iter().find(|board| board.gpu_uuid == B).unwrap();
+        assert_eq!(a.margin, 0.0);
+        assert_eq!(b.margin, 0.5);
+        assert_eq!(a.limit_mb, 6000, "10000 - 4000: external, uninflated");
+        assert_eq!(b.limit_mb, 4000, "10000 - 4000 * 1.5");
+        // Both models are unconfirmed, so both are widened by the same
+        // increment — on top of their own board's configured margin.
+        assert_eq!(a.workers[0].effective_margin, UNCONFIRMED_MARGIN_BONUS);
+        assert_eq!(
+            b.workers[0].effective_margin,
+            0.5 + UNCONFIRMED_MARGIN_BONUS
+        );
+    }
+
+    /// The trim trigger: a squeezed window plus an **idle** resident holding
+    /// pool slack on the same board raises a routing signal for the manager.
+    ///
+    /// The ledger cannot call the worker (dispatchers own workers), so what it
+    /// produces is a [`TrimRequest`], and it produces it at most once per
+    /// [`TRIM_DEBOUNCE`] per replica.
+    #[test]
+    fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
+        let ledger = ledger(10_000, no_margin());
+        // The idle resident: 4000 base plus 1000 MiB of retained pool.
+        let idle = loaded(Some(4000), Some(0));
+        let _idle = ledger.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        // The hungry one: 4800 base, no pool of its own yet.
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+        // footprints = (4000 + 1000) + 4800 = 9800; external = 10000 - 200 -
+        // 9800 = 0; limit = 10000; headroom = 200 — below the 256 MiB
+        // pre-fit contention floor, i.e. squeezed.
+        assert_eq!(ledger.headroom_mb(BOARD), 200);
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "nothing is flagged until someone actually comes up short"
+        );
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let trims = ledger.take_pending_trims();
+        assert_eq!(trims.len(), 1, "the idle resident is flagged, once");
+        assert_eq!(trims[0].inference_id, "g/idle");
+        assert_eq!(trims[0].worker, _idle.worker_id());
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "the queue is drained, not copied"
+        );
+        drop(token);
+
+        // Debounce: a second squeezed window right away re-flags nothing.
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "the same resident is not re-flagged within TRIM_DEBOUNCE"
+        );
+        drop(token);
+    }
+
+    /// The three ways an idle resident is *not* worth trimming, each of which
+    /// would otherwise cost a resident its whole working set for nothing.
+    #[test]
+    fn trims_are_not_flagged_without_a_squeeze_slack_and_idleness() {
+        // 1. No squeeze: the board has room, so the neighbour's pool is not
+        //    costing anybody anything.
+        let roomy = ledger(10_000, no_margin());
+        let idle = loaded(Some(1000), Some(0));
+        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let hungry = loaded(Some(1000), Some(0));
+        let asking = roomy
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 7000, 1000);
+        push_memory(&hungry, 7000, 0);
+        roomy.ingest_all_for_test();
+        assert_eq!(roomy.headroom_mb(BOARD), 7000);
+        let token = asking.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert!(
+            roomy.take_pending_trims().is_empty(),
+            "a comfortable board never trims, however much pool a neighbour holds"
+        );
+        drop(token);
+
+        // 2. Squeezed, but the idle resident holds less slack than a trim is
+        //    worth: it would pay a full pool teardown to hand over crumbs.
+        let tight = ledger(10_000, no_margin());
+        let idle = loaded(Some(4900), Some(0));
+        let _idle = tight.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let hungry = loaded(Some(4900), Some(0));
+        let asking = tight
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 100, TRIM_SLACK_MB - 1);
+        push_memory(&hungry, 100, 0);
+        tight.ingest_all_for_test();
+        let token = asking.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert!(
+            tight.take_pending_trims().is_empty(),
+            "below TRIM_SLACK_MB the trade is not worth making"
+        );
+        drop(token);
+
+        // 3. Squeezed, plenty of slack, but the neighbour is *busy* — it is
+        //    holding a grant, so it is not idle, its own reactive-shrink path
+        //    covers it, and a trim would race an in-flight batch.
+        let busy_board = ledger(10_000, no_margin());
+        let busy = loaded(Some(4000), Some(0));
+        let busy_admission = busy_board
+            .register_worker("g/busy", item_cost(4), &busy)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = busy_board
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&busy, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        busy_board.ingest_all_for_test();
+        let held = busy_admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let token = asking.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert!(
+            busy_board.take_pending_trims().is_empty(),
+            "a replica with a window in flight is never flagged"
+        );
+        drop(token);
+        drop(held);
+    }
+
+    /// After a trim lands, the released slack must stop being charged.
+    ///
+    /// Memory samples normally reach the ledger when a *window* settles, and a
+    /// trimmed resident is idle by definition — without this path the freed
+    /// memory would stay on its footprint until that model happened to run
+    /// again, which is exactly as long as the squeeze it was meant to relieve.
+    #[test]
+    fn a_trim_reply_releases_the_slack_from_the_footprint() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(4000), Some(0));
+        let admission = ledger
+            .register_worker("g/idle", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 5000, 1000);
+        ledger.ingest_all_for_test();
+        assert_eq!(
+            ledger.health()[0].workers[0].footprint_mb,
+            5000,
+            "4000 base + 1000 pool growth"
+        );
+
+        // The worker answered `trim` and its reply's sample is in telemetry.
+        push_memory(&handle, 6000, 0);
+        admission.note_trimmed();
+        assert_eq!(
+            ledger.health()[0].workers[0].footprint_mb,
+            4000,
+            "the pool is gone; only the base is still charged"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].reserved_mb,
+            Some(0),
+            "and the ledger's view of the pool matches what the worker reported"
+        );
+    }
+
+    /// A pre-fit share landing on its contention floor is **not** a squeeze on
+    /// its own.
+    ///
+    /// Pre-fit the appetite weighting is by `base`, so two models of very
+    /// different sizes split a board very unevenly — and the small one's slice
+    /// routinely comes out below one seed batch and is clamped back up to the
+    /// floor. That is the split working as designed. If it counted as a
+    /// squeeze, every grant to the smaller model on a board with **gigabytes
+    /// going spare** would ask an innocent neighbour to tear down its allocator
+    /// pool. The floor is only binding *because the board is full* when the
+    /// floors themselves no longer fit in the headroom.
+    #[test]
+    fn a_lopsided_pre_fit_split_on_a_wide_open_board_is_not_a_squeeze() {
+        let ledger = ledger(200_000, no_margin());
+        // The trim candidate: idle, and holding 1000 MiB of pool slack.
+        let idle = loaded(Some(1000), Some(0));
+        let _idle = ledger
+            .register_worker("g/idle", item_cost(4), &idle)
+            .unwrap();
+        // Two hungry pre-fit models, appetites 1 vs 4000.
+        let small = loaded(Some(1), Some(0));
+        let asking = ledger
+            .register_worker("g/small", item_cost(4), &small)
+            .unwrap();
+        let big = loaded(Some(4000), Some(0));
+        let other = ledger.register_worker("g/big", item_cost(4), &big).unwrap();
+        other.note_demand(3);
+        // footprints = (1000 + 1000) + 1 + 4000 = 6001; external = 0.
+        push_memory(&idle, 193_999, 1000);
+        push_memory(&small, 193_999, 0);
+        push_memory(&big, 193_999, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(
+            ledger.headroom_mb(BOARD),
+            193_999,
+            "nearly the whole 200 GB board is unclaimed"
+        );
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            token.grant().mb <= SEED_BATCH_FLOOR_MB,
+            "the premise: this share really did land on its floor ({} MiB)",
+            token.grant().mb
+        );
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "a floor reached by an uneven split on an empty board is not a squeeze"
+        );
+        drop(token);
+    }
+
+    /// Post-fit, the squeeze question is answered in units: the slice buys
+    /// fewer units than this window wanted. And *only* that — a window held
+    /// back by the ramp or the extrapolation ratchet while its MB slice could
+    /// have paid for far more is the design working as intended, and no amount
+    /// of freed neighbour pool would move it.
+    #[test]
+    fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
+        // The ramp/ratchet case first: a board with room to spare, a fitted
+        // model, and a budget bounded by what it has measured.
+        let roomy = ledger(200_000, no_margin());
+        let idle = loaded(Some(1000), Some(0));
+        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let handle = loaded(Some(1000), Some(0));
+        let admission = roomy.register_worker("g/a", item_cost(4), &handle).unwrap();
+        push_memory(&idle, 190_000, 1000);
+        push_memory(&handle, 190_000, 0);
+        roomy.ingest_all_for_test();
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let slope = roomy.health()[0]
+            .workers
+            .iter()
+            .find(|worker| worker.inference_id == "g/a")
+            .and_then(|worker| worker.fit.as_ref())
+            .expect("fitted by now")
+            .slope_mb_per_unit;
+        assert!(slope > 0.0);
+        roomy.take_pending_trims();
+        let token = admission.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            (token.grant().unit_budget as f64) * slope < roomy.headroom_mb(BOARD) as f64,
+            "the premise: memory was nowhere near the binding constraint"
+        );
+        assert!(
+            roomy.take_pending_trims().is_empty(),
+            "a ratchet-bounded window must not trim a neighbour: freeing pool \
+             cannot buy it a single extra unit"
+        );
+        drop(token);
+
+        // And the real thing: the same fitted model on a board with almost
+        // nothing left, where the slice genuinely cannot pay for the window.
+        let tight = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let _idle = tight.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let handle = loaded(Some(4980), Some(0));
+        let admission = tight.register_worker("g/a", item_cost(4), &handle).unwrap();
+        // footprints = (4000 + 1000) + 4980 = 9980; external = 0; headroom = 20.
+        push_memory(&idle, 20, 1000);
+        push_memory(&handle, 20, 0);
+        tight.ingest_all_for_test();
+        assert_eq!(tight.headroom_mb(BOARD), 20);
+        // 10 MiB/unit against a 20 MiB slice buys 2 units where even the seed
+        // batch wants 4: memory, and nothing else, is the binding constraint.
+        tight.install_fit_for_test(
+            "g/a",
+            BOARD,
+            FitSnapshot {
+                slope_mb_per_unit: 10.0,
+                intercept_mb: 0.0,
+                residual_mb: 0.0,
+                samples: 8,
+                version: 1,
+            },
+        );
+        tight.take_pending_trims();
+        let token = admission
+            .request_grant(1_000_000, None, 1, 0)
+            .expect("granted");
+        let trims = tight.take_pending_trims();
+        assert_eq!(trims.len(), 1, "memory is what held this window back");
+        assert_eq!(trims[0].inference_id, "g/idle");
+        drop(token);
+    }
+
+    /// A fit whose slope is not positive prices nothing, so the pre-fit rule
+    /// has to take over. Before this was handled, such a fit fell between the
+    /// two branches: neither ran, `squeezed` stayed false forever, and the trim
+    /// was silently switched off for that model for the life of the process.
+    #[test]
+    fn a_degenerate_fit_falls_back_to_the_pre_fit_squeeze_rule() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let _idle = ledger
+            .register_worker("g/idle", item_cost(4), &idle)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+        ledger.install_fit_for_test(
+            "g/hungry",
+            BOARD,
+            FitSnapshot {
+                slope_mb_per_unit: 0.0,
+                intercept_mb: 0.0,
+                residual_mb: 0.0,
+                samples: 8,
+                version: 1,
+            },
+        );
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            1,
+            "a slope of zero is 'no slope', which is exactly the pre-fit case"
+        );
+        drop(token);
+    }
+
+    /// Idleness is "has held no grant for a while", not "holds none at this
+    /// instant". A replica draining a queue is grantless between every pair of
+    /// windows; trimming it there would cost it a re-`cudaMalloc` of a working
+    /// set it is about to need again, thousands of times a minute.
+    #[test]
+    fn a_replica_between_windows_is_not_yet_idle_enough_to_trim() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let resident = ledger
+            .register_worker("g/idle", item_cost(4), &idle)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+
+        // The resident just finished a window: grantless, but not idle.
+        clean_window(&resident);
+        ledger.take_pending_trims();
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "a replica that settled a window a moment ago is between windows, \
+             not finished with them"
+        );
+        drop(token);
+
+        // Once the quiet period has passed, the same squeeze does flag it.
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            IDLE_BEFORE_TRIM + Duration::from_secs(1),
+        );
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let trims = ledger.take_pending_trims();
+        assert_eq!(trims.len(), 1, "it has now genuinely stopped");
+        assert_eq!(trims[0].inference_id, "g/idle");
+        drop(token);
+    }
+
+    /// The debounce is a delay, not a verdict: a resident that goes on
+    /// squeezing its neighbours is asked again once [`TRIM_DEBOUNCE`] has
+    /// passed. (Debouncing on the *flag* rather than on delivery is deliberate
+    /// — the ledger never hears whether a trim landed.)
+    #[test]
+    fn the_trim_debounce_expires_and_the_resident_is_asked_again() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let resident = ledger
+            .register_worker("g/idle", item_cost(4), &idle)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(ledger.take_pending_trims().len(), 1, "flagged once");
+        drop(token);
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "and not again inside the debounce"
+        );
+        drop(token);
+
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            TRIM_DEBOUNCE + Duration::from_secs(1),
+        );
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            1,
+            "the squeeze is still on, so the resident is asked again"
+        );
+        drop(token);
+    }
+
+    /// The pending-trim queue is bounded. An embedder that never drains it
+    /// must not let it grow without limit, and the residents that did not fit
+    /// are not lost — the next squeeze picks them up, because only the ones
+    /// actually flagged had their debounce stamped.
+    #[test]
+    fn the_pending_trim_queue_is_capped_and_the_rest_are_flagged_next_time() {
+        const RESIDENTS: usize = MAX_PENDING_TRIMS + 8;
+        // Cheap residents: 1 MiB of base each, 300 MiB of pool slack.
+        let footprints = (RESIDENTS as u64) * 301 + 1;
+        let ledger = ledger(footprints + 159, no_margin());
+        let handles: Vec<TelemetryHandle> = (0..RESIDENTS)
+            .map(|_| loaded(Some(1), Some(0)))
+            .collect();
+        let _residents: Vec<Admission> = handles
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| {
+                ledger
+                    .register_worker(&format!("g/idle{index}"), item_cost(4), handle)
+                    .unwrap()
+            })
+            .collect();
+        let hungry = loaded(Some(1), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry)
+            .unwrap();
+        for handle in &handles {
+            push_memory(handle, 159, 300);
+        }
+        push_memory(&hungry, 159, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.headroom_mb(BOARD), 159, "the board is full");
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            MAX_PENDING_TRIMS,
+            "the queue is capped, not unbounded"
+        );
+        drop(token);
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            RESIDENTS - MAX_PENDING_TRIMS,
+            "the residents that did not fit are picked up next squeeze; the ones \
+             that did are inside their debounce"
+        );
+        drop(token);
+    }
+
+    /// The trim's memory fold is freshness-guarded on **both** halves.
+    ///
+    /// The sample `note_trimmed` reads is not necessarily the trim's own: a
+    /// worker that could measure nothing replies `ok` with no sample at all,
+    /// leaving whatever the last predict put in telemetry — a reading of the
+    /// pool as it was *before* the release. Charging that as the post-trim
+    /// figure would silently undo the fold this path exists to perform.
+    #[test]
+    fn a_stale_sample_never_re_charges_a_trimmed_pool() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(4000), Some(0));
+        let admission = ledger
+            .register_worker("g/idle", item_cost(4), &handle)
+            .unwrap();
+        push_memory(&handle, 5000, 1000);
+        let pre_trim = handle.lock().unwrap().memory.clone().expect("a sample");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].workers[0].footprint_mb, 5000);
+
+        // A trim whose reply carried a fresh sample: the pool is gone.
+        push_memory(&handle, 6000, 0);
+        admission.note_trimmed();
+        assert_eq!(ledger.health()[0].workers[0].footprint_mb, 4000);
+
+        // A second trim, answered by a worker that could measure nothing: the
+        // freshest sample in telemetry is still the pre-trim one.
+        handle.lock().unwrap().memory = Some(pre_trim);
+        admission.note_trimmed();
+        assert_eq!(
+            ledger.health()[0].workers[0].footprint_mb,
+            4000,
+            "the older reading must not re-charge the released slack"
+        );
+        assert_eq!(ledger.health()[0].workers[0].reserved_mb, Some(0));
     }
 
     #[test]
