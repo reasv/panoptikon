@@ -205,6 +205,7 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
     reconcile_recorded_checksums(&mut conn, migrator)
         .await
         .with_context(|| format!("failed to reconcile checksums in {}", path.display()))?;
+    let applied_before = applied_migration_count(&mut conn).await?;
     migrator
         .run(&mut conn)
         .await
@@ -213,6 +214,32 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
         stamp_alembic_head(&mut conn, expected_alembic_head)
             .await
             .with_context(|| format!("failed to stamp database {}", path.display()))?;
+    } else if applied_migration_count(&mut conn).await? > applied_before {
+        // A migration ran against existing data. If it created an index,
+        // sqlite_stat1 now describes every index EXCEPT the new one, and a
+        // planner working from such lopsided stats can pick catastrophic
+        // plans: SQLite 3.51.3 costed the unanalyzed
+        // idx_item_data_setter_data_type with its built-in guess and turned
+        // every extracted_text_fts MATCH into per-row FTS probes (~3400x
+        // slower). Nothing else refreshes stats until the next job's
+        // post-job ANALYZE, so every search in between would hit the bad
+        // plan. A full ANALYZE here closes that window for any
+        // index-adding migration; it runs once per upgrade (~8s on a 10GB
+        // index), not per boot.
+        tracing::info!(
+            db = %path.display(),
+            "migrations applied; running ANALYZE to refresh planner statistics"
+        );
+        let started = std::time::Instant::now();
+        sqlx::query("ANALYZE")
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("failed to ANALYZE {} after migration", path.display()))?;
+        tracing::info!(
+            db = %path.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "post-migration ANALYZE complete"
+        );
     }
     // All three databases are read while other connections write them (index
     // and storage by jobs, user_data directly by API handlers). WAL is a
@@ -418,6 +445,17 @@ async fn reconcile_recorded_checksums(
             .context("failed to re-record migration checksum")?;
     }
     Ok(())
+}
+
+async fn applied_migration_count(conn: &mut SqliteConnection) -> Result<i64> {
+    if !table_exists(conn, "_sqlx_migrations").await? {
+        return Ok(0);
+    }
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(conn)
+        .await
+        .context("failed to count applied migrations")?;
+    Ok(row.0)
 }
 
 async fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> Result<bool> {
@@ -772,6 +810,90 @@ mod tests {
             .find(|migration| !migration.migration_type.is_down_migration())
             .unwrap();
         assert_eq!(recorded.as_slice(), first.checksum.as_ref());
+        conn.close().await.unwrap();
+    }
+
+    // Applying a migration to a database with existing data must refresh
+    // sqlite_stat1: an index-adding migration otherwise leaves stats that
+    // describe every index except the new one, and SQLite (observed on
+    // 3.51.3) can misplan queries catastrophically from such lopsided
+    // stats until the next post-job ANALYZE.
+    #[tokio::test]
+    async fn analyze_runs_when_migrations_apply_to_existing_data() {
+        use sqlx::migrate::MigrationType;
+
+        fn migration(version: i64, sql: &str) -> Migration {
+            Migration::new(
+                version,
+                format!("m{version}").into(),
+                MigrationType::Simple,
+                AssertSqlSafe(sql.to_string()).into_sql_str(),
+                false,
+            )
+        }
+        fn migrator_of(migrations: Vec<Migration>) -> Migrator {
+            Migrator {
+                migrations: Cow::Owned(migrations),
+                ..Migrator::DEFAULT
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        let create_table = migration(1, "CREATE TABLE things (id INTEGER PRIMARY KEY, kind TEXT)");
+        let create_index = migration(2, "CREATE INDEX idx_things_kind ON things (kind)");
+
+        migrate_path(&path, &migrator_of(vec![create_table.clone()]), "unused")
+            .await
+            .unwrap();
+
+        let mut conn = connect(&path).await;
+        assert!(
+            !table_exists(&mut conn, "sqlite_stat1").await.unwrap(),
+            "fresh database creation must not ANALYZE"
+        );
+        for i in 0..100 {
+            sqlx::query("INSERT INTO things (kind) VALUES (?1)")
+                .bind(format!("kind{}", i % 3))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        conn.close().await.unwrap();
+
+        migrate_path(
+            &path,
+            &migrator_of(vec![create_table.clone(), create_index.clone()]),
+            "unused",
+        )
+        .await
+        .unwrap();
+
+        let mut conn = connect(&path).await;
+        let analyzed: Vec<(String,)> = sqlx::query_as("SELECT idx FROM sqlite_stat1")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            analyzed.iter().any(|(idx,)| idx == "idx_things_kind"),
+            "migration on existing data must ANALYZE the new index, got {analyzed:?}"
+        );
+
+        // With nothing pending, migrate_path must not ANALYZE again.
+        sqlx::query("DELETE FROM sqlite_stat1")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        migrate_path(&path, &migrator_of(vec![create_table, create_index]), "unused")
+            .await
+            .unwrap();
+        let mut conn = connect(&path).await;
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_stat1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "no pending migrations must mean no ANALYZE");
         conn.close().await.unwrap();
     }
 

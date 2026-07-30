@@ -2,6 +2,8 @@ pub(crate) mod builder;
 pub(crate) mod embedding_utils;
 #[cfg(test)]
 mod explain_plan;
+#[cfg(test)]
+mod fts_probe;
 pub(crate) mod model;
 pub(crate) mod preprocess;
 pub(crate) mod utils;
