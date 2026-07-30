@@ -982,6 +982,11 @@ pub(crate) async fn complete_setup(
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
+    // Setup is a write workflow throughout (folder config, per-DB settings,
+    // and — with new_index_db — database creation via migrations). In
+    // readonly mode the migration DDL must not run, and the later writes
+    // would only fail with opaque internal errors; refuse up front instead.
+    crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders
         .iter()

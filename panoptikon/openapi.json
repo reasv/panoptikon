@@ -762,6 +762,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Server is in read-only mode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }

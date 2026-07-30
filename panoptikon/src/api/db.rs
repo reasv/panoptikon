@@ -52,12 +52,14 @@ pub(crate) struct DbCreateResponse {
     description = "Create new databases with the specified names.\nIt runs the migration scripts on the provided database names.\nIf the databases already exist, the effect is the same as running the migrations.",
     params(DbCreateQuery),
     responses(
-        (status = 200, description = "Created databases", body = DbCreateResponse)
+        (status = 200, description = "Created databases", body = DbCreateResponse),
+        (status = 403, description = "Server is in read-only mode", body = crate::api_error::ErrorBody)
     )
 )]
 pub async fn db_create(
     Query(query): Query<DbCreateQuery>,
 ) -> Result<Json<DbCreateResponse>, ApiError> {
+    crate::db::ensure_migrations_allowed()?;
     let handle = Handle::current();
     let DbCreateQuery {
         new_index_db,
@@ -85,4 +87,57 @@ pub async fn db_create(
     };
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_create_is_rejected_in_readonly_mode() {
+        let env = crate::test_utils::test_data_dir();
+        let _readonly = crate::db::readonly_test_override::force();
+        let result = db_create(Query(DbCreateQuery {
+            new_index_db: Some("readonly_guard".to_string()),
+            new_user_data_db: Some("readonly_guard".to_string()),
+        }))
+        .await;
+        let error = result.err().expect("readonly mode must reject db_create");
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        // The guard must fire before any DDL: no database files created.
+        assert!(!env.path().join("index").join("readonly_guard").exists());
+        assert!(
+            !env.path()
+                .join("user_data")
+                .join("readonly_guard.db")
+                .exists()
+        );
+    }
+
+    // Positive control for the absence assertions above: the same call
+    // outside readonly mode does create the database files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_create_runs_migrations_when_writable() {
+        let env = crate::test_utils::test_data_dir();
+        let _response = db_create(Query(DbCreateQuery {
+            new_index_db: Some("readonly_guard_control".to_string()),
+            new_user_data_db: Some("readonly_guard_control".to_string()),
+        }))
+        .await
+        .expect("db_create must succeed outside readonly mode");
+        assert!(
+            env.path()
+                .join("index")
+                .join("readonly_guard_control")
+                .join("index.db")
+                .is_file()
+        );
+        assert!(
+            env.path()
+                .join("user_data")
+                .join("readonly_guard_control.db")
+                .is_file()
+        );
+    }
 }

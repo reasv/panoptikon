@@ -481,6 +481,54 @@ pub(crate) fn readonly_mode() -> bool {
     crate::config::runtime().readonly
 }
 
+/// Rejects runtime migration entry points (POST /api/db/create, the Desktop
+/// setup new-database path) in readonly mode. Startup guards its own
+/// migrations in `main`, but these handlers run the same DDL on demand;
+/// without this check a readonly server would still create database files
+/// and alter schemas on request.
+pub(crate) fn ensure_migrations_allowed() -> Result<(), ApiError> {
+    #[cfg(test)]
+    let readonly = readonly_mode() || readonly_test_override::forced();
+    #[cfg(not(test))]
+    let readonly = readonly_mode();
+    if readonly {
+        return Err(ApiError::forbidden(
+            "Server is in read-only mode; creating or migrating databases is disabled",
+        ));
+    }
+    Ok(())
+}
+
+/// The process-global `RuntimeConfig` is a `OnceLock` shared by every unit
+/// test, so `readonly = true` can never be installed per-test. This override
+/// is consulted only by [`ensure_migrations_allowed`] (not by
+/// [`readonly_mode`] itself) so a test holding it can never flip concurrent
+/// tests' connections to read-only. Callers must hold the
+/// `test_utils::test_data_dir` lock to serialize against other handler tests.
+#[cfg(test)]
+pub(crate) mod readonly_test_override {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn forced() -> bool {
+        FORCED.load(Ordering::SeqCst)
+    }
+
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Forces the readonly guard on for the returned guard's lifetime.
+    pub(crate) fn force() -> Guard {
+        FORCED.store(true, Ordering::SeqCst);
+        Guard
+    }
+}
+
 /// `journal_size_limit` for writable schemas (64 MiB). A checkpoint that
 /// resets the WAL truncates the file back to this bound instead of leaving it
 /// at its high-water mark; without a limit, tens-of-GB logs from long jobs
