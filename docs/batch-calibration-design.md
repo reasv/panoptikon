@@ -8,8 +8,13 @@ rule, profile-key fallback, tiered base measurement); second review pass the
 same day (envelope fit, pool-aware ledger + idle-resident trim, grant dual
 denomination, reset and residual questions settled); third review pass the
 same day (WDDM throughput-collapse signal, extrapolation ratchet,
-non-local-profile margins, dispatcher pricing declared estimate-only).
-Supersedes the one-line itemization in that document. Not yet implemented.
+non-local-profile margins, dispatcher pricing declared estimate-only);
+fourth review pass the same day (single-currency driver-MB ledger,
+load-phase reservations, universal worker→GPU pinning, free-intercept
+fit); fifth review pass the same day (persisted ratchet state, local-store
+write policy, pre-fit WDDM comparator, dtype-unknown load reservations,
+concrete per-DB migration mechanics). Supersedes the one-line itemization
+in that document. Not yet implemented.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -167,6 +172,24 @@ Two keyspaces, deliberately different:
   index is **never** an identity — it is not stable across reboots or
   `CUDA_VISIBLE_DEVICES` changes.
 
+**Every worker is pinned to exactly one GPU.** The spawn machinery
+already supports pins (`config.replicas`/`config.devices` →
+`CUDA_VISIBLE_DEVICES` per replica), but the default today is a single
+*unpinned* replica that sees every device — impls then run on
+`devices[0]`, so on a multi-GPU host attribution is ambiguous and card 0
+silently gets everything. Under the ledger, ambiguity is unacceptable:
+the orchestrator resolves an explicit pin for every worker at spawn,
+written in the UUID form CUDA accepts directly
+(`CUDA_VISIBLE_DEVICES=GPU-…`), so the pin shares the budget keyspace's
+identity and device-index instability never enters (ROCm may need the
+index form plus a spawn-time index→UUID mapping; cuda-first as
+everywhere). Default placement keeps today's behaviour — first usable
+GPU; headroom-based placement across cards is a natural later upgrade
+once ledgers exist, not v1. The impl-side multi-device path
+(`get_device()` returning several devices) drops out of the supported
+envelope: a worker sees exactly one GPU, and every report (base,
+reserved, memory samples) lands on exactly one ledger.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit
@@ -210,22 +233,31 @@ Under auto:
 Orchestrator, per GPU, when dispatching a window:
 
 ```
-external  = total − free − Σ reserved(our workers, latest reports)
+footprint(w) = base(w) + max(0, reserved(w) − reserved_at_load(w))
+                                                 # driver currency, ≥ base
+external  = max(0, total − free − Σ footprint(our workers))
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-hold(w)   = max(base(w), last reported reserved(w))
-headroom  = limit − Σ hold(residents) − Σ outstanding_grants
+headroom  = limit − Σ footprint(residents) − Σ load_reservations
+                  − Σ outstanding_grants
 grant     = min(headroom share, ramp step, slope × knee_units,
                 priced content of the window itself)
 ```
 
-- Residents are charged at `hold = max(base, last-reported reserved)`,
-  **not** at `base`. Releasing a grant returns nothing physically — the
-  caching allocator keeps the memory until `empty_cache()` — so a ledger
-  that charges idle residents only `base` hands their retained pools out
-  again to neighbours, who then hit the defensive clamp forever. `base`
-  is the floor of the charge for every resident, always — residency
-  changes who has already paid it, not whether it counts.
+- **The ledger runs in one currency: driver MB.** A worker's charge is
+  its `footprint` — process-level `base` (context + workspaces +
+  weights) plus allocator pool growth since load. Charging allocator
+  `reserved` alone would misclassify each resident's ~0.5 GB context and
+  workspaces as *external* (margin-inflated) while `base` counts them
+  again — a systematic double-count worth 1.5–2 GB across a few
+  residents; charging `base` alone would hand a resident's retained pool
+  out again to neighbours — releasing a grant returns nothing physically
+  until `empty_cache()` — who then hit the defensive clamp forever.
+  `footprint ≥ base` by construction: residency changes who has already
+  paid the base, not whether it counts. Where NVML per-process works the
+  orchestrator may substitute the exact per-PID figure (the same tier
+  machinery as base measurement); `base + pool growth` is the WDDM-safe
+  approximation.
 - **A grant is dual-denominated**: an MB reservation (the ledger
   currency) and a unit budget (the packing currency). Post-fit the unit
   budget derives from the MB side via the slope; pre-fit there is no
@@ -237,17 +269,46 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
   when its response frame lands; a dying worker's grants are released
-  with its aborted windows under the existing generation guard.
-- **External usage is exact, not approximated.** Every worker reports its
-  own `memory_reserved` per response, so the orchestrator separates our
-  usage from the world's and the margin multiplier applies only to
-  genuinely external usage — sibling workers are never margin-inflated.
-  Samples arrive only on response frames, so after a long idle gap the
-  first window prices `external` from a stale sample; the shrink clamp
-  makes that safe, and the orchestrator refreshes via NVML (the
-  Package-1 probe machinery) when the freshest sample exceeds an age
-  threshold — in scope for v1, since the probe machinery already exists;
-  an accuracy measure, not a safety requirement.
+  with its aborted windows under the existing generation guard. A *hung*
+  worker (stuck CUDA call) holds its grant indefinitely — deliberate:
+  `predict` has no deadline by standing policy, the memory genuinely is
+  unavailable, and the contention floors keep neighbours running at
+  seed-batch throughput until the operator intervenes (drain + restart,
+  the existing stuck-CUDA recovery).
+- **A load in progress is a reservation too.** Loads are serialized by
+  the manager's load lock, but dispatch is concurrent with loading:
+  without a charge, windows granted during a multi-second load collide
+  with the incoming weights. From load-start the ledger holds a
+  `load_reservation` at the *expected* base (local profile → shipped
+  profile → conservative constant), replaced by the measured value when
+  the load response lands. This is also item 8's trigger arriving early:
+  expected base exceeding headroom is the evict-before-load signal.
+  One wrinkle: `dtype` is in the profile key, but dtype negotiation
+  (Package 1) resolves *during* the load — on the first-ever load of a
+  model on a GPU the orchestrator cannot know which dtype's profile to
+  consult, and guessing fp16 when negotiation lands on fp32
+  under-reserves ~2× for exactly the seconds the reservation exists to
+  protect. When the negotiated dtype is unknown, reserve at the most
+  conservative plausible dtype's base (fp32 profile if present, else the
+  constant); the load response reports the actual dtype, and the
+  orchestrator remembers the negotiated outcome per (model, GPU) for
+  subsequent loads.
+- **External usage is derived, not margin-guessed, for our own
+  processes.** Every worker reports `memory_reserved` per response (and
+  `reserved_at_load` once, on the load response), so the orchestrator
+  computes footprints and the margin multiplier applies only to
+  genuinely external usage — sibling workers, contexts and workspaces
+  included, are never margin-inflated. `external` is clamped at ≥ 0:
+  `free` and the per-worker samples come from different moments, and
+  sampling skew must never manufacture phantom headroom. Samples arrive
+  only on response frames, so after a long idle gap the first window
+  prices `external` from a stale sample; the shrink clamp makes that
+  safe, and the orchestrator refreshes via NVML (the Package-1 probe
+  machinery) when the freshest sample exceeds an age threshold — a
+  single coherent snapshot (total/free/per-process in one read),
+  preferred over stitched per-frame samples whenever it is fresh. In
+  scope for v1, since the probe machinery already exists; an accuracy
+  measure, not a safety requirement.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
@@ -278,7 +339,14 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   where WDDM gives no clean failure (see Backstop). The ratchet counts
   only local samples, so a fresh install ramps from seed even with a
   shipped profile: profiles govern pricing, `base` accounting, and the
-  knee cap — not growth.
+  knee cap — not growth. The ratchet anchor **persists**: the local
+  store records the largest locally measured clean high-water batch
+  (see Calibration store), so a restart resumes from the measured range
+  instead of re-ramping from seed — otherwise the "ramp cost is
+  logarithmic and one-time" argument silently becomes "per restart" on
+  desktops. A persisted anchor still enters every window through the
+  defensive clamp against live free memory, and deflation state remains
+  runtime-only.
 
 Worker, per batch within its window:
 
@@ -305,8 +373,12 @@ Worker, per batch within its window:
   slope toward zero — over-admission, the exact failure this design
   exists to prevent. Only **high-water batches** — those that grow the
   pool: every geometric ramp step, and regrowth after `empty_cache()` —
-  contribute reserved samples, regressing `peak_reserved − base`
-  against batch units. Warm-pool batches contribute the allocated
+  contribute reserved samples, regressing `peak_reserved −
+  reserved_at_load` against batch units with a **free intercept**:
+  `base` is process-level driver currency the allocator never saw, so
+  forcing the fit through it (or through zero) would bias the slope low
+  — admission uses the slope; the intercept is diagnostic only.
+  Warm-pool batches contribute the allocated
   transient (`peak_allocated − allocated_before`, which has no caching
   hysteresis) as the diagnostic floor and validation series.
   `empty_cache()` events are therefore calibration opportunities, not
@@ -322,7 +394,8 @@ Worker, per batch within its window:
   workers that are receiving windows — an idle resident gets no frames,
   so its retained pool would squeeze its neighbours indefinitely. When
   the ledger sees a hungry worker constrained by an idle resident's
-  `reserved − base` slack, the orchestrator sends that resident a trim
+  pool slack (`reserved − reserved_at_load`, the growth term of its
+  footprint), the orchestrator sends that resident a trim
   request; the worker calls `empty_cache()` and replies with a fresh
   memory sample. Trim is not unload: it releases only pool slack —
   weights, live tensors, and the CUDA context stay, so the model remains
@@ -344,9 +417,22 @@ Worker, per batch within its window:
   fire. The worker already times every batch for knee capture; a
   pool-growing batch whose units/sec craters far below the fitted
   throughput curve is therefore recorded as a synthetic negative sample
-  feeding the same deflation path. No new machinery — it reuses the
-  timing and the deflation mechanism. Collapse threshold: implementation
-  detail, tune empirically.
+  feeding the same deflation path. **Pre-fit the comparator is the
+  previous ramp step**: a ×2 units step whose units/sec drops by the
+  collapse ratio relative to the prior step is a spill — without this
+  the ramp, the riskiest phase (especially under a wrong shipped
+  profile), would be exactly the window the signal cannot cover. No new
+  machinery — it reuses the timing and the deflation mechanism. Collapse
+  threshold: implementation detail, tune empirically. Corollary at
+  batch 1: a single over-budget item "goes through anyway" and on WDDM
+  it does not fail as it would under Package 1's batch-1-OOM rule — it
+  silently runs slow, once. Accepted: `slice_settings` bounds decoded
+  pixels upstream, and it is one item, not a regime. Documentation (and later the Desktop tab)
+  should additionally recommend the driver's "Prefer No Sysmem
+  Fallback" setting (NVIDIA control panel, driver ≥ 546; not settable
+  programmatically) — with it, Windows regains a crisp OOM signal and
+  the synthetic path becomes the fallback for default-configured
+  machines rather than the primary signal.
 
 The only timing assumption left: external usage doesn't swing by more
 than the margin within one window. The backstop covers the exceptions.
@@ -431,6 +517,13 @@ samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
 generator         = "panoptikon 0.1.8" # provenance
+
+# Local-store-only fields (ignored when read from a shipped baseline —
+# they carry local authority a foreign measurement cannot):
+max_units_measured = 1024              # ratchet anchor: largest locally
+                                       # measured clean high-water batch
+local_samples      = 12                # local clean samples; also the
+                                       # non-local-profile confirmation gate
 ```
 
 Key tuple for lookup: `(inference_id, epoch, gpu, platform, backend,
@@ -465,10 +558,42 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   by the orchestrator, overlays shipped entries (local wins on identical
   key). Deleting an entry (by hand or from a future Desktop surface)
   triggers recalibration — passively, on the next run.
+- **Write policy**: the orchestrator updates a local entry (via the
+  atomic rewrite) whenever the ratchet anchor advances or the fit
+  meaningfully changes — not per batch. This is what makes the ratchet
+  and the confirmation gate survive restarts; runtime-only state
+  (deflation, ramp position within a step, outstanding grants) is
+  deliberately never persisted. Because a shipped baseline's `samples`
+  are the *generator's*, local confirmation always reads
+  `local_samples` — a shipped entry confirms only by accruing a local
+  overlay entry.
+- **Calibration is never frozen**: the fit keeps ingesting qualifying
+  samples for as long as the model runs — high-water batches from
+  ratchet range extensions and post-`empty_cache()` regrowth (shrink and
+  trim events are calibration opportunities), warm-pool transients as
+  the validation series, throughput samples for the knee. To make
+  continuous refitting survive restarts, the local entry also persists a
+  **bounded ring of recent high-water samples** (`(units, reserved_mb)`
+  pairs; local-only like the ratchet fields, stripped on
+  baseline import) — a robust fit cannot be resumed from aggregates
+  alone, and ring eviction doubles as recency aging: samples from a
+  since-changed driver or allocator fall out instead of anchoring the
+  fit forever. Ring size: implementation detail, a few dozen.
+- **Sharing**: shipped baselines accrete from maintainers' and
+  volunteers' local stores by copying the file (it is one
+  human-readable TOML; the local-only fields are stripped or ignored on
+  import). No mechanism beyond that in v1; an "export calibration"
+  affordance belongs on the future Desktop tab's list.
 - **Invalidation**: `epoch` is declared in model metadata
   (`metadata.cost.epoch`, default 1) and bumped when an impl's memory
-  behaviour changes (dtype policy, attention backend, torch generation
-  bump also changes the `torch` key naturally). Stale entries are ignored,
+  behaviour changes *without moving any key component* — a new attention
+  backend, a preprocessing change, swapped weights under the same
+  inference ID. It is per-model (per-ID override) and reaches every user
+  through the shipped registry on upgrade. Changes that *do* move a key
+  component need no bump: a default-dtype flip (the CLIP FP32→FP16 case)
+  re-keys lookups the moment negotiation lands on the new dtype, so all
+  old-dtype entries — local and shipped — stop matching automatically;
+  torch upgrades likewise via the `torch` key. Stale entries are ignored,
   not deleted.
 
 ### Model metadata additions
@@ -522,10 +647,34 @@ Migration and surface changes:
   majority even in cron, re-selecting auto by hand is awkward, and the
   user base is small; the rare intentional cap is re-entered once. Cron
   rows themselves are preserved — only the batch number is cleared.
-  Mechanically: an in-place edit through the existing comment-preserving
-  config editor, guarded by a one-time stamp recorded in the per-DB
-  database (not the TOML), so a number the user enters afterwards is
-  never wiped by a re-run.
+
+  Mechanics (both values live in the same per-index-DB `config.toml` —
+  `job_settings[].default_batch_size` and `cron_jobs[].batch_size` are
+  `SystemConfig` fields — so this is one file rewrite per index DB):
+
+  - **Hook**: a Rust post-migration step for index databases, running
+    wherever SQL migrations already run — the startup sweep
+    (`migrate_all_databases_on_disk`, which enumerates every index-DB
+    directory including ones the user never opens) *and* the per-DB
+    open/create path (`migrate_databases_on_disk`). Covering both paths
+    is what makes the guard airtight for databases created at runtime
+    *after* the upgrade: they get stamped at creation (when nulling a
+    default config is a no-op — `migrate_path` already knows `fresh`),
+    so a cap the user enters later can never be wiped by a delayed
+    first sweep.
+  - **Stamp**: a named-row table in the index schema (the
+    `maintenance_state` pattern), created empty by a normal sqlx
+    migration; the Rust step checks it, and inserts the row only after
+    the TOML rewrite succeeds. Config-then-stamp ordering is the
+    crash-safe direction: a crash between the two re-runs the null on
+    the next startup, which is harmless because no user interaction can
+    intervene before that restart completes.
+  - **Rewrite**: `SystemConfigStore` load → null the two fields → save,
+    which goes through the comment-preserving `TomlDocument`
+    patch path and the atomic write. A DB directory with no
+    `config.toml` is skipped, not seeded (nothing to null). One
+    verification for implementation: `patch_serialized` must *remove*
+    a key whose value went `Some → None` — TOML has no null.
 - Cron model config must accept and persist "auto" (`None`) — it already
   can; the UI must offer it.
 - The Desktop "new database" wizard drops its batch-size control entirely.
@@ -534,13 +683,15 @@ Migration and surface changes:
 
 ## Rollout order
 
-1. Cost-dimension metadata + the ledger/grant loop: grants and fit
-   snapshots on request frames, measurements and memory samples on
-   response frames, tiered base on the load response, packing + defensive
-   clamp in the worker, dispatcher cap-rule removal, local store
-   round-trip through the orchestrator. easyOCR re-batching (bucketed
-   `max-times-count`) **under realistic core pipelining** is the
-   acceptance test.
+1. Cost-dimension metadata + the ledger/grant loop: universal
+   worker→GPU pinning at spawn, grants and fit snapshots on request
+   frames, measurements and memory samples on response frames, tiered
+   base on the load response, load reservations (the
+   expected-base-vs-headroom *check* rides along; the eviction response
+   waits for item 8), packing + defensive clamp in the worker,
+   dispatcher cap-rule removal, local store round-trip through the
+   orchestrator. easyOCR re-batching (bucketed `max-times-count`)
+   **under realistic core pipelining** is the acceptance test.
 2. Budget config (margin + cap, per-UUID overrides) and the reactive
    shrink path with `empty_cache()` hysteresis, plus the idle-resident
    trim message.
@@ -556,7 +707,8 @@ Migration and surface changes:
 
 Item 8 of the parent doc (evict residents pre-load using recorded `base`)
 falls out of step 1's footprint data plus the existing generation-guarded
-unload machinery; it slots in after step 2. Item 9 (self-test) pre-warms
+unload machinery; its *trigger* (a load reservation exceeding headroom)
+already ships in step 1 — the eviction response slots in after step 2. Item 9 (self-test) pre-warms
 profiles using the same harness on synthetic inputs — after step 1 it is a
 script, not a subsystem.
 
@@ -573,6 +725,11 @@ script, not a subsystem.
   throughput-collapse ratio behind the WDDM synthetic negative sample,
   the non-local-profile confirmation sample count, and the
   extrapolation-ratchet factor (default 2×).
+- Placement policy on multi-GPU hosts: v1 pins every worker but keeps
+  today's placement (first usable GPU, or the registry's explicit
+  `devices` pins). Headroom-based placement — put the next load on the
+  card whose ledger has the most room — is the natural follow-up once
+  ledgers exist.
 - ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
   are untested here by design; the design is backend-agnostic on paper,
   cuda first in practice.
