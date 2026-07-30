@@ -30,3 +30,8 @@ When changes are made
 - If you alter server behavior, update `panoptikon/AGENTS.md` and
   `panoptikon/README.md`.
 - If you alter the worker protocol, update `docs/inferio-worker-protocol.md`.
+- If you prepare a release (version bump + `vX.Y.Z` tag): sync the Nix UI pin
+  first (`python3 scripts/sync-nix-ui-pin.py`, then `--check`, commit
+  `contrib/package/nix/panoptikon/ui-pin.json` if changed). Release-time step
+  only; routine `ui` bumps never require it. See `docs/desktop-release.md`
+  and `contrib/package/nix/README.md` ("Release checklist").

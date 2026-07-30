@@ -1,0 +1,100 @@
+# Seeded once to <stateDir>/config/server/default.toml (never overwritten).
+# Layout under --root: config/, data/, runtime/{pysrc,ui,venv}/.
+# Tools: bare names on PATH; fonts via FONTCONFIG_FILE; pdfium after setup.
+
+data_folder = "data"
+
+[logging]
+file = ""
+level = "${LOGLEVEL:-INFO}"
+
+[server]
+host = "${PANOPTIKON_HOST:-127.0.0.1}"
+port = "${PANOPTIKON_PORT:-6342}"
+# X-Forwarded-* headers are not trusted by default (the code default;
+# spoofable on a public bind). Uncomment only behind a trusted reverse
+# proxy that sets those headers.
+# trust_forwarded_headers = true
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6340"
+local = true
+# Embedded UI (bundled-ui); no checkout under stateDir.
+dir = "no-checkout-use-embedded-bundle"
+node = "node"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:${PANOPTIKON_PORT:-6342}"
+local = true
+
+[inference_local]
+enabled = true
+
+[inference_local.python_env]
+accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
+auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
+[search]
+# Tunable default lives in serde; comment so upgrades track code defaults.
+# embedding_cache_size = 1024
+
+[jobs]
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+pdfium = "${PDFIUM_PATH:-}"
+html_renderer = "${HTML_RENDERER_PATH:-}"
+thumbnail_font = "${PANOPTIKON_FONT:-}"
+
+[rulesets.allow_all]
+allow_all = true
+
+[rulesets.restricted_demo]
+allow = [
+    { methods = [
+        "GET",
+    ], path_prefix = "/docs" },
+    { methods = [
+        "GET",
+    ], path = "/openapi.json" },
+
+    { methods = [
+        "GET",
+        "POST",
+    ], path_prefix = "/api/search/" },
+    { methods = [
+        "GET",
+    ], path_prefix = "/api/items/" },
+
+    { methods = [
+        "GET",
+        "POST",
+        "DELETE",
+        "PUT",
+    ], path_prefix = "/api/bookmarks/" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/db" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/inference/cache" },
+]
+
+[[policies]]
+name = "localhost"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+# Seeded policy is loopback-only. Non-loopback / public exposure needs a Host
+# policy and auth (prefer restricted_demo), not bare allow_all.

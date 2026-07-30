@@ -1133,6 +1133,19 @@ pub async fn maybe_auto_setup(settings: &Settings, inference_enabled: bool) {
     if !inference_enabled || !local.python_env.auto_setup || local.python.is_some() {
         return;
     }
+    // NixOS module soft-fail preStart sets this after a failed setup attempt so
+    // ExecStart does not immediately re-run multi-GB setup while the unit looks
+    // active but is not yet listening. Operators re-run `panoptikon setup` or
+    // restart after fixing the failure; lockfile drift after a good start still
+    // uses auto_setup on the next process without this flag.
+    if std::env::var_os("PANOPTIKON_SKIP_IMMEDIATE_AUTO_SETUP").is_some() {
+        tracing::warn!(
+            "skipping automatic setup (PANOPTIKON_SKIP_IMMEDIATE_AUTO_SETUP); \
+             preStart already attempted setup — run `panoptikon setup` or restart \
+             after fixing the environment"
+        );
+        return;
+    }
     let Some(reason) = auto_setup_needed() else {
         return;
     };
