@@ -216,6 +216,20 @@ only 1–2 rows fit per page. Corrected conclusions:
   GROUP BY over `vec_distance_*` of *two* joined blobs in a self-join. If
   the sorter carries both blobs, fix B applied there should reclaim most of
   it. Unmeasured.
+  **FALSIFIED 2026-07-30.** Measured via `explain_plan_similar_to` on the
+  production DB: the standalone plan *flattens* the collection CTE into a
+  files-driven self-join whose GROUP BY needs **no sorter at all** — the
+  premise ("the sorter carries both blobs") is false, because `similar_to`
+  runs standalone (similarity sidebar/page), never inside the composed `or`
+  shape that denies the semantic filters their lucky join order. Its
+  9.5s/23s cost (t2t/x-modal, re-measured) is genuine join scaffolding +
+  distance work over the ×M pair fan-out. A fix-B restructure (per-pair
+  distance in a `MATERIALIZED` CTE) was implemented, measured, and
+  reverted: it *regresses* t2t to 67–78s and cross-modal to 200s+ — the
+  materialization writes the pair fan-out to temp, denies the flattened
+  plan, and the outer aggregate gains an items-driven re-join plus the very
+  GROUP BY temp b-tree fix B avoids elsewhere. `similar_to` perf is a
+  quant/algorithmic problem (step 3/4 below), not a sorter accident.
 - The same trap plausibly affects any future aggregate over a large blob or
   text column (e.g. `extracted_text`-adjacent aggregates) whenever the plan
   needs a GROUP BY sorter. Worth a builder-level convention: never place a
@@ -250,6 +264,7 @@ only 1–2 rows fit per page. Corrected conclusions:
    stats — tracked separately, not a fix-B artifact.
 2. **Apply the same restructuring to `item_similarity.rs`** and re-measure
    the 13s/30s `similar_to` cases.
+   **DONE AND REVERTED 2026-07-30 — made it worse; see §7 first bullet.**
 3. **Fix the quant pipeline's execution**: fix B on the coarse pass, head
    driven from `ranked` (CROSS JOIN-pinned, fix-B distance). Then re-run
    `tools/quant-recall` and reconsider the `auto` policy — plausibly
