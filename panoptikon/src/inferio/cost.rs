@@ -760,28 +760,25 @@ metadata.cost.aggregation = "sum"
             Some(CostAggregation::Sum),
         );
         // The tclip ids run the same engine's *text* tower: no pixels are
-        // decoded, so they stay on the group's per-item dimension even though
-        // their clip-group twins are priced per pixel.
+        // decoded, so they deviate from their clip-group twins. Unlike the
+        // openclip text towers they have no fixed context — the processor
+        // truncates at 8192 tokens and pads each batch to its longest member —
+        // so they are the token/max-times-count class, not the group's
+        // per-item one (step 5 of the design's rollout).
         expect(
             "tclip/qwen3-vl-embedding-2b",
-            CostUnit::Item,
-            Some(CostAggregation::Count),
+            CostUnit::Token,
+            Some(CostAggregation::MaxTimesCount),
         );
         expect(
             "tclip/qwen3-vl-embedding-8b",
-            CostUnit::Item,
-            Some(CostAggregation::Count),
+            CostUnit::Token,
+            Some(CostAggregation::MaxTimesCount),
         );
-        expect(
-            "vlm/moondream-2b-25-03-ocr",
-            CostUnit::Pixel,
-            Some(CostAggregation::Sum),
-        );
-        expect(
-            "tags/moondream-2b-25-03",
-            CostUnit::Pixel,
-            Some(CostAggregation::Sum),
-        );
+        // moondream's predict loops one image at a time, so no batch dimension
+        // exists to price: `none`, like faster_whisper (step 5).
+        expect("vlm/moondream-2b-25-03-ocr", CostUnit::None, None);
+        expect("tags/moondream-2b-25-03", CostUnit::None, None);
         expect(
             "florence2/msft_large-caption",
             CostUnit::Item,
