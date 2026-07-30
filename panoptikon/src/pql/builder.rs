@@ -70,6 +70,7 @@ impl CteRef {
 struct CteDefinition {
     name: String,
     query: SelectStatement,
+    materialized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +527,20 @@ fn create_cte(state: &mut QueryState, name: String, query: SelectStatement) -> C
     state.ctes.push(CteDefinition {
         name: name.clone(),
         query,
+        materialized: false,
+    });
+    CteRef { name }
+}
+
+/// A CTE rendered `AS MATERIALIZED`: fences the body from the query
+/// flattener. Fix B relies on this — an inlined per-row distance column
+/// would land back inside the caller's aggregate and put the embedding blob
+/// through the GROUP BY sorter again (docs/or-composition-penalty.md §5).
+fn create_materialized_cte(state: &mut QueryState, name: String, query: SelectStatement) -> CteRef {
+    state.ctes.push(CteDefinition {
+        name: name.clone(),
+        query,
+        materialized: true,
     });
     CteRef { name }
 }
@@ -1221,6 +1236,9 @@ fn build_with_clause(
         cte_expr
             .table_name(Alias::new(cte.name.as_str()))
             .query(cte.query.clone());
+        if cte.materialized {
+            cte_expr.materialized(true);
+        }
         with_clause.cte(cte_expr);
         has_cte = true;
     }

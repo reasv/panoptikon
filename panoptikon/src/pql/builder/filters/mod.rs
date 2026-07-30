@@ -1,4 +1,5 @@
 mod embedding_types;
+mod exact;
 mod has_unprocessed;
 mod image_embeddings;
 mod in_bookmarks;

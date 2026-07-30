@@ -232,6 +232,22 @@ only 1–2 rows fit per page. Corrected conclusions:
    confidence-weighted aggregation; verify with `tools/pql-equivalence`
    and re-run both explain_plan harnesses. This is unconditional — it wins
    regardless of any quant decision.
+   **IMPLEMENTED 2026-07-30** — shared assembly in
+   `panoptikon/src/pql/builder/filters/exact.rs`
+   (`assemble_exact_fixb`: distance + confidence weight in a
+   `MATERIALIZED dist_{cte}` CTE, aggregate over it), wired into both
+   filters' exact paths; quant head and count paths unchanged.
+   Verified: `tools/pql-equivalence` 79/79 PASS (stdtest snapshot);
+   `explain_plan_exact_vs_quant` composed RRF `or` mpnet
+   12.0–15.9s → **2.53–2.57s**, clip 2.2–2.6s → **0.62s** (semantic-only
+   mpnet 2.29 → 2.90s, clip 0.60 → 0.58s warm — the standalone shape
+   trades its accidental sorter-free plan for robustness, as §5
+   anticipated). During verification a *pre-existing* anomaly surfaced:
+   `match_text` FTS cases run ~250–300s on the Rust server against the
+   stdtest snapshot (clean master reproduces it; legacy Python and stdlib
+   SQLite run the same SQL in <0.5s; production `default` DB unaffected).
+   Suspected SQLite 3.44→3.51.3 planner change interacting with that DB's
+   stats — tracked separately, not a fix-B artifact.
 2. **Apply the same restructuring to `item_similarity.rs`** and re-measure
    the 13s/30s `similar_to` cases.
 3. **Fix the quant pipeline's execution**: fix B on the coarse pass, head

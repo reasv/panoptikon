@@ -7,13 +7,14 @@ use crate::pql::preprocess::PqlError;
 
 use super::super::{
     BaseTable, CteRef, EmbeddingQuants, Embeddings, ExtraColumn, ExtractedText, ItemData, Items,
-    JoinedTables, OrderByFilter, QueryState, Setters, add_rank_column_expr, apply_group_by,
-    apply_sort_bounds, get_std_group_by, wrap_query,
+    JoinedTables, OrderByFilter, QueryState, Setters, apply_group_by, apply_sort_bounds,
+    get_std_group_by, wrap_query,
 };
 use super::FilterCompiler;
 use super::embedding_types::{
     DistanceAggregation, DistanceFunction, IndexMode, QuantResolved, default_k,
 };
+use super::exact::{assemble_exact_fixb, confidence_weight_expr, rank_aggregate};
 use super::item_similarity::SourceArgs;
 use super::quant::{COARSE_DIST, COARSE_RANK, EXACT_DIST, assemble_two_stage};
 use super::text_embeddings::EmbedArgs;
@@ -303,70 +304,39 @@ impl SemanticImageSearch {
         (query, join_text)
     }
 
-    /// The full-precision rank aggregate, including confidence weighting.
-    fn exact_rank_column(&self, embedding: &[u8]) -> Expr {
-        let args = &self.image_embeddings;
-        let distance_func = match args._distance_func_override {
+    /// The per-row full-precision distance (references the `embeddings`
+    /// join, so it is only valid over the embeddings-joined skeleton).
+    fn exact_distance_expr(&self, embedding: &[u8]) -> Expr {
+        let distance_func = match self.image_embeddings._distance_func_override {
             Some(DistanceFunction::L2) => "vec_distance_L2",
             _ => "vec_distance_cosine",
         };
-        let vec_distance: Expr = Func::cust(distance_func)
+        Func::cust(distance_func)
             .args([
                 Expr::col((Embeddings::Table, Embeddings::Embedding)),
                 Expr::val(embedding.to_vec()),
             ])
-            .into();
-        let mut rank_column = match args.distance_aggregation {
-            DistanceAggregation::Max => vec_distance.clone().max(),
-            DistanceAggregation::Avg => vec_distance.clone().avg(),
-            DistanceAggregation::Min => vec_distance.clone().min(),
-        };
+            .into()
+    }
 
-        if let Some(src_text) = &args.src_text {
-            let conf_weight_clause: Expr = Func::cust("pow")
-                .args([
-                    Func::coalesce([
-                        Expr::col((ExtractedText::Table, ExtractedText::Confidence)),
-                        Expr::val(1),
-                    ])
-                    .into(),
-                    Expr::val(src_text.confidence_weight),
-                ])
-                .into();
-            let lang_conf_weight_clause: Expr = Func::cust("pow")
-                .args([
-                    Func::coalesce([
-                        Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence)),
-                        Expr::val(1),
-                    ])
-                    .into(),
-                    Expr::val(src_text.language_confidence_weight),
-                ])
-                .into();
-            if src_text.confidence_weight != 0.0 && src_text.language_confidence_weight != 0.0 {
-                let weights = conf_weight_clause
-                    .clone()
-                    .mul(lang_conf_weight_clause.clone());
-                rank_column = vec_distance
-                    .clone()
-                    .mul(weights.clone())
-                    .sum()
-                    .div(weights.sum());
-            } else if src_text.confidence_weight != 0.0 {
-                rank_column = vec_distance
-                    .clone()
-                    .mul(conf_weight_clause.clone())
-                    .sum()
-                    .div(conf_weight_clause.sum());
-            } else if src_text.language_confidence_weight != 0.0 {
-                rank_column = vec_distance
-                    .clone()
-                    .mul(lang_conf_weight_clause.clone())
-                    .sum()
-                    .div(lang_conf_weight_clause.sum());
-            }
-        }
-        rank_column
+    /// The per-row confidence weight, when confidence weighting applies.
+    fn confidence_weight(&self) -> Option<Expr> {
+        self.image_embeddings
+            .src_text
+            .as_ref()
+            .and_then(confidence_weight_expr)
+    }
+
+    /// The full-precision rank aggregate, including confidence weighting.
+    /// Aggregates over the blob directly — only safe where the plan cannot
+    /// meet a GROUP BY sorter fed by this expression; the exact path uses
+    /// `assemble_exact_fixb` instead (docs/or-composition-penalty.md §5).
+    fn exact_rank_column(&self, embedding: &[u8]) -> Expr {
+        rank_aggregate(
+            self.exact_distance_expr(embedding),
+            self.confidence_weight(),
+            self.image_embeddings.distance_aggregation,
+        )
     }
 
     /// The weight-free coarse proxy: plain aggregated Hamming distance over
@@ -483,27 +453,29 @@ impl FilterCompiler for SemanticImageSearch {
             return Ok(cte);
         }
 
-        let (mut query, join_text) =
-            self.candidate_skeleton(context, state, &ImageVectorJoin::Embeddings);
-        apply_group_by(&mut query, get_std_group_by(context, state));
-        add_rank_column_expr(&mut query, &self.sort, self.exact_rank_column(embedding))?;
+        // Fix B (docs/or-composition-penalty.md §5): the distance is
+        // evaluated in a materialized CTE so the GROUP BY sorter never
+        // carries the embedding blob.
+        let (skeleton, _) = self.candidate_skeleton(context, state, &ImageVectorJoin::Embeddings);
+        let (query, dist_cte) = assemble_exact_fixb(
+            state,
+            &cte_name,
+            skeleton,
+            self.exact_distance_expr(embedding),
+            self.confidence_weight(),
+            args.distance_aggregation,
+            &self.sort,
+        )?;
 
-        let mut joined_tables = JoinedTables::default();
-        joined_tables.mark(BaseTable::Items);
-        joined_tables.mark(BaseTable::ItemData);
-        joined_tables.mark(BaseTable::Setters);
-        // The unaliased extracted_text join only exists when a src_text
-        // criterion (or weight) required it.
-        if join_text {
-            joined_tables.mark(BaseTable::ExtractedText);
-        }
+        // The grouped select reads only the dist CTE, so no base tables are
+        // visible to the final query; its context is the dist CTE.
         let (query, context_for_wrap, joined_tables) = apply_sort_bounds(
             state,
             query,
-            context.clone(),
+            dist_cte,
             &cte_name,
             &self.sort,
-            joined_tables,
+            JoinedTables::default(),
         );
 
         let cte = wrap_query(state, query, &context_for_wrap, cte_name, &joined_tables);

@@ -210,6 +210,9 @@ data/
 # Permanent worktree of the deprecated Python implementation (python-legacy branch)
 /python-legacy/
 /target-pql
+# Alternate cargo target dir for building the suite/measure binary while the
+# running gateway locks target/release/panoptikon.exe.
+/target-equiv
 # Local release credentials and generated Desktop sidecar staging.
 /.local-secrets/
 /panoptikon-desktop/src-tauri/binaries/
