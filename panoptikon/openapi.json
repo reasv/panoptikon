@@ -2446,7 +2446,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: an optional cap on how many items are processed at\nonce. Omitted (or null) means auto — the inference server sizes\nbatches itself.",
             "required": false,
             "schema": {
               "type": [
@@ -2532,7 +2532,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: an optional cap on how many items are processed at\nonce. Omitted (or null) means auto — the inference server sizes\nbatches itself.",
             "required": false,
             "schema": {
               "type": [
@@ -5214,7 +5214,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Optional cap on GPU batch size; `None` = auto (the default, and what\nthe one-time `batch_auto` migration reset every existing row to)."
           },
           "inference_id": {
             "type": "string"
@@ -6631,7 +6632,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Last-selected cap on GPU batch size for this group/model; `None` =\nauto (the default, and what the one-time `batch_auto` migration reset\nevery stored value to)."
           },
           "default_threshold": {
             "type": [

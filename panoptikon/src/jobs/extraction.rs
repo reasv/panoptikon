@@ -43,6 +43,46 @@ pub(crate) const CACHE_KEY: &str = "batch";
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
 
+/// Work units core keeps inside in-flight inference requests, per job.
+///
+/// This is request-level sizing — how much work core hands the inference
+/// server at once, and how large a single item may grow before it is split
+/// into several sequential requests — and it is deliberately *not* the user's
+/// batch cap, which only bounds the GPU batches formed on the far side
+/// (docs/batch-calibration-design.md, "Batch size UX", split #2). Requests are
+/// still bounded in bytes by the intermediate-data budget; this bounds them in
+/// units so a 4000-page PDF cannot become one request. A capped job chunks at
+/// `min(cap, this)`, which keeps core from handing over more items at once
+/// than the far side is allowed to process in one batch — it is not a batch
+/// *alignment* guarantee, and does not need to be: the inference worker's
+/// packer applies the cap to every batch it forms, including merged ones.
+const REQUEST_UNIT_BUDGET: usize = 64;
+
+/// Work units this job keeps in flight per chunked request: the smaller of
+/// the user's cap (when set) and [`REQUEST_UNIT_BUDGET`]. Never zero — a
+/// stored `0` means "unset" everywhere in the cap chain.
+fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
+    match batch_cap {
+        Some(cap) if cap > 0 => (cap as usize).min(REQUEST_UNIT_BUDGET),
+        _ => REQUEST_UNIT_BUDGET,
+    }
+}
+
+/// The cap as the inference API takes it: an item-count ceiling on GPU
+/// batches, `None` = auto. Forwarded verbatim; never clamped to the request
+/// budget, because it constrains a different thing.
+fn gpu_batch_cap(batch_cap: Option<i64>) -> Option<u32> {
+    batch_cap
+        .filter(|cap| *cap > 0)
+        .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX))
+}
+
+/// The cap as `data_log.batch_size` stores it. That column is NOT NULL, so
+/// auto logs as 0 — the same "unset" sentinel the threshold column uses.
+fn logged_batch_size(batch_cap: Option<i64>) -> i64 {
+    batch_cap.unwrap_or(0)
+}
+
 /// Serializes batch-model loads against the queue boundary's unloads. Held
 /// only around the load itself (and around an unload's decision + call), never
 /// for the duration of a job.
@@ -90,6 +130,11 @@ pub(crate) struct ModelMetadata {
     pub input_handler_opts: serde_json::Map<String, Value>,
     pub target_entities: Vec<String>,
     pub output_type: String,
+    /// Mirrored from the registry, no longer consulted by core: it stopped
+    /// being a batch *target* when auto became the only mode, and its
+    /// surviving safety role (the first-touch seed on unknown hardware) is
+    /// the inference side's (docs/batch-calibration-design.md).
+    #[allow(dead_code)]
     pub default_batch_size: i64,
     pub default_threshold: Option<f64>,
     pub input_mime_types: Vec<String>,
@@ -132,7 +177,11 @@ struct JobInputData {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JobDefaults {
-    pub batch_size: i64,
+    /// The user's **cap** on GPU batch size, `None` = auto (no cap).
+    /// Never a target: the inference side sizes batches from its own cost
+    /// model and only has to stay at or below this (see
+    /// docs/batch-calibration-design.md, "Batch size UX").
+    pub batch_size: Option<i64>,
     pub threshold: Option<f64>,
 }
 
@@ -327,7 +376,7 @@ async fn run_extraction_job_inner(
         threshold: defaults.threshold,
         types: vec![model.output_type.clone()],
         setter: model.setter_name.clone(),
-        batch_size: defaults.batch_size,
+        batch_size: logged_batch_size(defaults.batch_size),
         reply,
     })
     .await?;
@@ -374,9 +423,16 @@ async fn run_extraction_job_inner(
     let budget_capacity = context.intermediate_budget_kib.max(1);
     let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
     // Bounds the total number of work units inside in-flight inference
-    // requests across all items (the actual meaning of job batch_size).
-    let unit_slots = Arc::new(Semaphore::new(defaults.batch_size as usize));
-    let unit_capacity = defaults.batch_size.max(1) as usize;
+    // requests across all items. This is core-side request sizing, and it is
+    // deliberately independent of the user's batch cap: the cap constrains the
+    // GPU batches inferio forms, while this constrains how much work core
+    // keeps in flight (design doc "Batch size UX", split #2). A capped job
+    // still chunks no larger than its cap, so no single request outruns what
+    // the far side may process in one batch.
+    let unit_slots = Arc::new(Semaphore::new(REQUEST_UNIT_BUDGET));
+    let unit_capacity = request_unit_capacity(defaults.batch_size);
+    // The cap travels with each request; `None` = auto.
+    let batch_cap = gpu_batch_cap(defaults.batch_size);
     // Item tasks live in a JoinSet owned by this task: when the job is
     // cancelled (task aborted), dropping the set aborts every in-flight item
     // instead of leaving detached tasks writing to the DB.
@@ -418,6 +474,7 @@ async fn run_extraction_job_inner(
                 budget_capacity,
                 &unit_slots,
                 unit_capacity,
+                batch_cap,
                 counters,
                 total_remaining,
             )
@@ -562,6 +619,7 @@ async fn process_item(
     budget_capacity: u32,
     unit_slots: &Arc<Semaphore>,
     unit_capacity: usize,
+    batch_cap: Option<u32>,
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
 ) -> ApiResult<()> {
@@ -632,6 +690,7 @@ async fn process_item(
         pool,
         unit_slots,
         unit_capacity,
+        batch_cap,
         &inference_inputs,
         &counters,
     )
@@ -690,13 +749,18 @@ fn input_memory_kib(inputs: &[InferenceInput]) -> u32 {
 /// `unit_capacity`, holding one unit permit per work unit for the duration of
 /// each request. Together with the shared semaphore this caps the total
 /// number of work units inside in-flight inference requests at the job's
-/// batch size, and splits oversized items (e.g. many-page PDFs) into multiple
-/// sequential requests whose outputs are concatenated in order.
+/// request budget, and splits oversized items (e.g. many-page PDFs) into
+/// multiple sequential requests whose outputs are concatenated in order.
+///
+/// `batch_cap` is the user's cap and is forwarded untouched (`None` = auto):
+/// it constrains the GPU batches the inference side forms, not the size of
+/// the requests core sends.
 async fn run_chunked_inference(
     setter_name: &str,
     pool: &InferencePool,
     unit_slots: &Arc<Semaphore>,
     unit_capacity: usize,
+    batch_cap: Option<u32>,
     inputs: &[InferenceInput],
     counters: &Arc<Mutex<JobCounters>>,
 ) -> anyhow::Result<PredictOutput> {
@@ -715,10 +779,10 @@ async fn run_chunked_inference(
                 CACHE_KEY,
                 CACHE_LRU_SIZE,
                 CACHE_TTL_SECS,
-                // The job's resolved batch_size doubles as the server-side
-                // merge cap (design doc §6): a local orchestrator must not
-                // form GPU batches larger than what this job was tuned for.
-                Some(u32::try_from(chunk_size).unwrap_or(u32::MAX)),
+                // The user's cap, verbatim: `None` (auto) lets the
+                // orchestrator's cost model size GPU batches, `Some(n)` is an
+                // item-count ceiling it must not exceed.
+                batch_cap,
                 // Batch jobs opt out of lazy prewarming (design doc §8).
                 Some(false),
                 chunk,
@@ -966,19 +1030,26 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
     Ok(pql)
 }
 
+/// Resolves the job's **cap** (`None` = auto) and threshold.
+///
+/// The cap chain is user intent only — explicit request value, then the
+/// per-ID stored default, then the group default. The registry's
+/// `default_batch_size` deliberately does *not* participate: core no longer
+/// invents a batch size, and that metadata now only seeds the inference
+/// side's first touch on unknown hardware (design doc "Batch size UX").
 pub(crate) fn resolve_job_defaults(
     config: &SystemConfig,
     model: &ModelMetadata,
     batch_size: Option<i64>,
     threshold: Option<f64>,
 ) -> JobDefaults {
-    let mut chosen_batch = model.default_batch_size.max(1);
+    let mut chosen_batch: Option<i64> = None;
     let mut chosen_threshold = model.default_threshold;
 
     for setting in &config.job_settings {
         if setting.group_name == model.group && setting.inference_id.is_none() {
-            if let Some(default_batch) = setting.default_batch_size {
-                chosen_batch = default_batch;
+            if let Some(default_batch) = setting.default_batch_size.filter(|value| *value > 0) {
+                chosen_batch = Some(default_batch);
             }
             if model.default_threshold.is_some() {
                 if let Some(default_threshold) = setting.default_threshold {
@@ -991,8 +1062,8 @@ pub(crate) fn resolve_job_defaults(
         if setting.group_name == model.group
             && setting.inference_id.as_deref() == Some(&model.setter_name)
         {
-            if let Some(default_batch) = setting.default_batch_size {
-                chosen_batch = default_batch;
+            if let Some(default_batch) = setting.default_batch_size.filter(|value| *value > 0) {
+                chosen_batch = Some(default_batch);
             }
             if model.default_threshold.is_some() {
                 if let Some(default_threshold) = setting.default_threshold {
@@ -1004,7 +1075,7 @@ pub(crate) fn resolve_job_defaults(
 
     if let Some(batch) = batch_size {
         if batch > 0 {
-            chosen_batch = batch;
+            chosen_batch = Some(batch);
         }
     }
     if threshold.is_some() {
@@ -1022,7 +1093,7 @@ pub(crate) fn resolve_job_defaults(
     let threshold = resolved.filter(|value| *value != 0.0);
 
     JobDefaults {
-        batch_size: chosen_batch.max(1),
+        batch_size: chosen_batch,
         threshold,
     }
 }
@@ -1358,6 +1429,7 @@ fn bind_param<'q>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::system_config::JobSettings;
 
     // The guard that keeps a boundary unload from landing on a model a newer
     // job has already loaded: a load bumps the generation under the slot, and
@@ -1432,5 +1504,134 @@ mod tests {
         );
         let open = resolve_model_metadata(&metadata, "doctr/open_model").unwrap();
         assert_eq!(open.unavailable_reason, None);
+    }
+
+    fn test_model() -> ModelMetadata {
+        ModelMetadata {
+            group: "clip".to_string(),
+            inference_id: "ViT-H-14".to_string(),
+            setter_name: "clip/ViT-H-14".to_string(),
+            input_handler: "image_frames".to_string(),
+            input_handler_opts: serde_json::Map::new(),
+            target_entities: vec!["items".to_string()],
+            output_type: "clip".to_string(),
+            default_batch_size: 64,
+            default_threshold: None,
+            input_mime_types: Vec::new(),
+            skip_processed_items: true,
+            unavailable_reason: None,
+            name: None,
+            description: None,
+            link: None,
+        }
+    }
+
+    fn config_with(settings: Vec<JobSettings>) -> SystemConfig {
+        SystemConfig {
+            job_settings: settings,
+            ..SystemConfig::default()
+        }
+    }
+
+    // Auto is the default and the registry number no longer leaks into it:
+    // with nothing stored and nothing requested the job runs uncapped, and a
+    // stored zero reads as "unset", not as a cap of zero.
+    #[test]
+    fn an_unset_batch_size_resolves_to_auto() {
+        let model = test_model();
+        assert_eq!(
+            resolve_job_defaults(&config_with(Vec::new()), &model, None, None).batch_size,
+            None
+        );
+        assert_eq!(
+            resolve_job_defaults(&config_with(Vec::new()), &model, Some(0), None).batch_size,
+            None
+        );
+
+        let zeroed = config_with(vec![JobSettings {
+            group_name: "clip".to_string(),
+            inference_id: None,
+            default_batch_size: Some(0),
+            default_threshold: None,
+        }]);
+        assert_eq!(
+            resolve_job_defaults(&zeroed, &model, None, None).batch_size,
+            None
+        );
+    }
+
+    // The cap chain is user intent only, most specific first.
+    #[test]
+    fn the_cap_chain_prefers_the_request_then_the_model_then_the_group() {
+        let model = test_model();
+        let config = config_with(vec![
+            JobSettings {
+                group_name: "clip".to_string(),
+                inference_id: None,
+                default_batch_size: Some(8),
+                default_threshold: None,
+            },
+            JobSettings {
+                group_name: "clip".to_string(),
+                inference_id: Some("clip/ViT-H-14".to_string()),
+                default_batch_size: Some(4),
+                default_threshold: None,
+            },
+        ]);
+        assert_eq!(
+            resolve_job_defaults(&config, &model, Some(2), None).batch_size,
+            Some(2)
+        );
+        assert_eq!(
+            resolve_job_defaults(&config, &model, None, None).batch_size,
+            Some(4)
+        );
+
+        let group_only = config_with(vec![JobSettings {
+            group_name: "clip".to_string(),
+            inference_id: None,
+            default_batch_size: Some(8),
+            default_threshold: None,
+        }]);
+        assert_eq!(
+            resolve_job_defaults(&group_only, &model, None, None).batch_size,
+            Some(8)
+        );
+    }
+
+    // The split the design turns on: core-side request sizing is the constant
+    // and never the user's cap, while the cap goes to the inference side
+    // untouched. The job body wires exactly these two: `unit_slots` is
+    // `Semaphore::new(REQUEST_UNIT_BUDGET)` (no cap term at all),
+    // `unit_capacity` is `request_unit_capacity`, and the value handed to
+    // `pool.predict` is `gpu_batch_cap`'s — not the chunk size, which is what
+    // it used to be.
+    #[test]
+    fn the_request_budget_is_independent_of_the_users_cap() {
+        // Auto and every cap at or above the budget chunk at the budget.
+        assert_eq!(request_unit_capacity(None), REQUEST_UNIT_BUDGET);
+        assert_eq!(
+            request_unit_capacity(Some(REQUEST_UNIT_BUDGET as i64)),
+            REQUEST_UNIT_BUDGET
+        );
+        assert_eq!(request_unit_capacity(Some(4096)), REQUEST_UNIT_BUDGET);
+        // A smaller cap also bounds the chunk, so no request outruns what the
+        // far side may process at once.
+        assert_eq!(request_unit_capacity(Some(8)), 8);
+        // Zero is "unset" everywhere in the cap chain, never a capacity of 0.
+        assert_eq!(request_unit_capacity(Some(0)), REQUEST_UNIT_BUDGET);
+        assert_eq!(request_unit_capacity(Some(-1)), REQUEST_UNIT_BUDGET);
+
+        // The cap itself is forwarded verbatim: not clamped to the budget,
+        // not turned into a number when it is absent.
+        assert_eq!(gpu_batch_cap(None), None);
+        assert_eq!(gpu_batch_cap(Some(0)), None);
+        assert_eq!(gpu_batch_cap(Some(8)), Some(8));
+        assert_eq!(gpu_batch_cap(Some(4096)), Some(4096));
+        assert_eq!(gpu_batch_cap(Some(i64::MAX)), Some(u32::MAX));
+
+        // And auto reaches the NOT NULL log column as its 0 sentinel.
+        assert_eq!(logged_batch_size(None), 0);
+        assert_eq!(logged_batch_size(Some(8)), 8);
     }
 }

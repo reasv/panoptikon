@@ -1095,7 +1095,12 @@ pub(crate) async fn complete_setup(
     config.scan_audio = request.scan_audio;
     config.scan_pdf = request.scan_pdf;
     config.scan_html = request.scan_html;
-    config.cron_jobs = request.cron_jobs;
+    config.cron_jobs = if request.new_index_db.is_some() {
+        // A database created by this run has no prior schedule to preserve.
+        request.cron_jobs
+    } else {
+        merge_cron_batch_caps(request.cron_jobs, &config.cron_jobs)
+    };
     config.enable_cron_job = request.enable_cron_job;
     config.cron_schedule = request.cron_schedule;
     store.save(&index_db, &config)?;
@@ -1107,6 +1112,79 @@ pub(crate) async fn complete_setup(
     };
 
     Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+}
+
+/// Carries an existing per-model batch cap across a wizard rerun.
+///
+/// The wizard replaces the whole cron schedule but has stopped sending
+/// `batch_size` at all (the cap is auto for new databases and edited on the
+/// Scan page afterwards), so on the reconfigure path a wholesale assignment
+/// would silently wipe a cap the user set there. `None` from the wizard means
+/// "not specified", not "clear it": the stored value wins. `threshold` gets
+/// no such treatment — the wizard still sends it, so what it sends is intent.
+fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<CronJob> {
+    incoming
+        .into_iter()
+        .map(|mut job| {
+            if job.batch_size.is_none() {
+                if let Some(stored) = existing
+                    .iter()
+                    .find(|candidate| candidate.inference_id == job.inference_id)
+                {
+                    job.batch_size = stored.batch_size;
+                }
+            }
+            job
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cron_cap_merge_tests {
+    use super::*;
+
+    fn job(inference_id: &str, batch_size: Option<i64>, threshold: Option<f64>) -> CronJob {
+        CronJob {
+            inference_id: inference_id.to_string(),
+            batch_size,
+            threshold,
+        }
+    }
+
+    // A rerun of the wizard (which no longer sends batch_size) keeps the cap
+    // the user set on the Scan page, per model, and does not invent one for
+    // models that never had a cap.
+    #[test]
+    fn a_rerun_without_batch_sizes_preserves_the_stored_caps() {
+        let existing = vec![
+            job("clip/ViT-H-14", Some(8), Some(0.1)),
+            job("tags/wd-v1", None, None),
+            job("gone/model", Some(32), None),
+        ];
+        let incoming = vec![
+            job("clip/ViT-H-14", None, Some(0.4)),
+            job("tags/wd-v1", None, None),
+            job("new/model", None, None),
+        ];
+
+        let merged = merge_cron_batch_caps(incoming, &existing);
+
+        assert_eq!(merged[0].batch_size, Some(8));
+        // The wizard still owns the threshold it sends.
+        assert_eq!(merged[0].threshold, Some(0.4));
+        assert_eq!(merged[1].batch_size, None);
+        assert_eq!(merged[2].batch_size, None);
+        // A model dropped from the schedule stays dropped.
+        assert_eq!(merged.len(), 3);
+    }
+
+    // An explicit incoming cap is intent and wins over the stored one.
+    #[test]
+    fn an_explicit_cap_overrides_the_stored_one() {
+        let existing = vec![job("clip/ViT-H-14", Some(8), None)];
+        let merged = merge_cron_batch_caps(vec![job("clip/ViT-H-14", Some(4), None)], &existing);
+        assert_eq!(merged[0].batch_size, Some(4));
+    }
 }
 
 #[cfg(test)]

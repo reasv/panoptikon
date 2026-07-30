@@ -89,20 +89,37 @@ pub(crate) async fn migrate_databases_on_disk(
     let index_db = index_db.unwrap_or(&default_index).to_string();
     let user_data_db = user_data_db.unwrap_or(&default_user).to_string();
     let paths = db_paths(&index_db, &user_data_db)?;
-    migrate_path(&paths.index_db_file, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await?;
+    migrate_path(
+        &paths.index_db_file,
+        &INDEX_MIGRATOR,
+        INDEX_ALEMBIC_HEAD,
+        DbKind::Index,
+    )
+    .await?;
     migrate_path(
         &paths.storage_db_file,
         &STORAGE_MIGRATOR,
         STORAGE_ALEMBIC_HEAD,
+        DbKind::Other,
     )
     .await?;
     migrate_path(
         &paths.user_db_file,
         &USER_DATA_MIGRATOR,
         USER_DATA_ALEMBIC_HEAD,
+        DbKind::Other,
     )
     .await?;
     Ok(paths)
+}
+
+/// Which schema a migrated file carries. Only the index databases run
+/// Rust post-migration steps (`db::batch_auto`), and those steps need to know
+/// they are looking at an `index.db` before deriving anything from its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbKind {
+    Index,
+    Other,
 }
 
 pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
@@ -124,11 +141,23 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
             let db_dir = entry.path();
             let index_db_file = db_dir.join("index.db");
             if index_db_file.is_file() {
-                migrate_path(&index_db_file, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD).await?;
+                migrate_path(
+                    &index_db_file,
+                    &INDEX_MIGRATOR,
+                    INDEX_ALEMBIC_HEAD,
+                    DbKind::Index,
+                )
+                .await?;
             }
             let storage_db_file = db_dir.join("storage.db");
             if storage_db_file.is_file() {
-                migrate_path(&storage_db_file, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD).await?;
+                migrate_path(
+                    &storage_db_file,
+                    &STORAGE_MIGRATOR,
+                    STORAGE_ALEMBIC_HEAD,
+                    DbKind::Other,
+                )
+                .await?;
             }
         }
     }
@@ -152,7 +181,13 @@ pub(crate) async fn migrate_all_databases_on_disk() -> Result<()> {
             if !is_db {
                 continue;
             }
-            migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD).await?;
+            migrate_path(
+                &path,
+                &USER_DATA_MIGRATOR,
+                USER_DATA_ALEMBIC_HEAD,
+                DbKind::Other,
+            )
+            .await?;
         }
     }
 
@@ -191,7 +226,26 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
     })
 }
 
-async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &str) -> Result<()> {
+/// Runs the index migrator over one file, hook included. Test-only: the
+/// production paths always go through `migrate_databases_on_disk` or the
+/// startup sweep.
+#[cfg(test)]
+pub(crate) async fn migrate_index_path_for_test(path: &Path) -> Result<()> {
+    migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD, DbKind::Index).await
+}
+
+/// The same for a `storage.db`, used to prove the hook is index-only.
+#[cfg(test)]
+pub(crate) async fn migrate_storage_path_for_test(path: &Path) -> Result<()> {
+    migrate_path(path, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD, DbKind::Other).await
+}
+
+async fn migrate_path(
+    path: &Path,
+    migrator: &Migrator,
+    expected_alembic_head: &str,
+    kind: DbKind,
+) -> Result<()> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true);
@@ -240,6 +294,12 @@ async fn migrate_path(path: &Path, migrator: &Migrator, expected_alembic_head: &
             elapsed_ms = started.elapsed().as_millis() as u64,
             "post-migration ANALYZE complete"
         );
+    }
+    if kind == DbKind::Index {
+        // Rust post-migration step: the one-time reset of stored batch sizes
+        // to auto. It lives here so it covers both the per-DB open/create
+        // path and the startup sweep — see db::batch_auto for why both matter.
+        crate::db::batch_auto::apply_batch_auto_migration(&mut conn, path, fresh).await?;
     }
     // All three databases are read while other connections write them (index
     // and storage by jobs, user_data directly by API handlers). WAL is a
@@ -642,7 +702,7 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, Some(USER_DATA_ALEMBIC_HEAD)).await;
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect("baseline at head should succeed");
 
@@ -669,7 +729,7 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, Some("31adcda83d68")).await;
 
-        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect_err("outdated revision must be refused");
         assert!(format!("{err:#}").contains("alembic revision"), "{err:#}");
@@ -683,7 +743,7 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, None).await;
 
-        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect_err("missing alembic_version must be refused");
         assert!(format!("{err:#}").contains("no alembic_version"), "{err:#}");
@@ -726,7 +786,7 @@ mod tests {
     async fn crlf_recorded_checksums_are_repaired() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .unwrap();
 
@@ -744,7 +804,7 @@ mod tests {
         }
         conn.close().await.unwrap();
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect("CRLF-recorded checksums must be repaired, not refused");
 
@@ -782,7 +842,7 @@ mod tests {
     async fn unexplained_checksum_mismatch_is_rerecorded_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .unwrap();
 
@@ -794,7 +854,7 @@ mod tests {
             .unwrap();
         conn.close().await.unwrap();
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect("an applied migration must never fail startup on a checksum");
 
@@ -843,7 +903,12 @@ mod tests {
         let create_table = migration(1, "CREATE TABLE things (id INTEGER PRIMARY KEY, kind TEXT)");
         let create_index = migration(2, "CREATE INDEX idx_things_kind ON things (kind)");
 
-        migrate_path(&path, &migrator_of(vec![create_table.clone()]), "unused")
+        migrate_path(
+            &path,
+            &migrator_of(vec![create_table.clone()]),
+            "unused",
+            DbKind::Other,
+        )
             .await
             .unwrap();
 
@@ -865,6 +930,7 @@ mod tests {
             &path,
             &migrator_of(vec![create_table.clone(), create_index.clone()]),
             "unused",
+            DbKind::Other,
         )
         .await
         .unwrap();
@@ -885,7 +951,12 @@ mod tests {
             .await
             .unwrap();
         conn.close().await.unwrap();
-        migrate_path(&path, &migrator_of(vec![create_table, create_index]), "unused")
+        migrate_path(
+            &path,
+            &migrator_of(vec![create_table, create_index]),
+            "unused",
+            DbKind::Other,
+        )
             .await
             .unwrap();
         let mut conn = connect(&path).await;
@@ -904,7 +975,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD)
+        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
             .await
             .expect("fresh database creation should succeed");
 
