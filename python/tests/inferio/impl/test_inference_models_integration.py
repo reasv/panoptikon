@@ -368,6 +368,44 @@ def test_faster_whisper_model_runs_on_cuda(model_cache_env):
 
 
 @pytest.mark.integration
+def test_nemotron_embed_vl_runs_on_cuda(model_cache_env):
+    if not _requires_cuda():
+        pytest.skip("nemotron-embed-vl runs bf16; CPU fp32 is impractically slow.")
+    if not _env_flag("PANOPTIKON_RUN_NEMOTRON_EMBED"):
+        pytest.skip(
+            "Set PANOPTIKON_RUN_NEMOTRON_EMBED=1 to run the nemotron-embed-vl "
+            "integration test (3.4 GB download)."
+        )
+
+    import numpy as np
+
+    from inferio.impl.nemotron_embed_vl import NemotronEmbedVLModel
+    from inferio.inferio_types import PredictionInput
+
+    model = NemotronEmbedVLModel(
+        model_name_or_path="nvidia/llama-nemotron-embed-vl-1b-v2",
+        attn_implementation="sdpa",
+    )
+    image_bytes = _make_test_image_bytes()
+    outputs = _predict_and_unload(
+        model,
+        [
+            PredictionInput(data={"text": "a page that says hello"}, file=None),
+            PredictionInput(data=None, file=image_bytes),
+        ],
+    )
+    assert len(outputs) == 2
+    for out in outputs:
+        assert isinstance(out, (bytes, bytearray))
+        arr = _deserialize_np_array(bytes(out))
+        # The clip output handler requires one 1D vector per input, and the
+        # impl L2-normalizes (the raw model output is unnormalized).
+        assert arr.ndim == 1
+        assert arr.shape[0] == 2048
+        assert abs(float(np.linalg.norm(arr)) - 1.0) < 1e-2
+
+
+@pytest.mark.integration
 def test_florence2_runs_on_cuda(model_cache_env):
     if not _requires_cuda():
         pytest.skip("Florence2 uses float16 + torch.compile; requires CUDA.")

@@ -632,7 +632,8 @@ config.impl_class = "qwen3-vl-embedding"
 config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
-  model. Heavier than CLIP; consider smaller batch sizes."""
+  model. Leads MMEB-V2 across natural images and visual documents. Heavier \
+  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 
 
@@ -641,8 +642,36 @@ config.impl_class = "qwen3-vl-embedding"
 config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
-  model. Heavier than CLIP; consider smaller batch sizes."""
+  model. Strong on visual documents/screenshots as well as natural images \
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
+  smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+
+[group.clip.inference_ids.PE-Core-L-14-336_meta]
+config.model_name = "PE-Core-L-14-336"
+config.pretrained = "meta"
+metadata.description = """Perception Encoder Core L/14 (336px) by Meta (2025). \
+  Outperforms ViT-H-14-378 (DFN5B) on retrieval benchmarks (COCO T2I R@1 \
+  57.1 vs 55.6) at ~1.3 GB VRAM in fp16 and roughly twice the speed. Note: \
+  32-token text context, long queries are truncated."""
+metadata.link = "https://huggingface.co/facebook/PE-Core-L14-336"
+
+[group.clip.inference_ids.PE-Core-bigG-14-448_meta]
+config.model_name = "PE-Core-bigG-14-448"
+config.pretrained = "meta"
+metadata.description = """Perception Encoder Core bigG/14 (448px) by Meta \
+  (2025). The largest and strongest PE model (COCO T2I R@1 58.1), but very \
+  heavy: ~4.6 GB VRAM in fp16 for marginal benchmark gains over PE-Core-L."""
+metadata.link = "https://huggingface.co/facebook/PE-Core-G14-448"
+
+[group.clip.inference_ids.ViT-B-16-SigLIP2-384_webli]
+config.model_name = "ViT-B-16-SigLIP2-384"
+config.pretrained = "webli"
+metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
+  matches ViT-H-14-378 (DFN5B) retrieval quality (COCO T2I R@1 54.6 vs 55.6) \
+  at ~0.75 GB VRAM in fp16. Multilingual. Recommended if resources are \
+  limited."""
+metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
 
 [group.clip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
@@ -666,6 +695,19 @@ config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
 metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
   accuracy (72.6%) for the size. Recommended if resources are very limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+
+[group.clip.inference_ids.nemotron-embed-vl-1b-v2]
+config.impl_class = "nemotron-embed-vl"
+config.model_name_or_path = "nvidia/llama-nemotron-embed-vl-1b-v2"
+config.attn_implementation = "sdpa"
+metadata.description = """NVIDIA Llama Nemotron Embed VL 1B v2: unified \
+  multimodal embedder (Llama 3.2 1B + SigLIP2 vision, ~1.7B params, 2048-dim, \
+  ~3.2 GB VRAM in bf16). Tiles images at native aspect ratio. Trained for \
+  visual document retrieval (screenshots, PDF pages, charts); natural \
+  image/art retrieval quality is unproven. Asymmetric retriever: text is \
+  always embedded as a search query, so use it for image embeddings only \
+  and do not pair it with a CLIP Text Embeddings (tclip) run."""
+metadata.link = "https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2"
 
 [group.clip.inference_ids.jina-clip-v2-api]
 config.model_name     = "jina-clip-v2"
@@ -856,7 +898,8 @@ config.impl_class = "qwen3-vl-embedding"
 config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
-  model. Heavier than CLIP; consider smaller batch sizes."""
+  model. Leads MMEB-V2 across natural images and visual documents. Heavier \
+  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 
 
@@ -865,8 +908,34 @@ config.impl_class = "qwen3-vl-embedding"
 config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
-  model. Heavier than CLIP; consider smaller batch sizes."""
+  model. Strong on visual documents/screenshots as well as natural images \
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
+  smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+
+[group.tclip.inference_ids.PE-Core-L-14-336_meta]
+config.model_name = "PE-Core-L-14-336"
+config.pretrained = "meta"
+metadata.description = """Perception Encoder Core L/14 (336px) by Meta (2025). \
+  Outperforms ViT-H-14-378 (DFN5B) on retrieval benchmarks at ~1.3 GB VRAM \
+  in fp16. Note: 32-token text context, longer text is truncated."""
+metadata.link = "https://huggingface.co/facebook/PE-Core-L14-336"
+
+[group.tclip.inference_ids.PE-Core-bigG-14-448_meta]
+config.model_name = "PE-Core-bigG-14-448"
+config.pretrained = "meta"
+metadata.description = """Perception Encoder Core bigG/14 (448px) by Meta \
+  (2025). The largest and strongest PE model, but very heavy: ~4.6 GB VRAM \
+  in fp16 for marginal benchmark gains over PE-Core-L."""
+metadata.link = "https://huggingface.co/facebook/PE-Core-G14-448"
+
+[group.tclip.inference_ids.ViT-B-16-SigLIP2-384_webli]
+config.model_name = "ViT-B-16-SigLIP2-384"
+config.pretrained = "webli"
+metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
+  matches ViT-H-14-378 (DFN5B) retrieval quality at ~0.75 GB VRAM in fp16. \
+  Multilingual. Recommended if resources are limited."""
+metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
 
 [group.tclip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
