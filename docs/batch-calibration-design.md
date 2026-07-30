@@ -3,7 +3,9 @@
 Package 2 of the GPU compatibility work: the concrete design for items 5–8
 of `gpu-compatibility-design.md` (self-calibrating batch size, pixel-budget
 admission, footprint recording, VRAM-aware behaviour). Decided 2026-07-30;
-supersedes the one-line itemization in that document. Not yet implemented.
+revised the same day after design review (grant ledger, dispatcher window
+rule, profile-key fallback, tiered base measurement). Supersedes the
+one-line itemization in that document. Not yet implemented.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -16,9 +18,10 @@ memory ≈ base + slope × units
 
 where `base` is the load footprint (weights + fixed overhead), `slope` is
 the marginal cost per unit of input, and *unit* is a model-specific cost
-dimension declared in the model's metadata. Every batch is then sized at
-**admission time**: read the currently available budget, subtract `base`,
-divide by `slope`, pack inputs up to that many units.
+dimension declared in the model's metadata. Every batch is then sized
+against the **currently available budget**: read live free memory, account
+for every claimant, divide the remainder by `slope`, pack inputs up to that
+many units.
 
 Why this and not a learned max batch:
 
@@ -33,11 +36,10 @@ Why this and not a learned max batch:
   different budgets. This is what makes profiles shippable.
 - Learning a max batch means probing until OOM. On a desktop with a GUI on
   the GPU that is exactly the experience we must not create. The cost model
-  is fitted from *measurements of our own usage at safe sizes*
-  (`max_memory_allocated()` deltas) and extrapolated — the OOM boundary is
-  predicted, never sought. The Package-1 OOM halving loop remains as a
-  backstop for prediction error and external-usage races, not as the
-  mechanism.
+  is fitted from *measurements of our own usage at safe sizes* and
+  extrapolated — the OOM boundary is predicted, never sought. The Package-1
+  OOM halving loop remains as a backstop for prediction error and
+  external-usage races, not as the mechanism.
 
 OOM is not a reliable signal (anything can be using the GPU); our own
 measured usage is. All calibration derives from the latter.
@@ -85,38 +87,61 @@ never a crash.
 
 Notes:
 
-- `max-times-count` models benefit most from **bucketing**: admission sorts
-  the pending queue by per-item units and packs batches from
+- `max-times-count` models benefit most from **bucketing**: packing sorts
+  the pending window by per-item units and builds batches from
   similarly-sized neighbours, so one 8000×6000 scan doesn't tax 63
   thumbnails. This is what finally retires easyOCR's
-  `enable_batching = false`.
+  `enable_batching = false`. Safety never depends on bucketing —
+  max×count pricing admits a mixed batch conservatively (one big scan →
+  batch of 1–2) — it is purely the throughput win, and its depth comes
+  from window sizing (below). The easyOCR acceptance test must run under
+  realistic core pipelining, or it measures a depth that never occurs in
+  production.
 - For `pixel` units, "units" means decoded pixels *as submitted* (after
   input-spec slicing/downscale) — the same quantity
   `slice_settings.mode = "pixels"` already reasons about upstream.
+- Backends without a free-memory query (MPS, CPU) degrade to no
+  admission: seed-sized fixed batches plus the Package-1 backstop, the
+  same class as `none`.
 
 ## Where each piece runs
 
 The inference server (inferio) is independent of core, can be remote, and
-can serve several cores; there can be several inferio servers, each with
-several GPUs. Therefore:
+can serve several cores; one host can run several workers (models ×
+replicas) on one GPU. VRAM is therefore a shared resource with exactly one
+component that sees all claimants — the Rust orchestrator — and sizing
+must be centralized there, not computed independently per worker:
 
-- **Admission and measurement run in the Python worker** — it is the only
-  place that has torch, the allocator statistics, and `mem_get_info`, and
-  the only place that can act between batches. A harness around `predict()`
-  (sibling to `run_with_oom_retry`) does budget→units→pack, measures, and
-  ramps. Workers receive their profile snapshot + budget config at spawn
-  and report measurements back over the existing worker protocol
-  (a new message type beside the error frames).
-- **The Rust orchestrator owns persistence** — workers are transient. It
-  merges measurement reports into the local calibration store (atomic TOML
-  rewrite), loads shipped baselines, serves the merged view to workers at
-  spawn, and exposes state read-only over the API for UI/labels
-  (`/api/inference/metadata` overlay, like `unavailable` today).
+- **The orchestrator is the budget arbiter.** Per GPU (by board UUID) it
+  keeps a ledger: the configured limits, each resident worker's recorded
+  `base`, each in-flight window's outstanding **grant**, and the freshest
+  external-usage sample. All sizing intelligence lives here: it fits the
+  cost model from reported samples, owns persistence (atomic TOML rewrite
+  of the local store, shipped-baseline loading), sizes dispatcher windows,
+  attaches a memory grant to every window, and exposes state read-only
+  over the API for UI/labels (`/api/inference/metadata` overlay, like
+  `unavailable` today).
+- **The worker is mechanism and sensor.** It is the only place that has
+  torch, the allocator statistics, `mem_get_info`, and per-item unit
+  counts after decode. A harness around `predict()` (sibling to
+  `run_with_oom_retry`) packs the window into GPU batches within the
+  grant (bucketed for `max-times-count`), applies the defensive clamp,
+  measures every batch, and reports measurements plus a fresh device
+  memory sample on the response frame.
 - **Core keeps its opaque-ID worldview** — it learns nothing about VRAM,
   GPUs, or profiles. It forwards the user cap per request and sizes its
   *requests* by its own concerns (payload memory in flight, pipelining),
   not by guessing GPU batches. The orchestrator/worker re-slices whatever
   arrives.
+
+Transport: **no new channels**. The worker protocol is strictly
+request/response with one window in flight per worker, so grants (and
+cost-fit snapshots, when they change) ride on request frames,
+measurements and memory samples ride on response frames, and the load
+response carries the base measurement. A worker-initiated query channel
+("ask the scheduler for the current budget mid-window") was considered
+and rejected: it complicates the protocol for a grow-direction freshness
+win the grant model already bounds (see the staleness note below).
 
 Two keyspaces, deliberately different:
 
@@ -129,45 +154,128 @@ Two keyspaces, deliberately different:
   index is **never** an identity — it is not stable across reboots or
   `CUDA_VISIBLE_DEVICES` changes.
 
-## Admission algorithm (per batch, worker-side)
+## Dispatcher windows and the batch cap
+
+The dispatcher's current effective-cap rule (max over the explicit
+`max_batch` values in the window; else registry `default_batch_size`;
+else server default) existed to reconcile "inferio doesn't know what is
+safe" with heterogeneously-capped requests. Grant-based admission removes
+that job, so the rule is **deleted, not adapted** — its OOM-recovery
+rationale is obsolete once safety lives in the ledger.
+
+Under auto:
+
+- **Window size comes from the orchestrator's fitted model**, like the
+  grant: a few GPU batches' worth of units (≈2–4× the current admitted
+  batch estimate; seed-derived before calibration), additionally bounded
+  by payload bytes (the 512 MiB frame limit is the hard wall). Windows
+  deep enough to hold several batches are what give bucketing material
+  and amortize the request/response round trip; the *bound* is what keeps
+  work divisible across replicas (an unbounded drain would hand the whole
+  queue to the first free replica) and keeps the failure blast radius
+  small (a window is the unit of fallback and of fatal-error loss). There
+  is no time bound anywhere: `predict` keeps its no-deadline semantics.
+- **The user cap travels per request.** Windows are partitioned by cap
+  value — capped jobs are the exception under auto, so mixed-cap queues
+  are rare and the partition costs nothing — and the worker enforces the
+  cap at pack time as an **item-count constraint**, never converted to
+  units.
+
+## Grant sizing and packing
+
+Orchestrator, per GPU, when dispatching a window:
 
 ```
-free, total   = mem_get_info(device)          # device-wide, other processes included
-ours          = memory_reserved(device)        # allocator pool = our footprint as the driver sees it
-other         = total − free − ours
-
-limit_total   = total × cap_fraction           # if configured (server lever)
-limit_margin  = total − other × (1 + margin)   # if configured (desktop lever, default on)
-budget        = min(configured limits) − base_if_not_resident
-
-max_units     = clamp((budget − predicted_current_batch_overhead) / slope,
-                      0, throughput_knee_units, request_cap_units)
+external  = total − free − Σ reserved(our workers, latest reports)
+limit     = min(total × cap_fraction,           # server lever, default off
+                total − external × (1 + margin)) # desktop lever, default on
+headroom  = limit − Σ base(residents) − Σ outstanding_grants
+grant     = min(headroom share, ramp step, slope × knee_units,
+                priced content of the window itself)
 ```
 
-- Pack inputs (bucketed for `max-times-count`) up to `max_units`; a batch
-  is never smaller than one item — a single item over budget goes through
-  anyway (the backstop catches it if it truly cannot run; Package 1 already
-  decided batch-1 OOM = item fails, job continues).
-- **Ramp**: until the profile has enough samples, do not jump to the
-  predicted ceiling — geometric ramp (seed, ×2 per clean batch) toward it,
-  measuring each step. A too-low seed costs a logarithmic number of
-  batches, which is why seeds don't need per-GPU tuning.
-- **Measurement**: `max_memory_allocated()` delta around `predict()` +
-  reset per batch, paired with batch units. Load footprint (`base`)
-  measured once around model load. Fit is a robust two-parameter fit;
-  retain scatter (sample count, residual) as confidence.
-- **Reactive shrink**: budget is recomputed every batch, so rising external
-  usage shrinks the next batch. Freeing our tensors is not enough to give
-  memory *back* — the allocator pool holds it — so when the budget target
-  falls materially below `memory_reserved()` (hysteresis: e.g. below 80%
-  of pool for 2 consecutive batches), call `empty_cache()` between batches.
-  Hysteresis exact thresholds: implementation detail, tune empirically.
+- `base` counts against the limit for **every resident, always** —
+  residency changes who has already paid it, not whether it counts.
+- **Grants are reservations, not estimates.** Two replicas cannot claim
+  the same headroom, so the concurrent-ramp race is structurally
+  impossible rather than probabilistically mitigated. A grant is released
+  when its response frame lands; a dying worker's grants are released
+  with its aborted windows under the existing generation guard.
+- **External usage is exact, not approximated.** Every worker reports its
+  own `memory_reserved` per response, so the orchestrator separates our
+  usage from the world's and the margin multiplier applies only to
+  genuinely external usage — sibling workers are never margin-inflated.
+- **Contention policy** when several models are hungry at once: demand
+  first (queue depth; an idle model holds only its `base`), then split by
+  calibrated appetite `slope × knee_units`, falling back to `base`
+  weighting before calibration, with a floor of one seed batch per worker
+  so nothing starves to zero.
+- **Ramp**: until the fit has enough samples, grants ramp geometrically
+  (seed, ×2 per clean window) instead of jumping to the predicted
+  ceiling, measuring each step. A too-low seed costs a logarithmic number
+  of windows, which is why seeds don't need per-GPU tuning.
+
+Worker, per batch within its window:
+
+- Convert the grant to units with the current cost fit and pack (bucketed
+  for `max-times-count`) up to it; a batch is never smaller than one
+  item — a single item over budget goes through anyway (the backstop
+  catches it if it truly cannot run; Package 1 already decided batch-1
+  OOM = item fails, job continues).
+- **Defensive clamp, shrink-only**: before each batch, check live
+  `mem_get_info` and pack smaller if the world moved; never exceed the
+  grant. Freshness is therefore per-batch in the shrink direction and
+  per-window in the grow direction — staleness can only *under*-size
+  (memory freed mid-window is not seen until the next window's grant), a
+  throughput nibble bounded by window depth, never a safety issue.
+- **Measurement**: `max_memory_reserved()` and `max_memory_allocated()`
+  deltas around each batch + reset, paired with batch units. The fit runs
+  orchestrator-side on the **reserved** series — that is the currency the
+  driver (and therefore the budget) sees; allocator fragmentation and
+  library workspaces make `allocated` a systematic underestimate, not
+  scatter. `allocated` is retained as a diagnostic floor. Robust
+  two-parameter fit; retain scatter (sample count, residual) as
+  confidence.
+- **Reactive shrink**: grants shrink as external usage rises, but freeing
+  our tensors is not enough to give memory *back* — the allocator pool
+  holds it — so when the grant falls materially below `memory_reserved()`
+  (hysteresis: e.g. below 80% of pool for 2 consecutive windows), call
+  `empty_cache()` between batches. Exact thresholds: implementation
+  detail, tune empirically.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
-  moved) and temporarily deflates the effective budget for that worker.
+  moved) and deflates that worker's grants; N consecutive clean windows
+  restore them — deflation must be recoverable, or one external spike
+  degrades a worker until respawn.
 
-The only timing assumption: external usage doesn't swing by more than the
-margin between two consecutive batches. The backstop covers the exceptions.
+The only timing assumption left: external usage doesn't swing by more
+than the margin within one window. The backstop covers the exceptions.
+
+## Base measurement
+
+`base` is the worker's whole-**process** device footprint, not its
+allocator footprint: the CUDA context (~300–600 MB) and cuDNN/cuBLAS
+workspaces reduce free memory but never appear in allocator statistics,
+and the ledger (and item-8 eviction) count residents in driver currency.
+Undercounting each resident by half a GB, times several residents, is
+phantom headroom. Measurement is tiered:
+
+1. **NVML per-process** (`nvmlDeviceGetComputeRunningProcesses`, own
+   PID's `usedGpuMemory`) — exact and pollution-free; reliable on Linux
+   including the CUDA Docker image under the nvidia runtime
+   (`nvidia-ml-py`, pure-Python dependency).
+2. Where NVML reports N/A — **Windows WDDM** — fall back to the
+   `mem_get_info` free-delta around load, clamped to ≥ the
+   allocated-delta. It is a one-shot sample: a reading implausibly larger
+   than allocated means another process moved during the load window →
+   fall back to allocated + a fixed context estimate.
+3. The `max_memory_allocated` delta around load is always recorded as the
+   floor.
+
+`base_method` is recorded in the profile as provenance. Cross-platform
+contamination is impossible by construction: `platform` is in the profile
+key, so Linux bases (exact, with Linux-sized contexts) never overlay
+Windows entries, whose WDDM contexts are genuinely different sizes.
 
 ## Budget configuration
 
@@ -215,8 +323,9 @@ dtype        = "fp16"                  # negotiated dtype actually in use
 unit         = "item"                  # denormalized from metadata for readability
 aggregation  = "count"
 
-base_mb           = 4321               # load footprint
-slope_kb_per_unit = 812.5              # marginal cost
+base_mb           = 4321               # load footprint (process-level, see Base measurement)
+base_method       = "nvml"             # nvml | free_delta | alloc_delta
+slope_kb_per_unit = 812.5              # marginal cost, fitted on reserved deltas
 knee_units        = 512                # optional: throughput stopped improving here
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
@@ -226,6 +335,16 @@ generator         = "panoptikon 0.1.8" # provenance
 
 Key tuple for lookup: `(inference_id, epoch, gpu, platform, backend,
 torch, dtype)`.
+
+**Lookup is a fallback hierarchy, not an exact match** on the full tuple:
+exact torch string → same torch `major.minor` ignoring the local version
+tag (`backend` already encodes the CUDA/ROCm family) → no match. The full
+string stays in the file as provenance; `epoch` remains the deliberate
+invalidation lever. A fallback-matched profile is used with a widened
+effective margin until local samples confirm it. Without this, every
+torch patch bump would orphan the entire shipped-baseline set, and
+volunteers on different patch versions would produce disjoint,
+never-matching entries.
 
 ### Layering and lifecycle
 
@@ -266,11 +385,12 @@ The current single number splits three ways:
 
 1. **User cap** (`Option`, default `None` = no cap) — renamed
    "max batch size" in every UI surface. Request-scoped: core forwards it
-   on each inference request; the worker applies
-   `min(cap, admission result)`. Inferio stores nothing per user/core, so
-   one server serves differently-capped jobs from several cores
-   concurrently. Capping only lowers; there is no override above the
-   calibrated/knee ceiling.
+   on each inference request; the dispatcher partitions windows by cap
+   value and the worker enforces it at pack time as an item-count
+   constraint (see the dispatcher section). Inferio stores nothing per
+   user/core, so one server serves differently-capped jobs from several
+   cores concurrently. Capping only lowers; there is no override above
+   the calibrated/knee ceiling.
 2. **Core in-flight sizing** — no longer user-facing. Core sizes requests
    by request-level concerns (payload bytes in flight — the existing
    byte-budget pipelining — and keeping the server fed), not by the cap
@@ -297,15 +417,21 @@ Migration and surface changes:
 
 ## Rollout order
 
-1. Cost-dimension metadata + admission/measurement harness in the worker,
-   with the local store round-trip through the orchestrator. easyOCR
-   re-batching (bucketed `max-times-count`) is the acceptance test.
+1. Cost-dimension metadata + the ledger/grant loop: grants and fit
+   snapshots on request frames, measurements and memory samples on
+   response frames, tiered base on the load response, packing + defensive
+   clamp in the worker, dispatcher cap-rule removal, local store
+   round-trip through the orchestrator. easyOCR re-batching (bucketed
+   `max-times-count`) **under realistic core pipelining** is the
+   acceptance test.
 2. Budget config (margin + cap, per-UUID overrides) and the reactive
    shrink path with `empty_cache()` hysteresis.
 3. Core/UI: auto/cap rename, wizard removal, last-used reset migration,
    cron "auto".
-4. Throughput-knee capture; shipped-baseline directory wiring (format
-   exists from step 1; shipping actual baselines can lag).
+4. Throughput-knee capture — fitted in units/sec (heterogeneous batches
+   make items/sec noisy for `sum` models) with a minimum-sample gate
+   before the knee may cap grants; shipped-baseline directory wiring
+   (format exists from step 1; shipping actual baselines can lag).
 5. Impl-time verifications flagged in the taxonomy table (moondream
    bounds, doctr recognition variance, qwen3 pixel cap, CLAP window).
 
@@ -319,14 +445,17 @@ script, not a subsystem.
 
 - Desktop margin default: 0.10 pending real-world feel; revisit after
   dogfooding on the two-5090 host (asymmetric monitor load is the test).
-- `empty_cache()` hysteresis thresholds (deflate ratio, consecutive-batch
-  count).
+- Tuning constants bundled as "implementation detail, tune empirically":
+  `empty_cache()` hysteresis (deflate ratio, consecutive-window count),
+  the clean-window count N that restores a deflated grant, the window
+  depth multiplier (2–4×), and the widened-margin factor for
+  fallback-matched profiles.
 - Whether `residual_mb` should widen the effective margin automatically
   (high-scatter models get more headroom) or just gate "verified" labels
   in the future Desktop tab.
-- ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi) but are
-  untested here by design; the design is backend-agnostic on paper, cuda
-  first in practice.
+- ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
+  are untested here by design; the design is backend-agnostic on paper,
+  cuda first in practice.
 - Whisper stays out of v1; if CT2 footprint recording is ever wanted it
   needs an NVML-based path (no torch allocator) and is Linux-reliable
   only.
