@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose};
-use futures_util::TryStreamExt;
 use sea_query::{SqliteQueryBuilder, Value as SeaValue, Values};
 use serde_json::Value;
 use sqlx::{
@@ -42,6 +41,17 @@ pub(crate) const CACHE_KEY: &str = "batch";
 
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
+
+/// Rows fetched per work-query chunk. The driver drains the work query in
+/// keyset chunks on short-lived read connections instead of one job-long
+/// cursor: a streaming cursor holds a SQLite read snapshot for the whole job,
+/// and that snapshot blocks every WAL checkpoint while the job's own commits
+/// accumulate in the log (a 1.2M-item tagging job was observed at a 33 GB WAL
+/// with 60-115s inserts; see docs/sqlite-wal-growth.md). Each chunk pays one
+/// re-evaluation of the work query, so the value balances per-chunk query
+/// overhead against snapshot lifetime and per-chunk row memory (text-target
+/// rows carry extracted text payloads).
+const WORK_CHUNK_ROWS: usize = 1024;
 
 /// Serializes batch-model loads against the queue boundary's unloads. Held
 /// only around the load itself (and around an unload's decision + call), never
@@ -382,53 +392,83 @@ async fn run_extraction_job_inner(
     // instead of leaving detached tasks writing to the DB.
     let mut tasks = tokio::task::JoinSet::new();
 
-    let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(compiled.sql.as_str()));
-    query = bind_params(query, &compiled.params)?;
-    let mut rows = query.fetch(&mut conn);
-    while let Some(row) = rows.try_next().await.map_err(|err| {
-        tracing::error!(error = %err, "failed to fetch extraction rows");
-        ApiError::internal("Failed to execute extraction query")
-    })? {
-        let Some(item) = map_job_input(&job.index_db, &job.user_data_db, &row).await? else {
-            continue;
+    let (cursor_column, partition_column) = work_query_keys(&model);
+    let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
+    let mut cursor = i64::MIN;
+    // Partition keys already dispatched this job. The keyset cursor alone
+    // makes one monotonic pass, but the GROUP BY representative row for an
+    // item can in principle differ between chunk queries (bare-column GROUP
+    // BY picks an arbitrary file), which could move an in-flight item ahead
+    // of the cursor; and models with skip_processed_items=false never drop
+    // processed rows from the predicate at all. This set is what guarantees
+    // each work unit is dispatched at most once per job in both cases.
+    let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    loop {
+        // The connection lives only for this fetch: the read snapshot it
+        // holds is released before any processing below awaits, so WAL
+        // checkpoints advance throughout the job instead of stalling behind
+        // a job-long cursor.
+        let rows = {
+            let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
+            query = bind_params(query, &compiled.params)?;
+            query.bind(cursor).fetch_all(&mut conn).await.map_err(|err| {
+                tracing::error!(error = %err, "failed to fetch extraction rows");
+                ApiError::internal("Failed to execute extraction query")
+            })?
         };
-        let loader_permit = loader_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal("Extraction job semaphore closed"))?;
-        let model = model.clone();
-        let pool = context.pool.clone();
-        let counters = Arc::clone(&counters);
-        let index_db = job.index_db.clone();
-        let threshold = defaults.threshold;
-        let unit_slots = Arc::clone(&unit_slots);
-        let budget_slots = Arc::clone(&budget_slots);
-        tasks.spawn(async move {
-            let result = process_item(
-                &index_db,
-                &model,
-                job_id,
-                item,
-                threshold,
-                &pool,
-                loader_permit,
-                &budget_slots,
-                budget_capacity,
-                &unit_slots,
-                unit_capacity,
-                counters,
-                total_remaining,
-            )
-            .await;
-            if let Err(err) = result {
-                tracing::error!(error = ?err, "extraction item failed");
+        let fetched = rows.len();
+        for row in &rows {
+            // Rows are ordered by the cursor key, so every row advances the
+            // cursor — including rows that are skipped or fail to map, which
+            // must not be re-fetched by the next chunk.
+            cursor = row.try_get(cursor_column).map_err(map_row_err)?;
+            let partition_key: i64 = row.try_get(partition_column).map_err(map_row_err)?;
+            if !dispatched.insert(partition_key) {
+                continue;
             }
-        });
+            let Some(item) = map_job_input(&job.index_db, &job.user_data_db, row).await? else {
+                continue;
+            };
+            let loader_permit = loader_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal("Extraction job semaphore closed"))?;
+            let model = model.clone();
+            let pool = context.pool.clone();
+            let counters = Arc::clone(&counters);
+            let index_db = job.index_db.clone();
+            let threshold = defaults.threshold;
+            let unit_slots = Arc::clone(&unit_slots);
+            let budget_slots = Arc::clone(&budget_slots);
+            tasks.spawn(async move {
+                let result = process_item(
+                    &index_db,
+                    &model,
+                    job_id,
+                    item,
+                    threshold,
+                    &pool,
+                    loader_permit,
+                    &budget_slots,
+                    budget_capacity,
+                    &unit_slots,
+                    unit_capacity,
+                    counters,
+                    total_remaining,
+                )
+                .await;
+                if let Err(err) = result {
+                    tracing::error!(error = ?err, "extraction item failed");
+                }
+            });
+        }
+        if fetched < WORK_CHUNK_ROWS {
+            break;
+        }
     }
-    drop(rows);
-    drop(conn);
+    drop(dispatched);
 
     while tasks.join_next().await.is_some() {}
 
@@ -966,6 +1006,34 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
     Ok(pql)
 }
 
+/// Keyset (cursor) and dedup (partition) columns for the compiled work query,
+/// per target entity. Must stay in sync with `build_job_pql`: the cursor
+/// column has to be unique per emitted row (`file_id` for file rows,
+/// `data_id` for text rows, both selected by every variant), and the
+/// partition column is the unit of work an item must not be dispatched twice
+/// under (`item_id`/`data_id` mirror the query's partition_by).
+fn work_query_keys(model: &ModelMetadata) -> (&'static str, &'static str) {
+    match model.target_entities.as_slice() {
+        [value] if value == "text" => ("data_id", "data_id"),
+        [value] if value == "files" => ("file_id", "file_id"),
+        _ => ("file_id", "item_id"),
+    }
+}
+
+/// Wraps the compiled work query in a keyset-pagination envelope. The inner
+/// SQL is emitted by our PQL compiler (possibly starting with a WITH clause,
+/// which SQLite accepts inside a FROM subquery); the wrapper's cursor
+/// placeholder binds *after* the inner query's own params because it appears
+/// later in the SQL text.
+fn chunked_work_query_sql(inner_sql: &str, cursor_column: &str, chunk_rows: usize) -> String {
+    format!(
+        "SELECT * FROM ({inner_sql}) AS work \
+         WHERE work.\"{cursor_column}\" > ? \
+         ORDER BY work.\"{cursor_column}\" ASC \
+         LIMIT {chunk_rows}"
+    )
+}
+
 pub(crate) fn resolve_job_defaults(
     config: &SystemConfig,
     model: &ModelMetadata,
@@ -1432,5 +1500,133 @@ mod tests {
         );
         let open = resolve_model_metadata(&metadata, "doctr/open_model").unwrap();
         assert_eq!(open.unavailable_reason, None);
+    }
+
+    fn test_model(target: &str, skip_processed: bool) -> ModelMetadata {
+        ModelMetadata {
+            group: "test".to_string(),
+            inference_id: "test/tagger".to_string(),
+            setter_name: "test/tagger".to_string(),
+            input_handler: "image_frames".to_string(),
+            input_handler_opts: serde_json::Map::new(),
+            target_entities: vec![target.to_string()],
+            output_type: "tags".to_string(),
+            default_batch_size: 4,
+            default_threshold: None,
+            input_mime_types: vec!["image/".to_string()],
+            skip_processed_items: skip_processed,
+            unavailable_reason: None,
+            name: None,
+            description: None,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn work_query_keys_match_the_partitioning_build_job_pql_emits() {
+        assert_eq!(work_query_keys(&test_model("items", true)), ("file_id", "item_id"));
+        assert_eq!(work_query_keys(&test_model("files", true)), ("file_id", "file_id"));
+        assert_eq!(work_query_keys(&test_model("text", true)), ("data_id", "data_id"));
+    }
+
+    // The WAL-growth regression (docs/sqlite-wal-growth.md): the driver must
+    // drain the work query in keyset chunks, each row fetched at most once
+    // across chunk queries, terminating even for models whose predicate never
+    // excludes processed items (skip_processed_items = false — the case where
+    // only the cursor prevents endless re-dispatch). Runs the *real* compiled
+    // job query (WITH clause, GROUP BY partition) against the migrated
+    // schema, so it also proves the wrapper SQL is valid SQLite.
+    #[tokio::test]
+    async fn chunked_work_query_fetches_each_item_exactly_once() {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, '2024-01-01T00:00:00', 'C:/data')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        // Five image items (one with two files, so the GROUP BY partition has
+        // something to collapse) and one non-image item the mime filter must
+        // exclude.
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (1, 'sha_1', 'md5_1', 'image/png',  '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'image/png',  '2024-01-01T00:00:00'),
+                (3, 'sha_3', 'md5_3', 'image/jpeg', '2024-01-01T00:00:00'),
+                (4, 'sha_4', 'md5_4', 'image/png',  '2024-01-01T00:00:00'),
+                (5, 'sha_5', 'md5_5', 'image/png',  '2024-01-01T00:00:00'),
+                (6, 'sha_6', 'md5_6', 'video/mp4',  '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, sha256, item_id, path, filename, last_modified, scan_id, available)
+            VALUES
+                (10, 'sha_1', 1, 'C:/data/1.png',  '1.png',  '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_1', 1, 'C:/data/1b.png', '1b.png', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_2', 2, 'C:/data/2.png',  '2.png',  '2024-01-01T00:00:00', 1, 1),
+                (13, 'sha_3', 3, 'C:/data/3.jpg',  '3.jpg',  '2024-01-01T00:00:00', 1, 1),
+                (14, 'sha_4', 4, 'C:/data/4.png',  '4.png',  '2024-01-01T00:00:00', 1, 1),
+                (15, 'sha_5', 5, 'C:/data/5.png',  '5.png',  '2024-01-01T00:00:00', 1, 1),
+                (16, 'sha_6', 6, 'C:/data/6.mp4',  '6.mp4',  '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let model = test_model("items", false);
+        let config = SystemConfig::default();
+        let pql = build_job_pql(&config, &model).unwrap();
+        let compiled = compile_pql_select(pql).unwrap();
+        let (cursor_column, partition_column) = work_query_keys(&model);
+        // Chunk size 2 with 5 matching items forces multiple chunk queries.
+        let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, 2);
+
+        let mut cursor = i64::MIN;
+        let mut dispatched = std::collections::HashSet::new();
+        let mut chunk_queries = 0;
+        loop {
+            chunk_queries += 1;
+            assert!(
+                chunk_queries <= 10,
+                "chunked drain failed to terminate: the cursor is not advancing"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
+            query = bind_params(query, &compiled.params).unwrap();
+            let rows = query
+                .bind(cursor)
+                .fetch_all(&mut dbs.index_conn)
+                .await
+                .expect("wrapped work query must be valid SQLite");
+            let fetched = rows.len();
+            for row in &rows {
+                let key: i64 = row.try_get(cursor_column).unwrap();
+                assert!(key > cursor, "chunk rows must be ordered by the cursor key");
+                cursor = key;
+                let partition_key: i64 = row.try_get(partition_column).unwrap();
+                assert!(
+                    dispatched.insert(partition_key),
+                    "item {partition_key} was dispatched twice — the regression \
+                     this drain exists to prevent"
+                );
+            }
+            if fetched < 2 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            {
+                let mut seen: Vec<i64> = dispatched.into_iter().collect();
+                seen.sort_unstable();
+                seen
+            },
+            vec![1, 2, 3, 4, 5],
+            "every matching item exactly once; the video item filtered out"
+        );
     }
 }
