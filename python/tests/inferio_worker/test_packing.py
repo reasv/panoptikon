@@ -141,6 +141,21 @@ def fake_torch():
         yield cuda
 
 
+@pytest.fixture
+def fake_rocm_torch():
+    """The same fake allocator behind a ROCm-shaped torch: `version.hip` set,
+    which is the worker's one positive HIP signal (`memory._is_hip`)."""
+    cuda = FakeCuda()
+    torch = SimpleNamespace(
+        cuda=cuda,
+        version=SimpleNamespace(hip="7.2.0", cuda=None),
+        __version__="2.11.0+rocm7.2",
+        dtype=type,
+    )
+    with mock.patch.dict(sys.modules, {"torch": torch}):
+        yield cuda
+
+
 def png_bytes(width: int, height: int) -> bytes:
     from PIL import Image
 
@@ -496,6 +511,33 @@ def test_throughput_collapse_flags_a_spilling_growth_batch(fake_torch):
         "the 1-unit tail batch is a downward step and is never comparable, "
         "however slow it is"
     )
+
+
+def test_throughput_collapse_stays_active_on_a_rocm_worker(fake_rocm_torch):
+    """The collapse detector is platform-neutral by design
+    (docs/rocm-batch-calibration-parity.md, D8): on ROCm the crisp hipMalloc
+    OOM is the primary negative signal, but the comparator stays live as a
+    generic over-admission guard. A HIP-shaped worker must flag the same
+    spilling growth batch a CUDA-shaped one does — same scenario as above,
+    different torch. This also proves the HIP memory-tier differences (NVML
+    refused, amdgpu sysfs absent, free/total from torch) do not starve the
+    detector of the pool-growth signal it keys on."""
+    calls = {"n": 0}
+
+    class Slowing:
+        def predict(self, inputs):
+            calls["n"] += 1
+            fake_rocm_torch.grow_pool(100)
+            import time
+
+            time.sleep(0.01 * (4 ** (calls["n"] - 1)))
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Slowing(), items(5), grant(unit_budget=2))
+    flags = [m.get("throughput_collapse") for m in payload["measurements"]]
+    assert flags[0] is None, "the first growing batch has no comparator"
+    assert flags[1] is True, "the spill is flagged on HIP exactly as on CUDA"
+    assert not flags[2], "the tail batch stays non-comparable on HIP too"
 
 
 def test_the_comparator_ages_out_after_a_run_of_non_comparable_batches(fake_torch):

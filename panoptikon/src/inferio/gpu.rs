@@ -226,7 +226,7 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
     // a restriction would otherwise see us pin workers to boards they
     // deliberately hid (see `restrict_to_visible`).
     let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-    build(query().as_deref(), visible.as_deref())
+    build(query(accelerator).as_deref(), visible.as_deref())
 }
 
 /// KFD topology + amdgpu sysfs (`rocm.rs`). The capability view is always
@@ -313,9 +313,26 @@ fn probe_rocm() -> HostGpus {
 }
 
 /// Run the single query. `None` on any failure — no nvidia-smi, timeout,
-/// non-zero exit.
-fn query() -> Option<String> {
-    let smi = find_nvidia_smi()?;
+/// non-zero exit — and every failure is logged, at WARN when the host is
+/// positively configured for CUDA. The ROCm probe already names every path
+/// to an unknown inventory; without these the CUDA side's empty ledger was
+/// indistinguishable from "the feature is not working".
+fn query(accelerator: Accelerator) -> Option<String> {
+    let Some(smi) = find_nvidia_smi() else {
+        // Only a WARN on a CUDA host: `cpu` boxes (and `auto`, which means
+        // accelerator resolution itself failed) legitimately have no
+        // nvidia-smi, and a startup warning on every such machine is noise.
+        if accelerator == Accelerator::Cuda {
+            tracing::warn!(
+                "this host is configured for CUDA but nvidia-smi was not \
+                 found on PATH{}; workers will not be pinned, batch sizes \
+                 will not be calibrated and model availability will not be \
+                 capability-filtered",
+                if cfg!(windows) { " or in System32" } else { "" }
+            );
+        }
+        return None;
+    };
     let mut cmd = Command::new(smi);
     cmd.args([
         "--query-gpu=index,uuid,name,memory.total,compute_cap",
@@ -324,12 +341,19 @@ fn query() -> Option<String> {
     let Some(output) = output_with_timeout(cmd, Duration::from_secs(5)) else {
         tracing::warn!(
             "nvidia-smi GPU probe failed or timed out; workers will not be \
-             pinned to a specific GPU and model availability will not be \
-             capability-filtered"
+             pinned to a specific GPU, batch sizes will not be calibrated \
+             and model availability will not be capability-filtered"
         );
         return None;
     };
     if !output.status.success() {
+        tracing::warn!(
+            status = %output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "nvidia-smi exited nonzero; leaving the GPU inventory unknown \
+             (workers will not be pinned and batch sizes will not be \
+             calibrated)"
+        );
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1138,44 +1162,64 @@ fn parse_inventory(stdout: &str) -> Option<Vec<GpuInfo>> {
         if line.is_empty() {
             continue;
         }
-        let mut fields = line.split(',');
-        let index = fields.next()?.trim().parse::<u32>().ok()?;
-        let uuid = fields.next()?.trim().to_owned();
-        let name = fields.next()?.trim().to_owned();
-        let total_mb = fields.next()?.trim().parse::<u64>().ok()?;
-        let cap_field = fields.next()?.trim().to_owned();
-        if fields.next().is_some() || !is_uuid_pin(&uuid) || name.is_empty() {
-            return None;
-        }
-        let compute_cap = if parse_compute_cap(&cap_field).is_some() {
-            Some(cap_field)
-        } else {
-            tracing::info!(
-                uuid = %uuid,
-                compute_cap = %cap_field,
-                "nvidia-smi did not report this board's compute capability; it \
-                 stays pinnable but is not used for default placement and \
-                 cannot satisfy a model's capability floor"
+        let Some(gpu) = parse_row(line) else {
+            tracing::warn!(
+                row = %line,
+                "unparseable nvidia-smi row; leaving the whole GPU inventory \
+                 unknown (workers will not be pinned and batch sizes will \
+                 not be calibrated)"
             );
-            None
+            return None;
         };
-        gpus.push(GpuInfo {
-            index,
-            uuid,
-            name,
-            total_mb,
-            compute_cap,
-            // nvidia-smi rows need neither: the UUID is both the identity
-            // and the pin form, and there is no gfx target.
-            bdf: None,
-            gfx_target_version: None,
-        });
+        gpus.push(gpu);
     }
     if gpus.is_empty() {
+        tracing::warn!(
+            "nvidia-smi reported no GPUs; workers will not be pinned and \
+             batch sizes will not be calibrated"
+        );
         None
     } else {
         Some(gpus)
     }
+}
+
+/// One row of the inventory query, or `None` if any identity column does
+/// not parse. All `None`s funnel through `parse_inventory`'s single WARN,
+/// which names the row.
+fn parse_row(line: &str) -> Option<GpuInfo> {
+    let mut fields = line.split(',');
+    let index = fields.next()?.trim().parse::<u32>().ok()?;
+    let uuid = fields.next()?.trim().to_owned();
+    let name = fields.next()?.trim().to_owned();
+    let total_mb = fields.next()?.trim().parse::<u64>().ok()?;
+    let cap_field = fields.next()?.trim().to_owned();
+    if fields.next().is_some() || !is_uuid_pin(&uuid) || name.is_empty() {
+        return None;
+    }
+    let compute_cap = if parse_compute_cap(&cap_field).is_some() {
+        Some(cap_field)
+    } else {
+        tracing::info!(
+            uuid = %uuid,
+            compute_cap = %cap_field,
+            "nvidia-smi did not report this board's compute capability; it \
+             stays pinnable but is not used for default placement and \
+             cannot satisfy a model's capability floor"
+        );
+        None
+    };
+    Some(GpuInfo {
+        index,
+        uuid,
+        name,
+        total_mb,
+        compute_cap,
+        // nvidia-smi rows need neither: the UUID is both the identity
+        // and the pin form, and there is no gfx target.
+        bdf: None,
+        gfx_target_version: None,
+    })
 }
 
 #[cfg(test)]

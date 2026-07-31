@@ -423,6 +423,22 @@ its twin. An omitted key in an override inherits the section default.
 `limit_mb` and `headroom_mb`, which is the fastest way to check that an
 override was picked up.
 
+#### Windows note: the driver's sysmem fallback
+
+On Windows the NVIDIA driver defaults to spilling over-committed VRAM into
+system RAM instead of failing the allocation ("CUDA - Sysmem Fallback
+Policy", default on since driver ~536). An over-admitted batch therefore
+never raises an out-of-memory error — it silently runs several times
+slower. The calibrator watches for exactly that shape (a pool-growing batch
+whose throughput craters relative to the previous step) and backs off as if
+it had seen an OOM, but each detection costs one slow batch. Setting the
+policy to **"Prefer No Sysmem Fallback"** (NVIDIA Control Panel → Manage 3D
+Settings, driver ≥ 546; globally or just for the venv's `python.exe`)
+restores a crisp OOM signal, which the calibrator handles faster and more
+precisely. Recommended on machines used primarily for inference; on a
+machine that also games, the global setting trades the slowdown for hard
+failures in other applications, so prefer the per-program form there.
+
 #### AMD GPUs (ROCm)
 
 Everything above runs on ROCm too: per-board budgets, admission, calibration
