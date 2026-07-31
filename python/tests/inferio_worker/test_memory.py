@@ -47,6 +47,12 @@ class FakeCuda:
         self.initialized = initialized
         self.uuid = "1a2b3c4d-0000-0000-0000-000000000000"
         self.name = "Fake GPU 5090"
+        # torch exposes the device's PCI fields from 2.8 (hipDeviceProp_t on
+        # ROCm, _CudaDeviceProperties on CUDA). `None` here stands for the
+        # older builds that do not — which includes the 2.7.1 the cpu/cu128
+        # extras currently pin, so on the shipped CUDA build that is the
+        # live case and no `gpu_bdf` is emitted at all.
+        self.pci = (0, 0x03, 0x00)
 
     def is_available(self):
         return True
@@ -71,7 +77,15 @@ class FakeCuda:
 
     def get_device_properties(self, index):
         assert index == 0, "a pinned worker only ever has device 0"
-        return SimpleNamespace(uuid=self.uuid, name=self.name)
+        props = SimpleNamespace(
+            uuid=self.uuid, name=self.name, total_memory=self.total
+        )
+        if self.pci is not None:
+            domain, bus, device = self.pci
+            props.pci_domain_id = domain
+            props.pci_bus_id = bus
+            props.pci_device_id = device
+        return props
 
     def reset_peak_memory_stats(self):
         self.reset_calls += 1
@@ -94,9 +108,20 @@ class FakeCuda:
         self.peak_reserved = max(self.peak_reserved, self.reserved)
 
 
-def fake_torch_module(cuda: object) -> SimpleNamespace:
-    """A torch stand-in carrying the attributes the module reads."""
-    return SimpleNamespace(cuda=cuda, dtype=FakeDtype, __version__="2.7.1+cu128")
+def fake_torch_module(cuda: object, hip: str | None = None) -> SimpleNamespace:
+    """A torch stand-in carrying the attributes the module reads.
+
+    `hip` makes it a ROCm build: `torch.version.hip` is the one positive
+    signal for that, and the hipified `torch.cuda.*` namespace is otherwise
+    indistinguishable from the real thing (which is the point of hipifying).
+    """
+    version = SimpleNamespace(hip=hip, cuda=None if hip else "12.8")
+    return SimpleNamespace(
+        cuda=cuda,
+        dtype=FakeDtype,
+        version=version,
+        __version__="2.11.0+rocm7.2" if hip else "2.7.1+cu128",
+    )
 
 
 @contextmanager
@@ -628,3 +653,304 @@ def test_empty_cache_never_raises() -> None:
 
     with isolated(SimpleNamespace(cuda=Exploding())):
         assert memory.empty_cache() is False
+
+
+# ---------------------------------------------------------------------------
+# Board identity: PCI address, total memory, HIP UUID suppression
+# (docs/rocm-batch-calibration-parity.md, D3)
+# ---------------------------------------------------------------------------
+
+
+def test_bdf_is_formatted_from_torchs_pci_fields(fake_torch) -> None:
+    # Expected behavior: the PCI address is the one identity vocabulary the
+    # kernel, the amdgpu driver and the HIP runtime all speak, so it is the
+    # ROCm ledger join. Lower-case hex, zero-padded, and the function digit
+    # forced to .0 — the amdgpu GPU function is always 0 (the HDMI/DP audio
+    # controller is .1 of the same *device*), which is also how the
+    # orchestrator's KFD probe renders it, so the two sides stay joinable.
+    assert memory.device_bdf() == "0000:03:00.0"
+    fake_torch.pci = (1, 0xC1, 0x1F)
+    assert memory.device_bdf() == "0001:c1:1f.0"
+    # Out-of-range values are not an address: a changed encoding must read as
+    # unknown rather than as a fabricated one.
+    fake_torch.pci = (0, 0x100, 0)
+    assert memory.device_bdf() is None
+    # An older torch simply does not carry the fields. On CUDA that is the
+    # end of it — the UUID is the identity there anyway.
+    fake_torch.pci = None
+    assert memory.device_bdf() is None
+
+
+def test_total_memory_is_reported_in_mib(fake_torch) -> None:
+    # The independent half of the registration cross-check: this comes from
+    # torch/HIP, never from the sysfs file the orchestrator's inventory total
+    # was read from, so agreement between them is evidence.
+    assert memory.gpu_total_mb() == 8192
+    fake_torch.total = 24_560 * MIB
+    assert memory.gpu_total_mb() == 24_560
+
+
+def test_hip_suppresses_the_uuid_but_keeps_the_address() -> None:
+    # Expected behavior: torch >= 2.5 renders a UUID on ROCm too, but it is a
+    # THIRD vocabulary — derived from the ASIC serial, matching neither KFD's
+    # `GPU-<16hex>` nor amd-smi's 8-4-4-4-12 form — and on consumer boards
+    # without a fused serial it is identical for every card of a model. A
+    # value that can neither match nor be trusted to differ is worse than
+    # none, so the worker reports no `gpu_uuid` at all on HIP and the ledger
+    # keys the replica by its PCI address instead.
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda, hip="7.2.0")):
+        uuid, name = memory.device_identity()
+        assert uuid is None
+        assert name == "Fake GPU 5090", "the name is informational and kept"
+        before = memory.begin_load()
+        cuda.allocate(1024)
+        report = memory.finish_load(before, object())
+    assert "gpu_uuid" not in report, report
+    assert report["gpu_bdf"] == "0000:03:00.0"
+    assert report["gpu_total_mb"] == 8192
+    assert report["torch_version"] == "2.11.0+rocm7.2"
+
+    # The same board on a CUDA build reports the UUID, and the address rides
+    # along additively (registration keys on the UUID first there).
+    with isolated(fake_torch_module(FakeCuda())):
+        uuid, _ = memory.device_identity()
+        assert uuid == "GPU-1a2b3c4d-0000-0000-0000-000000000000"
+
+
+def test_load_report_omits_the_identity_fields_it_cannot_measure(
+    fake_torch,
+) -> None:
+    # Every field here is additive and "absent means unknown": a worker with
+    # no PCI fields and no total must reply exactly as it did before D3.
+    fake_torch.pci = None
+    fake_torch.total = None
+    before = memory.begin_load()
+    fake_torch.allocate(512)
+    report = memory.finish_load(before, object())
+    assert "gpu_bdf" not in report, report
+    assert "gpu_total_mb" not in report, report
+    assert report["gpu_uuid"] == f"GPU-{fake_torch.uuid}"
+
+
+def test_a_raising_props_getter_degrades_one_field_not_the_whole_report() -> None:
+    # Expected behavior: the fields of `get_device_properties` are pybind
+    # getters, not plain attributes — arbitrary C++ that can raise anything,
+    # not only the AttributeError an older build produces. One unreadable
+    # field must read as unknown; letting the exception out would take down
+    # finish_load and lose the measured base and the negotiated dtype with
+    # it, over an identity field nothing needed.
+    class Hostile:
+        name = "Fake GPU 5090"
+        total_memory = 8192 * MIB
+        pci_domain_id = 0
+        pci_bus_id = 0x03
+        pci_device_id = 0x00
+
+        @property
+        def uuid(self):
+            raise RuntimeError("the pybind getter blew up")
+
+    class HostileProps(FakeCuda):
+        def get_device_properties(self, index):
+            assert index == 0
+            return Hostile()
+
+    cuda = HostileProps()
+    with isolated(fake_torch_module(cuda)):
+        assert memory.device_identity() == (None, "Fake GPU 5090")
+        assert memory.device_bdf() == "0000:03:00.0", "the other fields still read"
+        assert memory.gpu_total_mb() == 8192
+        before = memory.begin_load()
+        cuda.allocate(1024)
+        report = memory.finish_load(before, object())
+    assert "gpu_uuid" not in report, report
+    assert report["gpu_name"] == "Fake GPU 5090"
+    assert report["base_mb"] is not None, "the measurement survived intact"
+
+
+# ---------------------------------------------------------------------------
+# DRM fdinfo parsing (the older-ROCm-torch identity fallback, and the parser
+# D4's per-process memory tier reuses)
+# ---------------------------------------------------------------------------
+
+
+def fdinfo(pdev: str, client: int, vram: str | None, key: str = "drm-resident-vram") -> str:
+    lines = [
+        "pos:\t0",
+        "flags:\t02100002",
+        "drm-driver:\tamdgpu",
+        f"drm-pdev:\t{pdev}",
+        f"drm-client-id:\t{client}",
+    ]
+    if vram is not None:
+        lines.append(f"{key}:\t{vram}")
+    return "\n".join(lines) + "\n"
+
+
+def test_fdinfo_parses_both_memory_spellings_and_the_documented_units() -> None:
+    # `drm-memory-<region>` is the kernel docs' deprecated alias for
+    # `drm-resident-<region>` and is "only printed by amdgpu" — exactly the
+    # driver this exists for — so a parser that knew only the modern
+    # spelling would read every AMD client as zero.
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, "1024 KiB")) == (
+        "0000:03:00.0",
+        7,
+        1024 * 1024,
+    )
+    assert memory.parse_drm_fdinfo(
+        fdinfo("0000:03:00.0", 7, "2 MiB", key="drm-memory-vram")
+    ) == ("0000:03:00.0", 7, 2 * 1024 * 1024)
+    # The unit suffix is optional; bare means bytes.
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, "4096"))[2] == 4096
+    # And the grammar is `<uint> [KiB|MiB]` and nothing else: a spelling the
+    # format does not define is a line we do not understand, not a number.
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, "8 GiB")) is None
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, "4096 B")) is None
+    # Both spellings present: the modern one wins (they are aliases).
+    both = fdinfo("0000:03:00.0", 7, "8 MiB") + "drm-memory-vram:\t1 KiB\n"
+    assert memory.parse_drm_fdinfo(both)[2] == 8 * 1024 * 1024
+    # Upper-case addresses compare against ours, which are lower-case.
+    assert memory.parse_drm_fdinfo(fdinfo("0000:0C:00.0", 1, "1 KiB"))[0] == (
+        "0000:0c:00.0"
+    )
+
+
+def test_fdinfo_records_that_are_not_readings() -> None:
+    # A non-DRM fd (a socket, a file) carries none of the keys.
+    assert memory.parse_drm_fdinfo("pos:\t0\nflags:\t02\nmnt_id:\t24\n") is None
+    # The address and the client id are both required: the address is what
+    # the reading is about, the client id is what makes duplicated fds
+    # countable once.
+    assert memory.parse_drm_fdinfo("drm-pdev:\t0000:03:00.0\n") is None
+    assert memory.parse_drm_fdinfo("drm-client-id:\t7\n") is None
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, None)) == (
+        "0000:03:00.0",
+        7,
+        0,
+    ), "a client with no VRAM line holds no VRAM — a record, not a failure"
+    # Garbage never raises and never becomes a number.
+    for junk in ("", "not a fdinfo at all", "drm-pdev\t0000:03:00.0\n"):
+        assert memory.parse_drm_fdinfo(junk) is None
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", "seven", "1 KiB")) is None
+    # Expected behavior: absent and UNREADABLE are different answers. A
+    # memory line that is present but does not parse invalidates the whole
+    # record — reading it as 0 would invent an observation, and the
+    # observation it invents is the one that hands dominance (and with it
+    # this worker's board identity) to a different card.
+    for unreadable in ("lots", "-4 KiB", "4 furlongs", "1 2 KiB", "KiB"):
+        assert (
+            memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, unreadable)) is None
+        ), unreadable
+    # And an invalidated record contributes nothing to the map, not a zero.
+    assert memory.fdinfo_vram_by_pdev(
+        [fdinfo("0000:03:00.0", 7, "lots"), fdinfo("0000:0c:00.0", 8, "1 KiB")]
+    ) == {"0000:0c:00.0": 1024}
+
+
+def test_fdinfo_sums_per_board_and_dedupes_by_client() -> None:
+    # Expected behavior: several fds of one DRM client (dup(), fork) are ONE
+    # client, and summing them would double the process's VRAM. Different
+    # boards accumulate separately — the map is what D4's per-process tier
+    # filters by the identity address.
+    texts = [
+        fdinfo("0000:03:00.0", 1, "1024 KiB"),
+        fdinfo("0000:03:00.0", 1, "1024 KiB"),  # the same client, dup()ed
+        fdinfo("0000:03:00.0", 2, "512 KiB"),
+        fdinfo("0000:0c:00.0", 3, "8 MiB", key="drm-memory-vram"),
+        "not a drm fd at all\n",
+    ]
+    assert memory.fdinfo_vram_by_pdev(texts) == {
+        "0000:03:00.0": (1024 + 512) * 1024,
+        "0000:0c:00.0": 8 * 1024 * 1024,
+    }
+    assert memory.fdinfo_vram_by_pdev([]) == {}
+
+
+def test_dominant_vram_pdev_needs_a_strict_winner(tmp_path) -> None:
+    # The identity fallback for an older ROCm torch with no PCI fields. HIP
+    # filters ABOVE ROCr, so a pinned worker still holds render nodes for
+    # every ROCR-visible board: the board it is actually *using* is the one
+    # its VRAM is on. A tie identifies nothing, and guessing here does not
+    # degrade a reading — it prices one model's memory against another
+    # board's ledger.
+    def write(entries):
+        root = tmp_path / str(len(list(tmp_path.iterdir())))
+        root.mkdir()
+        for index, text in enumerate(entries):
+            (root / str(index)).write_text(text, encoding="utf-8")
+        return str(root)
+
+    winner = write(
+        [
+            fdinfo("0000:03:00.0", 1, "4 KiB"),
+            fdinfo("0000:0c:00.0", 2, "8192 MiB"),
+        ]
+    )
+    assert memory.dominant_vram_pdev(winner) == "0000:0c:00.0"
+
+    tied = write([fdinfo("0000:03:00.0", 1, "8 MiB"), fdinfo("0000:0c:00.0", 2, "8 MiB")])
+    assert memory.dominant_vram_pdev(tied) is None
+
+    idle = write([fdinfo("0000:03:00.0", 1, None), fdinfo("0000:0c:00.0", 2, "0")])
+    assert memory.dominant_vram_pdev(idle) is None, "nothing allocated yet"
+
+    # A single client that has allocated is unambiguous.
+    alone = write([fdinfo("0000:03:00.0", 1, "512 MiB")])
+    assert memory.dominant_vram_pdev(alone) == "0000:03:00.0"
+
+    # No /proc at all (every platform but Linux) is simply unknown.
+    assert memory.dominant_vram_pdev(str(tmp_path / "missing")) is None
+
+
+def test_the_fdinfo_fallback_is_hip_only(fake_torch, monkeypatch) -> None:
+    # Expected behavior: the fdinfo scan exists for ROCm torch too old to
+    # expose the PCI fields. On a CUDA host those fds are nvidia character
+    # devices, not DRM clients, and the identity is the UUID anyway — so the
+    # scan must not even run.
+    scans: list[str] = []
+
+    def scan(root=memory.FDINFO_ROOT):
+        scans.append(root)
+        return "0000:0c:00.0"
+
+    monkeypatch.setattr(memory, "dominant_vram_pdev", scan)
+    fake_torch.pci = None
+    assert memory.device_bdf() is None
+    assert scans == [], "no fdinfo scan on a CUDA build"
+
+    cuda = FakeCuda()
+    cuda.pci = None
+    with isolated(fake_torch_module(cuda, hip="7.2.0")):
+        assert memory.device_bdf() == "0000:0c:00.0"
+    assert len(scans) == 1
+
+    # And when torch DOES carry the fields they win: they are device-0
+    # scoped, i.e. exactly the board the pin selected, which no scan of this
+    # process's open files could establish.
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda, hip="7.2.0")):
+        assert memory.device_bdf() == "0000:03:00.0"
+    assert len(scans) == 1, "the fallback was not consulted"
+
+
+def test_identity_helpers_never_raise_and_never_initialize_cuda() -> None:
+    class Tripwire(FakeCuda):
+        def __init__(self):
+            super().__init__(initialized=False)
+
+        def get_device_properties(self, index):
+            raise AssertionError("get_device_properties would initialize CUDA")
+
+    with isolated(fake_torch_module(Tripwire(), hip="7.2.0")):
+        assert memory.device_bdf() is None
+        assert memory.gpu_total_mb() is None
+        assert memory.device_identity() == (None, None)
+
+    class Exploding:
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+
+    with isolated(SimpleNamespace(cuda=Exploding())):
+        assert memory.device_bdf() is None
+        assert memory.gpu_total_mb() is None

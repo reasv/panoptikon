@@ -1531,7 +1531,9 @@ mod tests {
                 ..LoadReport::default()
             }));
         }
-        let admission = ledger.register_worker("test/batch", cost, &telemetry);
+        // No expected board: this fixture spawns a worker directly, without
+        // the manager's pin→board-key pairing that supplies one.
+        let admission = ledger.register_worker("test/batch", cost, &telemetry, None);
         assert!(
             admission.is_some(),
             "the fixture must be on the priced path for this test to mean anything"

@@ -203,9 +203,40 @@ pub struct LoadReport {
     /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
     /// be an index, absent, or a UUID CUDA reordered — is the authoritative
     /// ledger identity for step 1b.
+    ///
+    /// Always absent on a ROCm worker: torch renders a UUID there from the
+    /// ASIC serial, but it is a third vocabulary matching neither KFD's nor
+    /// amd-smi's and repeating across same-model consumer boards, so the
+    /// worker suppresses it rather than emit an identity that can silently
+    /// collide (docs/rocm-batch-calibration-parity.md, D3/F5). Those hosts
+    /// are keyed by [`Self::gpu_bdf`].
     pub gpu_uuid: Option<String>,
-    /// That board's name per torch; part of the profile key.
+    /// That board's name per torch. **Informational only** — nothing keys on
+    /// it: the profile key uses the board name from the orchestrator's own
+    /// inventory, so every profile this host writes is keyed by one string
+    /// whatever each worker's torch calls the card
+    /// (`VramLedger::register_worker`, and the protocol doc's `gpu_name`
+    /// row).
     pub gpu_name: Option<String>,
+    /// The board's PCI address (`dddd:bb:dd.0`), as the worker read it from
+    /// `get_device_properties(0)`'s PCI fields — the one identity vocabulary
+    /// the kernel, the driver and the HIP runtime all speak, and therefore
+    /// the ROCm ledger join. Reported on CUDA hosts too (additive; the UUID
+    /// still keys them). Absent on an older torch with no PCI fields and no
+    /// usable fdinfo fallback.
+    ///
+    /// Which today means: **absent on the shipped CUDA build**, whose venv
+    /// pins torch 2.7.1 — `_CudaDeviceProperties` grew the PCI fields in
+    /// 2.8 — so this is live only on the `rocm` extra (torch 2.11) until
+    /// that pin moves, and the identity chain it feeds is load-bearing on
+    /// ROCm alone.
+    pub gpu_bdf: Option<String>,
+    /// That board's total VRAM in MiB, as **torch/HIP** reports it. The
+    /// point is the provenance: registration cross-checks a BDF match
+    /// against this, and it did not come from the sysfs file the inventory's
+    /// own total was read from, so agreement is evidence rather than a file
+    /// compared with itself (D3/F4).
+    pub gpu_total_mb: Option<u64>,
     /// `torch.__version__`, part of the profile key and knowable only in the
     /// worker (the orchestrator does not know its venv's torch).
     pub torch_version: Option<String>,
@@ -303,10 +334,12 @@ pub struct WorkerTelemetry {
     /// changes after spawn.
     ///
     /// Operator-facing provenance only — it is surfaced on `/health` and
-    /// nothing keys on it. The identity the ledger keys on is the
-    /// worker-reported [`LoadReport::gpu_uuid`], and the two can differ in
-    /// form as well as in value (an index pin, an unknown inventory, a MIG
-    /// instance, any ROCm host).
+    /// nothing keys on it. The identity the ledger keys on is what the
+    /// *worker* reported ([`LoadReport::gpu_uuid`], or [`LoadReport::gpu_bdf`]
+    /// on ROCm), and the two can differ in form as well as in value (an index
+    /// pin, an unknown inventory, a MIG instance, any ROCm host). The board
+    /// key a replica's *pin* names is resolved separately, for the ledger's
+    /// load reservation (`gpu::GpuInventory::resolve_board_key`).
     pub gpu: Option<String>,
     pub load: Option<Timestamped<LoadReport>>,
     /// Freshest sample, from whichever response carried one last.
@@ -746,6 +779,8 @@ impl Worker {
                 dtype = report.dtype.as_deref(),
                 gpu_uuid = report.gpu_uuid.as_deref(),
                 gpu_name = report.gpu_name.as_deref(),
+                gpu_bdf = report.gpu_bdf.as_deref(),
+                gpu_total_mb = report.gpu_total_mb,
                 torch = report.torch_version.as_deref(),
                 "worker reported its load footprint"
             );
@@ -1372,6 +1407,8 @@ impl LoadReport {
             dtype: field_string(payload, "dtype"),
             gpu_uuid: field_string(payload, "gpu_uuid"),
             gpu_name: field_string(payload, "gpu_name"),
+            gpu_bdf: field_string(payload, "gpu_bdf"),
+            gpu_total_mb: field_u64(payload, "gpu_total_mb"),
             torch_version: field_string(payload, "torch_version"),
             memory: MemorySample::parse(map_get(payload, "memory")),
         };
@@ -2409,6 +2446,8 @@ mod tests {
             ),
             (Value::from("gpu_uuid"), Value::from("GPU-1a2b")),
             (Value::from("gpu_name"), Value::from(42i64)),
+            (Value::from("gpu_bdf"), Value::from(3i64)),
+            (Value::from("gpu_total_mb"), Value::from("24576")),
             (Value::from("torch_version"), Value::from("2.7.1+cu128")),
         ];
         let report = LoadReport::parse(&mixed).expect("the good fields are kept");
@@ -2417,6 +2456,12 @@ mod tests {
         assert_eq!(report.memory, None);
         assert_eq!(report.gpu_uuid.as_deref(), Some("GPU-1a2b"));
         assert_eq!(report.gpu_name, None, "a non-string name is unknown");
+        assert_eq!(report.gpu_bdf, None, "a non-string address is unknown");
+        assert_eq!(
+            report.gpu_total_mb, None,
+            "a stringified total is unknown, never a parsed number: the \
+             registration cross-check must not admit a board on a guess"
+        );
         assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
 
         // A whole-MiB float (a worker that ever switches to fractional MB)
@@ -2428,6 +2473,38 @@ mod tests {
         let report = LoadReport::parse(&floats).expect("float base is usable");
         assert_eq!(report.base_mb, Some(1536));
         assert_eq!(report.reserved_at_load_mb, None);
+    }
+
+    /// A ROCm worker's load report: no `gpu_uuid` at all (torch renders a
+    /// third-vocabulary one on HIP and the worker suppresses it), a PCI
+    /// address instead, and the board's total as torch sees it — the pair
+    /// the ledger keys and cross-checks a ROCm replica by.
+    #[test]
+    fn load_report_carries_the_rocm_identity_fields() {
+        let rocm = vec![
+            (Value::from("base_mb"), Value::from(2048u64)),
+            (Value::from("base_method"), Value::from("alloc_delta")),
+            (Value::from("gpu_bdf"), Value::from("0000:03:00.0")),
+            (Value::from("gpu_total_mb"), Value::from(24_560u64)),
+            (
+                Value::from("gpu_name"),
+                Value::from("AMD Radeon RX 7900 XTX"),
+            ),
+            (Value::from("torch_version"), Value::from("2.11.0+rocm7.2")),
+        ];
+        let report = LoadReport::parse(&rocm).expect("a report with no uuid is a report");
+        assert_eq!(report.gpu_uuid, None);
+        assert_eq!(report.gpu_bdf.as_deref(), Some("0000:03:00.0"));
+        assert_eq!(report.gpu_total_mb, Some(24_560));
+        assert_eq!(report.torch_version.as_deref(), Some("2.11.0+rocm7.2"));
+
+        // The new fields alone are enough to make a report: a worker that
+        // could measure nothing else still has an identity to register with.
+        let identity_only = vec![(Value::from("gpu_bdf"), Value::from("0000:0c:00.0"))];
+        assert_eq!(
+            LoadReport::parse(&identity_only).map(|report| report.gpu_bdf),
+            Some(Some("0000:0c:00.0".to_owned()))
+        );
     }
 
     /// The measurement array is per-batch data from the same untrusted

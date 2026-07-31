@@ -8678,7 +8678,7 @@
               "string",
               "null"
             ],
-            "description": "The board the worker itself reports being on, which is what step 1b's\nledger keys by: the pin above can be an index, absent, or a UUID CUDA\nreordered, and only the worker can see what it actually got."
+            "description": "The board the worker itself reports being on: the pin above can be an\nindex, absent, or a UUID CUDA reordered, and only the worker can see\nwhat it actually got. `null` on a ROCm replica — torch's HIP-rendered\nUUID is a third vocabulary the worker deliberately suppresses, and\nthose replicas are admitted to the ledger by PCI address instead\n(docs/rocm-batch-calibration-parity.md, D3), which this view does not\nsurface yet."
           },
           "measurements_recorded": {
             "type": "integer",

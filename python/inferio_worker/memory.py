@@ -41,6 +41,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Iterable
 from typing import Any
 
 logger = logging.getLogger("inferio_worker.memory")
@@ -69,6 +70,27 @@ _nvml_state: dict[str, Any] = {"module_tried": False, "module": None, "handle": 
 _logged: dict[str, bool] = {
     "nvml_pid_missing": False,
     "nvml_board_unidentified": False,
+    "hip_uuid_suppressed": False,
+    "fdinfo_identity": False,
+}
+
+# Where the kernel exposes this process's own DRM clients. Absent on every
+# platform but Linux, which is exactly the platforms that cannot have an
+# amdgpu board (the `rocm` torch extra is Linux-only).
+FDINFO_ROOT = "/proc/self/fdinfo"
+
+# The unit suffixes the DRM usage-stats format allows on a memory line
+# (`drm-resident-vram: 12345 KiB`). Exactly the kernel-documented grammar,
+# `<uint> [KiB|MiB]` with the suffix optional and its absence meaning plain
+# bytes, per <https://docs.kernel.org/gpu/drm-usage-stats.html>. Deliberately
+# not a superset: accepting spellings the format does not define (a bare `B`,
+# a `GiB`) would be guessing at the meaning of a line we do not understand,
+# and the safe reading of a line we do not understand is "no reading at all"
+# — see `parse_drm_fdinfo`.
+_DRM_UNITS = {
+    "": 1,
+    "KIB": 1024,
+    "MIB": 1024 * 1024,
 }
 
 
@@ -328,6 +350,55 @@ def _nvml_own_process_mb(holding_mb: int | None = None) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _is_hip(torch: Any) -> bool:
+    """Whether this torch is a ROCm build (`torch.version.hip` is set).
+
+    `torch.version.cuda` is `None` there and `torch.__version__` reads like
+    `"2.11.0+rocm7.2"`, but `version.hip` is the one positive signal, and it
+    is what the hipified `torch.cuda.*` namespace never reveals on its own.
+    """
+    try:
+        return bool(getattr(getattr(torch, "version", None), "hip", None))
+    except Exception:
+        return False
+
+
+def _device_props() -> Any | None:
+    """`get_device_properties(0)` for the pinned device, or None.
+
+    Gated on [`_torch_cuda`] like every torch path here — the call *creates*
+    a context on a process that has none. One helper because three public
+    readings (identity, PCI address, total memory) come off the same struct
+    and torch caches it, so asking three times costs nothing.
+    """
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        return torch.cuda.get_device_properties(0)
+    except Exception:
+        return None
+
+
+def _prop(props: Any, field: str) -> Any | None:
+    """One field of a device-properties struct, or None if it cannot be read.
+
+    **Every** read of that struct in this module goes through here, and the
+    module's never-raise rule is the whole reason. The fields are pybind
+    getters, not plain attributes: an older build simply does not define some
+    of them (an `AttributeError`, which the `getattr` default absorbs), but a
+    getter is arbitrary C++ and can raise anything at all — and an exception
+    escaping here would take down `finish_load` and with it the *entire* load
+    report, losing the measured base and the negotiated dtype over an
+    unreadable identity field. A field that cannot be read is `None`, which
+    every consumer already treats as "unknown".
+    """
+    try:
+        return getattr(props, field, None)
+    except Exception:
+        return None
+
+
 def device_identity() -> tuple[str | None, str | None]:
     """`(uuid, name)` of the board this worker's CUDA device 0 resolved to.
 
@@ -336,20 +407,285 @@ def device_identity() -> tuple[str | None, str | None]:
     ledger can key on what the worker *actually* got rather than on the
     device-pin string it was spawned with. `(None, None)` whenever CUDA is
     not live (see `_torch_cuda`).
+
+    **On a ROCm build the UUID is suppressed entirely** (returned as `None`)
+    even though torch >= 2.5 renders one: it is a *third* vocabulary,
+    derived from the ASIC serial and unrelated to both the KFD `GPU-<16hex>`
+    form the inventory may use and the amd-smi 8-4-4-4-12 form, and on
+    consumer boards without a fused serial it degenerates to the same string
+    for every card of a model. A value that can neither match nor be trusted
+    to differ is worse than no value: the orchestrator keys ROCm replicas on
+    [`device_bdf`] instead (docs/rocm-batch-calibration-parity.md, D3/F5).
+    The *name* is kept — it is informational only; the profile keyspace is
+    the orchestrator's own inventory name.
     """
-    torch = _torch_cuda()
-    if torch is None:
+    props = _device_props()
+    if props is None:
         return (None, None)
-    try:
-        props = torch.cuda.get_device_properties(0)
-    except Exception:
-        return (None, None)
-    uuid = getattr(props, "uuid", None)
-    name = getattr(props, "name", None)
+    uuid = _prop(props, "uuid")
+    name = _prop(props, "name")
+    if uuid is not None and _is_hip(_torch()):
+        uuid = None
+        if not _logged["hip_uuid_suppressed"]:
+            _logged["hip_uuid_suppressed"] = True
+            logger.debug(
+                "this is a ROCm torch build; not reporting its rendered GPU "
+                "UUID (a third identity vocabulary that matches neither KFD's "
+                "nor amd-smi's and repeats across same-model boards). The PCI "
+                "address is reported instead"
+            )
     return (
         f"GPU-{uuid}" if uuid is not None else None,
         name if isinstance(name, str) and name else None,
     )
+
+
+def device_bdf() -> str | None:
+    """This worker's board as a PCI address (`dddd:bb:dd.0`), or None.
+
+    The PCI BDF is the one identity vocabulary the kernel, the amdgpu driver
+    and the HIP runtime all speak, which is what makes it the ROCm ledger
+    join (docs/rocm-batch-calibration-parity.md, D3). It is reported on CUDA
+    hosts too — it costs nothing, and registration keys on the UUID there
+    first — so nothing downstream has to know which backend it is reading.
+
+    Two sources, in order:
+
+    1. `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/
+       `pci_device_id` (`hipDeviceProp_t`, also present on CUDA). These are
+       **device-0-scoped**: they describe exactly the board the pin
+       selected, which no scan of this process's open files could establish
+       — HIP filters *above* ROCr, so a pinned worker still holds render
+       nodes for every ROCR-visible board.
+    2. Only on a ROCm build whose torch is too old to expose those fields:
+       the dominant-VRAM DRM client in `/proc/self/fdinfo`
+       ([`dominant_vram_pdev`]). Ambiguous by construction on a multi-GPU
+       host, hence the fallback rather than the source.
+
+    The function digit is forced to `.0`: the amdgpu GPU function is always
+    0 (the HDMI/DP audio controller is function .1 of the *same device*, not
+    the GPU's own function), which is also how the orchestrator's KFD probe
+    renders it (`rocm.rs::format_bdf`), so the two sides stay joinable. An
+    SR-IOV virtual function does sit at a nonzero function; forcing 0 there
+    fabricates an address whose PCI directory does not exist, the
+    orchestrator's VRAM read fails and the host goes unpriced — the safe
+    answer for a passthrough VF.
+
+    Which source answers is a fact about the *pin*, not the platform, today:
+    the `cpu`/`cu128` extras pin torch 2.7.1 and `_CudaDeviceProperties` grew
+    the PCI fields in 2.8, so on the shipped CUDA build source 1 is absent,
+    source 2 is HIP-only, and no `gpu_bdf` is emitted there at all — this
+    becomes live on CUDA when that pin moves to >= 2.8. The `rocm` extra pins
+    2.11, so the identity chain this feeds is load-bearing on ROCm alone.
+    """
+    props = _device_props()
+    if props is None:
+        return None
+    bdf = _props_bdf(props)
+    if bdf is not None:
+        return bdf
+    if not _is_hip(_torch()):
+        # A CUDA host without the PCI fields simply has no BDF to report;
+        # its identity is the UUID and the fdinfo tree holds nvidia
+        # character devices, not DRM clients.
+        return None
+    bdf = dominant_vram_pdev()
+    if bdf is not None and not _logged["fdinfo_identity"]:
+        _logged["fdinfo_identity"] = True
+        logger.debug(
+            "this torch build exposes no PCI fields on get_device_properties; "
+            "identifying this worker's board as %s, the DRM client holding the "
+            "most VRAM in this process",
+            bdf,
+        )
+    return bdf
+
+
+def _props_bdf(props: Any) -> str | None:
+    """The BDF from torch's PCI fields, or None when they are absent.
+
+    Read through [`_prop`] like every other field of that struct: older torch
+    builds (including the 2.7.1 the CUDA extras pin) simply do not carry
+    them, and a partial triple is not an address.
+    """
+    domain = _prop(props, "pci_domain_id")
+    bus = _prop(props, "pci_bus_id")
+    device = _prop(props, "pci_device_id")
+    if domain is None or bus is None or device is None:
+        return None
+    try:
+        domain, bus, device = int(domain), int(bus), int(device)
+    except Exception:
+        return None
+    if not (0 <= domain <= 0xFFFF and 0 <= bus <= 0xFF and 0 <= device <= 0x1F):
+        return None
+    return f"{domain:04x}:{bus:02x}:{device:02x}.0"
+
+
+def gpu_total_mb() -> int | None:
+    """Total VRAM of this worker's board in MiB, per torch, or None.
+
+    Reported on the load response so the orchestrator can cross-check a
+    BDF-matched registration against an **independent** source: the
+    inventory's total came from amdgpu's `mem_info_vram_total` sysfs file,
+    this one from HIP, so agreement is evidence rather than a file compared
+    with itself (docs/rocm-batch-calibration-parity.md, D3/F4).
+    """
+    props = _device_props()
+    if props is None:
+        return None
+    return _mb(_prop(props, "total_memory"))
+
+
+# ---------------------------------------------------------------------------
+# DRM fdinfo (per-process, per-board VRAM)
+# ---------------------------------------------------------------------------
+
+
+def parse_drm_fdinfo(text: str) -> tuple[str, int, int] | None:
+    """`(pdev, client_id, vram_bytes)` for one fdinfo file, or None.
+
+    The DRM usage-stats format is one `key: value` per line
+    (<https://docs.kernel.org/gpu/drm-usage-stats.html>); non-DRM fds carry
+    none of these keys and parse to None. `drm-pdev` and `drm-client-id` are
+    both required: the address is what the reading is *about*, and the
+    client id is what makes two fds of one client countable once (an fd
+    duplicated by `dup()`/fork shows the same client id, and summing both
+    would double the process's VRAM).
+
+    Both memory spellings are accepted. `drm-memory-<region>` is the kernel
+    docs' deprecated alias for `drm-resident-<region>` and is "only printed
+    by amdgpu" — exactly the driver this exists for — so a parser that knew
+    only the modern spelling would read every AMD client as zero.
+    `drm-resident-vram` wins when a kernel prints both.
+
+    **Absent and unreadable are different answers.** A DRM client with
+    neither key is a real record with **no VRAM** — a board this process has
+    open but has not allocated on, which is precisely what the dominance rule
+    needs to see. A key that is *present* but does not parse (a unit outside
+    the documented grammar, a number that is not one) makes the whole record
+    `None` instead: reading it as 0 would be inventing an observation, and
+    the observation it would invent is the one that hands dominance — and
+    with it this worker's board identity — to a different card.
+
+    The pdev is lower-cased so it compares directly against the addresses
+    [`device_bdf`] and the orchestrator's inventory render.
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        if key.startswith("drm-"):
+            fields[key] = value.strip()
+    pdev = fields.get("drm-pdev")
+    client_id = fields.get("drm-client-id")
+    if not pdev or client_id is None:
+        return None
+    try:
+        client = int(client_id)
+    except ValueError:
+        return None
+    raw = fields.get("drm-resident-vram")
+    if raw is None:
+        raw = fields.get("drm-memory-vram")
+    if raw is None:
+        return (pdev.lower(), client, 0)
+    vram = _parse_drm_bytes(raw)
+    if vram is None:
+        return None
+    return (pdev.lower(), client, vram)
+
+
+def _parse_drm_bytes(value: str | None) -> int | None:
+    """`<uint> [KiB|MiB]` in bytes, or None when it is not that.
+
+    The whole documented grammar and nothing else: the suffix is optional and
+    bare means bytes. `None` is "this line is not a reading", which the
+    caller turns into a discarded record rather than a zero.
+    """
+    if value is None:
+        return None
+    parts = value.split()
+    if not parts:
+        return None
+    try:
+        amount = int(parts[0])
+    except ValueError:
+        return None
+    if amount < 0:
+        return None
+    scale = _DRM_UNITS.get(parts[1].upper() if len(parts) > 1 else "")
+    if scale is None:
+        return None
+    return amount * scale
+
+
+def fdinfo_vram_by_pdev(texts: Iterable[str]) -> dict[str, int]:
+    """Per-board VRAM this process holds, keyed by PCI address, in bytes.
+
+    Pure over an iterable of fdinfo file contents so it is testable without
+    `/proc`, and general (a *map*, not one winner) because D4's per-process
+    memory tier consumes the same parse filtered by the identity BDF while
+    the identity fallback here consumes its argmax.
+
+    Deduplicated by DRM client id: several fds of one client are one client.
+    Records [`parse_drm_fdinfo`] rejected — a non-DRM fd, or a memory line it
+    could not read — contribute nothing at all, not a zero.
+    """
+    seen: set[tuple[str, int]] = set()
+    totals: dict[str, int] = {}
+    for text in texts:
+        record = parse_drm_fdinfo(text)
+        if record is None:
+            continue
+        pdev, client, vram = record
+        if (pdev, client) in seen:
+            continue
+        seen.add((pdev, client))
+        totals[pdev] = totals.get(pdev, 0) + vram
+    return totals
+
+
+def dominant_vram_pdev(root: str = FDINFO_ROOT) -> str | None:
+    """The PCI address this process holds the most VRAM on, or None.
+
+    The identity fallback of [`device_bdf`], and only that: a *strict*
+    maximum is required, so a tie — including the all-zero tie of a process
+    that has opened render nodes but allocated nothing — answers None rather
+    than picking a board. Guessing wrong here does not degrade a reading, it
+    prices one model's memory against another board's ledger.
+
+    Linux-only by nature: `/proc/self/fdinfo` does not exist elsewhere, and
+    the read then yields nothing.
+    """
+    totals = fdinfo_vram_by_pdev(_fdinfo_texts(root))
+    if not totals:
+        return None
+    ranked = sorted(totals.items(), key=lambda entry: entry[1], reverse=True)
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    pdev, vram = ranked[0]
+    return pdev if vram > 0 else None
+
+
+def _fdinfo_texts(root: str) -> list[str]:
+    """The contents of every readable fdinfo file. Best-effort throughout:
+    fds come and go while the directory is being walked, so an entry that
+    vanishes mid-scan is skipped rather than fatal."""
+    texts: list[str] = []
+    try:
+        names = os.listdir(root)
+    except Exception:
+        return texts
+    for name in names:
+        try:
+            with open(os.path.join(root, name), encoding="utf-8", errors="replace") as fd:
+                texts.append(fd.read())
+        except Exception:
+            continue
+    return texts
 
 
 def torch_version() -> str | None:
@@ -613,6 +949,15 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["gpu_uuid"] = uuid
     if name is not None:
         payload["gpu_name"] = name
+    # The BDF and the board's total memory: the ROCm ledger join and the
+    # independent cross-check that guards it (D3). Emitted on CUDA too — the
+    # keys are additive and the orchestrator keys on the UUID first there.
+    bdf = device_bdf()
+    if bdf is not None:
+        payload["gpu_bdf"] = bdf
+    total_mb = gpu_total_mb()
+    if total_mb is not None:
+        payload["gpu_total_mb"] = total_mb
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version

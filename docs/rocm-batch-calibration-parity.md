@@ -291,8 +291,15 @@ worker env (`accelerator_env::worker_env`) composes untouched — it never
 sets visibility vars. eocr's internal `cuda:0` single-device string is a
 no-op under a single visible device.
 
-**Known gap this opens (found implementing D2, 2026-07-31):** *load
-reservations* are keyed by the resolved pin string
+**Known gap this opened — CLOSED by D3, 2026-07-31.** The description below
+is kept because it is the reasoning behind where the fix lives. What shipped:
+`GpuInventory::resolve_board_key` resolves the *same* registry entry
+`resolve_pin` takes into the ledger's board key, `ModelManager::spawn_model`
+resolves the two as a pair, and the load reservation is keyed by the key. The
+CUDA half of the miss (abbreviated-UUID and unresolvable pins) is fixed by the
+same call, as predicted. Original text:
+
+*load reservations* are keyed by the resolved pin string
 (`ModelManager::spawn_model` → `VramLedger::reserve_load(…, pin, …)`, which
 looks the board up in the ledger's board map). That map is keyed by board
 *key*, so on ROCm — where the pin is now an index — the lookup misses and no
@@ -312,15 +319,28 @@ in *frequency*, not in kind — the fix is one mechanism for both, not a ROCm
 patch. Second, **ROCm is unpriced end to end until D3**: `register_worker`
 matches on a torch-rendered UUID a ROCm worker cannot produce, so no ROCm
 replica is admitted to the ledger at all, and a load reservation there would
-be protecting memory against admissions that cannot happen. The call site
-carries a `TODO(D3)` anchor pointing here.
+be protecting memory against admissions that cannot happen. (The `TODO(D3)`
+anchor that stood at the call site is gone; the pairing is there now.)
 
 The enumeration-order assumption (openable KFD node order = HIP order) is
-the one load-bearing unverifiable here, and D3's registration cross-check
-is its guard: a wrong order pins a worker to board A while believing it
-is board B, the worker's self-reported BDF then fails to match the pinned
-row, and the replica is refused admission (unpriced) with a log line
-naming both BDFs — visible, safe, diagnosable from a field report.
+the one load-bearing unverifiable here, and D3's registration cross-check is
+its guard — a **warning, not a refusal** (amended after review, 2026-07-31).
+Registration is order-independent and self-correcting: it resolves the board
+from the address the *worker* reports, so a replica pinned to board A that
+comes up on board B is still admitted, under board B, which is where its
+memory physically is and therefore where it must be priced. Refusing would
+leave a perfectly identifiable replica unpriced over a fault in a row order.
+
+What the mis-order does cost is the **load reservation**: that is taken
+before the worker exists, keyed by the board the pin named, so for the
+duration of the load it protected the wrong card. It stays keyed that way —
+there is nothing to resolve it against until the worker answers — and the
+divergence is what the alarm reports. `ModelManager::spawn_model` therefore
+passes the pin's board key into `register_worker` as `expected_board`, and
+`ledger::BoardLog::PinDiverged` names the model, both board keys, both BDFs
+and both totals when the two disagree: visible, safe, diagnosable from a
+field report, and the signal that the enumeration needs fixing on real
+multi-board ROCm hardware.
 
 ### D3 (G3) — Worker identity: torch PCI fields; fdinfo demoted (review F1)
 
@@ -363,6 +383,51 @@ little). Mismatch → refuse admission, log both values and both BDFs. On
 single-board hosts a worker with no BDF at all may fall back to the
 single inventory row iff the total-memory check passes — the NVML
 single-GPU fallback's twin.
+
+**As implemented (2026-07-31).** The worker gained `device_bdf()`,
+`gpu_total_mb()` and a pure fdinfo parser (`parse_drm_fdinfo`,
+`fdinfo_vram_by_pdev`, `dominant_vram_pdev`) that D4 reuses for its per-process
+memory tier; `device_identity()` suppresses the UUID under
+`torch.version.hip`. The registration table in `VramLedger::resolve_board` is:
+
+| worker reports | ledger does |
+|---|---|
+| `gpu_uuid` matching a board | admit under it, **no** memory check (CUDA, unchanged) |
+| `gpu_uuid` matching nothing, or none, + `gpu_bdf` matching a board's | cross-check `gpu_total_mb` (±5% or ±512 MB); pass → admit, fail or absent → refuse + warn |
+| `gpu_bdf` matching no board, on an inventory whose boards *have* addresses | refuse + warn (the enumeration-order alarm) |
+| nothing matched, exactly one board, **no `gpu_uuid` at all**, and no address that could have matched | cross-check `gpu_total_mb`; pass → admit, fail or absent → refuse |
+| anything else | refuse (unpriced dispatch, as before) |
+
+Three deliberate refinements to the text above. First, the single-board
+fallback also applies when the worker reported an address but **no board
+carries one** (every CUDA inventory) — the address is uninformative there,
+not contradictory, and the memory check still gates the admission. Second, a
+reported address that contradicts an inventory that *does* carry addresses
+never reaches the single-board fallback: positive evidence of the wrong board
+is not the same as no evidence. Third (review F3), the same rule applied to
+the UUID: the fallback requires `gpu_uuid` to be **absent**, not merely
+unmatched, so a MIG instance outside the enumeration is refused again rather
+than folded onto the host's only board. ROCm workers suppress the UUID
+entirely, so their path is untouched.
+
+Registration also takes the board key the replica's *pin* named
+(`expected_board`), purely as the D2 mis-order diagnostic described above: it
+never decides anything, and a divergence is logged, not refused. All of the
+log lines are formatted and emitted **after** the ledger lock is dropped
+(review F8) — `resolve_board` returns a decision plus the line to write —
+because a `tracing` event under that mutex would hold every concurrent grant
+request behind a log write.
+
+The `ReplicaTelemetryHealth` view still surfaces `gpu_uuid` only; a ROCm
+replica shows `null` there while being correctly admitted by address. Adding
+`gpu_bdf` to `/health` is a UI/schema change and was left out of this step.
+
+One reality note on the worker half (review F4): the `cpu`/`cu128` extras pin
+torch 2.7.1, and `_CudaDeviceProperties` grew the PCI fields in 2.8, so the
+shipped CUDA build emits **no `gpu_bdf` at all** today — it becomes live on
+CUDA when that pin moves to >= 2.8. The `rocm` extra pins 2.11, so this
+identity chain is load-bearing on ROCm alone for now, which is also where it
+is the only identity available.
 
 ### D4 (G4) — Worker memory sensing: sysfs/fdinfo tiers
 

@@ -218,9 +218,13 @@ pub struct ReplicaTelemetryHealth {
     /// backends' visibility variables accept different vocabularies; see
     /// `gpu::pin_env_var`).
     pub gpu: Option<String>,
-    /// The board the worker itself reports being on, which is what step 1b's
-    /// ledger keys by: the pin above can be an index, absent, or a UUID CUDA
-    /// reordered, and only the worker can see what it actually got.
+    /// The board the worker itself reports being on: the pin above can be an
+    /// index, absent, or a UUID CUDA reordered, and only the worker can see
+    /// what it actually got. `null` on a ROCm replica — torch's HIP-rendered
+    /// UUID is a third vocabulary the worker deliberately suppresses, and
+    /// those replicas are admitted to the ledger by PCI address instead
+    /// (docs/rocm-batch-calibration-parity.md, D3), which this view does not
+    /// surface yet.
     pub gpu_uuid: Option<String>,
     pub gpu_name: Option<String>,
     /// The worker venv's torch, part of the calibration profile key.
@@ -1365,6 +1369,18 @@ impl ModelManager {
             .iter()
             .map(|pin| self.cfg.gpus.resolve_pin(pin.as_deref()))
             .collect();
+        // The same registry entries resolved into the *other* vocabulary:
+        // the ledger's board keys. Pin and key are a pair and must be
+        // resolved from the same request — the pin is what the worker's
+        // visibility variable gets, the key is what the ledger's board map
+        // is keyed by, and on ROCm (index pins) or with an abbreviated CUDA
+        // UUID the two are different strings for one board
+        // (`GpuInventory::resolve_board_key`).
+        let board_keys: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.resolve_board_key(pin.as_deref()))
+            .collect();
         // A prewarmed process was spawned before this model's just-in-time
         // external inputs were resolved. Models with explicit worker env
         // must therefore use a fresh process.
@@ -1396,14 +1412,14 @@ impl ModelManager {
         // not worth reserving for: the ledger answers `None` for the
         // `none`-class, and likewise for a model whose earlier load in this run
         // reported no device footprint at all.
-        // TODO(D3): the resolved pin is not the ledger board key — on ROCm
-        // (index pins) and for abbreviated CUDA UUID pins this lookup misses
-        // and no load reservation is taken. D3 resolves (pin, board_key) as
-        // a pair; see docs/rocm-batch-calibration-parity.md D2.
-        let _load_reservations: Vec<LoadReservation> = device_pins
+        //
+        // Keyed by board key, never by the pin: the pin is written in the
+        // backend's visibility vocabulary and only coincides with the ledger
+        // key on a CUDA host with a full-UUID pin.
+        let _load_reservations: Vec<LoadReservation> = board_keys
             .iter()
             .flatten()
-            .filter_map(|pin| self.ledger.reserve_load(inference_id, cost, pin, None))
+            .filter_map(|gpu| self.ledger.reserve_load(inference_id, cost, gpu, None))
             .collect();
         let spawns: Vec<_> = device_pins
             .iter()
@@ -1463,10 +1479,18 @@ impl ModelManager {
                     // this replica gets no admission (a `none`-class model, a
                     // worker with no GPU, a board outside the inventory) and
                     // its dispatcher takes the unpriced path.
+                    //
+                    // The board key this replica's *pin* named goes in as
+                    // well, purely as a diagnostic: the ledger admits under
+                    // what the worker reports either way, but a divergence
+                    // between the two is the one observable symptom of a
+                    // board-row order that is not the backend's device order
+                    // (docs/rocm-batch-calibration-parity.md, D2/D3).
                     admissions.push(self.ledger.register_worker(
                         inference_id,
                         cost,
                         &worker.telemetry(),
+                        board_keys[replica].as_deref(),
                     ));
                     workers.push(worker);
                 }
@@ -1556,6 +1580,7 @@ fn registry_default_batch(registry: &Registry, full_inference_id: &str) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::*;
@@ -1947,6 +1972,19 @@ config.replicas = 2
             32,
             WorkerDeadlines::default(),
             GpuInventory::unknown(),
+            Some(calibration),
+        )
+    }
+
+    fn test_manager_with_gpus_and_calibration(
+        gpus: GpuInventory,
+        calibration: Arc<dyn CalibrationProfiles>,
+    ) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            gpus,
             Some(calibration),
         )
     }
@@ -2967,6 +3005,85 @@ config.replicas = 2
             devices,
             std::collections::BTreeSet::from(["GPU-3333".to_string(), "7".to_string()]),
             "index 3 became its UUID; the invisible index 7 passed through"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A calibration store that answers nothing and records which *board*
+    /// each question was keyed by. `expected_base_mb` has exactly one caller
+    /// — the load reservation in `spawn_model` — and it is reached only after
+    /// `VramLedger::reserve_load` has found the board in its map, so a
+    /// recorded name is proof the reservation resolved to a real board.
+    #[derive(Default)]
+    struct RecordingProfiles {
+        reservation_boards: StdMutex<Vec<String>>,
+    }
+
+    impl CalibrationProfiles for RecordingProfiles {
+        fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
+            self.reservation_boards
+                .lock()
+                .unwrap()
+                .push(query.gpu_name.to_owned());
+            None
+        }
+
+        fn lookup(&self, _query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
+            None
+        }
+
+        fn record(&self, _update: ProfileUpdate) {}
+    }
+
+    /// A ROCm-shaped inventory whose row indices are the registry's own
+    /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
+    /// and the ledger's key vocabulary are guaranteed to differ.
+    fn rocm_test_gpus() -> GpuInventory {
+        let board = |index: u32, bdf: &str| GpuInfo {
+            index,
+            uuid: format!("GPU-BDF-{bdf}"),
+            name: format!("AMD gfx1100 #{index}"),
+            total_mb: 24_576,
+            compute_cap: None,
+            bdf: Some(bdf.to_owned()),
+            gfx_target_version: Some(110_000),
+        };
+        GpuInventory::known_rocm(vec![board(3, "0000:03:00.0"), board(7, "0000:0c:00.0")])
+    }
+
+    /// D3's manager half: the load reservation is keyed by the board key,
+    /// never by the resolved pin. On ROCm the two are never the same string —
+    /// the pin is a HIP device index — so keying by the pin misses the
+    /// ledger's board map entirely and reserves nothing, which is precisely
+    /// the gap D2 left open. The recording store is the probe: a reservation
+    /// that found its board consults it, one that missed never gets that far.
+    ///
+    /// Venv-gated like the rest of this suite (it spawns real fixture
+    /// workers via the repo interpreter), so it runs on the dev box and in
+    /// CI rather than on every checkout.
+    #[tokio::test]
+    async fn load_reservations_are_keyed_by_board_not_by_the_hip_pin() {
+        let profiles = Arc::new(RecordingProfiles::default());
+        let setup = test_manager_with_gpus_and_calibration(
+            rocm_test_gpus(),
+            Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>,
+        );
+        let manager = &setup.manager;
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load spawns both pinned replicas");
+
+        let mut boards = profiles.reservation_boards.lock().unwrap().clone();
+        boards.sort();
+        assert_eq!(
+            boards,
+            vec!["AMD gfx1100 #3".to_string(), "AMD gfx1100 #7".to_string()],
+            "both replicas reserved against the board their index pin names; \
+             keying by the pin string (\"3\", \"7\") would have found no board \
+             at all and reserved nothing"
         );
 
         manager.shutdown().await;

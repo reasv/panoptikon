@@ -573,6 +573,21 @@ impl GpuInventory {
         }
     }
 
+    /// [`Self::known`]'s ROCm twin: index pins, amdgpu memory backend, no
+    /// ambient restriction. The PCI root is the production one because the
+    /// callers of this are pin/key/ledger tests that never read a file; the
+    /// refresh tests build their inventory around a fixture tree instead.
+    #[cfg(test)]
+    pub fn known_rocm(gpus: Vec<GpuInfo>) -> Self {
+        Self {
+            boards: (!gpus.is_empty()).then(|| gpus.into()),
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices: rocm::SysfsRoots::default().pci_devices,
+                ambient_hip_restriction: false,
+            },
+        }
+    }
+
     /// The boards, or `None` when the host is unknown.
     pub fn gpus(&self) -> Option<&[GpuInfo]> {
         self.boards.as_deref()
@@ -655,10 +670,18 @@ impl GpuInventory {
     /// *ledger* is keyed by, and the index is only ever a pin.
     ///
     /// The row-order-is-HIP-order assumption is this design's one
-    /// unverifiable, and D3's registration cross-check is its guard: a worker
-    /// whose self-reported PCI address does not match the row it was pinned
-    /// to is refused admission (unpriced) rather than priced against the
-    /// wrong board.
+    /// unverifiable, and D3's registration cross-check is its guard — a
+    /// *warning*, not a refusal. Registration is order-independent and
+    /// self-correcting: it resolves the board from what the worker itself
+    /// reports (its PCI address), so a replica that came up on a different
+    /// board than the pin named is still admitted, under the board it is
+    /// physically on, which is where its memory has to be priced. What the
+    /// mis-order costs is the *load reservation*: that is taken before the
+    /// worker exists and stays keyed by the board the pin believed, so it
+    /// protected the wrong card for the duration of the load. The divergence
+    /// warning (`ledger::BoardLog::PinDiverged`) is the field diagnostic for
+    /// exactly that, and it stays that way until a report from real
+    /// multi-board ROCm hardware says the order needs fixing.
     pub fn default_pin(&self) -> Option<String> {
         let gpu = self.default_board()?;
         Some(if self.pins_are_indices() {
@@ -821,6 +844,84 @@ impl GpuInventory {
              CUDA_VISIBLE_DEVICES unchanged"
         );
         Some(requested.to_owned())
+    }
+
+    /// Resolve the same registry `devices` entry [`Self::resolve_pin`] takes
+    /// into the **ledger board key** — the board's `uuid`, whatever
+    /// vocabulary the pin itself is written in.
+    ///
+    /// The two are a pair and are resolved together at every call site that
+    /// needs both: the pin goes into the worker's environment, the key goes
+    /// to the ledger (`VramLedger::reserve_load`, whose board map is keyed by
+    /// `uuid`). Before this existed the resolved *pin* was handed to the
+    /// ledger, which silently missed for every form where pin ≠ key: every
+    /// ROCm pin (an index), and on CUDA an abbreviated-UUID or unresolvable
+    /// pin. The miss costs the load reservation — the in-flight load is not
+    /// charged until the worker registers — so a second model loading
+    /// concurrently could be granted a window against memory the first load
+    /// was about to take (docs/rocm-batch-calibration-parity.md, D2's known
+    /// gap, closed by D3).
+    ///
+    /// The arms, in order, on **both** backends:
+    ///
+    /// - unknown inventory → `None`. There is no board map to key into
+    ///   either, so this is not a lost reservation, it is a host that has no
+    ///   ledger at all;
+    /// - no request → the default board's key (universal pinning puts the
+    ///   worker there);
+    /// - a board key, matched **case-insensitively but in full** → that
+    ///   board's key, in the inventory's own spelling (the ledger is keyed by
+    ///   that exact string);
+    /// - an index naming a row → that row's key;
+    /// - **CUDA only**, a `GPU-`/`MIG-` request that is an unambiguous
+    ///   *prefix* of exactly one board's UUID → that board's key. This is the
+    ///   abbreviation CUDA itself resolves (and which `resolve_pin` passes
+    ///   through verbatim for exactly that reason), so the ledger has to
+    ///   resolve it too or an operator writing `GPU-1a2b` gets no
+    ///   reservation. Two boards sharing the prefix answer `None`: a
+    ///   reservation on the wrong board is worse than none. The degenerate
+    ///   prefix `GPU-` is not special-cased: on a multi-board host it is
+    ///   ambiguous and answers `None` like any other shared prefix, and on a
+    ///   single-board host it resolves to that board — which is exactly what
+    ///   CUDA itself does with the same string, so the reservation and the
+    ///   pin agree. The prefix arm is deliberately absent on ROCm, mirroring
+    ///   `resolve_pin`'s exactness rule there — a prefix could name two
+    ///   `GPU-BDF-…` boards on one bus, and these keys never reach HIP, so
+    ///   there is no runtime abbreviation to be compatible with;
+    /// - anything else (an index we cannot see, a device *list*, a template)
+    ///   → `None`. A worker with several visible boards has no single board
+    ///   to charge, and an invisible index names no ledger row.
+    ///
+    /// No warning is logged on the `None` arms: `resolve_pin` has already
+    /// warned about every one of these strings, and a second line per replica
+    /// saying the same thing twice is noise.
+    pub fn resolve_board_key(&self, requested: Option<&str>) -> Option<String> {
+        let gpus = self.boards.as_deref()?;
+        let Some(requested) = requested else {
+            return self.default_board().map(|gpu| gpu.uuid.clone());
+        };
+        let trimmed = requested.trim();
+        if let Some(gpu) = gpus
+            .iter()
+            .find(|gpu| gpu.uuid.eq_ignore_ascii_case(trimmed))
+        {
+            return Some(gpu.uuid.clone());
+        }
+        if let Ok(index) = trimmed.parse::<u32>() {
+            return gpus
+                .iter()
+                .find(|gpu| gpu.index == index)
+                .map(|gpu| gpu.uuid.clone());
+        }
+        if self.pins_are_indices() || !is_uuid_pin(trimmed) {
+            return None;
+        }
+        let wanted = trimmed.to_ascii_uppercase();
+        let mut matches = gpus
+            .iter()
+            .filter(|gpu| gpu.uuid.to_ascii_uppercase().starts_with(&wanted));
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.uuid.clone())
     }
 
     /// The ROCm arm of [`Self::resolve_pin`] (see its docs for the full
@@ -1869,9 +1970,142 @@ mod tests {
         assert_eq!(inventory.resolve_pin(Some("cpu")), Some("cpu".to_string()));
     }
 
+    /// The ledger vocabulary of the same registry entry: a board key, on
+    /// both backends, for every form a pin can take. This is what closes
+    /// D2's load-reservation gap — the pin and the key are resolved as a
+    /// pair from one request, and on ROCm they are never the same string.
+    #[test]
+    fn board_keys_resolve_in_both_vocabularies() {
+        let cuda = inventory();
+        assert_eq!(
+            cuda.resolve_board_key(None),
+            Some("GPU-1111".to_string()),
+            "no request is the default board, the one universal pinning uses"
+        );
+        assert_eq!(cuda.resolve_pin(None), cuda.resolve_board_key(None));
+        assert_eq!(
+            cuda.resolve_board_key(Some("3")),
+            Some("GPU-3333".to_string()),
+            "an index names a row, whose key is what the ledger holds"
+        );
+        assert_eq!(
+            cuda.resolve_board_key(Some(" gpu-3333 ")),
+            Some("GPU-3333".to_string()),
+            "the key comes back in the inventory's spelling, not the operator's"
+        );
+        assert_eq!(
+            cuda.resolve_board_key(Some("7")),
+            None,
+            "an index nobody reported names no ledger row (the pin still \
+             passes through to CUDA)"
+        );
+        assert_eq!(cuda.resolve_board_key(Some("0,3")), None, "a device list");
+        assert_eq!(cuda.resolve_board_key(Some("cpu")), None);
+        assert_eq!(
+            cuda.resolve_board_key(Some("GPU-9999")),
+            None,
+            "a UUID for a board this host cannot see"
+        );
+
+        let rocm = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![
+                amd_gpu(0, "0000:03:00.0", 24576),
+                amd_gpu(1, "0000:0c:00.0", 24576),
+            ],
+        );
+        assert_eq!(
+            (
+                rocm.resolve_pin(Some("1")),
+                rocm.resolve_board_key(Some("1"))
+            ),
+            (
+                Some("1".to_string()),
+                Some("GPU-BDF-0000:0c:00.0".to_string())
+            ),
+            "the pair: HIP gets the index, the ledger gets the key"
+        );
+        assert_eq!(
+            rocm.resolve_board_key(Some("GPU-BDF-0000:0C:00.0")),
+            Some("GPU-BDF-0000:0c:00.0".to_string()),
+            "a board key resolves to itself, case-insensitively"
+        );
+        assert_eq!(
+            rocm.resolve_board_key(None),
+            Some("GPU-BDF-0000:03:00.0".to_string()),
+            "while the pin for the same request is the index 0"
+        );
+        assert_eq!(rocm.resolve_pin(None), Some("0".to_string()));
+        assert_eq!(
+            rocm.resolve_board_key(Some("GPU-BDF-0000:0c")),
+            None,
+            "no prefix matching on ROCm: a prefix could name two boards on \
+             one bus, and these keys never reach HIP"
+        );
+        assert_eq!(rocm.resolve_board_key(Some("9")), None);
+        assert_eq!(rocm.resolve_board_key(Some("0,1")), None);
+    }
+
+    /// CUDA resolves abbreviated UUIDs itself, so `resolve_pin` hands them
+    /// to it verbatim — which means the ledger has to resolve them too, or
+    /// an operator who wrote `GPU-1a2b` silently gets no load reservation.
+    /// An *ambiguous* abbreviation resolves to nothing: reserving against
+    /// the wrong board is worse than not reserving.
+    #[test]
+    fn abbreviated_cuda_uuids_resolve_to_a_board_key_when_unambiguous() {
+        let inventory = GpuInventory::known(vec![
+            gpu(0, "GPU-1a2b0000-0000-0000-0000-000000000000", "12.0"),
+            gpu(1, "GPU-1a2b9999-0000-0000-0000-000000000000", "12.0"),
+            gpu(2, "GPU-ffff0000-0000-0000-0000-000000000000", "12.0"),
+        ]);
+        assert_eq!(
+            inventory.resolve_board_key(Some("GPU-ffff")),
+            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string())
+        );
+        assert_eq!(
+            inventory.resolve_board_key(Some("gpu-FFFF0000")),
+            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
+            "case-insensitive, as CUDA is"
+        );
+        assert_eq!(
+            inventory.resolve_board_key(Some("GPU-1a2b")),
+            None,
+            "two boards share the prefix: refuse rather than guess"
+        );
+        assert_eq!(
+            inventory.resolve_board_key(Some("GPU-")),
+            None,
+            "the degenerate prefix matches everything"
+        );
+        assert_eq!(
+            inventory.resolve_board_key(Some("MIG-unknown")),
+            None,
+            "a MIG instance outside the enumeration has no ledger board"
+        );
+        // On a single-board host the same degenerate prefix is unambiguous
+        // and resolves — which is exactly what CUDA does with it, so the
+        // reservation lands on the board the pin will select. Asserted
+        // because it is a behaviour, not an accident of the ambiguity rule.
+        let only = GpuInventory::known(vec![gpu(
+            0,
+            "GPU-ffff0000-0000-0000-0000-000000000000",
+            "12.0",
+        )]);
+        assert_eq!(
+            only.resolve_board_key(Some("GPU-")),
+            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string())
+        );
+    }
+
     #[test]
     fn unknown_inventory_changes_nothing() {
         let unknown = GpuInventory::unknown();
+        assert_eq!(
+            unknown.resolve_board_key(Some("3")),
+            None,
+            "no inventory is no ledger board to key against either"
+        );
+        assert_eq!(unknown.resolve_board_key(None), None);
         assert!(unknown.gpus().is_none());
         assert_eq!(unknown.default_pin(), None);
         assert_eq!(unknown.resolve_pin(None), None, "no pin, as before");

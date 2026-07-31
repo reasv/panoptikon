@@ -214,10 +214,33 @@ cannot do without creating one.
 | `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
 | `dtype` | the negotiated load precision, one of `"fp16"`, `"bf16"`, `"fp32"` (part of the calibration profile key). Absent when the impl does not negotiate one (CPU impls, remote APIs) |
-| `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device |
-| `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), part of the calibration profile key |
+| `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
+| `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this |
+| `gpu_bdf` | the board's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the board. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
+| `gpu_total_mb` | that board's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID board match is cross-checked against |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |
+
+**Board identity across backends.** On CUDA the identity is `gpu_uuid`, which
+is byte-identical to what the orchestrator's inventory holds, so registration
+is an exact match and nothing else is consulted. On ROCm there is no such
+string: torch >= 2.5 renders a UUID from the ASIC serial, but it is a *third*
+vocabulary — matching neither KFD's `GPU-<16 hex>` nor amd-smi's 8-4-4-4-12
+form — and on consumer boards without a fused serial it is identical for every
+card of a model. The worker therefore reports **no `gpu_uuid` at all** when
+`torch.version.hip` is set, and the orchestrator keys those replicas on
+`gpu_bdf`, cross-checking `gpu_total_mb` against the board's own total before
+admitting them (±5% or ±512 MB). A match it cannot cross-check is refused, and
+a refused replica simply dispatches unpriced — the pre-calibration behaviour
+(`docs/rocm-batch-calibration-parity.md`, D3).
+
+`gpu_bdf` has one fallback source, used only on a ROCm build whose torch is
+too old to expose the PCI fields: the DRM client holding the most VRAM in
+`/proc/self/fdinfo` (`drm-pdev` + `drm-client-id`, with `drm-resident-vram` or
+its deprecated amdgpu alias `drm-memory-vram`, deduplicated by client id). It
+answers nothing unless one board strictly dominates, because a HIP-pinned
+process still holds render nodes for every ROCr-visible board — the pinned one
+is merely the one it allocated on.
 
 `predict` `ok` may additionally carry:
 

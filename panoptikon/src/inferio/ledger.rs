@@ -90,7 +90,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, MemoryQuery as GpuMemoryQuery};
-use super::worker::TelemetryHandle;
+use super::worker::{LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`.
@@ -104,6 +104,14 @@ pub const DEFAULT_MARGIN: f64 = 0.10;
 /// and its only effect is to shrink *concurrent* grants on the same board.
 /// Under-reserving is not cheap — that is a collision with incoming weights.
 pub const CONSERVATIVE_BASE_MB: u64 = 4096;
+
+/// Absolute floor of the total-VRAM tolerance the registration cross-check
+/// admits a non-UUID board match on (`VramLedger::cross_check_total`); the
+/// relative half is 5%. The two sources are different drivers reporting the
+/// same silicon and never agree exactly — firmware carve-outs, ECC reserves
+/// and the amdgpu `total − used` skew all shave a little — and on a small
+/// board 5% is a couple of hundred MB, which is inside that noise.
+const TOTAL_MEMORY_TOLERANCE_MB: u64 = 512;
 
 /// Pre-fit stand-in for "one seed batch" in MB. Before a fit there is no
 /// slope, so the contention floor cannot be priced; this is the flat floor
@@ -877,6 +885,12 @@ fn free_source_is_authoritative(source: &str) -> bool {
 struct GpuLedger {
     name: String,
     total_mb: u64,
+    /// The board's PCI address, lower-cased, when the inventory carries one
+    /// (ROCm only today). It is the fallback registration join for a worker
+    /// that cannot report a UUID the inventory would recognise — every ROCm
+    /// worker — and, being the address amdgpu names its own sysfs directory
+    /// with, the one string both sides derive independently.
+    bdf: Option<String>,
     free: Option<FreeSample>,
     /// This board has produced at least one whole-board free reading, so
     /// context-scoped (torch) readings no longer overwrite `free`.
@@ -921,6 +935,172 @@ impl LedgerState {
     }
 }
 
+/// What resolving a load report to a ledger board decided, and — separately
+/// — what to say about it.
+///
+/// The two are apart because [`VramLedger::resolve_board`] runs under the
+/// ledger mutex, and formatting a `tracing` event there would hold every
+/// concurrent grant request behind a log write (review F8). The resolution
+/// carries owned strings; [`VramLedger::register_worker`] drops the lock and
+/// only then calls [`BoardLog::emit`].
+struct BoardResolution {
+    /// `(board key, board name)` to admit the replica under, or `None` for
+    /// the unpriced dispatch path.
+    admit: Option<(String, String)>,
+    log: Option<BoardLog>,
+}
+
+impl BoardResolution {
+    fn refused(log: BoardLog) -> Self {
+        Self {
+            admit: None,
+            log: Some(log),
+        }
+    }
+}
+
+/// One line about a registration decision, emitted after the ledger lock is
+/// dropped. Every variant owns its strings for exactly that reason.
+enum BoardLog {
+    /// The worker's PCI address matches no board, on an inventory whose rows
+    /// *do* carry addresses.
+    BdfOutsideInventory {
+        worker_bdf: String,
+        worker_uuid: Option<String>,
+        boards: usize,
+    },
+    /// The total-VRAM cross-check that guards a non-UUID match failed: the
+    /// two totals disagree (`worker_total_mb: Some`), or the worker reported
+    /// no total at all and there is nothing to check against.
+    TotalDisagrees {
+        matched_by: &'static str,
+        board: String,
+        board_bdf: Option<String>,
+        board_total_mb: u64,
+        worker_bdf: Option<String>,
+        worker_uuid: Option<String>,
+        worker_total_mb: Option<u64>,
+        tolerance_mb: u64,
+    },
+    /// Nothing matched and no fallback applied — the ordinary CPU/remote-API
+    /// worker, and the board-outside-the-inventory case.
+    NoBoard {
+        worker_uuid: Option<String>,
+        worker_bdf: Option<String>,
+        boards: usize,
+    },
+    /// The replica was admitted, but under a **different** board than the one
+    /// the orchestrator's pin believed it had placed it on (review F1): the
+    /// enumeration-order diagnostic. Not a refusal — the replica is
+    /// physically on the resolved board, so charging it there is the correct
+    /// pricing — but the one signal that the row order the pin was derived
+    /// from is not HIP's device order.
+    PinDiverged {
+        expected: String,
+        expected_bdf: Option<String>,
+        expected_total_mb: Option<u64>,
+        resolved: String,
+        resolved_bdf: Option<String>,
+        resolved_total_mb: u64,
+        worker_bdf: Option<String>,
+        worker_uuid: Option<String>,
+    },
+}
+
+impl BoardLog {
+    fn emit(self, inference_id: &str) {
+        match self {
+            Self::BdfOutsideInventory {
+                worker_bdf,
+                worker_uuid,
+                boards,
+            } => tracing::warn!(
+                model = %inference_id,
+                worker_bdf = %worker_bdf,
+                worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
+                boards,
+                "this worker is on a PCI address no board in the GPU \
+                 inventory has — the inventory's row order may not be the \
+                 HIP device order it is pinned by. Dispatching this model \
+                 without VRAM admission rather than pricing it against a \
+                 board it is not on"
+            ),
+            Self::TotalDisagrees {
+                matched_by,
+                board,
+                board_bdf,
+                board_total_mb,
+                worker_bdf,
+                worker_uuid,
+                worker_total_mb,
+                tolerance_mb,
+            } => {
+                let message = if worker_total_mb.is_some() {
+                    "the worker's own total-VRAM reading does not agree with \
+                     the board it was matched to; dispatching this model \
+                     without VRAM admission rather than pricing it against a \
+                     board it may not be on"
+                } else {
+                    "this worker reports no total VRAM, so the board it was \
+                     matched to cannot be cross-checked; dispatching this \
+                     model without VRAM admission (only an exact UUID match \
+                     is admitted without one)"
+                };
+                tracing::warn!(
+                    model = %inference_id,
+                    matched_by,
+                    board = %board,
+                    board_bdf = board_bdf.as_deref().unwrap_or("<none>"),
+                    board_total_mb,
+                    worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
+                    worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
+                    worker_total_mb = ?worker_total_mb,
+                    tolerance_mb,
+                    "{message}"
+                );
+            }
+            Self::NoBoard {
+                worker_uuid,
+                worker_bdf,
+                boards,
+            } => tracing::debug!(
+                model = %inference_id,
+                worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
+                worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
+                boards,
+                "the worker reports no board this GPU inventory lists; \
+                 dispatching this model without VRAM admission"
+            ),
+            Self::PinDiverged {
+                expected,
+                expected_bdf,
+                expected_total_mb,
+                resolved,
+                resolved_bdf,
+                resolved_total_mb,
+                worker_bdf,
+                worker_uuid,
+            } => tracing::warn!(
+                model = %inference_id,
+                expected_board = %expected,
+                expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
+                expected_total_mb = ?expected_total_mb,
+                resolved_board = %resolved,
+                resolved_bdf = resolved_bdf.as_deref().unwrap_or("<none>"),
+                resolved_total_mb,
+                worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
+                worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
+                "this replica was pinned to one board and came up on another: \
+                 the board-row order the pin was derived from is not the \
+                 device order the backend enumerated. Admitting it under the \
+                 board it is actually on (which is the correct pricing), but \
+                 its *load* reservation was taken against the board the pin \
+                 named and therefore protected the wrong card"
+            ),
+        }
+    }
+}
+
 /// A per-GPU VRAM ledger over the probed board inventory.
 pub struct VramLedger {
     budgets: VramBudgets,
@@ -959,6 +1139,7 @@ impl VramLedger {
                     GpuLedger {
                         name: gpu.name.clone(),
                         total_mb: gpu.total_mb,
+                        bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
                         free: None,
                         seen_authoritative_free: false,
                         load_reservations: HashMap::new(),
@@ -1136,22 +1317,210 @@ impl VramLedger {
     // Worker registration
     // ------------------------------------------------------------------
 
+    /// Which ledger board a load report belongs to — plus the line to log
+    /// about it, which the caller emits once the lock is dropped (F8).
+    ///
+    /// The report carries up to three independent facts about the board —
+    /// a UUID, a PCI address, and torch's own total-memory figure — and the
+    /// arms below are ordered by how much each can be trusted to *identify*:
+    ///
+    /// 1. **UUID matching a board.** The CUDA path, unchanged, and no
+    ///    memory check: NVML UUIDs are globally unique and byte-identical on
+    ///    both sides, so a match is proof, and adding a check could only
+    ///    refuse a correct identification.
+    /// 2. **PCI address matching a board's.** The ROCm path (and the CUDA
+    ///    fall-through when a UUID was reported that matches *nothing* —
+    ///    review F5). A BDF match alone is not proof, because it is only as
+    ///    good as the assumption that the inventory's row order is HIP's
+    ///    device order: get that wrong and a worker pinned to board A
+    ///    reports board B's row. So the match must survive a **plausibility
+    ///    cross-check** against an independent source — the worker's
+    ///    `gpu_total_mb`, which came from torch/HIP, never from the sysfs
+    ///    file the inventory's own total was read from. Agreement within
+    ///    ±5% or ±512 MB (whichever is larger — driver reserves and
+    ///    carve-outs shave a little off both sides) admits; disagreement, or
+    ///    a report with no total at all, refuses with a warning naming both
+    ///    identities and both totals. Refusing on an absent total is the
+    ///    point of the whole mechanism: admitting without it would trust the
+    ///    enumeration assumption D2 cannot verify.
+    /// 3. **The single-board fallback.** Nothing matched, this host has
+    ///    exactly one board, the report says *something* about a GPU, no BDF
+    ///    could have matched (either the worker reported none, or no board
+    ///    carries one — a CUDA inventory never does), **and the worker
+    ///    reported no UUID at all** (review F3). Then the only board is the
+    ///    only candidate, and the same total-memory check decides. This is
+    ///    the twin of the worker's own NVML single-GPU fallback. A UUID that
+    ///    is *present* and matches nothing is positive evidence of a board
+    ///    this inventory does not describe — a MIG instance outside the
+    ///    enumeration, a restricted inventory — and never reaches this arm;
+    ///    ROCm workers suppress the UUID entirely, so their path is
+    ///    unaffected.
+    ///
+    /// Everything else refuses: a `none`-class worker with no GPU at all, a
+    /// board outside the inventory, and — deliberately — a BDF that matches
+    /// no row on a host whose rows *do* carry addresses. That last case is
+    /// the enumeration-order alarm: the worker is demonstrably on a board
+    /// this inventory does not describe, so the safe answer is unpriced
+    /// dispatch plus a log line a field report can be read off.
+    ///
+    /// `expected_board` is the board key the orchestrator's *pin* named for
+    /// this replica (`GpuInventory::resolve_board_key`), when the caller
+    /// knows it. It never decides anything: resolving against what the
+    /// worker itself reports is the whole point. It exists so that a
+    /// divergence between the two — the row order the pin was derived from
+    /// not being the device order the backend enumerated — produces the
+    /// [`BoardLog::PinDiverged`] alarm instead of passing silently. The
+    /// replica is still admitted under the *resolved* board, because that is
+    /// where it physically is and therefore where its memory must be priced.
+    fn resolve_board(
+        state: &LedgerState,
+        report: &LoadReport,
+        expected_board: Option<&str>,
+    ) -> BoardResolution {
+        if let Some(uuid) = report.gpu_uuid.as_deref() {
+            if let Some(board) = state.gpus.get(uuid) {
+                return Self::admit_board(state, uuid, board, report, expected_board);
+            }
+        }
+        let inventory_has_bdfs = state.gpus.values().any(|board| board.bdf.is_some());
+        if let Some(bdf) = report.gpu_bdf.as_deref() {
+            let wanted = bdf.to_ascii_lowercase();
+            let matched = state
+                .gpus
+                .iter()
+                .find(|(_, board)| board.bdf.as_deref() == Some(wanted.as_str()));
+            if let Some((key, board)) = matched {
+                return match Self::cross_check_total(
+                    report,
+                    key,
+                    board,
+                    "the PCI address the worker reports",
+                ) {
+                    None => Self::admit_board(state, key, board, report, expected_board),
+                    Some(log) => BoardResolution::refused(log),
+                };
+            }
+            if inventory_has_bdfs {
+                return BoardResolution::refused(BoardLog::BdfOutsideInventory {
+                    worker_bdf: bdf.to_owned(),
+                    worker_uuid: report.gpu_uuid.clone(),
+                    boards: state.gpus.len(),
+                });
+            }
+        }
+        // A report with nothing to say about a GPU at all is the CPU/MPS/
+        // remote-API worker, not a failed identification: it falls to the
+        // debug line below rather than through a check it was never a
+        // candidate for, which would warn on every CPU model this host loads.
+        let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
+        if state.gpus.len() == 1 && claims_a_gpu && report.gpu_uuid.is_none() {
+            let (key, board) = state.gpus.iter().next().expect("length checked");
+            // No divergence check here, and none is possible: with one board
+            // in the ledger, an `expected_board` resolved from the same
+            // inventory can only be that board.
+            return match Self::cross_check_total(report, key, board, "this host's only board") {
+                None => BoardResolution {
+                    admit: Some((key.clone(), board.name.clone())),
+                    log: None,
+                },
+                Some(log) => BoardResolution::refused(log),
+            };
+        }
+        BoardResolution::refused(BoardLog::NoBoard {
+            worker_uuid: report.gpu_uuid.clone(),
+            worker_bdf: report.gpu_bdf.clone(),
+            boards: state.gpus.len(),
+        })
+    }
+
+    /// Admit under `key`, and raise the mis-order alarm when the
+    /// orchestrator believed it had pinned this replica somewhere else
+    /// (review F1). Admission is under the **resolved** board either way:
+    /// the replica is physically there, so that is where its memory has to
+    /// be charged, and the alarm is the field diagnostic — the pin's own
+    /// *load reservation* was already taken against the believed board and
+    /// stays there until the enumeration is fixed.
+    fn admit_board(
+        state: &LedgerState,
+        key: &str,
+        board: &GpuLedger,
+        report: &LoadReport,
+        expected_board: Option<&str>,
+    ) -> BoardResolution {
+        let log = expected_board
+            .filter(|expected| *expected != key)
+            .map(|expected| BoardLog::PinDiverged {
+                expected: expected.to_owned(),
+                expected_bdf: state.gpus.get(expected).and_then(|row| row.bdf.clone()),
+                expected_total_mb: state.gpus.get(expected).map(|row| row.total_mb),
+                resolved: key.to_owned(),
+                resolved_bdf: board.bdf.clone(),
+                resolved_total_mb: board.total_mb,
+                worker_bdf: report.gpu_bdf.clone(),
+                worker_uuid: report.gpu_uuid.clone(),
+            });
+        BoardResolution {
+            admit: Some((key.to_owned(), board.name.clone())),
+            log,
+        }
+    }
+
+    /// `None` when the worker's own total-memory reading agrees with the
+    /// board it is about to be admitted under, within ±5% or ±512 MB —
+    /// whichever is larger, because the two sources shave different amounts
+    /// off the same silicon (firmware carve-outs, ECC reserves, the driver's
+    /// own allocations) and the absolute floor covers the small boards where
+    /// 5% is a couple of hundred MB. Otherwise the refusal's log line.
+    ///
+    /// An **absent** total fails. This check is the only evidence that a
+    /// non-UUID identification is the right board at all, so "unknown"
+    /// cannot pass it; the cost of a false refusal is one unpriced replica,
+    /// the cost of a false admission is every grant on that board.
+    fn cross_check_total(
+        report: &LoadReport,
+        key: &str,
+        board: &GpuLedger,
+        matched_by: &'static str,
+    ) -> Option<BoardLog> {
+        let tolerance = (board.total_mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB);
+        if let Some(total) = report.gpu_total_mb {
+            if total.abs_diff(board.total_mb) <= tolerance {
+                return None;
+            }
+        }
+        Some(BoardLog::TotalDisagrees {
+            matched_by,
+            board: key.to_owned(),
+            board_bdf: board.bdf.clone(),
+            board_total_mb: board.total_mb,
+            worker_bdf: report.gpu_bdf.clone(),
+            worker_uuid: report.gpu_uuid.clone(),
+            worker_total_mb: report.gpu_total_mb,
+            tolerance_mb: tolerance,
+        })
+    }
+
     /// Register a freshly loaded replica and return its admission handle, or
     /// `None` when the replica is not admissible: a `none`-class model, a
     /// worker that reported no GPU at all (no torch, CPU/MPS, remote API), or
     /// a board the ledger does not know (no nvidia-smi inventory, a MIG
     /// instance outside the enumeration). All of those take the unpriced
     /// dispatch path plus the Package-1 OOM backstop, per the design's
-    /// "backends without a free-memory query" rule.
+    /// "backends without a free-memory query" rule. [`Self::resolve_board`]
+    /// holds the exact table — which identity is matched in which order, and
+    /// which failures are refusals rather than fallbacks.
     ///
-    /// The board is whatever the *worker* reported (`LoadReport::gpu_uuid`),
-    /// which is authoritative: the spawn pin may be an index, absent, or a
-    /// UUID CUDA reordered.
+    /// The board is whatever the *worker* reported — its UUID, or on ROCm
+    /// its PCI address — which is authoritative: the spawn pin may be an
+    /// index, absent, or a UUID CUDA reordered. `expected_board` is the
+    /// board key that pin named, when the caller has it; it is a
+    /// **diagnostic input only** (the mis-order alarm), never a filter.
     pub fn register_worker(
         self: &Arc<Self>,
         inference_id: &str,
         cost: CostDimension,
         telemetry: &TelemetryHandle,
+        expected_board: Option<&str>,
     ) -> Option<Admission> {
         let aggregation = cost.aggregation?;
         if !cost.scales() {
@@ -1167,26 +1536,22 @@ impl VramLedger {
         }?;
         let loaded_at = stamped.captured_at;
         let report = stamped.value;
-        let gpu = report.gpu_uuid.clone()?;
-        // The board's *model name* — the profile keyspace. Taken from the
-        // inventory rather than from the worker's `gpu_name`, so every
-        // profile this host writes is keyed by the same string nvidia-smi
-        // prints, whatever torch calls the card.
-        let board_name = {
+        // The board key, plus its *model name* — the profile keyspace. The
+        // name is taken from the inventory rather than from the worker's
+        // `gpu_name`, so every profile this host writes is keyed by the same
+        // string the probe derived, whatever torch calls the card.
+        let resolution = {
             let state = self.lock();
-            match state.gpus.get(&gpu) {
-                Some(board) => board.name.clone(),
-                None => {
-                    tracing::debug!(
-                        model = %inference_id,
-                        gpu = %gpu,
-                        "the worker reports a board the GPU inventory does not list; \
-                         dispatching this model without VRAM admission"
-                    );
-                    return None;
-                }
-            }
+            Self::resolve_board(&state, &report, expected_board)
         };
+        // Emitted with the lock **dropped**: formatting a `tracing` event
+        // under the ledger mutex would put every concurrent grant request
+        // behind a log write (review F8). It happens before the `?` below so
+        // a refusal still says why.
+        if let Some(log) = resolution.log {
+            log.emit(inference_id);
+        }
+        let (gpu, board_name) = resolution.admit?;
         // Consulted **outside** the ledger lock: the store stats (and may
         // parse) files, and blocking every concurrent grant request behind
         // that would put file I/O on the dispatch path by the back door.
@@ -2823,14 +3188,31 @@ impl VramLedger {
         budgets: impl Into<VramBudgets>,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
+        let boards: Vec<_> = boards
+            .iter()
+            .map(|(uuid, name, total_mb)| (*uuid, *name, *total_mb, None))
+            .collect();
+        Self::for_test_boards(&boards, budgets, profiles)
+    }
+
+    /// [`Self::for_test_with`] with a PCI address per board — a ROCm-shaped
+    /// ledger, which is the only kind the BDF registration arm can match
+    /// against.
+    #[cfg(test)]
+    fn for_test_boards(
+        boards: &[(&str, &str, u64, Option<&str>)],
+        budgets: impl Into<VramBudgets>,
+        profiles: Option<Arc<dyn CalibrationProfiles>>,
+    ) -> Arc<Self> {
         let gpus = boards
             .iter()
-            .map(|(uuid, name, total_mb)| {
+            .map(|(uuid, name, total_mb, bdf)| {
                 (
                     (*uuid).to_owned(),
                     GpuLedger {
                         name: (*name).to_owned(),
                         total_mb: *total_mb,
+                        bdf: bdf.map(str::to_ascii_lowercase),
                         free: None,
                         seen_authoritative_free: false,
                         load_reservations: HashMap::new(),
@@ -3580,7 +3962,7 @@ mod tests {
         let ledger = ledger(10_000, VramBudget::default());
         let handle = loaded(Some(1500), Some(1000));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         push_memory(&handle, 3000, 1500);
         ledger.ingest_all_for_test();
@@ -3605,7 +3987,7 @@ mod tests {
     fn external_clamps_at_zero() {
         let ledger = ledger(10_000, VramBudget::default());
         let handle = loaded(Some(8000), Some(0));
-        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         // free 9000 + our 8000 > total 10000 — impossible in one instant.
         push_memory(&handle, 9000, 0);
         ledger.ingest_all_for_test();
@@ -3623,7 +4005,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(None, Some(0));
         let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         push_memory(&handle, 4000, 300);
         ledger.ingest_all_for_test();
@@ -3644,7 +4026,7 @@ mod tests {
             },
         );
         let handle = loaded(Some(1000), Some(0));
-        let _a = capped.register_worker("g/a", item_cost(4), &handle);
+        let _a = capped.register_worker("g/a", item_cost(4), &handle, None);
         push_memory(&handle, 4000, 0);
         capped.ingest_all_for_test();
         // external = 10000 - 4000 - 1000 = 5000 -> margin limit 4500;
@@ -3659,7 +4041,7 @@ mod tests {
             },
         );
         let handle = loaded(Some(1000), Some(0));
-        let _b = tight.register_worker("g/a", item_cost(4), &handle);
+        let _b = tight.register_worker("g/a", item_cost(4), &handle, None);
         push_memory(&handle, 8000, 0);
         tight.ingest_all_for_test();
         // external = 10000 - 8000 - 1000 = 1000 -> margin-off limit 9000;
@@ -3677,7 +4059,7 @@ mod tests {
         let ledger = ledger(10_000, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         push_memory(&handle, 9000, 0);
         ledger.ingest_all_for_test();
@@ -3716,9 +4098,11 @@ mod tests {
         let ledger = ledger(20_000, no_margin());
         let big = loaded(Some(3000), Some(0));
         let small = loaded(Some(1000), Some(0));
-        let a = ledger.register_worker("g/big", item_cost(4), &big).unwrap();
+        let a = ledger
+            .register_worker("g/big", item_cost(4), &big, None)
+            .unwrap();
         let b = ledger
-            .register_worker("g/small", item_cost(4), &small)
+            .register_worker("g/small", item_cost(4), &small, None)
             .unwrap();
         push_memory(&big, 16_000, 0);
         ledger.ingest_all_for_test();
@@ -3760,9 +4144,9 @@ mod tests {
         let ledger = ledger(20_000, no_margin());
         let busy = loaded(Some(1000), Some(0));
         let asking = loaded(Some(1000), Some(0));
-        let a = ledger.register_worker("g/busy", item_cost(4), &busy).unwrap();
+        let a = ledger.register_worker("g/busy", item_cost(4), &busy, None).unwrap();
         let b = ledger
-            .register_worker("g/asking", item_cost(4), &asking)
+            .register_worker("g/asking", item_cost(4), &asking, None)
             .unwrap();
         push_memory(&busy, 18_000, 0);
         ledger.ingest_all_for_test();
@@ -3790,7 +4174,7 @@ mod tests {
         for index in 0..4 {
             let handle = loaded(Some(1100), Some(0));
             let admission = ledger
-                .register_worker(&format!("g/m{index}"), item_cost(4), &handle)
+                .register_worker(&format!("g/m{index}"), item_cost(4), &handle, None)
                 .unwrap();
             admission.note_demand(2);
             handles.push(handle);
@@ -3828,7 +4212,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         // Each window is granted the ramp step and measures a batch that size,
@@ -3869,7 +4253,7 @@ mod tests {
         let ledger = ledger(1_000_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 900_000, 0);
         for _ in 0..40 {
@@ -3901,7 +4285,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         handle
@@ -3917,7 +4301,7 @@ mod tests {
         drop(admission);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         assert_eq!(ledger.health()[0].workers[0].ramp_step, 0);
@@ -3972,7 +4356,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         for expected in [4, 8, 16, 32] {
@@ -4050,7 +4434,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         for _ in 0..3 {
             admission
@@ -4070,7 +4454,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(500));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         let warm: Vec<BatchMeasurement> = (1..=6)
             .map(|k| BatchMeasurement {
@@ -4185,7 +4569,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         // A clean linear series of high-water batches: 10 MB per unit.
@@ -4218,7 +4602,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         let series: Vec<BatchMeasurement> =
@@ -4257,9 +4641,11 @@ mod tests {
         let handle = loaded(Some(1000), Some(0));
         let hog = loaded(Some(60_000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
-        let other = ledger.register_worker("g/hog", item_cost(4), &hog).unwrap();
+        let other = ledger
+            .register_worker("g/hog", item_cost(4), &hog, None)
+            .unwrap();
         push_memory(&handle, 39_000, 0);
         let series: Vec<BatchMeasurement> = (1..=6u64)
             .map(|k| measurement(k * 8, 0, 100 * k * 8))
@@ -4299,7 +4685,7 @@ mod tests {
 
         // A measured load teaches the ledger the real base for next time.
         let handle = loaded(Some(1234), Some(0));
-        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
         assert_eq!(
             ledger.headroom_mb(BOARD),
@@ -4345,7 +4731,7 @@ mod tests {
         });
         let ledger = ledger_with(20_000, no_margin(), &profiles);
         let handle = loaded(Some(1234), Some(0));
-        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -4360,7 +4746,7 @@ mod tests {
         });
         let ledger = ledger_with(20_000, no_margin(), &profiles);
         let handle = loaded(Some(1234), Some(0));
-        let _admission = ledger.register_worker("g/a", item_cost(4), &handle);
+        let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let _reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -4400,7 +4786,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         ledger.ingest_all_for_test();
@@ -4456,7 +4842,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         ledger.ingest_all_for_test();
@@ -4498,9 +4884,9 @@ mod tests {
         });
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let first = loaded(Some(1000), Some(0));
-        let _a = ledger.register_worker("g/a", item_cost(4), &first).unwrap();
+        let _a = ledger.register_worker("g/a", item_cost(4), &first, None).unwrap();
         let second = loaded(Some(1000), Some(0));
-        let _b = ledger.register_worker("g/a", item_cost(4), &second).unwrap();
+        let _b = ledger.register_worker("g/a", item_cost(4), &second, None).unwrap();
         assert_eq!(
             ledger.calibration_state("g/a", BOARD).unwrap().samples.len(),
             1,
@@ -4542,7 +4928,7 @@ mod tests {
             let ledger = ledger_with(100_000, VramBudget::default(), &profiles);
             let handle = loaded(Some(1000), Some(0));
             let admission = ledger
-                .register_worker("g/a", item_cost(4), &handle)
+                .register_worker("g/a", item_cost(4), &handle, None)
                 .unwrap();
             // Something else holds 49 GB, so the margin has something to
             // bite on at all.
@@ -4571,7 +4957,7 @@ mod tests {
         let ledger = ledger(100_000, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 50_000, 0);
         for units in [4, 8, 16, 32] {
@@ -4599,7 +4985,7 @@ mod tests {
         let ledger = ledger(100_000, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", CostDimension::fallback(), &handle)
+            .register_worker("g/a", CostDimension::fallback(), &handle, None)
             .unwrap();
         push_memory(&handle, 50_000, 0);
         for units in [4, 8, 16, 32, 64] {
@@ -4622,7 +5008,7 @@ mod tests {
         let ledger = ledger(100_000, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 50_000, 0);
         // A systematically scattered high-water series: residual ~150 MB
@@ -4671,7 +5057,7 @@ mod tests {
         );
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         ledger.ingest_all_for_test();
@@ -4691,7 +5077,7 @@ mod tests {
         let unmargined = self::ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let _admission = unmargined
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         unmargined.ingest_all_for_test();
@@ -4711,7 +5097,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
 
@@ -4796,7 +5182,7 @@ mod tests {
         let ledger = ledger_with(100_000, VramBudget::default(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 50_000, 0);
         ledger.ingest_all_for_test();
@@ -4851,7 +5237,7 @@ mod tests {
         );
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         for units in [4, 8, 16] {
@@ -4872,7 +5258,7 @@ mod tests {
         drop(admission);
         let handle = loaded(Some(1000), Some(0));
         let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         let after = ledger.calibration_state("g/a", BOARD).expect("still there");
         assert_eq!(
@@ -4911,7 +5297,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
 
@@ -4975,7 +5361,7 @@ mod tests {
             telemetry.load = Some(Timestamped::now(report));
             let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
             let admission = ledger
-                .register_worker("g/a", item_cost(4), &handle)
+                .register_worker("g/a", item_cost(4), &handle, None)
                 .unwrap();
             push_memory(&handle, 90_000, 0);
             measured_window(&handle, &admission, 4);
@@ -5000,13 +5386,15 @@ mod tests {
         };
         assert!(
             ledger
-                .register_worker("g/api", none_class, &loaded(Some(10), Some(0)))
+                .register_worker("g/api", none_class, &loaded(Some(10), Some(0)), None)
                 .is_none(),
             "the none class is never priced"
         );
         let bare: TelemetryHandle = Arc::new(StdMutex::new(WorkerTelemetry::default()));
         assert!(
-            ledger.register_worker("g/a", item_cost(4), &bare).is_none(),
+            ledger
+                .register_worker("g/a", item_cost(4), &bare, None)
+                .is_none(),
             "no load report at all (no torch, CPU/MPS host)"
         );
         let mut elsewhere = WorkerTelemetry::default();
@@ -5017,10 +5405,506 @@ mod tests {
         }));
         assert!(
             ledger
-                .register_worker("g/a", item_cost(4), &Arc::new(StdMutex::new(elsewhere)))
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &Arc::new(StdMutex::new(elsewhere)),
+                    None
+                )
                 .is_none(),
             "a board the inventory does not list"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Registration keying (docs/rocm-batch-calibration-parity.md, D3)
+    // ------------------------------------------------------------------
+
+    const AMD_A: &str = "GPU-BDF-0000:03:00.0";
+    const AMD_B: &str = "GPU-BDF-0000:0c:00.0";
+
+    /// A two-board ROCm-shaped ledger: keys in `GPU-BDF-…` form, a PCI
+    /// address per board, and 24 GB cards.
+    fn rocm_ledger() -> Arc<VramLedger> {
+        VramLedger::for_test_boards(
+            &[
+                (AMD_A, "AMD gfx1100 (24 GB)", 24_576, Some("0000:03:00.0")),
+                (AMD_B, "AMD gfx1100 (24 GB)", 24_576, Some("0000:0c:00.0")),
+            ],
+            VramBudget::default(),
+            None,
+        )
+    }
+
+    /// A ROCm worker's load report: **no** `gpu_uuid` (the worker suppresses
+    /// torch's HIP-rendered one), a PCI address, and torch's own total.
+    fn rocm_report(bdf: Option<&str>, total_mb: Option<u64>) -> LoadReport {
+        LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("alloc_delta".to_owned()),
+            reserved_at_load_mb: Some(0),
+            gpu_bdf: bdf.map(str::to_owned),
+            gpu_total_mb: total_mb,
+            torch_version: Some("2.11.0+rocm7.2".to_owned()),
+            dtype: Some("fp16".to_owned()),
+            ..LoadReport::default()
+        }
+    }
+
+    /// [`rocm_report`] as a telemetry handle, which is what registration
+    /// takes.
+    fn loaded_rocm(bdf: Option<&str>, total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(rocm_report(bdf, total_mb)));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// The board a replica was admitted under, per `/health`.
+    fn admitted_board(ledger: &Arc<VramLedger>, worker: usize) -> (String, String) {
+        let boards = ledger.health();
+        let board = boards
+            .iter()
+            .find(|board| !board.workers.is_empty())
+            .expect("some board holds the replica");
+        (
+            board.gpu_uuid.clone(),
+            board.workers[worker].inference_id.clone(),
+        )
+    }
+
+    /// The ROCm path: no UUID to match on, so the worker's PCI address is
+    /// the join — and the join is only accepted once the worker's *own*
+    /// total-VRAM reading agrees with the board's. Both facts reach us
+    /// through different drivers, which is what makes the agreement
+    /// evidence that the inventory's row order really is HIP's device
+    /// order (the one assumption D2 cannot verify).
+    #[test]
+    fn a_bdf_match_admits_under_the_boards_key() {
+        let ledger = rocm_ledger();
+        // 24_560 against 24_576: the ordinary few-MB driver-reserve skew.
+        let handle = loaded_rocm(Some("0000:0c:00.0"), Some(24_560));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        assert_eq!(
+            admitted_board(&ledger, 0),
+            (AMD_B.to_owned(), "g/a".to_owned()),
+            "admitted under the second board's key, from its address alone"
+        );
+        // The address is compared case-insensitively: sysfs and torch render
+        // hex independently and neither side promises a case.
+        let ledger = rocm_ledger();
+        let upper = loaded_rocm(Some("0000:0C:00.0"), Some(24_576));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &upper, None)
+            .expect("admitted");
+        assert_eq!(admitted_board(&ledger, 0).0, AMD_B);
+    }
+
+    /// The cross-check is the whole safety net: a BDF match whose totals
+    /// disagree, or that cannot be checked at all, is refused rather than
+    /// priced against a board the worker may not be on. Refusal is the
+    /// unpriced dispatch path — today's ROCm behaviour — never a failure.
+    #[test]
+    fn a_bdf_match_is_refused_without_an_agreeing_total() {
+        let ledger = rocm_ledger();
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    // A 16 GB board reported against a 24 GB row: the
+                    // enumeration is wrong somewhere.
+                    &loaded_rocm(Some("0000:03:00.0"), Some(16_384)),
+                    None
+                )
+                .is_none(),
+            "totals disagree by far more than the tolerance"
+        );
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), None),
+                    None
+                )
+                .is_none(),
+            "no total at all cannot pass a check, and only an exact UUID \
+             match is admitted without one"
+        );
+        assert!(
+            ledger.health().iter().all(|board| board.workers.is_empty()),
+            "nothing was admitted"
+        );
+        // The tolerance is max(5%, 512 MB): 24_576 * 5% = 1228 MB.
+        let ledger = rocm_ledger();
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), Some(24_576 - 1200)),
+                    None
+                )
+                .is_some(),
+            "inside 5%"
+        );
+        let ledger = rocm_ledger();
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), Some(24_576 - 1300)),
+                    None
+                )
+                .is_none(),
+            "outside 5%"
+        );
+    }
+
+    /// A PCI address no board in the inventory has is the enumeration-order
+    /// alarm D2 is guarded by: the worker is demonstrably on a board this
+    /// inventory does not describe. It must not fall back to anything.
+    #[test]
+    fn a_bdf_outside_the_inventory_is_refused() {
+        let ledger = rocm_ledger();
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:41:00.0"), Some(24_576)),
+                    None
+                )
+                .is_none()
+        );
+        // Not even on a single-board host, where the fallback would
+        // otherwise apply: the address is positive evidence of the *wrong*
+        // board, which is not the same as no evidence.
+        let single = VramLedger::for_test_boards(
+            &[(AMD_A, "AMD gfx1100 (24 GB)", 24_576, Some("0000:03:00.0"))],
+            VramBudget::default(),
+            None,
+        );
+        assert!(
+            single
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:41:00.0"), Some(24_576)),
+                    None
+                )
+                .is_none()
+        );
+    }
+
+    /// A UUID that matches **no** board does not end the search (review
+    /// F5): a MIG instance outside the enumeration, or a CUDA host whose
+    /// inventory was restricted, still has a PCI address to be identified
+    /// by. Only a matching UUID short-circuits the checks.
+    #[test]
+    fn a_uuid_that_matches_nothing_falls_through_to_the_bdf() {
+        let ledger = rocm_ledger();
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            gpu_uuid: Some("GPU-a-third-vocabulary".to_owned()),
+            gpu_bdf: Some("0000:03:00.0".to_owned()),
+            gpu_total_mb: Some(24_576),
+            ..LoadReport::default()
+        }));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted on the address");
+        assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
+    }
+
+    /// The NVML single-GPU fallback's twin: one board, nothing matched, and
+    /// no address that *could* have matched (a CUDA inventory carries none).
+    /// The total-memory check is what makes it safe — and multiple boards
+    /// make it impossible, because there is nothing to disambiguate with.
+    #[test]
+    fn the_single_board_fallback_needs_an_agreeing_total() {
+        let bare = |total: Option<u64>| {
+            let mut telemetry = WorkerTelemetry::default();
+            telemetry.load = Some(Timestamped::now(LoadReport {
+                base_mb: Some(1000),
+                gpu_total_mb: total,
+                ..LoadReport::default()
+            }));
+            Arc::new(StdMutex::new(telemetry)) as TelemetryHandle
+        };
+        let single = ledger(24_576, VramBudget::default());
+        let _admission = single
+            .register_worker("g/a", item_cost(4), &bare(Some(24_400)), None)
+            .expect("one board, and the worker's own total says it is that board");
+        assert_eq!(admitted_board(&single, 0).0, BOARD);
+
+        let fresh = ledger(24_576, VramBudget::default());
+        assert!(
+            fresh
+                .register_worker("g/a", item_cost(4), &bare(Some(8192)), None)
+                .is_none(),
+            "a board a third the size is not this one"
+        );
+        assert!(
+            fresh
+                .register_worker("g/a", item_cost(4), &bare(None), None)
+                .is_none(),
+            "and an unverifiable claim is not admitted"
+        );
+        // A report that says nothing about a GPU at all (a CPU impl that
+        // imported torch, a remote API) is not a failed identification and
+        // must not be treated as one — it is simply not a candidate.
+        let mut cpu = WorkerTelemetry::default();
+        cpu.load = Some(Timestamped::now(LoadReport {
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            ..LoadReport::default()
+        }));
+        assert!(
+            fresh
+                .register_worker("g/a", item_cost(4), &Arc::new(StdMutex::new(cpu)), None)
+                .is_none()
+        );
+
+        let two = VramLedger::for_test_boards(
+            &[
+                (BOARD, "TEST 9000", 24_576, None),
+                ("GPU-bbbb", "TEST 9000", 24_576, None),
+            ],
+            VramBudget::default(),
+            None,
+        );
+        assert!(
+            two.register_worker("g/a", item_cost(4), &bare(Some(24_576)), None)
+                .is_none(),
+            "two identical boards: the total identifies neither"
+        );
+    }
+
+    /// The pair D2 left open: a ROCm replica's pin is a HIP index and its
+    /// ledger key is the board key, so a load reservation taken with the
+    /// pin string finds nothing. Resolving both from the same registry
+    /// entry is what closes it — and the same call fixes CUDA's
+    /// abbreviated-UUID miss, which was never ROCm-specific.
+    #[test]
+    fn a_rocm_index_pin_reserves_against_the_board_it_names() {
+        let amd = |index: u32, bdf: &str| crate::inferio::gpu::GpuInfo {
+            index,
+            uuid: format!("GPU-BDF-{bdf}"),
+            name: "AMD gfx1100 (24 GB)".to_owned(),
+            total_mb: 24_576,
+            compute_cap: None,
+            bdf: Some(bdf.to_owned()),
+            gfx_target_version: Some(110_000),
+        };
+        let inventory =
+            GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
+        let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+        let pin = inventory.resolve_pin(Some("1")).expect("a HIP index");
+        assert_eq!(pin, "1");
+        assert!(
+            ledger
+                .reserve_load("g/a", item_cost(4), &pin, None)
+                .is_none(),
+            "the pin alone names no ledger board — this was the gap"
+        );
+        let key = inventory
+            .resolve_board_key(Some("1"))
+            .expect("the same request in the ledger's vocabulary");
+        assert_eq!(key, AMD_B);
+        let reservation = ledger.reserve_load("g/a", item_cost(4), &key, None);
+        assert!(reservation.is_some(), "and the pair does");
+        // The reservation lands on the board the pin selected, not the other.
+        let charged = |uuid: &str| {
+            ledger
+                .health()
+                .into_iter()
+                .find(|board| board.gpu_uuid == uuid)
+                .map(|board| board.load_reservations_mb)
+                .unwrap()
+        };
+        assert!(charged(AMD_B) > 0, "the pinned board carries the charge");
+        assert_eq!(charged(AMD_A), 0);
+        drop(reservation);
+        assert_eq!(charged(AMD_B), 0, "and gives it back when the load ends");
+    }
+
+    /// The inventory's PCI addresses have to reach the ledger for the BDF
+    /// arm to have anything to match: `VramLedger::new` is where that
+    /// threading happens, and a board built without it would refuse every
+    /// ROCm replica while looking perfectly healthy.
+    #[test]
+    fn the_ledger_carries_the_inventorys_pci_addresses() {
+        let inventory = GpuInventory::known_rocm(vec![crate::inferio::gpu::GpuInfo {
+            index: 0,
+            uuid: AMD_A.to_owned(),
+            name: "AMD gfx1100 (24 GB)".to_owned(),
+            total_mb: 24_576,
+            compute_cap: None,
+            bdf: Some("0000:03:00.0".to_owned()),
+            gfx_target_version: Some(110_000),
+        }]);
+        let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+        let handle = loaded_rocm(Some("0000:03:00.0"), Some(24_576));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("the address reached the ledger");
+        assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
+    }
+
+    /// Two boards of the *same model and size* is the case no memory
+    /// cross-check can ever tell apart, and therefore the case that decides
+    /// what a mis-ordered enumeration does. Answer (review F1): the replica
+    /// is admitted under the board it is **physically on** — the one it
+    /// reported — because that is where its memory has to be priced, and the
+    /// divergence from the board the pin believed is raised as an alarm, not
+    /// a refusal. Refusing here would leave a perfectly identifiable replica
+    /// unpriced on a host whose only fault is a row order.
+    #[test]
+    fn a_swapped_enumeration_admits_under_the_board_the_worker_is_on() {
+        let ledger = rocm_ledger();
+        // Pinned to (and believed on) board A; came up on board B.
+        let handle = loaded_rocm(Some("0000:0c:00.0"), Some(24_576));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, Some(AMD_A))
+            .expect("admitted despite the divergence");
+        assert_eq!(
+            admitted_board(&ledger, 0),
+            (AMD_B.to_owned(), "g/a".to_owned()),
+            "charged to the board it is on, not the one the pin named"
+        );
+
+        // The alarm itself. `resolve_board` hands the caller a decision *and*
+        // the line to log once the lock is dropped (review F8), so the
+        // diagnostic is assertable as the decision it is rather than by
+        // scraping a subscriber.
+        let report = rocm_report(Some("0000:0c:00.0"), Some(24_576));
+        let state = ledger.lock();
+        let diverged = VramLedger::resolve_board(&state, &report, Some(AMD_A));
+        assert_eq!(
+            diverged.admit.map(|(key, _)| key),
+            Some(AMD_B.to_owned()),
+            "still admitted, under the resolved board"
+        );
+        assert!(
+            matches!(diverged.log, Some(BoardLog::PinDiverged { .. })),
+            "and the mis-order is what gets logged"
+        );
+        // The same registration whose pin agrees says nothing at all.
+        let agreed = VramLedger::resolve_board(&state, &report, Some(AMD_B));
+        assert!(agreed.log.is_none(), "no alarm when the two agree");
+        // Nor when the caller has no belief to compare against.
+        assert!(
+            VramLedger::resolve_board(&state, &report, None)
+                .log
+                .is_none()
+        );
+    }
+
+    /// The cross-check's exact edges, in both halves of `max(5%, 512 MB)`.
+    /// The floor half is not decoration: on an 8 GB board 5% is 409 MB, so
+    /// deleting the `.max(512)` would change behaviour — and without this
+    /// test nothing would notice.
+    #[test]
+    fn the_total_tolerance_is_five_percent_with_a_512mb_floor() {
+        // 24 GB: 5% is 1228 MB, the wider of the two.
+        let big = |total: u64| {
+            rocm_ledger()
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), Some(total)),
+                    None,
+                )
+                .is_some()
+        };
+        assert!(big(24_576 - 1228), "a difference of exactly the tolerance");
+        assert!(!big(24_576 - 1229), "and one MB past it");
+        assert!(
+            big(24_576 + 1228),
+            "symmetric: the worker may read high too"
+        );
+        assert!(!big(24_576 + 1229));
+
+        // 8 GB: 5% is 409 MB, so the absolute floor is what decides.
+        let small = |total: u64| {
+            VramLedger::for_test_boards(
+                &[(AMD_A, "AMD gfx1030 (8 GB)", 8192, Some("0000:03:00.0"))],
+                VramBudget::default(),
+                None,
+            )
+            .register_worker(
+                "g/a",
+                item_cost(4),
+                &loaded_rocm(Some("0000:03:00.0"), Some(total)),
+                None,
+            )
+            .is_some()
+        };
+        assert!(
+            small(8192 - 512),
+            "the 512 MB floor admits where 5% would not"
+        );
+        assert!(!small(8192 - 513), "and stops one MB later");
+    }
+
+    /// A UUID match carries **no** memory check, deliberately. NVML UUIDs are
+    /// globally unique and byte-identical on both sides, so a match is proof
+    /// of identity; a total that then disagrees means the two *totals* differ
+    /// (an ECC mode, a firmware carve-out, a stale inventory), never that the
+    /// board is wrong. Checking could only refuse a correct identification.
+    #[test]
+    fn a_uuid_match_admits_whatever_the_totals_say() {
+        let ledger = ledger(24_576, VramBudget::default());
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            gpu_uuid: Some(BOARD.to_owned()),
+            // A number that no tolerance would ever admit.
+            gpu_total_mb: Some(1),
+            ..LoadReport::default()
+        }));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted on the UUID alone");
+        assert_eq!(admitted_board(&ledger, 0).0, BOARD);
+    }
+
+    /// Review F3: the single-board fallback requires the UUID to be **absent**
+    /// (as it is on every ROCm worker), not merely unmatched. A UUID that is
+    /// present and matches nothing is positive evidence of a board this
+    /// inventory does not describe — a MIG instance outside the enumeration,
+    /// an inventory restricted after the worker was spawned — and no
+    /// agreement of totals makes it this host's only board.
+    #[test]
+    fn a_present_but_unmatched_uuid_refuses_the_single_board_fallback() {
+        let bare = |uuid: Option<&str>| {
+            let mut telemetry = WorkerTelemetry::default();
+            telemetry.load = Some(Timestamped::now(LoadReport {
+                base_mb: Some(1000),
+                gpu_uuid: uuid.map(str::to_owned),
+                // Exactly the board's own total, so only the UUID decides.
+                gpu_total_mb: Some(24_576),
+                ..LoadReport::default()
+            }));
+            Arc::new(StdMutex::new(telemetry)) as TelemetryHandle
+        };
+        let single = ledger(24_576, VramBudget::default());
+        assert!(
+            single
+                .register_worker("g/a", item_cost(4), &bare(Some("MIG-somewhere")), None)
+                .is_none(),
+            "a reported identity that matches nothing is not this board"
+        );
+        let _admission = single
+            .register_worker("g/a", item_cost(4), &bare(None), None)
+            .expect("the same report with no identity claim does fall back");
+        assert_eq!(admitted_board(&single, 0).0, BOARD);
     }
 
     /// A grant and the pool growth it produces are the **same memory**: a
@@ -5033,7 +5917,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         // 100 MB/unit, so a 24-unit batch prices at 2400 MB.
         let series: Vec<BatchMeasurement> = (1..=6u64)
@@ -5066,7 +5950,7 @@ mod tests {
         let ledger = ledger(6144, no_margin());
         let handle = loaded(Some(1200), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         let series: Vec<BatchMeasurement> = (1..=6u64)
             .map(|k| measurement(k * 4, 0, 100 * k * 4))
@@ -5111,7 +5995,7 @@ mod tests {
         }));
         let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         let board = &ledger.health()[0];
         assert!(board.external_known, "the load report is a reading");
@@ -5139,7 +6023,7 @@ mod tests {
         let ledger = ledger(32_768, no_margin());
         let handle = loaded(Some(1024), Some(0));
         let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
 
         let push = |free_mb: u64, source: &str| {
@@ -5214,7 +6098,7 @@ mod tests {
         let ledger = ledger(32_768, no_margin());
         let handle = loaded(Some(1024), Some(0));
         let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         let push = |free_mb: u64, source: &str| {
             let mut telemetry = handle.lock().unwrap();
@@ -5251,6 +6135,7 @@ mod tests {
             GpuLedger {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
+                bdf: None,
                 free,
                 seen_authoritative_free: false,
                 load_reservations: HashMap::new(),
@@ -5314,7 +6199,7 @@ mod tests {
         let ledger = ledger(1_000_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 900_000, 0);
         let flood: Vec<BatchMeasurement> = (1..=(WorkerTelemetry::RING as u64 + 10))
@@ -5343,7 +6228,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         // A window runs one OOM batch and is then aborted (its worker died, the
@@ -5390,7 +6275,7 @@ mod tests {
         // A neighbour is resident and hungry while the none-class model loads.
         let handle = loaded(Some(1000), Some(0));
         let neighbour = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 9000, 0);
         ledger.ingest_all_for_test();
@@ -5439,7 +6324,7 @@ mod tests {
         // The load lands and reports no base at all.
         let handle = loaded(None, Some(0));
         let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         assert!(
             ledger.reserve_load("g/a", item_cost(4), BOARD, None).is_none(),
@@ -5459,7 +6344,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         assert!(
@@ -5498,7 +6383,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(10_000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 0, 0);
         ledger.ingest_all_for_test();
@@ -5520,7 +6405,7 @@ mod tests {
         let ledger = ledger(20_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 18_000, 0);
         ledger.ingest_all_for_test();
@@ -5565,8 +6450,12 @@ mod tests {
         );
         let on_a = loaded_on(A, Some(1000), Some(0));
         let on_b = loaded_on(B, Some(1000), Some(0));
-        let _a = ledger.register_worker("g/a", item_cost(4), &on_a).unwrap();
-        let _b = ledger.register_worker("g/b", item_cost(4), &on_b).unwrap();
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &on_a, None)
+            .unwrap();
+        let _b = ledger
+            .register_worker("g/b", item_cost(4), &on_b, None)
+            .unwrap();
         push_memory(&on_a, 9000, 0);
         push_memory(&on_b, 9000, 0);
         ledger.ingest_all_for_test();
@@ -5608,8 +6497,12 @@ mod tests {
         );
         let on_a = loaded_on(A, Some(1000), Some(0));
         let on_b = loaded_on(B, Some(1000), Some(0));
-        let _a = ledger.register_worker("g/a", item_cost(4), &on_a).unwrap();
-        let _b = ledger.register_worker("g/b", item_cost(4), &on_b).unwrap();
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &on_a, None)
+            .unwrap();
+        let _b = ledger
+            .register_worker("g/b", item_cost(4), &on_b, None)
+            .unwrap();
         // external = 10000 - 5000 - 1000 = 4000 on both boards.
         push_memory(&on_a, 5000, 0);
         push_memory(&on_b, 5000, 0);
@@ -5642,11 +6535,11 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         // The idle resident: 4000 base plus 1000 MiB of retained pool.
         let idle = loaded(Some(4000), Some(0));
-        let _idle = ledger.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let _idle = ledger.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
         // The hungry one: 4800 base, no pool of its own yet.
         let hungry = loaded(Some(4800), Some(0));
         let asking = ledger
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 200, 1000);
         push_memory(&hungry, 200, 0);
@@ -5688,10 +6581,10 @@ mod tests {
         //    costing anybody anything.
         let roomy = ledger(10_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
-        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
         let hungry = loaded(Some(1000), Some(0));
         let asking = roomy
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 7000, 1000);
         push_memory(&hungry, 7000, 0);
@@ -5708,10 +6601,10 @@ mod tests {
         //    worth: it would pay a full pool teardown to hand over crumbs.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4900), Some(0));
-        let _idle = tight.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let _idle = tight.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
         let hungry = loaded(Some(4900), Some(0));
         let asking = tight
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 100, TRIM_SLACK_MB - 1);
         push_memory(&hungry, 100, 0);
@@ -5729,11 +6622,11 @@ mod tests {
         let busy_board = ledger(10_000, no_margin());
         let busy = loaded(Some(4000), Some(0));
         let busy_admission = busy_board
-            .register_worker("g/busy", item_cost(4), &busy)
+            .register_worker("g/busy", item_cost(4), &busy, None)
             .unwrap();
         let hungry = loaded(Some(4800), Some(0));
         let asking = busy_board
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&busy, 200, 1000);
         push_memory(&hungry, 200, 0);
@@ -5759,7 +6652,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(4000), Some(0));
         let admission = ledger
-            .register_worker("g/idle", item_cost(4), &handle)
+            .register_worker("g/idle", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 5000, 1000);
         ledger.ingest_all_for_test();
@@ -5801,15 +6694,17 @@ mod tests {
         // The trim candidate: idle, and holding 1000 MiB of pool slack.
         let idle = loaded(Some(1000), Some(0));
         let _idle = ledger
-            .register_worker("g/idle", item_cost(4), &idle)
+            .register_worker("g/idle", item_cost(4), &idle, None)
             .unwrap();
         // Two hungry pre-fit models, appetites 1 vs 4000.
         let small = loaded(Some(1), Some(0));
         let asking = ledger
-            .register_worker("g/small", item_cost(4), &small)
+            .register_worker("g/small", item_cost(4), &small, None)
             .unwrap();
         let big = loaded(Some(4000), Some(0));
-        let other = ledger.register_worker("g/big", item_cost(4), &big).unwrap();
+        let other = ledger
+            .register_worker("g/big", item_cost(4), &big, None)
+            .unwrap();
         other.note_demand(3);
         // footprints = (1000 + 1000) + 1 + 4000 = 6001; external = 0.
         push_memory(&idle, 193_999, 1000);
@@ -5846,9 +6741,9 @@ mod tests {
         // model, and a budget bounded by what it has measured.
         let roomy = ledger(200_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
-        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
         let handle = loaded(Some(1000), Some(0));
-        let admission = roomy.register_worker("g/a", item_cost(4), &handle).unwrap();
+        let admission = roomy.register_worker("g/a", item_cost(4), &handle, None).unwrap();
         push_memory(&idle, 190_000, 1000);
         push_memory(&handle, 190_000, 0);
         roomy.ingest_all_for_test();
@@ -5880,9 +6775,9 @@ mod tests {
         // nothing left, where the slice genuinely cannot pay for the window.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
-        let _idle = tight.register_worker("g/idle", item_cost(4), &idle).unwrap();
+        let _idle = tight.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
         let handle = loaded(Some(4980), Some(0));
-        let admission = tight.register_worker("g/a", item_cost(4), &handle).unwrap();
+        let admission = tight.register_worker("g/a", item_cost(4), &handle, None).unwrap();
         // footprints = (4000 + 1000) + 4980 = 9980; external = 0; headroom = 20.
         push_memory(&idle, 20, 1000);
         push_memory(&handle, 20, 0);
@@ -5920,11 +6815,11 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
         let _idle = ledger
-            .register_worker("g/idle", item_cost(4), &idle)
+            .register_worker("g/idle", item_cost(4), &idle, None)
             .unwrap();
         let hungry = loaded(Some(4800), Some(0));
         let asking = ledger
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 200, 1000);
         push_memory(&hungry, 200, 0);
@@ -5959,11 +6854,11 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
         let resident = ledger
-            .register_worker("g/idle", item_cost(4), &idle)
+            .register_worker("g/idle", item_cost(4), &idle, None)
             .unwrap();
         let hungry = loaded(Some(4800), Some(0));
         let asking = ledger
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 200, 1000);
         push_memory(&hungry, 200, 0);
@@ -6002,11 +6897,11 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
         let resident = ledger
-            .register_worker("g/idle", item_cost(4), &idle)
+            .register_worker("g/idle", item_cost(4), &idle, None)
             .unwrap();
         let hungry = loaded(Some(4800), Some(0));
         let asking = ledger
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&idle, 200, 1000);
         push_memory(&hungry, 200, 0);
@@ -6053,13 +6948,13 @@ mod tests {
             .enumerate()
             .map(|(index, handle)| {
                 ledger
-                    .register_worker(&format!("g/idle{index}"), item_cost(4), handle)
+                    .register_worker(&format!("g/idle{index}"), item_cost(4), handle, None)
                     .unwrap()
             })
             .collect();
         let hungry = loaded(Some(1), Some(0));
         let asking = ledger
-            .register_worker("g/hungry", item_cost(4), &hungry)
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         for handle in &handles {
             push_memory(handle, 159, 300);
@@ -6097,7 +6992,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(4000), Some(0));
         let admission = ledger
-            .register_worker("g/idle", item_cost(4), &handle)
+            .register_worker("g/idle", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 5000, 1000);
         let pre_trim = handle.lock().unwrap().memory.clone().expect("a sample");
@@ -6247,7 +7142,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
 
@@ -6308,7 +7203,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle)
+            .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
         // One high-water window, so the entry has local evidence to be
@@ -6379,7 +7274,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle)
+            .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         ledger.ingest_all_for_test();
@@ -6433,7 +7328,7 @@ mod tests {
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
 
@@ -6476,7 +7371,7 @@ mod tests {
         );
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle)
+            .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
         measured_window(&handle, &admission, 64);
@@ -6502,7 +7397,7 @@ mod tests {
         );
         let handle = loaded(Some(1000), Some(0));
         let admission = next
-            .register_worker("g/a", item_cost(64), &handle)
+            .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
         next.ingest_all_for_test();
@@ -6538,7 +7433,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(16), &handle)
+            .register_worker("g/a", item_cost(16), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
 
@@ -6608,7 +7503,7 @@ mod tests {
         let ledger = ledger(200_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(32), &handle)
+            .register_worker("g/a", item_cost(32), &handle, None)
             .unwrap();
         push_memory(&handle, 190_000, 1000);
 
@@ -6724,7 +7619,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle)
+            .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
         for units in [8u64, 16, 32, 64] {
@@ -6781,7 +7676,7 @@ mod tests {
         // foreign, which is what keeps it out of the local store.
         let other = loaded(Some(1000), Some(0));
         let _second = ledger
-            .register_worker("g/b", item_cost(64), &other)
+            .register_worker("g/b", item_cost(64), &other, None)
             .unwrap();
         {
             let mut state = ledger.lock();
@@ -6828,10 +7723,10 @@ mod tests {
         // Seed 1, so the contention floor (one seed batch) is 1000 MiB and
         // leaves the appetite split room to be the binding constraint.
         let a = ledger
-            .register_worker("g/a", item_cost(1), &a_handle)
+            .register_worker("g/a", item_cost(1), &a_handle, None)
             .unwrap();
         let b = ledger
-            .register_worker("g/b", item_cost(1), &b_handle)
+            .register_worker("g/b", item_cost(1), &b_handle, None)
             .unwrap();
         push_memory(&a_handle, 8000, 0);
         push_memory(&b_handle, 8000, 0);
@@ -6886,7 +7781,7 @@ mod tests {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle)
+            .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
         // A flat curve over the three smallest buckets: batching buys
