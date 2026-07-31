@@ -1,10 +1,14 @@
 # Unified-memory admission: MPS, AMD APUs, CPU
 
-**Status: DRAFT for review.** Extends `docs/batch-calibration-design.md`
-(the ledger/grant/calibration machinery) and
-`docs/rocm-batch-calibration-parity.md` (the sysfs-first ROCm probe).
-Nothing here is implemented. Decision points are marked **DP-n** inline,
-each with a recommendation; a summary table sits at the end.
+**Status: DECIDED 2026-08-01, not yet implemented.** Extends
+`docs/batch-calibration-design.md` (the ledger/grant/calibration
+machinery) and `docs/rocm-batch-calibration-parity.md` (the sysfs-first
+ROCm probe). Decision points are marked **DP-n** inline; the table at the
+end records each decision. Two were amended in review: DP-3 (Apple
+Silicon always resolves to the accelerator unless the user explicitly
+configures CPU) and DP-4 (the worker-reported MPS total is authoritative
+— real machines run raised GPU wired limits, so no fixed window around
+the seed can be allowed to reject the true figure).
 
 ## Why this exists
 
@@ -106,10 +110,10 @@ Everything else is inherited:
   slowdown regimes (MPS compression/swap, GTT spill, CPU swap) where the
   hard error fires late or never.
 - **Margins**: defaults unchanged (`margin = 0.10`, unconfirmed-bonus
-  +0.15 until 5 local samples). **DP-1**: no unified-specific default
-  margin. Recommendation: keep the shipped defaults; the RAM-clamped free
-  already prices external pressure in, and the WDDM/dogfood revisit
-  clause in the base design covers retuning.
+  +0.15 until 5 local samples). **DP-1 (decided)**: no unified-specific
+  default margin — the RAM-clamped free already prices external pressure
+  in, and the WDDM/dogfood revisit clause in the base design covers
+  retuning.
 
 ### Negative signals, widened once for all three
 
@@ -128,15 +132,14 @@ This widening also fixes the pre-existing CPU dead-worker problem in
 passing, and it is deliberately conservative: a generic `RuntimeError` is
 only treated as OOM when the classifier agrees.
 
-**DP-2 — worker death as a negative sample.** A SIGKILL (macOS jetsam,
-Linux OOM-killer) cannot be caught in-process. Proposal: when a replica
+**DP-2 (decided) — worker death as a negative sample.** A SIGKILL (macOS
+jetsam, Linux OOM-killer) cannot be caught in-process. When a replica
 dies while a granted window is in flight on a **unified** board, the
 ledger records one synthetic negative (grant halving, never fed to the
 fit) before the death-cleanup path runs, tagged distinctly in the log.
 Scoped to unified boards only — on dGPUs a mid-window death has too many
 non-memory causes to blame the batch size, but on a unified board a death
-mid-batch is overwhelmingly the memory killer. Recommendation: yes,
-scoped exactly like this.
+mid-batch is overwhelmingly the memory killer.
 
 ### Trim
 
@@ -156,14 +159,16 @@ scoped exactly like this.
   sentinel. The extra maps to the same default-PyPI wheel set `cpu` maps
   to on macOS (the source markers already route every extra there), so
   this is a label change, not a dependency change; `extra_accelerator`
-  learns the new line, and an old sentinel reading `extra=cpu` on
-  macOS/aarch64 **re-resolves as MPS** (DP-3below).
-- **DP-3 — what `extra=cpu` means on a Mac.** Existing Macs have
-  `extra=cpu` sentinels ("cpu doubles as the macOS/MPS selection",
-  `setup.rs::accelerator_extra`). Recommendation: on macOS/aarch64 an
-  installed `cpu` extra resolves to `Mps` *unless the config explicitly
-  says `accelerator = "cpu"`* — explicit CPU on a Mac must mean CPU
-  (see the device-coherence item under Backend C). No forced re-setup.
+  learns the new line.
+- **DP-3 (decided) — Apple Silicon always resolves to the accelerator.**
+  The one and only way an Apple Silicon host runs unaccelerated is an
+  explicit `accelerator = "cpu"` in config. Everything else — `auto`, an
+  old sentinel reading `extra=cpu` ("cpu doubles as the macOS/MPS
+  selection", `setup.rs::accelerator_extra`), a missing sentinel, even an
+  explicit `cuda` (which setup already coerces to the default wheels with
+  a warning) — resolves to `Mps`. No forced re-setup for existing Macs.
+  Explicit CPU means CPU for real, including the worker's device (see
+  the device-coherence item under Backend C).
 - `accelerator_backend()` gains `Mps → "mps"` — the calibration keyspace
   split the `http.rs` comment already reserves.
 
@@ -180,21 +185,26 @@ Single synthetic board:
   whole GB. Same convention as the ROCm derived names: deterministic from
   kernel facts, identical on every host with that silicon, and includes
   the capacity fact that changes admission behaviour.
-- **Total**: Metal's `recommendedMaxWorkingSetSize` (≈75 % of RAM on
-  Apple Silicon) — the same figure torch exposes as
-  `torch.mps.recommended_max_memory()`. **DP-4 — how the orchestrator
-  reads it.** Options: (a) one Objective-C FFI call
-  (`MTLCreateSystemDefaultDevice` + property) via hand-rolled `objc`
-  externs or the `objc2-metal` crate; (b) seed `total = hw.memsize × 0.75`
-  at probe time and **adopt the exact figure from the first worker's load
-  report** (`gpu_total_mb` from `recommended_max_memory`), with a bounded,
-  logged adjustment. Recommendation: **(b)** — it needs no new dependency,
-  reuses the existing cross-check pattern (ROCm already compares
-  worker-reported totals against the inventory), and budgets only matter
-  once a worker exists anyway. The adoption is one small new mechanism:
-  a unified board may refine `total` once, from the first authoritative
-  report, within a ±10 % window of the seed; outside the window it warns
-  and keeps the seed.
+- **Total**: Metal's `recommendedMaxWorkingSetSize` — the same figure
+  torch exposes as `torch.mps.recommended_max_memory()`. Defaults to
+  ≈75 % of RAM on Apple Silicon, **but is not a constant**: raising the
+  GPU wired limit (`sysctl iogpu.wired_limit_mb`, a standard tweak on
+  Macs used for local ML — the reference M3 Max runs at 90 %) moves it,
+  and the moved figure is precisely the one admission must budget
+  against. **DP-4 (decided, amended in review) — how the orchestrator
+  reads it.** Seed `total = hw.memsize × 0.75` at probe time, then
+  **adopt the exact figure from the first worker's load report**
+  (`gpu_total_mb` from `recommended_max_memory`) as *authoritative*.
+  The adoption is sanity-bounded only — accepted when
+  `0 < reported ≤ hw.memsize` — and logged; there is **no proximity
+  window around the seed**, because a raised wired limit legitimately
+  puts the real figure 20 %+ away from it, and rejecting exactly the
+  tuned machines would be backwards. The seed exists only so budgets are
+  defined between startup and the first load. (The rejected alternative:
+  reading Metal directly from Rust via `objc2-metal` / hand-rolled objc
+  externs — a new dependency to learn a number the worker already knows,
+  and the worker's torch-reported figure is the one allocations are
+  actually judged against.)
 - **Memory refresh** (`MemoryQuery::Mps`): `free = max(0, min(total,
   ram_available))` from `host_statistics64`. No subprocess, no Metal call.
 - **Pinning**: none. One device; no visibility env var exists or is
@@ -261,11 +271,11 @@ existing VRAM tie-break decides default placement between them.
 - **Worker per-process tier**: DRM fdinfo already carries
   `drm-memory-gtt` / `drm-resident-gtt` next to the VRAM counters the
   parser handles; on a unified board the worker's own usage is
-  vram + gtt. **DP-5 — how the worker knows the board is unified.**
-  The worker has no inventory. Recommendation: the spawner (which
-  already writes the pin env) sets `PANOPTIKON_UNIFIED_GPU=1` for
-  replicas pinned to a unified board; dGPU workers keep the
-  vram-only arithmetic so their numbers do not shift.
+  vram + gtt. **DP-5 (decided) — how the worker knows the board is
+  unified.** The worker has no inventory; the spawner (which already
+  writes the pin env) sets `PANOPTIKON_UNIFIED_GPU=1` for replicas
+  pinned to a unified board. dGPU workers keep the vram-only arithmetic
+  so their numbers do not shift.
 - **Worker sample tier** (`free_source: "amdgpu-sysfs"`): same file pair
   extension under the same flag.
 
@@ -277,10 +287,9 @@ existing VRAM tie-break decides default placement between them.
 - **Name (calibration key)**: must not embed the BIOS-configurable
   carve-out. `AMD gfx1151 APU (128 GB)` — gfx target + the word `APU` +
   **physical RAM** rounded to whole GB (`MemTotal`), which is the stable
-  hardware fact. **DP-6**: RAM-in-name vs bare `AMD gfx1151 APU`.
-  Recommendation: include RAM — capacity changes admission behaviour and
-  the ROCm/MPS names both carry it; two Strix Halos with 32 vs 128 GB
-  should not share ratchet anchors.
+  hardware fact. **DP-6 (decided)**: RAM stays in the name — capacity
+  changes admission behaviour and the ROCm/MPS names both carry it; two
+  Strix Halos with 32 vs 128 GB should not share ratchet anchors.
 - **Registration cross-check**: HIP's `total_memory` on an APU may report
   the carve-out, the carve+GTT sum, or something else again — unverified.
   The cross-check accepts a worker total matching **either** the
@@ -301,21 +310,20 @@ existing VRAM tie-break decides default placement between them.
 
 ## Backend C: CPU
 
-**DP-7 — price CPU at all?** Recommendation: yes, last in the rollout.
-By the time MPS and APU land, a CPU board is almost free: it is the
-unified model with `pool_free` undefined (free = `ram_available` alone)
-and RSS as the footprint currency. The alternative — fixed registry
-defaults plus the widened OOM backstop — is defensible, but "auto works
-everywhere" then carries a footnote forever, and the footnote is the
-whole complaint.
+**DP-7 (decided) — CPU is priced**, last in the rollout. By the time MPS
+and APU land, a CPU board is almost free: it is the unified model with
+`pool_free` undefined (free = `ram_available` alone) and RSS as the
+footprint currency. The rejected alternative — fixed registry defaults
+plus the widened OOM backstop — would leave "auto works everywhere"
+carrying a footnote forever, and the footnote is the whole complaint.
 
 - **Board**: constant key `CPU`, one per host. Name for calibration:
   `CPU (64 GB)` (physical RAM rounded; the ISA/AVX level is captured
   indirectly by `platform` + `torch` in the key already). Backend key
   stays `"cpu"`.
-- **Total**: physical RAM. **DP-8 — default ceiling.** A RAM OOM is a
-  process kill, not a catchable exception, so the CPU board ships with a
-  default `cap_fraction` (recommendation: `0.75`) rather than relying on
+- **Total**: physical RAM. **DP-8 (decided) — default ceiling.** A RAM
+  OOM is a process kill, not a catchable exception, so the CPU board
+  ships with a default `cap_fraction = 0.75` rather than relying on
   margin alone. Overridable like any board.
 - **Worker readings**: `free_source: "ram"` (`psutil.virtual_memory()`);
   base = RSS at load end minus RSS at spawn (`base_method: "rss"`); batch
@@ -372,8 +380,9 @@ and its boundary is a documented decision instead of an emergent one.
   today; APU fixtures extend the existing sysfs trees with
   `mem_info_gtt_*` files and fdinfo GTT lines; RAM readings are
   monkeypatched. Rust: probe fixtures for the APU row (flagged, not
-  declined), dGPU+APU index integrity, MPS refresh clamps, total-adoption
-  window, CPU board construction.
+  declined), dGPU+APU index integrity, MPS refresh clamps, total
+  adoption (seed → authoritative report, sanity bounds, a report above
+  `hw.memsize` kept out), CPU board construction.
 - **CI**: prerequisite is the 3-OS test workflow (separate task, already
   agreed). Once it exists, the macOS arm64 runners have working MPS —
   add one *real-silicon* smoke: install torch, allocate, verify the
@@ -382,8 +391,10 @@ and its boundary is a documented decision instead of an emergent one.
   had; use it.
 - **Field passes** (the two machines that motivated this doc):
   - *M3 Max 128 GB*: watermark env semantics and default value on the
-    shipped torch; recommended-max magnitude vs `hw.memsize × 0.75`;
-    end-to-end grants/ratchet/knee on CLIP + mpnet; jetsam behaviour
+    shipped torch; recommended-max adoption on a machine with a raised
+    wired limit (this one runs ≈90 %, so the seed is ~15 points low and
+    the adoption path is exercised for real); end-to-end
+    grants/ratchet/knee on CLIP + mpnet; jetsam behaviour
     under deliberate over-budget (does DP-2's death-negative fire);
     compression-regime collapse detection (over-allocate, watch for the
     flag).
@@ -413,14 +424,17 @@ Each step is independently shippable; no config or DB migration is
 needed at any step (new backends only add keys and enum variants; absent
 config keys track serde defaults per the config-authoring rules).
 
-## Decision points
+## Decisions
 
-| DP | Question | Recommendation |
+All decided 2026-08-01. DP-3 and DP-4 differ from the draft's
+recommendation (amended in review).
+
+| DP | Question | Decision |
 |---|---|---|
 | 1 | Unified-specific default margin? | No — shipped defaults + RAM-clamped free |
 | 2 | Worker death mid-window = negative sample? | Yes, unified boards only |
-| 3 | `extra=cpu` sentinel on Apple Silicon | Resolves MPS unless config explicitly says `cpu` |
-| 4 | Orchestrator source for MPS total | Seed `hw.memsize × 0.75`, adopt worker's exact figure (±10 %) |
+| 3 | When does Apple Silicon run on CPU? | **Only** on explicit `accelerator = "cpu"`; everything else (auto, `extra=cpu` sentinel, missing sentinel, explicit `cuda`) resolves to MPS |
+| 4 | Orchestrator source for MPS total | Seed `hw.memsize × 0.75`; worker's `recommended_max_memory` figure is **authoritative** on first report, sanity-bounded by `(0, hw.memsize]` only — no proximity window (raised wired limits are legitimate and common) |
 | 5 | Worker's unified-board signal | Spawner env `PANOPTIKON_UNIFIED_GPU=1` |
 | 6 | RAM capacity in APU calibration name | Yes — `AMD gfx1151 APU (128 GB)` |
 | 7 | Price CPU at all | Yes, last |
