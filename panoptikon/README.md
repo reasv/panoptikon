@@ -434,9 +434,15 @@ admission-critical depends on `amd-smi`/`rocm-smi` being installed, on PATH,
 or on holding its JSON schema still. Boards are keyed
 `GPU-<16 hex>` from the fused KFD `unique_id`, or `GPU-BDF-0000:03:00.0` when
 the board has none (the kernel fills it on GFX9+, and not even there
-universally); either form works as a
-`[inference_local.vram.gpu."…"]` override key, and `/api/inference/health`
-prints whichever the probe resolved. Calibration profiles key by a
+universally); either form works as a `[inference_local.vram.gpu."…"]`
+override key, and `/api/inference/health` prints whichever the probe
+resolved. **Quote the key.** The `GPU-BDF-…` form contains colons and dots,
+which TOML does not accept in a bare key, so it must be written as a quoted
+key — `[inference_local.vram.gpu."GPU-BDF-0000:03:00.0"]`, and likewise
+`gpu."GPU-BDF-0000:03:00.0" = { margin = 0.2 }` in inline form. Unquoted, the
+dots make it a nested table and the colons are a syntax error. Board keys are
+matched **case-insensitively**, but two keys in one file differing only in
+case are rejected. Calibration profiles key by a
 deterministic board name — `AMD gfx1100 (24 GB)`, derived from the same sysfs
 facts — so they mean the same thing on every host with that silicon. Pins are
 HIP device indices written to `HIP_VISIBLE_DEVICES` (see "Environment
@@ -468,10 +474,15 @@ Deliberately not at parity:
 - **ROCm on Windows/WSL is out of scope.** The `rocm` extra carries
   `sys_platform == 'linux'` markers, so no managed install puts ROCm torch on
   Windows.
-- **APUs and iGPUs are a caveat, not a target**: kernel and BIOS disagree
-  about integrated parts' VRAM carve-out, so such a node usually leaves the
-  inventory unknown (no `mem_info_vram_total`), which is the pre-feature
-  behaviour rather than a regression.
+- **APUs and iGPUs are not priced at all.** An integrated part's "VRAM
+  total" is the BIOS UMA carve-out — often a few hundred MB — and has little
+  to do with the memory it can actually reach, so budgeting against it would
+  collapse every grant to a batch of one. The probe recognises such a node
+  (the kernel reports both compute units and CPU cores on it) and declines
+  to price the whole host, which is the pre-feature behaviour rather than a
+  regression. A host with an APU *and* a discrete card is declined too: the
+  discrete board's row index only means anything to HIP if the rows cover
+  every board HIP enumerates, and the APU is one of them.
 - **Partitioned boards (MI300-class CPX/NPS) are unpriced.** amdgpu reports
   VRAM per PCI device, not per partition, so pricing each partition against
   the whole board's memory would over-admit it N-fold; the probe declines
@@ -492,7 +503,10 @@ physically on, but the pin's row order is wrong), the two refusals
 `does not agree with the board it was matched to` and `is on a PCI address no
 board in the GPU inventory has` (that model then dispatches unpriced), the
 partitioned-board warning (`publishes several KFD nodes`), and the info line
-naming an ambient visibility restriction.
+naming an ambient visibility restriction. If there is no ledger at all —
+`/api/inference/health` lists no boards — the startup line
+`this host is configured for ROCm but no GPU inventory could be built` names
+the reason and how many KFD GPU nodes were found and openable.
 
 ### The managed Python environment (`panoptikon setup`)
 

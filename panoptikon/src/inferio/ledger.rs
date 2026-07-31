@@ -968,6 +968,10 @@ enum BoardLog {
         worker_bdf: String,
         worker_uuid: Option<String>,
         boards: usize,
+        /// The board the *pin* believed this replica was on, when the caller
+        /// knew it — see [`Self::TotalDisagrees`] for why a refusal needs it.
+        expected_board: Option<String>,
+        expected_bdf: Option<String>,
     },
     /// The total-VRAM cross-check that guards a non-UUID match failed: the
     /// two totals disagree (`worker_total_mb: Some`), or the worker reported
@@ -981,6 +985,17 @@ enum BoardLog {
         worker_uuid: Option<String>,
         worker_total_mb: Option<u64>,
         tolerance_mb: u64,
+        /// The board the orchestrator's *pin* named for this replica, when
+        /// the caller knew it, and that board's PCI address.
+        ///
+        /// Carried on a **refusal** because this is where a mis-ordered
+        /// enumeration surfaces on a host whose boards are *unequal*: the
+        /// cross-check runs before admission, so the replica never reaches
+        /// [`Self::PinDiverged`] and the "the pin believed board A" half of
+        /// the alarm would otherwise be missing exactly where the totals are
+        /// discriminating enough to prove it.
+        expected_board: Option<String>,
+        expected_bdf: Option<String>,
     },
     /// Nothing matched and no fallback applied — the ordinary CPU/remote-API
     /// worker, and the board-outside-the-inventory case.
@@ -1014,11 +1029,15 @@ impl BoardLog {
                 worker_bdf,
                 worker_uuid,
                 boards,
+                expected_board,
+                expected_bdf,
             } => tracing::warn!(
                 model = %inference_id,
                 worker_bdf = %worker_bdf,
                 worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
                 boards,
+                expected_board = expected_board.as_deref().unwrap_or("<none>"),
+                expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
                 "this worker is on a PCI address no board in the GPU \
                  inventory has — the inventory's row order may not be the \
                  HIP device order it is pinned by. Dispatching this model \
@@ -1034,6 +1053,8 @@ impl BoardLog {
                 worker_uuid,
                 worker_total_mb,
                 tolerance_mb,
+                expected_board,
+                expected_bdf,
             } => {
                 let message = if worker_total_mb.is_some() {
                     "the worker's own total-VRAM reading does not agree with \
@@ -1056,6 +1077,8 @@ impl BoardLog {
                     worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
                     worker_total_mb = ?worker_total_mb,
                     tolerance_mb,
+                    expected_board = expected_board.as_deref().unwrap_or("<none>"),
+                    expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
                     "{message}"
                 );
             }
@@ -1391,10 +1414,12 @@ impl VramLedger {
                 .find(|(_, board)| board.bdf.as_deref() == Some(wanted.as_str()));
             if let Some((key, board)) = matched {
                 return match Self::cross_check_total(
+                    state,
                     report,
                     key,
                     board,
                     "the PCI address the worker reports",
+                    expected_board,
                 ) {
                     None => Self::admit_board(state, key, board, report, expected_board),
                     Some(log) => BoardResolution::refused(log),
@@ -1405,6 +1430,8 @@ impl VramLedger {
                     worker_bdf: bdf.to_owned(),
                     worker_uuid: report.gpu_uuid.clone(),
                     boards: state.gpus.len(),
+                    expected_board: expected_board.map(str::to_owned),
+                    expected_bdf: Self::board_bdf(state, expected_board),
                 });
             }
         }
@@ -1418,7 +1445,14 @@ impl VramLedger {
             // No divergence check here, and none is possible: with one board
             // in the ledger, an `expected_board` resolved from the same
             // inventory can only be that board.
-            return match Self::cross_check_total(report, key, board, "this host's only board") {
+            return match Self::cross_check_total(
+                state,
+                report,
+                key,
+                board,
+                "this host's only board",
+                expected_board,
+            ) {
                 None => BoardResolution {
                     admit: Some((key.clone(), board.name.clone())),
                     log: None,
@@ -1477,10 +1511,12 @@ impl VramLedger {
     /// cannot pass it; the cost of a false refusal is one unpriced replica,
     /// the cost of a false admission is every grant on that board.
     fn cross_check_total(
+        state: &LedgerState,
         report: &LoadReport,
         key: &str,
         board: &GpuLedger,
         matched_by: &'static str,
+        expected_board: Option<&str>,
     ) -> Option<BoardLog> {
         let tolerance = (board.total_mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB);
         if let Some(total) = report.gpu_total_mb {
@@ -1497,7 +1533,20 @@ impl VramLedger {
             worker_uuid: report.gpu_uuid.clone(),
             worker_total_mb: report.gpu_total_mb,
             tolerance_mb: tolerance,
+            // The pin's belief travels with the refusal. On a host of
+            // *unequal* boards a mis-ordered enumeration lands here and
+            // never on `PinDiverged` — the cross-check runs first and the
+            // replica is refused before it can be admitted — so without
+            // this the loudest evidence of a wrong row order would name
+            // only the board the worker turned out to be on.
+            expected_board: expected_board.map(str::to_owned),
+            expected_bdf: Self::board_bdf(state, expected_board),
         })
+    }
+
+    /// The PCI address of a board key, when the ledger holds one for it.
+    fn board_bdf(state: &LedgerState, key: Option<&str>) -> Option<String> {
+        state.gpus.get(key?).and_then(|board| board.bdf.clone())
     }
 
     /// Register a freshly loaded replica and return its admission handle, or
@@ -5839,15 +5888,25 @@ mod tests {
     /// ROCm replica while looking perfectly healthy.
     #[test]
     fn the_ledger_carries_the_inventorys_pci_addresses() {
-        let inventory = GpuInventory::known_rocm(vec![crate::inferio::gpu::GpuInfo {
-            index: 0,
-            uuid: AMD_A.to_owned(),
+        // **Two** boards, deliberately: on a single-board host the address
+        // is not what admits the replica — the single-board fallback would
+        // take it on the total alone — so a ledger that dropped every row's
+        // PCI address would still pass. With two rows the address is the
+        // only thing that can identify this worker, and the boards are of
+        // different sizes so the cross-check discriminates too.
+        let amd = |index: u32, bdf: &str, total_mb: u64| crate::inferio::gpu::GpuInfo {
+            index,
+            uuid: format!("GPU-BDF-{bdf}"),
             name: "AMD gfx1100 (24 GB)".to_owned(),
-            total_mb: 24_576,
+            total_mb,
             compute_cap: None,
-            bdf: Some("0000:03:00.0".to_owned()),
+            bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
-        }]);
+        };
+        let inventory = GpuInventory::known_rocm(vec![
+            amd(0, "0000:03:00.0", 24_576),
+            amd(1, "0000:0c:00.0", 16_368),
+        ]);
         let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
         let handle = loaded_rocm(Some("0000:03:00.0"), Some(24_576));
         let _admission = ledger

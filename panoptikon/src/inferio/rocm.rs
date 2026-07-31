@@ -89,9 +89,71 @@ impl Default for SysfsRoots {
     }
 }
 
-/// Build the board inventory, or `None` for "unknown host" — which leaves
-/// ROCm hosts on exactly the unpriced dispatch path they were on before
-/// this existed.
+/// Why a probe produced no inventory, carried out of [`build`] so the
+/// caller can say what was seen rather than leaving a ROCm host silently
+/// unpriced.
+///
+/// A host that finds no boards behaves exactly as it did before this module
+/// existed — which is the safe outcome, and also an *invisible* one: the
+/// operator sees no ledger, no grants and no explanation. The bucket plus
+/// the two counts are the whole diagnosis, and they are what a field report
+/// needs to distinguish "this is not a ROCm host at all" from "the container
+/// was granted no render nodes" from "the board is partitioned".
+///
+/// [`Self::log`] is deliberately silent when the deciding site already
+/// warned: those lines name the specific node, address or board that
+/// tripped, which is strictly more informative than this summary, and two
+/// WARNs per boot saying the same thing is noise.
+pub(super) struct ProbeFailure {
+    bucket: &'static str,
+    gpu_nodes: usize,
+    openable: usize,
+    already_logged: bool,
+}
+
+impl ProbeFailure {
+    /// A failure whose deciding site said nothing; [`Self::log`] speaks.
+    fn undiagnosed(bucket: &'static str, gpu_nodes: usize, openable: usize) -> Self {
+        Self {
+            bucket,
+            gpu_nodes,
+            openable,
+            already_logged: false,
+        }
+    }
+
+    /// A failure whose deciding site already emitted its own WARN (or, for
+    /// the ambient restriction, its own INFO).
+    fn logged(bucket: &'static str, gpu_nodes: usize, openable: usize) -> Self {
+        Self {
+            bucket,
+            gpu_nodes,
+            openable,
+            already_logged: true,
+        }
+    }
+
+    /// One WARN naming what the probe saw, unless the deciding site already
+    /// spoke for itself.
+    pub(super) fn log(&self) {
+        if self.already_logged {
+            return;
+        }
+        tracing::warn!(
+            reason = self.bucket,
+            gpu_nodes = self.gpu_nodes,
+            openable_nodes = self.openable,
+            "this host is configured for ROCm but no GPU inventory could be \
+             built, so it gets no VRAM ledger, no grants and no calibration — \
+             dispatch takes the unpriced path (your cap, then the registry \
+             default, then default_max_batch)"
+        );
+    }
+}
+
+/// Build the board inventory, or a [`ProbeFailure`] for "unknown host" —
+/// which leaves ROCm hosts on exactly the unpriced dispatch path they were
+/// on before this existed.
 ///
 /// `ambient` is the value of each [`VISIBILITY_VARS`] entry, positionally.
 /// The caller reads the environment once and passes the values in, so the
@@ -116,7 +178,7 @@ impl Default for SysfsRoots {
 pub(super) fn build(
     roots: &SysfsRoots,
     ambient: [Option<&str>; VISIBILITY_VARS.len()],
-) -> Option<Vec<GpuInfo>> {
+) -> Result<Vec<GpuInfo>, ProbeFailure> {
     if let Some(var) = ambient_restriction(ambient) {
         tracing::info!(
             variable = var,
@@ -126,21 +188,46 @@ pub(super) fn build(
              set, so our pins cannot compose with it) — workers inherit the \
              restriction as-is: a HIP-layer restriction suppresses our \
              pinning entirely, and under a ROCR-only one a registry index \
-             pin selects *within* the operator's set"
+             pin from the registry is still written and selects *within* the \
+             operator's filtered set, not the host's own board order. That \
+             last point is the diagnostic for \"the model ran on a different \
+             card than devices = [N] names\": with a ROCR filter in force, \
+             index N counts the boards the operator left visible"
         );
-        return None;
+        return Err(ProbeFailure::logged("ambient visibility restriction", 0, 0));
     }
     let openable = openable_gpu_nodes(roots)?;
-    if openable.is_empty() {
-        return None;
+    let gpu_nodes = openable.gpu_nodes;
+    let count = openable.nodes.len();
+    if count == 0 {
+        return Err(ProbeFailure::undiagnosed(
+            if gpu_nodes == 0 {
+                "no KFD GPU nodes (this host has no amdgpu topology)"
+            } else {
+                "no openable render node"
+            },
+            gpu_nodes,
+            count,
+        ));
     }
-    let mut rows = Vec::with_capacity(openable.len());
-    for (index, (node, props)) in openable.iter().enumerate() {
-        let index = u32::try_from(index).ok()?;
-        rows.push(identify(roots, *node, props, index)?);
+    let mut rows = Vec::with_capacity(count);
+    for (index, (node, props)) in openable.nodes.iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            return Err(ProbeFailure::undiagnosed(
+                "more openable boards than a device index can name",
+                gpu_nodes,
+                count,
+            ));
+        };
+        let Some(row) = identify(roots, *node, props, index) else {
+            return Err(ProbeFailure::logged("identity read failed", gpu_nodes, count));
+        };
+        rows.push(row);
     }
-    let rows = demote_duplicate_ids(rows)?;
+    let rows = demote_duplicate_ids(rows)
+        .ok_or_else(|| ProbeFailure::logged("duplicate board keys", gpu_nodes, count))?;
     reject_partitioned_boards(rows)
+        .ok_or_else(|| ProbeFailure::logged("partitioned board", gpu_nodes, count))
 }
 
 /// Live free/total for every board, all-or-nothing. One unreadable board
@@ -219,9 +306,19 @@ fn is_set(value: Option<&str>) -> bool {
     })
 }
 
+/// The openable GPU nodes, plus how many GPU nodes the topology listed at
+/// all — the two numbers a [`ProbeFailure`] needs to say whether this host
+/// has no amdgpu topology or merely no render nodes this process may open.
+struct OpenableNodes {
+    /// Every KFD node with SIMDs, whether or not it survived the filter.
+    gpu_nodes: usize,
+    /// The survivors, in ascending KFD node order.
+    nodes: Vec<(u32, HashMap<String, u64>)>,
+}
+
 /// GPU nodes whose render node this process can actually open, in ascending
 /// KFD node order — which is the order ROCr enumerates agents in, hence the
-/// order HIP indexes them in. `None` makes the whole probe unknown; see
+/// order HIP indexes them in. An `Err` makes the whole probe unknown; see
 /// [`node_hidden_from_this_process`] for which read failures do that.
 ///
 /// A container granted a `/dev/dri` subset still sees the *whole* host
@@ -230,9 +327,14 @@ fn is_set(value: Option<&str>) -> bool {
 /// then silently falls back to CPU). Cgroup-hidden and unopenable nodes are
 /// dropped rather than failing the probe: such a node is one ROCr will not
 /// offer either, so excluding it *reconstructs* the runtime's enumeration.
-fn openable_gpu_nodes(roots: &SysfsRoots) -> Option<Vec<(u32, HashMap<String, u64>)>> {
+fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
+    // Numerically, never lexicographically: node 10 comes after node 9, and
+    // a string sort would put it between 1 and 2 — silently renumbering
+    // every row on a host with ten or more KFD nodes, and those row numbers
+    // are the HIP device indices D2 pins with.
     nodes.sort_by_key(|(node, _)| *node);
+    let mut gpu_nodes = 0usize;
     let mut out = Vec::new();
     for (node, dir) in nodes {
         let text = match fs::read_to_string(dir.join("properties")) {
@@ -256,14 +358,37 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Option<Vec<(u32, HashMap<String, u6
                      every later row's index, and those indices are the HIP \
                      device numbers a pin selects with)"
                 );
-                return None;
+                return Err(ProbeFailure::logged(
+                    "node properties unreadable",
+                    gpu_nodes,
+                    out.len(),
+                ));
             }
         };
         let props = parse_properties(&text);
         // The KFD topology lists CPU nodes too; only GPU nodes have SIMDs.
-        if props.get("simd_count").copied().unwrap_or(0) == 0 {
+        // An **absent** `simd_count` is not a CPU node, it is a properties
+        // file we do not understand — and reading it as a CPU node would
+        // silently drop a board and shift every later row's index. Only an
+        // explicit 0 skips, exactly as with the other required keys.
+        let Some(simd_count) = props.get("simd_count").copied() else {
+            tracing::warn!(
+                node,
+                "this KFD node's properties carry no simd_count, so whether \
+                 it is a GPU cannot be decided; leaving the ROCm GPU \
+                 inventory unknown (treating it as a CPU node would drop it \
+                 and shift every later row's HIP device index)"
+            );
+            return Err(ProbeFailure::logged(
+                "node reports no simd_count",
+                gpu_nodes,
+                out.len(),
+            ));
+        };
+        if simd_count == 0 {
             continue;
         }
+        gpu_nodes += 1;
         let Some(minor) = props.get("drm_render_minor").copied().filter(|m| *m > 0) else {
             tracing::info!(
                 node,
@@ -290,9 +415,41 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Option<Vec<(u32, HashMap<String, u6
             );
             continue;
         }
+        // An **APU**: KFD models an integrated part as one node carrying
+        // both SIMDs and CPU cores, and that combination is the only
+        // positive signal there is. It has to be tested here, after the
+        // openability filter, because a cgroup-hidden APU is not one ROCr
+        // will offer either.
+        //
+        // The all-or-nothing VRAM rule in `identify` does *not* catch these:
+        // amdgpu registers `mem_info_vram_total` for iGPUs too, reporting
+        // the BIOS's UMA carve-out (512 MB is a common default). So the host
+        // would be priced against the carve-out rather than against the
+        // memory an APU can actually reach, every grant would collapse to
+        // batch-1, and nothing would say why. Declining to price the host is
+        // the design's promised outcome for an APU, so take it explicitly.
+        //
+        // The node is not *skipped*: HIP still enumerates it, so excluding
+        // one row would shift every later row's device index. The whole
+        // probe goes unknown instead.
+        if props.get("cpu_cores_count").copied().unwrap_or(0) > 0 {
+            tracing::warn!(
+                node,
+                gfx_target_version = props.get("gfx_target_version").copied().unwrap_or(0),
+                "this KFD node reports both SIMDs and CPU cores, i.e. an APU; \
+                 amdgpu publishes only the BIOS UMA carve-out as its VRAM \
+                 total, so pricing this host would budget every grant against \
+                 a few hundred MB — leaving the ROCm GPU inventory unknown \
+                 instead (an APU host is unpriced by design, not mis-priced)"
+            );
+            return Err(ProbeFailure::logged("APU node", gpu_nodes, out.len()));
+        }
         out.push((node, props));
     }
-    Some(out)
+    Ok(OpenableNodes {
+        gpu_nodes,
+        nodes: out,
+    })
 }
 
 /// Whether an error reading a KFD node's `properties` means "this node is
@@ -359,9 +516,10 @@ fn identify(
         tracing::warn!(
             node,
             bdf = %bdf,
-            "cannot read a nonzero mem_info_vram_total for this board (an \
-             APU or a non-amdgpu node would look like this); leaving the \
-             ROCm GPU inventory unknown"
+            "cannot read a nonzero mem_info_vram_total for this board (a \
+             non-amdgpu node, or a container with a partial /sys, would look \
+             like this — an APU is caught earlier, by its own signal); \
+             leaving the ROCm GPU inventory unknown"
         );
         return None;
     };
@@ -686,7 +844,15 @@ mod tests {
         }
 
         fn build(&self) -> Option<Vec<GpuInfo>> {
+            build(&self.roots, [None; VISIBILITY_VARS.len()]).ok()
+        }
+
+        /// The failure bucket, for the cases where *why* the host went
+        /// unpriced is the thing under test.
+        fn bucket(&self) -> Option<&'static str> {
             build(&self.roots, [None; VISIBILITY_VARS.len()])
+                .err()
+                .map(|failure| failure.bucket)
         }
     }
 
@@ -891,6 +1057,192 @@ mod tests {
         assert!(fixture.build().is_none());
     }
 
+    /// A node reporting both SIMDs and CPU cores is how KFD models an
+    /// **APU**, and that combination is the only positive signal there is.
+    /// The all-or-nothing VRAM rule does not catch it: amdgpu publishes a
+    /// `mem_info_vram_total` for iGPUs too — the BIOS UMA carve-out — so
+    /// without this the host would be priced against a few hundred MB and
+    /// every grant would collapse to batch-1. Unpriced is the promised
+    /// outcome for an APU, so it is taken deliberately.
+    #[test]
+    fn an_apu_node_makes_the_probe_unknown() {
+        let fixture = Fixture::new();
+        fixture
+            .node(1, &{
+                let mut props = gpu_props(LOC_03_00, 128, 0, 90012);
+                // KFD reports the host's cores on the APU's own node.
+                props[0] = ("cpu_cores_count", 16);
+                props
+            })
+            .render(128)
+            // The carve-out: openable, identifiable, and a lie about
+            // capacity — which is exactly why the VRAM rule cannot see it.
+            .pci("0000:03:00.0", 512 * 1024 * 1024, 0);
+        assert!(
+            fixture.build().is_none(),
+            "an APU's UMA carve-out must not become this host's VRAM budget"
+        );
+        assert_eq!(fixture.bucket(), Some("APU node"));
+
+        // And the normal dGPU shape is untouched, in both spellings: an
+        // explicit `cpu_cores_count 0`, and the key absent altogether.
+        let explicit_zero = Fixture::new();
+        explicit_zero
+            .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .render(128)
+            .pci("0000:03:00.0", GB24, 0);
+        assert!(explicit_zero.build().is_some(), "cpu_cores_count 0");
+        let absent = Fixture::new();
+        absent
+            .node(1, &{
+                let mut props = gpu_props(LOC_03_00, 128, 0, 110000);
+                props.retain(|(key, _)| *key != "cpu_cores_count");
+                props
+            })
+            .render(128)
+            .pci("0000:03:00.0", GB24, 0);
+        assert!(
+            absent.build().is_some(),
+            "an absent cpu_cores_count is the ordinary dGPU shape"
+        );
+    }
+
+    /// An **absent** `simd_count` is not a CPU node, it is a properties file
+    /// we do not understand — and skipping it as one would drop a board and
+    /// shift every later row's HIP device index. Only an explicit 0 skips.
+    #[test]
+    fn an_absent_simd_count_makes_the_probe_unknown() {
+        let fixture = Fixture::new();
+        fixture
+            .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .node(2, &{
+                let mut props = gpu_props(LOC_0C_00, 129, 0, 110000);
+                props.retain(|(key, _)| *key != "simd_count");
+                props
+            })
+            .render(128)
+            .render(129)
+            .pci("0000:03:00.0", GB24, 0)
+            .pci("0000:0c:00.0", GB24, 0);
+        assert!(fixture.build().is_none());
+        assert_eq!(fixture.bucket(), Some("node reports no simd_count"));
+    }
+
+    /// KFD node numbers are sorted **numerically**. A lexicographic sort
+    /// puts node 10 between 1 and 2, which renumbers every row — and those
+    /// row numbers are the HIP device indices a pin selects with.
+    #[test]
+    fn node_order_is_numeric_not_lexicographic() {
+        let fixture = Fixture::new();
+        fixture
+            .node(2, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .node(9, &gpu_props(LOC_0C_00, 129, 0, 110000))
+            .node(10, &gpu_props(0x1000, 130, 0, 110000))
+            .render(128)
+            .render(129)
+            .render(130)
+            .pci("0000:03:00.0", GB24, 0)
+            .pci("0000:0c:00.0", GB24, 0)
+            .pci("0000:10:00.0", GB24, 0);
+        let rows = fixture.build().expect("known");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.index, row.bdf.as_deref().unwrap_or("")))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "0000:03:00.0"),
+                (1, "0000:0c:00.0"),
+                (2, "0000:10:00.0"),
+            ],
+            "nodes 2, 9, 10 index as 0, 1, 2 — not 10, 2, 9"
+        );
+    }
+
+    /// The cgroup-hidden skip, end to end through `openable_gpu_nodes`
+    /// rather than through the predicate alone: a node whose `properties`
+    /// read fails with `PermissionDenied` is excluded and its siblings keep
+    /// their positions.
+    ///
+    /// **Windows only, deliberately.** Reading a *directory* as a file is
+    /// `ERROR_ACCESS_DENIED` there, which `std` maps to `PermissionDenied`
+    /// — a portable way to produce that exact error kind with no privileges
+    /// and no mode bits. The Unix equivalent (a `chmod 000` properties file)
+    /// is not portable in the other direction: root ignores the mode, and
+    /// these tests run as root in containers. The predicate itself is
+    /// covered on every platform by `only_permission_denied_skips_a_node`.
+    #[cfg(windows)]
+    #[test]
+    fn a_cgroup_hidden_node_is_skipped_and_its_siblings_keep_their_positions() {
+        let fixture = Fixture::new();
+        fixture
+            .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .node(3, &gpu_props(LOC_0C_00, 129, 0, 110000))
+            .render(128)
+            .render(129)
+            .pci("0000:03:00.0", GB24, 0)
+            .pci("0000:0c:00.0", GB24, 0);
+        // Node 2's `properties` is a directory: the read fails with
+        // PermissionDenied, i.e. the cgroup-hidden shape.
+        let hidden = fixture.roots.kfd_nodes.join("2");
+        fs::create_dir_all(hidden.join("properties")).unwrap();
+        assert_eq!(
+            fs::read_to_string(hidden.join("properties"))
+                .expect_err("a directory is not readable as a file")
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+            "the premise of this test"
+        );
+        let rows = fixture.build().expect("the hidden node is skipped, not fatal");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.index, row.bdf.as_deref().unwrap_or("")))
+                .collect::<Vec<_>>(),
+            vec![(0, "0000:03:00.0"), (1, "0000:0c:00.0")]
+        );
+    }
+
+    /// The openability test is an open for **read+write**, because that is
+    /// the access KFD's own device-cgroup check demands. A render node we
+    /// can read but not write is one ROCr will refuse, so admitting it would
+    /// put a phantom row in the middle of the index space.
+    #[test]
+    fn a_read_only_render_node_is_excluded() {
+        let fixture = Fixture::new();
+        fixture
+            .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .node(2, &gpu_props(LOC_0C_00, 129, 0, 110000))
+            .render(128)
+            .render(129)
+            .pci("0000:03:00.0", GB24, 0)
+            .pci("0000:0c:00.0", GB24, 0);
+        let read_only = fixture.roots.dev_dri.join("renderD128");
+        let mut perms = fs::metadata(&read_only).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&read_only, perms).unwrap();
+        // Running with privileges that ignore the mode bits (root in a CI
+        // container) defeats the fixture, and there is then nothing to
+        // assert — the premise, not the behaviour, is what fails.
+        if OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&read_only)
+            .is_ok()
+        {
+            return;
+        }
+        let rows = fixture.build().expect("the writable sibling survives");
+        // Restored before the assertions so a failure still leaves a
+        // deletable tree: `TempDir`'s drop cannot remove a read-only file on
+        // Windows and swallows the error, leaking the fixture.
+        let mut perms = fs::metadata(&read_only).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&read_only, perms).unwrap();
+        assert_eq!(rows.len(), 1, "the read-only node is not an openable board");
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[0].bdf.as_deref(), Some("0000:0c:00.0"));
+    }
+
     /// A container granted a `/dev/dri` subset still sees the whole host
     /// topology. Row indices must be positions within the *openable*
     /// subset, because that is what ROCr enumerates and what HIP indexes.
@@ -923,10 +1275,16 @@ mod tests {
             .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
             .pci("0000:03:00.0", GB24, 0);
         assert!(fixture.build().is_none(), "render node absent");
+        assert_eq!(fixture.bucket(), Some("no openable render node"));
         // A topology with no GPU nodes at all — and, on every non-ROCm host,
-        // no topology root to read — is the same answer.
+        // no topology root to read — is the same answer, under the bucket
+        // that tells an operator this is not an amdgpu host at all.
         let empty = Fixture::new();
         assert!(empty.build().is_none());
+        assert_eq!(
+            empty.bucket(),
+            Some("no KFD GPU nodes (this host has no amdgpu topology)")
+        );
         assert!(
             build(
                 &SysfsRoots {
@@ -935,7 +1293,7 @@ mod tests {
                 },
                 [None; VISIBILITY_VARS.len()]
             )
-            .is_none()
+            .is_err()
         );
     }
 
@@ -953,14 +1311,14 @@ mod tests {
             let mut ambient = [None; VISIBILITY_VARS.len()];
             ambient[position] = Some("0");
             assert!(
-                build(&fixture.roots, ambient).is_none(),
+                build(&fixture.roots, ambient).is_err(),
                 "{} must blank the inventory",
                 VISIBILITY_VARS[position]
             );
             ambient[position] = Some("");
-            assert!(build(&fixture.roots, ambient).is_some());
+            assert!(build(&fixture.roots, ambient).is_ok());
             ambient[position] = Some(" , ");
-            assert!(build(&fixture.roots, ambient).is_some());
+            assert!(build(&fixture.roots, ambient).is_ok());
         }
     }
 
@@ -991,6 +1349,13 @@ mod tests {
         assert_eq!(gfx_name(120500).as_deref(), Some("gfx1250"));
         assert_eq!(gfx_name(0), None, "KFD's unsupported-ASIC value");
         assert_eq!(gfx_name(90099), None, "stepping outside a hex digit");
+        // The other half of the guard: a minor that no longer fits a hex
+        // digit means the packing changed under us, and rendering it anyway
+        // would mint a plausible-looking name for the wrong silicon — which
+        // is the calibration profile keyspace.
+        assert_eq!(gfx_name(92000), None, "minor outside a hex digit");
+        assert_eq!(gfx_name(91600), None, "minor 16, the first value past 0xf");
+        assert_eq!(gfx_name(91500).as_deref(), Some("gfx9f0"), "minor 15 fits");
     }
 
     #[test]

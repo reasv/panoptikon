@@ -136,10 +136,18 @@ def isolated(torch_module=None):
     tried and unusable" state so no real driver call happens, the memoized
     board address is cleared (it is resolved once per *process*, so leaking it
     would point one test's amdgpu tiers at another's board), and the one-shot
-    log flags are reset so a test can assert on them.
+    log flags are reset so a test can assert on them. `HIP_VISIBLE_DEVICES`
+    is dropped for the same reason: it is the module's pre-torch-import
+    signal that this worker is on a HIP device (`_hip_pinned`), so a value
+    inherited from the developer's shell would silently switch NVML off in
+    every CUDA-path test.
     """
-    with mock.patch.dict(sys.modules, {}, clear=False):
+    with (
+        mock.patch.dict(sys.modules, {}, clear=False),
+        mock.patch.dict(os.environ, {}, clear=False),
+    ):
         sys.modules.pop("inferio.impl.utils", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
         if torch_module is None:
             sys.modules.pop("torch", None)
         else:
@@ -395,6 +403,41 @@ def test_free_source_is_consistent_across_the_load_window(fake_torch) -> None:
     # the NVML one, which would have "measured" a 13 GB base.
     assert report["base_method"] == "alloc_delta", report
     assert report["base_mb"] == 1024 + memory.CONTEXT_ESTIMATE_MB, report
+
+
+def test_the_free_source_pin_holds_even_when_the_mix_looks_plausible(
+    fake_torch, monkeypatch, tmp_path
+) -> None:
+    # The discriminating case for the pin. The test above catches a mixed
+    # pair because the cross-source skew there is enormous (a 13 GB "base"),
+    # which the implausibility ceiling would have rejected anyway — so it
+    # cannot tell the pin apart from the ceiling. Here the mix lands *below*
+    # the ceiling and would be accepted as a perfectly ordinary free delta:
+    # NVML says 9000 MiB free before, NVML then goes away, and torch says
+    # 6976 MiB after. Against a 100 MiB reserved delta the ceiling is
+    # 100 + 500 + 2048 = 2648 MiB and the mixed delta is 2024 — plausible,
+    # wrong, and entirely a measurement of the two sources' disagreement.
+    #
+    # Pinned, the "after" reading simply does not exist and the allocator
+    # delta answers. Unpinned, the mixed reading wins.
+    monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "no-pci"))
+    nvml_answers = [(9000, 24_576), (None, None)]
+    with mock.patch.object(
+        memory,
+        "_nvml_memory",
+        side_effect=lambda: nvml_answers.pop(0) if nvml_answers else (None, None),
+    ):
+        before = memory.begin_load()
+        assert before["free_source"] == "nvml"
+        fake_torch.allocate(100, reserved_mb=100)
+        fake_torch.free = 6976 * MIB
+        report = memory.finish_load(before, object())
+        # The reading the unpinned re-read would have found: live, readable,
+        # and 2024 MiB away from the "before" one.
+        assert memory._free_total_mb() == (6976, 8192, "torch")
+    assert report["base_method"] == "alloc_delta", report
+    assert report["base_mb"] == 100 + memory.CONTEXT_ESTIMATE_MB, report
+    assert report["base_mb"] != 9000 - 6976, "that is the cross-source skew"
 
 
 def test_nvml_per_process_wins_and_missing_pid_is_logged(fake_torch, caplog) -> None:
@@ -899,6 +942,16 @@ def test_dominant_vram_pdev_needs_a_strict_winner(tmp_path) -> None:
     idle = write([fdinfo("0000:03:00.0", 1, None), fdinfo("0000:0c:00.0", 2, "0")])
     assert memory.dominant_vram_pdev(idle) is None, "nothing allocated yet"
 
+    # The same emptiness with only ONE board open, which the tie rule cannot
+    # see: a lone record is trivially the maximum. Holding nothing is not
+    # evidence of which board this worker is using — a process that has
+    # opened a render node and not allocated on it is exactly the pre-load
+    # state — so the strict-positive guard is what answers here.
+    lone_idle = write([fdinfo("0000:03:00.0", 1, "0")])
+    assert memory.dominant_vram_pdev(lone_idle) is None, "open, but holding nothing"
+    lone_keyless = write([fdinfo("0000:03:00.0", 1, None)])
+    assert memory.dominant_vram_pdev(lone_keyless) is None
+
     # A single client that has allocated is unambiguous.
     alone = write([fdinfo("0000:03:00.0", 1, "512 MiB")])
     assert memory.dominant_vram_pdev(alone) == "0000:03:00.0"
@@ -936,6 +989,36 @@ def test_the_fdinfo_fallback_is_hip_only(fake_torch, monkeypatch) -> None:
     with isolated(fake_torch_module(cuda, hip="7.2.0")):
         assert memory.device_bdf() == "0000:03:00.0"
     assert len(scans) == 1, "the fallback was not consulted"
+
+
+def test_an_fdinfo_derived_address_must_look_like_a_pci_address(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: unlike the torch-derived BDF, which this module
+    # formats itself out of three integers, the fdinfo one is a string lifted
+    # verbatim from a `drm-pdev` line — the parser only requires the key to be
+    # present and non-empty. Anything else there would become this worker's
+    # identity, go out on the wire as `gpu_bdf` to be joined against the
+    # orchestrator's inventory, and be pasted into a
+    # `/sys/bus/pci/devices/<bdf>` path. It has to look like an address first.
+    cuda = FakeCuda()
+    cuda.pci = None  # the older-ROCm-torch chain, i.e. the fdinfo fallback
+    hostile = [
+        "drm-pdev:\t../../../etc\ndrm-client-id:\t1\ndrm-resident-vram:\t512 MiB\n",
+        "drm-pdev:\t0000:03:00\ndrm-client-id:\t2\ndrm-resident-vram:\t8 MiB\n",
+    ]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=hostile, cuda=cuda):
+        assert memory.dominant_vram_pdev() == "../../../etc", "the parse is neutral"
+        assert memory.device_bdf() is None, "the identity is not"
+        assert memory._identity_bdf() is None
+        assert memory.fdinfo_own_vram_mb() is None
+        assert memory.amdgpu_free_total_mb() == (None, None)
+
+    # The well-formed spelling still resolves, so this is a shape check and
+    # not an accidental ban on the fallback.
+    good = [fdinfo("0000:0c:00.0", 1, "512 MiB")]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=good, cuda=cuda):
+        assert memory.device_bdf() == "0000:0c:00.0"
 
 
 def test_identity_helpers_never_raise_and_never_initialize_cuda() -> None:
@@ -1196,12 +1279,32 @@ def test_a_pinned_free_source_never_slides_to_another_tier(
     # whole-board tiers and torch are ~15 GB apart, which is exactly the base
     # a mixed pair of readings would "measure".
     board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
-    with rocm_host(tmp_path, monkeypatch, pci=pci_root(tmp_path, board)) as cuda:
+    with rocm_host(tmp_path, monkeypatch, pci=pci_root(tmp_path, board)):
         # Downwards: the amdgpu tier is readable and outranks torch, but a
         # window that began on torch ends on torch.
         assert memory._free_total_mb("torch") == (8000, 8192, "torch")
+        assert memory._free_total_mb("amdgpu-sysfs") == (
+            23_552,
+            24_576,
+            "amdgpu-sysfs",
+        )
+        # A label no tier answers to is not a fallback instruction. This is
+        # the orchestrator's `"nvidia-smi"` source, which only ever labels the
+        # orchestrator's own refresh and can never be a worker's before-reading
+        # — but if one ever arrived, no tier here may claim it.
+        assert memory._free_total_mb("nvidia-smi") == (None, None, None)
+
+    # Upwards, on a CUDA build — the only place NVML can answer at all now
+    # that `_nvml` refuses a HIP worker outright (a hybrid AMD+NVIDIA host
+    # would otherwise initialize NVML happily and hand back the wrong board).
+    # The amdgpu files are readable here too, which is what makes the pin
+    # meaningful rather than the only tier that could have answered.
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", pci_root(tmp_path, board))
+        monkeypatch.setattr(memory, "FDINFO_ROOT", empty_dir(tmp_path, "cuda-up"))
         with with_nvml(fake_pynvml_for(cuda, [])):
-            # Upwards: NVML answers and is the unpinned preference...
+            # NVML answers and is the unpinned preference...
             assert memory._free_total_mb() == (8000, 8192, "nvml")
             # ...and a pin to the tier below it is still honoured there.
             assert memory._free_total_mb("amdgpu-sysfs") == (
@@ -1209,15 +1312,13 @@ def test_a_pinned_free_source_never_slides_to_another_tier(
                 24_576,
                 "amdgpu-sysfs",
             )
-        # A label no tier answers to is not a fallback instruction. This is
-        # the orchestrator's `"nvidia-smi"` source, which only ever labels the
-        # orchestrator's own refresh and can never be a worker's before-reading
-        # — but if one ever arrived, no tier here may claim it.
-        assert memory._free_total_mb("nvidia-smi") == (None, None, None)
 
     # And when the pinned tier goes away, the tier sitting ready above it is
     # precisely the reading that must not be substituted for it.
-    with rocm_host(tmp_path, monkeypatch) as cuda:
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "gone-up"))
+        monkeypatch.setattr(memory, "FDINFO_ROOT", empty_dir(tmp_path, "cuda-up2"))
         with with_nvml(fake_pynvml_for(cuda, [])):
             assert memory._free_total_mb("amdgpu-sysfs") == (None, None, None)
 
@@ -1317,20 +1418,54 @@ def test_the_fdinfo_base_tier_is_hip_only(tmp_path, monkeypatch) -> None:
     assert report["base_mb"] == 200, report
 
 
-def test_nvml_still_outranks_the_fdinfo_tier(tmp_path, monkeypatch) -> None:
-    # The two are the same kind of reading and hold the same rank, so the
-    # order between them only matters on a host where both could answer —
-    # which does not exist (NVML dies on ROCm). Asserted anyway because the
-    # fallback structure, not the platform, is what enforces it.
+def test_nvml_is_refused_outright_on_a_rocm_worker(tmp_path, monkeypatch) -> None:
+    # Expected behavior: NVML is not merely *unavailable* on a ROCm worker,
+    # it is refused. `pynvml` is an unconditional base dependency and
+    # `nvmlInit` succeeds on any host with an NVIDIA driver loaded — which a
+    # hybrid AMD+NVIDIA box has. There, the D3 UUID suppression removes the
+    # one thing that would have disambiguated the handle lookup, so the
+    # single-GPU last-resort arm could return the NVIDIA board's handle and
+    # a single load report would describe two pieces of silicon: identity and
+    # base from the AMD board, free/total from the NVIDIA one. Nothing
+    # downstream can detect that, so the gate is explicit.
+    board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
     texts = [fdinfo("0000:03:00.0", 1, "1536 MiB")]
-    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+    with rocm_host(
+        tmp_path, monkeypatch, pci=pci_root(tmp_path, board), fdinfo_texts=texts
+    ) as cuda:
         proc = SimpleNamespace(pid=os.getpid(), usedGpuMemory=3000 * MIB)
+        # A *working* NVML, presented exactly as a CUDA host's would be.
         with with_nvml(fake_pynvml_for(cuda, [proc])):
+            assert memory._nvml() is None, "torch.version.hip is set"
+            assert memory._nvml_memory() == (None, None)
+            assert memory._nvml_own_process_mb() is None
+            # ...so the free/total chain lands on amdgpu sysfs, not on the
+            # NVIDIA board's 8192 MiB that this NVML would have reported.
+            assert memory.free_total_mb() == (23_552, 24_576, "amdgpu-sysfs")
             before = memory.begin_load()
             cuda.allocate(1024, reserved_mb=1200)
             report = memory.finish_load(before, object())
-    assert report["base_method"] == "nvml", report
-    assert report["base_mb"] == 3000, report
+    assert report["base_method"] == "fdinfo", report
+    assert report["base_mb"] == 1536, report
+
+    # The other half of the gate, and the one that matters for the *first*
+    # reading of a worker's life: `begin_load` runs before any impl has
+    # imported torch, so `torch.version.hip` cannot answer yet. Our own
+    # spawner writes `HIP_VISIBLE_DEVICES` on every pinned ROCm worker and on
+    # no other kind, so a non-empty value is proof of the backend with
+    # nothing imported.
+    with isolated():
+        with with_nvml(fake_pynvml_for(FakeCuda(), [])):
+            assert memory._nvml() is not None, "no signal either way yet"
+            with mock.patch.dict(
+                os.environ, {"HIP_VISIBLE_DEVICES": "1"}, clear=False
+            ):
+                assert memory._nvml() is None, "pinned to a HIP device"
+            # Whitespace/comma-only is "not configured", as everywhere else.
+            with mock.patch.dict(
+                os.environ, {"HIP_VISIBLE_DEVICES": " , "}, clear=False
+            ):
+                assert memory._nvml() is not None
 
 
 def test_an_under_reporting_fdinfo_loses_to_the_deltas(

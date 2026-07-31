@@ -1174,8 +1174,10 @@ impl Settings {
         for (uuid, over) in &vram.gpu {
             if uuid.trim().is_empty() {
                 anyhow::bail!(
-                    "inference_local.vram.gpu keys must be GPU board UUIDs (the 'GPU-…' \
-                     strings nvidia-smi -L prints); one entry has an empty key"
+                    "inference_local.vram.gpu keys must be GPU board keys — the ones \
+                     GET /api/inference/health lists ('GPU-…' as nvidia-smi -L prints \
+                     them on CUDA; 'GPU-<16 hex>' or 'GPU-BDF-0000:03:00.0' on ROCm); \
+                     one entry has an empty key"
                 );
             }
             check(

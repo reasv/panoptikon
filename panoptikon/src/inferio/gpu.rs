@@ -250,27 +250,48 @@ fn probe_rocm() -> HostGpus {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
         let ambient = ambient.each_ref().map(Option::as_deref);
         (
-            rocm::build(&roots, ambient),
+            Some(rocm::build(&roots, ambient)),
             rocm::ambient_hip_restriction(ambient),
         )
     } else {
         // Nothing was read, so nothing is known about the ambient
         // environment either; the legality filter in `resolve_pin` still
-        // applies, it just has no restriction to defer to.
+        // applies, it just has no restriction to defer to. `None` rather
+        // than a failure because there is nothing to diagnose: the paths do
+        // not exist here and were never going to.
         (None, false)
     };
     let backend = MemoryBackend::RocmSysfs {
         pci_devices: roots.pci_devices.clone(),
         ambient_hip_restriction,
     };
-    let Some(gpus) = inventory else {
-        return HostGpus {
-            caps: HostComputeCaps::unknown(),
-            inventory: GpuInventory {
-                boards: None,
-                backend,
-            },
-        };
+    let gpus = match inventory {
+        Some(Ok(gpus)) => gpus,
+        // Silently-unpriced is the failure mode this arm exists to prevent:
+        // the host behaves exactly as it did before the ROCm probe existed,
+        // which is safe but indistinguishable from "the feature is not
+        // working". `ProbeFailure::log` emits one WARN naming what was seen,
+        // and stays quiet when the deciding site already named the node,
+        // address or board it tripped on.
+        Some(Err(failure)) => {
+            failure.log();
+            return HostGpus {
+                caps: HostComputeCaps::unknown(),
+                inventory: GpuInventory {
+                    boards: None,
+                    backend,
+                },
+            };
+        }
+        None => {
+            return HostGpus {
+                caps: HostComputeCaps::unknown(),
+                inventory: GpuInventory {
+                    boards: None,
+                    backend,
+                },
+            };
+        }
     };
     for gpu in &gpus {
         tracing::info!(
@@ -753,7 +774,15 @@ impl GpuInventory {
     ///   hosts with an ambient restriction need. ROCm's unknown-inventory
     ///   arm is *not* this one — see the last section;
     /// - no request → the default board's UUID (universal pinning);
-    /// - a UUID request (`GPU-…`/`MIG-…`) → verbatim; CUDA accepts it;
+    /// - a UUID request (`GPU-…`/`MIG-…`) naming a board this host reports,
+    ///   exactly (case-insensitively) or as an unambiguous abbreviation →
+    ///   **the inventory's own spelling of that board's UUID**. CUDA accepts
+    ///   every spelling, but pin strings are compared byte-wise elsewhere
+    ///   (`prewarm.rs`'s pool claim) and [`Self::resolve_board_key`] already
+    ///   canonicalises, so the two have to agree about board equality;
+    /// - a UUID request that is ambiguous or names no board we can see (a
+    ///   `MIG-…` instance, another machine's UUID) → verbatim; resolving it
+    ///   is CUDA's business;
     /// - an index request → that board's UUID, so the ledger key is stable
     ///   even though the index is not;
     /// - anything else (an index we cannot see, a comma-separated list, a
@@ -817,8 +846,32 @@ impl GpuInventory {
     ///   deliberately narrowed. An ambient `ROCR_VISIBLE_DEVICES` is a
     ///   different matter and does not trigger this: HIP indexes into the
     ///   ROCr-filtered set, so the pin composes with the restriction instead
-    ///   of escaping it.
+    ///   of escaping it. That check is the **first** thing this function
+    ///   does, before the inventory is even looked at: it is a fact about
+    ///   the gateway's environment, not about which boards we found.
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
+        // First, unconditionally: the operator's own HIP-layer restriction
+        // outranks everything below, including the arms that would otherwise
+        // have been allowed to write an index. Checked here rather than in
+        // the uninventoried arm alone so the guard cannot be bypassed if a
+        // future change ever lets a HIP-restricted host carry a non-empty
+        // inventory. Today it cannot — the flag is only ever set alongside a
+        // blanked board list — so this changes no behaviour.
+        if self.ambient_hip_restriction() {
+            if let Some(requested) = requested {
+                tracing::warn!(
+                    pin = %requested.trim(),
+                    "ignoring this device pin: a HIP-layer visibility restriction \
+                     (HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES / \
+                     GPU_DEVICE_ORDINAL) is already set in this gateway's own \
+                     environment, and writing our own would override it and hand \
+                     the worker boards the operator deliberately hid — the \
+                     operator's restriction wins, and the worker inherits it \
+                     as-is"
+                );
+            }
+            return None;
+        }
         let Some(gpus) = self.boards.as_deref() else {
             if self.pins_are_indices() {
                 return self.resolve_hip_pin_uninventoried(requested);
@@ -833,6 +886,35 @@ impl GpuInventory {
         };
         let trimmed = requested.trim();
         if is_uuid_pin(trimmed) {
+            // Canonicalised against the inventory when it names a board we
+            // can see. CUDA accepts every spelling here — a full UUID in
+            // either case, and any unambiguous abbreviation of one — but the
+            // rest of the system compares pin strings **byte-wise**:
+            // `prewarm.rs` claims a parked worker only when its recorded pin
+            // equals the replica's resolved one, and `resolve_board_key`
+            // (which the ledger and telemetry key by) already canonicalises.
+            // Leaving the operator's spelling through meant the pool and the
+            // ledger disagreed about whether two replicas were on one board.
+            // A full UUID is legal everywhere an abbreviation was, so this
+            // never narrows what CUDA will accept.
+            if let Some(gpu) = gpus
+                .iter()
+                .find(|gpu| gpu.uuid.eq_ignore_ascii_case(trimmed))
+            {
+                return Some(gpu.uuid.clone());
+            }
+            let wanted = trimmed.to_ascii_uppercase();
+            let mut matches = gpus
+                .iter()
+                .filter(|gpu| gpu.uuid.to_ascii_uppercase().starts_with(&wanted));
+            if let Some(first) = matches.next() {
+                if matches.next().is_none() {
+                    return Some(first.uuid.clone());
+                }
+            }
+            // Ambiguous, or a board this host cannot see (a `MIG-…`
+            // instance, a UUID from another machine): verbatim, as before —
+            // resolving it is CUDA's business, not ours.
             return Some(trimmed.to_owned());
         }
         if let Ok(index) = trimmed.parse::<u32>() {
@@ -977,26 +1059,13 @@ impl GpuInventory {
 
     /// The ROCm arm of [`Self::resolve_pin`] for a host with **no boards**
     /// (see its docs). There is nothing to translate a board key against and
-    /// no index to check for range, so all that is left is HIP's grammar —
-    /// and, first, whether the operator already restricted this layer
-    /// themselves.
+    /// no index to check for range, so all that is left is HIP's grammar.
+    /// The operator's own HIP-layer restriction was already handled by the
+    /// guard at the top of [`Self::resolve_pin`], which no arm reaches past.
     fn resolve_hip_pin_uninventoried(&self, requested: Option<&str>) -> Option<String> {
         // No request is no pin here regardless: with no boards there is no
         // default board to pin to either.
         let trimmed = requested?.trim();
-        if self.ambient_hip_restriction() {
-            tracing::warn!(
-                pin = %trimmed,
-                "ignoring this device pin: a HIP-layer visibility restriction \
-                 (HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES / \
-                 GPU_DEVICE_ORDINAL) is already set in this gateway's own \
-                 environment, and writing our own would override it and hand \
-                 the worker boards the operator deliberately hid — the \
-                 operator's restriction wins, and the worker inherits it \
-                 as-is"
-            );
-            return None;
-        }
         if let Some(pin) = canonical_hip_pin(trimmed) {
             return Some(pin);
         }
@@ -1870,6 +1939,26 @@ mod tests {
             );
         }
         assert_eq!(restricted.resolve_pin(None), None);
+        // The guard sits at the top of `resolve_pin`, before the inventory is
+        // consulted at all, so it cannot be bypassed by a board list. Today
+        // the probe never produces this combination (any HIP-layer variable
+        // also blanks the inventory), which is exactly why the guard has to
+        // be positional rather than rely on that invariant holding forever.
+        let restricted_with_boards = GpuInventory {
+            boards: Some(vec![amd_gpu(0, "0000:03:00.0", 24576)].into()),
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices: PathBuf::from("/sys/bus/pci/devices"),
+                ambient_hip_restriction: true,
+            },
+        };
+        for requested in [None, Some("0"), Some("GPU-BDF-0000:03:00.0")] {
+            assert_eq!(
+                restricted_with_boards.resolve_pin(requested),
+                None,
+                "{requested:?} must not be written over the operator's own \
+                 restriction, inventory or no inventory"
+            );
+        }
         // The flag is what distinguishes them, and it comes from the same
         // positional array the probe reads the environment into.
         use super::rocm::{VISIBILITY_VARS, ambient_hip_restriction};
@@ -1960,6 +2049,64 @@ mod tests {
             inventory.resolve_pin(Some("MIG-abc")),
             Some("MIG-abc".to_string())
         );
+    }
+
+    /// A CUDA UUID pin that names a board we *can* see comes back in the
+    /// **inventory's** spelling, not the operator's. CUDA accepts every
+    /// spelling — either case, any unambiguous abbreviation — but the pin
+    /// string is compared byte-wise elsewhere: `prewarm.rs` claims a parked
+    /// worker only when its recorded pin equals the replica's resolved one,
+    /// and `resolve_board_key` already canonicalises for the ledger. Two
+    /// spellings of one board therefore have to converge here, or the pool
+    /// and the ledger disagree about which replicas share a card.
+    #[test]
+    fn cuda_uuid_pins_are_canonicalised_against_the_inventory() {
+        let inventory = GpuInventory::known(vec![
+            gpu(0, "GPU-1a2b0000-0000-0000-0000-000000000000", "12.0"),
+            gpu(1, "GPU-1a2b9999-0000-0000-0000-000000000000", "12.0"),
+            gpu(2, "GPU-ffff0000-0000-0000-0000-000000000000", "12.0"),
+        ]);
+        assert_eq!(
+            inventory.resolve_pin(Some("gpu-FFFF0000-0000-0000-0000-000000000000")),
+            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
+            "an exact match differing only in case takes the inventory's form"
+        );
+        assert_eq!(
+            inventory.resolve_pin(Some("  GPU-ffff  ")),
+            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
+            "an unambiguous abbreviation resolves to the full UUID, which \
+             CUDA accepts everywhere the abbreviation was legal"
+        );
+        assert_eq!(
+            inventory.resolve_pin(Some("GPU-1a2b")),
+            Some("GPU-1a2b".to_string()),
+            "two boards share the prefix: verbatim, as before — resolving it \
+             is CUDA's business, and guessing a board would be worse"
+        );
+        assert_eq!(
+            inventory.resolve_pin(Some("GPU-deadbeef")),
+            Some("GPU-deadbeef".to_string()),
+            "a UUID this host cannot see is unchanged"
+        );
+        assert_eq!(
+            inventory.resolve_pin(Some("MIG-abc")),
+            Some("MIG-abc".to_string()),
+            "and so is a MIG instance outside the enumeration"
+        );
+        // The point of the change: the pin and the ledger key now agree for
+        // every spelling that names a board, which is what the pool compares.
+        for spelling in [
+            "GPU-ffff",
+            "gpu-FFFF0000",
+            "GPU-ffff0000-0000-0000-0000-000000000000",
+            "2",
+        ] {
+            assert_eq!(
+                inventory.resolve_pin(Some(spelling)),
+                inventory.resolve_board_key(Some(spelling)),
+                "{spelling:?} must resolve to one string on both sides"
+            );
+        }
     }
 
     #[test]

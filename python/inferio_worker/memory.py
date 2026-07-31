@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Iterable
@@ -126,6 +127,12 @@ _DRM_UNITS = {
     "MIB": 1024 * 1024,
 }
 
+# A PCI address as the kernel writes it and as both sides of this design
+# format it: `dddd:bb:dd.f`, lower-case hex, function 0-7. Used to validate
+# the one BDF this module does *not* build itself — the one lifted out of a
+# `drm-pdev` line (see `device_bdf`).
+_BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+
 
 # ---------------------------------------------------------------------------
 # torch, but only if the impl already brought it *and* already used the GPU
@@ -189,7 +196,22 @@ def _nvml() -> tuple[Any, Any] | None:
     the worker's whole life, even though the same lookup succeeds the moment
     the impl initializes CUDA. Retrying costs one env read plus, at worst, a
     handful of NVML calls — nothing compared to what it buys.
+
+    **Refused outright on a ROCm worker**, which is not the same thing as
+    NVML being unavailable there. `pynvml` is an unconditional base
+    dependency and `nvmlInit` succeeds on *any* host with an NVIDIA driver
+    loaded — including a hybrid box with an AMD board doing the compute. On
+    such a host the D3 UUID suppression removes the very thing that would
+    have disambiguated the lookup, so the single-GPU last-resort arm below
+    could hand back a handle to the NVIDIA board, and one load report would
+    then describe two different pieces of silicon: base and identity from
+    the AMD board, free/total from the NVIDIA one. Nothing downstream can
+    detect that — the registration cross-check compares the worker's *total*
+    against the inventory, and the NVIDIA total is a perfectly plausible
+    number for some board. So the gate is here, ahead of every NVML path.
     """
+    if _is_hip(_torch()) or _hip_pinned():
+        return None
     pynvml = _nvml_module()
     if pynvml is None:
         return None
@@ -230,11 +252,13 @@ def _nvml_module() -> Any | None:
 
 def _nvml_handle(pynvml: Any) -> Any | None:
     # `CUDA_VISIBLE_DEVICES` deliberately, with no HIP_VISIBLE_DEVICES
-    # fallback: NVML is an NVIDIA driver interface and `nvmlInit` fails on a
-    # ROCm host before this is ever reached, and the ROCm pin is a HIP device
-    # index anyway (never a UUID), so reading it here could not produce a
-    # handle. ROCm gets its own memory tiers from amdgpu sysfs
-    # (docs/rocm-batch-calibration-parity.md, D4).
+    # fallback: a ROCm pin is a HIP device index, never a UUID, so reading it
+    # here could not produce a handle — and a ROCm worker never reaches this
+    # function at all, because `_nvml` refuses one outright. (`nvmlInit` does
+    # fail once and permanently on a *pure* ROCm host, but a hybrid host has
+    # an NVIDIA driver and would initialize happily, which is exactly why
+    # that gate is explicit rather than incidental.) ROCm gets its own memory
+    # tiers from amdgpu sysfs (docs/rocm-batch-calibration-parity.md, D4).
     pin = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
     if pin.upper().startswith(("GPU-", "MIG-")):
         handle = _nvml_handle_by_uuid(pynvml, pin)
@@ -396,6 +420,23 @@ def _is_hip(torch: Any) -> bool:
         return False
 
 
+def _hip_pinned() -> bool:
+    """Whether the orchestrator pinned this worker to a HIP device.
+
+    The pre-torch-import half of [`_is_hip`]: the very first memory reading a
+    worker takes (`begin_load`) happens before any impl has imported torch,
+    so `torch.version.hip` cannot answer yet — but our own spawner writes
+    `HIP_VISIBLE_DEVICES` on every pinned ROCm worker and on no other kind
+    (`gpu.rs::pin_env_var`), so a non-empty value is proof of the backend
+    without importing anything.
+
+    Whitespace/comma-only counts as unset, matching how both sides treat an
+    empty visibility variable.
+    """
+    value = os.environ.get("HIP_VISIBLE_DEVICES") or ""
+    return any(entry.strip() for entry in value.split(","))
+
+
 def _device_props() -> Any | None:
     """`get_device_properties(0)` for the pinned device, or None.
 
@@ -493,7 +534,9 @@ def device_bdf() -> str | None:
     2. Only on a ROCm build whose torch is too old to expose those fields:
        the dominant-VRAM DRM client in `/proc/self/fdinfo`
        ([`dominant_vram_pdev`]). Ambiguous by construction on a multi-GPU
-       host, hence the fallback rather than the source.
+       host, hence the fallback rather than the source — and, being a string
+       copied out of a kernel file rather than one this module formats, it
+       must match the `dddd:bb:dd.f` shape before it is believed.
 
     The function digit is forced to `.0`: the amdgpu GPU function is always
     0 (the HDMI/DP audio controller is function .1 of the *same device*, not
@@ -523,6 +566,16 @@ def device_bdf() -> str | None:
         # character devices, not DRM clients.
         return None
     bdf = dominant_vram_pdev()
+    # Shape-checked before it is believed, unlike the torch-derived address
+    # above, which this module *formats* itself from three integers. This one
+    # is a string lifted verbatim out of a `drm-pdev` line: the parser only
+    # requires the key to be present and non-empty, so a driver that ever
+    # writes something else there — or a non-amdgpu DRM client that spells the
+    # field differently — would otherwise become this worker's identity, be
+    # sent on the wire as `gpu_bdf`, and be joined against the orchestrator's
+    # inventory and used to build a `/sys/bus/pci/devices/<bdf>` path.
+    if bdf is not None and not _BDF_RE.fullmatch(bdf):
+        return None
     if bdf is not None and not _logged["fdinfo_identity"]:
         _logged["fdinfo_identity"] = True
         logger.debug(
@@ -773,6 +826,12 @@ def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
         return None
     texts = _fdinfo_texts(FDINFO_ROOT if root is None else root)
     vram = fdinfo_vram_by_pdev(texts).get(bdf)
+    # `vram <= 0` is redundant with the trailing falsy check (`_mb` clamps at
+    # 0, so a non-positive byte count can only become 0, which is discarded
+    # below) — deliberately kept: the two guards say different things. This
+    # one is the never-invent-a-footprint rule at the point the *reading* is
+    # taken; the other is the same rule at the point the MiB figure is
+    # reported. Collapsing either into the other makes the rule implicit.
     if vram is None or vram <= 0:
         return None
     own_mb = _mb(vram)
@@ -898,6 +957,12 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
     if total is None or used is None:
         return (None, None)
+    # The `max(..., 0)` is redundant with `_mb`'s own clamp and is kept on
+    # purpose: it states the *semantic* saturation (the driver updates the two
+    # counters independently, so `used > total` is a real mid-update reading
+    # and the honest answer is "full board"), where `_mb`'s clamp is a
+    # defensive floor on an arbitrary value. Removing it would leave the
+    # subtraction looking like it can go negative.
     return (_mb(max(total - used, 0)), _mb(total))
 
 
@@ -908,11 +973,17 @@ def _pci_device_dir(base: str, bdf: str) -> str:
     `rocm.rs::pci_device_dir` (the two must agree or a test could pass on one
     side of the wire and not the other). A colon cannot appear in a Windows
     path component — it opens an NTFS alternate data stream — so a fixture
-    tree for a board named `0000:03:00.0` is unwritable there. Nothing is
-    risked by the substitution: the real path is `/sys`, which no Windows host
-    has, and no Windows host can have a ROCm torch at all (the `rocm` extra
-    carries a `sys_platform == 'linux'` marker), so the branch is unreachable
-    outside tests.
+    tree for a board named `0000:03:00.0` is unwritable there.
+
+    Be precise about which branch runs where. **In production on Linux — the
+    only platform the amdgpu tier can exist on — this is always the plain
+    join**, and the mapping branch is dead. The mapping branch does run
+    outside tests, on a Windows host with a torch new enough to expose the
+    PCI fields (>= 2.8): the address resolves, this builds a dash-spelled
+    path, and nothing is there, which is the same "no reading" a Linux CUDA
+    box gets from the plain join. It is harmless because no Windows host has
+    amdgpu sysfs at all, and no Windows host can have a ROCm torch (the
+    `rocm` extra carries a `sys_platform == 'linux'` marker).
     """
     return os.path.join(base, bdf.replace(":", "-") if os.name == "nt" else bdf)
 
@@ -1066,14 +1137,15 @@ def _free_total_mb(
     measurement's deltas and the wire sample) sees the same currency.
 
     The chain is tried in that order on **every** host, with no platform test
-    of its own, because each tier's own availability already is one: `nvmlInit`
-    fails once and permanently on a ROCm host (and is memoized, so the ROCm
-    cost is one failed import for the process's life), and amdgpu's
+    of its own here, because each tier's own availability already is one. On a
+    *pure* ROCm host `nvmlInit` fails once and permanently (and is memoized, so
+    the cost is one failed import for the process's life); on a **hybrid**
+    AMD+NVIDIA host it would succeed, which is why the NVIDIA-ness test lives
+    inside `_nvml` itself rather than being left to the driver — see its
+    docstring. Downwards the availability rule holds unaided: amdgpu's
     `mem_info_vram_*` files exist only under an amdgpu board's PCI directory,
-    so a CUDA host falls through them by their absence. Explicitly branching on
-    `torch.version.hip` would add a second thing to keep true without changing
-    a single outcome. Effective order: `nvml → torch` on CUDA,
-    `amdgpu-sysfs → torch` on ROCm.
+    so a CUDA host falls through that tier by its absence. Effective order:
+    `nvml → torch` on CUDA, `amdgpu-sysfs → torch` on ROCm.
 
     Both driver-level tiers see the whole board; `mem_get_info` is last-resort
     on both backends (on HIP doubly so — its "free" was historically
@@ -1090,6 +1162,12 @@ def _free_total_mb(
         free, total = _nvml_memory()
         if free is not None:
             return (free, total, "nvml")
+        # Belt and braces: a pinned source that cannot answer already falls
+        # out of the `source in (None, X)` guards below and reaches the final
+        # `(None, None, None)`. Kept because it states the pinning contract
+        # *at the tier that failed* — "this pin does not slide down the
+        # chain" — rather than leaving it to be inferred from three guards
+        # further down. Same for the `amdgpu-sysfs` early return below.
         if source == "nvml":
             return (None, None, None)
     if source in (None, "amdgpu-sysfs"):
@@ -1101,6 +1179,8 @@ def _free_total_mb(
         free, total = amdgpu_free_total_mb()
         if free is not None:
             return (free, total, "amdgpu-sysfs")
+        # Belt and braces, as above: unreachable as behaviour, load-bearing
+        # as a statement of the contract.
         if source == "amdgpu-sysfs":
             return (None, None, None)
     if source in (None, "torch"):

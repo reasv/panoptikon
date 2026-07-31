@@ -171,12 +171,36 @@ Linux only:
    every render node at startup can resume a runtime-suspended GPU, once
    per boot.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
-   An openable node whose BDF or VRAM total cannot be read makes the
-   whole probe unknown (same all-or-nothing identity rule as the CUDA
-   parser). Known cost, accepted for v1: one quirky node — e.g. an APU
-   without `mem_info_vram_total` — costs a hybrid host the whole ledger;
-   partial inventories are worse because row indices must cover the full
-   openable set to mean anything to HIP.
+   The all-or-nothing rule (the CUDA parser's, for the same reason) covers
+   the whole identity, not just that file. Any **one** of these on any
+   **one** openable node makes the whole probe unknown:
+   - the KFD node's `properties` unreadable for a reason other than
+     "a device cgroup hides this board" (that one is a skip — ROCr cannot
+     see it either, so excluding it *reconstructs* the runtime's set);
+   - `simd_count` **absent** — an explicit 0 is a CPU node and skips, but an
+     absent key means the file is not the shape we parse, and reading it as
+     a CPU node would drop a board and shift every later row's index;
+   - **an APU** — a node reporting both SIMDs and CPU cores, which is how
+     KFD models an integrated part. Detected positively rather than left to
+     the VRAM rule, because amdgpu *does* publish `mem_info_vram_total` for
+     iGPUs: the BIOS UMA carve-out, commonly 512 MB. Without the explicit
+     test the host would be priced against the carve-out and every grant
+     would collapse to batch-1;
+   - no usable `location_id`/`domain`, i.e. no derivable PCI address;
+   - no readable, nonzero `mem_info_vram_total`;
+   - an **undecodable `gfx_target_version`** (0, or a minor/stepping outside
+     a hex digit) — the board's name is the calibration keyspace and must
+     never be a placeholder;
+   - a duplicate board key with no PCI address to fall back to;
+   - several KFD nodes behind one PCI device (a partitioned board).
+
+   Known cost, accepted for v1: one quirky node costs a hybrid host the
+   whole ledger. Partial inventories are worse, because row indices must
+   cover the full openable set to mean anything to HIP. Every one of these
+   paths logs a WARN naming the node or board; the probe additionally emits
+   one summary WARN for the two paths that name nothing (no KFD GPU nodes
+   at all, and no openable render node), so a ROCm host is never *silently*
+   unpriced.
 5. **Board key** (the ledger/config/pin identity, `GpuInfo::uuid`):
    `GPU-<16 lower hex>` from `unique_id` when it is present, nonzero and
    unique across the **openable** boards (the post-filter set, i.e. the
@@ -417,11 +441,45 @@ entirely, so their path is untouched.
 
 Registration also takes the board key the replica's *pin* named
 (`expected_board`), purely as the D2 mis-order diagnostic described above: it
-never decides anything, and a divergence is logged, not refused. All of the
-log lines are formatted and emitted **after** the ledger lock is dropped
-(review F8) — `resolve_board` returns a decision plus the line to write —
-because a `tracing` event under that mutex would hold every concurrent grant
-request behind a log write.
+never decides anything, and a divergence is logged, not refused. It rides on
+the **refusals** too (`TotalDisagrees`, `BdfOutsideInventory`), not only on
+`PinDiverged`: on a host of *unequal* boards a mis-ordered enumeration is
+caught by the total cross-check, which runs before admission, so the replica
+never reaches the divergence alarm and the "the pin believed board A" half of
+the evidence would otherwise be missing exactly where the totals are
+discriminating enough to prove it. All of the log lines are formatted and
+emitted **after** the ledger lock is dropped (review F8) — `resolve_board`
+returns a decision plus the line to write — because a `tracing` event under
+that mutex would hold every concurrent grant request behind a log write.
+
+**Honesty about the cross-check's reach.** On a **homogeneous** host — the
+common multi-GPU shape, two or four identical cards — the total-VRAM check
+has *no discriminating power at all*: every board reports the same number, so
+a worker that came up on the wrong card passes it and is admitted under the
+board its own PCI address names, which is correct pricing. There,
+`PinDiverged` is the only mis-order signal, and it is the reason the
+`expected_board` plumbing exists. The check is load-bearing in two other
+places: on **heterogeneous** hosts, where it is the thing that catches a
+BDF match landing on a board of the wrong size; and as the **absent-total
+refusal**, which is what stops a non-UUID identification being admitted on
+the enumeration assumption alone. Both are real; neither is "the mis-order
+guard on a normal multi-GPU box".
+
+**Board-key form flip (accepted v1 risk).** A board's key form is decided by
+whether the kernel fills `unique_id` for it: `GPU-<16 hex>` when it does,
+`GPU-BDF-0000:03:00.0` when it does not. That is a *kernel and firmware*
+property, not a hardware one — amdgpu has both started and stopped
+populating the field for particular ASICs across releases. So a driver update
+can silently flip a board's key form, and everything keyed by it is orphaned:
+the user's `[inference_local.vram.gpu."…"]` override stops applying (falling
+back to the section default, which is a *wider* budget, not a narrower one),
+and the ledger's remembered per-board base falls back to the calibration
+store. Nothing breaks and nothing mis-prices — a new key is simply an unknown
+board — but the symptom (a budget override that quietly stopped working after
+a system update) points nowhere near its cause. Accepted for v1; worth a
+release-note line the first time a field report shows it. The calibration
+*profile* key is unaffected: it is the deterministic `AMD gfx… (N GB)` name,
+which is derived from `gfx_target_version` and the VRAM total only.
 
 The `ReplicaTelemetryHealth` view still surfaces `gpu_uuid` only; a ROCm
 replica shows `null` there while being correctly admitted by address. Adding
@@ -469,8 +527,9 @@ unchanged, behind the existing `is_initialized` gates.
   own allocator pool loses the tier and the chain continues below it —
   the free-memory delta first, and the alloc-delta + context formula
   behind that — the mirror of the existing NVML implausibility guard,
-  pointed the other way. pynvml paths die naturally on ROCm (nvmlInit
-  fails once, logged once).
+  pointed the other way. pynvml paths die naturally on a *pure* ROCm host
+  (nvmlInit fails once, logged once) — but see the explicit gate below: on a
+  hybrid host they do not.
 - `free_source_is_authoritative` (ledger) adds `"amdgpu-sysfs"` to
   `"nvml" | "nvidia-smi"`. `"torch"` stays non-authoritative — on HIP
   doubly so given the historical process-local `hipMemGetInfo`.
@@ -486,16 +545,49 @@ unchanged, behind the existing `is_initialized` gates.
 `_sysfs_bytes` and `_pci_device_dir`. Final orders, as coded:
 
 - free/total (`_free_total_mb`): **nvml → amdgpu-sysfs → torch** on every
-  host, with no `torch.version.hip` branch. Each tier's availability already
-  is the platform test — `nvmlInit` fails once and permanently on a ROCm
-  host, and `mem_info_vram_*` exists under no other driver's PCI directory —
-  so the effective order is `nvml → torch` on CUDA and
-  `amdgpu-sysfs → torch` on ROCm without a second thing to keep true. The
-  `source=` pin works for the new label exactly as for the others: a "before"
-  reading from `amdgpu-sysfs` requires the "after" one to come from there or
-  the delta tier is skipped rather than mixed. `mem_get_info` was already
-  inside a `try/except` (verified, unchanged).
+  host, with no `torch.version.hip` branch *in the chain itself*, because
+  each tier's availability is already the platform test in the direction
+  that matters downwards: `mem_info_vram_*` exists under no other driver's
+  PCI directory, so a CUDA host falls through the amdgpu tier by its
+  absence. Effective order: `nvml → torch` on CUDA, `amdgpu-sysfs → torch`
+  on ROCm. The `source=` pin works for the new label exactly as for the
+  others: a "before" reading from `amdgpu-sysfs` requires the "after" one to
+  come from there or the delta tier is skipped rather than mixed.
+  `mem_get_info` was already inside a `try/except` (verified, unchanged).
+- **NVML is refused on a HIP worker, not merely unavailable** (added in
+  review). The original reasoning — "`nvmlInit` fails once and permanently
+  on a ROCm host" — is true of a *pure* ROCm host and false of a hybrid
+  AMD+NVIDIA one, where an NVIDIA driver is loaded and `pynvml` (an
+  unconditional base dependency) initializes happily. There, D3's UUID
+  suppression removes the very thing that would have disambiguated the
+  handle lookup, so `_nvml_handle`'s single-GPU last-resort arm could return
+  the NVIDIA board's handle: one load report would then carry identity and
+  base from the AMD board and free/total from the NVIDIA one, which no
+  downstream check can detect (the registration cross-check compares the
+  worker's total against the inventory, and the NVIDIA total is a plausible
+  number for *some* board). So `_nvml` returns `None` outright when
+  `torch.version.hip` is set — or, before any impl has imported torch, when
+  `HIP_VISIBLE_DEVICES` is non-empty, which our own spawner writes on every
+  pinned ROCm worker and on no other kind.
 - base (`_resolve_base`): **nvml → fdinfo → free_delta → alloc_delta**.
+- **The free-delta rung is structurally dead on a ROCm *first* load**, which
+  is worth stating because the ladder above reads as though it were live.
+  `begin_load` takes its "before" reading before anything has touched torch —
+  deliberately, so the HIP context the load is about to create falls inside
+  the measured window — and on ROCm the free/total tier is keyed by *this
+  worker's board address*, which comes from `get_device_properties(0)` and
+  therefore does not exist until the impl initializes HIP. So there is no
+  pre-load `amdgpu-sysfs` reading to difference against, the source pin has
+  nothing to pin, and the tier is skipped. NVML is why the rung lives on
+  CUDA at all: it answers pre-load without a context, from the UUID pin. The
+  real ROCm first-load ladder is therefore **fdinfo → alloc_delta**, and the
+  free delta only ever appears on a *second* load into a worker that already
+  has a device. Consequence for the field pass: `CONTEXT_ESTIMATE_MB` is
+  materially more load-bearing on ROCm than the D4 text above implies —
+  whenever fdinfo is unavailable (an older kernel's VM-walk stats), every
+  first load falls straight to `alloc_delta + CONTEXT_ESTIMATE_MB`, so the
+  HIP context size is promoted from "flagged" to the first number to measure
+  on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
   fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot debug
   line) and the next tier answers. Rationale: the reading is *expected* above
@@ -609,11 +701,92 @@ and such hosts were never priced before this branch either.
 **Verified in code (2026-07-31), no change needed.** Nothing is
 Windows-gated on the ROCm path because nothing can reach it: the probe
 module is Linux-only by construction (`/sys/class/kfd`, `/dev/dri`) and the
-extra's markers keep ROCm torch off Windows. The APU caveat turned out to
-be sharper than "worse numbers" in one direction: a node with no readable
-nonzero `mem_info_vram_total` makes the whole probe unknown (D1.4), so the
-common integrated-graphics shape is *unpriced*, not mis-priced. Both the
-caveat and the out-of-scope statement are in the README's ROCm section.
+extra's markers keep ROCm torch off Windows. Both the caveat and the
+out-of-scope statement are in the README's ROCm section.
+
+**APU correction (review, 2026-07-31).** The first statement of this — "a
+node with no readable nonzero `mem_info_vram_total` makes the whole probe
+unknown, so the common integrated-graphics shape is unpriced" — was wrong
+about the *mechanism*, and therefore about the outcome. amdgpu registers
+`mem_info_vram_total` for iGPUs too: it reports the BIOS UMA carve-out (512
+MB is a common default), which is a perfectly readable nonzero number. The
+all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them
+and priced the host against the carve-out, which collapses every grant to
+batch-1 with nothing in the log to say why. APU nodes are now detected
+positively — KFD models an integrated part as a single node carrying both
+`simd_count > 0` and `cpu_cores_count > 0`, and that combination is the only
+signal there is — and any openable one makes the whole probe unknown with a
+WARN naming the node and its gfx target (D1.4). The node is not *skipped*:
+HIP still enumerates it, so excluding one row would shift every later row's
+device index. So the outcome the design always promised — an APU host is
+**unpriced**, i.e. exactly its pre-branch behaviour — is now what actually
+happens, rather than being an accident of a rule that did not apply.
+
+## What this changed on CUDA hosts
+
+"ROCm parity" reads as though nothing moved on CUDA. Ten things did, and an
+operator debugging a CUDA host deserves the honest list rather than having to
+diff it out of the branch. None is a regression; several are fixes; two are
+behaviour changes worth knowing about.
+
+1. **Default placement can move on equal-capability, unequal-VRAM hosts.**
+   The capability tie-break gained a VRAM-descending rung before the
+   lowest-index one (D1.7), because an all-`None`-capability ROCm host would
+   otherwise let a first-enumerated iGPU out-rank the dGPU behind it. On CUDA
+   it only reorders boards of *equal* compute capability and different size,
+   where the bigger board is the strictly better default — but it does mean
+   an unpinned model on such a host relocates to the other card and
+   re-measures its base there on the next load. A placement change, not a
+   key-derivation change: nothing keyed by board identity is invalidated.
+2. **A new CUDA admission path, live today.** The single-board fallback
+   (D3) admits a worker that reported *no* UUID and *no* matchable address on
+   a host with exactly one board, gated by the total-VRAM check. On CUDA that
+   is the shipped `cpu`/`cu128` torch 2.7.1 build reporting `gpu_total_mb`
+   but — since `_CudaDeviceProperties` grew the PCI fields only in 2.8 — no
+   `gpu_bdf`. Such a replica used to fall through to unpriced dispatch; it is
+   now ledgered. The total check is what keeps that safe.
+3. **Load reservations stop missing on abbreviated UUIDs.** Reservations were
+   keyed by the resolved *pin* string; `resolve_board_key` now resolves the
+   same registry entry into the ledger's vocabulary (D2's closed gap). The
+   CUDA half of that miss — an operator who wrote `devices = ["GPU-1a2b"]`
+   got no load reservation at all — is fixed by the same call.
+4. **Pin canonicalisation** (added in review). A CUDA `GPU-…`/`MIG-…` pin
+   that names a board this host reports now comes back in the *inventory's*
+   spelling: an exact match differing only in case, and an unambiguous
+   abbreviation, both resolve to the full UUID. CUDA accepts the full form
+   everywhere an abbreviation was legal, so nothing narrows; what it fixes is
+   that `prewarm.rs` claims a parked worker by **byte-comparing** pin strings
+   while `resolve_board_key` already canonicalised, so the pool and the
+   ledger disagreed about whether two replicas shared a board. An ambiguous
+   abbreviation, and a UUID for a board we cannot see, still pass through
+   verbatim.
+5. **New wire fields on the load report**: `gpu_bdf` and `gpu_total_mb`
+   (additive; the CUDA build emits neither until its torch pin reaches 2.8,
+   except `gpu_total_mb`, which it emits today).
+6. **Two new WARNs.** One when a worker's own `env`/`env_remove` config
+   touches a GPU-visibility variable, since that config is applied *after*
+   the pin and silently outranks it. One — `PinDiverged` — which is reachable
+   on CUDA too: an operator-set visibility variable in a worker's env can put
+   a replica on a board other than the one the pin named.
+7. **A new debug line** (`NoBoard`) on every registration that resolves to no
+   ledger board — the ordinary CPU/remote-API worker included. Debug level,
+   so it is off by default.
+8. **The amdgpu-sysfs free/total tier is *probed* on CUDA**, not gated out.
+   It runs only when NVML has already failed and only after the board address
+   resolved (torch >= 2.8), and it then finds no `mem_info_vram_*` under an
+   NVIDIA board's PCI directory and falls through to torch. That absence is
+   deliberately the platform test — a `torch.version.hip` branch there would
+   be a second thing to keep true — but it does mean two `open()` calls on a
+   CUDA host whose NVML is unavailable.
+9. **OpenAPI description deltas** on the GPU-inventory schema (`bdf`,
+   `gfx_target_version`, and reworded `index`/`uuid`/`name`/`compute_cap`
+   text). Field-additive; the fixture was regenerated.
+10. **The probe now dispatches on the resolved accelerator.** A host
+    explicitly configured `accelerator = "rocm"` no longer runs nvidia-smi at
+    all, so it loses compute-capability gating for `/metadata` even if it has
+    NVIDIA hardware. That is a misconfiguration-only path — `auto`, `cuda`
+    and `cpu` all keep the nvidia-smi probe byte for byte, deliberately, so
+    capability filtering never depends on which wheels are installed.
 
 ## What shipped without AMD hardware, and how it was validated
 
@@ -624,24 +797,39 @@ machine:
   `nodes/<n>/properties`, fake PCI device dirs, fake `/dev/dri` render
   nodes for the openability filter) — same fixture style as the
   nvidia-smi parse tests; covers fused/absent/duplicate `unique_id`,
-  missing VRAM files, APU-shaped nodes, container-subset render nodes,
-  undecodable gfx targets, and (added during implementation, beyond the
-  design above) partitioned MI300-class boards that publish several KFD
-  nodes per PCI device, which make the probe unknown rather than
+  missing VRAM files, APU nodes (both the carve-out shape and the two
+  ordinary dGPU spellings that must *not* trip it), an absent `simd_count`,
+  container-subset render nodes, undecodable gfx targets (both the
+  minor and the stepping guard), numeric-not-lexicographic node ordering
+  (nodes 2/9/10), the read+write openability test against a read-only render
+  node, the cgroup-hidden skip end to end, and (added during implementation,
+  beyond the design above) partitioned MI300-class boards that publish
+  several KFD nodes per PCI device, which make the probe unknown rather than
   N-fold-over-admitting one board's memory.
 - D2 pin-form selection and resolve_pin-on-ROCm unit tests, including
   the numeric-verbatim vs non-numeric-don't-set rule; ambient
   restriction blanking over the four env vars; the pin variable following
-  the resolved accelerator on an unknown inventory.
-- D3 BDF formatting from torch PCI fields; fdinfo parser fixtures
-  (both memory-key spellings, multi-client filtering by pdev, dedupe by
-  client id, missing keys); registration cross-check paths (BDF match,
-  total mismatch, uuid-present-but-unmatched fallthrough, single-board
-  fallback, swapped enumeration) against synthetic inventories.
+  the resolved accelerator on an unknown inventory; the ambient HIP-layer
+  guard holding with *and* without a board list; and CUDA pin
+  canonicalisation agreeing with `resolve_board_key` for every spelling
+  that names a board.
+- D3 BDF formatting from torch PCI fields; the shape check on the
+  fdinfo-derived address (a `drm-pdev` line that is not an address never
+  becomes an identity); fdinfo parser fixtures (both memory-key spellings,
+  multi-client filtering by pdev, dedupe by client id, missing keys, and the
+  lone-client-holding-nothing case the tie rule cannot see); registration
+  cross-check paths (BDF match, total mismatch, uuid-present-but-unmatched
+  fallthrough, single-board fallback, swapped enumeration) against synthetic
+  inventories, with the address-carrying test built on *two* boards so a
+  ledger that dropped the addresses could not pass on the single-board
+  fallback.
 - D4 wire round-trips for `gpu_bdf`, `gpu_total_mb`,
   `free_source: "amdgpu-sysfs"`, `base_method: "fdinfo"`; ledger
   authoritative-source rule; fdinfo-below-reserved plausibility floor and
-  the total-memory upper bound.
+  the total-memory upper bound; NVML refused outright on a HIP worker (both
+  signals: `torch.version.hip`, and `HIP_VISIBLE_DEVICES` before torch is
+  imported at all) with a *working* fake NVML present; and the free-source
+  pin holding on a mixed pair whose skew is small enough to look plausible.
 - D6 rocm-keyed store round-trip
   (`calibration.rs::a_rocm_profile_round_trips_and_never_crosses_backends`):
   local write/read, the `major.minor` torch tier over `+rocm` local
@@ -661,31 +849,73 @@ mode degrades to unpriced + a diagnostic log):
 - End-to-end grants/trim/knee on an AMD board (mirror of the CUDA
   dogfooding list).
 
-**What a volunteer report should contain.** Five log lines matter, all at
+**What a volunteer report should contain.** Six log lines matter, all at
 default level. The three registration alarms carry a `model` field, so grep
 for the model name to correlate them — note that `TotalDisagrees` has two
-wordings depending on what the worker managed to report. The two probe-level
+wordings depending on what the worker managed to report. The probe-level
 lines have no model field: they are emitted once at startup and describe the
 whole host.
 
 - `PinDiverged` — *"this replica was pinned to one board and came up on
   another"* (WARN). The enumeration alarm. Pricing is still correct; the
   load reservation was not. Names `expected_board`/`expected_bdf` vs
-  `resolved_board`/`resolved_bdf`.
+  `resolved_board`/`resolved_bdf`. Note the reach: on a **homogeneous** host
+  this is the *only* mis-order signal, because the total cross-check cannot
+  tell identical boards apart.
 - `TotalDisagrees` — *"does not agree with the board it was matched to"*,
   or *"reports no total VRAM"* (WARN). A **refused** registration: that
-  model dispatches unpriced. Names both totals and the tolerance.
+  model dispatches unpriced. Names both totals, the tolerance, and the board
+  the pin believed (`expected_board`/`expected_bdf`) — on a host of unequal
+  boards a mis-ordered enumeration surfaces *here* rather than as
+  `PinDiverged`, because the cross-check runs before admission. **If it
+  fires on every load**, that is not an enumeration fault: report both
+  totals, because the tolerance (±5% or ±512 MB, whichever is larger) may
+  simply be wrong for your board's carve-outs.
 - `BdfOutsideInventory` — *"is on a PCI address no board in the GPU
   inventory has"* (WARN). Also a refusal, and the other face of an
-  enumeration fault: the worker is somewhere the probe never saw.
-- The partitioned-board warning — *"this PCI device publishes several KFD
-  nodes"* (WARN) — and the ambient-restriction line — *"an ambient GPU
-  visibility restriction is set"* (INFO). Both mean the whole host is
-  deliberately unpriced, and which one fired says why.
+  enumeration fault: the worker is somewhere the probe never saw. Carries
+  the pin's belief too.
+- The **unpriced-probe** line — *"this host is configured for ROCm but no
+  GPU inventory could be built"* (WARN), carrying `reason`, `gpu_nodes` and
+  `openable_nodes`. Emitted once at startup for the two failure paths that
+  name nothing themselves (`no KFD GPU nodes`, `no openable render node`).
+  It is the answer to "the ledger is simply not there and nothing said why".
+- The per-node refusals, each naming the node or board that tripped: the
+  partitioned-board warning — *"this PCI device publishes several KFD
+  nodes"* — the APU line — *"reports both SIMDs and CPU cores"* — the absent
+  `simd_count`, unreadable-properties, undecodable-gfx-target, missing-BDF,
+  missing-VRAM-total and duplicate-`unique_id` lines (all WARN).
+- The ambient-restriction line — *"an ambient GPU visibility restriction is
+  set"* (INFO). The whole host is deliberately unpriced; under a ROCR-only
+  restriction a registry index pin is still written and selects *within* the
+  operator's filtered set.
 
 A report that includes `GET /api/inference/health` (board keys, names,
 totals, per-board budgets) alongside these lines is enough to reconstruct
 what the probe saw without shell access to the machine.
+
+Two more things a field pass should settle, neither of which any fixture can:
+
+- **`location_id` node-id packing on partitioned boards.** The partition
+  detector relies on the kernel ORing the KFD node id into `location_id`'s
+  *function* bits (`kfd_topology.c`), which is what makes several nodes of
+  one MI300 derive the same `…:00.0` address and trip the one-node-per-PCI
+  rule. Some kernel revisions may pack the node id higher (bits 31:28
+  instead). If they do, the derived addresses diverge, the dedicated
+  detector never fires — and the probe still fails safe, because the
+  fabricated addresses have no PCI directory and the VRAM read fails, taking
+  the host unpriced by the missing-total path instead. So the failure is
+  contained; what cannot be known without hardware is which of the two paths
+  a real partitioned board actually takes, and the dedicated test shape may
+  simply never occur in the field.
+- **S6: torch < 2.6 in a user-managed venv dies at import under an
+  operator-set `ROCR_VISIBLE_DEVICES`** (pytorch#142292). This is not
+  something the design does — we never write that variable, precisely
+  because of this — but it is a documented assumption: a Slurm-style
+  scheduler sets ROCR, and a venv the user manages themselves can still hold
+  a torch old enough to crash on it. Such a host cannot run workers at all,
+  with or without this branch; the symptom is an import-time crash in the
+  worker, not an admission problem.
 
 ## Implementation order (all five landed 2026-07-31)
 

@@ -259,9 +259,15 @@ on the worker's own board, which is what `base_mb` is defined as, obtained
 without root, without amdsmi and without NVML's PID-namespace caveat (the
 worker reads *itself*). It is HIP-only and it is floored: fdinfo's memory stats
 for compute allocations are VM-walk-based and need a recent kernel, so a
-reading materially below the worker's own allocator growth across the load is
-rejected as an under-report and the coarser tiers answer instead — an
-under-measured base is headroom the ledger would hand out twice.
+reading materially below the worker's own allocator pool is rejected as an
+under-report and the coarser tiers answer instead — an under-measured base is
+headroom the ledger would hand out twice. The comparand is the **absolute**
+post-load pool (`reserved_at_load_mb`), not the load window's growth: fdinfo
+reports absolute whole-process VRAM, so the two only coincide on a process's
+*first* load, and a windowed comparand would wave an under-report through on
+every reload into an already-loaded worker. The windowed delta is the fallback
+for the one case that leaves the absolute figure unknown — the allocator could
+not be read after the load at all.
 
 `predict` `ok` may additionally carry:
 
@@ -433,13 +439,19 @@ The orchestrator sets for every worker:
   - `CUDA_VISIBLE_DEVICES` — CUDA hosts, and every host with no accelerator
     of its own. Normally a `GPU-…` board UUID; an unresolvable registry pin
     passes through as written.
-  - `HIP_VISIBLE_DEVICES` — ROCm hosts, always a **device index** (HIP reads
-    nothing else); a registry pin that cannot be resolved to one is *dropped*
-    rather than passed through, so the variable is simply not written and the
-    worker inherits the environment. `CUDA_VISIBLE_DEVICES` is deliberately
-    *not* also set there: it is a HIP alias, and setting both is documented
-    unintended-behaviour territory. `ROCR_VISIBLE_DEVICES` is never set —
-    torch < 2.6 crashes at init when it is.
+  - `HIP_VISIBLE_DEVICES` — ROCm hosts, always **a device index or a comma
+    list of indices** (HIP reads nothing else). A board key resolves to its
+    row index; a numeric pin, or an all-numeric list, passes through
+    **canonicalised** (`"00"` → `"0"`, `" 1 , 2 "` → `"1,2"`) even when it
+    names no board this host enumerated, because HIP can act on it and the
+    operator's intent survives. Only a **non-numeric** pin that matches no
+    board key is *dropped* — in a HIP visibility variable it would match no
+    device, hide every board and silently run the worker on the CPU — and
+    then the variable is simply not written and the worker inherits the
+    environment. `CUDA_VISIBLE_DEVICES` is deliberately *not* also set there:
+    it is a HIP alias, and setting both is documented unintended-behaviour
+    territory. `ROCR_VISIBLE_DEVICES` is never set — torch < 2.6 crashes at
+    init when it is.
 
   Exactly one is written, and only when a pin resolved; a worker is never
   handed both.

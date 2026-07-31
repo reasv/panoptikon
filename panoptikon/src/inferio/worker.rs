@@ -586,15 +586,31 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, device: Option<&str>) {
     if overrides.is_empty() {
         return;
     }
-    tracing::warn!(
-        variables = overrides.join(", "),
-        pin_variable = cfg.pin_env_var,
-        pin = device.unwrap_or("(none)"),
+    // Two messages, because with no pin written the collision has nothing to
+    // override: saying "the worker may not end up on the board it was pinned
+    // to" there reads as an alarm about a pin that does not exist. The entry
+    // is still worth one line — it is controlling device visibility on this
+    // worker, and the orchestrator is not the thing that set it, which is
+    // exactly the state that makes a later "why is this model on the wrong
+    // card" impossible to trace.
+    let message = if device.is_some() {
         "this worker's env config sets or removes a GPU-visibility variable; \
          it is applied after the device pin, so an entry naming the pin's own \
          variable replaces (or deletes) the pin, and an entry naming another \
          one is resolved against it by the runtime's own precedence — either \
          way the worker may not end up on the board it was pinned to"
+    } else {
+        "this worker's env config sets or removes a GPU-visibility variable \
+         while no device pin was written for this replica; the entry alone \
+         therefore decides which boards the worker can see, and the \
+         orchestrator's ledger is pricing it against whatever board it \
+         reports rather than one it placed it on"
+    };
+    tracing::warn!(
+        variables = overrides.join(", "),
+        pin_variable = cfg.pin_env_var,
+        pin = device.unwrap_or("(none)"),
+        "{message}"
     );
 }
 

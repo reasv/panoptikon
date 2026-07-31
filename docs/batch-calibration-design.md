@@ -993,6 +993,19 @@ script, not a subsystem.
   one unverifiable assumption — enumeration order — is cross-checked at
   worker registration, which degrades to unpriced dispatch rather than
   mis-pricing. No AMD hardware was available: a field pass is still owed.
+
+  **It was not free on CUDA**, and the full accounting is in that document's
+  "What this changed on CUDA hosts". The two an operator can *observe*: the
+  capability tie-break gained a VRAM-descending rung, so default placement
+  moves on an equal-capability, unequal-VRAM host (the unpinned model
+  relocates to the bigger board and re-measures its base there — a placement
+  change, not a change to how anything is keyed); and the registration
+  single-board fallback is a **new admission path live on CUDA today**,
+  admitting the shipped torch-2.7.1 worker that reports a total but no
+  address, gated by the total-VRAM check. The rest are fixes (load
+  reservations no longer miss on abbreviated-UUID pins; a resolved pin is
+  canonicalised so the prewarm pool and the ledger agree about board
+  equality), additive wire fields, and new log lines.
 - Per-item unit ceilings for `pixel`-class VLMs
   (`metadata.cost.unit_cap_per_item`, clamped into the worker's
   `price_inputs`): every capped VLM's price saturates in reality but not in
