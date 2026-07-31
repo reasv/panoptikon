@@ -6169,7 +6169,7 @@
       },
       "GpuInfo": {
         "type": "object",
-        "description": "One visible NVIDIA board.",
+        "description": "One visible board, from nvidia-smi (CUDA) or KFD topology (ROCm).",
         "required": [
           "index",
           "uuid",
@@ -6177,22 +6177,38 @@
           "total_mb"
         ],
         "properties": {
+          "bdf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's\nper-board sysfs counters (the memory refresh, D5) and the one\nvocabulary a worker can independently report about itself (D3).\n`None` on CUDA, where the UUID already serves both purposes."
+          },
           "compute_cap": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per board here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this board (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the board is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model."
+            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per board here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this board (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the board is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model.\nAlways `None` on ROCm — HIP has no analogue at all."
+          },
+          "gfx_target_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so\na future gfx-arch allowlist has its datum without another probe\n(D7). `None` on CUDA.",
+            "minimum": 0
           },
           "index": {
             "type": "integer",
             "format": "int32",
-            "description": "nvidia-smi enumeration index. Useful only for resolving registry\n`devices = [\"3\"]` pins into a UUID; never an identity.",
+            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Useful\nonly for resolving registry `devices = [\"3\"]` pins; never an identity.",
             "minimum": 0
           },
           "name": {
             "type": "string",
-            "description": "Marketing name, e.g. `NVIDIA GeForce RTX 5090`; the cost-profile key."
+            "description": "Marketing name, e.g. `NVIDIA GeForce RTX 5090`; the cost-profile key.\nOn ROCm, the deterministic `AMD gfx…` form `rocm.rs` derives."
           },
           "total_mb": {
             "type": "integer",
@@ -6201,7 +6217,7 @@
           },
           "uuid": {
             "type": "string",
-            "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`."
+            "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
           }
         }
       },

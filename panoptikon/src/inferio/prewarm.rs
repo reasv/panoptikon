@@ -980,6 +980,8 @@ config.devices = ["3"]
                 name: "Test GPU 0".into(),
                 total_mb: 8192,
                 compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
             },
             crate::inferio::gpu::GpuInfo {
                 index: 3,
@@ -987,6 +989,8 @@ config.devices = ["3"]
                 name: "Test GPU 3".into(),
                 total_mb: 8192,
                 compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
             },
         ])
     }

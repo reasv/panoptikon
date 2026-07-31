@@ -162,7 +162,9 @@ Linux only:
    the *openable* subset, which reconstructs ROCr's actual enumeration.
    This is what makes containerized multi-GPU hosts first-class instead
    of pinning out of range and silently falling to CPU. If *no* GPU node
-   is openable, the inventory is unknown.
+   is openable, the inventory is unknown. Accepted cost: briefly opening
+   every render node at startup can resume a runtime-suspended GPU, once
+   per boot.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
    An openable node whose BDF or VRAM total cannot be read makes the
    whole probe unknown (same all-or-nothing identity rule as the CUDA
@@ -172,8 +174,10 @@ Linux only:
    openable set to mean anything to HIP.
 5. **Board key** (the ledger/config/pin identity, `GpuInfo::uuid`):
    `GPU-<16 lower hex>` from `unique_id` when it is present, nonzero and
-   unique across the host's boards — the same string ROCR accepts and
-   rocminfo prints; otherwise the synthetic **`GPU-BDF-<bdf>`**, stable
+   unique across the **openable** boards (the post-filter set, i.e. the
+   rows this process will actually ledger — a cgroup-hidden sibling
+   that happens to share a serial is not one of them) — the same string
+   ROCR accepts and rocminfo prints; otherwise the synthetic **`GPU-BDF-<bdf>`**, stable
    across reboots by bus location. Both satisfy the existing `GPU-`
    prefix convention. Mixed hosts key each board by the best form it
    individually supports; a *duplicate* `unique_id` pair demotes both to
@@ -254,9 +258,13 @@ duplicate on consumer boards) — in fact the worker **suppresses
 rendered third-vocabulary UUID can never collide with anything. Identity
 comes from the same call's PCI fields instead: `pci_domain_id`,
 `pci_bus_id`, `pci_device_id` formatted as the BDF
-`<domain:04x>:<bus:02x>:<device:02x>.0` (AMD GPUs are PCI function 0; the
-board's audio function is a separate device). These fields are
-device-0-scoped — they describe exactly the board the pin selected —
+`<domain:04x>:<bus:02x>:<device:02x>.0` (the amdgpu GPU function is
+always .0; the HDMI/DP audio controller is function .1 of the *same*
+device, not the GPU's own function. An SR-IOV virtual function does sit
+at a nonzero function, where forcing .0 fabricates an address whose PCI
+directory does not exist — the VRAM read then fails and the probe goes
+unknown, i.e. unpriced, which is the safe answer for a passthrough VF).
+These fields are device-0-scoped — they describe exactly the board the pin selected —
 which is what an fdinfo scan could never give: HIP filters *above* ROCr,
 so a pinned worker still holds render nodes for every ROCR-visible board
 and "exactly one distinct BDF in fdinfo" would be false on every
@@ -294,9 +302,12 @@ unchanged, behind the existing `is_initialized` gates.
 - **Free/total tier (ROCm)**: read `mem_info_vram_{total,used}` from
   `/sys/bus/pci/devices/<bdf>/` for the board identified per D3 (cached
   BDF, re-resolved on each call until known — mirroring the NVML handle
-  retry). Reported with `free_source: "sysfs"`. This is device-wide
-  (other processes included) and is the *same file* the orchestrator's
-  refresh reads (D5), so the single-vocabulary rule holds exactly.
+  retry). Reported with `free_source: "amdgpu-sysfs"` — the label names
+  the driver, not the filesystem, so a future generic sysfs-derived
+  reporter cannot inherit authority by string collision. This is
+  device-wide (other processes included) and is the *same file* the
+  orchestrator's refresh reads (D5), so the single-vocabulary rule holds
+  exactly.
   `torch.cuda.mem_get_info` remains the last-resort tier with its
   existing `"torch"` label (wrapped in try/except — it can raise on
   HIP in containers), and the ledger continues to treat `"torch"` as
@@ -317,7 +328,7 @@ unchanged, behind the existing `is_initialized` gates.
   mirror of the existing NVML implausibility guard, pointed the other
   way. pynvml paths die naturally on ROCm (nvmlInit fails once, logged
   once).
-- `free_source_is_authoritative` (ledger) adds `"sysfs"` to
+- `free_source_is_authoritative` (ledger) adds `"amdgpu-sysfs"` to
   `"nvml" | "nvidia-smi"`. `"torch"` stays non-authoritative — on HIP
   doubly so given the historical process-local `hipMemGetInfo`.
 - `CONTEXT_ESTIMATE_MB = 500` stays as the HIP placeholder for the
@@ -394,7 +405,7 @@ Buildable and testable now:
   total mismatch, uuid-present-but-unmatched fallthrough, single-board
   fallback) against synthetic inventories.
 - D4 wire round-trips for `gpu_bdf`, `gpu_total_mb`,
-  `free_source: "sysfs"`, `base_method: "fdinfo"`; ledger
+  `free_source: "amdgpu-sysfs"`, `base_method: "fdinfo"`; ledger
   authoritative-source rule; fdinfo-below-reserved plausibility floor.
 - D6 rocm-keyed store round-trip.
 
@@ -416,8 +427,8 @@ mode degrades to unpriced + a diagnostic log):
 2. D2 pin plumbing (backend-aware spawn env, resolve_pin, ambient rules).
 3. D3 worker identity (torch PCI fields + gpu_bdf/gpu_total_mb wire
    fields) + registration cross-check (this is the safety net for 2).
-4. D4 worker sysfs/fdinfo memory tiers + ledger `"sysfs"` authority +
-   plausibility floor.
+4. D4 worker sysfs/fdinfo memory tiers + ledger `"amdgpu-sysfs"`
+   authority + plausibility floor.
 5. D6 test + D7/D8 statements; update `batch-calibration-design.md`'s
    ROCm open question, the protocol doc's memory-sensing section, and the
    README accelerator docs.

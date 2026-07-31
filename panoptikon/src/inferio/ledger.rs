@@ -89,7 +89,7 @@ use serde::{Deserialize, Serialize};
 
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
-use super::gpu::GpuInventory;
+use super::gpu::{GpuInventory, MemoryQuery as GpuMemoryQuery};
 use super::worker::TelemetryHandle;
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
@@ -862,8 +862,16 @@ struct FreeSample {
 /// produced one authoritative reading, torch-sourced ones stop overwriting it;
 /// a board that has only ever seen torch readings keeps using them, which is
 /// consistent even if it is offset.
+/// `"amdgpu-sysfs"` is the ROCm equivalent of `"nvml"`/`"nvidia-smi"`:
+/// amdgpu's own per-board `mem_info_vram_*` counters, device-wide rather
+/// than process-local, and the very files both the staleness refresh and
+/// the worker's free/total tier read (docs/rocm-batch-calibration-parity.md,
+/// D4/D5). The label names the *driver*, not the filesystem, so that a
+/// future generic sysfs-derived reporter cannot inherit authority here by
+/// string collision. `"torch"` stays non-authoritative everywhere — doubly
+/// so on HIP, where `hipMemGetInfo`'s "free" was historically process-local.
 fn free_source_is_authoritative(source: &str) -> bool {
-    matches!(source, "nvml" | "nvidia-smi")
+    matches!(source, "nvml" | "nvidia-smi" | "amdgpu-sysfs")
 }
 
 struct GpuLedger {
@@ -923,7 +931,10 @@ pub struct VramLedger {
     /// restart).
     profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
-    /// Whether a stale external sample triggers a live `nvidia-smi` refresh.
+    /// The interface a staleness refresh reads, resolved from the inventory
+    /// at construction so the refresh path never re-derives the backend.
+    memory_query: GpuMemoryQuery,
+    /// Whether a stale external sample triggers a live driver refresh.
     /// Always on in production; the ledger's own unit tests turn it off so
     /// their free readings are exactly what they fed in.
     probe_external: bool,
@@ -964,6 +975,7 @@ impl VramLedger {
                 gpus,
                 ..LedgerState::default()
             }),
+            memory_query: inventory.memory_query(),
             probe_external: true,
         })
     }
@@ -2631,10 +2643,12 @@ impl VramLedger {
             return;
         }
         let ledger = Arc::clone(self);
+        let query = self.memory_query.clone();
         tokio::task::spawn_blocking(move || {
             // One coherent snapshot of every board, so per-board readings can
             // never be stitched together from different moments.
-            let boards = super::gpu::query_memory();
+            let boards = query.run();
+            let source = query.free_source();
             let at = Instant::now();
             let mut state = ledger.lock();
             let mut answered = false;
@@ -2648,13 +2662,7 @@ impl VramLedger {
                     if uuid == gpu {
                         answered = true;
                     }
-                    Self::record_free_locked(
-                        &mut state,
-                        &uuid,
-                        free_mb,
-                        "nvidia-smi".to_owned(),
-                        at,
-                    );
+                    Self::record_free_locked(&mut state, &uuid, free_mb, source.to_owned(), at);
                 }
             }
             // Only the board this refresh was started for clears its own
@@ -2839,6 +2847,7 @@ impl VramLedger {
                 gpus,
                 ..LedgerState::default()
             }),
+            memory_query: GpuMemoryQuery::NvidiaSmi,
             probe_external: false,
         })
     }
@@ -5172,6 +5181,65 @@ mod tests {
             board.limit_mb, nvml_limit,
             "no gigabyte swing on source alone"
         );
+    }
+
+    /// The ROCm half of the same rule. amdgpu's `mem_info_vram_*` counters
+    /// are whole-board, so they outrank torch exactly as NVML does — and
+    /// the label is `"amdgpu-sysfs"`, naming the driver, so no future
+    /// generic `"sysfs"` reporter can inherit that authority by collision.
+    ///
+    /// This exercises the ingest path (`record_free_locked`), not the
+    /// staleness refresh: the refresh reads real hardware through
+    /// `MemoryQuery::run` and the ledger's test constructor disables it
+    /// outright, so what is covered here is the authority rule plus the
+    /// label the ROCm `MemoryQuery` hands it (asserted in `gpu.rs`).
+    #[test]
+    fn amdgpu_sysfs_readings_outrank_torch_readings() {
+        assert!(free_source_is_authoritative("amdgpu-sysfs"));
+        assert!(
+            !free_source_is_authoritative("sysfs"),
+            "a bare sysfs label must not inherit authority"
+        );
+        assert!(!free_source_is_authoritative("torch"));
+        assert_eq!(
+            GpuMemoryQuery::RocmSysfs {
+                pci_devices: std::path::PathBuf::from("/sys/bus/pci/devices"),
+                boards: Vec::new().into(),
+            }
+            .free_source(),
+            "amdgpu-sysfs",
+            "the label the refresh actually records under"
+        );
+
+        let ledger = ledger(32_768, no_margin());
+        let handle = loaded(Some(1024), Some(0));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle)
+            .unwrap();
+        let push = |free_mb: u64, source: &str| {
+            let mut telemetry = handle.lock().unwrap();
+            telemetry.memory = Some(Timestamped::now(MemorySample {
+                free_mb: Some(free_mb),
+                total_mb: Some(32_768),
+                free_source: Some(source.to_owned()),
+                reserved_mb: Some(0),
+                allocated_mb: Some(0),
+            }));
+        };
+        push(24_500, "amdgpu-sysfs");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert_eq!(board.external_source.as_deref(), Some("amdgpu-sysfs"));
+        let sysfs_limit = board.limit_mb;
+        push(28_000, "torch");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert_eq!(
+            board.external_source.as_deref(),
+            Some("amdgpu-sysfs"),
+            "a whole-board reading is not overwritten by a torch one"
+        );
+        assert_eq!(board.limit_mb, sysfs_limit);
     }
 
     /// The staleness refresh backs off after a failure. Without it, a host where

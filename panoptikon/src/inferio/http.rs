@@ -153,10 +153,13 @@ impl InferioState {
             cwd: None,
             deadlines,
         };
-        // One nvidia-smi call answers both hardware questions: which boards
-        // exist (worker→GPU pinning, the per-GPU ledger) and what they can
-        // do (the /metadata availability overlay). Probed once at startup.
-        let host = super::gpu::probe();
+        // One probe answers both hardware questions: which boards exist
+        // (worker→GPU pinning, the per-GPU ledger) and what they can do (the
+        // /metadata availability overlay). Probed once at startup, against
+        // the interface the installed wheels actually talk to — the same
+        // resolved accelerator the worker env and profile keys use, so a
+        // ROCm host is never asked about NVIDIA boards or vice versa.
+        let host = super::gpu::probe(accelerator);
         // The calibration store: shipped baselines beside the registry, the
         // generated file in the data folder. The environment half of every
         // profile key is resolved once, here — it cannot change while the

@@ -26,4 +26,7 @@ pub mod ledger;
 pub mod manager;
 pub mod prewarm;
 pub mod registry;
+/// The ROCm half of `gpu`: KFD/amdgpu sysfs instead of nvidia-smi. Private
+/// because `gpu` is the only entry point either backend is reached through.
+mod rocm;
 pub mod worker;
