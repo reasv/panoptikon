@@ -262,7 +262,8 @@ Two keyspaces, deliberately different:
 - **Cost profiles** are keyed by GPU *model* (`name` string) + environment
   tuple — a property of the silicon and software, shareable.
 - **Budgets and budget settings** are keyed by GPU *instance* (board UUID,
-  `GPU-…` from NVML/nvidia-smi/torch device properties). Two identical
+  `GPU-…` from NVML/nvidia-smi/torch device properties; on ROCm the same
+  `GPU-` prefix over a KFD `unique_id` or the board's PCI address). Two identical
   cards on one host share profiles but can carry different budget settings
   (e.g. the one driving the monitors gets a bigger margin). CUDA device
   index is **never** an identity — it is not stable across reboots or
@@ -277,10 +278,15 @@ silently gets everything. Under the ledger, ambiguity is unacceptable:
 the orchestrator resolves an explicit pin for every worker at spawn,
 written in the UUID form CUDA accepts directly
 (`CUDA_VISIBLE_DEVICES=GPU-…`), so the pin shares the budget keyspace's
-identity and device-index instability never enters (ROCm may need the
-index form plus a spawn-time index→UUID mapping; cuda-first as
-everywhere). Default placement is the **highest-compute-capability board**
-(ties broken by the lowest nvidia-smi index), which is rough parity with
+identity and device-index instability never enters. (ROCm shipped the
+index form instead — `HIP_VISIBLE_DEVICES=<row index>`, where the row order
+is the openable KFD nodes' order, i.e. what ROCr enumerates; HIP accepts no
+UUIDs, so no index→UUID mapping exists or is needed, and the row order is
+cross-checked at registration.
+See `docs/rocm-batch-calibration-parity.md` D2.) Default placement is the
+**highest-compute-capability board** (ties broken by VRAM total descending,
+then the lowest index — an all-unknown-capability ROCm host would otherwise
+let a first-enumerated small board outrank the big one), which is rough parity with
 what an unpinned worker got before: torch's default device order is
 `FASTEST_FIRST`, so "no pin, impls run on `devices[0]`" already meant the
 fastest board rather than the first one on the bus. Headroom-based
@@ -652,6 +658,13 @@ phantom headroom. Measurement is tiered:
 3. The `max_memory_allocated` delta around load is always recorded as the
    floor.
 
+On ROCm the first tier is DRM fdinfo rather than NVML — the process's own
+`drm-resident-vram` for the board it is pinned to, `base_method = "fdinfo"`,
+with the same shape of plausibility floor underneath it — and the free/total
+reading behind tiers 2/3 comes from amdgpu sysfs
+(`free_source = "amdgpu-sysfs"`, authoritative like NVML's). Details and the
+tier order in `docs/rocm-batch-calibration-parity.md` D4.
+
 `base_method` is recorded in the profile as provenance. Cross-platform
 contamination is impossible by construction: `platform` is in the profile
 key, so Linux bases (exact, with Linux-sized contexts) never overlay
@@ -972,9 +985,14 @@ script, not a subsystem.
   registry's explicit `devices` pins). Headroom-based placement — put the next load on the
   card whose ledger has the most room — is the natural follow-up once
   ledgers exist.
-- ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
-  are untested here by design; the design is backend-agnostic on paper,
-  cuda first in practice.
+- ROCm: **resolved** — see `docs/rocm-batch-calibration-parity.md`
+  (designed and implemented 2026-07-31). Parity is sysfs-first rather than
+  SMI-based: KFD topology + amdgpu counters replace the nvidia-smi probe
+  and the external-usage refresh, board identity is the PCI BDF (with a
+  `GPU-<unique_id>`/`GPU-BDF-…` key), pins are HIP device indices, and the
+  one unverifiable assumption — enumeration order — is cross-checked at
+  worker registration, which degrades to unpriced dispatch rather than
+  mis-pricing. No AMD hardware was available: a field pass is still owed.
 - Per-item unit ceilings for `pixel`-class VLMs
   (`metadata.cost.unit_cap_per_item`, clamped into the worker's
   `price_inputs`): every capped VLM's price saturates in reality but not in

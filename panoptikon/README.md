@@ -412,7 +412,8 @@ set, the admission budget is the smaller:
   between services. If you set it, leave `margin` alone.
 
 Overrides are per **GPU instance**, keyed by board UUID (`nvidia-smi -L`
-prints them), not by card model and never by CUDA device index — an index is
+prints them; ROCm keys its boards differently — see below), not by card model
+and never by CUDA device index — an index is
 not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Two identical
 cards therefore share their calibration data but can carry different budgets,
 which is the point: the one driving your monitors wants a bigger margin than
@@ -421,6 +422,77 @@ its twin. An omitted key in an override inherits the section default.
 `GET /api/inference/health` reports each board's `margin`, `cap_fraction`,
 `limit_mb` and `headroom_mb`, which is the fastest way to check that an
 override was picked up.
+
+#### AMD GPUs (ROCm)
+
+Everything above runs on ROCm too: per-board budgets, admission, calibration
+profiles and idle trim. The inventory comes from the kernel
+rather than an SMI CLI — KFD topology
+(`/sys/class/kfd/kfd/topology/nodes/`) for enumeration and identity, amdgpu's
+`mem_info_vram_{total,used}` for capacity and live usage — so nothing
+admission-critical depends on `amd-smi`/`rocm-smi` being installed, on PATH,
+or on holding its JSON schema still. Boards are keyed
+`GPU-<16 hex>` from the fused KFD `unique_id`, or `GPU-BDF-0000:03:00.0` when
+the board has none (the kernel fills it on GFX9+, and not even there
+universally); either form works as a
+`[inference_local.vram.gpu."…"]` override key, and `/api/inference/health`
+prints whichever the probe resolved. Calibration profiles key by a
+deterministic board name — `AMD gfx1100 (24 GB)`, derived from the same sysfs
+facts — so they mean the same thing on every host with that silicon. Pins are
+HIP device indices written to `HIP_VISIBLE_DEVICES` (see "Environment
+variables that remain").
+
+Deliberately not at parity:
+
+- **No capability gating.** The shipped floors are CUDA compute-capability
+  ones (sm_80 for bf16/FA2) and HIP has no analogue, so model admission
+  filters nothing on ROCm and `/metadata` carries no capability overlay —
+  and the impls' own capability guards do not fire either, since
+  `cuda_capability()` deliberately answers `None` under HIP. Dtype
+  negotiation is the one thing that still degrades: bf16 falls back to fp32
+  where the board cannot do it, but on HIP's own answer
+  (`torch.cuda.is_bf16_supported()`) rather than on a capability floor
+  (`python/inferio/impl/utils.py::_select_dtype`).
+- **An ambient visibility restriction leaves the host unpriced.** If any of
+  `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` or
+  `GPU_DEVICE_ORDINAL` is already set (Slurm-style schedulers set the first),
+  the inventory stays unknown and workers inherit the restriction as-is: HIP
+  indices count into the *filtered* set, so composing the pins *we* derive on
+  top of the operator's is not well defined. What happens to a pin you wrote
+  in the registry depends on which layer the operator's restriction sits in.
+  A HIP-layer one (the last three variables) suppresses our pinning
+  entirely — our value would override theirs and hand the worker boards they
+  deliberately hid. Under a ROCR-only restriction an index pin is still
+  written, and selects *within* the operator's set, since HIP indexes into
+  the ROCr-filtered set.
+- **ROCm on Windows/WSL is out of scope.** The `rocm` extra carries
+  `sys_platform == 'linux'` markers, so no managed install puts ROCm torch on
+  Windows.
+- **APUs and iGPUs are a caveat, not a target**: kernel and BIOS disagree
+  about integrated parts' VRAM carve-out, so such a node usually leaves the
+  inventory unknown (no `mem_info_vram_total`), which is the pre-feature
+  behaviour rather than a regression.
+- **Partitioned boards (MI300-class CPX/NPS) are unpriced.** amdgpu reports
+  VRAM per PCI device, not per partition, so pricing each partition against
+  the whole board's memory would over-admit it N-fold; the probe declines
+  the host instead.
+
+Anywhere admission is unavailable, dispatch takes the unpriced path (your cap,
+then the registry default, then `default_max_batch`) and the impls' OOM-retry
+halving is the backstop — which is crisp on Linux dGPUs, where `hipMalloc`
+never spills to host memory.
+
+**Field reports welcome.** No AMD hardware was available when this was
+written, so the one unverifiable assumption — that the KFD node order the
+inventory pins by is HIP's device order — is guarded at worker registration
+rather than proven. If something looks wrong, the gateway log lines worth
+including are: `this replica was pinned to one board and came up on another`
+(the enumeration alarm; the replica is still priced against the board it is
+physically on, but the pin's row order is wrong), the two refusals
+`does not agree with the board it was matched to` and `is on a PCI address no
+board in the GPU inventory has` (that model then dispatches unpriced), the
+partitioned-board warning (`publishes several KFD nodes`), and the info line
+naming an ambient visibility restriction.
 
 ### The managed Python environment (`panoptikon setup`)
 

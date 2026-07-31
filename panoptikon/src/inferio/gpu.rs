@@ -16,8 +16,9 @@
 //! `nvidia-smi` call with a timeout, and any unparseable *identity* makes
 //! the whole result unknown. Unknown never changes behaviour — pins pass
 //! through exactly as they did before this existed (raw index strings, or
-//! no pin at all), which is what keeps CPU/MPS/ROCm hosts and hosts without
-//! nvidia-smi on today's code path.
+//! no pin at all), which is what keeps CPU/MPS hosts and hosts without
+//! nvidia-smi on today's code path. (ROCm hosts take the sysfs probe
+//! below instead of falling through here.)
 //!
 //! The `compute_cap` column is the one exception, because it is the one
 //! field that is *separably* useless: vGPU slices and a few datacenter SKUs
@@ -26,8 +27,9 @@
 //! board list down with them. Such a board keeps its identity and is simply
 //! never chosen by capability-ranked default placement.
 //!
-//! There is exactly **one** probe for both hardware facts the server needs
-//! (board identities here, compute capabilities in `capability.rs`): they
+//! On CUDA there is exactly **one** probe for both hardware facts the
+//! server needs (board identities here, compute capabilities in
+//! `capability.rs`): they
 //! come from one `--query-gpu` invocation, so the two views can never
 //! disagree about which board is which, and boot pays one subprocess
 //! instead of two. Rows are matched positionally, so an inventory index and

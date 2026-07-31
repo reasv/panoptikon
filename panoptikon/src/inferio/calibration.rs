@@ -10,7 +10,11 @@
 //!   environment tuple `(platform, backend, torch, dtype)` and the model's
 //!   `(inference_id, epoch)`. They are a property of the silicon and the
 //!   software, so two identical cards in one host share one profile and a
-//!   maintainer's file is useful to a stranger.
+//!   maintainer's file is useful to a stranger. That last part is why the
+//!   ROCm board name is *derived* rather than read off a tool
+//!   (`AMD gfx1100 (24 GB)`, from sysfs facts): a name that could change
+//!   with what happens to be installed would orphan every profile on the
+//!   host (docs/rocm-batch-calibration-parity.md, D1.6/D6).
 //! - **Budgets** (the ledger) are keyed by board **UUID**, because two
 //!   identical cards can carry different settings and hold different
 //!   residents.
@@ -1378,6 +1382,11 @@ mod tests {
     use crate::inferio::registry::RegistryConfig;
 
     const GPU: &str = "NVIDIA GeForce RTX 5090";
+    /// The deterministic ROCm board name (`docs/rocm-batch-calibration-parity.md`
+    /// D1.6): derived from `gfx_target_version` and the VRAM total, so it is
+    /// identical on every host carrying the silicon and cannot flip with the
+    /// environment the way an amd-smi marketing name could.
+    const ROCM_GPU: &str = "AMD gfx1100 (24 GB)";
 
     fn env() -> StoreEnv {
         StoreEnv {
@@ -1387,13 +1396,27 @@ mod tests {
         }
     }
 
+    /// The ROCm extra is Linux-only, so its environment always pairs
+    /// `backend = "rocm"` with `platform = "linux"`.
+    fn rocm_env() -> StoreEnv {
+        StoreEnv {
+            platform: "linux".to_owned(),
+            backend: "rocm".to_owned(),
+            generator: "panoptikon test".to_owned(),
+        }
+    }
+
     fn store(root: &Path) -> Arc<CalibrationStore> {
+        store_with_env(root, env())
+    }
+
+    fn store_with_env(root: &Path, env: StoreEnv) -> Arc<CalibrationStore> {
         CalibrationStore::with_debounce(
             StorePaths {
                 shipped_dirs: vec![root.join("shipped")],
                 local_path: root.join("data/inferio/calibration.toml"),
             },
-            env(),
+            env,
             Duration::ZERO,
         )
     }
@@ -1634,6 +1657,123 @@ sample_reserved_mb = [80, 160]
             .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
             .unwrap();
         assert!(seed.exact_torch && !seed.local, "{seed:?}");
+    }
+
+    /// ROCm keying (`docs/rocm-batch-calibration-parity.md` D6): a rocm-keyed
+    /// profile round-trips through the local store, the `major.minor` torch
+    /// tier works on a `+rocm` local version tag exactly as it does on `+cu`,
+    /// and `backend` keeps the two families' profiles apart — a cuda entry can
+    /// never answer a rocm query, or the reverse, whatever else matches.
+    #[test]
+    fn a_rocm_profile_round_trips_and_never_crosses_backends() {
+        let root = tempfile::tempdir().unwrap();
+        let rocm = |inference_id: &str, torch: &str, slope: f64| ProfileUpdate {
+            gpu_name: ROCM_GPU.to_owned(),
+            torch: torch.to_owned(),
+            // NVML never answers on a ROCm host; fdinfo is its rank-equal twin.
+            base_method: Some("fdinfo".to_owned()),
+            ..update(inference_id, "fp16", slope)
+        };
+        let rocm_query = |torch: Option<&'static str>| ProfileQuery {
+            gpu_name: ROCM_GPU,
+            ..query("clip/vit", torch, Some("fp16"))
+        };
+
+        let store = store_with_env(root.path(), rocm_env());
+        store.record(rocm("clip/vit", "2.11.0+rocm7.2", 0.79));
+        // Zero debounce and no runtime: the write already happened, so a second
+        // store over the same path reads the file back.
+        let reread = store_with_env(root.path(), rocm_env());
+        let seed = reread
+            .lookup(&rocm_query(Some("2.11.0+rocm7.2")))
+            .expect("round trips");
+        assert!(seed.local);
+        assert!(seed.exact_torch);
+        assert_eq!(seed.base_mb, 4321);
+        assert!((seed.slope_mb_per_unit - 0.79).abs() < 1e-9);
+        assert_eq!(seed.max_units_measured, 1024);
+        assert_eq!(seed.local_samples, 12);
+        assert_eq!(seed.ring.len(), 4);
+        let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
+        assert!(body.contains("backend = \"rocm\""), "{body}");
+        assert!(body.contains("platform = \"linux\""), "{body}");
+        assert!(body.contains(&format!("gpu = \"{ROCM_GPU}\"")), "{body}");
+
+        // The torch tier: a patch-level sibling answers through `major.minor`,
+        // the local version tag (`+rocm7.2`) being ignored there.
+        store.record(rocm("clip/tier", "2.11.1+rocm7.2", 0.31));
+        let tiered = store
+            .lookup(&ProfileQuery {
+                inference_id: "clip/tier",
+                ..rocm_query(Some("2.11.0+rocm7.2"))
+            })
+            .expect("2.11.1 answers a 2.11.0 query");
+        assert!(!tiered.exact_torch, "matched through major.minor");
+        assert!((tiered.slope_mb_per_unit - 0.31).abs() < 1e-9);
+        // A different minor still is not a match, on this backend either.
+        assert!(
+            store
+                .lookup(&ProfileQuery {
+                    inference_id: "clip/tier",
+                    ..rocm_query(Some("2.10.0+rocm7.2"))
+                })
+                .is_none()
+        );
+
+        // Backend isolation, one variable at a time: a baseline identical to
+        // the rocm one except for `backend = "cuda"` is invisible to a rocm
+        // host — same gpu name, same platform, same torch string.
+        let rocm_block = |backend: &str| {
+            shipped_toml("clip/shipped", "2.11.0+rocm7.2", "fp16", 0.5)
+                .replace(&format!("gpu = \"{GPU}\""), &format!("gpu = \"{ROCM_GPU}\""))
+                .replace("platform = \"windows\"", "platform = \"linux\"")
+                .replace("backend = \"cuda\"", &format!("backend = \"{backend}\""))
+        };
+        write_shipped(root.path(), "cuda.toml", &rocm_block("cuda"));
+        let fresh = store_with_env(root.path(), rocm_env());
+        assert!(
+            fresh
+                .lookup(&ProfileQuery {
+                    inference_id: "clip/shipped",
+                    ..rocm_query(Some("2.11.0+rocm7.2"))
+                })
+                .is_none(),
+            "a cuda-backend entry never answers a rocm query"
+        );
+        write_shipped(root.path(), "rocm.toml", &rocm_block("rocm"));
+        let fresh = store_with_env(root.path(), rocm_env());
+        assert!(
+            fresh
+                .lookup(&ProfileQuery {
+                    inference_id: "clip/shipped",
+                    ..rocm_query(Some("2.11.0+rocm7.2"))
+                })
+                .is_some(),
+            "and the same entry keyed rocm does"
+        );
+
+        // The reverse, on the same files: a cuda host on the same platform
+        // sees neither the rocm baseline nor the rocm local entry.
+        let cuda_host = store_with_env(
+            root.path(),
+            StoreEnv {
+                backend: "cuda".to_owned(),
+                ..rocm_env()
+            },
+        );
+        assert!(
+            cuda_host
+                .lookup(&ProfileQuery {
+                    inference_id: "clip/shipped",
+                    ..rocm_query(Some("2.11.0+rocm7.2"))
+                })
+                .is_some(),
+            "the cuda-keyed baseline is the one it can see"
+        );
+        assert!(
+            cuda_host.lookup(&rocm_query(Some("2.11.0+rocm7.2"))).is_none(),
+            "the rocm local entry is not a candidate on a cuda host"
+        );
     }
 
     /// A stale epoch is ignored, not deleted — and the entry comes back the

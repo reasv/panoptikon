@@ -59,7 +59,7 @@ unit         = "item"                  # denormalized from metadata, for readabi
 aggregation  = "count"
 
 base_mb           = 4321               # load footprint, process-level
-base_method       = "nvml"             # nvml | free_delta | alloc_delta
+base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delta
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB
 knee_units        = 512                # optional; not fitted yet (rollout step 4)
 samples           = 38
@@ -75,6 +75,37 @@ The torch string falls back one tier: an exact match wins, otherwise the same
 invalidation lever — bumped in the model's registry metadata when an impl's
 memory behaviour changes without moving any other key component. Stale entries
 are ignored, never deleted.
+
+## ROCm baselines
+
+Same file, same fields, but three of them are spelled differently and `gpu` is
+a key component, so the spelling is load-bearing:
+
+```toml
+gpu      = "AMD gfx1100 (24 GB)"   # never a marketing name
+platform = "linux"                 # the rocm extra is Linux-only
+backend  = "rocm"
+torch    = "2.11.0+rocm7.2"        # full torch.__version__, as always
+```
+
+The `gpu` string is not read off any tool. The orchestrator *derives* it from
+kernel sysfs facts — the board's KFD `gfx_target_version` and its VRAM total
+rounded to the nearest GiB — so it is byte-identical on every host carrying
+that silicon and cannot appear, disappear or change spelling with what happens
+to be installed. An amd-smi/rocm-smi marketing name would have been
+environment-dependent, and a key that flips orphans every profile on the
+machine. Write it exactly as the running server names the board (it is the
+display name too, so `GET /api/inference/health` prints it); the VRAM figure
+is what separates SKUs that share a gfx target and do not price alike — a
+16 GB and a 24 GB gfx1100.
+
+`backend` keeps the two families apart on its own: a cuda-keyed profile never
+answers a rocm lookup, whatever else matches. The torch tier behaves
+identically on a `+rocm` local version tag — `2.11.0` and `2.11.1` share a
+`major.minor`, `2.10` and `2.11` do not.
+
+Nothing ROCm-keyed ships yet: none of it could be measured. The first
+baselines here will come from volunteers' local stores, as below.
 
 ## Contributing a baseline
 

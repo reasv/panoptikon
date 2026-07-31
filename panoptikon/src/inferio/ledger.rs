@@ -3685,8 +3685,9 @@ pub struct GpuBudgetHealth {
     /// False when no free-memory reading is known yet, in which case
     /// `external_mb` is 0 by assumption rather than by measurement.
     pub external_known: bool,
-    /// Which driver answered the freshest free reading (`"nvml"`, `"torch"`,
-    /// or `"nvidia-smi"` for a ledger-side staleness refresh).
+    /// Which driver answered the freshest free reading: `"nvml"` or
+    /// `"torch"` from a worker, `"nvidia-smi"` for a ledger-side staleness
+    /// refresh, and `"amdgpu-sysfs"` on ROCm hosts, where it is both.
     pub external_source: Option<String>,
     pub external_sample_age_ms: Option<u64>,
     /// The admission budget: `min(total × cap_fraction, total − external ×

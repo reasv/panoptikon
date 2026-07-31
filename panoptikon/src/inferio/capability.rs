@@ -3,15 +3,21 @@
 //! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
 //! the source: no torch import (~100 ms vs seconds), independent of venv
 //! state, and any failure degrades to "unknown", which never filters
-//! anything. ROCm/MPS/CPU hosts have no nvidia-smi and are likewise
-//! unknown by design — the only capability floors shipped today are
-//! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
-//! impls carry their own load-time backstop guard.
+//! anything. ROCm/MPS/CPU hosts are likewise unknown by design — the only
+//! capability floors shipped today are CUDA-specific (bf16 +
+//! FlashAttention 2 want sm_80+), and the Python impls carry their own
+//! load-time backstop guard. On ROCm that is a decision, not an accident of
+//! tooling: the sysfs probe enumerates boards perfectly well but HIP has no
+//! compute-capability analogue, so every row's `compute_cap` is `None`, the
+//! host view collapses to unknown, and the `/metadata` overlay stays absent
+//! (docs/rocm-batch-calibration-parity.md D7 — the rows do carry
+//! `gfx_target_version` for a future gfx-arch allowlist).
 //!
-//! The probe itself lives in `gpu.rs`: capabilities and board identities
-//! come out of **one** `nvidia-smi --query-gpu` call, positionally matched,
-//! so the two views can never disagree about which board is which. This
-//! module owns the type, the floor comparison and the `/metadata` overlay.
+//! The probe itself lives in `gpu.rs`: on CUDA, capabilities and board
+//! identities come out of **one** `nvidia-smi --query-gpu` call,
+//! positionally matched, so the two views can never disagree about which
+//! board is which. This module owns the type, the floor comparison and the
+//! `/metadata` overlay.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

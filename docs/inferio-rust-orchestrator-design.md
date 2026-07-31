@@ -217,7 +217,9 @@ frame). The harness:
 
 **Supervision (Rust side)**
 - Spawn via configured python; set env (`CUDA_VISIBLE_DEVICES` for device
-  pinning, config dirs, log level). Reuse the existing
+  pinning — `HIP_VISIBLE_DEVICES` with a device index on ROCm hosts, see
+  `docs/rocm-batch-calibration-parity.md` D2 — config dirs, log level).
+  Reuse the existing
   `process_tree::JobGuard` (Windows Job Object kill-on-close) so worker trees
   can never outlive the gateway — same mechanism already proven for the
   HTML-thumbnail browser.

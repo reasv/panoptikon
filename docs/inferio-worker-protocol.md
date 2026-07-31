@@ -171,7 +171,7 @@ Added for batch calibration (`docs/batch-calibration-design.md`): the worker
 is the only side that has torch, the allocator statistics and the decoded
 input, so it reports what it measured and the orchestrator does all the
 sizing. Every field here is **optional and additive** — a worker with no
-torch, no CUDA, or no NVML omits what it cannot measure, and the
+torch, no GPU runtime, or no NVML/amdgpu-sysfs source omits what it cannot measure, and the
 orchestrator treats every absent field as "unknown" (never an error). The
 protocol version is therefore unchanged (unknown map keys are ignored by
 both sides).

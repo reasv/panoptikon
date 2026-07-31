@@ -155,9 +155,12 @@ impl InferioState {
             // The pin *variable* follows the same resolved accelerator as the
             // worker env and the profile keys — not the inventory: a ROCm
             // host whose inventory came back unknown (ambient restriction,
-            // probe failure) still passes the operator's registry pin
-            // through verbatim, and a HIP index only means what they meant in
-            // HIP's own variable (docs/rocm-batch-calibration-parity.md, D2).
+            // probe failure) still writes the operator's registry pin into
+            // HIP's own variable, where an index is the only thing that means
+            // anything — so `resolve_pin` canonicalises numeric pins there,
+            // drops anything HIP could not read as an index, and writes no
+            // pin at all under a HIP-layer ambient restriction
+            // (docs/rocm-batch-calibration-parity.md, D2).
             pin_env_var: super::gpu::pin_env_var(accelerator),
         };
         // One probe answers both hardware questions: which boards exist

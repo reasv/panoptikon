@@ -1,11 +1,14 @@
 # ROCm parity for batch calibration — gap analysis and decided design
 
-Status: **ship blocker; design decided 2026-07-31, amended same day after
-adversarial review** (gaps enumerated 2026-07-30). The batch-calibration
-system (`batch-calibration-design.md`, implemented on this branch) must
-reach complete ROCm parity before release. No AMD hardware exists on the
-dev box and CI has no GPUs at all, so the design below is built to be
-**correct without hardware verification**: every assumption that could
+Status: **design decided 2026-07-31, amended same day after adversarial
+review, and implemented the same day** — steps 1–5 (D1+D5, D2, D3, D4,
+D6–D8) on this branch (gaps enumerated 2026-07-30). What remains is the
+field pass listed at the end: no AMD hardware exists on the dev box, so
+every runtime cross-check below has been exercised against fixtures and
+none against a real board. The batch-calibration system
+(`batch-calibration-design.md`, implemented on the same branch) was a ship
+blocker until this landed. CI has no GPUs at all either, so the design
+below was built to be **correct without hardware verification**: every assumption that could
 only be proven on a real ROCm machine is either replaced by a source that
 cannot disagree with itself, or guarded by a runtime cross-check that
 degrades to the unpriced dispatch path instead of mis-pricing. "Verified"
@@ -19,8 +22,10 @@ multi-GPU hosts, and the inventory's index space is computed over the
 *openable* render nodes so containers with a `/dev/dri` subset pin
 correctly instead of falling to CPU.
 
-## Behaviour on a ROCm host today (degraded, not broken)
+## Behaviour on a ROCm host before this branch (degraded, not broken)
 
+This is what the gap analysis started from, and it is still what a ROCm
+host falls back to wherever the design below refuses to price something.
 Without an inventory, the whole admission system is inert and dispatch
 takes the unpriced compatibility path:
 
@@ -555,7 +560,17 @@ on every host with the same silicon, so local profiles, shipped
 baselines and volunteers' contributions all key alike and the key can
 never flip with the environment (review F7). Documented in the
 calibration README. No shipped ROCm baselines initially (none can be
-measured); add a rocm-keyed round-trip test.
+measured); a rocm-keyed round-trip test guards the keying instead.
+
+**As implemented (2026-07-31).** No production code changed — the store was
+already backend-parametric, which was the finding. What landed is
+`a_rocm_profile_round_trips_and_never_crosses_backends` in `calibration.rs`
+(local write/read of a `backend = "rocm"`, `platform = "linux"`,
+`gpu = "AMD gfx1100 (24 GB)"`, `torch = "2.11.0+rocm7.2"` profile; the
+`major.minor` tier answering across `+rocm` patch levels; and a baseline
+identical but for `backend`, invisible from the other side in both
+directions) plus the ROCm authoring section in
+`python/inferio/config/calibration/README.md`.
 
 ### D7 (G7) — Capability floors: accepted-unknown, datum recorded
 
@@ -566,6 +581,17 @@ load-time backstops. The inventory rows record `gfx_target_version`
 (free from D1), so a future gfx-arch allowlist has its datum without
 another probe; the `/metadata` capability overlay simply stays absent on
 ROCm hosts.
+
+**Verified in code (2026-07-31), no change needed.** `gpu.rs::probe_rocm`
+constructs `HostComputeCaps::unknown()` directly on every arm — the CUDA
+path's `caps_of`/`from_caps` derivation is never reached — and
+`rocm.rs::identify` sets `compute_cap: None` on every row (while carrying
+`gfx_target_version`), so no row could supply a capability even if it were.
+`capability.rs::overlay_metadata` then filters nothing on an unknown host. The module doc there now says this is
+a decision (HIP has no analogue) rather than a consequence of nvidia-smi
+being absent, which is what it used to imply. The README states it as an
+accepted difference, so a ROCm user does not read the missing overlay as a
+bug.
 
 ### D8 (G8) — Windows machinery: structurally dormant, comparator stays
 
@@ -580,48 +606,98 @@ APU/iGPU hosts are a documented caveat: kernel/BIOS quirks can misreport
 VRAM totals; admission still functions (the numbers are merely worse),
 and such hosts were never priced before this branch either.
 
-## What ships without AMD hardware, and how it is validated
+**Verified in code (2026-07-31), no change needed.** Nothing is
+Windows-gated on the ROCm path because nothing can reach it: the probe
+module is Linux-only by construction (`/sys/class/kfd`, `/dev/dri`) and the
+extra's markers keep ROCm torch off Windows. The APU caveat turned out to
+be sharper than "worse numbers" in one direction: a node with no readable
+nonzero `mem_info_vram_total` makes the whole probe unknown (D1.4), so the
+common integrated-graphics shape is *unpriced*, not mis-priced. Both the
+caveat and the out-of-scope statement are in the README's ROCm section.
 
-Buildable and testable now:
+## What shipped without AMD hardware, and how it was validated
+
+All of the following is implemented and covered by tests that run on any
+machine:
 
 - D1/D5 sysfs probe against **fixture directory trees** (fake
   `nodes/<n>/properties`, fake PCI device dirs, fake `/dev/dri` render
   nodes for the openability filter) — same fixture style as the
   nvidia-smi parse tests; covers fused/absent/duplicate `unique_id`,
-  missing VRAM files, APU-shaped nodes, container-subset render nodes.
+  missing VRAM files, APU-shaped nodes, container-subset render nodes,
+  undecodable gfx targets, and (added during implementation, beyond the
+  design above) partitioned MI300-class boards that publish several KFD
+  nodes per PCI device, which make the probe unknown rather than
+  N-fold-over-admitting one board's memory.
 - D2 pin-form selection and resolve_pin-on-ROCm unit tests, including
   the numeric-verbatim vs non-numeric-don't-set rule; ambient
-  restriction blanking over the four env vars.
+  restriction blanking over the four env vars; the pin variable following
+  the resolved accelerator on an unknown inventory.
 - D3 BDF formatting from torch PCI fields; fdinfo parser fixtures
   (both memory-key spellings, multi-client filtering by pdev, dedupe by
   client id, missing keys); registration cross-check paths (BDF match,
   total mismatch, uuid-present-but-unmatched fallthrough, single-board
-  fallback) against synthetic inventories.
+  fallback, swapped enumeration) against synthetic inventories.
 - D4 wire round-trips for `gpu_bdf`, `gpu_total_mb`,
   `free_source: "amdgpu-sysfs"`, `base_method: "fdinfo"`; ledger
-  authoritative-source rule; fdinfo-below-reserved plausibility floor.
-- D6 rocm-keyed store round-trip.
+  authoritative-source rule; fdinfo-below-reserved plausibility floor and
+  the total-memory upper bound.
+- D6 rocm-keyed store round-trip
+  (`calibration.rs::a_rocm_profile_round_trips_and_never_crosses_backends`):
+  local write/read, the `major.minor` torch tier over `+rocm` local
+  version tags, and backend isolation in both directions.
 
 Needs a field pass on real hardware (none blocks shipping; every failure
 mode degrades to unpriced + a diagnostic log):
 
-- Openable-KFD-node-order = HIP-order on multi-GPU hosts (guarded by
-  D3's check; the refusal log names both BDFs, so one volunteer report
-  confirms or refutes it).
+- Openable-KFD-node-order = HIP-order on multi-GPU hosts. Guarded by D3,
+  which since the same-day amendment **warns rather than refuses**: the
+  replica is admitted under the board its own PCI address resolves to, and
+  `ledger::BoardLog::PinDiverged` names both board keys, both BDFs and both
+  totals. One volunteer report carrying that line confirms or refutes the
+  ordering assumption.
 - fdinfo `drm-resident-vram` magnitudes vs allocator expectations on
   ROCm-relevant kernels; HIP context size for the alloc-delta constant.
 - End-to-end grants/trim/knee on an AMD board (mirror of the CUDA
   dogfooding list).
 
-## Implementation order
+**What a volunteer report should contain.** Five log lines matter, all at
+default level. The three registration alarms carry a `model` field, so grep
+for the model name to correlate them — note that `TotalDisagrees` has two
+wordings depending on what the worker managed to report. The two probe-level
+lines have no model field: they are emitted once at startup and describe the
+whole host.
 
-1. D1 + D5 (sysfs inventory + memory refresh, fixtures-first) — lights
+- `PinDiverged` — *"this replica was pinned to one board and came up on
+  another"* (WARN). The enumeration alarm. Pricing is still correct; the
+  load reservation was not. Names `expected_board`/`expected_bdf` vs
+  `resolved_board`/`resolved_bdf`.
+- `TotalDisagrees` — *"does not agree with the board it was matched to"*,
+  or *"reports no total VRAM"* (WARN). A **refused** registration: that
+  model dispatches unpriced. Names both totals and the tolerance.
+- `BdfOutsideInventory` — *"is on a PCI address no board in the GPU
+  inventory has"* (WARN). Also a refusal, and the other face of an
+  enumeration fault: the worker is somewhere the probe never saw.
+- The partitioned-board warning — *"this PCI device publishes several KFD
+  nodes"* (WARN) — and the ambient-restriction line — *"an ambient GPU
+  visibility restriction is set"* (INFO). Both mean the whole host is
+  deliberately unpriced, and which one fired says why.
+
+A report that includes `GET /api/inference/health` (board keys, names,
+totals, per-board budgets) alongside these lines is enough to reconstruct
+what the probe saw without shell access to the machine.
+
+## Implementation order (all five landed 2026-07-31)
+
+1. ✅ D1 + D5 (sysfs inventory + memory refresh, fixtures-first) — lights
    up ledger boards on ROCm.
-2. D2 pin plumbing (backend-aware spawn env, resolve_pin, ambient rules).
-3. D3 worker identity (torch PCI fields + gpu_bdf/gpu_total_mb wire
+2. ✅ D2 pin plumbing (backend-aware spawn env, resolve_pin, ambient rules).
+3. ✅ D3 worker identity (torch PCI fields + gpu_bdf/gpu_total_mb wire
    fields) + registration cross-check (this is the safety net for 2).
-4. D4 worker sysfs/fdinfo memory tiers + ledger `"amdgpu-sysfs"`
+4. ✅ D4 worker sysfs/fdinfo memory tiers + ledger `"amdgpu-sysfs"`
    authority + plausibility floor.
-5. D6 test + D7/D8 statements; update `batch-calibration-design.md`'s
-   ROCm open question, the protocol doc's memory-sensing section, and the
-   README accelerator docs.
+5. ✅ D6 test + D7/D8 statements; `batch-calibration-design.md`'s ROCm
+   open question now points here, the protocol doc's memory-sensing
+   section was updated with each step, and the README gained an "AMD GPUs
+   (ROCm)" section under VRAM budgets (parity, accepted differences,
+   out-of-scope, and the field-report line list).

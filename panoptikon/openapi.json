@@ -6112,7 +6112,7 @@
               "string",
               "null"
             ],
-            "description": "Which driver answered the freshest free reading (`\"nvml\"`, `\"torch\"`,\nor `\"nvidia-smi\"` for a ledger-side staleness refresh)."
+            "description": "Which driver answered the freshest free reading: `\"nvml\"` or\n`\"torch\"` from a worker, `\"nvidia-smi\"` for a ledger-side staleness\nrefresh, and `\"amdgpu-sysfs\"` on ROCm hosts, where it is both."
           },
           "footprints_mb": {
             "type": "integer",
@@ -8658,7 +8658,7 @@
               "string",
               "null"
             ],
-            "description": "Which driver reported `free_mb`/`total_mb` (`\"nvml\"` | `\"torch\"`); the\ntwo disagree by gigabytes, so a reader comparing samples needs it."
+            "description": "Which driver reported `free_mb`/`total_mb` (`\"nvml\"` |\n`\"amdgpu-sysfs\"` | `\"torch\"`); they disagree by gigabytes, so a reader\ncomparing samples needs it."
           },
           "gpu": {
             "type": [

@@ -94,9 +94,12 @@ pub struct ManagerConfig {
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
     /// Visible GPUs, probed once at startup. Universal worker→GPU pinning
-    /// resolves every replica's `CUDA_VISIBLE_DEVICES` against this, and the
-    /// per-GPU ledger is keyed by these UUIDs. Unknown on hosts with no
-    /// nvidia-smi, which keeps today's unpinned behaviour.
+    /// resolves every replica's visibility pin against this — written to
+    /// `CUDA_VISIBLE_DEVICES` on CUDA hosts and `HIP_VISIBLE_DEVICES` on ROCm
+    /// ones — and the per-GPU ledger is keyed by these UUIDs. Unknown
+    /// whenever the backend's own probe answers nothing (no nvidia-smi; on
+    /// ROCm, unreadable KFD topology or an ambient visibility restriction),
+    /// which keeps today's unpinned behaviour.
     pub gpus: GpuInventory,
     /// VRAM admission limits (`[inference_local.vram]`): the server default
     /// plus per-board-UUID overrides. Defaults are margin 0.10 on,
@@ -238,8 +241,9 @@ pub struct ReplicaTelemetryHealth {
     /// Freshest device sample, and how long ago it was recorded.
     pub free_mb: Option<u64>,
     pub total_mb: Option<u64>,
-    /// Which driver reported `free_mb`/`total_mb` (`"nvml"` | `"torch"`); the
-    /// two disagree by gigabytes, so a reader comparing samples needs it.
+    /// Which driver reported `free_mb`/`total_mb` (`"nvml"` |
+    /// `"amdgpu-sysfs"` | `"torch"`); they disagree by gigabytes, so a reader
+    /// comparing samples needs it.
     pub free_source: Option<String>,
     pub reserved_mb: Option<u64>,
     pub allocated_mb: Option<u64>,
@@ -2863,9 +2867,12 @@ config.replicas = 2
     /// them.
     ///
     /// This is also the **unknown-inventory passthrough** case for
-    /// universal pinning: with no GPU inventory (every non-CUDA host, and
-    /// every host without nvidia-smi) the registry's raw index strings reach
-    /// the child unchanged, exactly as before pinning existed.
+    /// universal pinning: with no GPU inventory and CUDA's pin vocabulary
+    /// (which is what a default `GpuInventory` carries, as here) the
+    /// registry's raw index strings reach the child unchanged, exactly as
+    /// before pinning existed. The claim is scoped to that vocabulary: an
+    /// uninventoried *ROCm* host canonicalises index pins and drops
+    /// non-numeric ones instead (`gpu.rs::resolve_hip_pin_uninventoried`).
     #[tokio::test]
     async fn multi_replica_devices_serve_shared_queue() {
         let setup = test_manager(Duration::from_secs(60), 32);

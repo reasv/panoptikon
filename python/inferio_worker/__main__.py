@@ -247,7 +247,10 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 # measurement"): bracket the load so the orchestrator gets
                 # the process-level footprint it charges this worker for.
                 # Every field is optional — `finish_load` returns {} when
-                # nothing could be measured (no torch, CPU/MPS, no NVML).
+                # nothing could be measured (no torch, CPU/MPS, or a process
+                # that never allocated on the device), and each sensing tier
+                # is backend-specific: NVML on CUDA, DRM fdinfo and amdgpu
+                # sysfs on ROCm, the torch allocator on either.
                 before = memory.begin_load()
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
