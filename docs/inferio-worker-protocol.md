@@ -193,7 +193,7 @@ state at one instant, each key present but possibly nil:
 |---|---|
 | `free_mb` | driver-reported free memory on the worker's GPU |
 | `total_mb` | driver-reported total memory on the worker's GPU |
-| `free_source` | which driver told us: `"nvml"` or `"torch"` (`mem_get_info`). Absent/nil when neither could answer |
+| `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own board) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`) |
 | `allocated_mb` | live tensor bytes (`memory_allocated`) |
 
@@ -202,16 +202,27 @@ The two do not agree — NVML sees the whole board, `mem_get_info` the calling
 context's view (measured 3.4 GB apart on the dev box) — so a consumer that
 differences two samples, or subtracts our own footprint from `free_mb` to
 estimate what other processes hold, must only compare readings whose
-`free_source` matches. NVML is preferred whenever it is usable, because it
-also answers *before* this process has a CUDA context, which `mem_get_info`
-cannot do without creating one.
+`free_source` matches. The worker tries `nvml`, then `amdgpu-sysfs`, then
+`torch`, on every host — each tier's own availability is already the platform
+test (`nvmlInit` fails permanently on a ROCm host; `mem_info_vram_*` exists
+under no other driver's PCI directory), so the effective order is
+`nvml → torch` on CUDA and `amdgpu-sysfs → torch` on ROCm. The two
+driver-level sources see the whole board and answer *before* this process has
+a context, which `mem_get_info` cannot do without creating one; `torch` is
+last-resort on both backends, and on HIP doubly so — its "free" was
+historically process-local (ROCm/hip#348). Consumers treat `"nvml"` and
+`"amdgpu-sysfs"` as authoritative whole-board readings and `"torch"` as not.
+`"amdgpu-sysfs"` names the *driver*, not the filesystem, so a future generic
+sysfs-derived reporter cannot inherit that authority by string collision — and
+it is the same pair of files the orchestrator's own refresh reads, so both
+sides of the ledger speak one vocabulary by construction.
 
 `load` `ok` may additionally carry:
 
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint. Absent — never zero — when the process demonstrably never touched the GPU (no torch, CPU/MPS host, remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
 | `dtype` | the negotiated load precision, one of `"fp16"`, `"bf16"`, `"fp32"` (part of the calibration profile key). Absent when the impl does not negotiate one (CPU impls, remote APIs) |
 | `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
@@ -241,6 +252,16 @@ its deprecated amdgpu alias `drm-memory-vram`, deduplicated by client id). It
 answers nothing unless one board strictly dominates, because a HIP-pinned
 process still holds render nodes for every ROCr-visible board — the pinned one
 is merely the one it allocated on.
+
+The same fdinfo parse, filtered by that identity address instead of ranked by
+it, is what `base_method: "fdinfo"` reads: an absolute whole-process footprint
+on the worker's own board, which is what `base_mb` is defined as, obtained
+without root, without amdsmi and without NVML's PID-namespace caveat (the
+worker reads *itself*). It is HIP-only and it is floored: fdinfo's memory stats
+for compute allocations are VM-walk-based and need a recent kernel, so a
+reading materially below the worker's own allocator growth across the load is
+rejected as an under-report and the coarser tiers answer instead — an
+under-measured base is headroom the ledger would hand out twice.
 
 `predict` `ok` may additionally carry:
 

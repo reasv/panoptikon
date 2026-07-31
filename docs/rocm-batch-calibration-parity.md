@@ -461,10 +461,11 @@ unchanged, behind the existing `is_initialized` gates.
   KFD/compute allocations are VM-walk-based and recent (~kernel 6.x); an
   older kernel can under-report them, and an under-measured base is
   phantom headroom. So an fdinfo reading materially below the worker's
-  own `reserved` delta loses to the alloc-delta + context formula — the
-  mirror of the existing NVML implausibility guard, pointed the other
-  way. pynvml paths die naturally on ROCm (nvmlInit fails once, logged
-  once).
+  own allocator pool loses the tier and the chain continues below it —
+  the free-memory delta first, and the alloc-delta + context formula
+  behind that — the mirror of the existing NVML implausibility guard,
+  pointed the other way. pynvml paths die naturally on ROCm (nvmlInit
+  fails once, logged once).
 - `free_source_is_authoritative` (ledger) adds `"amdgpu-sysfs"` to
   `"nvml" | "nvidia-smi"`. `"torch"` stays non-authoritative — on HIP
   doubly so given the historical process-local `hipMemGetInfo`.
@@ -473,6 +474,61 @@ unchanged, behind the existing `is_initialized` gates.
   available the constant is rarely load-bearing, `IMPLAUSIBLE_SLACK_MB`
   absorbs the error band, and the value is flagged as a
   field-calibration item.
+
+**As implemented (2026-07-31).** `inferio_worker/memory.py` gained
+`amdgpu_free_total_mb`, `fdinfo_own_vram_mb`, `_fdinfo_base_mb`,
+`_identity_bdf` (the memoized board address both tiers are *about*),
+`_sysfs_bytes` and `_pci_device_dir`. Final orders, as coded:
+
+- free/total (`_free_total_mb`): **nvml → amdgpu-sysfs → torch** on every
+  host, with no `torch.version.hip` branch. Each tier's availability already
+  is the platform test — `nvmlInit` fails once and permanently on a ROCm
+  host, and `mem_info_vram_*` exists under no other driver's PCI directory —
+  so the effective order is `nvml → torch` on CUDA and
+  `amdgpu-sysfs → torch` on ROCm without a second thing to keep true. The
+  `source=` pin works for the new label exactly as for the others: a "before"
+  reading from `amdgpu-sysfs` requires the "after" one to come from there or
+  the delta tier is skipped rather than mixed. `mem_get_info` was already
+  inside a `try/except` (verified, unchanged).
+- base (`_resolve_base`): **nvml → fdinfo → free_delta → alloc_delta**.
+- **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
+  fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot debug
+  line) and the next tier answers. Rationale: the reading is *expected* above
+  the pool (HIP context + non-torch allocations ride on top), so only a
+  shortfall is suspicious, and the only innocent shortfalls are MiB
+  truncation on both sides and pages evicted since we committed them
+  (`drm-resident-vram` counts *resident* pages). 256 covers those while
+  staying well under `CONTEXT_ESTIMATE_MB`, so a reading that missed a whole
+  HIP context can never pass as jitter. The comparand is the **absolute**
+  post-load pool, not the load window's `reserved_delta`: fdinfo reports
+  absolute whole-process VRAM, the two coincide only on a process's first
+  load, and the ledger explicitly anticipates repeat loads into one worker —
+  where a windowed comparand would wave an under-report through for no better
+  reason than that the second load was small. (`reserved_delta` stays as the
+  fallback for the case where the allocator could not be read after the load
+  at all.)
+- **Upper sanity bound:** a reading at or above the board's own
+  `total_memory` is rejected too — the twin of the NVML sentinel guard that
+  rejects a filled-in `-1`. A per-process figure that equals or exceeds the
+  *device* is a parse or kernel-accounting artefact, not a footprint, and the
+  floor cannot catch it because over-reporting is the direction the floor
+  treats as normal. Skipped when the total is unknown.
+
+One deviation from the text above, in the safe direction: the **fdinfo base
+tier is gated on `torch.version.hip`** (the free/total sysfs tier is not).
+Recent nvidia-drm also publishes DRM fdinfo memory stats, and they are a
+different quantity under the same key — GEM/DRM allocations, not the CUDA
+context and caching allocator — which the plausibility floor cannot catch,
+because a small model's pool is below the tolerance and *any* reading then
+passes. Ungated, a CUDA-Linux worker whose NVML tier is
+unavailable (container PID namespace) could report a few MiB of base for a
+process holding a 600 MB context. On CUDA the per-process tier is NVML's, by
+design.
+
+A Windows-only affordance rode along: `_pci_device_dir` swaps the BDF's
+colons for dashes on Windows, the exact twin of `rocm.rs::pci_device_dir`,
+so the fixture trees are writable on the dev box. Unreachable in production
+(the real path is `/sys`, and the `rocm` extra is Linux-only).
 
 ### D5 (G5) — External-usage refresh: sysfs read, no subprocess
 

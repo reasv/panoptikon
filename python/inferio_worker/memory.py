@@ -59,6 +59,24 @@ CONTEXT_ESTIMATE_MB = 500
 # another process rather than ours.
 IMPLAUSIBLE_SLACK_MB = 2048
 
+# The mirror of `IMPLAUSIBLE_SLACK_MB`, pointed the other way, for the fdinfo
+# tier: how far *below* the allocator pool we are holding a per-process VRAM
+# reading may sit before it is judged an under-report rather than a measurement
+# (docs/rocm-batch-calibration-parity.md, D4/F6). fdinfo's KFD/compute figures
+# are VM-walk-based and comparatively recent, and an older kernel can report a
+# fraction of what we actually hold — which would be phantom headroom, the one
+# error direction the ledger cannot absorb.
+#
+# The reading is expected to be **larger** than that pool (the HIP context and
+# every non-torch allocation ride on top of it), so only a shortfall is
+# suspicious, and only the two innocent shortfalls need covering:
+# MiB truncation on both sides, and pages the driver has evicted since we
+# committed them (`drm-resident-vram` counts *resident* pages, not reserved
+# ones). 256 MiB covers both with room to spare while staying well under
+# `CONTEXT_ESTIMATE_MB`, so a reading that missed a whole HIP context — the
+# actual failure mode this guards — can never slip through as jitter.
+FDINFO_UNDERREPORT_SLACK_MB = 256
+
 # NVML memoization. The *module* half is one-shot: importing pynvml and
 # calling nvmlInit either works for the life of the process or never does, so
 # a failure is paid (and logged) exactly once. The *handle* half deliberately
@@ -72,12 +90,27 @@ _logged: dict[str, bool] = {
     "nvml_board_unidentified": False,
     "hip_uuid_suppressed": False,
     "fdinfo_identity": False,
+    "fdinfo_under_reported": False,
 }
+
+# This worker's own board address, memoized. The *resolution* half only —
+# deliberately no negative caching, exactly as with the NVML handle (see
+# `_nvml`): the first call is always pre-load, before the impl has a device,
+# so a `None` there is "not yet", never "not ever".
+_bdf_state: dict[str, Any] = {"bdf": None}
 
 # Where the kernel exposes this process's own DRM clients. Absent on every
 # platform but Linux, which is exactly the platforms that cannot have an
 # amdgpu board (the `rocm` torch extra is Linux-only).
 FDINFO_ROOT = "/proc/self/fdinfo"
+
+# Where the amdgpu driver exposes each board's VRAM counters
+# (`<root>/<bdf>/mem_info_vram_{total,used}`). Same Linux-only reasoning as
+# `FDINFO_ROOT`, and the *same files the orchestrator's staleness refresh
+# reads* (docs/rocm-batch-calibration-parity.md, D5) — which is what makes the
+# design's "one memory vocabulary per host" rule hold by construction here
+# rather than by two drivers happening to agree.
+PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
 
 # The unit suffixes the DRM usage-stats format allows on a memory line
 # (`drm-resident-vram: 12345 KiB`). Exactly the kernel-documented grammar,
@@ -648,7 +681,7 @@ def fdinfo_vram_by_pdev(texts: Iterable[str]) -> dict[str, int]:
     return totals
 
 
-def dominant_vram_pdev(root: str = FDINFO_ROOT) -> str | None:
+def dominant_vram_pdev(root: str | None = None) -> str | None:
     """The PCI address this process holds the most VRAM on, or None.
 
     The identity fallback of [`device_bdf`], and only that: a *strict*
@@ -659,8 +692,16 @@ def dominant_vram_pdev(root: str = FDINFO_ROOT) -> str | None:
 
     Linux-only by nature: `/proc/self/fdinfo` does not exist elsewhere, and
     the read then yields nothing.
+
+    `root` defaults to `None` and resolves to [`FDINFO_ROOT`] *inside* the
+    call, exactly as [`fdinfo_own_vram_mb`] does. A `root=FDINFO_ROOT`
+    parameter default would bind the module global at import time, so the two
+    readers of the same tree would answer from different roots the moment one
+    is redirected.
     """
-    totals = fdinfo_vram_by_pdev(_fdinfo_texts(root))
+    totals = fdinfo_vram_by_pdev(
+        _fdinfo_texts(FDINFO_ROOT if root is None else root)
+    )
     if not totals:
         return None
     ranked = sorted(totals.items(), key=lambda entry: entry[1], reverse=True)
@@ -686,6 +727,213 @@ def _fdinfo_texts(root: str) -> list[str]:
         except Exception:
             continue
     return texts
+
+
+def _identity_bdf() -> str | None:
+    """[`device_bdf`], resolved once and then remembered, or None.
+
+    Both amdgpu tiers below are *about one board* — this worker's — so they
+    cannot read anything until the identity is known. Resolution is retried on
+    **every** call until it succeeds, for the same reason the NVML handle is
+    (see `_nvml`): the first call of a worker's life comes from `begin_load`,
+    which reads free memory before anything has touched torch, so there is no
+    device to ask yet. Caching that first `None` would silence both tiers for
+    the process's whole life over a question that answers itself moments later.
+    The retry costs one cached `get_device_properties` read; on an older ROCm
+    torch that falls through to [`dominant_vram_pdev`] it costs one scan of
+    `/proc/self/fdinfo`, which is bounded by this process's own fd count and
+    stops the moment the scan identifies a board.
+    """
+    cached = _bdf_state["bdf"]
+    if cached is not None:
+        return cached
+    bdf = device_bdf()
+    if bdf is not None:
+        _bdf_state["bdf"] = bdf
+    return bdf
+
+
+def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
+    """This process's VRAM on **its own** board, in MiB, or None.
+
+    The ROCm twin of NVML's own-PID figure (`_nvml_own_process_mb`): an
+    absolute, pollution-free whole-process footprint, which is exactly what
+    `base_mb` is defined as. It reads *ourselves* — no root, no amdsmi (which
+    is not on PyPI), and no PID-namespace caveat, since a container's
+    `/proc/self` is its own.
+
+    Filtered by the identity address rather than summed across boards: HIP
+    filters *above* ROCr, so this process holds render nodes for every
+    ROCR-visible board and the other boards' clients are not ours to charge.
+    A board absent from the map, or present holding nothing, is no reading at
+    all (None) rather than a zero — the never-invent-a-footprint rule.
+    """
+    bdf = _identity_bdf()
+    if bdf is None:
+        return None
+    texts = _fdinfo_texts(FDINFO_ROOT if root is None else root)
+    vram = fdinfo_vram_by_pdev(texts).get(bdf)
+    if vram is None or vram <= 0:
+        return None
+    own_mb = _mb(vram)
+    return own_mb if own_mb else None
+
+
+def _fdinfo_base_mb(
+    reserved_mb: int | None,
+    reserved_delta: int | None,
+    root: str | None = None,
+) -> int | None:
+    """[`fdinfo_own_vram_mb`] once it has passed the plausibility floor.
+
+    fdinfo's KFD/compute memory stats are VM-walk-based and recent (~kernel
+    6.x); an older kernel can under-report them, and an under-measured base is
+    phantom headroom — the ledger hands out memory that is already spent. So
+    the reading is checked against the one quantity we measured ourselves: the
+    allocator pool this process is holding.
+
+    The comparand is the **absolute** post-load `reserved_mb`, not the load
+    window's delta, because fdinfo reports absolute whole-process VRAM: the two
+    quantities only coincide on a process's *first* load, and the ledger
+    explicitly anticipates repeat loads into one worker (a model reloaded after
+    a trim, a replica that loads a second model). Differencing an absolute
+    reading against a windowed one would compare the whole process against one
+    window's growth and pass an under-report the moment the process held
+    anything from before. `reserved_delta` is the fallback for the case where
+    the allocator could not be read *after* the load at all, which is the only
+    reading that ever leaves `reserved_mb` unknown.
+
+    fdinfo *above* the pool is expected (the HIP context and any non-torch
+    allocation sit on top of it); fdinfo materially below it means the walk did
+    not see our allocations, and the tier loses to the coarser ones instead of
+    reporting the shortfall. A reading at or above the board's whole capacity
+    is rejected for the mirror-image reason — see the sentinel guard in
+    [`_nvml_own_process_mb`], which this follows: a per-process figure that
+    equals or exceeds the *device* is not a footprint, it is a parse or a
+    kernel accounting artefact, and an absolute tier that accepted it would
+    charge the ledger a nonsense number under the most authoritative
+    provenance ROCm has.
+
+    Structurally the mirror of the free-delta implausibility guard in
+    [`_resolve_base`]: same measured quantities, same one-shot debug line, the
+    inequality pointed the other way.
+
+    **HIP-gated**, unlike the sysfs free/total tier, which needs no gate
+    because `mem_info_vram_*` exists under no other driver's PCI directory.
+    Recent nvidia-drm *does* publish DRM fdinfo memory stats, and they are a
+    different quantity wearing the same key: GEM/DRM allocations, not the CUDA
+    context and the caching allocator this base must account for. The
+    plausibility floor alone would not catch that — a small model's pool is
+    below the tolerance, so any reading at all passes it — and the
+    result would be a base of a few MiB for a process holding a 600 MB
+    context, which is the one error direction the ledger cannot absorb. On
+    CUDA the per-process tier is NVML's, and its absence is what the deltas
+    are for.
+    """
+    if not _is_hip(_torch()):
+        return None
+    own = fdinfo_own_vram_mb(root)
+    if own is None:
+        return None
+    total_mb = gpu_total_mb()
+    if total_mb is not None and total_mb > 0 and own >= total_mb:
+        logger.debug(
+            "DRM fdinfo reports this process holding %d MiB of a %d MiB board; "
+            "rejecting the reading and falling back to the memory deltas",
+            own,
+            total_mb,
+        )
+        return None
+    pool = reserved_mb if reserved_mb is not None else reserved_delta
+    floor = (pool or 0) - FDINFO_UNDERREPORT_SLACK_MB
+    if own < floor:
+        if not _logged["fdinfo_under_reported"]:
+            _logged["fdinfo_under_reported"] = True
+            logger.debug(
+                "DRM fdinfo reports this process holding %d MiB of VRAM while "
+                "our own allocator pool is %d MiB (-%d MiB tolerance); "
+                "rejecting the reading as an under-report (fdinfo memory stats "
+                "for compute allocations need a recent kernel) and falling "
+                "back to the memory deltas",
+                own,
+                pool or 0,
+                FDINFO_UNDERREPORT_SLACK_MB,
+            )
+        return None
+    return own
+
+
+# ---------------------------------------------------------------------------
+# amdgpu sysfs (device-wide free/total for this worker's board)
+# ---------------------------------------------------------------------------
+
+
+def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for this worker's board from amdgpu sysfs.
+
+    `mem_info_vram_total - mem_info_vram_used` on
+    `/sys/bus/pci/devices/<bdf>/`, which is **device-wide** (every process's
+    allocations, not just ours) and is the same pair of files the
+    orchestrator's own refresh reads — so the two sides of the ledger speak
+    one vocabulary by construction (design principle "one memory vocabulary
+    per host"), instead of NVML's and torch's disagreement being replaced by
+    amdgpu's and HIP's.
+
+    `(None, None)` on every host that is not an amdgpu Linux box: the paths
+    simply do not exist, which is also true of an NVIDIA board's PCI
+    directory, so the tier needs no platform test of its own. Both files are
+    required — a total without a used figure is not a free reading — and the
+    subtraction saturates at 0 rather than going negative if the driver
+    reports a used figure above the total mid-update.
+
+    One known optimism, accepted and documented in D5: `total - used` ignores
+    the firmware/kernel carve-outs nvidia-smi's `memory.free` excludes, so
+    these readings run a few hundred MB high. The ledger's margin absorbs it.
+    """
+    bdf = _identity_bdf()
+    if bdf is None:
+        return (None, None)
+    device = _pci_device_dir(PCI_DEVICES_ROOT if root is None else root, bdf)
+    total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
+    used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
+    if total is None or used is None:
+        return (None, None)
+    return (_mb(max(total - used, 0)), _mb(total))
+
+
+def _pci_device_dir(base: str, bdf: str) -> str:
+    """`<base>/<bdf>`, with the colons swapped for dashes on Windows.
+
+    A fixture affordance, and the exact twin of the orchestrator's
+    `rocm.rs::pci_device_dir` (the two must agree or a test could pass on one
+    side of the wire and not the other). A colon cannot appear in a Windows
+    path component — it opens an NTFS alternate data stream — so a fixture
+    tree for a board named `0000:03:00.0` is unwritable there. Nothing is
+    risked by the substitution: the real path is `/sys`, which no Windows host
+    has, and no Windows host can have a ROCm torch at all (the `rocm` extra
+    carries a `sys_platform == 'linux'` marker), so the branch is unreachable
+    outside tests.
+    """
+    return os.path.join(base, bdf.replace(":", "-") if os.name == "nt" else bdf)
+
+
+def _sysfs_bytes(path: str) -> int | None:
+    """A sysfs file holding one non-negative decimal integer, or None.
+
+    Never raises (the module rule) and never guesses: a missing file, a
+    permission error, a driver that changed the format and a negative number
+    are all "no reading", which every caller already treats as unknown.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            raw = handle.read(64).strip()
+    except Exception:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def torch_version() -> str | None:
@@ -812,25 +1060,48 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 def _free_total_mb(
     source: str | None = None,
 ) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)` for the worker's GPU, source nvml|torch.
+    """`(free_mb, total_mb, source)`, source `nvml` | `amdgpu-sysfs` | `torch`.
 
     The one place free/total memory is read, so every consumer (the base
     measurement's deltas and the wire sample) sees the same currency.
 
-    NVML is preferred: it answers before this process has a CUDA context,
-    whereas `mem_get_info` would *create* one. The two sources do not agree
-    (measured 3.4 GB apart on the dev box — NVML sees the whole board,
-    `mem_get_info` the current context's view), so a delta across the load
-    window is only meaningful between two readings of the *same* source.
-    Pass the source the "before" reading came from to pin it; `None` picks
-    the best available. Both numbers always come from whichever source
-    answered — never one from each.
+    The chain is tried in that order on **every** host, with no platform test
+    of its own, because each tier's own availability already is one: `nvmlInit`
+    fails once and permanently on a ROCm host (and is memoized, so the ROCm
+    cost is one failed import for the process's life), and amdgpu's
+    `mem_info_vram_*` files exist only under an amdgpu board's PCI directory,
+    so a CUDA host falls through them by their absence. Explicitly branching on
+    `torch.version.hip` would add a second thing to keep true without changing
+    a single outcome. Effective order: `nvml → torch` on CUDA,
+    `amdgpu-sysfs → torch` on ROCm.
+
+    Both driver-level tiers see the whole board; `mem_get_info` is last-resort
+    on both backends (on HIP doubly so — its "free" was historically
+    process-local, ROCm/hip#348 — which is why the ledger treats `"torch"` as
+    non-authoritative). The sources do not agree (NVML and `mem_get_info`
+    measured 3.4 GB apart on the dev box), so a delta across the load window is
+    only meaningful between two readings of the *same* source. Pass the source
+    the "before" reading came from to pin it; `None` picks the best available.
+    Both numbers always come from whichever source answered — never one from
+    each, and a pinned source that cannot answer yields nothing rather than
+    silently sliding down the chain.
     """
     if source in (None, "nvml"):
         free, total = _nvml_memory()
         if free is not None:
             return (free, total, "nvml")
         if source == "nvml":
+            return (None, None, None)
+    if source in (None, "amdgpu-sysfs"):
+        # Byte-identical to the Rust `MemoryQuery`'s label for the same files
+        # (`gpu.rs::free_source`), which is what makes the orchestrator's
+        # free-source consistency rule hold across the two components — and it
+        # names the *driver*, not the filesystem, so no future generic
+        # sysfs-derived reporter inherits its authority by string collision.
+        free, total = amdgpu_free_total_mb()
+        if free is not None:
+            return (free, total, "amdgpu-sysfs")
+        if source == "amdgpu-sysfs":
             return (None, None, None)
     if source in (None, "torch"):
         torch = _torch_cuda()
@@ -952,7 +1223,12 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     # The BDF and the board's total memory: the ROCm ledger join and the
     # independent cross-check that guards it (D3). Emitted on CUDA too — the
     # keys are additive and the orchestrator keys on the UUID first there.
-    bdf = device_bdf()
+    # Through the memoizing accessor, not `device_bdf` directly: the wire
+    # field is the ledger's join key and the amdgpu tiers' filter, and one
+    # value has to serve both or a board whose address became resolvable
+    # mid-load would be *attributed* to one board while its memory was
+    # *measured* on another.
+    bdf = _identity_bdf()
     if bdf is not None:
         payload["gpu_bdf"] = bdf
     total_mb = gpu_total_mb()
@@ -990,7 +1266,11 @@ def _resolve_base(
        a footprint that appears on Linux and vanishes on Windows would be
        worse than one that is consistently external.
     2. NVML's own-PID figure then wins outright — absolute, pollution-free,
-       and already the whole-process footprint `base` is defined as.
+       and already the whole-process footprint `base` is defined as. Its ROCm
+       twin, DRM fdinfo's per-process VRAM on this worker's own board
+       (`base_method: "fdinfo"`), is the same kind of reading and takes the
+       same rank: NVML is asked first and dies naturally on a ROCm host, so on
+       any one host exactly one of the two can answer.
     3. Otherwise the driver's free-memory delta is used *if usable*:
        present, positive, and not implausibly larger than what we could
        plausibly hold outside the allocator (reserved delta + context +
@@ -1016,6 +1296,9 @@ def _resolve_base(
     own = _nvml_own_process_mb(holding_mb=reserved_mb)
     if own is not None and own > 0:
         return (own, "nvml")
+    own = _fdinfo_base_mb(reserved_mb, reserved_delta)
+    if own is not None and own > 0:
+        return (own, "fdinfo")
 
     floor = alloc_floor or 0
     free_delta = _free_delta(before.get("free_mb"), free_after)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -132,8 +133,10 @@ def isolated(torch_module=None):
     real torch and real `inferio.impl.utils` (whose `select_dtype` records
     its last decision), and the module deliberately observes both. Dropping
     them keeps each case hermetic. NVML is forced into its "import already
-    tried and unusable" state so no real driver call happens, and the
-    one-shot log flags are reset so a test can assert on them.
+    tried and unusable" state so no real driver call happens, the memoized
+    board address is cleared (it is resolved once per *process*, so leaking it
+    would point one test's amdgpu tiers at another's board), and the one-shot
+    log flags are reset so a test can assert on them.
     """
     with mock.patch.dict(sys.modules, {}, clear=False):
         sys.modules.pop("inferio.impl.utils", None)
@@ -147,6 +150,7 @@ def isolated(torch_module=None):
                 {"module_tried": True, "module": None, "handle": None},
                 clear=False,
             ),
+            mock.patch.dict(memory._bdf_state, {"bdf": None}, clear=False),
             mock.patch.dict(memory._logged, {}, clear=False),
         ):
             for key in memory._logged:
@@ -935,17 +939,25 @@ def test_the_fdinfo_fallback_is_hip_only(fake_torch, monkeypatch) -> None:
 
 
 def test_identity_helpers_never_raise_and_never_initialize_cuda() -> None:
+    # The forbidden calls are *recorded* as well as raised: every torch call
+    # in this module sits inside a `try/except` (its never-raise rule), so an
+    # AssertionError alone would be swallowed by the code under test and the
+    # tripwire would report success. The list is what actually fails the test.
+    calls: list[str] = []
+
     class Tripwire(FakeCuda):
         def __init__(self):
             super().__init__(initialized=False)
 
         def get_device_properties(self, index):
+            calls.append("get_device_properties")
             raise AssertionError("get_device_properties would initialize CUDA")
 
     with isolated(fake_torch_module(Tripwire(), hip="7.2.0")):
         assert memory.device_bdf() is None
         assert memory.gpu_total_mb() is None
         assert memory.device_identity() == (None, None)
+    assert calls == [], calls
 
     class Exploding:
         def __getattr__(self, name):
@@ -954,3 +966,576 @@ def test_identity_helpers_never_raise_and_never_initialize_cuda() -> None:
     with isolated(SimpleNamespace(cuda=Exploding())):
         assert memory.device_bdf() is None
         assert memory.gpu_total_mb() is None
+
+
+# ---------------------------------------------------------------------------
+# amdgpu memory tiers: device-wide free/total from sysfs and this process's own
+# footprint from DRM fdinfo (docs/rocm-batch-calibration-parity.md, D4)
+# ---------------------------------------------------------------------------
+
+
+def write_board(root: str, bdf: str, total=None, used=None) -> str:
+    """One board's amdgpu VRAM counters under a fake `/sys/bus/pci/devices`.
+
+    The directory name goes through the module's own `_pci_device_dir`, which
+    swaps the BDF's colons for dashes on Windows — a colon cannot appear in a
+    Windows path component, so a fixture for `0000:03:00.0` is otherwise
+    unwritable on the dev box (the orchestrator's `rocm.rs` fixtures do the
+    same thing for the same reason).
+    """
+    device = Path(memory._pci_device_dir(root, bdf))
+    device.mkdir(parents=True, exist_ok=True)
+    if total is not None:
+        (device / "mem_info_vram_total").write_text(f"{total}\n", encoding="utf-8")
+    if used is not None:
+        (device / "mem_info_vram_used").write_text(f"{used}\n", encoding="utf-8")
+    return root
+
+
+def _fresh(tmp_path, prefix: str) -> Path:
+    """A directory no earlier call in this test has written to.
+
+    Reusing one would leak the previous fixture's files into the next case —
+    both trees are read by *listing* them, so a stale fd file or a stale board
+    directory is indistinguishable from a real one.
+    """
+    root = tmp_path / f"{prefix}-{len(list(tmp_path.iterdir()))}"
+    root.mkdir()
+    return root
+
+
+def pci_root(tmp_path, boards: dict) -> str:
+    """A fake PCI device tree: `{bdf: (total_bytes, used_bytes)}`."""
+    root = _fresh(tmp_path, "pci")
+    for bdf, (total, used) in boards.items():
+        write_board(str(root), bdf, total, used)
+    return str(root)
+
+
+def fdinfo_root(tmp_path, texts) -> str:
+    """A fake `/proc/self/fdinfo` holding one file per open fd."""
+    root = _fresh(tmp_path, "fdinfo")
+    for index, text in enumerate(texts):
+        (root / str(index)).write_text(text, encoding="utf-8")
+    return str(root)
+
+
+def empty_dir(tmp_path, name: str) -> str:
+    """A root that exists and answers nothing — how a test switches a tier off
+    without depending on the machine it runs on."""
+    root = tmp_path / name
+    root.mkdir(exist_ok=True)
+    return str(root)
+
+
+@contextmanager
+def rocm_host(tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None):
+    """A ROCm worker whose two sysfs roots point at fixture trees.
+
+    Both roots are always redirected, never left at their defaults: the tiers
+    read `/sys` and `/proc`, and what this machine has there is not this
+    suite's business.
+    """
+    cuda = cuda if cuda is not None else FakeCuda()
+    with isolated(fake_torch_module(cuda, hip="7.2.0")):
+        monkeypatch.setattr(
+            memory,
+            "PCI_DEVICES_ROOT",
+            pci if pci is not None else empty_dir(tmp_path, "no-pci"),
+        )
+        monkeypatch.setattr(
+            memory,
+            "FDINFO_ROOT",
+            fdinfo_root(tmp_path, fdinfo_texts)
+            if fdinfo_texts is not None
+            else empty_dir(tmp_path, "no-fdinfo"),
+        )
+        yield cuda
+
+
+def test_amdgpu_sysfs_free_is_total_minus_used(tmp_path) -> None:
+    # Expected behavior: the driver publishes a total and a used figure, not a
+    # free one, and this is the SAME pair of files the orchestrator's refresh
+    # reads — which is what makes the free-source consistency rule hold on
+    # ROCm by construction rather than by two drivers agreeing.
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        root = pci_root(tmp_path, {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)})
+        assert memory.amdgpu_free_total_mb(root) == (23_552, 24_576)
+
+        # Bytes, floored to whole MiB like every other reading here: the odd
+        # 700 KB of a partial MiB is not memory anything can be granted out of.
+        write_board(root, "0000:03:00.0", total=8 * MIB + 700_000, used=0)
+        assert memory.amdgpu_free_total_mb(root) == (8, 8)
+
+        # The two counters are read a moment apart and the driver updates them
+        # independently, so `used > total` is possible; a negative free
+        # reading is not. It saturates at 0 — a full board, which is true.
+        write_board(root, "0000:03:00.0", total=8 * MIB, used=9 * MIB)
+        assert memory.amdgpu_free_total_mb(root) == (0, 8)
+
+        # Both files are required: a total without a used figure is not a free
+        # reading, and half of one must never be reported as the whole.
+        partial = tmp_path / "partial"
+        partial.mkdir()
+        write_board(str(partial), "0000:03:00.0", total=8 * MIB)
+        assert memory.amdgpu_free_total_mb(str(partial)) == (None, None)
+
+        # A driver whose format changed reads as unknown, never as a guess.
+        write_board(root, "0000:03:00.0", total=8 * MIB, used="lots")
+        assert memory.amdgpu_free_total_mb(root) == (None, None)
+
+        # This worker's board is not in the tree at all (a container with a
+        # subset of `/sys`, a fabricated SR-IOV address).
+        assert memory.amdgpu_free_total_mb(str(tmp_path / "missing")) == (None, None)
+
+    # And with no identity there is nothing to read *about*: the tier is about
+    # one board, so an unidentified worker gets no reading rather than the
+    # first board it can find.
+    with isolated():
+        assert memory.amdgpu_free_total_mb(
+            pci_root(tmp_path, {"0000:03:00.0": (8 * MIB, 0)})
+        ) == (None, None)
+
+
+def test_the_sysfs_tier_outranks_torch_on_a_rocm_host(tmp_path, monkeypatch) -> None:
+    # Expected behavior: `mem_get_info` on HIP was historically process-local
+    # (ROCm/hip#348) and can raise outright in containers, so amdgpu's
+    # whole-board counters are preferred and torch is the last resort. The
+    # label is `"amdgpu-sysfs"`, byte-identical to the Rust MemoryQuery's, and
+    # the ledger treats exactly that string as authoritative.
+    board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
+    with rocm_host(tmp_path, monkeypatch, pci=pci_root(tmp_path, board)):
+        assert memory.free_total_mb() == (23_552, 24_576, "amdgpu-sysfs")
+        sample = memory.device_memory_sample()
+    assert sample["free_source"] == "amdgpu-sysfs"
+    assert (sample["free_mb"], sample["total_mb"]) == (23_552, 24_576)
+
+
+def test_the_tier_chain_falls_through_by_availability_not_by_platform(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: one chain on every host — NVML, then amdgpu sysfs,
+    # then torch — because each tier's own availability is already the
+    # platform test. `nvmlInit` fails once and permanently on a ROCm host, and
+    # an NVIDIA board's PCI directory carries no `mem_info_vram_*` files.
+    board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", pci_root(tmp_path, board))
+        with with_nvml(fake_pynvml_for(cuda, [])):
+            assert memory.free_total_mb() == (
+                8000,
+                8192,
+                "nvml",
+            ), "NVML answers first and the sysfs files are never consulted"
+
+    # No NVML, and this board has no amdgpu counters (the CUDA case, and also
+    # a ROCm host whose `/sys` is not visible): torch is what is left.
+    with rocm_host(tmp_path, monkeypatch):
+        assert memory.free_total_mb() == (8000, 8192, "torch")
+
+
+def test_a_resolvable_board_is_not_an_amdgpu_board(tmp_path, monkeypatch) -> None:
+    # Expected behavior: torch >= 2.8 carries the PCI fields on CUDA too, so
+    # the board address resolves on an NVIDIA host and the tier is *reached* —
+    # and it is still dead, because the PCI directory that exists there (every
+    # PCI device has one) carries no `mem_info_vram_*`. That absence is the
+    # whole platform test: the tier needs no `torch.version.hip` branch, which
+    # is the second thing that would have to be kept true.
+    cuda = FakeCuda()
+    root = _fresh(tmp_path, "cuda-pci")
+    write_board(str(root), "0000:03:00.0")  # the directory, none of the files
+    with isolated(fake_torch_module(cuda)):
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", str(root))
+        monkeypatch.setattr(memory, "FDINFO_ROOT", empty_dir(tmp_path, "cuda-fdinfo"))
+        assert memory._identity_bdf() == "0000:03:00.0", "the address resolves"
+        assert memory.amdgpu_free_total_mb() == (None, None)
+        assert memory.free_total_mb() == (8000, 8192, "torch")
+
+
+def test_the_free_source_pins_the_load_window_on_rocm(tmp_path, monkeypatch) -> None:
+    # Expected behavior: a base measured as a free-memory delta is only
+    # meaningful between two readings of the SAME source (the sources disagree
+    # by gigabytes). The "before" reading records `amdgpu-sysfs` and the
+    # "after" one is required to come from there too.
+    board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
+    root = pci_root(tmp_path, board)
+    with rocm_host(tmp_path, monkeypatch, pci=root) as cuda:
+        before = memory.begin_load()
+        assert before["free_source"] == "amdgpu-sysfs"
+        # 1.5 GB left the board device-wide while our allocator grew by 1 GB:
+        # the extra is the HIP context, which is exactly why base is measured
+        # in driver currency.
+        write_board(root, "0000:03:00.0", total=24_576 * MIB, used=(1024 + 1536) * MIB)
+        cuda.allocate(1024, reserved_mb=1024)
+        report = memory.finish_load(before, object())
+    assert report["base_method"] == "free_delta", report
+    assert report["base_mb"] == 1536, report
+
+    # And when the pinned source cannot answer the second time (a driver
+    # reload took the directory away, a container remounted `/sys`), the tier
+    # is skipped rather than differenced against torch's own reading — which
+    # would have "measured" a 15 GB base here.
+    root = pci_root(tmp_path, board)
+    with rocm_host(tmp_path, monkeypatch, pci=root) as cuda:
+        before = memory.begin_load()
+        assert before["free_source"] == "amdgpu-sysfs"
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "gone"))
+        cuda.allocate(1024, reserved_mb=1024)
+        report = memory.finish_load(before, object())
+    assert report["base_method"] == "alloc_delta", report
+    assert report["base_mb"] == 1024 + memory.CONTEXT_ESTIMATE_MB, report
+
+
+def test_a_pinned_free_source_never_slides_to_another_tier(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: the pin exists because the sources disagree by
+    # gigabytes, so an unhonourable pin must yield nothing rather than the
+    # next tier's answer — in EITHER direction. On the fixture below the two
+    # whole-board tiers and torch are ~15 GB apart, which is exactly the base
+    # a mixed pair of readings would "measure".
+    board = {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)}
+    with rocm_host(tmp_path, monkeypatch, pci=pci_root(tmp_path, board)) as cuda:
+        # Downwards: the amdgpu tier is readable and outranks torch, but a
+        # window that began on torch ends on torch.
+        assert memory._free_total_mb("torch") == (8000, 8192, "torch")
+        with with_nvml(fake_pynvml_for(cuda, [])):
+            # Upwards: NVML answers and is the unpinned preference...
+            assert memory._free_total_mb() == (8000, 8192, "nvml")
+            # ...and a pin to the tier below it is still honoured there.
+            assert memory._free_total_mb("amdgpu-sysfs") == (
+                23_552,
+                24_576,
+                "amdgpu-sysfs",
+            )
+        # A label no tier answers to is not a fallback instruction. This is
+        # the orchestrator's `"nvidia-smi"` source, which only ever labels the
+        # orchestrator's own refresh and can never be a worker's before-reading
+        # — but if one ever arrived, no tier here may claim it.
+        assert memory._free_total_mb("nvidia-smi") == (None, None, None)
+
+    # And when the pinned tier goes away, the tier sitting ready above it is
+    # precisely the reading that must not be substituted for it.
+    with rocm_host(tmp_path, monkeypatch) as cuda:
+        with with_nvml(fake_pynvml_for(cuda, [])):
+            assert memory._free_total_mb("amdgpu-sysfs") == (None, None, None)
+
+
+def test_fdinfo_is_the_rocm_per_process_base_tier(tmp_path, monkeypatch) -> None:
+    # Tier 1's ROCm twin: an absolute whole-process footprint, which is what
+    # `base_mb` is defined as, read from the kernel about OUR process — no
+    # root, no amdsmi, and no PID-namespace caveat (NVML's tier 1 has all
+    # three). Only clients on the board this worker was pinned to count: HIP
+    # filters above ROCr, so the process holds render nodes for boards it is
+    # not using.
+    texts = [
+        fdinfo("0000:03:00.0", 1, "1024 MiB"),
+        fdinfo("0000:03:00.0", 1, "1024 MiB"),  # the same client, dup()ed
+        fdinfo("0000:03:00.0", 2, "512 MiB", key="drm-memory-vram"),
+        fdinfo("0000:0c:00.0", 3, "8192 MiB"),  # a board we merely have open
+        "not a drm fd at all\n",
+    ]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+        assert memory.fdinfo_own_vram_mb() == 1536
+        before = memory.begin_load()
+        cuda.allocate(1024, reserved_mb=1200)
+        report = memory.finish_load(before, object())
+    assert report["base_method"] == "fdinfo", report
+    assert report["base_mb"] == 1536, report
+
+    # A board with no clients of ours, and a board holding nothing, are both
+    # "no reading" rather than a zero footprint — the never-invent-a-footprint
+    # rule, and the reason such a worker falls to the coarser tiers.
+    with rocm_host(
+        tmp_path, monkeypatch, fdinfo_texts=[fdinfo("0000:0c:00.0", 3, "8192 MiB")]
+    ):
+        assert memory.fdinfo_own_vram_mb() is None
+    with rocm_host(
+        tmp_path, monkeypatch, fdinfo_texts=[fdinfo("0000:03:00.0", 1, None)]
+    ):
+        assert memory.fdinfo_own_vram_mb() is None
+
+
+def test_the_fdinfo_tier_works_off_the_dominant_client_identity(
+    tmp_path, monkeypatch
+) -> None:
+    # The older-ROCm-torch chain end to end: `get_device_properties` carries
+    # no PCI fields, so the identity is the dominant DRM client — and the
+    # per-process tier then filters the very same tree by it. Two things this
+    # is the regression test for. The identity scan's root is resolved per
+    # call, not bound at import, or it would read the real `/proc/self/fdinfo`
+    # while the tier read the fixture. And the address on the wire is the
+    # *memoized* one, so the ledger joins on the board the tier measured:
+    # dominance moves as a process allocates, and re-resolving at emission
+    # time would attribute a load to one board while pricing it on another.
+    cuda = FakeCuda()
+    cuda.pci = None
+    texts = [
+        fdinfo("0000:0c:00.0", 1, "1536 MiB"),
+        fdinfo("0000:03:00.0", 2, "4 MiB"),
+    ]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts, cuda=cuda):
+        assert memory._identity_bdf() == "0000:0c:00.0"
+        before = memory.begin_load()
+        cuda.allocate(1024, reserved_mb=1200)
+        report = memory.finish_load(before, object())
+        assert (report["base_mb"], report["base_method"]) == (1536, "fdinfo"), report
+        assert report["gpu_bdf"] == "0000:0c:00.0"
+
+        # Another process's board becomes the one we hold the most on. The
+        # scan does follow it; the identity does not.
+        Path(memory.FDINFO_ROOT, "dominance-moved").write_text(
+            fdinfo("0000:03:00.0", 3, "8000 MiB"), encoding="utf-8"
+        )
+        assert memory.dominant_vram_pdev() == "0000:03:00.0", "the scan moves"
+        second = memory.begin_load()
+        cuda.allocate(64, reserved_mb=64)
+        again = memory.finish_load(second, object())
+    assert again["gpu_bdf"] == "0000:0c:00.0", "the wire field is the memoized identity"
+
+
+def test_the_fdinfo_base_tier_is_hip_only(tmp_path, monkeypatch) -> None:
+    # Expected behavior: unlike the sysfs free/total tier — whose files exist
+    # under no other driver's PCI directory, so absence gates it — recent
+    # nvidia-drm publishes DRM fdinfo memory stats too, and they are a
+    # DIFFERENT quantity under the same key: GEM/DRM allocations, not the CUDA
+    # context and caching allocator a base must account for. The plausibility
+    # floor cannot catch that (a small model's reserved delta sits below the
+    # tolerance, so any reading passes), and the result would be a base of a
+    # few MiB for a process holding a 600 MB context.
+    texts = [fdinfo("0000:03:00.0", 1, "8 MiB")]
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        monkeypatch.setattr(memory, "FDINFO_ROOT", fdinfo_root(tmp_path, texts))
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "no-pci"))
+        assert memory.fdinfo_own_vram_mb() == 8, "the reader itself is neutral"
+        before = memory.begin_load()
+        cuda.allocate(200, reserved_mb=200)
+        report = memory.finish_load(before, object())
+    assert report["base_method"] == "free_delta", report
+    assert report["base_mb"] == 200, report
+
+
+def test_nvml_still_outranks_the_fdinfo_tier(tmp_path, monkeypatch) -> None:
+    # The two are the same kind of reading and hold the same rank, so the
+    # order between them only matters on a host where both could answer —
+    # which does not exist (NVML dies on ROCm). Asserted anyway because the
+    # fallback structure, not the platform, is what enforces it.
+    texts = [fdinfo("0000:03:00.0", 1, "1536 MiB")]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+        proc = SimpleNamespace(pid=os.getpid(), usedGpuMemory=3000 * MIB)
+        with with_nvml(fake_pynvml_for(cuda, [proc])):
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+    assert report["base_method"] == "nvml", report
+    assert report["base_mb"] == 3000, report
+
+
+def test_an_under_reporting_fdinfo_loses_to_the_deltas(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    # Expected behavior: fdinfo's KFD/compute figures are VM-walk-based and
+    # comparatively recent, and an older kernel can report a fraction of what
+    # we hold. An under-measured base is phantom headroom — the ledger hands
+    # out memory that is already spent — so a reading materially below our own
+    # allocator's growth is rejected and the coarser tiers take over. The
+    # mirror of the free-delta implausibility guard, pointed the other way.
+    texts = [fdinfo("0000:03:00.0", 1, "1000 MiB")]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+        with caplog.at_level("DEBUG", logger="inferio_worker.memory"):
+            before = memory.begin_load()
+            cuda.allocate(4096, reserved_mb=4096)
+            report = memory.finish_load(before, object())
+            # A second load that lands in the SAME branch must not repeat the
+            # line: on such a kernel the tier degrades on every load of the
+            # worker's life, and one message is the whole point of the flag.
+            # (A second load that *passed* the floor would prove nothing —
+            # it would take no branch that could log.)
+            second = memory.begin_load()
+            cuda.allocate(4096, reserved_mb=4096)
+            second_report = memory.finish_load(second, object())
+        assert memory._logged["fdinfo_under_reported"] is True
+    assert report["base_method"] == "free_delta", report
+    assert report["base_mb"] == 4096, report
+    assert second_report["base_method"] != "fdinfo", second_report
+    assert len(
+        [record for record in caplog.records if "under-report" in record.message]
+    ) == 1, caplog.records
+
+
+def test_the_fdinfo_floor_allows_the_innocent_shortfalls(tmp_path, monkeypatch) -> None:
+    # Expected behavior: fdinfo ABOVE our allocator delta is the normal case
+    # (the HIP context and every non-torch allocation ride on top of it), so
+    # only a shortfall is suspicious — and only by more than the tolerance,
+    # which exists for MiB truncation on both sides and for pages the driver
+    # evicted since we committed them (`drm-resident-vram` counts resident
+    # pages). The tolerance is well under the context estimate, so a reading
+    # that missed a whole HIP context can never pass as jitter.
+    delta, slack = 4096, memory.FDINFO_UNDERREPORT_SLACK_MB
+
+    def base_with(vram_mb: int) -> tuple:
+        texts = [fdinfo("0000:03:00.0", 1, f"{vram_mb} MiB")]
+        with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+            before = memory.begin_load()
+            cuda.allocate(delta, reserved_mb=delta)
+            report = memory.finish_load(before, object())
+        return (report["base_mb"], report["base_method"])
+
+    assert base_with(delta - slack) == (delta - slack, "fdinfo"), "exactly at the floor"
+    assert base_with(delta - slack - 1)[1] == "free_delta", "one MiB below it"
+    assert base_with(delta + 500) == (delta + 500, "fdinfo"), "the ordinary case"
+    assert slack < memory.CONTEXT_ESTIMATE_MB, "a missed context is never jitter"
+
+
+def test_the_fdinfo_floor_compares_against_the_absolute_pool(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: fdinfo reports ABSOLUTE whole-process VRAM, so the
+    # comparand is the absolute allocator pool, not the load window's delta.
+    # The two coincide only on a process's FIRST load — and the ledger
+    # explicitly anticipates repeat loads into one worker (a model reloaded
+    # after a trim, a replica taking a second model), where a windowed
+    # comparand would wave an under-report straight through for no better
+    # reason than that the second load happened to be small.
+    def two_loads(vram_mb: int) -> tuple:
+        texts = [fdinfo("0000:03:00.0", 1, f"{vram_mb} MiB")]
+        with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+            first = memory.begin_load()
+            cuda.allocate(3000, reserved_mb=3000)
+            memory.finish_load(first, object())
+            second = memory.begin_load()
+            cuda.allocate(100, reserved_mb=100)
+            report = memory.finish_load(second, object())
+        return (report["base_mb"], report["base_method"])
+
+    # 900 MiB is an under-report against the 3100 MiB pool the process is
+    # holding by then, however small the second load was. Against that load's
+    # own 100 MiB delta it would have passed as a plausible whole-process
+    # footprint — and the ledger would have been handed 2.2 GB of phantom
+    # headroom on a worker that had already spent it.
+    assert two_loads(900)[1] != "fdinfo"
+    # And a reading that does account for the whole process still wins the
+    # tier, on the second load exactly as on the first.
+    assert two_loads(3500) == (3500, "fdinfo")
+
+
+def test_an_fdinfo_reading_at_the_board_capacity_is_rejected(
+    tmp_path, monkeypatch
+) -> None:
+    # The mirror of NVML's sentinel guard (`_nvml_own_process_mb` rejects a
+    # filled-in `-1`): a PER-PROCESS figure at or above the whole DEVICE is
+    # not a footprint, it is a parse or a kernel accounting artefact. An
+    # absolute tier that accepted it would charge the ledger the entire board
+    # under the most authoritative provenance ROCm has — and the floor above
+    # cannot catch it, since an over-report is the direction the floor treats
+    # as normal.
+    def base_with(vram_mb: int) -> str:
+        texts = [fdinfo("0000:03:00.0", 1, f"{vram_mb} MiB")]
+        with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts) as cuda:
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1024)
+            report = memory.finish_load(before, object())
+        return report["base_method"]
+
+    total = 8192  # `FakeCuda`'s board, i.e. what `gpu_total_mb` reports
+    assert base_with(total) != "fdinfo", "exactly the capacity"
+    assert base_with(total + 4096) != "fdinfo", "and beyond it"
+    assert base_with(total - 1) == "fdinfo", "one MiB under it is a real reading"
+
+
+def test_the_amdgpu_tiers_never_initialize_cuda(tmp_path, monkeypatch) -> None:
+    # Expected behavior: both tiers need this worker's board address, which
+    # comes from `get_device_properties` — the call that CREATES the context
+    # this module exists to avoid creating. No context yet means no identity,
+    # which means no reading, however complete the fixtures are.
+    #
+    # Each forbidden call is recorded as well as raised, and the recording is
+    # what the assertion reads: the module wraps every torch call in a
+    # `try/except` by rule, so a raise alone is swallowed and a tripwire that
+    # only raised would pass while the context was being created.
+    calls: list[str] = []
+
+    class Tripwire(FakeCuda):
+        def __init__(self):
+            super().__init__(initialized=False)
+
+        def get_device_properties(self, index):
+            calls.append("get_device_properties")
+            raise AssertionError("get_device_properties would initialize CUDA")
+
+        def mem_get_info(self):
+            calls.append("mem_get_info")
+            raise AssertionError("mem_get_info would initialize CUDA")
+
+    pci = pci_root(tmp_path, {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)})
+    texts = [fdinfo("0000:03:00.0", 1, "1536 MiB")]
+    with rocm_host(tmp_path, monkeypatch, pci=pci, fdinfo_texts=texts, cuda=Tripwire()):
+        assert memory.amdgpu_free_total_mb() == (None, None)
+        assert memory.fdinfo_own_vram_mb() is None
+        assert memory.free_total_mb() == (None, None, None)
+        assert memory.device_memory_sample() is None
+    assert calls == [], calls
+
+
+def test_the_board_address_is_re_resolved_until_it_is_known(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: the FIRST reading of a worker's life is taken in
+    # `begin_load`, before the impl has touched torch, so the board is not
+    # identifiable yet — exactly the NVML handle's situation. Caching that
+    # `None` would silence both amdgpu tiers for the process's whole life over
+    # a question that answers itself moments later.
+    pci = pci_root(tmp_path, {"0000:03:00.0": (24_576 * MIB, 1024 * MIB)})
+    cuda = FakeCuda(initialized=False)
+    with rocm_host(tmp_path, monkeypatch, pci=pci, cuda=cuda):
+        assert memory.amdgpu_free_total_mb() == (None, None)
+        assert memory._bdf_state["bdf"] is None, "a failure is not remembered"
+        cuda.initialized = True
+        assert memory.amdgpu_free_total_mb() == (23_552, 24_576)
+        assert memory._bdf_state["bdf"] == "0000:03:00.0", "a success is"
+
+
+def test_the_amdgpu_tiers_never_raise(tmp_path, monkeypatch) -> None:
+    class Exploding:
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+
+    with isolated(SimpleNamespace(cuda=Exploding())):
+        monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", str(tmp_path / "nowhere"))
+        monkeypatch.setattr(memory, "FDINFO_ROOT", str(tmp_path / "nowhere"))
+        assert memory.amdgpu_free_total_mb() == (None, None)
+        assert memory.fdinfo_own_vram_mb() is None
+        assert memory.free_total_mb() == (None, None, None)
+
+    # A board "directory" that is really a file: the module reports unknown
+    # rather than letting an OSError out of `finish_load`, which would lose the
+    # whole load report over a memory reading nothing depended on.
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    Path(memory._pci_device_dir(str(hostile), "0000:03:00.0")).write_text(
+        "not a directory", encoding="utf-8"
+    )
+    with rocm_host(tmp_path, monkeypatch, pci=str(hostile)):
+        assert memory.amdgpu_free_total_mb() == (None, None)
+
+
+def test_the_bdf_reaches_sysfs_verbatim_off_windows(monkeypatch) -> None:
+    # Expected behavior: the colon→dash swap is a Windows FIXTURE affordance
+    # only (a colon in a path component opens an NTFS alternate data stream,
+    # so a tree named `0000:03:00.0` is unwritable on the dev box). The
+    # production path is `/sys/bus/pci/devices/<bdf>` and the address must
+    # reach it byte for byte — the dashed spelling names a directory the
+    # amdgpu driver never creates, so a swap that leaked to Linux would take
+    # the free/total tier off the whole platform it exists for. Every test in
+    # this file runs on the dev box's `os.name == "nt"`, which is precisely
+    # why the branch that ships needs asserting explicitly.
+    monkeypatch.setattr(os, "name", "posix")
+    assert memory._pci_device_dir("/sys/bus/pci/devices", "0000:03:00.0").endswith(
+        "0000:03:00.0"
+    )
+    monkeypatch.setattr(os, "name", "nt")
+    assert memory._pci_device_dir("C:/fixtures", "0000:03:00.0").endswith(
+        "0000-03-00.0"
+    )

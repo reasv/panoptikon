@@ -707,7 +707,9 @@ unit         = "item"                  # cost dimension in force when measured;
 aggregation  = "count"                 # part of the key (see below)
 
 base_mb           = 4321               # load footprint (process-level, see Base measurement)
-base_method       = "nvml"             # nvml | free_delta | alloc_delta
+base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delta
+                                       # (fdinfo = NVML tier 1's ROCm twin,
+                                       # docs/rocm-batch-calibration-parity.md D4)
 slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
                                        # on reserved deltas (same field name and
                                        # currency as the wire `fit` snapshot)

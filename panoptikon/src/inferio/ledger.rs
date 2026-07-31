@@ -512,8 +512,8 @@ struct WorkerEntry {
     /// never persisted — an unkeyed entry could not be read back safely.
     torch: Option<String>,
     dtype: Option<String>,
-    /// `nvml` | `free_delta` | `alloc_delta`: provenance for `base_mb`,
-    /// carried into the profile.
+    /// `nvml` | `fdinfo` | `free_delta` | `alloc_delta`: provenance for
+    /// `base_mb`, carried into the profile.
     base_method: Option<String>,
     seed_units: u64,
     /// Recorded **once** per worker registration: `Worker::load`'s report is
@@ -5561,6 +5561,105 @@ mod tests {
                 )
                 .is_none(),
             "outside 5%"
+        );
+    }
+
+    /// The whole ROCm shape, wire to board (D4): a msgpack `load` payload as
+    /// a ROCm worker actually sends it — no `gpu_uuid`, a PCI address,
+    /// torch's own total, `base_method: "fdinfo"` and a memory sample
+    /// sourced from `"amdgpu-sysfs"` — decoded by the worker codec and
+    /// registered.
+    ///
+    /// Both new provenance strings are carried opaquely by every layer
+    /// between the two ends (`field_string` into an `Option<String>`), which
+    /// is exactly why they need a test that spans the whole path rather than
+    /// either half: nothing in between would notice a typo, and the two ends
+    /// are the only places the strings mean anything — the ledger's
+    /// authority rule for `"amdgpu-sysfs"`, and the calibration profile's
+    /// provenance for `"fdinfo"`.
+    #[test]
+    fn a_rocm_wire_load_report_reaches_the_board_it_names() {
+        use rmpv::Value;
+
+        let payload = vec![
+            (Value::from("base_mb"), Value::from(2048u64)),
+            (Value::from("base_method"), Value::from("fdinfo")),
+            (Value::from("reserved_at_load_mb"), Value::from(1800u64)),
+            (Value::from("dtype"), Value::from("fp16")),
+            (Value::from("gpu_bdf"), Value::from("0000:0c:00.0")),
+            (Value::from("gpu_total_mb"), Value::from(24_560u64)),
+            (
+                Value::from("gpu_name"),
+                Value::from("AMD Radeon RX 7900 XTX"),
+            ),
+            (Value::from("torch_version"), Value::from("2.11.0+rocm7.2")),
+            (
+                Value::from("memory"),
+                Value::Map(vec![
+                    (Value::from("free_mb"), Value::from(21_000u64)),
+                    (Value::from("total_mb"), Value::from(24_560u64)),
+                    (Value::from("free_source"), Value::from("amdgpu-sysfs")),
+                    (Value::from("reserved_mb"), Value::from(1800u64)),
+                    (Value::from("allocated_mb"), Value::from(1500u64)),
+                ]),
+            ),
+        ];
+        let report = LoadReport::parse(&payload).expect("a ROCm load report");
+        assert_eq!(report.gpu_uuid, None, "suppressed on HIP");
+        assert_eq!(report.base_method.as_deref(), Some("fdinfo"));
+
+        let ledger = rocm_ledger();
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(report));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted by address, cross-checked by total");
+        assert_eq!(
+            admitted_board(&ledger, 0),
+            (AMD_B.to_owned(), "g/a".to_owned())
+        );
+        assert_eq!(
+            ledger
+                .lock()
+                .workers
+                .values()
+                .next()
+                .and_then(|worker| worker.base_method.clone())
+                .as_deref(),
+            Some("fdinfo"),
+            "the provenance the calibration profile is written with"
+        );
+
+        // The load response's own sample is recorded immediately — it is the
+        // only reading this board has until a predict lands — and it is
+        // recorded under its own source, which is authoritative: a later
+        // `"torch"` reading cannot displace it.
+        let sourced = |ledger: &Arc<VramLedger>| {
+            ledger
+                .health()
+                .into_iter()
+                .find(|board| board.gpu_uuid == AMD_B)
+                .expect("the board the worker named")
+                .external_source
+        };
+        assert_eq!(sourced(&ledger).as_deref(), Some("amdgpu-sysfs"));
+
+        {
+            let mut telemetry = handle.lock().unwrap();
+            telemetry.memory = Some(Timestamped::now(MemorySample {
+                free_mb: Some(9_000),
+                total_mb: Some(24_560),
+                free_source: Some("torch".to_owned()),
+                reserved_mb: Some(1800),
+                allocated_mb: Some(1500),
+            }));
+        }
+        ledger.ingest_all_for_test();
+        assert_eq!(
+            sourced(&ledger).as_deref(),
+            Some("amdgpu-sysfs"),
+            "a torch reading does not displace the whole-board one"
         );
     }
 

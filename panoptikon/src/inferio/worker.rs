@@ -173,12 +173,14 @@ pub enum WorkerOutput {
 pub struct MemorySample {
     pub free_mb: Option<u64>,
     pub total_mb: Option<u64>,
-    /// Which driver `free_mb`/`total_mb` came from: `"nvml"` or `"torch"`
-    /// (`mem_get_info`). The two disagree by gigabytes on the same board —
-    /// NVML sees the whole board, `mem_get_info` the calling context's view —
-    /// so any consumer that differences two samples, or subtracts our own
-    /// footprint from `free_mb` to price *other* processes, must first check
-    /// that this matches. `None` when the worker could not read either.
+    /// Which driver `free_mb`/`total_mb` came from: `"nvml"`,
+    /// `"amdgpu-sysfs"` (the ROCm whole-board counters) or `"torch"`
+    /// (`mem_get_info`). They disagree by gigabytes on the same board — the
+    /// two driver sources see the whole board, `mem_get_info` the calling
+    /// context's view — so any consumer that differences two samples, or
+    /// subtracts our own footprint from `free_mb` to price *other* processes,
+    /// must first check that this matches. `None` when the worker could read
+    /// none of them.
     pub free_source: Option<String>,
     /// Caching-allocator pool size (`torch.cuda.memory_reserved`).
     pub reserved_mb: Option<u64>,
@@ -192,8 +194,9 @@ pub struct MemorySample {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadReport {
     pub base_mb: Option<u64>,
-    /// `"nvml"` | `"free_delta"` | `"alloc_delta"` — provenance for the
-    /// calibration profile, kept as the worker sent it.
+    /// `"nvml"` | `"fdinfo"` (its ROCm twin) | `"free_delta"` |
+    /// `"alloc_delta"` — provenance for the calibration profile, kept as the
+    /// worker sent it.
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
     /// Negotiated load precision (`"fp16"`/`"bf16"`/`"fp32"`); part of the
@@ -1399,7 +1402,14 @@ impl MemorySample {
 impl LoadReport {
     /// `None` when the response carried no memory-sensing fields at all,
     /// which is how an older worker (or one with no torch) answers.
-    fn parse(payload: &[(Value, Value)]) -> Option<Self> {
+    ///
+    /// Visible to the rest of `inferio` (rather than private here) so the
+    /// ledger's registration tests can start from a real msgpack payload
+    /// instead of a hand-built struct: the provenance strings the ledger acts
+    /// on — `free_source`, `base_method` — are carried opaquely from the
+    /// worker to the board, and a round trip is the only test that covers the
+    /// whole of that path.
+    pub(super) fn parse(payload: &[(Value, Value)]) -> Option<Self> {
         let report = Self {
             base_mb: field_u64(payload, "base_mb"),
             base_method: field_string(payload, "base_method"),

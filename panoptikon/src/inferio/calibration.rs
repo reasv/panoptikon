@@ -153,7 +153,7 @@ pub struct CalibrationProfile {
     /// Load footprint, process-level (see the design's "Base measurement").
     #[serde(default)]
     pub base_mb: u64,
-    /// `nvml` | `free_delta` | `alloc_delta` — provenance for `base_mb`.
+    /// `nvml` | `fdinfo` | `free_delta` | `alloc_delta` — provenance for `base_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_method: Option<String>,
     /// Marginal cost in MiB per unit, fitted on reserved deltas. Zero means
